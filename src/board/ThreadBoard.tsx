@@ -2,6 +2,7 @@ import { useState } from "react";
 import { motion } from "motion/react";
 import {
   ArrowRight,
+  Bell,
   Eye,
   GitBranch,
   Layers,
@@ -13,6 +14,7 @@ import type { Direction, RepoRef, SessionStatus } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { StatusDot } from "../components/ui/StatusChip";
 import { CreateDirectionDialog } from "../nav/dialogs";
+import { CoordinationPanel } from "./CoordinationPanel";
 import { cn } from "../lib/cn";
 
 const KIND_LABEL: Record<string, string> = {
@@ -63,23 +65,26 @@ export function ThreadBoard() {
         </Button>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-        {dirs.length === 0 ? (
-          <EmptyBoard onAdd={() => setNewDir(true)} />
-        ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-3">
-            {dirs.map((d) => (
-              <DirectionCard key={d.id} direction={d} />
-            ))}
-            <button
-              onClick={() => setNewDir(true)}
-              className="flex min-h-[140px] flex-col items-center justify-center gap-2 rounded-[var(--radius-lg)] border border-dashed border-border text-ink-faint transition-colors hover:border-border-strong hover:bg-surface hover:text-ink-muted"
-            >
-              <Plus size={18} />
-              <span className="text-[12px]">Add direction</span>
-            </button>
-          </div>
-        )}
+      <div className="flex min-h-0 flex-1">
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          {dirs.length === 0 ? (
+            <EmptyBoard onAdd={() => setNewDir(true)} />
+          ) : (
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-3">
+              {dirs.map((d) => (
+                <DirectionCard key={d.id} direction={d} />
+              ))}
+              <button
+                onClick={() => setNewDir(true)}
+                className="flex min-h-[140px] flex-col items-center justify-center gap-2 rounded-[var(--radius-lg)] border border-dashed border-border text-ink-faint transition-colors hover:border-border-strong hover:bg-surface hover:text-ink-muted"
+              >
+                <Plus size={18} />
+                <span className="text-[12px]">Add direction</span>
+              </button>
+            </div>
+          )}
+        </div>
+        <CoordinationPanel directions={dirs} />
       </div>
 
       <CreateDirectionDialog open={newDir} onOpenChange={setNewDir} threadId={thread.id} />
@@ -94,7 +99,11 @@ function DirectionCard({ direction }: { direction: Direction }) {
     repos,
     sessions,
     openSession,
+    nudgeDirection,
   } = useStore();
+  const hasLive = Object.values(sessions).some(
+    (s) => s.directionId === direction.id && s.status === "running",
+  );
   const writes = worktreesByDirection[direction.id] ?? [];
   const scope = directionReposByDirection[direction.id] ?? [];
   const reads = scope
@@ -112,6 +121,16 @@ function DirectionCard({ direction }: { direction: Direction }) {
           <Layers size={13} className="text-ink-faint" />
           {direction.name}
         </span>
+        {hasLive && (
+          <button
+            onClick={() => void nudgeDirection(direction.id)}
+            aria-label="Nudge this direction to read its inbox"
+            title="Nudge: tell this agent to check the thread bus"
+            className="grid h-5 w-5 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-brand"
+          >
+            <Bell size={12} />
+          </button>
+        )}
         <span className="ml-auto flex items-center gap-1.5 rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-muted">
           <span className={cn("h-1.5 w-1.5 rounded-full", TOOL_DOT[direction.tool] ?? "bg-idle")} />
           {TOOL_LABEL[direction.tool] ?? direction.tool}
