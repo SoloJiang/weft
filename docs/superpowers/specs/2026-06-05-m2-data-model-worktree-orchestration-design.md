@@ -139,3 +139,12 @@ M2 的验收是**正确性**(数据模型 + worktree 生命周期 + 并行安全
 - `open_session(direction,repo)`:在已物化 worktree 上创建 session 行(cwd 正确)并 spawn 原生 claude(live resume 机制与 M1 已证一致)。
 
 **开发期设施:** `WEFT_HOME` 环境变量可覆盖 weft 数据根(测试隔离 + 用户可迁移数据);debug-only `tauri-plugin-mcp-bridge` 支撑无人值守 IPC 验证。
+
+**代码审查必修(已修,commit `6bf3b15`):** 删除 worktree 时一并 `git branch -D` 删掉 `ws/...` 命名空间分支(否则每次删 thread 在用户仓累积悬挂分支,违背零累积);`now()` 时钟兜底防 panic;`cleanup_worktrees` 不再吞 git 错误。
+
+### 延后的 follow-up(审查发现,不阻塞 M2 正确性)
+
+- **物化非原子**:`materialize_direction` 先建 worktree 再插 DB 行,二者之间崩溃会留下"有 worktree 无 DB 行"的孤儿。修法:启动时用 `git worktree list` 对账 DB,或先记意图再建。
+- **时间戳**:`created_at` 当前存 epoch 秒字符串(注释写 RFC3339)。改存真正 RFC3339 或 integer epoch。
+- **外键无索引**:`workspace_id/thread_id/direction_id/repo_id` 上加索引迁移(数据增长前)。
+- **`SessionInfo.repo` 字段名误导**:当前存的是 worktree 路径而非仓名,后续 UI craft pass 时校正。
