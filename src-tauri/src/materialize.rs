@@ -59,19 +59,21 @@ pub async fn materialize_direction(
     Ok(out)
 }
 
-/// Physically remove worktrees (called during cascade delete). `removed` is the
-/// (repo_id, path) list returned by `repo::delete_thread_cascade`.
-pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String)]) -> Result<()> {
+/// Physically remove worktrees and their namespaced branches (called during
+/// cascade delete). `removed` is the (repo_id, path, branch) list returned by
+/// `repo::delete_thread_cascade`. Per the zero-accumulation principle, the
+/// branch is torn down too so deleted threads leave nothing in the canonical repo.
+pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Result<()> {
     use sea_orm::EntityTrait;
-    for (repo_id, path) in removed {
-        if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id)
-            .one(&db.0)
-            .await?
-        {
-            let _ = git::remove_worktree(
-                std::path::Path::new(&r.local_git_path),
-                std::path::Path::new(path),
-            );
+    for (repo_id, path, branch) in removed {
+        if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id).one(&db.0).await? {
+            let repo_path = std::path::Path::new(&r.local_git_path);
+            if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
+                eprintln!("[weft] worktree remove failed for {path}: {e}");
+            }
+            if let Err(e) = git::delete_branch(repo_path, branch) {
+                eprintln!("[weft] branch delete failed for {branch}: {e}");
+            }
         }
     }
     Ok(())

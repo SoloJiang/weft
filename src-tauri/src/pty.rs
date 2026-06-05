@@ -60,8 +60,8 @@ struct OutputPayload {
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Spawn `claude` into a fresh PTY at `cwd` and wire up output/exit/capture.

@@ -10,8 +10,8 @@ fn now() -> String {
     // RFC3339 without pulling chrono: seconds since epoch is enough for ordering.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     format!("{secs}")
 }
 
@@ -200,19 +200,19 @@ pub async fn worktree_for(
 
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
-pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, String)>> {
+pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, String, String)>> {
     let dirs = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&db.0)
         .await?;
-    let mut removed: Vec<(i32, String)> = Vec::new(); // (repo_id, worktree path)
+    let mut removed: Vec<(i32, String, String)> = Vec::new(); // (repo_id, worktree path, branch)
     for d in &dirs {
         let wts = worktree::Entity::find()
             .filter(worktree::Column::DirectionId.eq(d.id))
             .all(&db.0)
             .await?;
         for w in wts {
-            removed.push((w.repo_id, w.path.clone()));
+            removed.push((w.repo_id, w.path.clone(), w.branch.clone()));
             worktree::Entity::delete_by_id(w.id).exec(&db.0).await?;
         }
         session::Entity::delete_many()
@@ -298,7 +298,7 @@ mod tests {
 
         // cascade delete returns the path to clean and empties the rows
         let removed = delete_thread_cascade(&db, t.id).await.unwrap();
-        assert_eq!(removed, vec![(repo.id, "/tmp/wt".to_string())]);
+        assert_eq!(removed, vec![(repo.id, "/tmp/wt".to_string(), "ws/demo-ws/add-login/main".to_string())]);
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
         assert_eq!(list_threads(&db, ws.id).await.unwrap().len(), 0);
         assert_eq!(list_worktrees(&db, None).await.unwrap().len(), 0);

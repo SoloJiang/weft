@@ -67,6 +67,12 @@ async fn m2_acceptance() {
     assert!(Path::new(&w3[0].path).exists(), "other thread's worktree survives");
     assert_eq!(repo::list_worktrees(&db, None).await.unwrap().len(), 1);
 
+    // the deleted thread's namespaced branch must be gone from the canonical repo
+    // (zero-accumulation), while the surviving thread's branch remains.
+    let listed_after = weft_app_lib::git::list_worktrees(&repo_a).unwrap();
+    assert!(!listed_after.iter().any(|(_, b)| b == &w1[0].branch), "deleted thread's branch must be gone");
+    assert!(listed_after.iter().any(|(_, b)| b == &w3[0].branch), "surviving thread's branch remains");
+
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&weft_home);
 }

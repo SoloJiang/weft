@@ -3,6 +3,7 @@
 //! is never checked out in two worktrees at once.
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -59,6 +60,13 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Delete a (weft-namespaced) branch from `repo`, ignoring "not found".
+pub fn delete_branch(repo: &Path, branch: &str) -> Result<()> {
+    // -D force-deletes; weft worktree branches are throwaway WIP and the caller
+    // is explicitly tearing the direction down (zero-accumulation principle).
+    git(repo, &["branch", "-D", branch]).map(|_| ()).or(Ok(()))
+}
+
 /// Create a throwaway demo repo (for trying the app without a real repo).
 pub fn init_demo_repo(at: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(at)?;
@@ -70,8 +78,6 @@ pub fn init_demo_repo(at: &Path) -> Result<PathBuf> {
     git(at, &["commit", "-q", "-m", "init"])?;
     Ok(at.to_path_buf())
 }
-
-use serde::Serialize;
 
 /// One file's diff stat in a worktree.
 #[derive(Serialize, Debug, PartialEq)]
