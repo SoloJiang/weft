@@ -19,6 +19,16 @@ Thread 级共享:`<viewRoot>/.thread/` 状态目录 + `PLAN.md` 黑板,物化时
 ### 主动层(v1 核心:结构化消息总线)
 weft 起一个**本机 MCP server(thread bus)**,挂到该 thread 所有会话,暴露工具。agent 调 MCP 工具收发,无需共享可写目录。
 
+## ✅ Spike 结论(2026-06-05,承重风险全绿)
+
+用一个最小 Node HTTP MCP bus(`bus_post`/`bus_inbox`,in-memory)实测三家:
+- **Claude**:`--mcp-config <ephemeral.json>`(http transport)→ 调 `bus_post` 成功;**叠加性证实**——子仓自带 `.mcp.json`(repo_own)与 weft_bus 同时生效,未覆盖。
+- **Codex**:`codex exec -c mcp_servers.weft_bus.url=<url>` → 日志 `mcp: weft_bus/bus_post completed`,消息入收件箱。
+- **OpenCode**:项目 `opencode.json` 的 `mcp: { weft_bus: { type:"remote", url } }` → 调 `weft_bus_bus_post` 成功;`opencode mcp list` 显示**全局 codegraph + 项目 weft_bus 共存**(叠加证实)。
+
+→ **单个本机 HTTP MCP bus + 临时叠加注入,三家全部可行。** 设计成立,进入 v1 实现。
+唯一实现细节:**OpenCode 注入须深合并进子仓 opencode.json(不可覆盖)**;Claude/Codex 用启动 flag 天然不碰文件。
+
 ## 承重决策(已核验)
 
 **bus = 单个本机 HTTP MCP server(随 app 起,全局一个进程),按 URL 路径参数区分 thread + direction。**
