@@ -33,6 +33,7 @@ pub fn run() {
             commands::list_threads,
             commands::list_repos,
             commands::list_directions,
+            commands::list_direction_repos,
             commands::create_direction,
             commands::list_worktrees,
             commands::repo_diff,

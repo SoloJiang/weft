@@ -41,6 +41,13 @@ export interface Direction {
   created_at: string;
 }
 
+export interface DirectionRepo {
+  id: number;
+  direction_id: number;
+  repo_id: number;
+  role: string;
+}
+
 export interface Worktree {
   id: number;
   repo_id: number;

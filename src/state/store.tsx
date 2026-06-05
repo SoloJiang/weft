@@ -10,6 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import type {
   Direction,
+  DirectionRepo,
   RepoRef,
   SessionInfo,
   SessionStatus,
@@ -34,13 +35,17 @@ interface Store {
   threads: Thread[];
   directionsByThread: Record<number, Direction[]>;
   worktreesByDirection: Record<number, Worktree[]>;
+  directionReposByDirection: Record<number, DirectionRepo[]>;
 
+  activeThreadId: number | null;
   sessions: Record<number, OpenSession>;
   activeSessionId: number | null;
 
   selectWorkspace: (id: number) => Promise<void>;
   refreshWorkspaces: () => Promise<void>;
+  selectThread: (threadId: number) => Promise<void>;
   loadThreadChildren: (threadId: number) => Promise<void>;
+  backToBoard: () => void;
 
   createWorkspace: (name: string) => Promise<void>;
   addRepo: (name: string, path: string) => Promise<void>;
@@ -73,6 +78,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
   const [worktreesByDirection, setWorktrees] = useState<Record<number, Worktree[]>>({});
+  const [directionReposByDirection, setDirectionRepos] = useState<
+    Record<number, DirectionRepo[]>
+  >({});
+  const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
 
@@ -89,20 +98,45 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setThreads(t);
     setDirections({});
     setWorktrees({});
+    setActiveThreadId(null);
+    setActiveSessionId(null);
   }, []);
 
   const loadThreadChildren = useCallback(async (threadId: number) => {
     const dirs = await api.listDirections(threadId);
     setDirections((m) => ({ ...m, [threadId]: dirs }));
-    const wtEntries = await Promise.all(
-      dirs.map(async (d) => [d.id, await api.listWorktrees(d.id)] as const),
+    const entries = await Promise.all(
+      dirs.map(
+        async (d) =>
+          [
+            d.id,
+            await api.listWorktrees(d.id),
+            await api.listDirectionRepos(d.id),
+          ] as const,
+      ),
     );
     setWorktrees((m) => {
       const next = { ...m };
-      for (const [id, wts] of wtEntries) next[id] = wts;
+      for (const [id, wts] of entries) next[id] = wts;
+      return next;
+    });
+    setDirectionRepos((m) => {
+      const next = { ...m };
+      for (const [id, , drs] of entries) next[id] = drs;
       return next;
     });
   }, []);
+
+  const selectThread = useCallback(
+    async (threadId: number) => {
+      setActiveThreadId(threadId);
+      setActiveSessionId(null);
+      await loadThreadChildren(threadId);
+    },
+    [loadThreadChildren],
+  );
+
+  const backToBoard = useCallback(() => setActiveSessionId(null), []);
 
   const createWorkspace = useCallback(
     async (name: string) => {
@@ -155,6 +189,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         delete n[threadId];
         return n;
       });
+      setActiveThreadId((cur) => (cur === threadId ? null : cur));
     },
     [activeWorkspaceId],
   );
@@ -239,11 +274,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     threads,
     directionsByThread,
     worktreesByDirection,
+    directionReposByDirection,
+    activeThreadId,
     sessions,
     activeSessionId,
     selectWorkspace,
     refreshWorkspaces,
+    selectThread,
     loadThreadChildren,
+    backToBoard,
     createWorkspace,
     addRepo,
     createThread,

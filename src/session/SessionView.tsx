@@ -1,5 +1,11 @@
 import { motion } from "motion/react";
-import { GitBranch, RotateCcw, Square, TerminalSquare } from "lucide-react";
+import {
+  ArrowLeft,
+  GitBranch,
+  RotateCcw,
+  Square,
+  TerminalSquare,
+} from "lucide-react";
 import { useStore } from "../state/store";
 import type { SessionStatus } from "../lib/types";
 import { TerminalPanel } from "../panels/TerminalPanel";
@@ -7,10 +13,11 @@ import { StatusChip } from "../components/ui/StatusChip";
 import { Button } from "../components/ui/Button";
 
 export function SessionView() {
-  const { sessions, activeSessionId, resumeSession, killSession } = useStore();
+  const { sessions, activeSessionId, resumeSession, killSession, backToBoard } =
+    useStore();
   const active = activeSessionId != null ? sessions[activeSessionId] : null;
 
-  if (!active) return <EmptyState />;
+  if (!active) return null;
 
   const { info, status, nativeId } = active;
   const cwdShort = info.worktree.replace(/^.*\/worktrees\//, "…/");
@@ -19,6 +26,13 @@ export function SessionView() {
     <section className="flex min-w-0 flex-1 flex-col bg-bg">
       {/* session header */}
       <header className="flex items-center gap-3 border-b border-border bg-surface px-3 py-2">
+        <button
+          onClick={backToBoard}
+          aria-label="Back to board"
+          className="-ml-1 grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+        >
+          <ArrowLeft size={15} />
+        </button>
         <span className="flex items-center gap-1.5 rounded-[var(--radius-sm)] bg-raised px-2 py-0.5 text-[11px] font-medium capitalize text-ink-muted">
           <TerminalSquare size={12} className="text-brand" />
           {info.tool}
@@ -71,18 +85,3 @@ export function SessionView() {
   );
 }
 
-function EmptyState() {
-  return (
-    <section className="flex min-w-0 flex-1 flex-col items-center justify-center bg-bg px-6 text-center">
-      <div className="grid h-12 w-12 place-items-center rounded-[var(--radius-lg)] border border-border bg-surface">
-        <TerminalSquare size={22} className="text-ink-faint" />
-      </div>
-      <h2 className="mt-4 text-[15px] font-semibold text-ink">No session open</h2>
-      <p className="mt-1.5 max-w-sm text-[13px] leading-relaxed text-ink-faint">
-        Pick a repo under a direction in the sidebar to spawn its native agent in
-        an isolated worktree. Trust and permission prompts appear right here in
-        the terminal, answered as usual.
-      </p>
-    </section>
-  );
-}

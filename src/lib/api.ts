@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Direction,
+  DirectionRepo,
   RepoRef,
   Role,
   SessionInfo,
@@ -31,6 +32,8 @@ export const api = {
 
   listDirections: (threadId: number) =>
     invoke<Direction[]>("list_directions", { threadId }),
+  listDirectionRepos: (directionId: number) =>
+    invoke<DirectionRepo[]>("list_direction_repos", { directionId }),
   createDirection: (
     threadId: number,
     name: string,

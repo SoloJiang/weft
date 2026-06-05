@@ -101,6 +101,16 @@ pub async fn list_repos(db: &Db, workspace_id: i32) -> Result<Vec<repo_ref::Mode
         .await?)
 }
 
+pub async fn list_direction_repos(
+    db: &Db,
+    direction_id: i32,
+) -> Result<Vec<direction_repo::Model>> {
+    Ok(direction_repo::Entity::find()
+        .filter(direction_repo::Column::DirectionId.eq(direction_id))
+        .all(&db.0)
+        .await?)
+}
+
 pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::Model>> {
     Ok(direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))

@@ -53,6 +53,14 @@ pub async fn list_directions(db: State<'_, Db>, thread_id: i32) -> R<Vec<entitie
     repo::list_directions(&db, thread_id).await.map_err(e)
 }
 
+#[tauri::command]
+pub async fn list_direction_repos(
+    db: State<'_, Db>,
+    direction_id: i32,
+) -> R<Vec<entities::direction_repo::Model>> {
+    repo::list_direction_repos(&db, direction_id).await.map_err(e)
+}
+
 /// scope: list of { repoId, role } from the frontend.
 #[derive(serde::Deserialize)]
 pub struct ScopeItem { pub repo_id: i32, pub role: String }
