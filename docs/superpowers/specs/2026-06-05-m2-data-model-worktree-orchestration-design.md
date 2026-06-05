@@ -55,7 +55,7 @@ session(id, direction_id, repo_id, tool, cwd, native_session_id, status, created
 - **worktree.path 稳定**(见下),`session.cwd = worktree.path`。
 - 关系完整性:删 thread → 级联删 direction / direction_repo / worktree(并物理清理)/ session。
 
-技术:`sqlx`(编译期校验)或 `tauri-plugin-sql`。**选 `sqlx` + 自带 migration**(类型安全、不依赖前端插件、后端可独立测试)。DB 文件:`~/.weft/weft.db`。
+技术:**SeaORM**(async-first ORM,底层即 sqlx;自带 migration、entity、关系映射)。理由:既要 ORM 的开发体验(实体/关系/级联),又保留 sqlx 的可靠性,且与 Tauri 的 async 运行时天然契合。`store/` 下放 entity 定义 + migration + 仓储封装;后端可独立测(SQLite,可用内存库跑单测)。DB 文件:`~/.weft/weft.db`。
 
 ## 承重决策:worktree 物化到稳定持久目录(非 /tmp)
 
