@@ -32,12 +32,29 @@ struct Active {
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     alive: Arc<AtomicBool>,
+    direction_id: i32,
 }
 
 /// Tauri-managed state: live PTY sessions keyed by the DB `session.id`.
 #[derive(Default)]
 pub struct PtyState {
     sessions: Mutex<HashMap<i32, Active>>,
+}
+
+impl PtyState {
+    /// Write `data` to the live session of `direction_id`, if any. Returns true
+    /// if a session was found and written to.
+    pub fn wake_direction(&self, direction_id: i32, data: &str) -> bool {
+        let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for a in g.values_mut() {
+            if a.direction_id == direction_id {
+                let _ = a.writer.write_all(data.as_bytes());
+                let _ = a.writer.flush();
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -70,6 +87,7 @@ fn now_secs() -> u64 {
 fn spawn(
     app: &AppHandle,
     tool: &str,
+    direction_id: i32,
     inject_args: &[String],
     cwd: &PathBuf,
     resume_id: Option<&str>,
@@ -188,6 +206,7 @@ fn spawn(
         writer,
         master: pair.master,
         alive,
+        direction_id,
     })
 }
 
@@ -243,7 +262,7 @@ async fn open_session_impl(
         &cwd,
     );
 
-    let active = spawn(&app, &dir.tool, &inj.args, &cwd, None, sess.id, db.clone())
+    let active = spawn(&app, &dir.tool, direction_id, &inj.args, &cwd, None, sess.id, db.clone())
         .context("spawn agent")?;
     state.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(sess.id, active);
 
@@ -303,7 +322,7 @@ async fn resume_impl(
     };
     let base = app.state::<crate::BusBase>().0.clone();
     let inj = crate::bus::inject::inject(&base, tid, &s.direction_id.to_string(), &s.tool, &cwd);
-    let active = spawn(&app, &s.tool, &inj.args, &cwd, Some(&native), session_id, db.clone())
+    let active = spawn(&app, &s.tool, s.direction_id, &inj.args, &cwd, Some(&native), session_id, db.clone())
         .context("spawn agent --resume")?;
     state.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id, active);
     Ok(SessionInfo {
