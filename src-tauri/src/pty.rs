@@ -267,10 +267,18 @@ async fn open_session_impl(
     // (claude's variadic flag would otherwise eat it). Best-effort: a bare
     // session still opens if the brief can't be assembled.
     let brief = crate::brief::assemble(db, direction_id).await.unwrap_or_default();
+    let ask = crate::bus::inject::inject_ask_hook(
+        &base,
+        dir.thread_id,
+        &direction_id.to_string(),
+        &dir.tool,
+        &cwd,
+    );
     let mut args: Vec<String> = Vec::new();
     if !brief.trim().is_empty() {
         args.push(brief);
     }
+    args.extend(ask.args);
     args.extend(inj.args);
 
     let active = spawn(&app, &dir.tool, direction_id, &args, &cwd, None, sess.id, db.clone())
@@ -452,11 +460,15 @@ async fn plan_with_lead_impl(
 
     let base = app.state::<crate::BusBase>().0.clone();
     let inj = crate::bus::inject::inject_planner(&base, thread_id, &tool, &cwd);
+    // The lead is read-only planning, but install the Ask Bridge too so any
+    // permission prompt it hits still surfaces instead of stalling.
+    let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "", &tool, &cwd);
 
     // Seed the planning prompt as the agent's initial positional message. It must
     // come BEFORE --mcp-config: claude's --mcp-config is variadic and would
     // otherwise swallow the prompt as a second config path (ENAMETOOLONG).
     let mut args = vec![lead_prompt().to_string()];
+    args.extend(ask.args);
     args.extend(inj.args);
 
     let session_id = -thread_id; // synthetic, ephemeral, collision-free

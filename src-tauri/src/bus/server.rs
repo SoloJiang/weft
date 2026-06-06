@@ -4,6 +4,7 @@
 //! arguments. This does NOT stop a local process that forges the URL path
 //! itself (no auth; an accepted local-first tradeoff).
 
+use crate::ask::{AskRegistry, Decision};
 use crate::bus::BusRegistry;
 use crate::store::Db;
 use axum::{
@@ -14,13 +15,16 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
+use std::time::Duration;
 
-/// Shared state for the local MCP server: the in-memory thread bus + the DB
-/// (the planner reads the repo map and writes proposals).
+/// Shared state for the local server: the in-memory thread bus, the DB (the
+/// planner reads the repo map and writes proposals), and the Ask registry (the
+/// permission Ask Bridge).
 #[derive(Clone)]
 pub struct ServerState {
     pub bus: BusRegistry,
     pub db: Db,
+    pub asks: AskRegistry,
 }
 
 impl FromRef<ServerState> for BusRegistry {
@@ -33,13 +37,82 @@ impl FromRef<ServerState> for Db {
         s.db.clone()
     }
 }
+impl FromRef<ServerState> for AskRegistry {
+    fn from_ref(s: &ServerState) -> AskRegistry {
+        s.asks.clone()
+    }
+}
 
-pub fn router(bus: BusRegistry, db: Db) -> Router {
+pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
     Router::new()
         .route("/bus/:thread/:dir/mcp", post(handle).get(get_not_allowed))
         .route("/planner/:thread/mcp", post(handle_planner).get(get_not_allowed))
+        .route("/ask/:thread/:dir", post(handle_ask).get(get_not_allowed))
         .route("/health", get(|| async { "ok" }))
-        .with_state(ServerState { bus, db })
+        .with_state(ServerState { bus, db, asks })
+}
+
+/// How long weft holds a permission Ask before letting the tool fall back to its
+/// own prompt. Kept under the hook's own timeout so the fallback is clean.
+const ASK_WAIT: Duration = Duration::from_secs(50);
+
+/// The Ask Bridge endpoint. A tool's permission hook POSTs its PreToolUse-style
+/// payload here and BLOCKS until the human answers in weft (→ allow/deny) or the
+/// wait elapses (→ empty body, so the tool runs its own prompt — never a
+/// silent stall). Identity (thread/dir) comes from the URL path, not the body.
+async fn handle_ask(
+    Path((thread, dir)): Path<(i32, String)>,
+    State(asks): State<AskRegistry>,
+    Json(req): Json<Value>,
+) -> Response {
+    let tool_name = req.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool");
+    let (summary, detail) = summarize(tool_name, req.get("tool_input"));
+    let (id, rx) = asks.request(thread, &dir, "claude", &summary, &detail);
+
+    match tokio::time::timeout(ASK_WAIT, rx).await {
+        Ok(Ok(decision)) => {
+            let (d, reason) = match decision {
+                Decision::Allow => ("allow", "Approved in weft"),
+                Decision::Deny => ("deny", "Denied in weft"),
+            };
+            Json(json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": d,
+                    "permissionDecisionReason": reason
+                }
+            }))
+            .into_response()
+        }
+        // timed out or dropped → drop the card, return no decision: the tool
+        // falls back to its native prompt rather than hanging.
+        _ => {
+            asks.cancel(id);
+            Json(json!({})).into_response()
+        }
+    }
+}
+
+/// A short human label + raw detail for a tool action.
+fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String) {
+    let s = |k: &str| input.and_then(|v| v.get(k)).and_then(|v| v.as_str()).map(|s| s.to_string());
+    match tool_name {
+        "Bash" => {
+            let cmd = s("command").unwrap_or_default();
+            let first = cmd.lines().next().unwrap_or("").to_string();
+            (format!("Run: {first}"), cmd)
+        }
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+            let f = s("file_path").unwrap_or_default();
+            (format!("{tool_name} {f}"), f)
+        }
+        other => {
+            let detail = input
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            (other.to_string(), detail)
+        }
+    }
 }
 
 async fn get_not_allowed() -> StatusCode {
@@ -281,11 +354,12 @@ fn tool_specs() -> Value {
 pub async fn serve(
     bus: BusRegistry,
     db: Db,
+    asks: AskRegistry,
 ) -> std::io::Result<(String, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let base = format!("http://127.0.0.1:{}", addr.port());
-    let app = router(bus, db);
+    let app = router(bus, db, asks);
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });

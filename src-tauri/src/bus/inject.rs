@@ -19,6 +19,57 @@ fn planner_url(base: &str, thread: i32) -> String {
     format!("{base}/planner/{thread}/mcp")
 }
 
+fn ask_url(base: &str, thread: i32, dir: &str) -> String {
+    format!("{base}/ask/{thread}/{dir}")
+}
+
+/// Install the Ask Bridge for a claude session: a per-session settings file with
+/// a PreToolUse hook that POSTs each tool action to weft's /ask endpoint and
+/// blocks on the returned allow/deny. Returns the extra `--settings <file>`
+/// args. Additive — claude merges this with the user's own settings/hooks. Only
+/// claude here (codex/opencode bridge in via their own channels). Best-effort:
+/// returns empty args if the files can't be written.
+pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
+    if tool != "claude" {
+        return Injection { args: vec![] };
+    }
+    let url = ask_url(base, thread, dir);
+    let script = cwd.join(".weft-ask-hook.sh");
+    // Reads the PreToolUse JSON on stdin, asks weft, echoes weft's decision JSON
+    // (empty on failure/timeout → claude falls back to its own prompt).
+    let body = format!(
+        "#!/usr/bin/env bash\n\
+         resp=$(curl -s -m 55 -X POST '{url}' -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)\n\
+         [ -n \"$resp\" ] && printf '%s' \"$resp\"\n\
+         exit 0\n"
+    );
+    if std::fs::write(&script, body).is_err() {
+        return Injection { args: vec![] };
+    }
+    let _ = std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+
+    let settings = cwd.join(".weft-ask.settings.json");
+    let json = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "*", "hooks": [
+                    { "type": "command",
+                      "command": format!("bash {}", script.to_string_lossy()),
+                      "timeout": 58 }
+                ] }
+            ]
+        }
+    });
+    if std::fs::write(&settings, serde_json::to_vec_pretty(&json).unwrap_or_default()).is_err() {
+        return Injection { args: vec![] };
+    }
+    git_exclude(cwd, ".weft-ask-hook.sh");
+    git_exclude(cwd, ".weft-ask.settings.json");
+    Injection {
+        args: vec!["--settings".into(), settings.to_string_lossy().to_string()],
+    }
+}
+
 /// Build the thread-bus injection. `cwd` is the worktree (used for the claude
 /// temp config and the opencode merge). `dir` is the direction id as a string.
 pub fn inject(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {

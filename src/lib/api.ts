@@ -5,6 +5,7 @@ import type {
   DirectionRepo,
   LeadInfo,
   NeedItem,
+  PermissionAsk,
   Proposal,
   RepoChecks,
   RepoGraph,
@@ -88,6 +89,11 @@ export const api = {
     invoke<BusMsg[]>("thread_messages", { threadId }),
   busPostHuman: (threadId: number, to: string | null, text: string) =>
     invoke<void>("bus_post_human", { threadId, to, text }),
+
+  // Ask Bridge: pending tool permission requests + the answer.
+  pendingAsks: () => invoke<PermissionAsk[]>("pending_asks"),
+  answerPermission: (askId: number, allow: boolean) =>
+    invoke<void>("answer_permission", { askId, allow }),
 
   // Needs-you: open agent→human questions, aggregated across the workspace.
   needsYou: (workspaceId: number) =>

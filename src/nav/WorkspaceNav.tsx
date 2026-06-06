@@ -121,8 +121,8 @@ export function WorkspaceNav() {
 }
 
 function NeedsButton() {
-  const { needs, showNeeds, openNeeds } = useStore();
-  const count = needs.length;
+  const { needs, asks, showNeeds, openNeeds } = useStore();
+  const count = needs.length + asks.length;
   const has = count > 0;
 
   return (

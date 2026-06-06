@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { ArrowUpRight, Check, HelpCircle, Send } from "lucide-react";
+import { ArrowUpRight, Check, HelpCircle, Send, ShieldQuestion, X } from "lucide-react";
 import { useStore } from "../state/store";
-import type { NeedItem } from "../lib/types";
+import type { NeedItem, PermissionAsk } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 
@@ -13,8 +13,9 @@ import { Input } from "../components/ui/Input";
  * back to the asking direction's inbox.
  */
 export function NeedsYouView() {
-  const { needs } = useStore();
+  const { needs, asks } = useStore();
   const reduce = useReducedMotion();
+  const total = needs.length + asks.length;
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -25,25 +26,37 @@ export function NeedsYouView() {
         <h1 className="text-[16px] font-semibold tracking-tight text-ink">
           Needs you
         </h1>
-        {needs.length > 0 && (
+        {total > 0 && (
           <span className="rounded-full bg-waiting/15 px-2 py-0.5 text-[11px] font-medium tabular-nums text-waiting">
-            {needs.length}
+            {total}
           </span>
         )}
         <span className="ml-auto text-[12px] text-ink-faint">
-          questions only you can answer, across every thread
+          approvals and questions only you can answer
         </span>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {needs.length === 0 ? (
+        {total === 0 ? (
           <EmptyNeeds />
         ) : (
           <div className="mx-auto flex w-full max-w-[680px] flex-col gap-2.5 px-5 py-5">
             <AnimatePresence initial={false}>
+              {asks.map((ask) => (
+                <motion.div
+                  key={`ask-${ask.id}`}
+                  layout={!reduce}
+                  initial={reduce ? false : { opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduce ? { opacity: 0 } : { opacity: 0, height: 0, marginBottom: -10, scale: 0.98 }}
+                  transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                >
+                  <PermissionRow ask={ask} />
+                </motion.div>
+              ))}
               {needs.map((item) => (
                 <motion.div
-                  key={item.ask_id}
+                  key={`need-${item.ask_id}`}
                   layout={!reduce}
                   initial={reduce ? false : { opacity: 0, y: 6 }}
                   animate={{ opacity: 1, y: 0 }}
@@ -62,6 +75,35 @@ export function NeedsYouView() {
         )}
       </div>
     </section>
+  );
+}
+
+function PermissionRow({ ask }: { ask: PermissionAsk }) {
+  const { answerPermission } = useStore();
+  return (
+    <div className="overflow-hidden rounded-[var(--radius-lg)] border border-approval/40 bg-surface">
+      <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
+        <ShieldQuestion size={13} className="shrink-0 text-approval" />
+        <span className="font-medium capitalize text-ink">{ask.tool}</span>
+        <span className="text-ink-faint">wants permission</span>
+        <span className="ml-auto whitespace-nowrap text-ink-faint tabular-nums">
+          {ago(ask.ts)}
+        </span>
+      </div>
+      <p className="truncate px-3.5 pb-1 pt-1.5 font-mono text-[13px] text-ink" title={ask.detail}>
+        {ask.summary}
+      </p>
+      <div className="flex gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
+        <Button variant="primary" onClick={() => void answerPermission(ask.id, true)}>
+          <Check size={13} />
+          Allow
+        </Button>
+        <Button variant="ghost" onClick={() => void answerPermission(ask.id, false)}>
+          <X size={13} />
+          Deny
+        </Button>
+      </div>
+    </div>
   );
 }
 

@@ -168,6 +168,17 @@ export interface ResolvedProposal {
   directions: ResolvedDirection[];
 }
 
+/** A tool's permission request, blocked on the human (the Ask Bridge §4.3). */
+export interface PermissionAsk {
+  id: number;
+  thread: number;
+  dir: string;
+  tool: string;
+  summary: string;
+  detail: string;
+  ts: number;
+}
+
 /** An open agent→human question, aggregated workspace-wide for "Needs you". */
 export interface NeedItem {
   ask_id: number;

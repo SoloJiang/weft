@@ -11,6 +11,7 @@ pub mod slug;
 pub mod store;
 pub mod git;
 pub mod materialize;
+mod ask;
 mod batch;
 mod brief;
 pub mod bus;
@@ -40,12 +41,14 @@ pub fn run() {
     let db = tauri::async_runtime::block_on(async { store::Db::open_default().await })
         .unwrap_or_else(|e| fatal("open weft.db", e));
 
-    // Start the thread-bus HTTP MCP server on an ephemeral port.
+    // Start the local HTTP server (thread bus MCP + planner MCP + Ask Bridge).
     let bus = bus::BusRegistry::new();
+    let asks = ask::AskRegistry::new();
     let bus_base: String = {
         let bus = bus.clone();
         let db = db.clone();
-        tauri::async_runtime::block_on(async move { bus::server::serve(bus, db).await })
+        let asks = asks.clone();
+        tauri::async_runtime::block_on(async move { bus::server::serve(bus, db, asks).await })
             .map(|(base, _handle)| base) // leak the JoinHandle: server lives for app lifetime
             .unwrap_or_else(|e| fatal("start bus server", e))
     };
@@ -66,6 +69,7 @@ pub fn run() {
         .manage(db)
         .manage(pty::PtyState::default())
         .manage(bus)
+        .manage(asks)
         .manage(BusBase(bus_base))
         .setup(move |app| {
             coordinator::run(app.handle().clone(), wake_rx);
@@ -95,6 +99,8 @@ pub fn run() {
             commands::delete_thread,
             commands::thread_messages,
             commands::bus_post_human,
+            commands::pending_asks,
+            commands::answer_permission,
             commands::needs_you,
             commands::answer_ask,
             pty::open_session,

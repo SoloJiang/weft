@@ -274,6 +274,31 @@ pub fn answer_ask(
     }
 }
 
+/// All pending permission Asks across the workspace (the Ask Bridge → Needs-you).
+#[tauri::command]
+pub fn pending_asks(asks: tauri::State<'_, crate::ask::AskRegistry>) -> R<Vec<crate::ask::Ask>> {
+    Ok(asks.open())
+}
+
+/// Answer a pending permission Ask; unblocks the waiting tool.
+#[tauri::command]
+pub fn answer_permission(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    ask_id: u64,
+    allow: bool,
+) -> R<()> {
+    let d = if allow {
+        crate::ask::Decision::Allow
+    } else {
+        crate::ask::Decision::Deny
+    };
+    if asks.resolve(ask_id, d) {
+        Ok(())
+    } else {
+        Err("that request was already answered or has expired".into())
+    }
+}
+
 #[tauri::command]
 pub fn bus_post_human(
     bus: tauri::State<'_, crate::bus::BusRegistry>,

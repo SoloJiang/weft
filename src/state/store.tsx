@@ -13,6 +13,7 @@ import type {
   Direction,
   DirectionRepo,
   NeedItem,
+  PermissionAsk,
   Proposal,
   RepoChecks,
   RepoEdge,
@@ -55,12 +56,15 @@ interface Store {
 
   /** Open agent→human questions across the workspace; the Needs-you surface. */
   needs: NeedItem[];
+  /** Pending tool permission requests (the Ask Bridge). */
+  asks: PermissionAsk[];
   /** Whether the Needs-you view occupies the main region. */
   showNeeds: boolean;
   openNeeds: () => void;
   refreshNeeds: () => Promise<void>;
   answerAsk: (item: NeedItem, text: string) => Promise<void>;
   goToAsk: (item: NeedItem) => Promise<void>;
+  answerPermission: (askId: number, allow: boolean) => Promise<void>;
 
   /** The curator's repo map: profiles + dependency edges. */
   repoProfiles: RepoProfile[];
@@ -130,6 +134,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [messages, setMessages] = useState<BusMsg[]>([]);
   const [needs, setNeeds] = useState<NeedItem[]>([]);
+  const [asks, setAsks] = useState<PermissionAsk[]>([]);
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
@@ -381,6 +386,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const refreshNeeds = useCallback(async () => {
+    // Permission Asks are global (not workspace-scoped); always refresh them.
+    try {
+      setAsks(await api.pendingAsks());
+    } catch {
+      /* server may not be ready */
+    }
     if (activeWorkspaceId == null) {
       setNeeds([]);
       return;
@@ -481,6 +492,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [refreshNeeds],
   );
+
+  const answerPermission = useCallback(async (askId: number, allow: boolean) => {
+    // optimistic: drop the card immediately, then unblock the tool
+    setAsks((cur) => cur.filter((a) => a.id !== askId));
+    try {
+      await api.answerPermission(askId, allow);
+    } catch {
+      /* already resolved/expired */
+    }
+  }, []);
 
   const goToAsk = useCallback(
     async (item: NeedItem) => {
@@ -625,11 +646,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     postHuman,
     nudgeDirection,
     needs,
+    asks,
     showNeeds,
     openNeeds,
     refreshNeeds,
     answerAsk,
     goToAsk,
+    answerPermission,
     repoProfiles,
     repoEdges,
     showRepoMap,
