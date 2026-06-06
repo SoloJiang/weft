@@ -3,12 +3,12 @@
 //! mid-turn input (the wake runs after the current turn) rather than fragile idle
 //! detection — this is the honest "push" half of bus + coordinator = near-realtime.
 
-use crate::bus::Wake;
+use crate::bus::{Wake, HUMAN};
 use crate::pty::PtyState;
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 const WAKE_PROMPT: &str =
     "You have new messages on the thread bus. Call the bus_inbox tool to read them.\r";
@@ -20,6 +20,12 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
     std::thread::spawn(move || {
         let mut last: HashMap<i32, Instant> = HashMap::new();
         while let Ok(w) = rx.recv() {
+            // A wake addressed to the human means an agent asked a question:
+            // nudge the UI to refresh its Needs-you surface, don't touch a PTY.
+            if w.dir == HUMAN {
+                let _ = app.emit("needs-you://changed", w.thread);
+                continue;
+            }
             // The bus identity is a direction id as a string; ignore non-numeric
             // targets (e.g. a human "you" never registers as a member anyway).
             let Ok(dir) = w.dir.parse::<i32>() else {

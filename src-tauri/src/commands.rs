@@ -106,6 +106,72 @@ pub fn thread_messages(
     Ok(bus.log(thread_id))
 }
 
+/// One thing waiting on the human, with enough context to act on it cold.
+#[derive(serde::Serialize)]
+pub struct NeedItem {
+    pub ask_id: u64,
+    pub thread_id: i32,
+    pub thread_title: String,
+    pub direction_id: i32,
+    pub direction_name: String,
+    pub text: String,
+    pub ts: u64,
+}
+
+/// Aggregate every open agent→human question across the workspace's threads.
+/// This is the data behind the "Needs-you" surface — a pure bus + structure
+/// projection, no TUI parsing.
+#[tauri::command]
+pub async fn needs_you(
+    db: State<'_, Db>,
+    bus: tauri::State<'_, crate::bus::BusRegistry>,
+    workspace_id: i32,
+) -> R<Vec<NeedItem>> {
+    let threads = repo::list_threads(&db, workspace_id).await.map_err(e)?;
+    let mut items: Vec<NeedItem> = Vec::new();
+    for t in threads {
+        let asks = bus.open_asks(t.id);
+        if asks.is_empty() {
+            continue;
+        }
+        let dirs = repo::list_directions(&db, t.id).await.map_err(e)?;
+        for a in asks {
+            let dir_id = a.from.parse::<i32>().unwrap_or(-1);
+            let dir_name = dirs
+                .iter()
+                .find(|d| d.id == dir_id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| a.from.clone());
+            items.push(NeedItem {
+                ask_id: a.id,
+                thread_id: t.id,
+                thread_title: t.title.clone(),
+                direction_id: dir_id,
+                direction_name: dir_name,
+                text: a.text,
+                ts: a.ts,
+            });
+        }
+    }
+    items.sort_by_key(|i| i.ts);
+    Ok(items)
+}
+
+/// Answer an open ask; the reply lands in the asking direction's bus inbox.
+#[tauri::command]
+pub fn answer_ask(
+    bus: tauri::State<'_, crate::bus::BusRegistry>,
+    thread_id: i32,
+    ask_id: u64,
+    text: String,
+) -> R<()> {
+    if bus.answer_ask(thread_id, ask_id, &text) {
+        Ok(())
+    } else {
+        Err("that question was already answered or no longer exists".into())
+    }
+}
+
 #[tauri::command]
 pub fn bus_post_human(
     bus: tauri::State<'_, crate::bus::BusRegistry>,

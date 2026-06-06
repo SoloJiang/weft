@@ -5,9 +5,14 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The sentinel "direction" id for the human operator. Agents address the human
+/// through this; a wake on it tells the UI an ask is waiting.
+pub const HUMAN: &str = "you";
 
 /// Emitted when a direction should be woken to read its inbox.
 #[derive(Clone, Debug)]
@@ -22,7 +27,18 @@ pub struct Msg {
     pub to: String, // "*" for broadcast
     pub text: String,
     pub ts: u64,
-    pub kind: String, // "message" | "interface"
+    pub kind: String, // "message" | "interface" | "ask"
+}
+
+/// A question an agent direction has put to the human, awaiting an answer.
+/// This is the clean, non-TUI signal behind the "Needs-you" surface.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Ask {
+    pub id: u64,
+    pub from: String, // asking direction id (as string)
+    pub text: String,
+    pub ts: u64,
+    pub answered: bool,
 }
 
 #[derive(Default)]
@@ -31,6 +47,7 @@ struct ThreadBus {
     log: Vec<Msg>,                      // full timeline (for the UI later)
     state: serde_json::Value,           // shared thread_state blob (object)
     members: HashSet<String>,           // dirs that have connected
+    asks: Vec<Ask>,                     // questions awaiting a human answer
 }
 
 /// Cloneable handle to all threads' buses.
@@ -38,6 +55,7 @@ struct ThreadBus {
 pub struct BusRegistry {
     inner: Arc<Mutex<HashMap<i32, ThreadBus>>>,
     wake: Arc<Mutex<Option<Sender<Wake>>>>,
+    next_ask_id: Arc<AtomicU64>,
 }
 
 fn now() -> u64 {
@@ -156,6 +174,69 @@ impl BusRegistry {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.entry(thread).or_default().log.clone()
     }
+
+    /// Record a question from direction `from` to the human; returns its id.
+    /// Also lands in the timeline (kind = "ask") and wakes the human sentinel
+    /// so the UI knows attention is needed without polling.
+    pub fn ask_human(&self, thread: i32, from: &str, text: &str) -> u64 {
+        let id = self.next_ask_id.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let bus = g.entry(thread).or_default();
+            let ts = now();
+            bus.asks.push(Ask {
+                id,
+                from: from.to_string(),
+                text: text.to_string(),
+                ts,
+                answered: false,
+            });
+            bus.log.push(Msg {
+                from: from.to_string(),
+                to: HUMAN.to_string(),
+                text: text.to_string(),
+                ts,
+                kind: "ask".to_string(),
+            });
+        }
+        self.emit_wake(thread, HUMAN);
+        id
+    }
+
+    /// The unanswered asks in a thread, oldest first.
+    pub fn open_asks(&self, thread: i32) -> Vec<Ask> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.entry(thread)
+            .or_default()
+            .asks
+            .iter()
+            .filter(|a| !a.answered)
+            .cloned()
+            .collect()
+    }
+
+    /// Answer an open ask: mark it answered and deliver `text` to the asking
+    /// direction's inbox (as if from the human). Returns false if not found.
+    pub fn answer_ask(&self, thread: i32, ask_id: u64, text: &str) -> bool {
+        let target = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let bus = g.entry(thread).or_default();
+            match bus.asks.iter_mut().find(|a| a.id == ask_id && !a.answered) {
+                Some(a) => {
+                    a.answered = true;
+                    Some(a.from.clone())
+                }
+                None => None,
+            }
+        };
+        match target {
+            Some(dir) => {
+                self.post(thread, HUMAN, &dir, text, "message");
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +299,62 @@ mod tests {
         r.post(1, "x", "10", "t1", "message");
         assert_eq!(r.inbox(2, "10").len(), 0);
         assert_eq!(r.inbox(1, "10").len(), 1);
+    }
+
+    #[test]
+    fn ask_human_is_listed_as_open() {
+        let r = BusRegistry::new();
+        let id = r.ask_human(1, "10", "Should I bump the major version?");
+        let open = r.open_asks(1);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, id);
+        assert_eq!(open[0].from, "10");
+        assert_eq!(open[0].text, "Should I bump the major version?");
+        assert!(!open[0].answered);
+    }
+
+    #[test]
+    fn answering_clears_the_ask_and_replies_to_asker() {
+        let r = BusRegistry::new();
+        r.join(1, "10");
+        let id = r.ask_human(1, "10", "major or minor?");
+        let ok = r.answer_ask(1, id, "minor");
+        assert!(ok);
+        // no longer open
+        assert_eq!(r.open_asks(1).len(), 0);
+        // the asking direction receives the answer in its inbox
+        let inbox = r.inbox(1, "10");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, "you");
+        assert_eq!(inbox[0].text, "minor");
+    }
+
+    #[test]
+    fn answering_unknown_ask_is_a_noop() {
+        let r = BusRegistry::new();
+        assert!(!r.answer_ask(1, 999, "hi"));
+    }
+
+    #[test]
+    fn asks_are_isolated_per_thread() {
+        let r = BusRegistry::new();
+        r.ask_human(1, "10", "q1");
+        r.ask_human(2, "20", "q2");
+        assert_eq!(r.open_asks(1).len(), 1);
+        assert_eq!(r.open_asks(2).len(), 1);
+        assert_eq!(r.open_asks(1)[0].text, "q1");
+    }
+
+    #[test]
+    fn ask_human_notifies_the_human_via_wake() {
+        // The human's "direction" sentinel is "you"; a wake on it lets the
+        // UI/coordinator know an ask is waiting without polling.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = BusRegistry::new();
+        r.set_wake_sender(tx);
+        r.ask_human(7, "10", "ping?");
+        let w = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(w.thread, 7);
+        assert_eq!(w.dir, "you");
     }
 }

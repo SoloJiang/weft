@@ -99,6 +99,12 @@ fn call_tool(reg: &BusRegistry, thread: i32, me: &str, name: &str, args: &Value)
             let msgs = reg.inbox(thread, me);
             text_result(serde_json::to_string(&msgs).unwrap_or_else(|_| "[]".into()))
         }
+        "ask_human" => {
+            let id = reg.ask_human(thread, me, &s("text"));
+            text_result(format!(
+                "asked the human (ask #{id}); their answer will arrive in your bus_inbox — keep working and check it"
+            ))
+        }
         "thread_state_get" => text_result(reg.state_get(thread).to_string()),
         "thread_state_set" => {
             let patch = args.get("patch").cloned().unwrap_or_else(|| json!({}));
@@ -129,6 +135,12 @@ fn tool_specs() -> Value {
             "name": "bus_inbox",
             "description": "Read and clear your unread messages from other directions.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "ask_human",
+            "description": "Ask the human operator a question that only they can decide (a judgment call, a missing requirement, an approval). Surfaces in weft's Needs-you inbox; their answer returns via bus_inbox. Non-blocking — keep working and check your inbox.",
+            "inputSchema": { "type": "object",
+                "properties": { "text": str_prop() }, "required": ["text"] }
         },
         {
             "name": "thread_state_get",

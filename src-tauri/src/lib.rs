@@ -80,6 +80,8 @@ pub fn run() {
             commands::delete_thread,
             commands::thread_messages,
             commands::bus_post_human,
+            commands::needs_you,
+            commands::answer_ask,
             pty::open_session,
             pty::resume_session,
             pty::write_pty,
