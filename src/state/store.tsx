@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -138,6 +139,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
   const [checksByDirection, setChecksByDirection] = useState<Record<number, RepoChecks[]>>({});
   const [checkingDirections, setCheckingDirections] = useState<Record<number, boolean>>({});
+  // Idle tracking for the auto-verify loop: last PTY-output time per session,
+  // and which directions we've already auto-checked this idle episode.
+  const lastOutputRef = useRef<Record<number, number>>({});
+  const autoCheckedRef = useRef<Set<number>>(new Set());
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [messages, setMessages] = useState<BusMsg[]>([]);
   const [needs, setNeeds] = useState<NeedItem[]>([]);
@@ -318,6 +325,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return;
       }
       const info = await api.openSession(directionId, repoId);
+      lastOutputRef.current[info.session_id] = Date.now();
+      autoCheckedRef.current.delete(directionId);
       setSessions((m) => ({
         ...m,
         [info.session_id]: {
@@ -637,6 +646,35 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       clearInterval(h);
     };
   }, [leadActive, activeThreadId, activeSessionId]);
+
+  // Auto-verify loop (ARCHITECTURE §4.13): when a worker's PTY goes quiet for a
+  // while it has likely finished its turn — run that direction's checks once per
+  // idle episode so "done" means "checks ran", not self-report. Output resuming
+  // re-arms it. Tool-general: keys off PTY silence, not any tool's event format.
+  useEffect(() => {
+    const IDLE_MS = 20000;
+    const un = listen<{ session_id: number }>("pty://output", (e) => {
+      lastOutputRef.current[e.payload.session_id] = Date.now();
+    });
+    const h = setInterval(() => {
+      const now = Date.now();
+      for (const s of Object.values(sessionsRef.current)) {
+        if (s.kind !== "worker" || s.status !== "running") continue;
+        const last = lastOutputRef.current[s.info.session_id] ?? 0;
+        const idle = now - last > IDLE_MS;
+        if (idle && !autoCheckedRef.current.has(s.directionId)) {
+          autoCheckedRef.current.add(s.directionId);
+          void verifyDirection(s.directionId);
+        } else if (!idle) {
+          autoCheckedRef.current.delete(s.directionId);
+        }
+      }
+    }, 5000);
+    return () => {
+      clearInterval(h);
+      void un.then((f) => f());
+    };
+  }, [verifyDirection]);
 
   useEffect(() => {
     if (activeThreadId == null) {

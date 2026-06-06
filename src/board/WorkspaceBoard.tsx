@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
-import { Flame, Layers, Plus } from "lucide-react";
+import { Flame, Layers, Plus, X } from "lucide-react";
 import { useStore } from "../state/store";
 import type { ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
@@ -110,13 +110,16 @@ function ThreadCard({
   hotIds: Map<number, unknown>;
   onOpen: () => void;
 }) {
-  const { sessions, needs, asks } = useStore();
+  const { sessions, needs, asks, checksByDirection } = useStore();
   const live = Object.values(sessions).filter(
     (s) => s.status === "running" && t.direction_ids.includes(s.directionId),
   ).length;
   const attention =
     needs.filter((n) => n.thread_id === t.thread_id).length +
     asks.filter((a) => a.thread === t.thread_id).length;
+  const failing = t.direction_ids.filter((id) =>
+    (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
+  ).length;
 
   return (
     <motion.button
@@ -168,6 +171,12 @@ function ThreadCard({
           <span className="flex items-center gap-1 text-running">
             <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
             {live} live
+          </span>
+        )}
+        {failing > 0 && (
+          <span className="flex items-center gap-1 text-danger">
+            <X size={11} />
+            {failing} failing
           </span>
         )}
         {attention > 0 && (
