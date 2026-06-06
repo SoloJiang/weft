@@ -15,39 +15,56 @@ fn mcp_url(base: &str, thread: i32, dir: &str) -> String {
     format!("{base}/bus/{thread}/{dir}/mcp")
 }
 
-/// Build the injection. `cwd` is the worktree (used for the claude temp config
-/// and the opencode merge). `dir` is the direction id as a string.
+fn planner_url(base: &str, thread: i32) -> String {
+    format!("{base}/planner/{thread}/mcp")
+}
+
+/// Build the thread-bus injection. `cwd` is the worktree (used for the claude
+/// temp config and the opencode merge). `dir` is the direction id as a string.
 pub fn inject(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
-    let url = mcp_url(base, thread, dir);
+    inject_mcp("weft_bus", "bus", &mcp_url(base, thread, dir), tool, cwd)
+}
+
+/// Build the planner-MCP injection for a lead session (read-only planning).
+/// Same additive mechanism as the bus, a different server keyed to the thread.
+pub fn inject_planner(base: &str, thread: i32, tool: &str, cwd: &Path) -> Injection {
+    inject_mcp("weft_planner", "planner", &planner_url(base, thread), tool, cwd)
+}
+
+/// Additively register one HTTP MCP `server` at `url` for `tool`, never
+/// overriding the sub-repo's own config. `stem` names the claude temp config
+/// file (`.weft-<stem>.mcp.json`).
+fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> Injection {
     match tool {
         "claude" => {
-            // ephemeral --mcp-config file inside the worktree. It's an injected,
-            // untracked file, so we add it to the worktree's git exclude (see
-            // git_exclude) to keep it out of `git status` / diffs / commits.
-            let cfg = cwd.join(".weft-bus.mcp.json");
+            // ephemeral --mcp-config file inside the cwd. It's an injected,
+            // untracked file, so we add it to git exclude (see git_exclude) to
+            // keep it out of `git status` / diffs / commits.
+            let file = format!(".weft-{stem}.mcp.json");
+            let cfg = cwd.join(&file);
             let json = serde_json::json!({
-                "mcpServers": { "weft_bus": { "type": "http", "url": url } }
+                "mcpServers": { server: { "type": "http", "url": url } }
             });
             let _ = std::fs::write(&cfg, serde_json::to_vec_pretty(&json).unwrap_or_default());
-            git_exclude(cwd, ".weft-bus.mcp.json");
+            git_exclude(cwd, &file);
             Injection {
                 args: vec!["--mcp-config".into(), cfg.to_string_lossy().to_string()],
             }
         }
         "codex" => Injection {
-            args: vec!["-c".into(), format!("mcp_servers.weft_bus.url={url}")],
+            args: vec!["-c".into(), format!("mcp_servers.{server}.url={url}")],
         },
         "opencode" => {
-            merge_opencode_config(cwd, &url);
+            merge_opencode_config(cwd, server, url);
             Injection { args: vec![] }
         }
         _ => Injection { args: vec![] },
     }
 }
 
-/// Deep-merge `mcp.weft_bus = {type:remote, url, enabled:true}` into the
-/// worktree's opencode.json, preserving any existing config the sub-repo shipped.
-fn merge_opencode_config(cwd: &Path, url: &str) {
+/// Deep-merge `mcp.<server> = {type:remote, url, enabled:true}` into the cwd's
+/// opencode.json, preserving any existing config the sub-repo shipped.
+fn merge_opencode_config(cwd: &Path, server: &str, url: &str) {
     let path = cwd.join("opencode.json");
     let mut root: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
@@ -68,7 +85,7 @@ fn merge_opencode_config(cwd: &Path, url: &str) {
         .or_insert_with(|| serde_json::json!({}));
     if let Some(mcp_obj) = mcp.as_object_mut() {
         mcp_obj.insert(
-            "weft_bus".to_string(),
+            server.to_string(),
             serde_json::json!({ "type": "remote", "url": url, "enabled": true }),
         );
     }
@@ -134,6 +151,26 @@ mod tests {
         let inj = inject("http://127.0.0.1:9", 2, "30", "codex", Path::new("/tmp"));
         assert_eq!(inj.args, vec!["-c".to_string(),
             "mcp_servers.weft_bus.url=http://127.0.0.1:9/bus/2/30/mcp".to_string()]);
+    }
+
+    #[test]
+    fn planner_claude_writes_its_own_config() {
+        let dir = std::env::temp_dir().join(format!("weft-inj-plan-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let inj = inject_planner("http://127.0.0.1:9", 7, "claude", &dir);
+        assert_eq!(inj.args[0], "--mcp-config");
+        let cfg = std::fs::read_to_string(dir.join(".weft-planner.mcp.json")).unwrap();
+        assert!(cfg.contains("weft_planner") && cfg.contains("/planner/7/mcp"));
+        // the bus config is a SEPARATE file — planner doesn't clobber it
+        assert_ne!(inj.args[1], dir.join(".weft-bus.mcp.json").to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn planner_codex_override_targets_planner_server() {
+        let inj = inject_planner("http://127.0.0.1:9", 3, "codex", Path::new("/tmp"));
+        assert_eq!(inj.args, vec!["-c".to_string(),
+            "mcp_servers.weft_planner.url=http://127.0.0.1:9/planner/3/mcp".to_string()]);
     }
 
     #[test]
