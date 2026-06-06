@@ -30,7 +30,42 @@ pub async fn add_repo_ref(
     }
     // default base ref = current branch of the repo
     let base = crate::git::current_branch(std::path::Path::new(&local_git_path)).unwrap_or_else(|_| "main".into());
-    repo::add_repo_ref(&db, workspace_id, &name, &local_git_path, &base, "claude").await.map_err(e)
+    let r = repo::add_repo_ref(&db, workspace_id, &name, &local_git_path, &base, "claude").await.map_err(e)?;
+    // Eager, deterministic profiling (ARCHITECTURE §4.9): best-effort, never
+    // blocks adding the repo if inference/git hiccups.
+    let _ = crate::curator::profile_repo(&db, &r).await;
+    Ok(r)
+}
+
+#[tauri::command]
+pub async fn list_repo_profiles(
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<Vec<crate::curator::ProfileView>> {
+    crate::curator::list(&db, workspace_id).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curator::Graph> {
+    crate::curator::graph(&db, workspace_id).await.map_err(e)
+}
+
+#[tauri::command]
+pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
+    let r = repo::get_repo(&db, repo_id).await.map_err(e)?.ok_or("repo not found")?;
+    crate::curator::profile_repo(&db, &r).await.map_err(e)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_repo_profile(
+    db: State<'_, Db>,
+    repo_id: i32,
+    summary: String,
+    role: String,
+) -> R<()> {
+    crate::curator::edit_profile(&db, repo_id, &summary, &role).await.map_err(e)?;
+    Ok(())
 }
 
 #[tauri::command]

@@ -6708,6 +6708,7 @@ dependencies = [
  "tauri-plugin-mcp-bridge",
  "tauri-plugin-opener",
  "tokio",
+ "toml 0.8.2",
  "tower",
 ]
 

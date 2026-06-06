@@ -15,8 +15,10 @@ mod batch;
 pub mod bus;
 mod claude;
 mod coordinator;
+mod curator;
 mod drivers;
 mod inspect;
+pub mod profile;
 mod pty;
 mod commands;
 
@@ -72,6 +74,10 @@ pub fn run() {
             commands::create_thread,
             commands::list_threads,
             commands::list_repos,
+            commands::list_repo_profiles,
+            commands::repo_graph,
+            commands::reprofile_repo,
+            commands::update_repo_profile,
             commands::list_directions,
             commands::list_direction_repos,
             commands::create_direction,

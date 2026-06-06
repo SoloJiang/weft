@@ -142,3 +142,8 @@ pub fn repo_diff(worktree_path: &Path) -> Result<DiffSummary> {
 pub fn current_branch(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
+
+/// Short HEAD commit sha; used to stamp a repo profile and detect staleness.
+pub fn head_commit(repo: &Path) -> Result<String> {
+    git(repo, &["rev-parse", "--short", "HEAD"])
+}

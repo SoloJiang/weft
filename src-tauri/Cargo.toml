@@ -29,6 +29,7 @@ futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 axum = "0.7"
 tower = "0.5"
+toml = "0.8"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

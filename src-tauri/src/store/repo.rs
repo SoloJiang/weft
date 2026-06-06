@@ -1,10 +1,12 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
-use super::entities::{direction, direction_repo, repo_ref, session, thread, worktree, workspace};
+use super::entities::{
+    direction, direction_repo, repo_profile, repo_ref, session, thread, worktree, workspace,
+};
 use super::Db;
 use crate::slug::unique_slug;
 use anyhow::Result;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TryIntoModel};
 
 fn now() -> String {
     // RFC3339 without pulling chrono: seconds since epoch is enough for ordering.
@@ -99,6 +101,47 @@ pub async fn list_repos(db: &Db, workspace_id: i32) -> Result<Vec<repo_ref::Mode
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
         .all(&db.0)
         .await?)
+}
+
+pub async fn get_repo(db: &Db, repo_id: i32) -> Result<Option<repo_ref::Model>> {
+    Ok(repo_ref::Entity::find_by_id(repo_id).one(&db.0).await?)
+}
+
+pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profile::Model>> {
+    Ok(repo_profile::Entity::find()
+        .filter(repo_profile::Column::RepoId.eq(repo_id))
+        .one(&db.0)
+        .await?)
+}
+
+/// Insert or update a repo's profile. `stack`/`published`/`deps` are JSON arrays.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_repo_profile(
+    db: &Db,
+    repo_id: i32,
+    role: &str,
+    stack: &str,
+    summary: &str,
+    published: &str,
+    deps: &str,
+    source: &str,
+    profiled_commit: &str,
+) -> Result<repo_profile::Model> {
+    let mut a = match get_repo_profile(db, repo_id).await? {
+        Some(m) => m.into(),
+        None => repo_profile::ActiveModel {
+            repo_id: Set(repo_id),
+            ..Default::default()
+        },
+    };
+    a.role = Set(role.to_string());
+    a.stack = Set(stack.to_string());
+    a.summary = Set(summary.to_string());
+    a.published = Set(published.to_string());
+    a.deps = Set(deps.to_string());
+    a.source = Set(source.to_string());
+    a.profiled_commit = Set(profiled_commit.to_string());
+    Ok(a.save(&db.0).await?.try_into_model()?)
 }
 
 pub async fn list_direction_repos(

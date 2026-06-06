@@ -1,5 +1,5 @@
 use crate::store::entities::{
-    direction, direction_repo, repo_ref, session, thread, worktree, workspace,
+    direction, direction_repo, repo_profile, repo_ref, session, thread, worktree, workspace,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -9,7 +9,7 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(M0001Init)]
+        vec![Box::new(M0001Init), Box::new(M0002RepoProfile)]
     }
 }
 
@@ -52,6 +52,33 @@ impl MigrationTrait for M0001Init {
                 .drop_table(Table::drop().table(Alias::new(t)).to_owned())
                 .await?;
         }
+        Ok(())
+    }
+}
+
+/// Adds the curator's repo-profile table (ARCHITECTURE §4.9).
+pub struct M0002RepoProfile;
+
+impl MigrationName for M0002RepoProfile {
+    fn name(&self) -> &str {
+        "m0002_repo_profile"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0002RepoProfile {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(repo_profile::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("repo_profile")).to_owned())
+            .await?;
         Ok(())
     }
 }
