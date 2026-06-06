@@ -394,7 +394,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // lead will pre-fill this instead, later.
     await api.saveProposal(activeThreadId, {
       rationale: "",
-      directions: [{ name: "Direction 1", tool: "claude", writes: [], reads: [] }],
+      directions: [{ name: "Direction 1", tool: "claude", writes: [] }],
     });
     await refreshProposal(activeThreadId);
   }, [activeThreadId, refreshProposal]);

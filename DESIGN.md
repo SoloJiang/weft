@@ -169,9 +169,11 @@ weft treatment:
   (cards = directions). `Needs you` is a pinned exception lane aggregated at both
   levels. Cards flow themselves; the human acts (Approve / Answer / Open /
   Review / Merge), it does not drag.
-- **Scope confirm**: the post-decompose step — every repo shown with an inferred
-  `write / read / none` chip the human can correct before materialization. The
-  visible face of the core wow; corrections feed the repo map.
+- **Scope confirm (write trigger)**: the post-decompose step — each direction
+  shows which repos it will *write* (a per-repo on/off toggle the human
+  corrects), then a single "create" materializes worktrees. Reads are
+  unmanaged. This is the one human gate; everything else is automation +
+  the tools' own permission prompts. The visible face of the core wow.
 
 ## Motion
 

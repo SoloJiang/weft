@@ -13,15 +13,15 @@ use crate::store::{repo, Db};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// One proposed work line: a tool plus the repos it writes / reads, by name.
+/// One proposed work line: a tool plus the repos it WRITES, by name. Reads are
+/// unmanaged (the change note "scope simplification"): an agent may read any
+/// file; only the write set is scoped, materialized, and confirmed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedDirection {
     pub name: String,
     pub tool: String,
     #[serde(default)]
     pub writes: Vec<String>,
-    #[serde(default)]
-    pub reads: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,13 +32,12 @@ pub struct Proposal {
     pub directions: Vec<ProposedDirection>,
 }
 
-/// A repo in a resolved direction's scope: id (-1 if the name is unknown), the
-/// name as written, the role, and whether it matched a workspace repo.
+/// A write repo in a resolved direction: id (-1 if the name is unknown), the
+/// name as written, and whether it matched a workspace repo.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ScopeEntry {
     pub repo_id: i32,
     pub repo_name: String,
-    pub role: String,
     pub known: bool,
 }
 
@@ -47,41 +46,32 @@ pub struct ScopeEntry {
 pub struct ResolvedDirection {
     pub name: String,
     pub tool: String,
-    pub scope: Vec<ScopeEntry>,
+    /// The write set, resolved to workspace repos.
+    pub writes: Vec<ScopeEntry>,
 }
 
-/// Resolve one proposed direction's repo names to workspace repo ids + roles.
-/// `repos` is (id, name) for the workspace. Writes take precedence if a name
-/// appears in both lists; unknown names are kept with `known = false`.
+/// Resolve one proposed direction's write-repo names to workspace repo ids.
+/// `repos` is (id, name) for the workspace; unknown names are kept with
+/// `known = false`, never silently dropped. Duplicates are de-duped.
 pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDirection {
     let id_of = |name: &str| repos.iter().find(|(_, n)| n == name).map(|(id, _)| *id);
-    let mut scope = Vec::new();
+    let mut writes = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for (names, role) in [(&dir.writes, "write"), (&dir.reads, "read")] {
-        for name in names {
-            if !seen.insert(name.clone()) {
-                continue; // a write already claimed this name; don't add as read
-            }
-            match id_of(name) {
-                Some(id) => scope.push(ScopeEntry {
-                    repo_id: id,
-                    repo_name: name.clone(),
-                    role: role.to_string(),
-                    known: true,
-                }),
-                None => scope.push(ScopeEntry {
-                    repo_id: -1,
-                    repo_name: name.clone(),
-                    role: role.to_string(),
-                    known: false,
-                }),
-            }
+    for name in &dir.writes {
+        if !seen.insert(name.clone()) {
+            continue;
         }
+        let id = id_of(name);
+        writes.push(ScopeEntry {
+            repo_id: id.unwrap_or(-1),
+            repo_name: name.clone(),
+            known: id.is_some(),
+        });
     }
     ResolvedDirection {
         name: dir.name.clone(),
         tool: dir.tool.clone(),
-        scope,
+        writes,
     }
 }
 
@@ -136,10 +126,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     let mut created = Vec::new();
     for d in &resolved.directions {
         let scope: Vec<(i32, String)> = d
-            .scope
+            .writes
             .iter()
             .filter(|s| s.known)
-            .map(|s| (s.repo_id, s.role.clone()))
+            .map(|s| (s.repo_id, "write".to_string()))
             .collect();
         let dir = repo::create_direction(db, thread_id, &d.name, &d.tool, &scope).await?;
         materialize::materialize_direction(db, dir.id).await?;
@@ -172,18 +162,17 @@ mod tests {
     }
 
     #[test]
-    fn resolves_writes_and_reads_to_ids() {
+    fn resolves_write_names_to_ids() {
         let d = ProposedDirection {
             name: "Payments".into(),
             tool: "claude".into(),
             writes: vec!["web-app".into(), "api".into()],
-            reads: vec!["shared-lib".into()],
         };
         let r = resolve(&d, &repos());
         assert_eq!(r.name, "Payments");
-        assert_eq!(r.scope.len(), 3);
-        assert_eq!(r.scope[0], ScopeEntry { repo_id: 1, repo_name: "web-app".into(), role: "write".into(), known: true });
-        assert_eq!(r.scope[2], ScopeEntry { repo_id: 3, repo_name: "shared-lib".into(), role: "read".into(), known: true });
+        assert_eq!(r.writes.len(), 2);
+        assert_eq!(r.writes[0], ScopeEntry { repo_id: 1, repo_name: "web-app".into(), known: true });
+        assert_eq!(r.writes[1], ScopeEntry { repo_id: 2, repo_name: "api".into(), known: true });
     }
 
     #[test]
@@ -192,35 +181,32 @@ mod tests {
             name: "X".into(),
             tool: "codex".into(),
             writes: vec!["ghost-repo".into()],
-            reads: vec![],
         };
         let r = resolve(&d, &repos());
-        assert_eq!(r.scope.len(), 1);
-        assert!(!r.scope[0].known);
-        assert_eq!(r.scope[0].repo_id, -1);
+        assert_eq!(r.writes.len(), 1);
+        assert!(!r.writes[0].known);
+        assert_eq!(r.writes[0].repo_id, -1);
     }
 
     #[test]
-    fn write_wins_when_name_in_both_lists() {
+    fn duplicate_write_is_deduped() {
         let d = ProposedDirection {
             name: "X".into(),
             tool: "claude".into(),
-            writes: vec!["api".into()],
-            reads: vec!["api".into()],
+            writes: vec!["api".into(), "api".into()],
         };
         let r = resolve(&d, &repos());
-        assert_eq!(r.scope.len(), 1);
-        assert_eq!(r.scope[0].role, "write");
+        assert_eq!(r.writes.len(), 1);
     }
 
     #[test]
     fn proposal_parses_with_missing_optional_fields() {
         let p: Proposal = serde_json::from_str(
-            r#"{ "directions": [ { "name": "only writes", "tool": "claude", "writes": ["api"] } ] }"#,
+            r#"{ "directions": [ { "name": "no writes yet", "tool": "claude" } ] }"#,
         )
         .unwrap();
         assert_eq!(p.rationale, "");
         assert_eq!(p.directions.len(), 1);
-        assert!(p.directions[0].reads.is_empty());
+        assert!(p.directions[0].writes.is_empty());
     }
 }

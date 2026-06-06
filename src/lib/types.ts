@@ -117,29 +117,28 @@ export interface RepoGraph {
   edges: RepoEdge[];
 }
 
-/** The lead's proposed split of a Task into directions (by repo NAME). */
+/** The lead's proposed split of a Task into directions (by repo NAME).
+ *  Only the WRITE set is scoped — reads are unmanaged (agents read freely). */
 export interface ProposedDirection {
   name: string;
   tool: string;
   writes: string[];
-  reads: string[];
 }
 export interface Proposal {
   rationale: string;
   directions: ProposedDirection[];
 }
 
-/** A proposal resolved against the workspace repos, for review/edit. */
+/** A write repo resolved against the workspace repos, for review/edit. */
 export interface ScopeEntry {
   repo_id: number;
   repo_name: string;
-  role: string; // write | read
   known: boolean;
 }
 export interface ResolvedDirection {
   name: string;
   tool: string;
-  scope: ScopeEntry[];
+  writes: ScopeEntry[];
 }
 export interface ResolvedProposal {
   thread_id: number;

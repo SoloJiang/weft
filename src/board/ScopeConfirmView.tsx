@@ -1,17 +1,16 @@
 import { useMemo, useState } from "react";
-import { Layers, Lightbulb, Plus, Sparkles, X } from "lucide-react";
+import { Check, Layers, Lightbulb, Plus, Sparkles, X } from "lucide-react";
 import { useStore } from "../state/store";
 import type { Proposal, RepoRef, ResolvedProposal } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { Select } from "../components/ui/Select";
 import { cn } from "../lib/cn";
 
-type RoleState = "none" | "read" | "write";
-
 interface DraftDir {
   name: string;
   tool: string;
-  roles: Record<number, RoleState>;
+  /** repo ids this direction will write (the only managed scope). */
+  writes: Set<number>;
 }
 
 const TOOL_OPTIONS = [
@@ -21,10 +20,10 @@ const TOOL_OPTIONS = [
 ];
 
 /**
- * The scope-confirm step (ARCHITECTURE §5.1): review the lead's proposed split
- * of a Task into directions, correct write/read/none per repo, then create the
- * directions — only write repos get a worktree. The human edits; nothing is
- * materialized until "Create".
+ * The scope-confirm step / write trigger (scope-simplification change): review
+ * the lead's proposed split of a Task into directions, correct WHICH REPOS each
+ * direction writes, then create them. Only write repos get a worktree; reads are
+ * unmanaged. Nothing is materialized until "Create".
  */
 export function ScopeConfirmView({
   proposal,
@@ -42,12 +41,7 @@ export function ScopeConfirmView({
     proposal.directions.map((d) => ({
       name: d.name,
       tool: d.tool,
-      roles: Object.fromEntries(
-        repos.map((r) => {
-          const entry = d.scope.find((s) => s.repo_id === r.id);
-          return [r.id, (entry?.role as RoleState) ?? "none"];
-        }),
-      ),
+      writes: new Set(d.writes.filter((s) => s.known).map((s) => s.repo_id)),
     })),
   );
 
@@ -57,8 +51,7 @@ export function ScopeConfirmView({
       directions: dirs.map((d) => ({
         name: d.name.trim() || "Untitled",
         tool: d.tool,
-        writes: repos.filter((r) => d.roles[r.id] === "write").map((r) => r.name),
-        reads: repos.filter((r) => d.roles[r.id] === "read").map((r) => r.name),
+        writes: repos.filter((r) => d.writes.has(r.id)).map((r) => r.name),
       })),
     }),
     [dirs, repos, proposal.rationale],
@@ -70,19 +63,21 @@ export function ScopeConfirmView({
   function patch(i: number, next: Partial<DraftDir>) {
     setDirs((cur) => cur.map((d, j) => (j === i ? { ...d, ...next } : d)));
   }
-  function setRole(i: number, repoId: number, role: RoleState) {
+  function toggleWrite(i: number, repoId: number) {
     setDirs((cur) =>
-      cur.map((d, j) => (j === i ? { ...d, roles: { ...d.roles, [repoId]: role } } : d)),
+      cur.map((d, j) => {
+        if (j !== i) return d;
+        const writes = new Set(d.writes);
+        if (writes.has(repoId)) writes.delete(repoId);
+        else writes.add(repoId);
+        return { ...d, writes };
+      }),
     );
   }
   function addDir() {
     setDirs((cur) => [
       ...cur,
-      {
-        name: `Direction ${cur.length + 1}`,
-        tool: "claude",
-        roles: Object.fromEntries(repos.map((r) => [r.id, "none" as RoleState])),
-      },
+      { name: `Direction ${cur.length + 1}`, tool: "claude", writes: new Set() },
     ]);
   }
   function removeDir(i: number) {
@@ -132,7 +127,7 @@ export function ScopeConfirmView({
           repos={repos}
           onName={(name) => patch(i, { name })}
           onTool={(tool) => patch(i, { tool })}
-          onRole={(repoId, role) => setRole(i, repoId, role)}
+          onToggle={(repoId) => toggleWrite(i, repoId)}
           onRemove={dirs.length > 1 ? () => removeDir(i) : undefined}
         />
       ))}
@@ -148,8 +143,8 @@ export function ScopeConfirmView({
       <div className="sticky bottom-0 mt-1 flex items-center gap-2 border-t border-border bg-bg/90 py-3 backdrop-blur">
         <span className="text-[12px] text-ink-faint">
           {writeCount > 0
-            ? `${dirs.length} ${dirs.length === 1 ? "direction" : "directions"} · ${writeCount} will open a worktree`
-            : "Give at least one direction a write repo to create it"}
+            ? `${dirs.length} ${dirs.length === 1 ? "direction" : "directions"} · only write repos get a worktree`
+            : "Pick at least one repo for a direction to write"}
         </span>
         <div className="ml-auto flex items-center gap-2">
           <Button variant="ghost" onClick={() => void saveDraft()} disabled={busy}>
@@ -171,14 +166,14 @@ function DirectionEditor({
   repos,
   onName,
   onTool,
-  onRole,
+  onToggle,
   onRemove,
 }: {
   dir: DraftDir;
   repos: RepoRef[];
   onName: (v: string) => void;
   onTool: (v: string) => void;
-  onRole: (repoId: number, role: RoleState) => void;
+  onToggle: (repoId: number) => void;
   onRemove?: () => void;
 }) {
   return (
@@ -204,64 +199,46 @@ function DirectionEditor({
           </button>
         )}
       </div>
-      <ul className="flex flex-col">
-        {repos.map((r) => (
-          <li
-            key={r.id}
-            className="flex items-center gap-2 px-3 py-1.5 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-border/60"
-          >
-            <span className="truncate text-[12px] text-ink-muted">{r.name}</span>
-            <div className="ml-auto">
-              <ScopeToggle value={dir.roles[r.id] ?? "none"} onChange={(v) => onRole(r.id, v)} />
-            </div>
-          </li>
-        ))}
+      <ul className="flex flex-col px-1.5 py-1.5">
+        {repos.map((r) => {
+          const writes = dir.writes.has(r.id);
+          return (
+            <li key={r.id}>
+              <button
+                onClick={() => onToggle(r.id)}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-[var(--radius-md)] px-2 py-1.5 text-left transition-colors",
+                  writes ? "bg-running/10" : "hover:bg-raised",
+                )}
+              >
+                <span
+                  className={cn(
+                    "grid h-4 w-4 shrink-0 place-items-center rounded border transition-colors",
+                    writes
+                      ? "border-running bg-running/20 text-running"
+                      : "border-border text-transparent",
+                  )}
+                >
+                  <Check size={11} />
+                </span>
+                <span className={cn("truncate text-[12px]", writes ? "text-ink" : "text-ink-muted")}>
+                  {r.name}
+                </span>
+                {writes && (
+                  <span className="ml-auto rounded bg-running/15 px-1.5 py-0.5 font-mono text-[9px] uppercase text-running">
+                    write
+                  </span>
+                )}
+              </button>
+            </li>
+          );
+        })}
         {repos.length === 0 && (
-          <li className="px-3 py-3 text-center text-[11px] text-ink-faint">
+          <li className="px-2 py-3 text-center text-[11px] text-ink-faint">
             Add repos to this workspace first.
           </li>
         )}
       </ul>
-    </div>
-  );
-}
-
-const SEGMENTS: { value: RoleState; label: string }[] = [
-  { value: "none", label: "None" },
-  { value: "read", label: "Read" },
-  { value: "write", label: "Write" },
-];
-
-function ScopeToggle({
-  value,
-  onChange,
-}: {
-  value: RoleState;
-  onChange: (v: RoleState) => void;
-}) {
-  return (
-    <div className="inline-flex overflow-hidden rounded-[var(--radius-sm)] border border-border">
-      {SEGMENTS.map((s) => {
-        const active = s.value === value;
-        return (
-          <button
-            key={s.value}
-            onClick={() => onChange(s.value)}
-            className={cn(
-              "px-2 py-0.5 text-[11px] transition-colors",
-              active
-                ? s.value === "write"
-                  ? "bg-running/20 font-medium text-running"
-                  : s.value === "read"
-                    ? "bg-brand-ghost font-medium text-brand"
-                    : "bg-raised font-medium text-ink-muted"
-                : "text-ink-faint hover:bg-raised hover:text-ink-muted",
-            )}
-          >
-            {s.label}
-          </button>
-        );
-      })}
     </div>
   );
 }

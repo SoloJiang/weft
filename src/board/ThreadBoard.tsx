@@ -3,14 +3,13 @@ import { motion } from "motion/react";
 import {
   ArrowRight,
   Bell,
-  Eye,
   Layers,
   Plus,
   Sparkles,
   TerminalSquare,
 } from "lucide-react";
 import { useStore } from "../state/store";
-import type { Direction, RepoRef, SessionStatus } from "../lib/types";
+import type { Direction, SessionStatus } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { StatusDot } from "../components/ui/StatusChip";
 import { Inspect } from "../components/Inspect";
@@ -106,7 +105,6 @@ export function ThreadBoard() {
 function DirectionCard({ direction }: { direction: Direction }) {
   const {
     worktreesByDirection,
-    directionReposByDirection,
     repos,
     sessions,
     openSession,
@@ -116,11 +114,6 @@ function DirectionCard({ direction }: { direction: Direction }) {
     (s) => s.directionId === direction.id && s.status === "running",
   );
   const writes = worktreesByDirection[direction.id] ?? [];
-  const scope = directionReposByDirection[direction.id] ?? [];
-  const reads = scope
-    .filter((s) => s.role === "read")
-    .map((s) => repos.find((r) => r.id === s.repo_id))
-    .filter((r): r is RepoRef => !!r);
 
   return (
     <motion.div
@@ -196,21 +189,6 @@ function DirectionCard({ direction }: { direction: Direction }) {
           );
         })}
       </ul>
-
-      {/* read repos — context, not yet openable (M5) */}
-      {reads.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1 border-t border-border px-3 py-2">
-          <Eye size={11} className="text-ink-faint" />
-          {reads.map((r) => (
-            <span
-              key={r.id}
-              className="rounded-full bg-bg px-1.5 py-0.5 text-[10px] text-ink-faint"
-            >
-              {r.name}
-            </span>
-          ))}
-        </div>
-      )}
     </motion.div>
   );
 }

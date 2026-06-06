@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { GitBranch } from "lucide-react";
+import { Check } from "lucide-react";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Button } from "../components/ui/Button";
 import { Input, Field } from "../components/ui/Input";
@@ -227,8 +227,6 @@ export function CreateThreadDialog({ open, onOpenChange }: DProps) {
   );
 }
 
-type ScopeRole = "none" | "read" | "write";
-
 export function CreateDirectionDialog({
   open,
   onOpenChange,
@@ -237,23 +235,30 @@ export function CreateDirectionDialog({
   const { repos, createDirection } = useStore();
   const [name, setName] = useState("main");
   const [tool, setTool] = useState("claude");
-  const [scope, setScope] = useState<Record<number, ScopeRole>>({});
+  const [writes, setWrites] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const writeCount = Object.values(scope).filter((r) => r === "write").length;
+  const writeCount = writes.size;
+
+  function toggle(repoId: number) {
+    setWrites((cur) => {
+      const next = new Set(cur);
+      if (next.has(repoId)) next.delete(repoId);
+      else next.add(repoId);
+      return next;
+    });
+  }
 
   async function submit() {
     if (!name.trim() || busy || writeCount === 0) return;
     setBusy(true);
     setErr(null);
     try {
-      const items = Object.entries(scope)
-        .filter(([, r]) => r !== "none")
-        .map(([id, r]) => ({ repo_id: Number(id), role: r as "write" | "read" }));
+      const items = [...writes].map((id) => ({ repo_id: id, role: "write" as const }));
       await createDirection(threadId, name.trim(), tool, items);
       onOpenChange(false);
-      setScope({});
+      setWrites(new Set());
       setName("main");
     } catch (e) {
       setErr(String(e));
@@ -266,7 +271,7 @@ export function CreateDirectionDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         title="New direction"
-        description="Pick which repos this direction writes (worktree) or reads."
+        description="Pick which repos this direction will write. Each gets its own worktree."
         className="w-[min(520px,calc(100vw-2rem))]"
       >
         <form
@@ -302,39 +307,51 @@ export function CreateDirectionDialog({
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <span className="text-[12px] font-medium text-ink-muted">Scope</span>
+            <span className="text-[12px] font-medium text-ink-muted">
+              Writes
+            </span>
             {repos.length === 0 ? (
               <p className="rounded-[var(--radius-md)] border border-dashed border-border px-3 py-4 text-center text-[12px] text-ink-faint">
                 No repos in this workspace yet. Add one first.
               </p>
             ) : (
-              <div className="flex flex-col gap-1 rounded-[var(--radius-md)] border border-border bg-bg/50 p-1">
+              <div className="flex flex-col gap-0.5 rounded-[var(--radius-md)] border border-border bg-bg/50 p-1">
                 {repos.map((r) => {
-                  const role = scope[r.id] ?? "none";
+                  const on = writes.has(r.id);
                   return (
-                    <div
+                    <button
                       key={r.id}
-                      className="flex items-center justify-between gap-3 rounded-[var(--radius-sm)] px-2 py-1.5"
+                      type="button"
+                      onClick={() => toggle(r.id)}
+                      className={cn(
+                        "flex items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left transition-colors",
+                        on ? "bg-running/10" : "hover:bg-raised",
+                      )}
                     >
-                      <span className="flex items-center gap-2 text-[13px] text-ink">
-                        <GitBranch size={13} className="text-ink-faint" />
-                        {r.name}
-                        <span className="font-mono text-[11px] text-ink-faint">
-                          @{r.base_ref}
-                        </span>
+                      <span
+                        className={cn(
+                          "grid h-4 w-4 shrink-0 place-items-center rounded border transition-colors",
+                          on
+                            ? "border-running bg-running/20 text-running"
+                            : "border-border text-transparent",
+                        )}
+                      >
+                        <Check size={11} />
                       </span>
-                      <RoleToggle
-                        value={role}
-                        onChange={(v) => setScope((s) => ({ ...s, [r.id]: v }))}
-                      />
-                    </div>
+                      <span className={cn("text-[13px]", on ? "text-ink" : "text-ink-muted")}>
+                        {r.name}
+                      </span>
+                      <span className="font-mono text-[11px] text-ink-faint">
+                        @{r.base_ref}
+                      </span>
+                    </button>
                   );
                 })}
               </div>
             )}
             <span className="text-[11px] text-ink-faint">
-              Only <span className="text-running">write</span> repos get a worktree.
-              Read repos are recorded (mounted later).
+              Each write repo gets an isolated worktree. Agents read any repo
+              freely, so reads aren't listed.
             </span>
           </div>
 
@@ -359,41 +376,6 @@ export function CreateDirectionDialog({
         </form>
       </DialogContent>
     </Dialog>
-  );
-}
-
-function RoleToggle({
-  value,
-  onChange,
-}: {
-  value: ScopeRole;
-  onChange: (v: ScopeRole) => void;
-}) {
-  const opts: { v: ScopeRole; label: string }[] = [
-    { v: "none", label: "None" },
-    { v: "read", label: "Read" },
-    { v: "write", label: "Write" },
-  ];
-  return (
-    <div className="inline-flex rounded-[var(--radius-sm)] border border-border bg-bg p-0.5">
-      {opts.map((o) => (
-        <button
-          key={o.v}
-          type="button"
-          onClick={() => onChange(o.v)}
-          className={cn(
-            "rounded-[5px] px-2 py-0.5 text-[11px] font-medium transition-colors",
-            value === o.v
-              ? o.v === "write"
-                ? "bg-brand text-brand-ink"
-                : "bg-raised text-ink"
-              : "text-ink-faint hover:text-ink-muted",
-          )}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
   );
 }
 

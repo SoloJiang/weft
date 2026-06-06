@@ -30,9 +30,11 @@ The shape of the work:
    map is the fuel for the core trick below.
 2. **Decompose (the wow)** — you give a **Task** (PRD / bug / refactor / spike /
    link; PRD is just one kind). A per-thread **lead** agent classifies it, then
-   uses the repo map to derive **scope** (which repos are write / read / none)
-   and split it into **directions** — automatically. No other tool turns one
-   task into "which repos, and who does what" across a fleet.
+   uses the repo map to derive **scope** (which repos each direction will
+   *write*) and split it into **directions** — automatically. Reads are
+   unmanaged: an agent may read any repo freely, so only the write set is
+   scoped, materialized, and confirmed. No other tool turns one task into
+   "which repos, and who does what" across a fleet.
 3. **Deliver, automatically** — each write-repo gets an isolated git worktree;
    the lead spawns a **worker** per direction (heterogeneous tools allowed),
    hands each a structured **brief** (scope + interface-contract + acceptance),
