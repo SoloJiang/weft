@@ -83,6 +83,9 @@ export const en = {
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
     wantsPermission: "wants permission",
+    always: "Always allow",
+    fullAccess: "Full access",
+    fullAccessTitle: "Auto-approve everything from this task",
     emptyTitle: "Nothing needs you",
     emptyBody:
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",

@@ -95,8 +95,8 @@ export const api = {
 
   // Ask Bridge: pending tool permission requests + the answer.
   pendingAsks: () => invoke<PermissionAsk[]>("pending_asks"),
-  answerPermission: (askId: number, allow: boolean) =>
-    invoke<void>("answer_permission", { askId, allow }),
+  answerPermission: (askId: number, answer: "allow" | "deny" | "always" | "full") =>
+    invoke<void>("answer_permission", { askId, answer }),
 
   // Needs-you: open agent→human questions, aggregated across the workspace.
   needsYou: (workspaceId: number) =>

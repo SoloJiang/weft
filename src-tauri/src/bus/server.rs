@@ -70,6 +70,12 @@ async fn handle_ask(
     let tool = q.get("tool").map(|s| s.as_str()).unwrap_or("claude");
     let tool_name = req.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool");
     let (summary, detail) = summarize(tool_name, req.get("tool_input"));
+
+    // A standing rule (full access / always-allow) decides without surfacing.
+    if asks.auto_decision(thread, &dir, &summary) == Some(Decision::Allow) {
+        return hook_decision("allow", "Auto-approved by a weft rule");
+    }
+
     let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail);
 
     match tokio::time::timeout(ASK_WAIT, rx).await {
@@ -78,14 +84,7 @@ async fn handle_ask(
                 Decision::Allow => ("allow", "Approved in weft"),
                 Decision::Deny => ("deny", "Denied in weft"),
             };
-            Json(json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": d,
-                    "permissionDecisionReason": reason
-                }
-            }))
-            .into_response()
+            hook_decision(d, reason)
         }
         // timed out or dropped → drop the card, return no decision: the tool
         // falls back to its native prompt rather than hanging.
@@ -94,6 +93,18 @@ async fn handle_ask(
             Json(json!({})).into_response()
         }
     }
+}
+
+/// The PreToolUse hook response carrying a permission decision.
+fn hook_decision(decision: &str, reason: &str) -> Response {
+    Json(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason
+        }
+    }))
+    .into_response()
 }
 
 /// A short human label + raw detail for a tool action.

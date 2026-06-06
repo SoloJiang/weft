@@ -67,7 +67,10 @@ interface Store {
   refreshNeeds: () => Promise<void>;
   answerAsk: (item: NeedItem, text: string) => Promise<void>;
   goToAsk: (item: NeedItem) => Promise<void>;
-  answerPermission: (askId: number, allow: boolean) => Promise<void>;
+  answerPermission: (
+    askId: number,
+    answer: "allow" | "deny" | "always" | "full",
+  ) => Promise<void>;
 
   /** The curator's repo map: profiles + dependency edges. */
   repoProfiles: RepoProfile[];
@@ -532,15 +535,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refreshNeeds],
   );
 
-  const answerPermission = useCallback(async (askId: number, allow: boolean) => {
-    // optimistic: drop the card immediately, then unblock the tool
-    setAsks((cur) => cur.filter((a) => a.id !== askId));
-    try {
-      await api.answerPermission(askId, allow);
-    } catch {
-      /* already resolved/expired */
-    }
-  }, []);
+  const answerPermission = useCallback(
+    async (askId: number, answer: "allow" | "deny" | "always" | "full") => {
+      // optimistic: drop the card immediately, then unblock the tool
+      setAsks((cur) => cur.filter((a) => a.id !== askId));
+      try {
+        await api.answerPermission(askId, answer);
+      } catch {
+        /* already resolved/expired */
+      }
+    },
+    [],
+  );
 
   const goToAsk = useCallback(
     async (item: NeedItem) => {

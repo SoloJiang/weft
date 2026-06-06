@@ -326,19 +326,16 @@ pub fn pending_asks(asks: tauri::State<'_, crate::ask::AskRegistry>) -> R<Vec<cr
     Ok(asks.open())
 }
 
-/// Answer a pending permission Ask; unblocks the waiting tool.
+/// Answer a pending permission Ask. `answer` is allow | deny | always | full —
+/// always remembers this action for the task, full grants it full access.
 #[tauri::command]
 pub fn answer_permission(
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     ask_id: u64,
-    allow: bool,
+    answer: String,
 ) -> R<()> {
-    let d = if allow {
-        crate::ask::Decision::Allow
-    } else {
-        crate::ask::Decision::Deny
-    };
-    if asks.resolve(ask_id, d) {
+    let a = crate::ask::Answer::parse(&answer).ok_or("unknown answer")?;
+    if asks.answer(ask_id, a) {
         Ok(())
     } else {
         Err("that request was already answered or has expired".into())

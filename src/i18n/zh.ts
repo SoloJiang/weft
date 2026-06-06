@@ -77,6 +77,9 @@ export const zh = {
     title: "需要你",
     subtitle: "只有你能回答的审批与提问",
     wantsPermission: "请求权限",
+    always: "始终允许",
+    fullAccess: "完全访问",
+    fullAccessTitle: "自动批准该任务的所有请求",
     emptyTitle: "暂无待办",
     emptyBody:
       "当 agent 遇到只有你能拍板的决定时,会在这里发问。你回答一次,答复会直接回到它的收件箱,你无需去翻找会话。",

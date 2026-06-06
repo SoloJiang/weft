@@ -1,7 +1,16 @@
 import { useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { ArrowUpRight, Check, HelpCircle, Send, ShieldQuestion, X } from "lucide-react";
+import {
+  ArrowUpRight,
+  Check,
+  CheckCheck,
+  HelpCircle,
+  Send,
+  ShieldCheck,
+  ShieldQuestion,
+  X,
+} from "lucide-react";
 import { useStore } from "../state/store";
 import type { NeedItem, PermissionAsk } from "../lib/types";
 import { Button } from "../components/ui/Button";
@@ -97,12 +106,24 @@ function PermissionRow({ ask }: { ask: PermissionAsk }) {
       <p className="truncate px-3.5 pb-1 pt-1.5 font-mono text-[13px] text-ink" title={ask.detail}>
         {ask.summary}
       </p>
-      <div className="flex gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
-        <Button variant="primary" onClick={() => void answerPermission(ask.id, true)}>
+      <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
+        <Button variant="primary" onClick={() => void answerPermission(ask.id, "allow")}>
           <Check size={13} />
           {t("common.allow")}
         </Button>
-        <Button variant="ghost" onClick={() => void answerPermission(ask.id, false)}>
+        <Button variant="ghost" onClick={() => void answerPermission(ask.id, "always")}>
+          <CheckCheck size={13} />
+          {t("needs.always")}
+        </Button>
+        <Button
+          variant="ghost"
+          title={t("needs.fullAccessTitle")}
+          onClick={() => void answerPermission(ask.id, "full")}
+        >
+          <ShieldCheck size={13} />
+          {t("needs.fullAccess")}
+        </Button>
+        <Button variant="ghost" className="ml-auto" onClick={() => void answerPermission(ask.id, "deny")}>
           <X size={13} />
           {t("common.deny")}
         </Button>
