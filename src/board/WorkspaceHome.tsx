@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { motion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Activity, FolderGit2, Plus } from "lucide-react";
 import { useStore, type OpenSession } from "../state/store";
@@ -8,7 +8,8 @@ import type { NormEvent } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { ToolIcon } from "../components/ToolIcon";
 import { RepoMapView } from "./RepoMapView";
-import { CreateThreadDialog } from "../nav/dialogs";
+import { PermissionRow, AskRow } from "./NeedsYouView";
+import { AddRepoDialog, CreateThreadDialog } from "../nav/dialogs";
 import { cn } from "../lib/cn";
 
 /**
@@ -18,14 +19,27 @@ import { cn } from "../lib/cn";
  * rail now; this answers "what's happening right now".
  */
 export function WorkspaceHome() {
-  const { workspaces, activeWorkspaceId, homeTab, setHomeTab } = useStore();
+  const { workspaces, activeWorkspaceId, repos, needs, asks, homeTab, setHomeTab } =
+    useStore();
   const { t } = useTranslation();
   const [newThread, setNewThread] = useState(false);
+  const [addRepo, setAddRepo] = useState(false);
   const ws = workspaces.find((w) => w.id === activeWorkspaceId);
+  const needsCount = needs.length + asks.length;
 
   const tabs = [
-    { key: "overview" as const, label: t("workspace.tabOverview"), icon: Activity },
-    { key: "repos" as const, label: t("workspace.tabRepos"), icon: FolderGit2 },
+    {
+      key: "overview" as const,
+      label: t("workspace.tabOverview"),
+      icon: Activity,
+      badge: needsCount > 0 ? { n: needsCount, attn: true } : null,
+    },
+    {
+      key: "repos" as const,
+      label: t("workspace.tabRepos"),
+      icon: FolderGit2,
+      badge: repos.length > 0 ? { n: repos.length, attn: false } : null,
+    },
   ];
 
   return (
@@ -48,6 +62,18 @@ export function WorkspaceHome() {
               >
                 <tab.icon size={13} className={active ? "text-brand" : ""} />
                 {tab.label}
+                {tab.badge && (
+                  <span
+                    className={cn(
+                      "rounded-full px-1.5 text-[10px] font-semibold tabular-nums",
+                      tab.badge.attn
+                        ? "bg-waiting/20 text-waiting"
+                        : "bg-raised text-ink-faint",
+                    )}
+                  >
+                    {tab.badge.n}
+                  </span>
+                )}
                 {active && (
                   <motion.span
                     layoutId="home-tab"
@@ -58,7 +84,7 @@ export function WorkspaceHome() {
             );
           })}
         </div>
-        {homeTab === "overview" && (
+        {homeTab === "overview" ? (
           <Button
             variant="primary"
             className="ml-auto"
@@ -68,22 +94,34 @@ export function WorkspaceHome() {
             <Plus size={14} />
             {t("nav.newThread")}
           </Button>
+        ) : (
+          <Button
+            variant="default"
+            className="ml-auto"
+            onClick={() => setAddRepo(true)}
+            disabled={!ws}
+          >
+            <Plus size={14} />
+            {t("dialog.addRepo")}
+          </Button>
         )}
       </header>
 
       {homeTab === "overview" ? <OverviewTab /> : <RepoMapView embedded />}
 
       <CreateThreadDialog open={newThread} onOpenChange={setNewThread} />
+      <AddRepoDialog open={addRepo} onOpenChange={setAddRepo} />
     </section>
   );
 }
 
 function OverviewTab() {
-  const { sessions, directionsByThread, loadThreadChildren } = useStore();
+  const { sessions, directionsByThread, loadThreadChildren, needs, asks } = useStore();
   const { t } = useTranslation();
   const running = Object.values(sessions).filter(
     (s) => s.status === "running" || s.status === "starting",
   );
+  const needsCount = needs.length + asks.length;
 
   // Ensure task names are available for any thread with a live agent.
   const threadKey = [...new Set(running.map((s) => s.threadId))].sort().join(",");
@@ -94,7 +132,7 @@ function OverviewTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [threadKey]);
 
-  if (running.length === 0) {
+  if (running.length === 0 && needsCount === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
         <div className="grid h-11 w-11 place-items-center rounded-[var(--radius-lg)] border border-border bg-surface">
@@ -112,16 +150,68 @@ function OverviewTab() {
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="mx-auto flex w-full max-w-[820px] flex-col gap-1.5 px-5 py-5">
-        <div className="mb-1 flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
-          <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
-          {t("workspace.runningNow")}
-          <span className="tabular-nums text-ink-faint/70">{running.length}</span>
-        </div>
-        {running.map((s) => (
-          <RunningRow key={s.info.session_id} s={s} />
-        ))}
+      <div className="mx-auto flex w-full max-w-[820px] flex-col gap-5 px-5 py-5">
+        {needsCount > 0 && (
+          <div className="flex flex-col gap-1.5">
+            <SectionLabel dot="bg-waiting" label={t("needs.title")} count={needsCount} />
+            <AnimatePresence initial={false}>
+              {asks.map((ask) => (
+                <motion.div
+                  key={`ask-${ask.id}`}
+                  layout
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.98 }}
+                  transition={{ duration: 0.18 }}
+                >
+                  <PermissionRow ask={ask} />
+                </motion.div>
+              ))}
+              {needs.map((item) => (
+                <motion.div
+                  key={`need-${item.ask_id}`}
+                  layout
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.98 }}
+                  transition={{ duration: 0.18 }}
+                >
+                  <AskRow item={item} />
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </div>
+        )}
+
+        {running.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            <SectionLabel dot="bg-running" label={t("workspace.runningNow")} count={running.length} pulse />
+            {running.map((s) => (
+              <RunningRow key={s.info.session_id} s={s} />
+            ))}
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+function SectionLabel({
+  dot,
+  label,
+  count,
+  pulse,
+}: {
+  dot: string;
+  label: string;
+  count: number;
+  pulse?: boolean;
+}) {
+  return (
+    <div className="mb-1 flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
+      <span className={cn("h-1.5 w-1.5 rounded-full", dot, pulse && "weft-pulse")} />
+      {label}
+      <span className="tabular-nums text-ink-faint/70">{count}</span>
     </div>
   );
 }

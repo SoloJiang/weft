@@ -24,6 +24,7 @@ export const zh = {
     repoMap: "仓库地图",
     needsYou: "需要你",
     nothingNeedsYou: "暂无待办",
+    otherWorkspaceNeeds: "其他工作区有待办",
     newWorkspace: "新建工作区",
     noWorkspace: "无工作区",
     local: "本地 · 无服务端",

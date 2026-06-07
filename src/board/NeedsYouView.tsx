@@ -90,7 +90,7 @@ export function NeedsYouView() {
   );
 }
 
-function PermissionRow({ ask }: { ask: PermissionAsk }) {
+export function PermissionRow({ ask }: { ask: PermissionAsk }) {
   const { answerPermission } = useStore();
   const { t } = useTranslation();
   return (
@@ -132,7 +132,7 @@ function PermissionRow({ ask }: { ask: PermissionAsk }) {
   );
 }
 
-function AskRow({ item }: { item: NeedItem }) {
+export function AskRow({ item }: { item: NeedItem }) {
   const { answerAsk, goToAsk } = useStore();
   const { t } = useTranslation();
   const [text, setText] = useState("");

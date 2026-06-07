@@ -1,48 +1,34 @@
 import { useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import {
-  Check,
-  ChevronRight,
-  FolderGit2,
-  HelpCircle,
-  Moon,
-  Plus,
-  Sun,
-  Trash2,
-} from "lucide-react";
+import { ChevronRight, Moon, Plus, Sun, Trash2 } from "lucide-react";
 import { useStore } from "../state/store";
 import { useTheme } from "../state/theme";
 import { setLang } from "../i18n";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
-import {
-  AddRepoDialog,
-  CreateThreadDialog,
-  CreateWorkspaceDialog,
-} from "./dialogs";
+import { CreateThreadDialog, CreateWorkspaceDialog } from "./dialogs";
 
 export function WorkspaceNav() {
   const {
     workspaces,
     activeWorkspaceId,
-    repos,
     threads,
     selectWorkspace,
     backToWorkspace,
-    openRepoMap,
-    homeTab,
-    activeThreadId,
-    showNeeds,
+    needsByWorkspace,
   } = useStore();
-  const onReposTab = activeThreadId == null && !showNeeds && homeTab === "repos";
   const [dlg, setDlg] = useState<null | "ws" | "repo" | "thread">(null);
   const active = workspaces.find((w) => w.id === activeWorkspaceId);
   const { t } = useTranslation();
+  // Any OTHER workspace waiting on the human → flag it on the switcher.
+  const otherNeeds = workspaces.some(
+    (w) => w.id !== activeWorkspaceId && (needsByWorkspace[w.id] ?? 0) > 0,
+  );
 
   return (
     <nav className="flex h-full w-72 shrink-0 flex-col border-r border-border bg-surface">
-      <div className="flex items-center gap-2 px-3 pb-2 pt-3">
+      <div className="flex items-center gap-2 px-3 pb-2.5 pt-3">
         <button
           onClick={backToWorkspace}
           title={t("nav.home")}
@@ -55,39 +41,14 @@ export function WorkspaceNav() {
         <WorkspacePicker
           workspaces={workspaces}
           activeId={activeWorkspaceId}
+          needsByWorkspace={needsByWorkspace}
+          otherNeeds={otherNeeds}
           onSelect={(id) => void selectWorkspace(id)}
           onNew={() => setDlg("ws")}
         />
       </div>
 
-      <NeedsButton />
-
-      <div
-        className={cn(
-          "group mx-2 mb-1 flex items-center rounded-[var(--radius-md)] transition-colors",
-          onReposTab ? "bg-brand-ghost" : "hover:bg-brand-ghost",
-        )}
-      >
-        <button
-          onClick={openRepoMap}
-          disabled={!active}
-          title={t("nav.repoMap")}
-          className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-[12px] text-ink-muted disabled:opacity-40"
-        >
-          <FolderGit2 size={13} className="text-ink-faint" />
-          {t("nav.repos", { count: repos.length })}
-        </button>
-        <button
-          onClick={() => setDlg("repo")}
-          disabled={!active}
-          aria-label={t("dialog.addRepo")}
-          className="mr-1 grid h-6 w-6 place-items-center rounded text-ink-faint opacity-0 transition-opacity hover:text-ink group-hover:opacity-100 disabled:opacity-40"
-        >
-          <Plus size={14} />
-        </button>
-      </div>
-
-      <div className="mx-2 my-1 border-t border-border" />
+      <div className="mx-2 mb-1 border-t border-border" />
 
       <div className="flex items-center justify-between px-3 py-1.5">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
@@ -126,49 +87,8 @@ export function WorkspaceNav() {
       </footer>
 
       <CreateWorkspaceDialog open={dlg === "ws"} onOpenChange={(o) => !o && setDlg(null)} />
-      <AddRepoDialog open={dlg === "repo"} onOpenChange={(o) => !o && setDlg(null)} />
       <CreateThreadDialog open={dlg === "thread"} onOpenChange={(o) => !o && setDlg(null)} />
     </nav>
-  );
-}
-
-function NeedsButton() {
-  const { needs, asks, showNeeds, openNeeds } = useStore();
-  const { t } = useTranslation();
-  const count = needs.length + asks.length;
-  const has = count > 0;
-
-  return (
-    <button
-      onClick={openNeeds}
-      aria-label={t("nav.needsYou")}
-      className={cn(
-        "group mx-2 mb-1 mt-1 flex items-center gap-2 rounded-[var(--radius-md)] px-2 py-1.5 text-left transition-colors",
-        showNeeds
-          ? has
-            ? "bg-waiting/15 text-ink"
-            : "bg-raised text-ink"
-          : has
-            ? "bg-waiting/10 text-ink hover:bg-waiting/15"
-            : "text-ink-faint hover:bg-brand-ghost hover:text-ink-muted",
-      )}
-    >
-      {has ? (
-        <span className="grid h-3.5 w-3.5 place-items-center">
-          <HelpCircle size={13} className="text-waiting" />
-        </span>
-      ) : (
-        <Check size={13} className="text-ink-faint" />
-      )}
-      <span className="text-[13px] font-medium">
-        {has ? t("nav.needsYou") : t("nav.nothingNeedsYou")}
-      </span>
-      {has && (
-        <span className="ml-auto rounded-full bg-waiting/20 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-waiting">
-          {count}
-        </span>
-      )}
-    </button>
   );
 }
 
@@ -273,11 +193,15 @@ function ThreadRow({ thread }: { thread: Thread }) {
 function WorkspacePicker({
   workspaces,
   activeId,
+  needsByWorkspace,
+  otherNeeds,
   onSelect,
   onNew,
 }: {
   workspaces: { id: number; name: string }[];
   activeId: number | null;
+  needsByWorkspace: Record<number, number>;
+  otherNeeds: boolean;
   onSelect: (id: number) => void;
   onNew: () => void;
 }) {
@@ -287,29 +211,45 @@ function WorkspacePicker({
     <details className="group relative flex-1">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-1 rounded-[var(--radius-md)] px-2 py-1 text-[13px] font-medium text-ink hover:bg-brand-ghost">
         <span className="truncate">{active?.name ?? t("nav.noWorkspace")}</span>
-        <ChevronRight
-          size={13}
-          className="text-ink-faint transition-transform group-open:rotate-90"
-        />
+        <span className="flex items-center gap-1.5">
+          {otherNeeds && (
+            <span
+              title={t("nav.otherWorkspaceNeeds")}
+              className="h-1.5 w-1.5 rounded-full bg-waiting"
+            />
+          )}
+          <ChevronRight
+            size={13}
+            className="text-ink-faint transition-transform group-open:rotate-90"
+          />
+        </span>
       </summary>
-      <div className="absolute left-0 top-full z-50 mt-1 w-52 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.6)]">
-        {workspaces.map((w) => (
-          <button
-            key={w.id}
-            onClick={(ev) => {
-              onSelect(w.id);
-              (ev.currentTarget.closest("details") as HTMLDetailsElement).open = false;
-            }}
-            className={cn(
-              "flex w-full items-center rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-[13px]",
-              w.id === activeId
-                ? "bg-brand-ghost text-ink"
-                : "text-ink-muted hover:bg-brand-ghost hover:text-ink",
-            )}
-          >
-            {w.name}
-          </button>
-        ))}
+      <div className="absolute left-0 top-full z-50 mt-1 w-56 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.6)]">
+        {workspaces.map((w) => {
+          const count = needsByWorkspace[w.id] ?? 0;
+          return (
+            <button
+              key={w.id}
+              onClick={(ev) => {
+                onSelect(w.id);
+                (ev.currentTarget.closest("details") as HTMLDetailsElement).open = false;
+              }}
+              className={cn(
+                "flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left text-[13px]",
+                w.id === activeId
+                  ? "bg-brand-ghost text-ink"
+                  : "text-ink-muted hover:bg-brand-ghost hover:text-ink",
+              )}
+            >
+              <span className="truncate">{w.name}</span>
+              {count > 0 && (
+                <span className="ml-auto rounded-full bg-waiting/20 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-waiting">
+                  {count}
+                </span>
+              )}
+            </button>
+          );
+        })}
         <div className="my-1 border-t border-border" />
         <button
           onClick={(ev) => {

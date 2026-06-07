@@ -79,6 +79,8 @@ interface Store {
   needs: NeedItem[];
   /** Pending tool permission requests (the Ask Bridge). */
   asks: PermissionAsk[];
+  /** Pending needs count per workspace id (for the workspace switcher). */
+  needsByWorkspace: Record<number, number>;
   /** Whether the Needs-you view occupies the main region. */
   showNeeds: boolean;
   openNeeds: () => void;
@@ -175,6 +177,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<BusMsg[]>([]);
   const [needs, setNeeds] = useState<NeedItem[]>([]);
   const [asks, setAsks] = useState<PermissionAsk[]>([]);
+  const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
@@ -546,6 +549,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       /* bus may not be ready */
     }
+    // per-workspace counts so the switcher can flag OTHER workspaces.
+    try {
+      setNeedsByWorkspace(Object.fromEntries(await api.workspaceNeedsCounts()));
+    } catch {
+      /* ignore */
+    }
   }, [activeWorkspaceId]);
 
   const openNeeds = useCallback(() => {
@@ -843,6 +852,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setReviewingProposal,
     needs,
     asks,
+    needsByWorkspace,
     showNeeds,
     openNeeds,
     refreshNeeds,

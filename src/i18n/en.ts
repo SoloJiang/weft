@@ -25,6 +25,7 @@ export const en = {
     repoMap: "Repo map",
     needsYou: "Needs you",
     nothingNeedsYou: "Nothing needs you",
+    otherWorkspaceNeeds: "Another workspace needs you",
     newWorkspace: "New workspace",
     noWorkspace: "No workspace",
     local: "Local · no server",

@@ -103,6 +103,8 @@ export const api = {
 
   // Ask Bridge: pending tool permission requests + the answer.
   pendingAsks: () => invoke<PermissionAsk[]>("pending_asks"),
+  workspaceNeedsCounts: () =>
+    invoke<[number, number][]>("workspace_needs_counts"),
   answerPermission: (askId: number, answer: "allow" | "deny" | "always" | "full") =>
     invoke<void>("answer_permission", { askId, answer }),
 

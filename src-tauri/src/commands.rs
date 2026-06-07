@@ -349,6 +349,30 @@ pub fn pending_asks(asks: tauri::State<'_, crate::ask::AskRegistry>) -> R<Vec<cr
     Ok(asks.open())
 }
 
+/// Pending "needs you" count per workspace (agent questions + tool asks), so the
+/// workspace switcher can flag OTHER workspaces that want attention.
+#[tauri::command]
+pub async fn workspace_needs_counts(
+    db: State<'_, Db>,
+    bus: tauri::State<'_, crate::bus::BusRegistry>,
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+) -> R<Vec<(i32, u32)>> {
+    use std::collections::HashSet;
+    let open_asks = asks.open();
+    let mut out = Vec::new();
+    for w in repo::list_workspaces(&db).await.map_err(e)? {
+        let threads = repo::list_threads(&db, w.id).await.map_err(e)?;
+        let tids: HashSet<i32> = threads.iter().map(|t| t.id).collect();
+        let mut count: u32 = 0;
+        for t in &threads {
+            count += bus.open_asks(t.id).len() as u32;
+        }
+        count += open_asks.iter().filter(|a| tids.contains(&a.thread)).count() as u32;
+        out.push((w.id, count));
+    }
+    Ok(out)
+}
+
 /// Answer a pending permission Ask. `answer` is allow | deny | always | full —
 /// always remembers this action for the task, full grants it full access.
 #[tauri::command]

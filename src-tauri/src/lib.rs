@@ -106,6 +106,7 @@ pub fn run() {
             commands::thread_messages,
             commands::bus_post_human,
             commands::pending_asks,
+            commands::workspace_needs_counts,
             commands::answer_permission,
             commands::needs_you,
             commands::answer_ask,
