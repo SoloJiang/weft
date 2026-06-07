@@ -34,8 +34,11 @@ export const en = {
     lightTheme: "Light theme",
     darkTheme: "Dark theme",
   },
+  wsboard: {
+    planning: "Planning",
+  },
   workspace: {
-    tabOverview: "Overview",
+    tabOverview: "Activity",
     tabRepos: "Repos",
     runningNow: "Running now",
     aTask: "task",

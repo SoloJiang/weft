@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { Activity, FolderGit2, Plus } from "lucide-react";
+import { Activity, FolderGit2, LayoutGrid, Plus } from "lucide-react";
 import { useStore, type OpenSession } from "../state/store";
 import { api } from "../lib/api";
 import type { NormEvent } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { ToolIcon } from "../components/ToolIcon";
 import { RepoMapView } from "./RepoMapView";
+import { WorkspaceKanban } from "./WorkspaceKanban";
 import { RailToggle } from "../components/RailToggle";
 import { PermissionRow, AskRow } from "./NeedsYouView";
 import { AddRepoDialog, CreateThreadDialog } from "../nav/dialogs";
@@ -29,6 +30,12 @@ export function WorkspaceHome() {
   const needsCount = needs.length + asks.length;
 
   const tabs = [
+    {
+      key: "board" as const,
+      label: t("thread.tabBoard"),
+      icon: LayoutGrid,
+      badge: null as { n: number; attn: boolean } | null,
+    },
     {
       key: "overview" as const,
       label: t("workspace.tabOverview"),
@@ -86,30 +93,25 @@ export function WorkspaceHome() {
             );
           })}
         </div>
-        {homeTab === "overview" ? (
-          <Button
-            variant="primary"
-            className="ml-auto"
-            onClick={() => setNewThread(true)}
-            disabled={!ws}
-          >
-            <Plus size={14} />
-            {t("nav.newThread")}
-          </Button>
-        ) : (
-          <Button
-            variant="default"
-            className="ml-auto"
-            onClick={() => setAddRepo(true)}
-            disabled={!ws}
-          >
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          <Button variant="default" onClick={() => setAddRepo(true)} disabled={!ws}>
             <Plus size={14} />
             {t("dialog.addRepo")}
           </Button>
-        )}
+          <Button variant="primary" onClick={() => setNewThread(true)} disabled={!ws}>
+            <Plus size={14} />
+            {t("nav.newThread")}
+          </Button>
+        </div>
       </header>
 
-      {homeTab === "overview" ? <OverviewTab /> : <RepoMapView embedded />}
+      {homeTab === "board" ? (
+        <WorkspaceKanban />
+      ) : homeTab === "overview" ? (
+        <OverviewTab />
+      ) : (
+        <RepoMapView embedded />
+      )}
 
       <CreateThreadDialog open={newThread} onOpenChange={setNewThread} />
       <AddRepoDialog open={addRepo} onOpenChange={setAddRepo} />

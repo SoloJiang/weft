@@ -99,8 +99,8 @@ interface Store {
   repoProfiles: RepoProfile[];
   repoEdges: RepoEdge[];
   /** Which workspace-home tab is active (Overview · Repos). */
-  homeTab: "overview" | "repos";
-  setHomeTab: (t: "overview" | "repos") => void;
+  homeTab: "board" | "overview" | "repos";
+  setHomeTab: (t: "board" | "overview" | "repos") => void;
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
@@ -184,7 +184,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
-  const [homeTab, setHomeTab] = useState<"overview" | "repos">("overview");
+  const [homeTab, setHomeTab] = useState<"board" | "overview" | "repos">("board");
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
   // Lead dock: per-thread collapse memory; bus drawer; proposal-review state.
@@ -227,7 +227,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setActiveThreadId(null);
     setActiveSessionId(null);
     setShowNeeds(false);
-    setHomeTab("overview");
+    setHomeTab("board");
     setRepoProfiles([]);
     setRepoEdges([]);
     setProposal(null);
@@ -264,7 +264,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setActiveThreadId(threadId);
       setActiveSessionId(null);
       setShowNeeds(false);
-      setHomeTab("overview");
+      setHomeTab("board");
       setShowBus(false);
       setReviewingProposal(false);
       try {
@@ -295,7 +295,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setActiveThreadId(null);
     setActiveSessionId(null);
     setShowNeeds(false);
-    setHomeTab("overview");
+    setHomeTab("board");
   }, []);
 
   const createWorkspace = useCallback(
@@ -367,7 +367,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (focus) {
           setActiveSessionId(existing.info.session_id);
           setShowNeeds(false);
-          setHomeTab("overview");
+          setHomeTab("board");
         }
         return;
       }
@@ -389,7 +389,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (focus) {
         setActiveSessionId(info.session_id);
         setShowNeeds(false);
-        setHomeTab("overview");
+        setHomeTab("board");
       }
     },
     [activeThreadId],
@@ -579,7 +579,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const openNeeds = useCallback(() => {
     setActiveSessionId(null);
-    setHomeTab("overview");
+    setHomeTab("board");
     setShowNeeds(true);
   }, []);
 

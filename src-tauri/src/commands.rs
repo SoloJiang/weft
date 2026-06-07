@@ -93,6 +93,8 @@ pub struct ThreadOverview {
     pub kind: String,
     pub status: String,
     pub direction_ids: Vec<i32>,
+    /// directions whose status is "done" (for the workspace board's phase).
+    pub done: u32,
     /// distinct repos this thread WRITES (across its directions).
     pub write_repos: Vec<RepoLite>,
 }
@@ -118,6 +120,7 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
             kind: t.kind,
             status: t.status,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
+            done: dirs.iter().filter(|d| d.status == "done").count() as u32,
             write_repos: seen.into_iter().map(|(id, name)| RepoLite { id, name }).collect(),
         });
     }

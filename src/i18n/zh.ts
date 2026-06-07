@@ -33,8 +33,11 @@ export const zh = {
     lightTheme: "亮色主题",
     darkTheme: "暗色主题",
   },
+  wsboard: {
+    planning: "规划中",
+  },
   workspace: {
-    tabOverview: "概览",
+    tabOverview: "活动",
     tabRepos: "仓库",
     runningNow: "正在运行",
     aTask: "任务",

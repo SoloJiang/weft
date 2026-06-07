@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion, useReducedMotion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import {
@@ -15,6 +15,7 @@ import {
 import { useStore } from "../state/store";
 import type { RepoProfile } from "../lib/types";
 import { Input } from "../components/ui/Input";
+import { RepoGraph } from "./RepoGraph";
 import { cn } from "../lib/cn";
 
 const ROLE_ICON: Record<string, typeof Server> = {
@@ -33,9 +34,13 @@ const ROLE_ICON: Record<string, typeof Server> = {
  * and survives re-profiling).
  */
 export function RepoMapView({ embedded = false }: { embedded?: boolean }) {
-  const { repoProfiles, repoEdges } = useStore();
+  const { repoProfiles, repoEdges, refreshRepoMap } = useStore();
   const { t } = useTranslation();
   const reduce = useReducedMotion();
+
+  useEffect(() => {
+    void refreshRepoMap();
+  }, [refreshRepoMap]);
 
   const nameOf = useMemo(() => {
     const m = new Map<number, string>();
@@ -48,6 +53,12 @@ export function RepoMapView({ embedded = false }: { embedded?: boolean }) {
         {repoProfiles.length === 0 ? (
           <EmptyMap />
         ) : (
+          <>
+          {repoProfiles.length > 1 && (
+            <div className="border-b border-border">
+              <RepoGraph />
+            </div>
+          )}
           <div className="mx-auto flex w-full max-w-[760px] flex-col gap-2.5 px-5 py-5">
             {repoProfiles.map((p, i) => {
               const dependsOn = repoEdges.filter((e) => e.from === p.repo_id);
@@ -72,6 +83,7 @@ export function RepoMapView({ embedded = false }: { embedded?: boolean }) {
               );
             })}
           </div>
+          </>
         )}
     </div>
   );

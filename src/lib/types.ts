@@ -193,6 +193,8 @@ export interface ThreadOverview {
   kind: string;
   status: string;
   direction_ids: number[];
+  /** directions whose status is "done" (for the workspace board phase). */
+  done: number;
   write_repos: { id: number; name: string }[];
 }
 
