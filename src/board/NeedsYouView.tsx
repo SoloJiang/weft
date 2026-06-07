@@ -107,11 +107,19 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
         {ask.summary}
       </p>
       <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
-        <Button variant="primary" onClick={() => void answerPermission(ask.id, "allow")}>
+        <Button
+          variant="primary"
+          title={t("needs.allowTitle")}
+          onClick={() => void answerPermission(ask.id, "allow")}
+        >
           <Check size={13} />
           {t("common.allow")}
         </Button>
-        <Button variant="ghost" onClick={() => void answerPermission(ask.id, "always")}>
+        <Button
+          variant="ghost"
+          title={t("needs.alwaysTitle")}
+          onClick={() => void answerPermission(ask.id, "always")}
+        >
           <CheckCheck size={13} />
           {t("needs.always")}
         </Button>
@@ -123,7 +131,12 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
           <ShieldCheck size={13} />
           {t("needs.fullAccess")}
         </Button>
-        <Button variant="ghost" className="ml-auto" onClick={() => void answerPermission(ask.id, "deny")}>
+        <Button
+          variant="ghost"
+          className="ml-auto"
+          title={t("needs.denyTitle")}
+          onClick={() => void answerPermission(ask.id, "deny")}
+        >
           <X size={13} />
           {t("common.deny")}
         </Button>
