@@ -33,9 +33,11 @@ export function WorkspaceKanban() {
   }, [refreshOverview]);
 
   const phaseOf = (o: ThreadOverview): Phase => {
+    // Direction-level only, so the card matches the board's Needs-you column
+    // (a thread-level lead ask, dir="", lives in Activity, not a task column).
     const attention =
       needs.some((n) => o.direction_ids.includes(n.direction_id)) ||
-      asks.some((a) => a.thread === o.thread_id);
+      asks.some((a) => o.direction_ids.includes(Number(a.dir)));
     const failing = o.direction_ids.some((id) =>
       (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
     );
@@ -107,7 +109,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   ).length;
   const attention =
     needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +
-    asks.filter((a) => a.thread === o.thread_id).length;
+    asks.filter((a) => o.direction_ids.includes(Number(a.dir))).length;
   const failing = o.direction_ids.filter((id) =>
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;

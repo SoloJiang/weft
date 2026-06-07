@@ -98,6 +98,8 @@ export const zh = {
     proposalReady_other: "建议 {{count}} 个任务",
     reviewCreate: "查看并创建",
     starting: "正在启动 lead…",
+    stopped: "lead 已停止。",
+    restart: "重启 lead",
     viewChat: "对话",
     viewTerminal: "终端",
     transcriptEmpty: "还没有产出。",

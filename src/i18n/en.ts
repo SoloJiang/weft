@@ -104,6 +104,8 @@ export const en = {
     proposalReady_other: "Proposed {{count}} tasks",
     reviewCreate: "Review & create",
     starting: "Starting the lead…",
+    stopped: "The lead stopped.",
+    restart: "Restart lead",
     viewChat: "Chat",
     viewTerminal: "Terminal",
     transcriptEmpty: "Nothing yet.",

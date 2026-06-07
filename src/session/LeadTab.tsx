@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, MessagesSquare, Sparkles, Square, SquareTerminal } from "lucide-react";
+import { ArrowRight, MessagesSquare, RotateCcw, Sparkles, Square, SquareTerminal } from "lucide-react";
 import { useStore } from "../state/store";
 import type { SessionStatus } from "../lib/types";
 import { TerminalPanel } from "../panels/TerminalPanel";
@@ -18,18 +18,43 @@ import { cn } from "../lib/cn";
  * proposes a plan, a card surfaces here; reviewing happens on the Board tab.
  */
 export function LeadTab({ onReview }: { onReview: () => void }) {
-  const { leadSession, startLead, killSession, proposal, reviewingProposal, setReviewingProposal } =
-    useStore();
+  const {
+    leadSession,
+    startLead,
+    killSession,
+    proposal,
+    reviewingProposal,
+    setReviewingProposal,
+    activeThreadId,
+    sessions,
+  } = useStore();
   const { t } = useTranslation();
   const [view, setView] = useState<"chat" | "terminal">("chat");
+  // Auto-start at most ONCE per thread. Keying off leadSession alone loops if the
+  // lead exits right after spawning (null → start → exit → null → start …).
+  const attemptedRef = useRef<number | null>(null);
 
-  // Opening the Lead tab starts (or reuses) the lead and drops straight into
-  // read-only — no manual "start" step.
   useEffect(() => {
-    if (!leadSession) void startLead();
-  }, [leadSession, startLead]);
+    if (leadSession || activeThreadId == null) return;
+    if (attemptedRef.current === activeThreadId) return;
+    attemptedRef.current = activeThreadId;
+    void startLead();
+  }, [leadSession, activeThreadId, startLead]);
 
-  if (!leadSession) return <LeadStarting />;
+  if (!leadSession) {
+    const exited = Object.values(sessions).some(
+      (s) => s.kind === "lead" && s.threadId === activeThreadId && s.status === "exited",
+    );
+    return (
+      <LeadStarting
+        exited={exited}
+        onRetry={() => {
+          attemptedRef.current = activeThreadId;
+          void startLead();
+        }}
+      />
+    );
+  }
 
   const { info, status, nativeId } = leadSession;
   const running = status === "running" || status === "starting";
@@ -144,8 +169,22 @@ function ViewTab({
   );
 }
 
-function LeadStarting() {
+function LeadStarting({ exited, onRetry }: { exited: boolean; onRetry: () => void }) {
   const { t } = useTranslation();
+  if (exited) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+        <div className="grid h-11 w-11 place-items-center rounded-[var(--radius-lg)] bg-surface">
+          <Sparkles size={20} className="text-ink-faint" />
+        </div>
+        <p className="mt-3 text-[13px] text-ink-muted">{t("lead.stopped")}</p>
+        <Button variant="primary" className="mt-4" onClick={onRetry}>
+          <RotateCcw size={14} />
+          {t("lead.restart")}
+        </Button>
+      </div>
+    );
+  }
   return (
     <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
       <div className="grid h-11 w-11 place-items-center rounded-[var(--radius-lg)] bg-accent-ghost">

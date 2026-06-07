@@ -26,3 +26,6 @@ dist-ssr
 
 # Rust
 target/
+
+# Docs (design specs, plans, diagrams — kept local)
+docs/
