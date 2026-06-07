@@ -185,6 +185,9 @@ export const zh = {
     role_infra: "基础设施",
     role_docs: "文档",
     role_unknown: "未知",
+    zoomIn: "放大",
+    zoomOut: "缩小",
+    fit: "适应视图",
   },
   inspect: {
     label: "检视 —— 打开终端、显示、复制路径",

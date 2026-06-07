@@ -196,6 +196,9 @@ export const en = {
     role_infra: "infra",
     role_docs: "docs",
     role_unknown: "unknown",
+    zoomIn: "Zoom in",
+    zoomOut: "Zoom out",
+    fit: "Fit to view",
   },
   inspect: {
     label: "Inspect — open terminal, reveal, copy path",
