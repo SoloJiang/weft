@@ -6,6 +6,7 @@ import {
   Check,
   CheckCheck,
   HelpCircle,
+  Layers,
   Send,
   ShieldCheck,
   ShieldQuestion,
@@ -91,8 +92,9 @@ export function NeedsYouView() {
 }
 
 export function PermissionRow({ ask }: { ask: PermissionAsk }) {
-  const { answerPermission } = useStore();
+  const { answerPermission, selectThread } = useStore();
   const { t } = useTranslation();
+  const context = [ask.thread_title, ask.dir_name].filter(Boolean).join(" · ");
   return (
     <div className="overflow-hidden rounded-[var(--radius-lg)] border border-approval/40 bg-surface">
       <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
@@ -103,6 +105,17 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
           {ago(ask.ts, t)}
         </span>
       </div>
+      {context && (
+        <button
+          onClick={() => void selectThread(ask.thread)}
+          title={t("needs.openDirection")}
+          className="group flex max-w-full items-center gap-1.5 px-3.5 pt-1.5 text-[11px] text-ink-faint transition-colors hover:text-ink"
+        >
+          <Layers size={11} className="shrink-0" />
+          <span className="truncate">{context}</span>
+          <ArrowUpRight size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+        </button>
+      )}
       <p className="truncate px-3.5 pb-1 pt-1.5 font-mono text-[13px] text-ink" title={ask.detail}>
         {ask.summary}
       </p>

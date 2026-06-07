@@ -393,10 +393,26 @@ pub fn answer_ask(
     }
 }
 
-/// All pending permission Asks across the workspace (the Ask Bridge → Needs-you).
+/// All pending permission Asks across the workspace (the Ask Bridge → Needs-you),
+/// enriched with the owning thread's title and the asking task's name so the card
+/// says which thread / which task is asking.
 #[tauri::command]
-pub fn pending_asks(asks: tauri::State<'_, crate::ask::AskRegistry>) -> R<Vec<crate::ask::Ask>> {
-    Ok(asks.open())
+pub async fn pending_asks(
+    db: State<'_, Db>,
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+) -> R<Vec<crate::ask::Ask>> {
+    let mut open = asks.open();
+    for a in &mut open {
+        if let Ok(Some(t)) = repo::get_thread(&db, a.thread).await {
+            a.thread_title = t.title;
+        }
+        if let Ok(id) = a.dir.parse::<i32>() {
+            if let Ok(Some(d)) = repo::get_direction(&db, id).await {
+                a.dir_name = d.name;
+            }
+        }
+    }
+    Ok(open)
 }
 
 /// Pending "needs you" count per workspace (agent questions + tool asks), so the

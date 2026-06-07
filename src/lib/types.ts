@@ -214,6 +214,9 @@ export interface PermissionAsk {
   summary: string;
   detail: string;
   ts: number;
+  /** owning thread title + asking task name, for context on the card. */
+  thread_title: string;
+  dir_name: string;
 }
 
 /** An open agent→human question, aggregated workspace-wide for "Needs you". */

@@ -243,6 +243,10 @@ pub async fn create_direction(
     Ok(dir)
 }
 
+pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<direction::Model>> {
+    Ok(direction::Entity::find_by_id(direction_id).one(&db.0).await?)
+}
+
 /// Set a direction's lifecycle status (agent- or human-driven). No-op if gone.
 pub async fn set_direction_status(db: &Db, direction_id: i32, status: &str) -> Result<()> {
     if let Some(d) = direction::Entity::find_by_id(direction_id).one(&db.0).await? {

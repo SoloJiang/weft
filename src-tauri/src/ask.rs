@@ -54,6 +54,12 @@ pub struct Ask {
     /// the raw action detail (command / file path / full input).
     pub detail: String,
     pub ts: u64,
+    /// Human context, filled when listed (pending_asks): the owning thread's
+    /// title and the asking task's name. Empty for a lead/planning session.
+    #[serde(default)]
+    pub thread_title: String,
+    #[serde(default)]
+    pub dir_name: String,
 }
 
 #[derive(Default)]
@@ -108,6 +114,8 @@ impl AskRegistry {
             summary: summary.to_string(),
             detail: detail.to_string(),
             ts: now(),
+            thread_title: String::new(),
+            dir_name: String::new(),
         });
         (id, rx)
     }
