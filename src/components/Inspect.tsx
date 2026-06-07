@@ -47,7 +47,7 @@ export function Inspect({
           align="end"
           sideOffset={4}
           onClick={(e) => e.stopPropagation()}
-          className="weft-pop z-[60] w-60 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.5)]"
+          className="weft-pop z-[60] w-64 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.5)]"
         >
           <Item icon={<SquareTerminal size={13} />} onSelect={() => void api.openTerminal(path)}>
             {t("inspect.openTerminal")}
@@ -62,23 +62,17 @@ export function Inspect({
             {t("inspect.copyPath")}
           </Item>
 
-          <DM.Separator className="my-1 h-px bg-border" />
-          <div className="px-2 py-1 text-[10px] leading-relaxed text-ink-faint">
-            <div className="truncate" title={path}>
-              <span className="text-ink-muted">{t("inspect.pathLabel")}</span> {shortPath(path)}
-            </div>
-            {branch && (
-              <div className="truncate font-mono" title={branch}>
-                <span className="font-sans text-ink-muted">{t("inspect.branchLabel")}</span> {branch}
+          {(branch || nativeId) && (
+            <>
+              <DM.Separator className="my-1 h-px bg-border" />
+              <div className="flex flex-col gap-1.5 px-2 py-1.5">
+                {branch && <MetaRow label={t("inspect.branchLabel")} value={branch} />}
+                {nativeId && (
+                  <MetaRow label={t("inspect.sessionLabel")} value={nativeId.slice(0, 12)} />
+                )}
               </div>
-            )}
-            {nativeId && (
-              <div className="truncate font-mono" title={nativeId}>
-                <span className="font-sans text-ink-muted">{t("inspect.sessionLabel")}</span>{" "}
-                {nativeId.slice(0, 12)}
-              </div>
-            )}
-          </div>
+            </>
+          )}
         </DM.Content>
       </DM.Portal>
     </DM.Root>
@@ -105,6 +99,13 @@ function Item({
   );
 }
 
-function shortPath(p: string): string {
-  return p.replace(/^.*\/worktrees\//, "…/");
+function MetaRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-2 text-[11px]">
+      <span className="w-12 shrink-0 text-ink-faint">{label}</span>
+      <span className="truncate font-mono text-ink-muted" title={value}>
+        {value}
+      </span>
+    </div>
+  );
 }

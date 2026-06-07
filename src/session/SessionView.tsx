@@ -13,7 +13,7 @@ import { useStore } from "../state/store";
 import type { SessionStatus } from "../lib/types";
 import { TerminalPanel } from "../panels/TerminalPanel";
 import { Transcript } from "./Transcript";
-import { DiffView } from "./DiffView";
+import { DiffDrawer } from "./DiffDrawer";
 import { StatusChip } from "../components/ui/StatusChip";
 import { Button } from "../components/ui/Button";
 import { Inspect } from "../components/Inspect";
@@ -35,11 +35,13 @@ export function SessionView() {
   const tool = active?.info.tool;
   // Observe by default (chat); all three tools have a sidecar transcript now.
   const transcripted = tool === "claude" || tool === "codex" || tool === "opencode";
-  const [view, setView] = useState<"chat" | "diff" | "terminal">(
+  const [view, setView] = useState<"chat" | "terminal">(
     transcripted ? "chat" : "terminal",
   );
+  const [showDiff, setShowDiff] = useState(false);
   useEffect(() => {
     setView(transcripted ? "chat" : "terminal");
+    setShowDiff(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.info.session_id, tool]);
 
@@ -47,6 +49,7 @@ export function SessionView() {
 
   const { info, status, nativeId } = active;
   const isLead = active.kind === "lead";
+  const running = status === "running" || status === "starting";
   // Product words, not plumbing: "<repo> · <direction>". The real worktree
   // path / branch / native id live in Inspect (§4.7).
   const repoName =
@@ -93,31 +96,35 @@ export function SessionView() {
             <ViewTab active={view === "terminal"} onClick={() => setView("terminal")} title={t("lead.viewTerminal")}>
               <SquareTerminal size={13} />
             </ViewTab>
-            {!isLead && (
-              <ViewTab active={view === "diff"} onClick={() => setView("diff")} title={t("diff.tab")}>
-                <GitCompare size={13} />
-              </ViewTab>
-            )}
           </div>
+          {!isLead && (
+            <button
+              onClick={() => setShowDiff(true)}
+              title={t("diff.tab")}
+              className="flex h-7 items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-2.5 text-[12px] text-ink-muted transition-colors hover:bg-surface hover:text-ink"
+            >
+              <GitCompare size={13} />
+              {t("diff.tab")}
+            </button>
+          )}
           <StatusChip status={status as SessionStatus} />
-          <Button
-            size="sm"
-            variant="default"
-            onClick={() => void resumeSession(info.session_id)}
-            disabled={!nativeId}
-            title={nativeId ? t("session.resumeReady") : t("session.starting")}
-          >
-            <RotateCcw size={12} />
-            {t("session.resume")}
-          </Button>
-          <Button
-            size="sm"
-            variant="danger"
-            onClick={() => void killSession(info.session_id)}
-          >
-            <Square size={11} />
-            {t("session.kill")}
-          </Button>
+          {running ? (
+            <Button size="sm" variant="danger" onClick={() => void killSession(info.session_id)}>
+              <Square size={11} />
+              {t("session.kill")}
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="default"
+              onClick={() => void resumeSession(info.session_id)}
+              disabled={!nativeId}
+              title={nativeId ? t("session.resumeReady") : t("session.starting")}
+            >
+              <RotateCcw size={12} />
+              {t("session.resume")}
+            </Button>
+          )}
           <Inspect
             path={info.worktree}
             branch={info.branch}
@@ -128,13 +135,7 @@ export function SessionView() {
       </header>
 
       {view === "chat" ? (
-        <Transcript
-          cwd={info.worktree}
-          tool={info.tool}
-          running={status === "running" || status === "starting"}
-        />
-      ) : view === "diff" ? (
-        <DiffView cwd={info.worktree} />
+        <Transcript cwd={info.worktree} tool={info.tool} running={running} />
       ) : (
         /* embedded native TUI — keyed so each session gets a fresh terminal */
         <motion.div
@@ -146,6 +147,10 @@ export function SessionView() {
         >
           <TerminalPanel sessionId={info.session_id} />
         </motion.div>
+      )}
+
+      {!isLead && (
+        <DiffDrawer cwd={info.worktree} open={showDiff} onClose={() => setShowDiff(false)} />
       )}
     </section>
   );
