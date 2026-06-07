@@ -35,7 +35,7 @@ export function ScopeConfirmView({
   repos: RepoRef[];
   taskTitle: string;
 }) {
-  const { saveProposal, confirmProposal } = useStore();
+  const { saveProposal, confirmProposal, defaultTool } = useStore();
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
 
@@ -79,7 +79,7 @@ export function ScopeConfirmView({
   function addDir() {
     setDirs((cur) => [
       ...cur,
-      { name: `Direction ${cur.length + 1}`, tool: "claude", writes: new Set() },
+      { name: `Direction ${cur.length + 1}`, tool: defaultTool, writes: new Set() },
     ]);
   }
   function removeDir(i: number) {

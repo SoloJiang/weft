@@ -402,10 +402,10 @@ export function CreateDirectionDialog({
   onOpenChange,
   threadId,
 }: DProps & { threadId: number }) {
-  const { repos, createDirection } = useStore();
+  const { repos, createDirection, defaultTool } = useStore();
   const { t } = useTranslation();
   const [name, setName] = useState("main");
-  const [tool, setTool] = useState("claude");
+  const [tool, setTool] = useState(defaultTool);
   const [writes, setWrites] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
