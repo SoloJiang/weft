@@ -92,6 +92,7 @@ pub fn run() {
             commands::list_directions,
             commands::set_task_status,
             commands::read_transcript,
+            commands::worktree_diff,
             commands::get_proposal,
             commands::save_proposal,
             commands::confirm_proposal,

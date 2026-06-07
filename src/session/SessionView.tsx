@@ -3,6 +3,7 @@ import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import {
   ArrowLeft,
+  GitCompare,
   MessagesSquare,
   RotateCcw,
   Square,
@@ -12,6 +13,7 @@ import { useStore } from "../state/store";
 import type { SessionStatus } from "../lib/types";
 import { TerminalPanel } from "../panels/TerminalPanel";
 import { Transcript } from "./Transcript";
+import { DiffView } from "./DiffView";
 import { StatusChip } from "../components/ui/StatusChip";
 import { Button } from "../components/ui/Button";
 import { Inspect } from "../components/Inspect";
@@ -34,7 +36,7 @@ export function SessionView() {
   const tool = active?.info.tool;
   // Observe by default (chat); all three tools have a sidecar transcript now.
   const transcripted = tool === "claude" || tool === "codex" || tool === "opencode";
-  const [view, setView] = useState<"chat" | "terminal">(
+  const [view, setView] = useState<"chat" | "diff" | "terminal">(
     transcripted ? "chat" : "terminal",
   );
   useEffect(() => {
@@ -90,6 +92,11 @@ export function SessionView() {
             <ViewTab active={view === "chat"} onClick={() => setView("chat")} title={t("lead.viewChat")}>
               <MessagesSquare size={13} />
             </ViewTab>
+            {!isLead && (
+              <ViewTab active={view === "diff"} onClick={() => setView("diff")} title={t("diff.tab")}>
+                <GitCompare size={13} />
+              </ViewTab>
+            )}
             <ViewTab active={view === "terminal"} onClick={() => setView("terminal")} title={t("lead.viewTerminal")}>
               <SquareTerminal size={13} />
             </ViewTab>
@@ -124,6 +131,8 @@ export function SessionView() {
 
       {view === "chat" ? (
         <Transcript cwd={info.worktree} tool={info.tool} />
+      ) : view === "diff" ? (
+        <DiffView cwd={info.worktree} />
       ) : (
         /* embedded native TUI — keyed so each session gets a fresh terminal */
         <motion.div

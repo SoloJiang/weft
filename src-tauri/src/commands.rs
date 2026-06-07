@@ -234,6 +234,15 @@ pub async fn set_task_status(db: State<'_, Db>, direction_id: i32, status: Strin
     repo::set_direction_status(&db, direction_id, &status).await.map_err(e)
 }
 
+/// The worker's worktree diff (file stats + unified patch) for the Diff tab.
+#[tauri::command]
+pub fn worktree_diff(cwd: String) -> R<crate::git::WorktreeDiff> {
+    let p = std::path::Path::new(&cwd);
+    let files = crate::git::repo_diff(p).map_err(e)?.files;
+    let patch = crate::git::repo_patch(p).unwrap_or_default();
+    Ok(crate::git::WorktreeDiff { files, patch })
+}
+
 /// Observe-mode (§4.4): the agent's own transcript, normalized to app-native
 /// events so the chat view never depends on rendering the live TUI.
 #[tauri::command]

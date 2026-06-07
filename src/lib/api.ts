@@ -18,6 +18,7 @@ import type {
   ThreadOverview,
   Workspace,
   Worktree,
+  WorktreeDiff,
 } from "./types";
 
 // Tauri converts camelCase command args to snake_case Rust params. Nested
@@ -82,6 +83,8 @@ export const api = {
     invoke<SessionInfo>("resume_session", { sessionId }),
   readTranscript: (cwd: string, tool: string) =>
     invoke<NormEvent[]>("read_transcript", { cwd, tool }),
+  worktreeDiff: (cwd: string) =>
+    invoke<WorktreeDiff>("worktree_diff", { cwd }),
   writePty: (sessionId: number, data: string) =>
     invoke<void>("write_pty", { sessionId, data }),
   resizePty: (sessionId: number, rows: number, cols: number) =>

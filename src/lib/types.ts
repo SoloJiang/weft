@@ -31,6 +31,17 @@ export interface Thread {
   created_at: string;
 }
 
+export interface FileDiff {
+  path: string;
+  added: number;
+  removed: number;
+}
+
+export interface WorktreeDiff {
+  files: FileDiff[];
+  patch: string;
+}
+
 /** Normalized observe-mode transcript event (from the tool's own sidecar). */
 export type NormEvent =
   | { kind: "message"; role: "user" | "assistant"; text: string; ts: string }

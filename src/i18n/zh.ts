@@ -124,6 +124,12 @@ export const zh = {
     interacting: "交互中",
     backToReadonly: "返回只读",
   },
+  diff: {
+    tab: "改动",
+    empty: "还没有改动。",
+    filesChanged_other: "{{count}} 个文件",
+    untrackedOnly: "目前只有新增(未跟踪)文件。",
+  },
   bus: {
     title: "会话总线",
     activity: "活动",

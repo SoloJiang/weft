@@ -131,6 +131,13 @@ export const en = {
     interacting: "Interacting",
     backToReadonly: "Back to read-only",
   },
+  diff: {
+    tab: "Diff",
+    empty: "No changes yet.",
+    filesChanged_one: "{{count}} file",
+    filesChanged_other: "{{count}} files",
+    untrackedOnly: "Only new (untracked) files so far.",
+  },
   bus: {
     title: "Thread bus",
     activity: "Activity",

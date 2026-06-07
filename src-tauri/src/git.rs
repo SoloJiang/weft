@@ -93,6 +93,19 @@ pub struct DiffSummary {
     pub files: Vec<FileDiff>,
 }
 
+/// File stats + the unified patch for a worktree (the worker observe Diff tab).
+#[derive(Serialize, Debug, Default)]
+pub struct WorktreeDiff {
+    pub files: Vec<FileDiff>,
+    pub patch: String,
+}
+
+/// Unified patch of a worktree's tracked changes (`git diff HEAD`). Untracked
+/// files appear in the stat list but not the patch.
+pub fn repo_patch(worktree_path: &Path) -> Result<String> {
+    git(worktree_path, &["diff", "HEAD"])
+}
+
 /// `git worktree list --porcelain` parsed into (path, branch) pairs.
 pub fn list_worktrees(repo: &Path) -> Result<Vec<(String, String)>> {
     let out = git(repo, &["worktree", "list", "--porcelain"])?;
