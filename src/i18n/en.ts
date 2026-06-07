@@ -89,6 +89,9 @@ export const en = {
     proposalReady_other: "Proposed {{count}} tasks",
     reviewCreate: "Review & create",
     starting: "Starting the lead…",
+    viewChat: "Chat",
+    viewTerminal: "Terminal",
+    transcriptEmpty: "The lead hasn't said anything yet.",
   },
   scope: {
     proposedFor: "Proposed plan for {{title}}",

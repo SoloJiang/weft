@@ -84,6 +84,9 @@ export const zh = {
     proposalReady_other: "建议 {{count}} 个任务",
     reviewCreate: "查看并创建",
     starting: "正在启动 lead…",
+    viewChat: "对话",
+    viewTerminal: "终端",
+    transcriptEmpty: "lead 还没有说话。",
   },
   scope: {
     proposedFor: "「{{title}}」的建议方案",

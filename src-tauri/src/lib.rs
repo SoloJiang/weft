@@ -24,6 +24,7 @@ mod inspect;
 mod planner;
 pub mod profile;
 mod pty;
+mod sidecar;
 mod commands;
 
 /// The bus server's base URL, e.g. "http://127.0.0.1:54321".
@@ -89,6 +90,7 @@ pub fn run() {
             commands::update_repo_profile,
             commands::list_directions,
             commands::set_task_status,
+            commands::read_transcript,
             commands::get_proposal,
             commands::save_proposal,
             commands::confirm_proposal,

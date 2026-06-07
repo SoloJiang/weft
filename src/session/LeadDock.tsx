@@ -5,11 +5,14 @@ import {
   ArrowRight,
   ChevronsLeft,
   ChevronsRight,
+  MessagesSquare,
   Send,
   Sparkles,
+  SquareTerminal,
 } from "lucide-react";
 import { useStore } from "../state/store";
 import { TerminalPanel } from "../panels/TerminalPanel";
+import { LeadTranscript } from "./LeadTranscript";
 import { ToolIcon } from "../components/ToolIcon";
 import { Button } from "../components/ui/Button";
 import { cn } from "../lib/cn";
@@ -31,6 +34,7 @@ export function LeadDock() {
     setReviewingProposal,
   } = useStore();
   const { t } = useTranslation();
+  const [view, setView] = useState<"chat" | "terminal">("chat");
 
   const running = leadSession?.status === "running" || leadSession?.status === "starting";
   const proposalPending =
@@ -91,14 +95,34 @@ export function LeadDock() {
             {leadSession.info.tool}
           </span>
         )}
-        <button
-          onClick={toggleLeadCollapsed}
-          aria-label={t("lead.collapse")}
-          title={t("lead.collapse")}
-          className="ml-auto grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-        >
-          <ChevronsRight size={15} />
-        </button>
+        <div className="ml-auto flex items-center gap-1">
+          {leadSession && (
+            <div className="flex items-center rounded-[var(--radius-md)] bg-bg p-0.5">
+              <ViewTab
+                active={view === "chat"}
+                onClick={() => setView("chat")}
+                title={t("lead.viewChat")}
+              >
+                <MessagesSquare size={13} />
+              </ViewTab>
+              <ViewTab
+                active={view === "terminal"}
+                onClick={() => setView("terminal")}
+                title={t("lead.viewTerminal")}
+              >
+                <SquareTerminal size={13} />
+              </ViewTab>
+            </div>
+          )}
+          <button
+            onClick={toggleLeadCollapsed}
+            aria-label={t("lead.collapse")}
+            title={t("lead.collapse")}
+            className="grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+          >
+            <ChevronsRight size={15} />
+          </button>
+        </div>
       </header>
 
       {leadSession ? (
@@ -129,21 +153,57 @@ export function LeadDock() {
               </motion.button>
             )}
           </AnimatePresence>
-          <motion.div
-            key={leadSession.info.session_id}
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 0.16 }}
-            className="min-h-0 flex-1 p-1.5"
-          >
-            <TerminalPanel sessionId={leadSession.info.session_id} mode="readonly" />
-          </motion.div>
+          {view === "chat" ? (
+            <LeadTranscript
+              cwd={leadSession.info.worktree}
+              tool={leadSession.info.tool}
+            />
+          ) : (
+            <motion.div
+              key={leadSession.info.session_id}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.16 }}
+              className="min-h-0 flex-1 p-1.5"
+            >
+              <TerminalPanel sessionId={leadSession.info.session_id} mode="readonly" />
+            </motion.div>
+          )}
           <Composer />
         </div>
       ) : (
         <LeadStart />
       )}
     </aside>
+  );
+}
+
+function ViewTab({
+  active,
+  onClick,
+  title,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      aria-pressed={active}
+      className={cn(
+        "grid h-6 w-7 place-items-center rounded-[var(--radius-sm)] transition-colors",
+        active
+          ? "bg-raised text-ink shadow-[0_1px_2px_rgba(0,0,0,0.3)]"
+          : "text-ink-faint hover:text-ink-muted",
+      )}
+    >
+      {children}
+    </button>
   );
 }
 

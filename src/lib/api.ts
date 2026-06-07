@@ -5,6 +5,7 @@ import type {
   DirectionRepo,
   LeadInfo,
   NeedItem,
+  NormEvent,
   PermissionAsk,
   Proposal,
   RepoChecks,
@@ -79,6 +80,8 @@ export const api = {
     invoke<LeadInfo>("plan_with_lead", { threadId, lang }),
   resumeSession: (sessionId: number) =>
     invoke<SessionInfo>("resume_session", { sessionId }),
+  readTranscript: (cwd: string, tool: string) =>
+    invoke<NormEvent[]>("read_transcript", { cwd, tool }),
   writePty: (sessionId: number, data: string) =>
     invoke<void>("write_pty", { sessionId, data }),
   resizePty: (sessionId: number, rows: number, cols: number) =>

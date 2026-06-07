@@ -31,6 +31,11 @@ export interface Thread {
   created_at: string;
 }
 
+/** Normalized observe-mode transcript event (from the tool's own sidecar). */
+export type NormEvent =
+  | { kind: "message"; role: "user" | "assistant"; text: string; ts: string }
+  | { kind: "tool"; name: string; summary: string; ts: string };
+
 export interface Direction {
   id: number;
   thread_id: number;
