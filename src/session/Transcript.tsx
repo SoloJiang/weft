@@ -1,9 +1,31 @@
 import { useEffect, useRef, useState } from "react";
+import type { ComponentType } from "react";
 import { useTranslation } from "react-i18next";
-import { Wrench } from "lucide-react";
+import {
+  FilePen,
+  FileText,
+  ListTodo,
+  type LucideProps,
+  Radio,
+  Search,
+  SquareTerminal,
+  Wrench,
+} from "lucide-react";
 import { api } from "../lib/api";
 import type { NormEvent } from "../lib/types";
 import { cn } from "../lib/cn";
+
+/** Map a (cleaned) tool name to a glyph so the pills are scannable. */
+function toolIcon(name: string): ComponentType<LucideProps> {
+  const n = name.toLowerCase();
+  if (/(bash|exec_command|shell|run)/.test(n)) return SquareTerminal;
+  if (/(write|edit|apply_patch|patch)/.test(n)) return FilePen;
+  if (/(grep|glob|rg|ripgrep|ls|find|list)/.test(n)) return Search;
+  if (/read|view|cat/.test(n)) return FileText;
+  if (/(bus_|broadcast|ask_human|announce|interface|inbox|status)/.test(n)) return Radio;
+  if (/todo/.test(n)) return ListTodo;
+  return Wrench;
+}
 
 /**
  * Observe-mode chat for any agent (lead or worker): renders the session's
@@ -57,16 +79,18 @@ export function Transcript({ cwd, tool }: { cwd: string; tool: string }) {
     <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-3 py-3">
       {events.map((e, i) =>
         e.kind === "tool" ? (
-          <div
-            key={i}
-            className="flex items-center gap-1.5 text-[11px] text-ink-faint"
-          >
-            <Wrench size={11} className="shrink-0 text-ink-faint/70" />
-            <span className="font-medium text-ink-muted">{e.name}</span>
-            {e.summary && (
-              <span className="truncate font-mono text-ink-faint">{e.summary}</span>
-            )}
-          </div>
+          (() => {
+            const Icon = toolIcon(e.name);
+            return (
+              <div key={i} className="flex items-center gap-1.5 text-[11px] text-ink-faint">
+                <Icon size={11} className="shrink-0 text-ink-faint/70" />
+                <span className="font-medium text-ink-muted">{e.name}</span>
+                {e.summary && (
+                  <span className="truncate font-mono text-ink-faint">{e.summary}</span>
+                )}
+              </div>
+            );
+          })()
         ) : e.role === "user" ? (
           <div key={i} className="flex justify-end">
             <p className="max-w-[88%] whitespace-pre-wrap break-words rounded-[var(--radius-md)] bg-brand-ghost px-3 py-2 text-[12.5px] leading-relaxed text-ink">

@@ -100,10 +100,35 @@ pub struct WorktreeDiff {
     pub patch: String,
 }
 
-/// Unified patch of a worktree's tracked changes (`git diff HEAD`). Untracked
-/// files appear in the stat list but not the patch.
+/// Unified patch of a worktree's changes: tracked via `git diff HEAD`, plus
+/// untracked files synthesized as add-patches (workers building from scratch
+/// create new files, which `git diff HEAD` omits). Skips unreadable (binary) and
+/// very large files.
 pub fn repo_patch(worktree_path: &Path) -> Result<String> {
-    git(worktree_path, &["diff", "HEAD"])
+    let mut out = git(worktree_path, &["diff", "HEAD"])?;
+    let untracked = git(worktree_path, &["ls-files", "--others", "--exclude-standard"])?;
+    for rel in untracked.lines().filter(|l| !l.is_empty()) {
+        let Ok(content) = std::fs::read_to_string(worktree_path.join(rel)) else {
+            continue; // binary / unreadable
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() > 2000 {
+            continue; // don't flood the view with a huge generated file
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{} @@\n",
+            lines.len()
+        ));
+        for l in &lines {
+            out.push('+');
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 /// `git worktree list --porcelain` parsed into (path, branch) pairs.

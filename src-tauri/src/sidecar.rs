@@ -33,6 +33,20 @@ pub async fn read_transcript(cwd: &Path, tool: &str) -> Vec<NormEvent> {
     }
 }
 
+/// Strip MCP server prefixes so tool pills read cleanly:
+/// `mcp__weft_bus__bus_post` / `weft_bus_bus_post` → `bus_post`.
+fn clean_tool_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        return rest.rsplit("__").next().unwrap_or(rest).to_string();
+    }
+    for p in ["weft_bus_", "weft_planner_"] {
+        if let Some(rest) = name.strip_prefix(p) {
+            return rest.to_string();
+        }
+    }
+    name.to_string()
+}
+
 /// One-line, truncated summary string for a tool call.
 fn truncate(s: &str) -> String {
     let line = s.lines().next().unwrap_or("");
@@ -137,7 +151,7 @@ fn parse_claude_line(v: &serde_json::Value, out: &mut Vec<NormEvent>) {
                     Some("tool_use") => {
                         let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                         out.push(NormEvent::Tool {
-                            name: name.to_string(),
+                            name: clean_tool_name(name),
                             summary: summarize_tool(name, b.get("input")),
                             ts: ts.clone(),
                         });
@@ -251,9 +265,9 @@ fn parse_codex_line(v: &serde_json::Value, out: &mut Vec<NormEvent>) {
             }
         }
         Some("function_call") => {
-            let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("tool").to_string();
+            let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
             out.push(NormEvent::Tool {
-                name,
+                name: clean_tool_name(name),
                 summary: codex_call_summary(p.get("arguments")),
                 ts,
             });
@@ -279,7 +293,7 @@ fn parse_opencode_part(role: &str, data: &serde_json::Value, out: &mut Vec<NormE
         Some("tool") => {
             let name = data.get("tool").and_then(|t| t.as_str()).unwrap_or("tool");
             out.push(NormEvent::Tool {
-                name: name.to_string(),
+                name: clean_tool_name(name),
                 summary: summarize_tool(name, data.pointer("/state/input")),
                 ts: String::new(),
             });
@@ -462,6 +476,15 @@ mod tests {
                 NormEvent::Tool { name: "bash".into(), summary: "npm test".into(), ts: String::new() },
             ]
         );
+    }
+
+    #[test]
+    fn cleans_mcp_tool_prefixes() {
+        assert_eq!(clean_tool_name("mcp__weft_bus__bus_post"), "bus_post");
+        assert_eq!(clean_tool_name("weft_bus_bus_post"), "bus_post");
+        assert_eq!(clean_tool_name("weft_planner_propose_directions"), "propose_directions");
+        assert_eq!(clean_tool_name("Bash"), "Bash");
+        assert_eq!(clean_tool_name("exec_command"), "exec_command");
     }
 
     #[test]
