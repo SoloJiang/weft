@@ -57,7 +57,6 @@ export const zh = {
       "让 lead 读取仓库地图、提议如何把工作拆到各仓库——或你自己起草范围。创建任何 worktree 前都由你审阅确认。",
     planWithLead: "用 lead 规划",
     draftManually: "手动起草",
-    write: "写",
     nudge: "提醒:让这个 agent 查看 bus",
     runChecks: "运行该任务的检查(lint / type / test)",
     noChecks: "未推断出检查项",

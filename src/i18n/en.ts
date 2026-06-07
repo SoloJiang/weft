@@ -61,7 +61,6 @@ export const en = {
       "Let the lead read the repo map and propose how to split the work across repos — or draft the scope yourself. You review and confirm before any worktree is created.",
     planWithLead: "Plan with lead",
     draftManually: "Draft manually",
-    write: "write",
     nudge: "Nudge: tell this agent to check the bus",
     runChecks: "Run this task's checks (lint / type / test)",
     noChecks: "no checks inferred",

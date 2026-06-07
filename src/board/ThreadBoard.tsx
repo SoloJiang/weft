@@ -239,9 +239,6 @@ function DirectionCard({ direction }: { direction: Direction }) {
                 <span className="truncate text-[12px] text-ink">
                   {repo?.name ?? `repo ${w.repo_id}`}
                 </span>
-                <span className="rounded bg-bg px-1 py-px font-mono text-[9px] uppercase text-running">
-                  {t("thread.write")}
-                </span>
                 <span className="ml-auto flex items-center">
                   {sess ? (
                     <StatusDot status={sess.status as SessionStatus} />

@@ -224,11 +224,6 @@ function DirectionEditor({
                 <span className={cn("truncate text-[12px]", writes ? "text-ink" : "text-ink-muted")}>
                   {r.name}
                 </span>
-                {writes && (
-                  <span className="ml-auto rounded bg-running/15 px-1.5 py-0.5 font-mono text-[9px] uppercase text-running">
-                    {t("thread.write")}
-                  </span>
-                )}
               </button>
             </li>
           );
