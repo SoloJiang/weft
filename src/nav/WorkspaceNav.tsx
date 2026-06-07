@@ -28,7 +28,6 @@ export function WorkspaceNav() {
     workspaces,
     activeWorkspaceId,
     threads,
-    repos,
     selectWorkspace,
     backToWorkspace,
     needsByWorkspace,
@@ -126,7 +125,6 @@ export function WorkspaceNav() {
         <WsNavItem
           icon={FolderGit2}
           label={t("workspace.tabRepos")}
-          count={repos.length}
           active={onHome && homeTab === "repos"}
           onClick={() => {
             backToWorkspace();
