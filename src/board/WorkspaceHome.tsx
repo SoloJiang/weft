@@ -1,17 +1,15 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { Activity, FolderGit2, LayoutGrid, Plus } from "lucide-react";
+import { Activity, FolderGit2, LayoutGrid } from "lucide-react";
 import { useStore, type OpenSession } from "../state/store";
 import { api } from "../lib/api";
 import type { NormEvent } from "../lib/types";
-import { Button } from "../components/ui/Button";
 import { ToolIcon } from "../components/ToolIcon";
 import { RepoMapView } from "./RepoMapView";
 import { WorkspaceKanban } from "./WorkspaceKanban";
 import { RailToggle } from "../components/RailToggle";
 import { PermissionRow, AskRow } from "./NeedsYouView";
-import { AddRepoDialog, CreateThreadDialog } from "../nav/dialogs";
 import { cn } from "../lib/cn";
 
 /**
@@ -21,85 +19,22 @@ import { cn } from "../lib/cn";
  * rail now; this answers "what's happening right now".
  */
 export function WorkspaceHome() {
-  const { workspaces, activeWorkspaceId, repos, needs, asks, homeTab, setHomeTab } =
-    useStore();
+  const { homeTab } = useStore();
   const { t } = useTranslation();
-  const [newThread, setNewThread] = useState(false);
-  const [addRepo, setAddRepo] = useState(false);
-  const ws = workspaces.find((w) => w.id === activeWorkspaceId);
-  const needsCount = needs.length + asks.length;
-
-  const tabs = [
-    {
-      key: "board" as const,
-      label: t("thread.tabBoard"),
-      icon: LayoutGrid,
-      badge: null as { n: number; attn: boolean } | null,
-    },
-    {
-      key: "overview" as const,
-      label: t("workspace.tabOverview"),
-      icon: Activity,
-      badge: needsCount > 0 ? { n: needsCount, attn: true } : null,
-    },
-    {
-      key: "repos" as const,
-      label: t("workspace.tabRepos"),
-      icon: FolderGit2,
-      badge: repos.length > 0 ? { n: repos.length, attn: false } : null,
-    },
-  ];
+  const title =
+    homeTab === "board"
+      ? t("thread.tabBoard")
+      : homeTab === "overview"
+        ? t("workspace.tabOverview")
+        : t("workspace.tabRepos");
+  const Icon = homeTab === "board" ? LayoutGrid : homeTab === "overview" ? Activity : FolderGit2;
 
   return (
     <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
-      <header className="flex items-center gap-3 border-b border-border px-5 py-2.5">
+      <header className="flex items-center gap-2 border-b border-border px-5 py-2.5">
         <RailToggle />
-        <div className="flex shrink-0 items-center gap-1">
-          {tabs.map((tab) => {
-            const active = homeTab === tab.key;
-            return (
-              <button
-                key={tab.key}
-                onClick={() => setHomeTab(tab.key)}
-                className={cn(
-                  "relative flex items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-md)] px-2.5 py-1.5 text-[12.5px] transition-colors",
-                  active ? "text-ink" : "text-ink-faint hover:text-ink-muted",
-                )}
-              >
-                <tab.icon size={13} className={active ? "text-brand" : ""} />
-                {tab.label}
-                {tab.badge && (
-                  <span
-                    className={cn(
-                      "rounded-full px-1.5 text-[10px] font-semibold tabular-nums",
-                      tab.badge.attn
-                        ? "bg-waiting/20 text-waiting"
-                        : "bg-raised text-ink-faint",
-                    )}
-                  >
-                    {tab.badge.n}
-                  </span>
-                )}
-                {active && (
-                  <motion.span
-                    layoutId="home-tab"
-                    className="absolute inset-x-1.5 -bottom-[9px] h-[2px] rounded-full bg-brand"
-                  />
-                )}
-              </button>
-            );
-          })}
-        </div>
-        <div className="ml-auto flex shrink-0 items-center gap-2">
-          <Button variant="default" onClick={() => setAddRepo(true)} disabled={!ws}>
-            <Plus size={14} />
-            {t("dialog.addRepo")}
-          </Button>
-          <Button variant="primary" onClick={() => setNewThread(true)} disabled={!ws}>
-            <Plus size={14} />
-            {t("nav.newThread")}
-          </Button>
-        </div>
+        <Icon size={15} className="text-ink-faint" />
+        <h1 className="text-[14px] font-semibold tracking-tight text-ink">{title}</h1>
       </header>
 
       {homeTab === "board" ? (
@@ -109,9 +44,6 @@ export function WorkspaceHome() {
       ) : (
         <RepoMapView embedded />
       )}
-
-      <CreateThreadDialog open={newThread} onOpenChange={setNewThread} />
-      <AddRepoDialog open={addRepo} onOpenChange={setAddRepo} />
     </section>
   );
 }

@@ -107,17 +107,8 @@ export function ThreadBoard() {
 
   return (
     <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
-      <header className="flex items-center gap-4 border-b border-border px-5 py-2.5">
+      <header className="flex items-center gap-3 border-b border-border px-5 py-2.5">
         <RailToggle />
-        <div className="flex min-w-0 items-center gap-2">
-          <h1 className="truncate text-[15px] font-semibold tracking-tight text-ink">
-            {thread.title}
-          </h1>
-          <span className="shrink-0 rounded bg-surface px-1.5 py-0.5 font-mono text-[10px] uppercase text-ink-faint">
-            {t(`kind.${thread.kind}`, thread.kind)}
-          </span>
-        </div>
-
         <div className="flex shrink-0 items-center gap-1">
           {TABS.map((tb) => {
             const active = tab === tb.key;
@@ -150,6 +141,9 @@ export function ThreadBoard() {
         </div>
 
         <div className="ml-auto flex shrink-0 items-center gap-2">
+          <span className="rounded bg-surface px-1.5 py-0.5 font-mono text-[10px] uppercase text-ink-faint">
+            {t(`kind.${thread.kind}`, thread.kind)}
+          </span>
           <button
             onClick={() => setShowBus(!showBus)}
             className="flex items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-md)] border border-border px-2.5 py-1.5 text-[12px] text-ink-muted transition-colors hover:bg-surface hover:text-ink"

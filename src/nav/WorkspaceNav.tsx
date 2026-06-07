@@ -2,23 +2,39 @@ import { useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import * as DM from "@radix-ui/react-dropdown-menu";
-import { Check, ChevronDown, Moon, PanelLeftClose, Plus, Sun, Trash2 } from "lucide-react";
+import {
+  Activity,
+  Check,
+  ChevronDown,
+  FolderGit2,
+  LayoutGrid,
+  Moon,
+  PanelLeftClose,
+  Plus,
+  Sun,
+  Trash2,
+} from "lucide-react";
 import { useStore } from "../state/store";
 import { useTheme } from "../state/theme";
 import { setLang } from "../i18n";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
-import { CreateThreadDialog, CreateWorkspaceDialog } from "./dialogs";
+import { AddRepoDialog, CreateThreadDialog, CreateWorkspaceDialog } from "./dialogs";
 
 export function WorkspaceNav() {
   const {
     workspaces,
     activeWorkspaceId,
     threads,
+    repos,
     selectWorkspace,
     backToWorkspace,
     needsByWorkspace,
     setNavCollapsed,
+    homeTab,
+    setHomeTab,
+    activeThreadId,
+    showNeeds,
   } = useStore();
   const [dlg, setDlg] = useState<null | "ws" | "repo" | "thread">(null);
   const active = workspaces.find((w) => w.id === activeWorkspaceId);
@@ -27,6 +43,8 @@ export function WorkspaceNav() {
   const otherNeeds = workspaces.some(
     (w) => w.id !== activeWorkspaceId && (needsByWorkspace[w.id] ?? 0) > 0,
   );
+  // On the workspace home (no thread / session open) — for highlighting the views.
+  const onHome = activeThreadId == null && !showNeeds;
 
   return (
     <nav className="flex h-full w-72 shrink-0 flex-col border-r border-border bg-surface">
@@ -59,6 +77,42 @@ export function WorkspaceNav() {
       </div>
 
       <div className="mx-2 mb-1 border-t border-border" />
+
+      {/* workspace views — the home tabs, moved into the rail (Linear-style) */}
+      <ul className="flex flex-col gap-0.5 px-2 py-1">
+        <WsNavItem
+          icon={LayoutGrid}
+          label={t("thread.tabBoard")}
+          active={onHome && homeTab === "board"}
+          onClick={() => {
+            backToWorkspace();
+            setHomeTab("board");
+          }}
+        />
+        <WsNavItem
+          icon={Activity}
+          label={t("workspace.tabOverview")}
+          active={onHome && homeTab === "overview"}
+          onClick={() => {
+            backToWorkspace();
+            setHomeTab("overview");
+          }}
+        />
+        <WsNavItem
+          icon={FolderGit2}
+          label={t("workspace.tabRepos")}
+          count={repos.length}
+          active={onHome && homeTab === "repos"}
+          onClick={() => {
+            backToWorkspace();
+            setHomeTab("repos");
+          }}
+          onAdd={active ? () => setDlg("repo") : undefined}
+          addLabel={t("dialog.addRepo")}
+        />
+      </ul>
+
+      <div className="mx-2 my-1 border-t border-border" />
 
       <div className="flex items-center justify-between px-3 py-1.5">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
@@ -95,7 +149,59 @@ export function WorkspaceNav() {
 
       <CreateWorkspaceDialog open={dlg === "ws"} onOpenChange={(o) => !o && setDlg(null)} />
       <CreateThreadDialog open={dlg === "thread"} onOpenChange={(o) => !o && setDlg(null)} />
+      <AddRepoDialog open={dlg === "repo"} onOpenChange={(o) => !o && setDlg(null)} />
     </nav>
+  );
+}
+
+function WsNavItem({
+  icon: Icon,
+  label,
+  count,
+  active,
+  onClick,
+  onAdd,
+  addLabel,
+}: {
+  icon: typeof LayoutGrid;
+  label: string;
+  count?: number;
+  active: boolean;
+  onClick: () => void;
+  onAdd?: () => void;
+  addLabel?: string;
+}) {
+  return (
+    <li
+      className={cn(
+        "group flex items-center rounded-[var(--radius-md)] transition-colors",
+        active ? "bg-brand-ghost" : "hover:bg-brand-ghost",
+      )}
+    >
+      <button
+        onClick={onClick}
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-[13px]",
+          active ? "text-ink" : "text-ink-muted",
+        )}
+      >
+        <Icon size={14} className={active ? "text-brand" : "text-ink-faint"} />
+        <span className="truncate">{label}</span>
+        {count != null && count > 0 && (
+          <span className="ml-auto text-[10px] tabular-nums text-ink-faint">{count}</span>
+        )}
+      </button>
+      {onAdd && (
+        <button
+          onClick={onAdd}
+          aria-label={addLabel}
+          title={addLabel}
+          className="mr-1 grid h-6 w-6 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity hover:text-ink group-hover:opacity-100"
+        >
+          <Plus size={14} />
+        </button>
+      )}
+    </li>
   );
 }
 
