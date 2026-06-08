@@ -139,6 +139,10 @@ export const en = {
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",
     answerPlaceholder: "Answer {{name}}…",
     openDirection: "Open this task",
+    wantsToWrite: "wants to modify",
+    approveRun: "Approve & run",
+    approveRunTitle: "Create the worktree and start a worker",
+    denyWriteTitle: "Decline this change; tell the lead",
   },
   session: {
     back: "Back to board",

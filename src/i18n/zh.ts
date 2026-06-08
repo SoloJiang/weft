@@ -131,6 +131,10 @@ export const zh = {
       "当 agent 遇到只有你能拍板的决定时,会在这里发问。你回答一次,答复会直接回到它的收件箱,你无需去翻找会话。",
     answerPlaceholder: "回复 {{name}}…",
     openDirection: "打开这个任务",
+    wantsToWrite: "想修改",
+    approveRun: "批准并运行",
+    approveRunTitle: "创建 worktree 并拉起 worker",
+    denyWriteTitle: "拒绝这次改动;通知 lead",
   },
   session: {
     back: "返回看板",
