@@ -81,6 +81,50 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Watchdog caps in seconds, read once per session from env. 0 disables.
+fn idle_cap_secs() -> u64 {
+    env_secs("WEFT_IDLE_WATCHDOG_SECS", 1800)
+} // 30 min
+fn wall_cap_secs() -> u64 {
+    env_secs("WEFT_WALL_CAP_SECS", 7200)
+} // 2 h
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn human_dur(secs: u64) -> String {
+    if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}min", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Decide whether a session should be force-stopped. Pure → unit-tested.
+/// `has_open_ask` = the session is legitimately blocked on the human, so its
+/// silence is expected → never idle-kill. Wall-clock always applies.
+fn watchdog_verdict(
+    now: u64,
+    start: u64,
+    last_activity: u64,
+    wall_cap: u64,
+    idle_cap: u64,
+    has_open_ask: bool,
+) -> Option<String> {
+    if wall_cap > 0 && now.saturating_sub(start) >= wall_cap {
+        return Some(format!("ran for over {}", human_dur(wall_cap)));
+    }
+    if idle_cap > 0 && !has_open_ask && now.saturating_sub(last_activity) >= idle_cap {
+        return Some(format!("no activity for {}", human_dur(idle_cap)));
+    }
+    None
+}
+
 /// Agent-output language directive (ARCHITECTURE §4.8, layer 2). Appended to the
 /// lead prompt / worker brief so prose follows the operator's UI language; code
 /// and identifiers always stay English. Empty for English (the default).
@@ -523,4 +567,39 @@ async fn plan_with_lead_impl(
         cwd: cwd.to_string_lossy().to_string(),
         tool,
     })
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+    #[test]
+    fn wall_cap_fires_regardless_of_activity() {
+        assert!(watchdog_verdict(10_000, 0, 9_999, 7200, 1800, false)
+            .unwrap()
+            .contains("ran for over 2h"));
+    }
+    #[test]
+    fn idle_fires_when_silent_and_not_waiting_on_human() {
+        assert!(watchdog_verdict(5_000, 4_000, 3_000, 0, 1800, false)
+            .unwrap()
+            .contains("no activity"));
+    }
+    #[test]
+    fn idle_suppressed_while_waiting_on_human() {
+        assert_eq!(watchdog_verdict(5_000, 4_000, 3_000, 0, 1800, true), None);
+    }
+    #[test]
+    fn active_session_is_kept() {
+        assert_eq!(watchdog_verdict(1_000, 0, 999, 7200, 1800, false), None);
+    }
+    #[test]
+    fn zero_caps_disable_each_check() {
+        assert_eq!(watchdog_verdict(1_000_000, 0, 0, 0, 0, false), None);
+    }
+    #[test]
+    fn human_dur_formats() {
+        assert_eq!(human_dur(7200), "2h");
+        assert_eq!(human_dur(1800), "30min");
+        assert_eq!(human_dur(45), "45s");
+    }
 }
