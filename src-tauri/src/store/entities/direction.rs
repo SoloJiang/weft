@@ -14,6 +14,14 @@ pub struct Model {
     /// Reversible; weft never forces it (an open ask overlays Needs-you in the UI).
     #[sea_orm(default_value = "queued")]
     pub status: String,
+    /// The one repo this direction writes (scope rework, spec Part 1). FK into
+    /// repo_ref. 0 = unset (shouldn't happen for a confirmed write direction).
+    #[sea_orm(default_value = 0)]
+    pub repo_id: i32,
+    /// Why this repo must change — the lead's required justification, surfaced
+    /// in Needs-you and kept for audit.
+    #[sea_orm(default_value = "")]
+    pub reason: String,
     pub created_at: String,
 }
 

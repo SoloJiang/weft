@@ -13,7 +13,6 @@ import type {
   RepoGraph,
   RepoRef,
   ResolvedProposal,
-  Role,
   SessionInfo,
   Thread,
   ThreadOverview,
@@ -23,8 +22,7 @@ import type {
   WorktreeDiff,
 } from "./types";
 
-// Tauri converts camelCase command args to snake_case Rust params. Nested
-// structs (scope items) keep serde field names, hence `repo_id`/`role`.
+// Tauri converts camelCase command args to snake_case Rust params.
 
 export const api = {
   listWorkspaces: () => invoke<Workspace[]>("list_workspaces"),
@@ -75,8 +73,10 @@ export const api = {
     threadId: number,
     name: string,
     tool: string,
-    scope: { repo_id: number; role: Role }[],
-  ) => invoke<Direction>("create_direction", { threadId, name, tool, scope }),
+    repoId: number,
+    reason: string,
+  ) =>
+    invoke<Direction>("create_direction", { threadId, name, tool, repoId, reason }),
 
   listWorktrees: (directionId: number) =>
     invoke<Worktree[]>("list_worktrees", { directionId }),

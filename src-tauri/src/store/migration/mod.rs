@@ -14,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0002RepoProfile),
             Box::new(M0003Plan),
             Box::new(M0004DirectionStatus),
+            Box::new(M0005DirectionRepoReason),
         ]
     }
 }
@@ -159,5 +160,56 @@ impl MigrationTrait for M0004DirectionStatus {
                     .to_owned(),
             )
             .await
+    }
+}
+
+/// Adds the single write-repo id + reason columns to directions (scope rework,
+/// spec Part 1). M0001 reflects the current entity, so a FRESH db already has
+/// both; this only matters for dbs created before the columns existed. sqlite
+/// has no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0005DirectionRepoReason;
+
+impl MigrationName for M0005DirectionRepoReason {
+    fn name(&self) -> &str {
+        "m0005_direction_repo_reason"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0005DirectionRepoReason {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for col in [
+            ColumnDef::new(Alias::new("repo_id")).integer().not_null().default(0).to_owned(),
+            ColumnDef::new(Alias::new("reason")).string().not_null().default("").to_owned(),
+        ] {
+            let r = manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new("direction"))
+                        .add_column(col)
+                        .to_owned(),
+                )
+                .await;
+            match r {
+                Ok(()) => {}
+                Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for c in ["repo_id", "reason"] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new("direction"))
+                        .drop_column(Alias::new(c))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 }

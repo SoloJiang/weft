@@ -1,15 +1,16 @@
-//! Turn a direction's write-scope into git worktrees under the persistent
-//! worktree home, and record them. Read-scope mounting is M5; none-scope is
-//! never touched. Nothing is written into the canonical repo (architecture §2.1).
+//! Turn a direction's single bound write-repo into a git worktree under the
+//! persistent worktree home, and record it. Reads are unmanaged (agents read
+//! real repos directly). Nothing is written into the canonical repo (§2.1).
 
 use crate::store::{entities, repo, Db};
 use crate::{git, paths};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-/// For each write repo in `direction_id`, create a worktree at
-/// `<worktree_home>/<ws>/<thread>/<direction>/<repo>` on the direction's branch
-/// and record it. Idempotent: existing worktree rows/paths are reused.
+/// Create the one worktree for `direction_id`'s bound repo at
+/// `<worktree_home>/<ws>/<thread>/<direction>/<repo>` on the direction's branch.
+/// Idempotent: an existing worktree row/path is reused. Returns empty if the
+/// direction has no repo bound (shouldn't happen for a confirmed write direction).
 pub async fn materialize_direction(
     db: &Db,
     direction_id: i32,
@@ -28,35 +29,33 @@ pub async fn materialize_direction(
         .await?
         .context("workspace not found")?;
 
-    let home = paths::worktree_home()?;
-    let mut out = Vec::new();
-    for repo_ref in repo::direction_write_repos(db, direction_id).await? {
-        if let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
-            out.push(existing);
-            continue;
-        }
-        let path: PathBuf = home
-            .join(&ws.slug)
-            .join(&thread.slug)
-            .join(&dir.slug)
-            .join(&repo_ref.slug);
-        git::add_worktree(
-            std::path::Path::new(&repo_ref.local_git_path),
-            &dir.branch,
-            &path,
-        )
-        .with_context(|| format!("worktree for repo {}", repo_ref.name))?;
-        let rec = repo::record_worktree(
-            db,
-            repo_ref.id,
-            direction_id,
-            &dir.branch,
-            &path.to_string_lossy(),
-        )
-        .await?;
-        out.push(rec);
+    let Some(repo_ref) = repo::direction_repo_of(db, direction_id).await? else {
+        return Ok(Vec::new());
+    };
+    if let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
+        return Ok(vec![existing]);
     }
-    Ok(out)
+    let home = paths::worktree_home()?;
+    let path: PathBuf = home
+        .join(&ws.slug)
+        .join(&thread.slug)
+        .join(&dir.slug)
+        .join(&repo_ref.slug);
+    git::add_worktree(
+        std::path::Path::new(&repo_ref.local_git_path),
+        &dir.branch,
+        &path,
+    )
+    .with_context(|| format!("worktree for repo {}", repo_ref.name))?;
+    let rec = repo::record_worktree(
+        db,
+        repo_ref.id,
+        direction_id,
+        &dir.branch,
+        &path.to_string_lossy(),
+    )
+    .await?;
+    Ok(vec![rec])
 }
 
 /// Physically remove worktrees and their namespaced branches (called during

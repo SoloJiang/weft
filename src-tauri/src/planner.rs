@@ -13,15 +13,17 @@ use crate::store::{repo, Db};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// One proposed work line: a tool plus the repos it WRITES, by name. Reads are
-/// unmanaged (the change note "scope simplification"): an agent may read any
-/// file; only the write set is scoped, materialized, and confirmed.
+/// One proposed work line: a tool, the ONE repo it writes (by name), and the
+/// required reason it must change. Reads are unmanaged — agents read any repo
+/// freely (scope rework, spec Part 1).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedDirection {
     pub name: String,
     pub tool: String,
     #[serde(default)]
-    pub writes: Vec<String>,
+    pub repo: String,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,32 +48,24 @@ pub struct ScopeEntry {
 pub struct ResolvedDirection {
     pub name: String,
     pub tool: String,
-    /// The write set, resolved to workspace repos.
-    pub writes: Vec<ScopeEntry>,
+    /// The one write repo, resolved to a workspace repo.
+    pub repo: ScopeEntry,
+    pub reason: String,
 }
 
-/// Resolve one proposed direction's write-repo names to workspace repo ids.
-/// `repos` is (id, name) for the workspace; unknown names are kept with
-/// `known = false`, never silently dropped. Duplicates are de-duped.
+/// Resolve one proposed direction's write-repo name to a workspace repo id.
+/// `repos` is (id, name); an unknown name is kept with `known = false`.
 pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDirection {
-    let id_of = |name: &str| repos.iter().find(|(_, n)| n == name).map(|(id, _)| *id);
-    let mut writes = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for name in &dir.writes {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        let id = id_of(name);
-        writes.push(ScopeEntry {
-            repo_id: id.unwrap_or(-1),
-            repo_name: name.clone(),
-            known: id.is_some(),
-        });
-    }
+    let id = repos.iter().find(|(_, n)| *n == dir.repo).map(|(id, _)| *id);
     ResolvedDirection {
         name: dir.name.clone(),
         tool: dir.tool.clone(),
-        writes,
+        repo: ScopeEntry {
+            repo_id: id.unwrap_or(-1),
+            repo_name: dir.repo.clone(),
+            known: id.is_some(),
+        },
+        reason: dir.reason.clone(),
     }
 }
 
@@ -125,13 +119,12 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
     let mut created = Vec::new();
     for d in &resolved.directions {
-        let scope: Vec<(i32, String)> = d
-            .writes
-            .iter()
-            .filter(|s| s.known)
-            .map(|s| (s.repo_id, "write".to_string()))
-            .collect();
-        let dir = repo::create_direction(db, thread_id, &d.name, &d.tool, &scope).await?;
+        if !d.repo.known {
+            continue; // unknown repo name never resolved to a worktree-able repo
+        }
+        let dir =
+            repo::create_direction(db, thread_id, &d.name, &d.tool, d.repo.repo_id, &d.reason)
+                .await?;
         materialize::materialize_direction(db, dir.id).await?;
         created.push(dir.id);
     }
@@ -162,17 +155,17 @@ mod tests {
     }
 
     #[test]
-    fn resolves_write_names_to_ids() {
+    fn resolves_repo_name_to_id_with_reason() {
         let d = ProposedDirection {
             name: "Payments".into(),
             tool: "claude".into(),
-            writes: vec!["web-app".into(), "api".into()],
+            repo: "api".into(),
+            reason: "add the discount endpoint".into(),
         };
         let r = resolve(&d, &repos());
         assert_eq!(r.name, "Payments");
-        assert_eq!(r.writes.len(), 2);
-        assert_eq!(r.writes[0], ScopeEntry { repo_id: 1, repo_name: "web-app".into(), known: true });
-        assert_eq!(r.writes[1], ScopeEntry { repo_id: 2, repo_name: "api".into(), known: true });
+        assert_eq!(r.reason, "add the discount endpoint");
+        assert_eq!(r.repo, ScopeEntry { repo_id: 2, repo_name: "api".into(), known: true });
     }
 
     #[test]
@@ -180,33 +173,23 @@ mod tests {
         let d = ProposedDirection {
             name: "X".into(),
             tool: "codex".into(),
-            writes: vec!["ghost-repo".into()],
+            repo: "ghost-repo".into(),
+            reason: "whatever".into(),
         };
         let r = resolve(&d, &repos());
-        assert_eq!(r.writes.len(), 1);
-        assert!(!r.writes[0].known);
-        assert_eq!(r.writes[0].repo_id, -1);
-    }
-
-    #[test]
-    fn duplicate_write_is_deduped() {
-        let d = ProposedDirection {
-            name: "X".into(),
-            tool: "claude".into(),
-            writes: vec!["api".into(), "api".into()],
-        };
-        let r = resolve(&d, &repos());
-        assert_eq!(r.writes.len(), 1);
+        assert!(!r.repo.known);
+        assert_eq!(r.repo.repo_id, -1);
     }
 
     #[test]
     fn proposal_parses_with_missing_optional_fields() {
         let p: Proposal = serde_json::from_str(
-            r#"{ "directions": [ { "name": "no writes yet", "tool": "claude" } ] }"#,
+            r#"{ "directions": [ { "name": "wip", "tool": "claude" } ] }"#,
         )
         .unwrap();
         assert_eq!(p.rationale, "");
         assert_eq!(p.directions.len(), 1);
-        assert!(p.directions[0].writes.is_empty());
+        assert_eq!(p.directions[0].repo, "");
+        assert_eq!(p.directions[0].reason, "");
     }
 }

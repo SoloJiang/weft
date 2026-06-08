@@ -328,14 +328,15 @@ fn planner_specs() -> Value {
         },
         {
             "name": "propose_directions",
-            "description": "Propose how to split this task into parallel directions, each with the repos it WRITES (by name, from the repo map). Only the write set is scoped — an agent may read any repo freely, so don't list reads. The human reviews and confirms before any worktree is created.",
+            "description": "Propose how to split this task into directions. Each direction targets EXACTLY ONE repo it will modify (by name, from the repo map) and MUST include a `reason` explaining why that repo must change. Reads are free — an agent may read any repo without declaring it, so never list reads. To modify N repos, propose N directions. The human reviews each as a Needs-you card and approves before any worktree is created.",
             "inputSchema": { "type": "object", "properties": {
                 "rationale": str_prop(),
                 "directions": { "type": "array", "items": { "type": "object", "properties": {
                     "name": str_prop(),
                     "tool": str_prop(),
-                    "writes": { "type": "array", "items": str_prop() }
-                }, "required": ["name", "tool"] } }
+                    "repo": str_prop(),
+                    "reason": str_prop()
+                }, "required": ["name", "tool", "repo", "reason"] } }
             }, "required": ["directions"] }
         }
     ])

@@ -176,6 +176,7 @@ pub async fn upsert_repo_profile(
     Ok(a.save(&db.0).await?.try_into_model()?)
 }
 
+// NOTE: dormant — returns empty until direction_repo is removed in sub-plan 1d.
 pub async fn list_direction_repos(
     db: &Db,
     direction_id: i32,
@@ -193,13 +194,15 @@ pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::M
         .await?)
 }
 
-/// Create a direction with its per-repo scope. `scope` is (repo_id, role).
+/// Create a direction bound to exactly one write repo + a reason (scope rework,
+/// spec Part 1). The worktree is materialized separately by `materialize`.
 pub async fn create_direction(
     db: &Db,
     thread_id: i32,
     name: &str,
     tool: &str,
-    scope: &[(i32, String)],
+    repo_id: i32,
+    reason: &str,
 ) -> Result<direction::Model> {
     let t = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
@@ -225,21 +228,13 @@ pub async fn create_direction(
         tool: Set(tool.to_string()),
         branch: Set(branch),
         status: Set("queued".to_string()),
+        repo_id: Set(repo_id),
+        reason: Set(reason.to_string()),
         created_at: Set(now()),
         ..Default::default()
     }
     .insert(&db.0)
     .await?;
-    for (repo_id, role) in scope {
-        direction_repo::ActiveModel {
-            direction_id: Set(dir.id),
-            repo_id: Set(*repo_id),
-            role: Set(role.clone()),
-            ..Default::default()
-        }
-        .insert(&db.0)
-        .await?;
-    }
     Ok(dir)
 }
 
@@ -257,19 +252,16 @@ pub async fn set_direction_status(db: &Db, direction_id: i32, status: &str) -> R
     Ok(())
 }
 
-pub async fn direction_write_repos(db: &Db, direction_id: i32) -> Result<Vec<repo_ref::Model>> {
-    let links = direction_repo::Entity::find()
-        .filter(direction_repo::Column::DirectionId.eq(direction_id))
-        .filter(direction_repo::Column::Role.eq("write"))
-        .all(&db.0)
-        .await?;
-    let mut out = Vec::new();
-    for l in links {
-        if let Some(r) = repo_ref::Entity::find_by_id(l.repo_id).one(&db.0).await? {
-            out.push(r);
-        }
+/// The single write repo bound to a direction (scope rework). None if the
+/// direction has no repo set (repo_id = 0) or the repo row is gone.
+pub async fn direction_repo_of(db: &Db, direction_id: i32) -> Result<Option<repo_ref::Model>> {
+    let Some(d) = direction::Entity::find_by_id(direction_id).one(&db.0).await? else {
+        return Ok(None);
+    };
+    if d.repo_id == 0 {
+        return Ok(None);
     }
-    Ok(out)
+    Ok(repo_ref::Entity::find_by_id(d.repo_id).one(&db.0).await?)
 }
 
 pub async fn record_worktree(
@@ -398,17 +390,19 @@ mod tests {
         let t = create_thread(&db, ws.id, "Add login", "feature")
             .await
             .unwrap();
-        let dir = create_direction(&db, t.id, "main", "claude", &[(repo.id, "write".into())])
+        let dir = create_direction(&db, t.id, "main", "claude", repo.id, "build the feature")
             .await
             .unwrap();
         assert_eq!(dir.branch, "ws/demo-ws/add-login/main");
+        assert_eq!(dir.repo_id, repo.id);
+        assert_eq!(dir.reason, "build the feature");
 
         // pretend it was materialized
         record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt")
             .await
             .unwrap();
         assert_eq!(list_worktrees(&db, Some(dir.id)).await.unwrap().len(), 1);
-        assert!(direction_write_repos(&db, dir.id).await.unwrap().len() == 1);
+        assert!(direction_repo_of(&db, dir.id).await.unwrap().is_some());
 
         // cascade delete returns the path to clean and empties the rows
         let removed = delete_thread_cascade(&db, t.id).await.unwrap();
@@ -416,5 +410,32 @@ mod tests {
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
         assert_eq!(list_threads(&db, ws.id).await.unwrap().len(), 0);
         assert_eq!(list_worktrees(&db, None).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn direction_repo_of_none_when_unset() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "Demo WS").await.unwrap();
+        let t = create_thread(&db, ws.id, "Add login", "feature")
+            .await
+            .unwrap();
+        // A direction with repo_id == 0 (unset) has no bound write repo.
+        let dir = direction::ActiveModel {
+            thread_id: Set(t.id),
+            name: Set("main".to_string()),
+            slug: Set("main".to_string()),
+            tool: Set("claude".to_string()),
+            branch: Set("ws/demo-ws/add-login/main".to_string()),
+            status: Set("queued".to_string()),
+            repo_id: Set(0),
+            reason: Set(String::new()),
+            created_at: Set(now()),
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+        assert_eq!(dir.repo_id, 0);
+        assert!(direction_repo_of(&db, dir.id).await.unwrap().is_none());
     }
 }

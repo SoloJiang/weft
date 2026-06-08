@@ -80,7 +80,10 @@ pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
 
-    let write_repos = repo::direction_write_repos(db, direction_id).await?;
+    let write_repos: Vec<_> = repo::direction_repo_of(db, direction_id)
+        .await?
+        .into_iter()
+        .collect();
     let write_ids: Vec<i32> = write_repos.iter().map(|r| r.id).collect();
 
     let graph = curator::graph(db, thread.workspace_id).await?;

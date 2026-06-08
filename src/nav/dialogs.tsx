@@ -426,8 +426,11 @@ export function CreateDirectionDialog({
     setBusy(true);
     setErr(null);
     try {
-      const items = [...writes].map((id) => ({ repo_id: id, role: "write" as const }));
-      await createDirection(threadId, name.trim(), tool, items);
+      // TODO(1b): replaced by Needs-you writeTrigger card with required reason.
+      // A direction now binds exactly one write repo + reason; bridge the old
+      // multi-select by taking the first selected repo and an empty reason.
+      const repoId = [...writes][0];
+      await createDirection(threadId, name.trim(), tool, repoId, "");
       onOpenChange(false);
       setWrites(new Set());
       setName("main");

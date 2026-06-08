@@ -140,7 +140,8 @@ interface Store {
     threadId: number,
     name: string,
     tool: string,
-    scope: { repo_id: number; role: "write" | "read" }[],
+    repoId: number,
+    reason: string,
   ) => Promise<void>;
   deleteThread: (threadId: number) => Promise<void>;
 
@@ -470,9 +471,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       threadId: number,
       name: string,
       tool: string,
-      scope: { repo_id: number; role: "write" | "read" }[],
+      repoId: number,
+      reason: string,
     ) => {
-      const dir = await api.createDirection(threadId, name, tool, scope);
+      const dir = await api.createDirection(threadId, name, tool, repoId, reason);
       await loadThreadChildren(threadId);
       void dispatchDirection(dir.id);
     },

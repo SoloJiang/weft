@@ -157,7 +157,7 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
         let dirs = repo::list_directions(&db, t.id).await.map_err(e)?;
         let mut seen = std::collections::BTreeMap::<i32, String>::new();
         for d in &dirs {
-            for r in repo::direction_write_repos(&db, d.id).await.map_err(e)? {
+            if let Some(r) = repo::direction_repo_of(&db, d.id).await.map_err(e)? {
                 seen.entry(r.id).or_insert(r.name);
             }
         }
@@ -259,20 +259,18 @@ pub async fn list_direction_repos(
     repo::list_direction_repos(&db, direction_id).await.map_err(e)
 }
 
-/// scope: list of { repoId, role } from the frontend.
-#[derive(serde::Deserialize)]
-pub struct ScopeItem { pub repo_id: i32, pub role: String }
-
 #[tauri::command]
 pub async fn create_direction(
     db: State<'_, Db>,
     thread_id: i32,
     name: String,
     tool: String,
-    scope: Vec<ScopeItem>,
+    repo_id: i32,
+    reason: String,
 ) -> R<entities::direction::Model> {
-    let scope: Vec<(i32, String)> = scope.into_iter().map(|s| (s.repo_id, s.role)).collect();
-    let dir = repo::create_direction(&db, thread_id, &name, &tool, &scope).await.map_err(e)?;
+    let dir = repo::create_direction(&db, thread_id, &name, &tool, repo_id, &reason)
+        .await
+        .map_err(e)?;
     materialize::materialize_direction(&db, dir.id).await.map_err(e)?;
     Ok(dir)
 }
