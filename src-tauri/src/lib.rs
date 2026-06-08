@@ -103,7 +103,6 @@ pub fn run() {
             commands::confirm_proposal,
             commands::preview_brief,
             commands::verify_direction,
-            commands::list_direction_repos,
             commands::create_direction,
             commands::list_worktrees,
             commands::repo_diff,

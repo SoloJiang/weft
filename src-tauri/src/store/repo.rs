@@ -1,7 +1,7 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    direction, direction_repo, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
+    direction, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
 };
 use super::Db;
 use crate::slug::unique_slug;
@@ -176,17 +176,6 @@ pub async fn upsert_repo_profile(
     Ok(a.save(&db.0).await?.try_into_model()?)
 }
 
-// NOTE: dormant — returns empty until direction_repo is removed in sub-plan 1d.
-pub async fn list_direction_repos(
-    db: &Db,
-    direction_id: i32,
-) -> Result<Vec<direction_repo::Model>> {
-    Ok(direction_repo::Entity::find()
-        .filter(direction_repo::Column::DirectionId.eq(direction_id))
-        .all(&db.0)
-        .await?)
-}
-
 pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::Model>> {
     Ok(direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
@@ -323,10 +312,6 @@ pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, 
         }
         session::Entity::delete_many()
             .filter(session::Column::DirectionId.eq(d.id))
-            .exec(&db.0)
-            .await?;
-        direction_repo::Entity::delete_many()
-            .filter(direction_repo::Column::DirectionId.eq(d.id))
             .exec(&db.0)
             .await?;
         direction::Entity::delete_by_id(d.id).exec(&db.0).await?;

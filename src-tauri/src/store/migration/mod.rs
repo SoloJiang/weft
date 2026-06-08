@@ -1,5 +1,5 @@
 use crate::store::entities::{
-    direction, direction_repo, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
+    direction, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -15,6 +15,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0003Plan),
             Box::new(M0004DirectionStatus),
             Box::new(M0005DirectionRepoReason),
+            Box::new(M0006DropDirectionRepo),
         ]
     }
 }
@@ -44,7 +45,6 @@ impl MigrationTrait for M0001Init {
         manager.create_table(Self::table(&schema, repo_ref::Entity)).await?;
         manager.create_table(Self::table(&schema, thread::Entity)).await?;
         manager.create_table(Self::table(&schema, direction::Entity)).await?;
-        manager.create_table(Self::table(&schema, direction_repo::Entity)).await?;
         manager.create_table(Self::table(&schema, worktree::Entity)).await?;
         manager.create_table(Self::table(&schema, session::Entity)).await?;
         Ok(())
@@ -52,7 +52,7 @@ impl MigrationTrait for M0001Init {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for t in [
-            "session", "worktree", "direction_repo", "direction", "thread", "repo_ref", "workspace",
+            "session", "worktree", "direction", "thread", "repo_ref", "workspace",
         ] {
             manager
                 .drop_table(Table::drop().table(Alias::new(t)).to_owned())
@@ -210,6 +210,36 @@ impl MigrationTrait for M0005DirectionRepoReason {
                 )
                 .await?;
         }
+        Ok(())
+    }
+}
+
+/// Drops the now-unused direction_repo table (scope rework: a direction
+/// binds a single repo via direction.repo_id). Fresh DBs never created it
+/// (M0001 no longer does), so tolerate "no such table".
+pub struct M0006DropDirectionRepo;
+
+impl MigrationName for M0006DropDirectionRepo {
+    fn name(&self) -> &str {
+        "m0006_drop_direction_repo"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0006DropDirectionRepo {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .drop_table(Table::drop().table(Alias::new("direction_repo")).to_owned())
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("no such table") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Irreversible: the table is gone for good. No-op.
         Ok(())
     }
 }

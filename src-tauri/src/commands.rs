@@ -252,14 +252,6 @@ pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<Rep
 }
 
 #[tauri::command]
-pub async fn list_direction_repos(
-    db: State<'_, Db>,
-    direction_id: i32,
-) -> R<Vec<entities::direction_repo::Model>> {
-    repo::list_direction_repos(&db, direction_id).await.map_err(e)
-}
-
-#[tauri::command]
 pub async fn create_direction(
     db: State<'_, Db>,
     thread_id: i32,

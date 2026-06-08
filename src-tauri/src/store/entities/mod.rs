@@ -1,5 +1,4 @@
 pub mod direction;
-pub mod direction_repo;
 pub mod plan;
 pub mod repo_profile;
 pub mod repo_ref;
