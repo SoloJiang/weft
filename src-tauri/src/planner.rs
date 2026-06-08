@@ -359,6 +359,9 @@ mod tests {
 
     #[tokio::test]
     async fn approve_deny_pending_against_db() {
+        // Hold the shared env lock for the whole window WEFT_HOME is set, so the
+        // default-home paths test can't observe our override. Panic-tolerant.
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = format!("weft-planner-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
