@@ -5,6 +5,7 @@ import {
   ArrowUpRight,
   Check,
   CheckCheck,
+  GitBranch,
   HelpCircle,
   Layers,
   Send,
@@ -13,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { useStore } from "../state/store";
-import type { NeedItem, PermissionAsk } from "../lib/types";
+import type { NeedItem, PermissionAsk, WriteTrigger } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import type { TFunction } from "i18next";
@@ -25,10 +26,10 @@ import type { TFunction } from "i18next";
  * back to the asking direction's inbox.
  */
 export function NeedsYouView() {
-  const { needs, asks } = useStore();
+  const { needs, asks, writeTriggers } = useStore();
   const { t } = useTranslation();
   const reduce = useReducedMotion();
-  const total = needs.length + asks.length;
+  const total = needs.length + asks.length + writeTriggers.length;
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -55,6 +56,18 @@ export function NeedsYouView() {
         ) : (
           <div className="mx-auto flex w-full max-w-[680px] flex-col gap-2.5 px-5 py-5">
             <AnimatePresence initial={false}>
+              {writeTriggers.map((wt) => (
+                <motion.div
+                  key={`wt-${wt.thread_id}-${wt.index}`}
+                  layout={!reduce}
+                  initial={reduce ? false : { opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reduce ? { opacity: 0 } : { opacity: 0, height: 0, marginBottom: -10, scale: 0.98 }}
+                  transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                >
+                  <WriteTriggerRow item={wt} />
+                </motion.div>
+              ))}
               {asks.map((ask) => (
                 <motion.div
                   key={`ask-${ask.id}`}
@@ -88,6 +101,67 @@ export function NeedsYouView() {
         )}
       </div>
     </section>
+  );
+}
+
+export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
+  const { approveWriteTrigger, denyWriteTrigger, selectThread } = useStore();
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const context = [item.thread_title, item.name].filter(Boolean).join(" · ");
+
+  async function act(fn: () => Promise<void>) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await fn();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="overflow-hidden rounded-[var(--radius-lg)] border border-approval/40 bg-surface">
+      <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
+        <GitBranch size={13} className="shrink-0 text-approval" />
+        <span className="text-ink-faint">{t("needs.wantsToWrite")}</span>
+        <span className="font-mono font-medium text-ink">{item.repo_name}</span>
+        {context && (
+          <button
+            onClick={() => void selectThread(item.thread_id)}
+            title={t("needs.openDirection")}
+            className="group ml-auto flex min-w-0 items-center gap-1.5 text-ink-faint transition-colors hover:text-ink"
+          >
+            <Layers size={11} className="shrink-0" />
+            <span className="truncate">{context}</span>
+          </button>
+        )}
+      </div>
+      <p className="px-3.5 pb-1 pt-1.5 text-[14px] leading-relaxed text-ink">
+        {item.reason}
+      </p>
+      <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
+        <Button
+          variant="primary"
+          disabled={busy}
+          title={t("needs.approveRunTitle")}
+          onClick={() => void act(() => approveWriteTrigger(item))}
+        >
+          <Check size={13} />
+          {t("needs.approveRun")}
+        </Button>
+        <Button
+          variant="ghost"
+          className="ml-auto"
+          disabled={busy}
+          title={t("needs.denyWriteTitle")}
+          onClick={() => void act(() => denyWriteTrigger(item))}
+        >
+          <X size={13} />
+          {t("common.deny")}
+        </Button>
+      </div>
+    </div>
   );
 }
 
