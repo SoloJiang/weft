@@ -190,13 +190,13 @@ function Toggle({
       aria-label={label}
       onClick={() => onChange(!on)}
       className={cn(
-        "relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors",
+        "mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full border-0 p-0 transition-colors",
         on ? "bg-waiting" : "bg-border-strong",
       )}
     >
       <span
         className={cn(
-          "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform",
+          "inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-150",
           on ? "translate-x-[18px]" : "translate-x-0.5",
         )}
       />
