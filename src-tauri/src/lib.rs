@@ -22,6 +22,7 @@ mod coordinator;
 mod curator;
 mod detect;
 mod drivers;
+mod gc;
 mod inspect;
 mod planner;
 pub mod profile;
@@ -82,6 +83,7 @@ pub fn run() {
         .manage(BusBase(bus_base))
         .setup(move |app| {
             coordinator::run(app.handle().clone(), wake_rx);
+            gc::spawn_periodic(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
