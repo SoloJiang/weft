@@ -1,6 +1,7 @@
-//! Detect which coding-agent CLIs are installed locally, so Settings can offer a
-//! sensible default tool and flag missing ones. Resolution mirrors how sessions
-//! spawn (the app's PATH), so "installed" means "weft can actually run it".
+//! Detect which coding-agent CLIs are installed locally (Settings display + the
+//! default-tool picker). Resolution goes through detect.rs so it matches how
+//! sessions spawn (PATH, augmented from the login shell at startup) and includes
+//! the Codex app-bundle fallback.
 
 use serde::Serialize;
 
@@ -9,23 +10,39 @@ pub struct ToolStatus {
     pub tool: String,
     pub installed: bool,
     pub version: Option<String>,
+    pub path: Option<String>,
+    pub meets_min: bool,
 }
 
 const TOOLS: [&str; 3] = ["claude", "codex", "opencode"];
 
 fn probe(tool: &str) -> ToolStatus {
-    match std::process::Command::new(tool).arg("--version").output() {
-        Ok(o) if o.status.success() => {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            let version = raw.trim().lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            ToolStatus { tool: tool.to_string(), installed: true, version }
-        }
-        _ => ToolStatus { tool: tool.to_string(), installed: false, version: None },
+    let Some(path) = crate::detect::resolve_tool_path(tool) else {
+        return ToolStatus { tool: tool.into(), installed: false, version: None, path: None, meets_min: true };
+    };
+    let version = std::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let meets_min = version.as_deref().map(|v| crate::detect::meets_min(tool, v)).unwrap_or(true);
+    ToolStatus {
+        tool: tool.into(),
+        installed: true,
+        version,
+        path: Some(path.to_string_lossy().to_string()),
+        meets_min,
     }
 }
 
-/// Probe each known CLI's `--version`. Best-effort; a missing binary just reports
-/// installed=false. Runs off the async runtime since it shells out.
 #[tauri::command]
 pub async fn detect_tools() -> Result<Vec<ToolStatus>, String> {
     tokio::task::spawn_blocking(|| TOOLS.iter().map(|t| probe(t)).collect::<Vec<_>>())
