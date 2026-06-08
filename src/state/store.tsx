@@ -734,9 +734,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
-      const dirId = await api.approveWriteTrigger(item.thread_id, item.index);
-      void dispatchDirection(dirId);
-      await refreshNeeds();
+      try {
+        const dirId = await api.approveWriteTrigger(item.thread_id, item.index);
+        void dispatchDirection(dirId);
+      } finally {
+        await refreshNeeds();
+      }
     },
     [dispatchDirection, refreshNeeds],
   );
@@ -746,8 +749,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
-      await api.denyWriteTrigger(item.thread_id, item.index);
-      await refreshNeeds();
+      try {
+        await api.denyWriteTrigger(item.thread_id, item.index);
+      } finally {
+        await refreshNeeds();
+      }
     },
     [refreshNeeds],
   );
