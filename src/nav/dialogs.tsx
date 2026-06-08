@@ -406,33 +406,22 @@ export function CreateDirectionDialog({
   const { t } = useTranslation();
   const [name, setName] = useState("main");
   const [tool, setTool] = useState(defaultTool);
-  const [writes, setWrites] = useState<Set<number>>(new Set());
+  const [repoId, setRepoId] = useState<number | null>(null);
+  const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const writeCount = writes.size;
-
-  function toggle(repoId: number) {
-    setWrites((cur) => {
-      const next = new Set(cur);
-      if (next.has(repoId)) next.delete(repoId);
-      else next.add(repoId);
-      return next;
-    });
-  }
+  const ready = !!name.trim() && repoId != null && !!reason.trim();
 
   async function submit() {
-    if (!name.trim() || busy || writeCount === 0) return;
+    if (!ready || busy || repoId == null) return;
     setBusy(true);
     setErr(null);
     try {
-      // TODO(1b): replaced by Needs-you writeTrigger card with required reason.
-      // A direction now binds exactly one write repo + reason; bridge the old
-      // multi-select by taking the first selected repo and an empty reason.
-      const repoId = [...writes][0];
-      await createDirection(threadId, name.trim(), tool, repoId, "");
+      await createDirection(threadId, name.trim(), tool, repoId, reason.trim());
       onOpenChange(false);
-      setWrites(new Set());
+      setRepoId(null);
+      setReason("");
       setName("main");
     } catch (e) {
       setErr(String(e));
@@ -482,7 +471,7 @@ export function CreateDirectionDialog({
 
           <div className="flex flex-col gap-1.5">
             <span className="text-[12px] font-medium text-ink-muted">
-              {t("dialog.writes")}
+              {t("dialog.writeRepo")}
             </span>
             {repos.length === 0 ? (
               <p className="rounded-[var(--radius-md)] border border-dashed border-border px-3 py-4 text-center text-[12px] text-ink-faint">
@@ -491,12 +480,12 @@ export function CreateDirectionDialog({
             ) : (
               <div className="flex flex-col gap-0.5 rounded-[var(--radius-md)] border border-border bg-bg/50 p-1">
                 {repos.map((r) => {
-                  const on = writes.has(r.id);
+                  const on = repoId === r.id;
                   return (
                     <button
                       key={r.id}
                       type="button"
-                      onClick={() => toggle(r.id)}
+                      onClick={() => setRepoId(r.id)}
                       className={cn(
                         "flex items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-left transition-colors",
                         on ? "bg-running/10" : "hover:bg-raised",
@@ -504,7 +493,7 @@ export function CreateDirectionDialog({
                     >
                       <span
                         className={cn(
-                          "grid h-4 w-4 shrink-0 place-items-center rounded border transition-colors",
+                          "grid h-4 w-4 shrink-0 place-items-center rounded-full border transition-colors",
                           on
                             ? "border-running bg-running/20 text-running"
                             : "border-border text-transparent",
@@ -523,26 +512,29 @@ export function CreateDirectionDialog({
                 })}
               </div>
             )}
-            <span className="text-[11px] text-ink-faint">{t("dialog.writesHint")}</span>
+            <span className="text-[11px] text-ink-faint">{t("dialog.writeRepoHint")}</span>
           </div>
 
+          <Field label={t("dialog.reason")}>
+            <Input
+              placeholder={t("dialog.reasonPlaceholder")}
+              value={reason}
+              onChange={(e) => setReason(e.currentTarget.value)}
+            />
+          </Field>
+
           {err && <p className="text-[12px] text-danger">{err}</p>}
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[11px] text-ink-faint">
-              {t("dialog.writeRepos", { count: writeCount })}
-            </span>
-            <div className="flex gap-2">
-              <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
-                {t("common.cancel")}
-              </Button>
-              <Button
-                type="submit"
-                variant="primary"
-                disabled={!name.trim() || busy || writeCount === 0}
-              >
-                {busy ? t("dialog.materializing") : t("dialog.createDirection")}
-              </Button>
-            </div>
+          <div className="flex items-center justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={!ready || busy}
+            >
+              {busy ? t("dialog.materializing") : t("dialog.createDirection")}
+            </Button>
           </div>
         </form>
       </DialogContent>

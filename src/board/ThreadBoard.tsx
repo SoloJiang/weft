@@ -21,7 +21,6 @@ import { CreateDirectionDialog } from "../nav/dialogs";
 import { RailToggle } from "../components/RailToggle";
 import { BusDrawer } from "./BusDrawer";
 import { LeadTab } from "../session/LeadTab";
-import { ScopeConfirmView } from "./ScopeConfirmView";
 import { cn } from "../lib/cn";
 
 const TOOL_LABEL: Record<string, string> = {
@@ -47,7 +46,6 @@ export function ThreadBoard() {
     threads,
     activeThreadId,
     directionsByThread,
-    repos,
     proposal,
     reviewingProposal,
     setReviewingProposal,
@@ -165,10 +163,6 @@ export function ThreadBoard() {
       <div className="flex min-h-0 flex-1 flex-col">
         {tab === "lead" ? (
           <LeadTab onReview={() => setTab("board")} />
-        ) : reviewing && proposal ? (
-          <div className="min-h-0 flex-1 overflow-auto">
-            <ScopeConfirmView proposal={proposal} repos={repos} taskTitle={thread.title} />
-          </div>
         ) : dirs.length === 0 ? (
           <EmptyDiscuss onTalk={() => setTab("lead")} />
         ) : (
