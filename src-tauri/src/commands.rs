@@ -376,6 +376,68 @@ pub async fn needs_you(
     Ok(items)
 }
 
+/// One pending write declaration waiting on the human, with thread context.
+#[derive(serde::Serialize)]
+pub struct WriteTrigger {
+    pub thread_id: i32,
+    pub thread_title: String,
+    pub index: usize,
+    pub name: String,
+    pub repo_name: String,
+    pub reason: String,
+}
+
+/// Every pending write declaration across the workspace's threads — the
+/// data behind the Needs-you "approve a write" cards.
+#[tauri::command]
+pub async fn write_triggers(
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<Vec<WriteTrigger>> {
+    let threads = repo::list_threads(&db, workspace_id).await.map_err(e)?;
+    let mut out = Vec::new();
+    for t in threads {
+        for p in crate::planner::pending_writes(&db, t.id).await.map_err(e)? {
+            out.push(WriteTrigger {
+                thread_id: t.id,
+                thread_title: t.title.clone(),
+                index: p.index,
+                name: p.name,
+                repo_name: p.repo_name,
+                reason: p.reason,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Approve a write declaration: create its direction + materialize. Returns the
+/// new direction id so the caller can dispatch a worker.
+#[tauri::command]
+pub async fn approve_write_trigger(
+    db: State<'_, Db>,
+    thread_id: i32,
+    index: usize,
+) -> R<i32> {
+    crate::planner::approve_direction(&db, thread_id, index).await.map_err(e)
+}
+
+/// Deny a write declaration: mark denied + relay to the lead's bus inbox.
+#[tauri::command]
+pub async fn deny_write_trigger(
+    db: State<'_, Db>,
+    bus: tauri::State<'_, crate::bus::BusRegistry>,
+    thread_id: i32,
+    index: usize,
+) -> R<()> {
+    let (name, repo) = crate::planner::deny_direction(&db, thread_id, index).await.map_err(e)?;
+    let msg = format!(
+        "The human DENIED the write declaration \"{name}\" (repo {repo}). Do not create it; revise the plan or ask why.",
+    );
+    bus.post(thread_id, crate::bus::HUMAN, "lead", &msg, "message");
+    Ok(())
+}
+
 /// Answer an open ask; the reply lands in the asking direction's bus inbox.
 #[tauri::command]
 pub fn answer_ask(
@@ -430,6 +492,7 @@ pub async fn workspace_needs_counts(
         let mut count: u32 = 0;
         for t in &threads {
             count += bus.open_asks(t.id).len() as u32;
+            count += crate::planner::pending_writes(&db, t.id).await.map_err(e)?.len() as u32;
         }
         count += open_asks.iter().filter(|a| tids.contains(&a.thread)).count() as u32;
         out.push((w.id, count));
