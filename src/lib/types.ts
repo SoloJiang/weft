@@ -136,8 +136,20 @@ export type LeadChatPush =
   | { type: "message"; thread_id: number; message: LeadMessage }
   | { type: "delta"; thread_id: number; message_id: number; text: string }
   | { type: "finalize"; thread_id: number; message_id: number; status: string }
-  | { type: "turn"; thread_id: number; state: "busy" | "idle" | "stopped"; queued: number }
-  | { type: "init"; thread_id: number; native_id: string; slash_commands: string[] };
+  | {
+      type: "turn";
+      thread_id: number;
+      session_id: number | null;
+      state: "busy" | "idle" | "stopped";
+      queued: number;
+    }
+  | {
+      type: "init";
+      thread_id: number;
+      session_id: number | null;
+      native_id: string;
+      slash_commands: string[];
+    };
 
 /** Snapshot of the lead engine, for mount-time hydration. */
 export interface LeadStateInfo {

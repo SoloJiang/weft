@@ -47,6 +47,8 @@ export interface OpenSession {
   nativeId: string | null;
   /** worker = a task's session; lead = the thread's persistent conversation */
   kind: "worker" | "lead";
+  /** chat = driven by the chat engine (claude); pty = embedded native TUI. */
+  mode?: "chat" | "pty";
 }
 
 interface Store {
@@ -75,6 +77,9 @@ interface Store {
   sendLeadChat: (threadId: number, text: string) => Promise<void>;
   /** Interrupt the lead's current turn. */
   interruptLead: (threadId: number) => Promise<void>;
+  /** Chat-mode worker engine state, keyed by session id. */
+  workerTurn: Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>;
+  workerSlash: Record<number, string[]>;
   /** Send a composed message into any session's PTY (bracketed paste + enter). */
   sendToSession: (sessionId: number, text: string) => Promise<void>;
   /** The thread-bus drawer (demoted from a permanent rail). */
@@ -472,6 +477,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
+  // claude workers run on the chat engine (chat-first); codex/opencode keep the
+  // PTY+TUI path untouched — fast codex spawn and deep links stay as they were.
+  const toolOfDirection = useCallback(
+    (directionId: number) =>
+      Object.values(directionsByThread)
+        .flat()
+        .find((d) => d.id === directionId)?.tool,
+    [directionsByThread],
+  );
+
   // Spawn (or focus) a worker for a (direction, repo) slot. focus=true opens it
   // full-screen (a click); focus=false dispatches it in the background.
   const spawnWorker = useCallback(
@@ -487,19 +502,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         return;
       }
-      const info = await api.openSession(directionId, repoId, currentLang());
+      const chat = toolOfDirection(directionId) === "claude";
+      const info = chat
+        ? await api.chatOpenWorker(directionId, repoId, currentLang())
+        : await api.openSession(directionId, repoId, currentLang());
       lastOutputRef.current[info.session_id] = Date.now();
       autoCheckedRef.current.delete(directionId);
       setSessions((m) => ({
         ...m,
         [info.session_id]: {
           info,
-          status: "starting",
+          status: chat ? "running" : "starting",
           directionId,
           repoId,
           threadId: activeThreadId ?? -1,
-          nativeId: null,
+          nativeId: info.native_id,
           kind: "worker",
+          mode: chat ? "chat" : "pty",
         },
       }));
       if (focus) {
@@ -508,7 +527,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setHomeTab("board");
       }
     },
-    [activeThreadId],
+    [activeThreadId, toolOfDirection],
   );
 
   const viewDirection = useCallback((directionId: number, repoId: number) => {
@@ -539,7 +558,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
         return;
       }
-      const info = await api.driveSession(directionId, repoId, currentLang());
+      const chat = toolOfDirection(directionId) === "claude";
+      const info = chat
+        ? await api.chatOpenWorker(directionId, repoId, currentLang())
+        : await api.driveSession(directionId, repoId, currentLang());
       lastOutputRef.current[info.session_id] = Date.now();
       autoCheckedRef.current.delete(directionId);
       setSessions((m) => {
@@ -552,12 +574,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           ...pruned,
           [info.session_id]: {
             info,
-            status: info.resumed ? "running" : "starting",
+            status: chat || info.resumed ? "running" : "starting",
             directionId,
             repoId,
             threadId: activeThreadId ?? -1,
             nativeId: info.native_id,
             kind: "worker",
+            mode: chat ? "chat" : "pty",
           },
         };
       });
@@ -567,7 +590,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setHomeTab("board");
       }
     },
-    [activeThreadId],
+    [activeThreadId, toolOfDirection],
   );
 
   // Automation-first (§4 principle 7): once a task is materialized, dispatch its
@@ -634,11 +657,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
   >({});
   const [leadSlash, setLeadSlash] = useState<Record<number, string[]>>({});
+  const [workerTurn, setWorkerTurn] = useState<
+    Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
+  >({});
+  const [workerSlash, setWorkerSlash] = useState<Record<number, string[]>>({});
 
   useEffect(() => {
     const un = listen<LeadChatPush>("lead-chat", (e) => {
       const p = e.payload;
       if (p.type === "message") {
+        // Chat workers have no PTY output; their timeline activity feeds the
+        // same idle clock the auto-verify loop watches.
+        if (p.message.session_id != null) {
+          lastOutputRef.current[p.message.session_id] = Date.now();
+        }
         setLeadMessages((m) => {
           const list = m[p.thread_id] ?? [];
           if (list.some((x) => x.id === p.message.id)) return m;
@@ -668,12 +700,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           ),
         }));
       } else if (p.type === "turn") {
-        setLeadTurn((t) => ({
-          ...t,
-          [p.thread_id]: { state: p.state, queued: p.queued },
-        }));
+        if (p.session_id != null) {
+          const sid = p.session_id;
+          lastOutputRef.current[sid] = Date.now();
+          setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queued: p.queued } }));
+          setSessions((m) =>
+            m[sid]
+              ? {
+                  ...m,
+                  [sid]: {
+                    ...m[sid],
+                    status:
+                      p.state === "busy" ? "running" : p.state === "idle" ? "idle" : "exited",
+                  },
+                }
+              : m,
+          );
+        } else {
+          setLeadTurn((t) => ({
+            ...t,
+            [p.thread_id]: { state: p.state, queued: p.queued },
+          }));
+        }
       } else if (p.type === "init") {
-        setLeadSlash((s) => ({ ...s, [p.thread_id]: p.slash_commands }));
+        if (p.session_id != null) {
+          const sid = p.session_id;
+          setWorkerSlash((s) => ({ ...s, [sid]: p.slash_commands }));
+          setSessions((m) =>
+            m[sid] ? { ...m, [sid]: { ...m[sid], nativeId: p.native_id } } : m,
+          );
+        } else {
+          setLeadSlash((s) => ({ ...s, [p.thread_id]: p.slash_commands }));
+        }
       }
     });
     return () => {
@@ -1127,6 +1185,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     loadLeadChat,
     sendLeadChat,
     interruptLead,
+    workerTurn,
+    workerSlash,
     sendToSession,
     showBus,
     setShowBus,

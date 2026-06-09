@@ -260,6 +260,7 @@ export const zh = {
     kill: "终止",
     clickToInteract: "点击进入交互",
     message: "给这个 agent 发消息…",
+    chatStopped: "worker 引擎已停止 · 发送消息会自动续上",
     resumeMenu: "恢复…",
     interacting: "交互中",
     backToReadonly: "返回只读",

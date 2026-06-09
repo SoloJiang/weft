@@ -178,6 +178,145 @@ pub async fn list_lead_messages(
     Ok(msgs)
 }
 
+// ───────────────────── chat-mode workers (phase 2) ─────────────────────
+//
+// Claude workers can run on the same engine: chat timeline in the SessionView
+// instead of a PTY TUI. codex/opencode workers keep the existing PTY path
+// untouched (fast codex spawn + deep links stay), and every session — chat or
+// PTY — remains takeover-able in the user's own terminal via its native id.
+
+/// Spawn (or resume) a chat-mode claude worker for a (direction, repo) slot.
+/// Mirrors `open_session_impl`'s wiring: worktree cwd, thread-bus MCP + ask
+/// bridge, the assembled brief — but the brief goes in as the first user
+/// message of a weft-owned conversation instead of a PTY seed.
+#[tauri::command]
+pub async fn chat_open_worker(
+    app: AppHandle,
+    db: State<'_, Db>,
+    direction_id: i32,
+    repo_id: i32,
+    lang: Option<String>,
+) -> Result<crate::pty::SessionInfo, String> {
+    chat_open_worker_impl(&app, &db, direction_id, repo_id, lang.as_deref().unwrap_or("en"))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn chat_open_worker_impl(
+    app: &AppHandle,
+    db: &Db,
+    direction_id: i32,
+    repo_id: i32,
+    lang: &str,
+) -> anyhow::Result<crate::pty::SessionInfo> {
+    use sea_orm::EntityTrait;
+    let wt = repo::worktree_for(db, direction_id, repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no materialized worktree for that direction+repo"))?;
+    let dir = crate::store::entities::direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction not found"))?;
+    if dir.tool != "claude" {
+        anyhow::bail!("chat mode is claude-only; use the PTY path for {}", dir.tool);
+    }
+    let cwd = std::path::PathBuf::from(&wt.path);
+
+    // Resume an earlier conversation when this slot already captured one.
+    let prior = repo::latest_session_for(db, direction_id, repo_id).await?;
+    let native = prior.as_ref().and_then(|s| s.native_session_id.clone());
+    let resumed = native.is_some();
+    let sess = match prior {
+        Some(s) if s.native_session_id.is_some() => s,
+        _ => repo::create_session(db, direction_id, repo_id, &dir.tool, &wt.path).await?,
+    };
+
+    let base = app.state::<crate::BusBase>().0.clone();
+    let inj = crate::bus::inject::inject(&base, dir.thread_id, &direction_id.to_string(), &dir.tool, &cwd);
+    let ask = crate::bus::inject::inject_ask_hook(&base, dir.thread_id, &direction_id.to_string(), &dir.tool, &cwd);
+    let mut extra = ask.args;
+    extra.extend(inj.args);
+
+    let state = app.state::<LeadChatState>();
+    let key = sess.id as i64;
+    let eng = match state.get(key) {
+        Some(e) => e,
+        None => {
+            let inner = engine::EngineInner {
+                thread_id: dir.thread_id,
+                session_id: Some(sess.id),
+                cwd,
+                extra_args: extra,
+                system_prompt: String::new(),
+                native_id: native.clone(),
+                slash_commands: vec![],
+                turn: Default::default(),
+                turn_id: repo::next_turn_id(db, dir.thread_id).await.unwrap_or(1) - 1,
+                child: None,
+                stdin: None,
+                current: None,
+                interrupting: false,
+                generation: 0,
+            };
+            let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
+            state.insert(key, e.clone());
+            e
+        }
+    };
+    engine::ensure_running(app, db, &eng).await?;
+
+    // A fresh conversation gets its mandate as the opening message (the brief
+    // is a message, not a system prompt — same semantics as the PTY seed).
+    if !resumed {
+        let mut brief = crate::brief::assemble(db, direction_id).await.unwrap_or_default();
+        if !brief.trim().is_empty() {
+            brief.push_str(crate::pty::lang_directive(lang));
+            engine::send(app, db, &eng, &brief).await?;
+        }
+    }
+    let _ = repo::set_direction_status(db, direction_id, "working").await;
+
+    Ok(crate::pty::SessionInfo {
+        session_id: sess.id,
+        repo: wt.path.clone(),
+        worktree: wt.path,
+        branch: wt.branch,
+        tool: dir.tool,
+        resumed,
+        native_id: native,
+    })
+}
+
+#[tauri::command]
+pub async fn chat_send(
+    app: AppHandle,
+    db: State<'_, Db>,
+    session_id: i32,
+    text: String,
+) -> Result<(), String> {
+    let eng = app
+        .state::<LeadChatState>()
+        .get(session_id as i64)
+        .ok_or_else(|| "no chat engine for that session".to_string())?;
+    engine::send(&app, &db, &eng, &text).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn chat_interrupt(app: AppHandle, session_id: i32) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::interrupt(&app, &eng).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_stop(app: AppHandle, session_id: i32) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::stop(&app, &eng).await;
+    }
+    Ok(())
+}
+
 /// One-shot import of a legacy PTY-lead transcript (the tool's own jsonl,
 /// parsed by the sidecar) into lead_message rows. Best-effort: any failure
 /// leaves the timeline empty — history remains reachable in a terminal.

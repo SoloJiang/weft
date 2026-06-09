@@ -268,6 +268,7 @@ export const en = {
     kill: "Kill",
     clickToInteract: "Click to interact",
     message: "Message this agent…",
+    chatStopped: "Worker engine stopped · sending resumes it",
     resumeMenu: "Resume…",
     interacting: "Interacting",
     backToReadonly: "Back to read-only",

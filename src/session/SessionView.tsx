@@ -14,6 +14,9 @@ import { api } from "../lib/api";
 import type { SessionStatus } from "../lib/types";
 import { TerminalPanel } from "../panels/TerminalPanel";
 import { Transcript } from "./Transcript";
+import { ChatTimeline } from "./ChatTimeline";
+import { ChatComposer } from "./ChatComposer";
+import { resumeCommand } from "../lib/resume";
 import { DiffPanel } from "./DiffPanel";
 import { StatusChip } from "../components/ui/StatusChip";
 import { Button } from "../components/ui/Button";
@@ -37,10 +40,15 @@ export function SessionView() {
     activeSessionId,
     killSession,
     sendToSession,
+    leadMessages,
+    workerTurn,
+    workerSlash,
+    loadLeadChat,
   } = useStore();
   const { t } = useTranslation();
   const active = activeSessionId != null ? sessions[activeSessionId] : null;
   const tool = active?.info.tool;
+  const isChat = active?.mode === "chat";
   // Observe by default (chat); all three tools have a sidecar transcript now.
   const transcripted = tool === "claude" || tool === "codex" || tool === "opencode";
   const [view, setView] = useState<"chat" | "terminal">(
@@ -56,6 +64,12 @@ export function SessionView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.info.session_id, tool]);
 
+  // Chat-mode workers: hydrate the thread's timeline (their rows live there).
+  const chatThreadId = isChat ? active?.threadId : null;
+  useEffect(() => {
+    if (chatThreadId != null) void loadLeadChat(chatThreadId);
+  }, [chatThreadId, loadLeadChat]);
+
   if (!active) return null;
 
   const { info, status, nativeId } = active;
@@ -67,7 +81,7 @@ export function SessionView() {
     <div className="flex min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
         <header className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2">
-          {!isLead && (
+          {!isLead && !isChat && (
             <div className="flex items-center rounded-[var(--radius-md)] bg-bg p-0.5">
               <ViewTab active={view === "chat"} onClick={() => setView("chat")} title={t("lead.viewChat")}>
                 <MessagesSquare size={13} />
@@ -101,7 +115,13 @@ export function SessionView() {
             <Keyboard size={13} />
           </button>
           {running && (
-            <Button size="sm" variant="danger" onClick={() => void killSession(info.session_id)}>
+            <Button
+              size="sm"
+              variant="danger"
+              onClick={() =>
+                void (isChat ? api.chatStop(info.session_id) : killSession(info.session_id))
+              }
+            >
               <Square size={11} />
               {t("session.kill")}
             </Button>
@@ -134,7 +154,35 @@ export function SessionView() {
           </div>
         )}
 
-        {isLead || view === "chat" ? (
+        {isChat ? (
+          /* chat-engine worker: weft-owned timeline + composer, no PTY at all */
+          <div className="flex min-h-0 flex-1 flex-col">
+            <ChatTimeline
+              messages={(leadMessages[active.threadId] ?? []).filter(
+                (m) => m.session_id === info.session_id,
+              )}
+              busy={(workerTurn[info.session_id]?.state ?? "stopped") === "busy"}
+              onReviewProposal={() => {}}
+            />
+            <ChatComposer
+              slashCommands={workerSlash[info.session_id] ?? []}
+              busy={(workerTurn[info.session_id]?.state ?? "stopped") === "busy"}
+              stopped={(workerTurn[info.session_id]?.state ?? "stopped") === "stopped"}
+              queued={workerTurn[info.session_id]?.queued ?? 0}
+              stoppedHint={t("session.chatStopped")}
+              onSend={(v) => void api.chatSend(info.session_id, v)}
+              onStop={() => void api.chatInterrupt(info.session_id)}
+              onTakeOver={async () => {
+                if (!nativeId) return false;
+                await api.chatStop(info.session_id);
+                await navigator.clipboard.writeText(
+                  resumeCommand(info.tool, info.worktree, nativeId),
+                );
+                return true;
+              }}
+            />
+          </div>
+        ) : isLead || view === "chat" ? (
           <div className="flex min-h-0 flex-1 flex-col">
             <Transcript
               cwd={info.worktree}

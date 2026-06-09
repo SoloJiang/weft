@@ -34,11 +34,14 @@ pub enum Push {
     },
     Turn {
         thread_id: i32,
+        /// Some(session) for chat-mode workers; None for the lead.
+        session_id: Option<i32>,
         state: String,
         queued: usize,
     },
     Init {
         thread_id: i32,
+        session_id: Option<i32>,
         native_id: String,
         slash_commands: Vec<String>,
     },
@@ -214,6 +217,7 @@ pub async fn send(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> anyh
         EVENT,
         Push::Turn {
             thread_id,
+            session_id: sid,
             state: if inner.turn.busy { "busy" } else { "idle" }.into(),
             queued: inner.turn.queue.len(),
         },
@@ -271,7 +275,12 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     inner.turn = TurnState::default();
     let _ = app.emit(
         EVENT,
-        Push::Turn { thread_id: inner.thread_id, state: "stopped".into(), queued: 0 },
+        Push::Turn {
+            thread_id: inner.thread_id,
+            session_id: inner.session_id,
+            state: "stopped".into(),
+            queued: 0,
+        },
     );
 }
 
@@ -299,7 +308,12 @@ fn spawn_reader(
                     } else {
                         let _ = repo::set_lead_native_id(&db, thread_id, &session_id).await;
                     }
-                    let _ = app.emit(EVENT, Push::Init { thread_id, native_id: session_id, slash_commands });
+                    let _ = app.emit(EVENT, Push::Init {
+                        thread_id,
+                        session_id: inner.session_id,
+                        native_id: session_id,
+                        slash_commands,
+                    });
                 }
                 super::proto::ChatEvent::TextDelta { text } => {
                     let sid = inner.session_id;
@@ -391,7 +405,10 @@ fn spawn_reader(
                     }
                     let state = if inner.turn.busy { "busy" } else { "idle" };
                     let _ = app.emit(EVENT, Push::Turn {
-                        thread_id, state: state.into(), queued: inner.turn.queue.len(),
+                        thread_id,
+                        session_id: inner.session_id,
+                        state: state.into(),
+                        queued: inner.turn.queue.len(),
                     });
                 }
                 _ => {}
@@ -419,7 +436,10 @@ fn spawn_reader(
             inner.stdin = None;
             inner.turn = TurnState::default();
             let _ = app.emit(EVENT, Push::Turn {
-                thread_id: inner.thread_id, state: "stopped".into(), queued: 0,
+                thread_id: inner.thread_id,
+                session_id: inner.session_id,
+                state: "stopped".into(),
+                queued: 0,
             });
         }
     });

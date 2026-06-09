@@ -99,6 +99,15 @@ export const api = {
     invoke<LeadStateInfo>("lead_state", { threadId }),
   listLeadMessages: (threadId: number) =>
     invoke<LeadMessage[]>("list_lead_messages", { threadId }),
+
+  // Chat-mode workers (claude): same engine, keyed by session id.
+  chatOpenWorker: (directionId: number, repoId: number, lang: string) =>
+    invoke<SessionInfo>("chat_open_worker", { directionId, repoId, lang }),
+  chatSend: (sessionId: number, text: string) =>
+    invoke<void>("chat_send", { sessionId, text }),
+  chatInterrupt: (sessionId: number) =>
+    invoke<void>("chat_interrupt", { sessionId }),
+  chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),
   resumeSession: (sessionId: number) =>
     invoke<SessionInfo>("resume_session", { sessionId }),
   sessionFor: (directionId: number, repoId: number) =>
