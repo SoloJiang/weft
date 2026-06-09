@@ -154,7 +154,6 @@ interface Store {
   ) => Promise<void>;
   deleteThread: (threadId: number) => Promise<void>;
 
-  openSession: (directionId: number, repoId: number) => Promise<void>;
   viewing: { directionId: number; repoId: number } | null;
   viewDirection: (directionId: number, repoId: number) => void;
   driveDirection: (directionId: number, repoId: number, focus: boolean) => Promise<void>;
@@ -463,11 +462,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeThreadId],
   );
 
-  const openSession = useCallback(
-    (directionId: number, repoId: number) => spawnWorker(directionId, repoId, true),
-    [spawnWorker],
-  );
-
   const viewDirection = useCallback((directionId: number, repoId: number) => {
     setViewing({ directionId, repoId });
     setActiveSessionId(null);
@@ -489,25 +483,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           s.status !== "exited",
       );
       if (existing) {
-        if (focus) setActiveSessionId(existing.info.session_id);
+        if (focus) {
+          setActiveSessionId(existing.info.session_id);
+          setShowNeeds(false);
+          setHomeTab("board");
+        }
         return;
       }
       const info = await api.driveSession(directionId, repoId, currentLang());
       lastOutputRef.current[info.session_id] = Date.now();
       autoCheckedRef.current.delete(directionId);
-      setSessions((m) => ({
-        ...m,
-        [info.session_id]: {
-          info,
-          status: info.resumed ? "running" : "starting",
-          directionId,
-          repoId,
-          threadId: activeThreadId ?? -1,
-          nativeId: info.native_id,
-          kind: "worker",
-        },
-      }));
-      if (focus) setActiveSessionId(info.session_id);
+      setSessions((m) => {
+        const pruned = Object.fromEntries(
+          Object.entries(m).filter(
+            ([, s]) => !(s.directionId === directionId && s.repoId === repoId && s.status === "exited"),
+          ),
+        );
+        return {
+          ...pruned,
+          [info.session_id]: {
+            info,
+            status: info.resumed ? "running" : "starting",
+            directionId,
+            repoId,
+            threadId: activeThreadId ?? -1,
+            nativeId: info.native_id,
+            kind: "worker",
+          },
+        };
+      });
+      if (focus) {
+        setActiveSessionId(info.session_id);
+        setShowNeeds(false);
+        setHomeTab("board");
+      }
     },
     [activeThreadId],
   );
@@ -573,6 +582,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     );
     if (live) return; // already running — the dock shows it
     const lead = await api.planWithLead(thread, currentLang());
+    // Hand-built SessionInfo (lead has no backend SessionInfo); keep fields in sync with the type.
     const info: SessionInfo = {
       session_id: lead.session_id,
       repo: "",
@@ -1109,7 +1119,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     createThread,
     createDirection,
     deleteThread,
-    openSession,
     viewing,
     viewDirection,
     driveDirection,
