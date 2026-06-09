@@ -67,8 +67,36 @@ export function WorkspaceKanban() {
     );
   }
 
+  // Cross-thread contention: repos written by ≥2 issues — the workspace-level
+  // "hot repo" view single-repo tools can't draw (§4.6). Computed from overview.
+  const contention = new Map<string, { name: string; count: number }>();
+  for (const o of overview) {
+    for (const r of o.write_repos) {
+      const e = contention.get(String(r.id)) ?? { name: r.name, count: 0 };
+      e.count += 1;
+      contention.set(String(r.id), e);
+    }
+  }
+  const hot = [...contention.values()].filter((e) => e.count >= 2);
+
   return (
-    <div className="min-h-0 flex-1 overflow-auto">
+    <div className="flex min-h-0 flex-1 flex-col">
+      {hot.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-waiting/30 bg-waiting/10 px-5 py-2 text-[11.5px]">
+          <span className="font-medium text-waiting">{t("workspace.contendedRepos")}</span>
+          {hot.map((h) => (
+            <span
+              key={h.name}
+              className="flex items-center gap-1 rounded-full border border-waiting/30 bg-bg px-2 py-0.5 font-mono text-ink-muted"
+            >
+              {h.name}
+              <span className="tabular-nums text-waiting">×{h.count}</span>
+            </span>
+          ))}
+          <span className="text-ink-faint">{t("workspace.reconcile")}</span>
+        </div>
+      )}
+      <div className="min-h-0 flex-1 overflow-auto">
       <div className="flex h-full min-w-fit gap-3 px-5 py-4">
         {COLUMNS.map((col) => {
           const cards = overview.filter((o) => phaseOf(o) === col.key);
@@ -96,6 +124,7 @@ export function WorkspaceKanban() {
             </div>
           );
         })}
+        </div>
       </div>
     </div>
   );
