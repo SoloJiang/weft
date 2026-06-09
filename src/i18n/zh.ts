@@ -147,6 +147,13 @@ export const zh = {
     filesChanged_other: "{{count}} 个文件",
     untrackedOnly: "目前只有新增(未跟踪)文件。",
   },
+  observe: {
+    attach: "接管",
+    continue: "继续",
+    start: "开始",
+    empty: "尚未物化。",
+    answerPlaceholder: "输入回复，回车发送",
+  },
   bus: {
     title: "会话总线",
     activity: "活动",
