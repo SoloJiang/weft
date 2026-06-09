@@ -1,4 +1,5 @@
 pub mod direction;
+pub mod lead_message;
 pub mod plan;
 pub mod repo_profile;
 pub mod repo_ref;

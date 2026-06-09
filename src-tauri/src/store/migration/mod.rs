@@ -1,5 +1,5 @@
 use crate::store::entities::{
-    direction, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
+    direction, lead_message, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -16,6 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0004DirectionStatus),
             Box::new(M0005DirectionRepoReason),
             Box::new(M0006DropDirectionRepo),
+            Box::new(M0007LeadMessage),
         ]
     }
 }
@@ -240,6 +241,42 @@ impl MigrationTrait for M0006DropDirectionRepo {
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         // Irreversible: the table is gone for good. No-op.
+        Ok(())
+    }
+}
+
+/// Adds the chat timeline table for the lead console (and chat-mode workers).
+pub struct M0007LeadMessage;
+
+impl MigrationName for M0007LeadMessage {
+    fn name(&self) -> &str {
+        "m0007_lead_message"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0007LeadMessage {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(lead_message::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_lead_message_thread")
+                    .table(Alias::new("lead_message"))
+                    .col(Alias::new("thread_id"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("lead_message")).to_owned())
+            .await?;
         Ok(())
     }
 }

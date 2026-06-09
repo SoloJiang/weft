@@ -1,7 +1,7 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    direction, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
+    direction, lead_message, plan, repo_profile, repo_ref, session, thread, worktree, workspace,
 };
 use super::Db;
 use crate::slug::unique_slug;
@@ -370,6 +370,121 @@ pub async fn latest_session_for(
         .await?)
 }
 
+// ---- chat timeline (lead console + chat-mode workers) ----
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_lead_message(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn_id: i32,
+    role: &str,
+    kind: &str,
+    content: &str,
+    status: &str,
+) -> Result<lead_message::Model> {
+    Ok(lead_message::ActiveModel {
+        thread_id: Set(thread_id),
+        session_id: Set(session_id),
+        turn_id: Set(turn_id),
+        role: Set(role.to_string()),
+        kind: Set(kind.to_string()),
+        content: Set(content.to_string()),
+        status: Set(status.to_string()),
+        created_at: Set(now()),
+        ..Default::default()
+    }
+    .insert(&db.0)
+    .await?)
+}
+
+pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) -> Result<()> {
+    if let Some(m) = lead_message::Entity::find_by_id(id).one(&db.0).await? {
+        let mut a: lead_message::ActiveModel = m.into();
+        a.content = Set(content.to_string());
+        a.status = Set(status.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_message::Model>> {
+    Ok(lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .order_by_asc(lead_message::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// The next turn number for a thread's timeline (1-based).
+pub async fn next_turn_id(db: &Db, thread_id: i32) -> Result<i32> {
+    Ok(list_lead_messages(db, thread_id)
+        .await?
+        .iter()
+        .map(|m| m.turn_id)
+        .max()
+        .unwrap_or(0)
+        + 1)
+}
+
+/// Flip the oldest queued user message matching `text` to complete — called when
+/// the engine flushes it from the queue into the process.
+pub async fn complete_queued(db: &Db, thread_id: i32, text: &str) -> Result<()> {
+    let needle = serde_json::json!({ "text": text }).to_string();
+    if let Some(m) = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Status.eq("queued"))
+        .order_by_asc(lead_message::Column::Id)
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .find(|m| m.content == needle || m.kind == "command")
+    {
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set("complete".to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// The lead's persisted engine metadata (native session id) lives in a single
+/// role=system kind=meta row per thread, invisible to the timeline UI.
+pub async fn lead_native_id(db: &Db, thread_id: i32) -> Result<Option<String>> {
+    Ok(lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&db.0)
+        .await?
+        .and_then(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .ok()?
+                .get("native_id")?
+                .as_str()
+                .map(String::from)
+        }))
+}
+
+pub async fn set_lead_native_id(db: &Db, thread_id: i32, native_id: &str) -> Result<()> {
+    let content = serde_json::json!({ "native_id": native_id }).to_string();
+    let existing = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&db.0)
+        .await?;
+    match existing {
+        Some(m) => {
+            let mut a: lead_message::ActiveModel = m.into();
+            a.content = Set(content);
+            a.update(&db.0).await?;
+        }
+        None => {
+            insert_lead_message(db, thread_id, None, 0, "system", "meta", &content, "complete")
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +492,42 @@ mod tests {
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn lead_message_roundtrip() {
+        let db = mem().await;
+        let m = insert_lead_message(&db, 1, None, 1, "user", "text", r#"{"text":"hi"}"#, "complete")
+            .await
+            .unwrap();
+        assert_eq!(m.thread_id, 1);
+        update_lead_message(&db, m.id, r#"{"text":"hi!"}"#, "complete").await.unwrap();
+        let all = list_lead_messages(&db, 1).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].content, r#"{"text":"hi!"}"#);
+        assert_eq!(next_turn_id(&db, 1).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn queued_flips_to_complete() {
+        let db = mem().await;
+        insert_lead_message(&db, 2, None, 2, "user", "text", r#"{"text":"later"}"#, "queued")
+            .await
+            .unwrap();
+        complete_queued(&db, 2, "later").await.unwrap();
+        let all = list_lead_messages(&db, 2).await.unwrap();
+        assert_eq!(all[0].status, "complete");
+    }
+
+    #[tokio::test]
+    async fn lead_native_id_upserts() {
+        let db = mem().await;
+        assert!(lead_native_id(&db, 3).await.unwrap().is_none());
+        set_lead_native_id(&db, 3, "abc").await.unwrap();
+        set_lead_native_id(&db, 3, "def").await.unwrap();
+        assert_eq!(lead_native_id(&db, 3).await.unwrap().as_deref(), Some("def"));
+        // meta row stays single + out of turn numbering
+        assert_eq!(list_lead_messages(&db, 3).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
