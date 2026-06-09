@@ -74,7 +74,9 @@ fn sweep_repo(
         let pc = canon_str(&path);
         let mtime = dir_mtime_secs(&path);
         if should_sweep(&pc, home_canon, tracked, ttl, now, mtime) {
-            if git::remove_worktree(canonical_repo, &path).is_ok() {
+            let _ = git::remove_worktree(canonical_repo, &path);
+            if !path.exists() {
+                eprintln!("[weft] gc: reclaimed orphan worktree {}", path.display());
                 removed += 1;
             }
         }
