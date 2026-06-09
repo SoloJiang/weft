@@ -155,9 +155,10 @@ async fn session_for_impl(
         Some(w) => w,
         None => return Ok(None),
     };
-    let dir = repo::get_direction(db, direction_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("direction not found"))?;
+    let dir = match repo::get_direction(db, direction_id).await? {
+        Some(d) => d,
+        None => return Ok(None),
+    };
     let latest = repo::latest_session_for(db, direction_id, repo_id).await?;
     Ok(Some(ObserveRef {
         worktree: wt.path,
@@ -197,6 +198,7 @@ async fn drive_session_impl(
 ) -> Result<SessionInfo> {
     let latest = repo::latest_session_for(db, direction_id, repo_id).await?;
     match drive_choice(latest.as_ref().map(|s| (s.id, s.native_session_id.as_deref()))) {
+        // lang is not re-applied on resume: the original brief already carries the language directive.
         DriveChoice::Resume(session_id) => resume_impl(app, db, state, session_id).await,
         DriveChoice::Fresh => open_session_impl(app, db, state, direction_id, repo_id, lang).await,
     }
@@ -577,7 +579,7 @@ async fn resume_impl(
         branch: wt.branch,
         tool: s.tool,
         resumed: true,
-        native_id: Some(native.clone()),
+        native_id: Some(native),
     })
 }
 
@@ -761,7 +763,8 @@ async fn plan_with_lead_impl(
 }
 
 #[cfg(test)]
-mod tests {
+mod watchdog_tests {
+    use super::*;
     #[test]
     fn drive_choice_resumes_when_native_present() {
         assert!(matches!(
@@ -782,11 +785,7 @@ mod tests {
             super::DriveChoice::Fresh
         ));
     }
-}
 
-#[cfg(test)]
-mod watchdog_tests {
-    use super::*;
     #[test]
     fn wall_cap_fires_regardless_of_activity() {
         assert!(watchdog_verdict(10_000, 0, 9_999, 7200, 1800, false)
