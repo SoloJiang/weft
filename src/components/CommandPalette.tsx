@@ -20,6 +20,11 @@ type Command = {
   run: () => void;
 };
 
+/** Open the palette from anywhere (e.g. the rail's search trigger). */
+export function openCommandPalette() {
+  window.dispatchEvent(new Event("weft:open-palette"));
+}
+
 /**
  * ⌘K / Ctrl+K command palette — the silky cross-app jump (§ navigation unify).
  * One keystroke to reach any issue or workspace surface without hunting the
@@ -52,8 +57,13 @@ export function CommandPalette() {
         setOpen((v) => !v);
       }
     };
+    const onOpen = () => setOpen(true);
     window.addEventListener("keydown", onKey, { capture: true });
-    return () => window.removeEventListener("keydown", onKey, { capture: true });
+    window.addEventListener("weft:open-palette", onOpen);
+    return () => {
+      window.removeEventListener("keydown", onKey, { capture: true });
+      window.removeEventListener("weft:open-palette", onOpen);
+    };
   }, []);
 
   // Reset query/selection and focus the field whenever it opens.

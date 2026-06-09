@@ -38,6 +38,7 @@ export const en = {
     planning: "Planning",
   },
   palette: {
+    search: "Search",
     placeholder: "Search issues · jump · act",
     empty: "No matches",
     issue: "Issue",

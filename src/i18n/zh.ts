@@ -37,6 +37,7 @@ export const zh = {
     planning: "规划中",
   },
   palette: {
+    search: "搜索",
     placeholder: "搜索 issue · 跳转 · 动作",
     empty: "无匹配",
     issue: "issue",

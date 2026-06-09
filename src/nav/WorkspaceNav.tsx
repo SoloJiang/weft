@@ -11,6 +11,7 @@ import {
   LayoutGrid,
   PanelLeftClose,
   Plus,
+  Search,
   Settings,
   SquarePen,
   Trash2,
@@ -18,6 +19,7 @@ import {
 import { useStore } from "../state/store";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
+import { openCommandPalette } from "../components/CommandPalette";
 import { AddRepoDialog, CreateThreadDialog, CreateWorkspaceDialog } from "./dialogs";
 import { SettingsDialog } from "./SettingsDialog";
 
@@ -76,6 +78,20 @@ export function WorkspaceNav() {
       </div>
 
       <div className="mx-2 mb-1 border-t border-border" />
+
+      {/* search / jump — the ⌘K command palette trigger */}
+      <div className="px-2 pt-1">
+        <button
+          onClick={openCommandPalette}
+          className="flex w-full items-center gap-2 rounded-[var(--radius-md)] border border-border bg-raised px-2 py-1.5 text-[13px] text-ink-faint transition-colors hover:border-brand/40 hover:text-ink-muted"
+        >
+          <Search size={14} className="shrink-0" />
+          <span>{t("palette.search")}</span>
+          <kbd className="ml-auto rounded border border-border bg-surface px-1.5 py-px font-mono text-[10px] text-ink-faint">
+            ⌘K
+          </kbd>
+        </button>
+      </div>
 
       {/* primary actions */}
       <div className="flex flex-col gap-0.5 px-2 py-1">
