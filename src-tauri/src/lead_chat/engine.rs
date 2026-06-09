@@ -45,13 +45,31 @@ pub enum Push {
         native_id: String,
         slash_commands: Vec<String>,
     },
+    /// The tool call currently executing — transient: rendered while it runs,
+    /// replaced by the next one, cleared by the Turn event. Never persisted.
+    Activity {
+        thread_id: i32,
+        session_id: Option<i32>,
+        name: String,
+        summary: String,
+    },
 }
 
-/// Busy/queue bookkeeping for one engine. Pure — unit-tested below.
+/// One outbound human message: text plus optional image attachments
+/// (media_type, base64). Queued whole while a turn is running.
+#[derive(Clone, Default)]
+pub struct Outgoing {
+    pub text: String,
+    pub images: Vec<(String, String)>,
+}
+
+/// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
+/// input during a turn is queued whole and delivered in order once the turn
+/// ends — never silently dropped, never interleaved mid-turn. Pure — tested.
 #[derive(Default)]
 pub struct TurnState {
     pub busy: bool,
-    pub queue: VecDeque<String>,
+    pub queue: VecDeque<Outgoing>,
 }
 
 impl TurnState {
@@ -65,7 +83,7 @@ impl TurnState {
     }
 
     /// Turn finished: pop the next queued message (stays busy) or go idle.
-    pub fn on_turn_end(&mut self) -> Option<String> {
+    pub fn on_turn_end(&mut self) -> Option<Outgoing> {
         match self.queue.pop_front() {
             Some(next) => Some(next),
             None => {
@@ -170,11 +188,18 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     Ok(())
 }
 
-async fn write_user(inner: &mut EngineInner, text: &str) {
+async fn write_user(inner: &mut EngineInner, out: &Outgoing) {
     if let Some(stdin) = inner.stdin.as_mut() {
+        let mut content = vec![serde_json::json!({ "type": "text", "text": out.text })];
+        for (media_type, data) in &out.images {
+            content.push(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media_type, "data": data }
+            }));
+        }
         let msg = serde_json::json!({
             "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": text }] }
+            "message": { "role": "user", "content": content }
         });
         let _ = stdin.write_all(format!("{msg}\n").as_bytes()).await;
         let _ = stdin.flush().await;
@@ -182,7 +207,16 @@ async fn write_user(inner: &mut EngineInner, text: &str) {
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
-pub async fn send(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> anyhow::Result<()> {
+/// `images` ride the outbound message as base64 blocks; `files` are appended
+/// as plain paths (the agent reads them with its own tools).
+pub async fn send(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    text: &str,
+    images: Vec<(String, String)>,
+    files: Vec<String>,
+) -> anyhow::Result<()> {
     ensure_running(app, db, eng).await?;
     let mut inner = eng.lock().await;
     let thread_id = inner.thread_id;
@@ -195,6 +229,10 @@ pub async fn send(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> anyh
     }
     let turn = inner.turn_id;
     let status = if direct { "complete" } else { "queued" };
+    let image_uris: Vec<String> = images
+        .iter()
+        .map(|(mt, data)| format!("data:{mt};base64,{data}"))
+        .collect();
     let content = if is_command {
         let trimmed = text.trim_start();
         let mut it = trimmed.splitn(2, ' ');
@@ -204,14 +242,22 @@ pub async fn send(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> anyh
         })
         .to_string()
     } else {
-        serde_json::json!({ "text": text }).to_string()
+        serde_json::json!({ "text": text, "images": image_uris, "files": files }).to_string()
     };
     let m = repo::insert_lead_message(db, thread_id, sid, turn, "user", kind, &content, status).await?;
     let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+    let mut outbound = text.to_string();
+    if !files.is_empty() {
+        outbound.push_str("\n\nAttached files (read them as needed):\n");
+        for f in &files {
+            outbound.push_str(&format!("- {f}\n"));
+        }
+    }
+    let out = Outgoing { text: outbound, images };
     if direct {
-        write_user(&mut inner, text).await;
+        write_user(&mut inner, &out).await;
     } else {
-        inner.turn.queue.push_back(text.to_string());
+        inner.turn.queue.push_back(out);
     }
     let _ = app.emit(
         EVENT,
@@ -365,17 +411,15 @@ fn spawn_reader(
                             });
                         }
                     }
-                    let sid = inner.session_id;
-                    let turn = inner.turn_id;
+                    // Tool calls are transient activity, not timeline rows:
+                    // show the one currently running, gone when the turn moves on.
                     for (name, summary) in tools {
-                        let content = serde_json::json!({ "name": name, "summary": summary }).to_string();
-                        if let Ok(m) = repo::insert_lead_message(
-                            &db, thread_id, sid, turn, "assistant", "tool", &content, "complete",
-                        )
-                        .await
-                        {
-                            let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
-                        }
+                        let _ = app.emit(EVENT, Push::Activity {
+                            thread_id,
+                            session_id: inner.session_id,
+                            name,
+                            summary,
+                        });
                     }
                 }
                 super::proto::ChatEvent::TurnEnd { is_error } => {
@@ -401,7 +445,7 @@ fn spawn_reader(
                     if let Some(next) = inner.turn.on_turn_end() {
                         inner.turn_id += 1;
                         write_user(&mut inner, &next).await;
-                        let _ = repo::complete_queued(&db, thread_id, &next).await;
+                        let _ = repo::complete_queued(&db, thread_id, &next.text).await;
                     }
                     let state = if inner.turn.busy { "busy" } else { "idle" };
                     let _ = app.emit(EVENT, Push::Turn {
@@ -454,9 +498,9 @@ mod tests {
         let mut t = TurnState::default();
         assert!(t.try_begin_send()); // idle → busy: send through
         assert!(!t.try_begin_send()); // busy: enqueue
-        t.queue.push_back("second".into());
+        t.queue.push_back(Outgoing { text: "second".into(), images: vec![] });
         let next = t.on_turn_end();
-        assert_eq!(next.as_deref(), Some("second"));
+        assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
         assert!(t.busy); // popped → still busy
         assert!(t.on_turn_end().is_none()); // empty queue → idle
         assert!(!t.busy);

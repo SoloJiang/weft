@@ -427,18 +427,17 @@ pub async fn next_turn_id(db: &Db, thread_id: i32) -> Result<i32> {
         + 1)
 }
 
-/// Flip the oldest queued user message matching `text` to complete — called when
-/// the engine flushes it from the queue into the process.
-pub async fn complete_queued(db: &Db, thread_id: i32, text: &str) -> Result<()> {
-    let needle = serde_json::json!({ "text": text }).to_string();
+/// Flip the OLDEST queued user message to complete — called when the engine
+/// flushes the front of its FIFO into the process; queue order equals row
+/// insertion order, so position (not content) is the identity. `_text` kept
+/// for telemetry/debug call sites.
+pub async fn complete_queued(db: &Db, thread_id: i32, _text: &str) -> Result<()> {
     if let Some(m) = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
         .filter(lead_message::Column::Status.eq("queued"))
         .order_by_asc(lead_message::Column::Id)
-        .all(&db.0)
+        .one(&db.0)
         .await?
-        .into_iter()
-        .find(|m| m.content == needle || m.kind == "command")
     {
         let mut a: lead_message::ActiveModel = m.into();
         a.status = Set("complete".to_string());

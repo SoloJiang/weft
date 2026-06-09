@@ -13,6 +13,7 @@ import { currentLang } from "../i18n";
 import type {
   BusMsg,
   Direction,
+  ImageAttachment,
   LeadChatPush,
   LeadMessage,
   NeedItem,
@@ -74,12 +75,20 @@ interface Store {
   /** Hydrate a thread's timeline from DB + make sure the engine runs. */
   loadLeadChat: (threadId: number) => Promise<void>;
   /** Send a human message to the lead (optimistic; engine queues when busy). */
-  sendLeadChat: (threadId: number, text: string) => Promise<void>;
+  sendLeadChat: (
+    threadId: number,
+    text: string,
+    images?: ImageAttachment[],
+    files?: string[],
+  ) => Promise<void>;
   /** Interrupt the lead's current turn. */
   interruptLead: (threadId: number) => Promise<void>;
   /** Chat-mode worker engine state, keyed by session id. */
   workerTurn: Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>;
   workerSlash: Record<number, string[]>;
+  /** The tool call running right now (transient): lead by thread, worker by session. */
+  leadActivity: Record<number, { name: string; summary: string } | null>;
+  workerActivity: Record<number, { name: string; summary: string } | null>;
   /** Send a composed message into any session's PTY (bracketed paste + enter). */
   sendToSession: (sessionId: number, text: string) => Promise<void>;
   /** The thread-bus drawer (demoted from a permanent rail). */
@@ -661,6 +670,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
   >({});
   const [workerSlash, setWorkerSlash] = useState<Record<number, string[]>>({});
+  const [leadActivity, setLeadActivity] = useState<
+    Record<number, { name: string; summary: string } | null>
+  >({});
+  const [workerActivity, setWorkerActivity] = useState<
+    Record<number, { name: string; summary: string } | null>
+  >({});
 
   useEffect(() => {
     const un = listen<LeadChatPush>("lead-chat", (e) => {
@@ -699,10 +714,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               : x,
           ),
         }));
+      } else if (p.type === "activity") {
+        const act = { name: p.name, summary: p.summary };
+        if (p.session_id != null) {
+          const sid = p.session_id;
+          lastOutputRef.current[sid] = Date.now();
+          setWorkerActivity((a) => ({ ...a, [sid]: act }));
+        } else {
+          setLeadActivity((a) => ({ ...a, [p.thread_id]: act }));
+        }
       } else if (p.type === "turn") {
         if (p.session_id != null) {
           const sid = p.session_id;
           lastOutputRef.current[sid] = Date.now();
+          setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queued: p.queued } }));
           setSessions((m) =>
             m[sid]
@@ -717,6 +742,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               : m,
           );
         } else {
+          setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
             ...t,
             [p.thread_id]: { state: p.state, queued: p.queued },
@@ -761,9 +787,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const sendLeadChat = useCallback(async (threadId: number, text: string) => {
-    await api.leadSend(threadId, text, currentLang());
-  }, []);
+  const sendLeadChat = useCallback(
+    async (threadId: number, text: string, images?: ImageAttachment[], files?: string[]) => {
+      await api.leadSend(threadId, text, currentLang(), images, files);
+    },
+    [],
+  );
 
   const interruptLead = useCallback(async (threadId: number) => {
     await api.leadInterrupt(threadId);
@@ -1187,6 +1216,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     interruptLead,
     workerTurn,
     workerSlash,
+    leadActivity,
+    workerActivity,
     sendToSession,
     showBus,
     setShowBus,

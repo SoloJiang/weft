@@ -25,6 +25,13 @@ export function toolIcon(name: string): ComponentType<LucideProps> {
   return Wrench;
 }
 
+/** Human-scannable tool identity: `mcp__weft_planner__get_task` → "weft_planner · get_task". */
+export function cleanToolName(name: string) {
+  const mcp = name.match(/^mcp__([^_]+(?:_[^_]+)*?)__(.+)$/);
+  if (mcp) return `${mcp[1]} · ${mcp[2]}`;
+  return name;
+}
+
 /** i18n key for the tool's activity label — call t() on the result. */
 export function toolLabelKey(name: string) {
   const n = name.toLowerCase();

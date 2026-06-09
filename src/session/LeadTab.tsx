@@ -18,6 +18,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     leadMessages,
     leadTurn,
     leadSlash,
+    leadActivity,
     loadLeadChat,
     sendLeadChat,
     interruptLead,
@@ -39,6 +40,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
       <ChatTimeline
         messages={msgs}
         busy={turn.state === "busy"}
+        activity={leadActivity[activeThreadId]}
         onReviewProposal={() => {
           setReviewingProposal(true);
           onReview();
@@ -50,7 +52,9 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
         stopped={turn.state === "stopped"}
         queued={turn.queued}
         stoppedHint={t("lead.engineStopped")}
-        onSend={(text) => void sendLeadChat(activeThreadId, text)}
+        onSend={(text, images, files) =>
+          void sendLeadChat(activeThreadId, text, images, files)
+        }
         onStop={() => void interruptLead(activeThreadId)}
         onTakeOver={async () => {
           const st = await api.leadState(activeThreadId);

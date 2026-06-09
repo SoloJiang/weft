@@ -4,6 +4,7 @@ import type {
   BusMsg,
   ConfigItem,
   Direction,
+  ImageAttachment,
   LeadMessage,
   LeadStateInfo,
   NeedItem,
@@ -88,8 +89,13 @@ export const api = {
     invoke<SessionInfo>("open_session", { directionId, repoId, lang }),
 
   // Lead chat engine: weft-owned conversation (headless stream-json claude).
-  leadSend: (threadId: number, text: string, lang: string) =>
-    invoke<void>("lead_send", { threadId, text, lang }),
+  leadSend: (
+    threadId: number,
+    text: string,
+    lang: string,
+    images?: ImageAttachment[],
+    files?: string[],
+  ) => invoke<void>("lead_send", { threadId, text, lang, images, files }),
   leadInterrupt: (threadId: number) =>
     invoke<void>("lead_interrupt", { threadId }),
   leadEnsure: (threadId: number, lang: string) =>
@@ -103,8 +109,12 @@ export const api = {
   // Chat-mode workers (claude): same engine, keyed by session id.
   chatOpenWorker: (directionId: number, repoId: number, lang: string) =>
     invoke<SessionInfo>("chat_open_worker", { directionId, repoId, lang }),
-  chatSend: (sessionId: number, text: string) =>
-    invoke<void>("chat_send", { sessionId, text }),
+  chatSend: (
+    sessionId: number,
+    text: string,
+    images?: ImageAttachment[],
+    files?: string[],
+  ) => invoke<void>("chat_send", { sessionId, text, images, files }),
   chatInterrupt: (sessionId: number) =>
     invoke<void>("chat_interrupt", { sessionId }),
   chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),
@@ -178,5 +188,10 @@ export const api = {
   pickFolder: async (title?: string) => {
     const sel = await openDialog({ directory: true, multiple: false, title });
     return typeof sel === "string" ? sel : null;
+  },
+  // Native multi-file picker; [] when cancelled.
+  pickFiles: async (title?: string) => {
+    const sel = await openDialog({ directory: false, multiple: true, title });
+    return Array.isArray(sel) ? sel : typeof sel === "string" ? [sel] : [];
   },
 };

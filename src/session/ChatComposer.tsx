@@ -1,15 +1,34 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Check, Send, SlashSquare, Square, SquareTerminal } from "lucide-react";
+import {
+  Check,
+  FileText,
+  Paperclip,
+  Send,
+  SlashSquare,
+  Square,
+  SquareTerminal,
+  X,
+} from "lucide-react";
+import type { ImageAttachment } from "../lib/types";
+import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { Button } from "../components/ui/Button";
+import { Tooltip } from "../components/ui/Tooltip";
+
+interface PendingImage extends ImageAttachment {
+  /** data URI for the thumbnail. */
+  preview: string;
+}
 
 /**
  * The chat-engine composer, shared by the lead console and chat-mode workers.
  * Enter sends (Shift+Enter newline); a leading `/` opens the command palette
- * fed by the CLI's own init-reported slash_commands — skills and commands work
- * headless exactly as in the TUI, with a real picker on top. While a turn runs
- * the Stop button interrupts; extra sends queue (the chip shows how many).
+ * fed by the CLI's own init-reported slash_commands — built-ins, plugin
+ * commands and skills alike, exactly what the agent supports headless. Images
+ * paste straight in (or attach via the clip); files attach as paths the agent
+ * reads itself. While a turn runs the Stop button interrupts and extra sends
+ * queue — same semantics as the native TUI's mid-turn input queue.
  */
 export function ChatComposer({
   slashCommands,
@@ -27,13 +46,15 @@ export function ChatComposer({
   queued: number;
   /** Footer hint while the engine is stopped (sending resumes it). */
   stoppedHint: string;
-  onSend: (text: string) => void;
+  onSend: (text: string, images: ImageAttachment[], files: string[]) => void;
   onStop: () => void;
   /** Stop the engine + copy the terminal resume command; false = unavailable. */
   onTakeOver?: () => Promise<boolean>;
 }) {
   const { t } = useTranslation();
   const [text, setText] = useState("");
+  const [images, setImages] = useState<PendingImage[]>([]);
+  const [files, setFiles] = useState<string[]>([]);
   const [slashIdx, setSlashIdx] = useState(0);
   const [copied, setCopied] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -46,11 +67,20 @@ export function ChatComposer({
   }, [text]);
 
   // Palette: leading "/" with no space yet → filter the CLI's command list.
+  // Prefix matches outrank substring matches so built-ins like /clear surface
+  // as soon as you type them, not buried under plugin skills.
   const slashQuery = text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
   const slashMatches = useMemo(() => {
     if (slashQuery == null || slashCommands.length === 0) return [];
     const q = slashQuery.toLowerCase();
-    return slashCommands.filter((c) => c.toLowerCase().includes(q)).slice(0, 8);
+    const prefix: string[] = [];
+    const within: string[] = [];
+    for (const c of slashCommands) {
+      const lc = c.toLowerCase();
+      if (lc.startsWith(q)) prefix.push(c);
+      else if (lc.includes(q)) within.push(c);
+    }
+    return [...prefix, ...within].slice(0, 16);
   }, [slashQuery, slashCommands]);
   const paletteOpen = slashMatches.length > 0;
 
@@ -58,13 +88,47 @@ export function ChatComposer({
 
   const send = () => {
     const v = text.trim();
-    if (!v) return;
-    onSend(v);
+    if (!v && images.length === 0 && files.length === 0) return;
+    onSend(v, images.map(({ media_type, data }) => ({ media_type, data })), files);
     setText("");
+    setImages([]);
+    setFiles([]);
   };
 
   const complete = (cmd: string) => {
     setText(`/${cmd} `);
+    ref.current?.focus();
+  };
+
+  const addImageBlob = (blob: Blob) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const uri = String(reader.result ?? "");
+      const m = uri.match(/^data:([^;]+);base64,(.*)$/s);
+      if (!m) return;
+      setImages((arr) => [...arr, { media_type: m[1], data: m[2], preview: uri }]);
+    };
+    reader.readAsDataURL(blob);
+  };
+
+  const onPaste = (e: React.ClipboardEvent) => {
+    for (const item of e.clipboardData.items) {
+      if (item.type.startsWith("image/")) {
+        const blob = item.getAsFile();
+        if (blob) {
+          e.preventDefault();
+          addImageBlob(blob);
+        }
+      }
+    }
+  };
+
+  const attachFiles = async () => {
+    const picked = await api.pickFiles(t("lead.attachFiles"));
+    if (picked.length === 0) return;
+    // Picked files attach as paths — the agent reads them (images included)
+    // with its own tools. Pasted images go inline as base64 blocks instead.
+    setFiles((arr) => [...arr, ...picked.filter((p) => !arr.includes(p))]);
     ref.current?.focus();
   };
 
@@ -80,7 +144,7 @@ export function ChatComposer({
     <div className="border-t border-border bg-bg px-4 py-3">
       <div className="relative mx-auto max-w-[820px] rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-[0_12px_40px_-28px_rgba(0,0,0,0.65)]">
         {paletteOpen && (
-          <div className="absolute inset-x-2 bottom-full mb-2 overflow-hidden rounded-[var(--radius-md)] border border-border bg-raised shadow-[0_12px_40px_-20px_rgba(0,0,0,0.6)]">
+          <div className="absolute inset-x-2 bottom-full mb-2 max-h-64 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-raised shadow-[0_12px_40px_-20px_rgba(0,0,0,0.6)]">
             {slashMatches.map((cmd, i) => (
               <button
                 key={cmd}
@@ -96,12 +160,51 @@ export function ChatComposer({
             ))}
           </div>
         )}
+
+        {(images.length > 0 || files.length > 0) && (
+          <div className="flex flex-wrap items-center gap-1.5 px-1.5 pb-1.5">
+            {images.map((img, i) => (
+              <span key={i} className="group/att relative">
+                <img
+                  src={img.preview}
+                  alt=""
+                  className="h-12 w-12 rounded-[var(--radius-md)] border border-border object-cover"
+                />
+                <button
+                  onClick={() => setImages((arr) => arr.filter((_, j) => j !== i))}
+                  aria-label={t("common.close")}
+                  className="absolute -right-1.5 -top-1.5 grid h-4 w-4 place-items-center rounded-full border border-border bg-raised text-ink-faint opacity-0 transition-opacity hover:text-ink group-hover/att:opacity-100"
+                >
+                  <X size={9} />
+                </button>
+              </span>
+            ))}
+            {files.map((f) => (
+              <span
+                key={f}
+                className="inline-flex items-center gap-1 rounded-full border border-border bg-bg px-2 py-1 font-mono text-[10.5px] text-ink-muted"
+              >
+                <FileText size={10} className="shrink-0" />
+                {f.split("/").pop()}
+                <button
+                  onClick={() => setFiles((arr) => arr.filter((x) => x !== f))}
+                  aria-label={t("common.close")}
+                  className="text-ink-faint hover:text-ink"
+                >
+                  <X size={10} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
         <textarea
           ref={ref}
           autoFocus
           rows={1}
           value={text}
           onChange={(e) => setText(e.currentTarget.value)}
+          onPaste={onPaste}
           onKeyDown={(e) => {
             if (paletteOpen) {
               if (e.key === "ArrowDown") {
@@ -134,8 +237,17 @@ export function ChatComposer({
           className="max-h-[150px] min-h-[42px] w-full resize-none bg-transparent px-2 py-1 text-[13px] leading-relaxed text-ink outline-none placeholder:text-ink-faint"
         />
         <div className="flex items-center gap-2 border-t border-border/70 px-1.5 pt-2">
+          <Tooltip label={t("lead.attachFiles")}>
+            <button
+              onClick={() => void attachFiles()}
+              aria-label={t("lead.attachFiles")}
+              className="grid h-7 w-7 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+            >
+              <Paperclip size={13} />
+            </button>
+          </Tooltip>
           <span className="hidden truncate text-[11px] text-ink-faint sm:block">
-            {stopped ? stoppedHint : t("lead.slashHint")}
+            {stopped ? stoppedHint : busy ? t("lead.busyHint") : t("lead.slashHint")}
           </span>
           <span className="ml-auto" />
           {queued > 0 && (
@@ -144,16 +256,19 @@ export function ChatComposer({
             </span>
           )}
           {onTakeOver && (
-            <button
-              onClick={() => void takeOver()}
-              title={t("lead.takeOverTerminal")}
-              className="grid h-7 w-7 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-            >
-              {copied ? <Check size={13} className="text-running" /> : <SquareTerminal size={13} />}
-            </button>
-          )}
-          {copied && (
-            <span className="text-[10.5px] text-ink-faint">{t("lead.takeOverCopied")}</span>
+            <Tooltip label={copied ? t("lead.takeOverCopied") : t("lead.takeOverTip")}>
+              <button
+                onClick={() => void takeOver()}
+                aria-label={t("lead.takeOverTerminal")}
+                className="grid h-7 w-7 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+              >
+                {copied ? (
+                  <Check size={13} className="text-running" />
+                ) : (
+                  <SquareTerminal size={13} />
+                )}
+              </button>
+            </Tooltip>
           )}
           {busy ? (
             <Button size="sm" variant="ghost" onClick={onStop}>
@@ -161,7 +276,12 @@ export function ChatComposer({
               {t("lead.stop")}
             </Button>
           ) : null}
-          <Button size="sm" variant="primary" disabled={!text.trim()} onClick={send}>
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={!text.trim() && images.length === 0 && files.length === 0}
+            onClick={send}
+          >
             <Send size={13} />
             {t("lead.send")}
           </Button>

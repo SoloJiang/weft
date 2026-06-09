@@ -76,14 +76,19 @@ pub fn parse_line(line: &str) -> ChatEvent {
     }
 }
 
-/// First string-ish field of a tool input, truncated — same spirit as the
-/// sidecar's summaries; just enough for a compact timeline pill.
+/// First string-ish field of a tool input, truncated — just enough for a
+/// compact activity pill. An empty/opaque input yields "" (render nothing),
+/// never "{}" noise.
 fn compact_input(input: &Value) -> String {
-    let s = ["file_path", "path", "command", "pattern", "query", "url"]
+    let s = ["file_path", "path", "command", "pattern", "query", "url", "description"]
         .iter()
         .find_map(|k| input[k].as_str())
         .map(String::from)
-        .unwrap_or_else(|| input.to_string());
+        .unwrap_or_else(|| match input {
+            Value::Object(o) if o.is_empty() => String::new(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        });
     s.chars().take(120).collect()
 }
 
@@ -115,6 +120,18 @@ mod tests {
         assert!(matches!(parse_line(l), ChatEvent::Other));
         let l2 = r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"thinking"}}}"#;
         assert!(matches!(parse_line(l2), ChatEvent::Other));
+    }
+
+    #[test]
+    fn empty_tool_input_yields_blank_summary() {
+        let l = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__weft_planner__get_task","input":{}}]}}"#;
+        match parse_line(l) {
+            ChatEvent::Assistant { tools, .. } => {
+                assert_eq!(tools[0].0, "mcp__weft_planner__get_task");
+                assert_eq!(tools[0].1, "");
+            }
+            e => panic!("{e:?}"),
+        }
     }
 
     #[test]

@@ -43,6 +43,7 @@ export function SessionView() {
     leadMessages,
     workerTurn,
     workerSlash,
+    workerActivity,
     loadLeadChat,
   } = useStore();
   const { t } = useTranslation();
@@ -162,6 +163,7 @@ export function SessionView() {
                 (m) => m.session_id === info.session_id,
               )}
               busy={(workerTurn[info.session_id]?.state ?? "stopped") === "busy"}
+              activity={workerActivity[info.session_id]}
               onReviewProposal={() => {}}
             />
             <ChatComposer
@@ -170,7 +172,7 @@ export function SessionView() {
               stopped={(workerTurn[info.session_id]?.state ?? "stopped") === "stopped"}
               queued={workerTurn[info.session_id]?.queued ?? 0}
               stoppedHint={t("session.chatStopped")}
-              onSend={(v) => void api.chatSend(info.session_id, v)}
+              onSend={(v, images, files) => void api.chatSend(info.session_id, v, images, files)}
               onStop={() => void api.chatInterrupt(info.session_id)}
               onTakeOver={async () => {
                 if (!nativeId) return false;

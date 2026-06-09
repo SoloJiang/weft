@@ -149,7 +149,22 @@ export type LeadChatPush =
       session_id: number | null;
       native_id: string;
       slash_commands: string[];
+    }
+  | {
+      /** The tool call currently executing — transient, cleared by `turn`. */
+      type: "activity";
+      thread_id: number;
+      session_id: number | null;
+      name: string;
+      summary: string;
     };
+
+/** One composer attachment heading to the engine (pasted or picked image). */
+export interface ImageAttachment {
+  media_type: string;
+  /** base64 payload, no data-URI prefix. */
+  data: string;
+}
 
 /** Snapshot of the lead engine, for mount-time hydration. */
 export interface LeadStateInfo {

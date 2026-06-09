@@ -64,6 +64,22 @@ async fn lead_engine(
     Ok(eng)
 }
 
+/// One inbound image attachment from the composer (pasted or picked).
+#[derive(serde::Deserialize)]
+pub struct ImageIn {
+    pub media_type: String,
+    /// base64 payload, no data-URI prefix.
+    pub data: String,
+}
+
+fn to_pairs(images: Option<Vec<ImageIn>>) -> Vec<(String, String)> {
+    images
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| (i.media_type, i.data))
+        .collect()
+}
+
 #[tauri::command]
 pub async fn lead_send(
     app: AppHandle,
@@ -71,11 +87,15 @@ pub async fn lead_send(
     thread_id: i32,
     text: String,
     lang: Option<String>,
+    images: Option<Vec<ImageIn>>,
+    files: Option<Vec<String>>,
 ) -> Result<(), String> {
     let eng = lead_engine(&app, &db, thread_id, lang.as_deref().unwrap_or("en"))
         .await
         .map_err(|e| e.to_string())?;
-    engine::send(&app, &db, &eng, &text).await.map_err(|e| e.to_string())
+    engine::send(&app, &db, &eng, &text, to_pairs(images), files.unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -271,7 +291,7 @@ async fn chat_open_worker_impl(
         let mut brief = crate::brief::assemble(db, direction_id).await.unwrap_or_default();
         if !brief.trim().is_empty() {
             brief.push_str(crate::pty::lang_directive(lang));
-            engine::send(app, db, &eng, &brief).await?;
+            engine::send(app, db, &eng, &brief, vec![], vec![]).await?;
         }
     }
     let _ = repo::set_direction_status(db, direction_id, "working").await;
@@ -293,12 +313,16 @@ pub async fn chat_send(
     db: State<'_, Db>,
     session_id: i32,
     text: String,
+    images: Option<Vec<ImageIn>>,
+    files: Option<Vec<String>>,
 ) -> Result<(), String> {
     let eng = app
         .state::<LeadChatState>()
         .get(session_id as i64)
         .ok_or_else(|| "no chat engine for that session".to_string())?;
-    engine::send(&app, &db, &eng, &text).await.map_err(|e| e.to_string())
+    engine::send(&app, &db, &eng, &text, to_pairs(images), files.unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
