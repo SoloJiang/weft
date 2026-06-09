@@ -5,7 +5,25 @@
 use crate::store::{entities, repo, Db};
 use crate::{git, paths};
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The deterministic worktree path for a direction's bound repo, namespaced
+/// `<home>/<ws>/<thread>/<direction>/<repo>`. Pure (no DB / FS) so the layout —
+/// the core of "scope→物化映射" (§6) — is unit-testable. The thread + direction
+/// segments are what keep the same repo, opened by two threads, from colliding
+/// on one path/branch (§5 M2 acceptance, §7 known-issue).
+pub fn worktree_path(
+    home: &Path,
+    ws_slug: &str,
+    thread_slug: &str,
+    dir_slug: &str,
+    repo_slug: &str,
+) -> PathBuf {
+    home.join(ws_slug)
+        .join(thread_slug)
+        .join(dir_slug)
+        .join(repo_slug)
+}
 
 /// Create the one worktree for `direction_id`'s bound repo at
 /// `<worktree_home>/<ws>/<thread>/<direction>/<repo>` on the direction's branch.
@@ -36,11 +54,7 @@ pub async fn materialize_direction(
         return Ok(vec![existing]);
     }
     let home = paths::worktree_home()?;
-    let path: PathBuf = home
-        .join(&ws.slug)
-        .join(&thread.slug)
-        .join(&dir.slug)
-        .join(&repo_ref.slug);
+    let path = worktree_path(&home, &ws.slug, &thread.slug, &dir.slug, &repo_ref.slug);
     git::add_worktree(
         std::path::Path::new(&repo_ref.local_git_path),
         &dir.branch,
@@ -77,4 +91,42 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worktree_path_is_namespaced_ws_thread_dir_repo() {
+        let p = worktree_path(Path::new("/home/wt"), "acme", "checkout-promo", "api", "billing");
+        assert_eq!(p, Path::new("/home/wt/acme/checkout-promo/api/billing"));
+    }
+
+    #[test]
+    fn same_repo_in_two_threads_does_not_collide() {
+        // §5 M2 acceptance: a repo opened by two threads must land on distinct
+        // paths (and thus distinct branches) — the thread segment guarantees it.
+        let home = Path::new("/wt");
+        let a = worktree_path(home, "acme", "thread-a", "d1", "billing");
+        let b = worktree_path(home, "acme", "thread-b", "d1", "billing");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn two_directions_in_one_thread_do_not_collide() {
+        let home = Path::new("/wt");
+        let a = worktree_path(home, "acme", "t1", "dir-a", "billing");
+        let b = worktree_path(home, "acme", "t1", "dir-b", "billing");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn same_scope_is_deterministic() {
+        // Idempotent re-materialize must resolve to the identical path.
+        let home = Path::new("/wt");
+        let a = worktree_path(home, "acme", "t1", "d1", "billing");
+        let b = worktree_path(home, "acme", "t1", "d1", "billing");
+        assert_eq!(a, b);
+    }
 }
