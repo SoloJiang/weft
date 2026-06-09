@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { Layers, Plus, SquarePen, X } from "lucide-react";
+import { Columns3, FolderGit2, Layers, Plus, Rows3, SquarePen, X } from "lucide-react";
 import { useStore } from "../state/store";
 import type { ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
@@ -29,6 +29,9 @@ export function WorkspaceKanban() {
   const { overview, refreshOverview, sessions, needs, asks, checksByDirection, selectThread } =
     useStore();
   const { t } = useTranslation();
+  // Two lenses on the same portfolio: by phase (lifecycle columns) or by repo
+  // (cross-issue swimlanes — the contention view single-repo tools can't draw).
+  const [view, setView] = useState<"phase" | "repo">("phase");
 
   useEffect(() => {
     void refreshOverview();
@@ -73,6 +76,16 @@ export function WorkspaceKanban() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex items-center gap-2 border-b border-border px-5 py-2">
+        <div className="ml-auto flex items-center rounded-[var(--radius-md)] bg-surface p-0.5">
+          <ViewToggle active={view === "phase"} onClick={() => setView("phase")} label={t("wsboard.byPhase")}>
+            <Columns3 size={13} />
+          </ViewToggle>
+          <ViewToggle active={view === "repo"} onClick={() => setView("repo")} label={t("wsboard.byRepo")}>
+            <Rows3 size={13} />
+          </ViewToggle>
+        </div>
+      </div>
       {hot.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 border-b border-waiting/30 bg-waiting/10 px-5 py-2 text-[11.5px]">
           <span className="font-medium text-waiting">{t("workspace.contendedRepos")}</span>
@@ -88,6 +101,9 @@ export function WorkspaceKanban() {
           <span className="text-ink-faint">{t("workspace.reconcile")}</span>
         </div>
       )}
+      {view === "repo" ? (
+        <RepoSwimlanes overview={overview} onOpen={(id) => void selectThread(id)} />
+      ) : (
       <div className="min-h-0 flex-1 overflow-auto">
       <div className="flex h-full min-w-fit gap-3 px-5 py-4">
         {COLUMNS.map((col) => {
@@ -117,6 +133,128 @@ export function WorkspaceKanban() {
           );
         })}
         </div>
+      </div>
+      )}
+    </div>
+  );
+}
+
+function ViewToggle({
+  active,
+  onClick,
+  label,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={label}
+      aria-pressed={active}
+      className={cn(
+        "flex items-center gap-1.5 rounded-[var(--radius-sm)] px-2 py-1 text-[12px] transition-colors",
+        active ? "bg-raised text-ink shadow-[0_1px_2px_rgba(0,0,0,0.3)]" : "text-ink-faint hover:text-ink-muted",
+      )}
+    >
+      {children}
+      {label}
+    </button>
+  );
+}
+
+/** Cross-issue swimlanes (M-D): one lane per repo, listing the issues that write
+ *  it. Overlap = the cross-repo contention that single-repo tools can't show —
+ *  the same signal as the hot-repo banner, laid out as the full map. */
+function RepoSwimlanes({
+  overview,
+  onOpen,
+}: {
+  overview: ThreadOverview[];
+  onOpen: (threadId: number) => void;
+}) {
+  const { t } = useTranslation();
+  const lanes = new Map<number, { name: string; threads: ThreadOverview[] }>();
+  const unscoped: ThreadOverview[] = [];
+  for (const o of overview) {
+    if (o.write_repos.length === 0) {
+      unscoped.push(o);
+      continue;
+    }
+    for (const r of o.write_repos) {
+      const lane = lanes.get(r.id) ?? { name: r.name, threads: [] };
+      lane.threads.push(o);
+      lanes.set(r.id, lane);
+    }
+  }
+  // Hot lanes (most issues) first — that's where reconciling will be needed.
+  const ordered = [...lanes.entries()].sort((a, b) => b[1].threads.length - a[1].threads.length);
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto flex w-full max-w-[860px] flex-col gap-2.5 px-5 py-4">
+        <p className="px-1 text-[11.5px] text-ink-faint">{t("wsboard.repoLanesHint")}</p>
+        {ordered.map(([id, lane]) => {
+          const hot = lane.threads.length >= 2;
+          return (
+            <div
+              key={id}
+              className={cn(
+                "flex flex-col gap-2 rounded-[var(--radius-lg)] border bg-surface/40 p-3 sm:flex-row sm:items-start",
+                hot ? "border-waiting/40" : "border-border",
+              )}
+            >
+              <div className="flex w-40 shrink-0 items-center gap-1.5">
+                <FolderGit2 size={13} className={hot ? "text-waiting" : "text-ink-faint"} />
+                <span className="truncate font-mono text-[12px] text-ink">{lane.name}</span>
+                <span
+                  className={cn(
+                    "ml-auto rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums sm:ml-0",
+                    hot ? "bg-waiting/15 text-waiting" : "text-ink-faint",
+                  )}
+                >
+                  {lane.threads.length}
+                </span>
+              </div>
+              <div className="flex min-w-0 flex-1 flex-wrap gap-1.5">
+                {lane.threads.map((o) => (
+                  <button
+                    key={o.thread_id}
+                    onClick={() => onOpen(o.thread_id)}
+                    className="flex max-w-full items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-bg px-2 py-1 text-left text-[12px] text-ink-muted transition-colors hover:border-border-strong hover:text-ink"
+                  >
+                    <Layers size={11} className="shrink-0 text-ink-faint" />
+                    <span className="truncate">{o.title}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+        {unscoped.length > 0 && (
+          <div className="flex flex-col gap-2 rounded-[var(--radius-lg)] border border-dashed border-border bg-surface/20 p-3 sm:flex-row sm:items-start">
+            <div className="flex w-40 shrink-0 items-center gap-1.5 text-ink-faint">
+              <Layers size={13} />
+              <span className="truncate text-[12px]">{t("wsboard.unscoped")}</span>
+              <span className="ml-auto text-[10px] tabular-nums sm:ml-0">{unscoped.length}</span>
+            </div>
+            <div className="flex min-w-0 flex-1 flex-wrap gap-1.5">
+              {unscoped.map((o) => (
+                <button
+                  key={o.thread_id}
+                  onClick={() => onOpen(o.thread_id)}
+                  className="flex max-w-full items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-bg px-2 py-1 text-left text-[12px] text-ink-muted transition-colors hover:border-border-strong hover:text-ink"
+                >
+                  <Layers size={11} className="shrink-0 text-ink-faint" />
+                  <span className="truncate">{o.title}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -36,6 +36,10 @@ export const en = {
   },
   wsboard: {
     planning: "Planning",
+    byPhase: "By phase",
+    byRepo: "By repo",
+    unscoped: "No scope yet",
+    repoLanesHint: "Which issues touch each repo — overlaps are where branches will need reconciling.",
   },
   palette: {
     search: "Search",

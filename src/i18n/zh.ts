@@ -35,6 +35,10 @@ export const zh = {
   },
   wsboard: {
     planning: "规划中",
+    byPhase: "按阶段",
+    byRepo: "按仓库",
+    unscoped: "尚未划定范围",
+    repoLanesHint: "每个仓库被哪些 issue 改动——重叠之处就是稍后分支需要合并协调的地方。",
   },
   palette: {
     search: "搜索",
