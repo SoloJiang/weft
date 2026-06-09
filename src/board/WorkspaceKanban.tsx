@@ -77,7 +77,7 @@ export function WorkspaceKanban() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-5 py-2">
+      <div className="flex items-center gap-2 border-b border-border px-5 py-2.5">
         <RailToggle />
         <div className="ml-auto flex items-center rounded-[var(--radius-md)] bg-surface p-0.5">
           <ViewToggle active={view === "phase"} onClick={() => setView("phase")} label={t("wsboard.byPhase")}>
@@ -272,7 +272,7 @@ function EmptyBoard() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center border-b border-transparent px-5 py-2">
+      <div className="flex items-center border-b border-transparent px-5 py-2.5">
         <RailToggle />
       </div>
       <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">

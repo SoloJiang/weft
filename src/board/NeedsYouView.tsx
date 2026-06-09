@@ -34,7 +34,7 @@ export function NeedsYouView() {
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-bg">
-      <header className="flex items-center gap-2.5 border-b border-border px-5 py-3">
+      <header className="flex items-center gap-2.5 border-b border-border px-5 py-2.5">
         <RailToggle />
         <span className="grid h-6 w-6 place-items-center rounded-[var(--radius-sm)] bg-waiting/15">
           <HelpCircle size={14} className="text-waiting" />
