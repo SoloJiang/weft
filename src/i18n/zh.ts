@@ -36,6 +36,16 @@ export const zh = {
   wsboard: {
     planning: "规划中",
   },
+  palette: {
+    placeholder: "搜索 issue · 跳转 · 动作",
+    empty: "无匹配",
+    issue: "issue",
+    go: "前往",
+    board: "工作区看板",
+    activity: "活动",
+    repos: "仓库地图",
+    toggleSidebar: "切换侧边栏",
+  },
   workspace: {
     tabOverview: "活动",
     tabRepos: "仓库",

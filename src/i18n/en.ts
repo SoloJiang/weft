@@ -37,6 +37,16 @@ export const en = {
   wsboard: {
     planning: "Planning",
   },
+  palette: {
+    placeholder: "Search issues · jump · act",
+    empty: "No matches",
+    issue: "Issue",
+    go: "Go to",
+    board: "Workspace board",
+    activity: "Activity",
+    repos: "Repo map",
+    toggleSidebar: "Toggle sidebar",
+  },
   workspace: {
     tabOverview: "Activity",
     tabRepos: "Repos",

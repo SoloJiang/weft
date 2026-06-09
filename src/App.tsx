@@ -6,6 +6,7 @@ import { SessionView } from "./session/SessionView";
 import { ObserveView } from "./session/ObserveView";
 import { DangerToast } from "./components/DangerToast";
 import { Toasts } from "./components/Toast";
+import { CommandPalette } from "./components/CommandPalette";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
 function Main() {
@@ -30,6 +31,7 @@ function Shell() {
       </ErrorBoundary>
       <DangerToast />
       <Toasts />
+      <CommandPalette />
     </div>
   );
 }

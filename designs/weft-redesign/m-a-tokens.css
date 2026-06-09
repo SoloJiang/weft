@@ -1,0 +1,75 @@
+/* ============================================================================
+   M-A · LOOM 换肤 drop-in for src/index.css
+   ----------------------------------------------------------------------------
+   落地第一步(低风险、当天可见):用下面两个块整体替换 src/index.css 里现有的
+   `:root, :root[data-theme="dark"]` 和 `:root[data-theme="light"]` 变量块。
+
+   组件 className(bg-surface / text-ink / bg-brand …)与 @theme 映射一律不动 —
+   整库自动换肤。基底 hue 292(紫)→ 65/75(暖石墨);brand indigo → teal「经线」;
+   accent orange → coral「纬线」。新增 --c-warp-line(更亮的青,给激活指示/链接/编织线)。
+
+   字体(可选,与换肤同批):在文件顶部加
+     @import url("https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5/400.css");
+     @import url("https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5/500.css");
+     @import url("https://cdn.jsdelivr.net/npm/@fontsource/geist-sans@5/600.css");
+     @import url("https://cdn.jsdelivr.net/npm/@fontsource/geist-mono@5/400.css");
+   并把 @theme 里的 --font-sans 改为 "Geist", -apple-system, "PingFang SC", "Noto Sans SC", …
+   ============================================================================ */
+
+/* ── DARK (default) — warm graphite, teal warp + coral weft ── */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --c-bg: oklch(0.175 0.008 65);
+  --c-surface: oklch(0.214 0.009 65);
+  --c-raised: oklch(0.252 0.010 65);
+  --c-border: oklch(0.315 0.010 65);
+  --c-border-strong: oklch(0.420 0.013 65);
+  --c-hover: oklch(0.288 0.010 65);
+  --c-ink: oklch(0.952 0.006 75);
+  --c-ink-muted: oklch(0.745 0.012 75);
+  --c-ink-faint: oklch(0.605 0.012 75);
+  --c-brand: oklch(0.575 0.105 212);            /* teal warp — fill / primary */
+  --c-brand-press: oklch(0.525 0.100 214);
+  --c-brand-ink: oklch(0.985 0.006 212);
+  --c-brand-ghost: oklch(0.745 0.105 202 / 0.15);
+  --c-warp-line: oklch(0.745 0.105 202 / 0.40); /* NEW: brighter teal for active/link/weave lines */
+  --c-accent: oklch(0.715 0.155 40);            /* coral weft — convergence / delivered */
+  --c-accent-ghost: oklch(0.715 0.155 40 / 0.16);
+  --c-running: oklch(0.770 0.150 158);
+  --c-waiting: oklch(0.815 0.120 88);
+  --c-approval: oklch(0.745 0.150 52);
+  --c-inject: oklch(0.745 0.100 220);
+  --c-idle: oklch(0.620 0.012 65);
+  --c-danger: oklch(0.655 0.200 25);
+}
+
+/* ── LIGHT — warm paper; brand/accent deepened for AA ── */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --c-bg: oklch(0.967 0.006 75);
+  --c-surface: oklch(0.992 0.004 75);
+  --c-raised: oklch(1 0 0);
+  --c-border: oklch(0.885 0.008 75);
+  --c-border-strong: oklch(0.790 0.012 75);
+  --c-hover: oklch(0.945 0.006 75);
+  --c-ink: oklch(0.275 0.020 75);
+  --c-ink-muted: oklch(0.455 0.018 75);
+  --c-ink-faint: oklch(0.575 0.016 75);
+  --c-brand: oklch(0.520 0.120 214);
+  --c-brand-press: oklch(0.470 0.120 214);
+  --c-brand-ink: oklch(0.990 0.006 212);
+  --c-brand-ghost: oklch(0.560 0.120 212 / 0.12);
+  --c-warp-line: oklch(0.560 0.120 212 / 0.38);
+  --c-accent: oklch(0.585 0.175 38);
+  --c-accent-ghost: oklch(0.585 0.175 38 / 0.12);
+  --c-running: oklch(0.580 0.150 158);
+  --c-waiting: oklch(0.620 0.130 75);
+  --c-approval: oklch(0.585 0.150 52);
+  --c-inject: oklch(0.560 0.110 222);
+  --c-idle: oklch(0.600 0.012 75);
+  --c-danger: oklch(0.560 0.200 27);
+}
+
+/* 嵌入终端 viewport 始终深色(明亮主题下也是):给 xterm 容器固定 dark token,
+   或直接固定背景。参考原型 styles.css 的 .term 规则。 */
