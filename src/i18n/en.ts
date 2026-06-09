@@ -26,13 +26,10 @@ export const en = {
     createWorkspaceFirst: "Create a workspace to begin.",
     repoMap: "Repo map",
     needsYou: "Needs you",
-    nothingNeedsYou: "Nothing needs you",
     otherWorkspaceNeeds: "Another workspace needs you",
     newWorkspace: "New workspace",
     noWorkspace: "No workspace",
     local: "Local · no server",
-    lightTheme: "Light theme",
-    darkTheme: "Dark theme",
   },
   wsboard: {
     planning: "Planning",
@@ -81,7 +78,6 @@ export const en = {
     emptyBodyNoWs: "Create a workspace to begin.",
   },
   thread: {
-    reviewScope: "Review the proposed scope, then create the sub-tasks",
     directionsSub_one: "{{count}} sub-task · runs in parallel, each scoped to its own repos",
     directionsSub_other: "{{count}} sub-tasks · run in parallel, each scoped to its own repos",
     tabBoard: "Board",
@@ -105,9 +101,6 @@ export const en = {
   },
   lead: {
     title: "Lead",
-    startTitle: "Start the lead",
-    startBody:
-      "Your main collaborator for this issue: it reads the repo map, plans the work with you, and drives the sub-tasks.",
     start: "Start the lead",
     compose: "Message the lead…",
     send: "Send",
@@ -227,11 +220,9 @@ export const en = {
     fit: "Fit to view",
   },
   inspect: {
-    label: "Inspect — open terminal, reveal, copy path",
-    openTerminal: "Open terminal here",
+    label: "Inspect — reveal, copy path",
     reveal: "Reveal working copy",
     copyPath: "Copy path",
-    pathLabel: "copy",
     branchLabel: "branch",
     sessionLabel: "session",
   },

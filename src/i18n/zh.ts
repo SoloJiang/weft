@@ -25,13 +25,10 @@ export const zh = {
     createWorkspaceFirst: "先创建一个工作区。",
     repoMap: "仓库地图",
     needsYou: "待你处理",
-    nothingNeedsYou: "暂无待办",
     otherWorkspaceNeeds: "其他工作区有待办",
     newWorkspace: "新建工作区",
     noWorkspace: "无工作区",
     local: "本地 · 无服务端",
-    lightTheme: "亮色主题",
-    darkTheme: "暗色主题",
   },
   wsboard: {
     planning: "规划中",
@@ -77,7 +74,6 @@ export const zh = {
     emptyBodyNoWs: "先创建一个工作区。",
   },
   thread: {
-    reviewScope: "审阅建议的范围,然后创建子任务",
     directionsSub_other: "{{count}} 个子任务 · 并行执行,各自划定到自己的仓库",
     tabBoard: "看板",
     newDirection: "新建子任务",
@@ -100,9 +96,6 @@ export const zh = {
   },
   lead: {
     title: "Lead",
-    startTitle: "启动 lead",
-    startBody:
-      "这个 issue 的主要协作者:它读取仓库地图、和你一起规划、并驱动各个子任务。",
     start: "启动 lead",
     compose: "给 lead 发消息…",
     send: "发送",
@@ -217,11 +210,9 @@ export const zh = {
     fit: "适应视图",
   },
   inspect: {
-    label: "检视 —— 打开终端、显示、复制路径",
-    openTerminal: "在此打开终端",
+    label: "检视 —— 显示、复制路径",
     reveal: "显示工作副本",
     copyPath: "复制路径",
-    pathLabel: "路径",
     branchLabel: "分支",
     sessionLabel: "会话",
   },
