@@ -252,7 +252,7 @@ fn watchdog_verdict(
 /// Agent-output language directive (ARCHITECTURE §4.8, layer 2). Appended to the
 /// lead prompt / worker brief so prose follows the operator's UI language; code
 /// and identifiers always stay English. Empty for English (the default).
-fn lang_directive(lang: &str) -> &'static str {
+pub fn lang_directive(lang: &str) -> &'static str {
     if lang == "zh" {
         "\n\n用中文撰写所有自然语言产出(计划、摘要、bus 消息、PR/commit 文案);代码、标识符与技术约定始终用英文。"
     } else {
@@ -703,7 +703,7 @@ pub struct LeadInfo {
 /// the thread: it discusses the work, and the plan EMERGES from that conversation
 /// rather than from a one-shot propose-and-exit. It proposes when (and only when)
 /// the human has converged with it, and may re-propose after more discussion.
-fn lead_prompt() -> &'static str {
+pub fn lead_prompt() -> &'static str {
     "You are the lead for this thread in weft — the human's main collaborator. \
 Start by greeting briefly and using the weft_planner MCP tools to orient: call get_task to read \
 what's being asked, and get_repo_map to learn each repo's role and the cross-repo dependency graph. \

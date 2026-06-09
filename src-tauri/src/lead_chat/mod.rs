@@ -3,5 +3,6 @@
 //! incremental pushes to the frontend. Replaces the PTY+jsonl-projection lead.
 //! Spec: docs/superpowers/specs/2026-06-10-lead-chat-engine-design.md
 
+pub mod commands;
 pub mod engine;
 pub mod proto;

@@ -80,6 +80,7 @@ pub fn run() {
 
     builder
         .manage(db)
+        .manage(lead_chat::engine::LeadChatState::default())
         .manage(pty::PtyState::default())
         .manage(pty::GuardrailState::default())
         .manage(bus)
@@ -131,6 +132,12 @@ pub fn run() {
             commands::approve_write_trigger,
             commands::deny_write_trigger,
             commands::answer_ask,
+            lead_chat::commands::lead_send,
+            lead_chat::commands::lead_interrupt,
+            lead_chat::commands::lead_ensure,
+            lead_chat::commands::lead_stop,
+            lead_chat::commands::lead_state,
+            lead_chat::commands::list_lead_messages,
             pty::open_session,
             pty::plan_with_lead,
             pty::resume_session,
