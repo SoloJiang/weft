@@ -37,6 +37,9 @@ fn check(name: &str, program: &str, args: &[&str]) -> Check {
 /// typecheck/lint/build/test the package.json actually defines (no invented
 /// scripts); rust and go use their standard cheap+test pair. Unknown → none.
 pub fn infer_checks(dir: &Path) -> Vec<Check> {
+    let mut out = Vec::new();
+
+    // language rungs (cheap → expensive), one toolchain per repo dir
     if let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) {
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
         let scripts = json.get("scripts").and_then(|v| v.as_object());
@@ -51,8 +54,6 @@ pub fn infer_checks(dir: &Path) -> Vec<Check> {
         } else {
             "npm"
         };
-        let mut out = Vec::new();
-        // cheap → expensive
         if has("typecheck") {
             out.push(check("typecheck", pm, &["run", "typecheck"]));
         }
@@ -65,21 +66,25 @@ pub fn infer_checks(dir: &Path) -> Vec<Check> {
         if has("test") {
             out.push(check("test", pm, &["test", "--", "--run"]));
         }
-        return out;
+    } else if dir.join("Cargo.toml").exists() {
+        out.push(check("check", "cargo", &["check", "--quiet"]));
+        out.push(check("test", "cargo", &["test", "--quiet"]));
+    } else if dir.join("go.mod").exists() {
+        out.push(check("build", "go", &["build", "./..."]));
+        out.push(check("test", "go", &["test", "./..."]));
     }
-    if dir.join("Cargo.toml").exists() {
-        return vec![
-            check("check", "cargo", &["check", "--quiet"]),
-            check("test", "cargo", &["test", "--quiet"]),
-        ];
+
+    // contract rung (§4.13 interface-contract conformance): a proto/buf repo gets
+    // `buf lint`, additive alongside the language rungs above. Convention-detected
+    // like the toolchains — only fires when the repo already uses buf.
+    if ["buf.yaml", "buf.yml", "buf.gen.yaml"]
+        .iter()
+        .any(|f| dir.join(f).exists())
+    {
+        out.push(check("contract", "buf", &["lint"]));
     }
-    if dir.join("go.mod").exists() {
-        return vec![
-            check("build", "go", &["build", "./..."]),
-            check("test", "go", &["test", "./..."]),
-        ];
-    }
-    Vec::new()
+
+    out
 }
 
 /// Keep the last ~`max` bytes of `s`, on a line boundary when possible.
@@ -184,6 +189,18 @@ mod tests {
     fn unknown_repo_has_no_checks() {
         let d = tmp(&[("readme.txt", "hi")]);
         assert!(infer_checks(&d).is_empty());
+    }
+
+    #[test]
+    fn proto_repo_adds_a_contract_rung_alongside_language() {
+        // buf alone → just the contract rung
+        let d = tmp(&[("buf.yaml", "version: v1\n")]);
+        let names: Vec<String> = infer_checks(&d).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["contract"]);
+        // buf + a language → language rungs, then contract
+        let d2 = tmp(&[("go.mod", "module x\n"), ("buf.yaml", "version: v1\n")]);
+        let names2: Vec<String> = infer_checks(&d2).into_iter().map(|c| c.name).collect();
+        assert_eq!(names2, vec!["build", "test", "contract"]);
     }
 
     #[test]
