@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, MessagesSquare, RotateCcw, Sparkles, Square, SquareTerminal } from "lucide-react";
+import { ArrowRight, MessagesSquare, RotateCcw, Send, Sparkles, Square, SquareTerminal } from "lucide-react";
 import { useStore, type OpenSession } from "../state/store";
 import type { SessionStatus } from "../lib/types";
 import { TerminalPanel } from "../panels/TerminalPanel";
@@ -131,7 +131,10 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
       </AnimatePresence>
 
       {view === "chat" ? (
-        <Transcript cwd={info.worktree} tool={info.tool} running={running} />
+        <div className="flex min-h-0 flex-1 flex-col">
+          <Transcript cwd={info.worktree} tool={info.tool} running={running} />
+          {running && <LeadComposer />}
+        </div>
       ) : (
         <motion.div
           key={info.session_id}
@@ -143,6 +146,65 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
           <TerminalPanel sessionId={info.session_id} />
         </motion.div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The composer for the Lead conversation — what makes "home is a conversation"
+ * (§ M-C) actually conversational from the Chat view, instead of forcing the
+ * human into the raw Terminal tab to type. Sends via the store's bracketed-paste
+ * path so multi-line prompts land intact in the TUI. Enter sends; Shift+Enter
+ * adds a line.
+ */
+function LeadComposer() {
+  const { sendToLead } = useStore();
+  const { t } = useTranslation();
+  const [text, setText] = useState("");
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-grow to content (capped), so a long prompt is visible as you type.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [text]);
+
+  const send = () => {
+    const v = text.trim();
+    if (!v) return;
+    void sendToLead(v);
+    setText("");
+  };
+
+  return (
+    <div className="border-t border-border bg-surface px-2.5 py-2">
+      <div className="flex items-end gap-2 rounded-[var(--radius-md)] border border-border bg-bg px-2.5 py-1.5 transition-colors focus-within:border-brand/50">
+        <textarea
+          ref={ref}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              send();
+            }
+          }}
+          rows={1}
+          placeholder={t("lead.compose")}
+          className="max-h-40 min-h-[20px] flex-1 resize-none bg-transparent text-[13px] leading-snug text-ink outline-none placeholder:text-ink-faint"
+        />
+        <button
+          onClick={send}
+          disabled={!text.trim()}
+          aria-label={t("lead.send")}
+          title={t("lead.send")}
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] bg-brand text-brand-ink transition-opacity hover:opacity-90 disabled:opacity-30"
+        >
+          <Send size={13} />
+        </button>
+      </div>
     </div>
   );
 }
