@@ -24,7 +24,9 @@ pub struct ConfigItem {
 /// Layer precedence — higher wins. Unknown layers sort lowest.
 fn precedence(layer: &str) -> u8 {
     match layer {
-        "repo" => 2,
+        "repo" => 4,
+        "weft-workspace" => 3,
+        "weft-global" => 2,
         "team" => 1,
         _ => 0, // personal
     }
@@ -116,6 +118,37 @@ pub fn effective_for(repo_path: &Path, home: &Path) -> Vec<ConfigItem> {
     resolve_effective(out)
 }
 
+/// Like `effective_for`, but injects weft-managed skills as `weft-global` /
+/// `weft-workspace` layers between personal and repo. `weft` is (name, layer,
+/// dir) — layer is "weft-global" or "weft-workspace". Pure over its inputs.
+pub fn effective_for_with_weft(
+    repo_path: &Path,
+    home: &Path,
+    weft: &[(String, String, String)],
+) -> Vec<ConfigItem> {
+    let mut out = Vec::new();
+    let personal = home.join(".claude");
+    list_skills(&personal, "personal", &mut out);
+    push_rule_if(personal.join("CLAUDE.md"), "personal", &mut out);
+
+    for (name, layer, dir) in weft {
+        out.push(ConfigItem {
+            name: name.clone(),
+            kind: "skill".into(),
+            layer: layer.clone(),
+            path: dir.clone(),
+            overridden: false,
+        });
+    }
+
+    let repo_claude = repo_path.join(".claude");
+    list_skills(&repo_claude, "repo", &mut out);
+    push_rule_if(repo_path.join("CLAUDE.md"), "repo", &mut out);
+    push_rule_if(repo_claude.join("CLAUDE.md"), "repo", &mut out);
+
+    resolve_effective(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +195,23 @@ mod tests {
         let d = std::env::temp_dir().join(format!("weft-config-{}-{}", std::process::id(), id));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn weft_layers_sit_between_personal_and_repo() {
+        let out = resolve_effective(vec![
+            item("deploy", "skill", "personal"),
+            item("deploy", "skill", "weft-global"),
+            item("deploy", "skill", "weft-workspace"),
+            item("deploy", "skill", "repo"),
+        ]);
+        // highest precedence (repo) wins; the rest overridden
+        let effective: Vec<_> = out.iter().filter(|i| !i.overridden).collect();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].layer, "repo");
+        // and weft-workspace beats weft-global beats personal in the shadow order
+        assert!(out.iter().any(|i| i.layer == "weft-workspace" && i.overridden));
+        assert!(out.iter().any(|i| i.layer == "weft-global" && i.overridden));
     }
 
     #[test]

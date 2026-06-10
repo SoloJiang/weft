@@ -598,15 +598,24 @@ pub async fn session_for(
 }
 
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,
-/// each tagged with the layer it comes from (personal / repo) and whether a
-/// higher layer shadows it.
+/// each tagged with the layer it comes from (personal / weft-global /
+/// weft-workspace / repo) and whether a higher layer shadows it. `ws_id`
+/// is optional — when absent, weft-managed layers are omitted (personal + repo
+/// only), keeping backward-compat with existing frontend calls that don't pass it.
 #[tauri::command]
-pub fn effective_config(repo_path: String) -> R<Vec<crate::config::ConfigItem>> {
-    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
-    Ok(crate::config::effective_for(
-        std::path::Path::new(&repo_path),
-        &home,
-    ))
+pub async fn effective_config(db: State<'_, Db>, repo_path: String, ws_id: Option<i32>) -> R<Vec<crate::config::ConfigItem>> {
+    let home = dirs::home_dir().ok_or_else(|| "no home".to_string())?;
+    let weft: Vec<(String, String, String)> = match ws_id {
+        Some(w) => crate::skills::enabled_for_workspace(&db, w)
+            .await
+            .map_err(e)?
+            .into_iter()
+            .filter(|s| !s.overridden)
+            .map(|s| (s.name, "weft-workspace".to_string(), s.dir))
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(crate::config::effective_for_with_weft(std::path::Path::new(&repo_path), &home, &weft))
 }
 
 // --- Skills (git-hosted skill sources): source CRUD, sync, parse preview, enable ---
