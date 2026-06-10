@@ -127,6 +127,32 @@ pub fn meets_min(tool: &str, version: &str) -> bool {
     }
 }
 
+/// Preference order when the user hasn't chosen a tool explicitly.
+pub(crate) const TOOL_PRIORITY: [&str; 3] = ["codex", "claude", "opencode"];
+
+/// Pure default-tool decision: an explicit user choice wins when that CLI is
+/// installed; otherwise the first installed tool by priority; otherwise codex
+/// (nothing can spawn anyway — Settings surfaces the "no CLI" warning).
+pub(crate) fn pick_default_tool(user: Option<&str>, installed: impl Fn(&str) -> bool) -> String {
+    if let Some(u) = user {
+        if installed(u) {
+            return u.to_string();
+        }
+    }
+    TOOL_PRIORITY
+        .iter()
+        .copied()
+        .find(|t| installed(t))
+        .unwrap_or("codex")
+        .to_string()
+}
+
+/// Resolve the effective default tool against the real PATH (and the Codex
+/// app-bundle fallback), honoring the user's explicit choice when present.
+pub fn resolve_default_tool(user: Option<&str>) -> String {
+    pick_default_tool(user, |t| resolve_tool_path(t).is_some())
+}
+
 fn codex_app_bundle_paths() -> Vec<std::path::PathBuf> {
     let mut v = vec![std::path::PathBuf::from(
         "/Applications/Codex.app/Contents/Resources/codex",
