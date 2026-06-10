@@ -18,6 +18,7 @@ mod check;
 mod claude;
 mod codex;
 pub mod config;
+pub mod skills;
 mod coordinator;
 mod curator;
 mod detect;
