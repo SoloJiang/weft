@@ -1,6 +1,5 @@
 /* REPOS = the Curator's map. A cross-repo dependency graph (no single repo can
-   hold it) + per-repo profiles. This map is the fuel for scope decomposition,
-   and it's where cross-thread contention ("hot repos") is computed. */
+   hold it) + per-repo profiles. This map is the fuel for scope decomposition. */
 
 const NODES = {
   infra:  { x: 95,  y: 80 },
@@ -29,17 +28,15 @@ function RepoGraph({ sel, onSel }) {
       })}
       {window.REPOS.map((r) => {
         const n = NODES[r.id]; const G = ROLE_GLYPH[r.role];
-        const hot = window.CONTENTION.find((c) => c.repo === r.id);
         const on = sel === r.id;
         return (
           <g key={r.id} transform={`translate(${n.x},${n.y})`} className="gnode" onClick={() => onSel(r.id)} style={{ cursor: "pointer" }}>
             <rect x="-46" y="-17" width="92" height="34" rx="9"
               fill={on ? "var(--warp-ghost)" : "var(--surface)"}
-              stroke={on ? "var(--warp)" : (hot ? "var(--st-error)" : "var(--border)")}
+              stroke={on ? "var(--warp)" : "var(--border)"}
               strokeWidth={on ? 1.6 : 1} />
             <g transform="translate(-34,-7)" style={{ color: on ? "var(--warp)" : "var(--ink-muted)" }}><G size={14} /></g>
             <text x="-14" y="4" className="gnode-t mono" fill="var(--ink)">{r.name}</text>
-            {hot && <circle cx="40" cy="-14" r="5" fill="var(--st-error)" />}
           </g>
         );
       })}
@@ -51,7 +48,6 @@ function ReposScreen({ onDialog }) {
   const [sel, setSel] = React.useState("api");
   const r = window.repo(sel);
   const dependents = window.REPOS.filter((x) => x.deps.includes(sel));
-  const hot = window.CONTENTION.find((c) => c.repo === sel);
   const IFACE = { api: ["POST /checkout", "GET /cart", "DiscountResult v1"], web: ["—"], tokens: ["tokens.json", "<Button/> <Field/>"], mobile: ["—"], infra: ["deploy(staging|prod)"], docs: ["docs.site"] };
 
   return (
@@ -71,7 +67,6 @@ function ReposScreen({ onDialog }) {
           <RepoGraph sel={sel} onSel={setSel} />
           <div className="graph-legend">
             <span className="t-meta"><span className="leg-line" /> 依赖关系（来自包清单 · 确定性推导）</span>
-            <span className="t-meta"><span className="leg-hot" /> 热点仓（跨 issue 争用）</span>
             <span className="t-meta">这张图装不进任何单个仓 —— 它是 scope 自动拆解的燃料</span>
           </div>
         </div>
@@ -82,12 +77,6 @@ function ReposScreen({ onDialog }) {
             <span className="t-eyebrow">一句话职责 <span className="faint" style={{ textTransform: "none", letterSpacing: 0 }}>· 手填优先于自动推断</span></span>
             <p className="t-body" style={{ marginTop: 4 }}>{r.oneliner}</p>
           </div>
-
-          {hot && (
-            <div className="prof-hot">
-              <IconWarn size={14} /><div><b style={{ fontWeight: 600 }}>热点仓</b><div className="t-meta" style={{ marginTop: 2 }}>{hot.note}</div></div>
-            </div>
-          )}
 
           <div className="prof-grid">
             <div><span className="t-eyebrow">技术栈</span><div className="t-label" style={{ marginTop: 3 }}>{r.stack}</div></div>

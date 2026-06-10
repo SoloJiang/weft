@@ -51,7 +51,7 @@ export function SessionView() {
   // Product words, not plumbing: "<repo> · <direction>". The real worktree
   // path / branch / native id live in Inspect (§4.7).
   return (
-    <div className="flex min-w-0 flex-1">
+    <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
         <header className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2">
           <StatusChip status={status as SessionStatus} />

@@ -70,12 +70,12 @@ function NotesScreen() {
               <Move n="4" title="把核心 wow 拍成电影"
                 from="scope 确认是一个朴素步骤；依赖顺序与契约握手不可见。"
                 to="Task → 编织式 scope 地图（写/只读/不涉及随仓亮灭）→ 依赖顺序与契约先行 → 唯一人工 gate，可纠正、会学习。" />
-              <Move n="5" title="跨 issue 全局视角"
-                from="多线并行下的仓争用没有第一类呈现。"
-                to="按仓 swimlane 暴露『热点仓』(两个 issue 同写 api) — 这是单仓工具 Conductor / vibe-kanban 结构上画不出的差异化视角。" />
+              <Move n="5" title="跨仓地图前置"
+                from="scope 分解依赖临时读仓，仓库职责和依赖关系容易被埋进对话上下文。"
+                to="Repo Profile + 依赖图成为 Workspace 的一等资源；Lead 用紧凑地图拆 scope，用户可在仓库地图里检查和修正。" />
               <Move n="6" title="机制隐入，决策在前"
-                from="worktree / PTY / diff 面板等机制与产品决策混在同一层级。"
-                to="机制（worktree/PTY/MCP/add-dir）退进 Inspect 逃生舱；任务、scope、分支/PR/diff、工具选择留在台前；失败可读、随手可逃。" />
+                from="worktree / headless 进程 / diff 面板等机制与产品决策混在同一层级。"
+                to="机制（worktree/headless engine/MCP/add-dir）退进 Inspect 逃生舱；任务、scope、分支/PR/diff、工具选择留在台前；失败可读、随手可逃。" />
             </div>
           </section>
 

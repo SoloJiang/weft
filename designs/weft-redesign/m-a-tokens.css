@@ -71,5 +71,5 @@
   --c-danger: oklch(0.560 0.200 27);
 }
 
-/* 嵌入终端 viewport 始终深色(明亮主题下也是):给 xterm 容器固定 dark token,
-   或直接固定背景。参考原型 styles.css 的 .term 规则。 */
+/* Chat timeline / diff code blocks can use the darker surface tokens in both
+   themes while the surrounding chrome follows the active theme. */

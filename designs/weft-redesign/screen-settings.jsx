@@ -59,7 +59,7 @@ function SettingsScreen({ theme, setTheme }) {
           <section className="set-sec">
             <span className="t-eyebrow">通用</span>
             <div className="card set-card">
-              <SetRow label="主题" hint="跟随系统,可手动覆盖;嵌入终端始终深色">
+              <SetRow label="主题" hint="跟随系统,可手动覆盖;chat timeline 与代码区保持高对比">
                 <Segmented value={theme} onChange={setTheme}
                   options={[{ id: "dark", label: "深色" }, { id: "light", label: "浅色" }]} />
               </SetRow>

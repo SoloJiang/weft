@@ -85,12 +85,6 @@ const THREADS = [
   },
 ];
 
-/* cross-thread "hot repo" contention — api written by two threads */
-const CONTENTION = [
-  { repo: "api", threads: ["t-discount", "t-gateway"], severity: "high",
-    note: "两个 issue 都在写 api，分支已分叉 12 个提交；建议先合 discount 的契约。" },
-];
-
 /* needs-you exceptions, aggregated across the workspace */
 const NEEDS = [
   {
@@ -142,7 +136,7 @@ const BUS = [
   { from: "mobile", to: "all", kind: "status", text: "接入校验调用，跑通 9/22 测试", age: "6m" },
 ];
 
-/* a session's terminal transcript (framed native TUI) */
+/* a session's chat timeline transcript */
 const TERM = [
   { t: "sys", text: "claude · ws/checkout/discount/api · DiscountResult 契约子任务" },
   { t: "user", text: "实现 POST /checkout/discount，按 brief 的 acceptance 跑测试。" },
@@ -176,6 +170,6 @@ const DIFF = [
 ];
 
 Object.assign(window, {
-  TOOLS, REPOS, repo, DIRECTIONS, THREADS, CONTENTION, NEEDS,
+  TOOLS, REPOS, repo, DIRECTIONS, THREADS, NEEDS,
   LEAD_STREAM, SCOPE, BUS, TERM, DIFF,
 });

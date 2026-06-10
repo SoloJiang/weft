@@ -1,5 +1,4 @@
-/* BOARD = two-level trust dashboard. Workspace (cards = threads, with a per-repo
-   swimlane that exposes cross-thread "hot repos") ⇄ Thread (cards = directions
+/* BOARD = two-level trust dashboard. Workspace (cards = issues) ⇄ Issue (cards = directions
    carrying acceptance signals + expandable provenance). Cards flow themselves;
    the human acts (Approve / Answer / Open / Review / Merge), never drags. */
 
@@ -98,37 +97,6 @@ function WorkspaceByPhase({ onOpen }) {
   );
 }
 
-function WorkspaceByRepo({ onOpen }) {
-  return (
-    <div className="swimwrap scroll-y">
-      {window.REPOS.map((r) => {
-        const threads = window.THREADS.filter((t) => t.writes.includes(r.id));
-        const hot = window.CONTENTION.find((c) => c.repo === r.id);
-        return (
-          <div key={r.id} className={"swim" + (hot ? " hot" : "")}>
-            <div className="swim-id">
-              <span className="mono swim-repo">{r.name}</span>
-              <span className="t-meta">{r.role}</span>
-              {hot && <span className="hot-tag"><IconWarn size={12} /> 热点仓</span>}
-            </div>
-            <div className="swim-lane">
-              {threads.length === 0 && <span className="t-meta faint">无写入</span>}
-              {threads.map((t) => (
-                <button key={t.id} className={"swim-card tile " + (window.LANES[t.lane].cls)} onClick={() => onOpen(t.id)}>
-                  <span className="dot" /> <span className="truncate">{t.title}</span>
-                  <Tool id={t.lead} />
-                </button>
-              ))}
-              {hot && <span className="hot-note t-meta"><IconBranch size={12} /> {hot.note}</span>}
-            </div>
-            {hot && <button className="btn btn-default btn-sm swim-act"><IconMerge size={13} /> 建议合并顺序</button>}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function ThreadBoardView({ onSession }) {
   return (
     <div className="board scroll-x">
@@ -146,22 +114,16 @@ function ThreadBoardView({ onSession }) {
 }
 
 function BoardScreen({ level, onLevel, onOpenThread, onSession }) {
-  const [wsView, setWsView] = React.useState("phase");
   return (
     <div className="screen">
       <div className="scr-head">
         <Segmented value={level} onChange={onLevel}
           options={[{ id: "workspace", label: L("Issue · 总览", "Issues · overview"), Icon: IconBoard }, { id: "thread", label: L("子任务 · 结算加优惠码", "Sub-tasks · 结算加优惠码"), Icon: IconLayers }]} />
         <span className="grow" />
-        {level === "workspace" && (
-          <Segmented value={wsView} onChange={setWsView}
-            options={[{ id: "phase", label: L("按阶段", "By phase") }, { id: "repo", label: L("按仓 swimlane", "By repo") }]} />
-        )}
         {level === "thread" && <span className="t-meta">{L("卡片自动流转 · 你只需 批准 / 回答 / 打开 / 评审 / 合并", "Cards flow themselves · you Approve / Answer / Open / Review / Merge")}</span>}
       </div>
       <div className="scr-body" style={{ overflow: "hidden" }}>
-        {level === "workspace" && wsView === "phase" && <WorkspaceByPhase onOpen={onOpenThread} />}
-        {level === "workspace" && wsView === "repo" && <WorkspaceByRepo onOpen={onOpenThread} />}
+        {level === "workspace" && <WorkspaceByPhase onOpen={onOpenThread} />}
         {level === "thread" && <ThreadBoardView onSession={onSession} />}
       </div>
     </div>

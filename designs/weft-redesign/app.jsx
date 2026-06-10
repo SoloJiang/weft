@@ -40,7 +40,7 @@ function Palette({ onClose, onNav, onTheme, onDialog }) {
     { label: "Scope 拆解 — 核心 wow", Icon: IconSpark, go: () => onNav("scope") },
     { label: "看板 · Issue 总览", Icon: IconBoard, go: () => onNav("board") },
     { label: "看板 · 子任务（结算加优惠码）", Icon: IconLayers, go: () => onNav("thread", "t-discount") },
-    { label: "会话工作台（framed TUI + diff）", Icon: IconTerminal, go: () => onNav("session") },
+    { label: "会话工作台（chat timeline + diff）", Icon: IconTerminal, go: () => onNav("session") },
     { label: "仓库地图 · Curator", Icon: IconRepos, go: () => onNav("repos") },
     { label: "设置 · 含有效配置预览", Icon: IconSettings, go: () => onNav("settings") },
     { label: "状态与边界 · 状态规格", Icon: IconLayers, go: () => onNav("states") },

@@ -120,7 +120,7 @@ export function ObserveView() {
   };
 
   return (
-    <div className="flex min-w-0 flex-1">
+    <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
         {/* Chat takeover needs no PTY-era bar (status chip / Attach): the
             conversation is the console; diff + inspect ride the composer row. */}

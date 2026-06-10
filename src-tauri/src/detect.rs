@@ -202,4 +202,29 @@ mod tests {
         assert!(!meets_min("codex", "0.19.9"));
         assert!(meets_min("unknown-tool", "0.0.1"));
     }
+
+    #[test]
+    fn default_tool_prefers_user_choice_when_installed() {
+        let installed = |t: &str| t == "claude" || t == "codex";
+        assert_eq!(pick_default_tool(Some("claude"), installed), "claude");
+    }
+
+    #[test]
+    fn default_tool_falls_back_when_user_choice_missing() {
+        let installed = |t: &str| t == "claude";
+        assert_eq!(pick_default_tool(Some("codex"), installed), "claude");
+    }
+
+    #[test]
+    fn default_tool_detects_by_priority() {
+        let installed = |t: &str| t == "codex" || t == "opencode";
+        assert_eq!(pick_default_tool(None, installed), "codex");
+        let only_oc = |t: &str| t == "opencode";
+        assert_eq!(pick_default_tool(None, only_oc), "opencode");
+    }
+
+    #[test]
+    fn default_tool_codex_when_nothing_installed() {
+        assert_eq!(pick_default_tool(None, |_| false), "codex");
+    }
 }

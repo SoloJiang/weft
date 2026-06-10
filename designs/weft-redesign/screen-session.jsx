@@ -1,6 +1,5 @@
-/* SESSION = frame, don't redraw + the §4.3 interaction layer, in full.
-   7-state session machine (body adapts), keyboard-ownership map (only ⌘-prefix
-   is product-reserved; everything else passes through to the PTY), interactive
+/* SESSION = Weft-owned chat timeline + the §4.3 interaction layer, in full.
+   7-state session machine (body adapts), keyboard-ownership map, interactive
    injection arbitration, approval bar, per-repo diff + protected merge + Inspect. */
 
 const SESS_STATUS = {
@@ -16,11 +15,11 @@ const SESS_ORDER = ["starting", "running", "waiting-input", "waiting-approval", 
 
 const KEYMAP = [
   { k: "⌘K", who: "产品保留", act: "命令面板" },
-  { k: "⌘↵", who: "产品保留", act: "composer 发送(整块 bracketed paste)" },
+  { k: "⌘↵", who: "产品保留", act: "composer 发送整块消息" },
   { k: "⌘[ / ⌘]", who: "产品保留", act: "上 / 下一个面板" },
   { k: "⌘1–9", who: "产品保留", act: "跳到第 N 个会话" },
-  { k: "Esc / ⌃C", who: "透传 TUI", act: "中断 / 停止(头部按钮等价写控制序列)" },
-  { k: "其余键", who: "透传 TUI", act: "/ 斜杠命令 · ↑↓ 历史 · Tab 补全 · 普通字符 —— 原样进 PTY" },
+  { k: "Esc / ⌃C", who: "产品处理", act: "中断 / 停止当前回合" },
+  { k: "其余键", who: "composer", act: "/ 斜杠命令 · @ 文件路径 · 普通字符 —— 进入 Weft composer" },
 ];
 
 function SessionScreen({ onNav, onDialog }) {
@@ -78,9 +77,9 @@ function SessionScreen({ onNav, onDialog }) {
 
       <div className="sess">
         <section className="sess-main">
-          <div className={"term-frame" + (status === "running" || status === "waiting-input" || status === "injecting" ? " focused" : "")}>
-            <div className="term-top">
-              <span className="term-dot" /><span className="term-dot" /><span className="term-dot" />
+          <div className={"chat-frame" + (status === "running" || status === "waiting-input" || status === "injecting" ? " focused" : "")}>
+            <div className="chat-top">
+              <span className="chat-dot" /><span className="chat-dot" /><span className="chat-dot" />
               <span className="t-meta mono" style={{ marginLeft: 8 }}>~/.weft/wt/checkout-discount-api</span>
               <span className="grow" />
               {(status === "running" || status === "waiting-input") && <span className="focus-tag"><span className="dot" /> typing here</span>}
@@ -103,10 +102,10 @@ function SessionScreen({ onNav, onDialog }) {
               </div>
             )}
 
-            {/* terminal body — adapts to status */}
-            <div className="term scroll-y">
+            {/* chat body — adapts to status */}
+            <div className="chat-body scroll-y">
               {status === "starting" ? (
-                <div className="tl tl-sys row gap2"><Spin /> 连接 PTY · 启动 claude…</div>
+                <div className="tl tl-sys row gap2"><Spin /> 连接 chat engine · 启动 claude…</div>
               ) : (
                 <>
                   {window.TERM.map((l, i) => (
@@ -135,21 +134,21 @@ function SessionScreen({ onNav, onDialog }) {
                 <button className="btn btn-sm btn-danger" onClick={() => setStatus("running")}><IconX size={13} /> 拒绝 · n</button>
               </div>
             ) : status === "exited" ? (
-              <div className="term-end fade-in">
+              <div className="chat-end fade-in">
                 <span className="st st-error"><span className="dot" /> 会话已退出(exit 0)</span>
                 <span className="grow" />
                 <button className="btn btn-sm btn-default"><IconCopy size={13} /> 复制 resume 命令</button>
                 <button className="btn btn-sm btn-primary" onClick={() => setStatus("running")}><IconReplay size={13} /> resume 接回</button>
               </div>
             ) : status === "paused" ? (
-              <div className="term-end fade-in">
-                <span className="st st-idle"><span className="dot" /> 已暂停 · 跳去外部 app 时 PTY 脱挂</span>
+              <div className="chat-end fade-in">
+                <span className="st st-idle"><span className="dot" /> 已暂停 · 外部接管中</span>
                 <span className="grow" />
                 <button className="btn btn-sm btn-primary" onClick={() => setStatus("running")}><IconReplay size={13} /> re-attach</button>
               </div>
             ) : status === "starting" ? null : (
-              <div className="composer term-composer">
-                <input className="composer-input" placeholder={status === "waiting-input" ? "agent 在等你回答 —— 直接输入即可…" : "直接输入即进 PTY;多行内容用 ⌘↵ 经 composer 整段发送…"} />
+              <div className="composer chat-composer">
+                <input className="composer-input" placeholder={status === "waiting-input" ? "agent 在等你回答 —— 直接输入即可…" : "输入消息;多行内容用 ⌘↵ 整段发送…"} />
                 <button className="btn-icon sm" title="@ 插入文件路径"><IconPlus size={15} /></button>
                 <button className="btn btn-primary btn-sm"><IconSend size={13} /></button>
               </div>
@@ -218,12 +217,12 @@ function SessionScreen({ onNav, onDialog }) {
               <button className="btn-icon sm" onClick={() => setKeys(false)}><IconX size={15} /></button>
             </div>
             <div className="dialog-body">
-              <div className="dlg-note" style={{ marginBottom: 2 }}>原则:只截 <b style={{ color: "var(--ink)" }}>⌘ 前缀</b>的少数键,其余一律原样透传给原生 TUI。</div>
+              <div className="dlg-note" style={{ marginBottom: 2 }}>原则:产品保留导航和发送快捷键;普通输入进入 Weft composer,必要时可在终端接管原生 CLI。</div>
               <div className="keymap">
                 {KEYMAP.map((r) => (
                   <div key={r.k} className="keymap-row">
                     <span className="kbd km-key">{r.k}</span>
-                    <span className={"km-who " + (r.who === "透传 TUI" ? "pass" : "")}>{r.who}</span>
+                    <span className={"km-who " + (r.who === "composer" ? "pass" : "")}>{r.who}</span>
                     <span className="t-meta grow">{r.act}</span>
                   </div>
                 ))}

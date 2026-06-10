@@ -462,31 +462,28 @@ button.tile:hover { border-color: var(--border-strong); }
 .swimwrap { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; height: 100%; }
 .swim { display: grid; grid-template-columns: 158px 1fr auto; gap: 16px; align-items: center;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); padding: 13px 15px; }
-.swim.hot { border-color: color-mix(in oklch, var(--st-error) 38%, var(--border)); background: color-mix(in oklch, var(--st-error) 5%, var(--surface)); }
 .swim-id { display: flex; flex-direction: column; gap: 2px; }
 .swim-repo { font-size: 14px; font-weight: 600; }
-.hot-tag { display: inline-flex; align-items: center; gap: 4px; margin-top: 3px; font-size: 10.5px; font-weight: 600; color: var(--st-error); }
 .swim-lane { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .swim-card { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px; border-radius: 99px;
   border: 1px solid var(--border); background: var(--sunken); font-size: 11.5px; color: var(--ink-muted); max-width: 230px; }
 .swim-card .dot { width: 7px; height: 7px; border-radius: 99px; background: currentColor; }
-.hot-note { flex-basis: 100%; color: var(--st-error); display: flex; align-items: center; gap: 6px; }
 .swim-act { white-space: nowrap; }
 
 /* ============================ SESSION ================================== */
 .sess { display: flex; flex: 1 1 auto; min-height: 0; }
 .sess-head { gap: 9px; }
 .sess-main { flex: 1 1 auto; min-width: 0; padding: 14px; display: flex; }
-.term-frame { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--sunken);
+.chat-frame { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--sunken);
   border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden; }
-.term-frame.focused { border-color: var(--warp); box-shadow: 0 0 0 3px var(--warp-ghost); }
-.term-top { display: flex; align-items: center; gap: 6px; padding: 9px 13px; border-bottom: 1px solid var(--border); background: var(--surface); }
-.term-dot { width: 9px; height: 9px; border-radius: 99px; background: var(--border-strong); }
+.chat-frame.focused { border-color: var(--warp); box-shadow: 0 0 0 3px var(--warp-ghost); }
+.chat-top { display: flex; align-items: center; gap: 6px; padding: 9px 13px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.chat-dot { width: 9px; height: 9px; border-radius: 99px; background: var(--border-strong); }
 .focus-tag { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--warp); }
 .focus-tag .dot { width: 6px; height: 6px; border-radius: 99px; background: var(--warp); }
 .inject-banner { display: flex; align-items: center; gap: 9px; padding: 8px 13px; font-size: 11.5px;
   color: var(--st-inject); background: color-mix(in oklch, var(--st-inject) 13%, transparent); border-bottom: 1px solid var(--border); }
-.term { flex: 1; overflow-y: auto; padding: 13px 15px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.75; }
+.chat-body { flex: 1; overflow-y: auto; padding: 13px 15px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.75; }
 .tl { display: flex; gap: 9px; padding: 2px 0; }
 .tl-sys { color: var(--ink-faint); font-size: 11px; padding-bottom: 6px; }
 .tl-glyph { color: var(--ink-faint); flex: 0 0 auto; }
@@ -499,8 +496,8 @@ button.tile:hover { border-color: var(--border-strong); }
 @keyframes blink { 50% { opacity: 0; } }
 .approval-bar { display: flex; align-items: center; gap: 9px; padding: 10px 13px; color: var(--st-waiting);
   background: var(--waiting-ghost); border-top: 1px solid color-mix(in oklch, var(--st-waiting) 38%, var(--border)); }
-.term-composer { display: flex; align-items: center; gap: 9px; padding: 9px 12px; border-top: 1px solid var(--border); background: var(--surface); }
-.term-composer .composer-input { flex: 1; }
+.chat-composer { display: flex; align-items: center; gap: 9px; padding: 9px 12px; border-top: 1px solid var(--border); background: var(--surface); }
+.chat-composer .composer-input { flex: 1; }
 
 .inspect-wrap { position: relative; }
 .popover { position: absolute; right: 0; top: 36px; z-index: 40; width: 268px; padding: 6px;
@@ -535,10 +532,8 @@ button.tile:hover { border-color: var(--border-strong); }
 .gnode rect { transition: stroke .15s var(--ease), fill .15s var(--ease); }
 .graph-legend { display: flex; flex-direction: column; gap: 5px; padding-top: 12px; border-top: 1px solid var(--border); }
 .leg-line { display: inline-block; width: 18px; height: 2px; background: var(--warp-line); vertical-align: middle; margin-right: 7px; }
-.leg-hot { display: inline-block; width: 8px; height: 8px; border-radius: 99px; background: var(--st-error); vertical-align: middle; margin-right: 7px; }
 .profile-pane { padding: 18px; display: flex; flex-direction: column; gap: 15px; }
 .prof-oneliner p { margin-top: 4px; }
-.prof-hot { display: flex; gap: 10px; padding: 11px; border-radius: var(--r-md); background: var(--error-ghost); color: var(--st-error); }
 .prof-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .iface-pill { font-size: 11px; padding: 3px 8px; border-radius: 6px; background: var(--sunken); border: 1px solid var(--border); color: var(--ink-muted); }
 .prof-deps { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
@@ -766,7 +761,7 @@ button.tile:active { transform: translateY(0); }
 .dlg-list-row + .dlg-list-row { border-top: 1px solid var(--border); }
 
 /* ============================ SESSION · §4.3 状态机 / 键位 ============== */
-.term-end { display: flex; align-items: center; gap: 9px; padding: 11px 13px; border-top: 1px solid var(--border); background: var(--surface); }
+.chat-end { display: flex; align-items: center; gap: 9px; padding: 11px 13px; border-top: 1px solid var(--border); background: var(--surface); }
 .inject-flash { animation: injectWash 1.3s var(--ease) both; border-radius: 5px; }
 @keyframes injectWash { 0% { background: color-mix(in oklch, var(--st-inject) 22%, transparent); } 100% { background: transparent; } }
 .keymap { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
@@ -792,7 +787,7 @@ button.tile:active { transform: translateY(0); }
 
 /* ============================ RESPONSIVE · 窄窗 ======================== */
 @media (max-width: 1100px) {
-  /* session: stack diff under terminal so neither gets crushed */
+  /* session: stack diff under chat timeline so neither gets crushed */
   .sess { flex-direction: column; }
   .sess-main { flex: 1 1 auto; min-height: 0; padding: 14px 14px 0; }
   .diffpane { width: auto !important; flex: 0 0 auto; max-height: 46%; border-left: none; border-top: 1px solid var(--border); }
@@ -806,9 +801,9 @@ button.tile:active { transform: translateY(0); }
   .ctl-hello .t-meta { display: none; }     /* trim home intro on narrow */
 }
 
-/* embedded TUI viewport stays DARK in both themes (TUIs assume dark) — DESIGN.md.
-   Weft chrome around it (header/composer/approval) follows the theme; the PTY does not. */
-.term {
+/* Chat transcript body uses a darker surface in both themes; surrounding chrome
+   follows the active theme. */
+.chat-body {
   background: oklch(0.150 0.008 65);
   --ink: oklch(0.952 0.006 75);
   --ink-muted: oklch(0.745 0.012 75);
