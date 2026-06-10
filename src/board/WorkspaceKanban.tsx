@@ -8,12 +8,11 @@ import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { cn } from "../lib/cn";
 
-type Phase = "planning" | "working" | "needs" | "review" | "done";
+type Phase = "planning" | "working" | "review" | "done";
 
 const COLUMNS: { key: Phase; label: string; dot: string }[] = [
   { key: "planning", label: "wsboard.planning", dot: "bg-idle" },
   { key: "working", label: "thread.colRunning", dot: "bg-running" },
-  { key: "needs", label: "thread.colNeeds", dot: "bg-waiting" },
   { key: "review", label: "thread.colReview", dot: "bg-brand" },
   { key: "done", label: "thread.colDone", dot: "bg-accent" },
 ];
@@ -34,22 +33,25 @@ export function WorkspaceKanban() {
   }, [refreshOverview]);
 
   // Phase from the stored direction statuses — deterministic across restarts
-  // (no dependency on in-memory sessions). Needs-you overlays everything;
+  // (no dependency on in-memory sessions). Needs-you is a tag on the card, not
+  // a stage: an open ask never moves a card out of its lifecycle column.
   // planning = the thread is still being scoped (no tasks yet); any task not
   // yet through coding = working; only review-and-beyond remains = review.
   const phaseOf = (o: ThreadOverview): Phase => {
-    const attention =
-      needs.some((n) => o.direction_ids.includes(n.direction_id)) ||
-      asks.some((a) => o.direction_ids.includes(Number(a.dir)));
-    const failing = o.direction_ids.some((id) =>
-      (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
-    );
-    if (attention || failing) return "needs";
     if (o.direction_ids.length === 0) return "planning";
     if (o.statuses.every((s) => s === "done")) return "done";
     if (o.statuses.some((s) => s !== "done" && s !== "review")) return "working";
     return "review";
   };
+
+  // Cards waiting on the human (or with a failing check) bubble to the top of
+  // their column — the attention signal without hijacking the stage.
+  const urgent = (o: ThreadOverview): boolean =>
+    needs.some((n) => o.direction_ids.includes(n.direction_id)) ||
+    asks.some((a) => o.direction_ids.includes(Number(a.dir))) ||
+    o.direction_ids.some((id) =>
+      (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
+    );
 
   if (overview.length === 0) {
     return <EmptyBoard />;
@@ -60,7 +62,9 @@ export function WorkspaceKanban() {
       <div className="min-h-0 flex-1 overflow-auto">
         <div className="flex h-full min-w-fit gap-3 px-5 py-4">
           {COLUMNS.map((col) => {
-            const cards = overview.filter((o) => phaseOf(o) === col.key);
+            const cards = overview
+              .filter((o) => phaseOf(o) === col.key)
+              .sort((a, b) => Number(urgent(b)) - Number(urgent(a)));
             return (
               <div
                 key={col.key}
@@ -139,7 +143,7 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection } = useStore();
+  const { sessions, needs, asks, checksByDirection, openNeeds } = useStore();
   const { t } = useTranslation();
   const live = Object.values(sessions).filter(
     (s) => s.status === "running" && o.direction_ids.includes(s.directionId),
@@ -172,7 +176,14 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
           {o.title}
         </span>
         {attention > 0 && (
-          <span className="grid h-5 min-w-5 shrink-0 place-items-center rounded-full bg-waiting text-[10px] font-semibold tabular-nums text-bg">
+          <span
+            title={t("needs.title")}
+            onClick={(e) => {
+              e.stopPropagation();
+              openNeeds();
+            }}
+            className="grid h-5 min-w-5 shrink-0 cursor-pointer place-items-center rounded-full bg-waiting text-[10px] font-semibold tabular-nums text-bg transition-opacity hover:opacity-80"
+          >
             {attention}
           </span>
         )}
@@ -229,7 +240,14 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
           </span>
         )}
         {attention > 0 && (
-          <span className="ml-auto rounded-full bg-waiting/15 px-1.5 py-0.5 font-medium text-waiting">
+          <span
+            title={t("needs.title")}
+            onClick={(e) => {
+              e.stopPropagation();
+              openNeeds();
+            }}
+            className="ml-auto cursor-pointer rounded-full bg-waiting/15 px-1.5 py-0.5 font-medium text-waiting transition-colors hover:bg-waiting/25"
+          >
             {t("workspace.needsYouBadge", { count: attention })}
           </span>
         )}

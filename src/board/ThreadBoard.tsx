@@ -24,14 +24,14 @@ import { ScopeReview } from "./ScopeReview";
 import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
 
-/** Task lifecycle column. "needs" is a weft overlay (an open ask / failing
- *  check). Under automation-first, queued/planning/working all mean "weft is
- *  driving it" — one column, with the stored sub-state as a chip on the card. */
-type TaskState = "working" | "needs" | "review" | "done";
+/** Task lifecycle column. Needs-you is a tag on the card (amber chip), never
+ *  a stage: an open ask leaves the task in its lifecycle column and bubbles it
+ *  to the top. Under automation-first, queued/planning/working all mean "weft
+ *  is driving it" — one column, with the stored sub-state as a chip. */
+type TaskState = "working" | "review" | "done";
 
 const COLUMNS: { key: TaskState; label: string; dot: string }[] = [
   { key: "working", label: "thread.colRunning", dot: "bg-running" },
-  { key: "needs", label: "thread.colNeeds", dot: "bg-waiting" },
   { key: "review", label: "thread.colReview", dot: "bg-brand" },
   { key: "done", label: "thread.colDone", dot: "bg-accent" },
 ];
@@ -68,20 +68,18 @@ export function ThreadBoard() {
   if (!thread) return null;
   const dirs = directionsByThread[thread.id] ?? [];
 
-  // Column from the stored, agent/human-set status; an open ask/need or a
-  // failing check overlays the task into Needs-you (the exception lane weft
-  // owns). queued/planning/working share the driving column.
+  // Column from the stored, agent/human-set status. queued/planning/working
+  // share the driving column; an open ask/need or a failing check only tags
+  // the card (amber chip) and bubbles it to the top of its column.
   const statusOf = (d: Direction): TaskState => {
-    const need =
-      needs.some((n) => n.direction_id === d.id) ||
-      asks.some((a) => a.dir === String(d.id));
-    const failing = (checksByDirection[d.id] ?? []).some((rc) =>
-      rc.checks.some((c) => c.status === "fail"),
-    );
-    if (need || failing) return "needs";
     if (d.status === "review" || d.status === "done") return d.status;
     return "working";
   };
+
+  const urgent = (d: Direction): boolean =>
+    needs.some((n) => n.direction_id === d.id) ||
+    asks.some((a) => a.dir === String(d.id)) ||
+    (checksByDirection[d.id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail"));
 
   return (
     <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
@@ -101,7 +99,9 @@ export function ThreadBoard() {
           <div className="min-h-0 flex-1 overflow-auto">
             <div className="flex h-full min-w-fit gap-3 px-5 py-4">
               {COLUMNS.map((col) => {
-                const cards = dirs.filter((d) => statusOf(d) === col.key);
+                const cards = dirs
+                  .filter((d) => statusOf(d) === col.key)
+                  .sort((a, b) => Number(urgent(b)) - Number(urgent(a)));
                 return (
                   <div key={col.key} className="flex w-[300px] shrink-0 flex-col gap-2">
                     <div className="flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
@@ -164,6 +164,7 @@ function DirectionCard({ direction }: { direction: Direction }) {
     asks,
     checksByDirection,
     requestSkillReview,
+    openNeeds,
   } = useStore();
   const { t } = useTranslation();
   const writes = worktreesByDirection[direction.id] ?? [];
@@ -203,9 +204,14 @@ function DirectionCard({ direction }: { direction: Direction }) {
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {hasNeed && (
-            <span className="rounded-full bg-waiting/15 px-1.5 py-0.5 text-[10.5px] font-medium text-waiting">
+            <button
+              type="button"
+              title={t("needs.title")}
+              onClick={() => openNeeds()}
+              className="rounded-full bg-waiting/15 px-1.5 py-0.5 text-[10.5px] font-medium text-waiting transition-colors hover:bg-waiting/25"
+            >
               {t("thread.colNeeds")}
-            </span>
+            </button>
           )}
           <StatusMenu direction={direction} />
         </div>
@@ -407,7 +413,7 @@ function TrustSignal({ kind, label }: { kind: TrustKind; label: string }) {
 }
 
 /** Keyboard/click path to restatus a task. Sets the stored status (§4.6);
- *  "needs" is weft-derived, so it isn't offered. */
+ *  Needs-you is a weft-derived tag, not a status, so it isn't offered. */
 function StatusMenu({ direction }: { direction: Direction }) {
   const { setTaskStatus } = useStore();
   const { t } = useTranslation();
