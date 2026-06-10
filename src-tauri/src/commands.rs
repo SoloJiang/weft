@@ -380,6 +380,30 @@ pub async fn needs_you(
     Ok(items)
 }
 
+/// The resolved default coding tool plus the user's explicit choice (if any).
+/// `tool` is what new threads/directions get; `configured != tool` means the
+/// configured CLI is missing and we fell back.
+#[derive(serde::Serialize)]
+pub struct DefaultTool {
+    pub tool: String,
+    pub configured: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_default_tool(db: State<'_, Db>) -> R<DefaultTool> {
+    let configured = repo::get_setting(&db, "default_tool").await.map_err(e)?;
+    let tool = crate::detect::resolve_default_tool(configured.as_deref());
+    Ok(DefaultTool { tool, configured })
+}
+
+#[tauri::command]
+pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
+    if !crate::detect::TOOL_PRIORITY.contains(&tool.as_str()) {
+        return Err(format!("unknown tool {tool:?}; expected one of {:?}", crate::detect::TOOL_PRIORITY));
+    }
+    repo::set_setting(&db, "default_tool", &tool).await.map_err(e)
+}
+
 /// One pending write declaration waiting on the human, with thread context.
 #[derive(serde::Serialize)]
 pub struct WriteTrigger {

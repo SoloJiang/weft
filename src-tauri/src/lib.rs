@@ -147,6 +147,8 @@ pub fn run() {
             inspect::reveal_path,
             inspect::open_url,
             tools::detect_tools,
+            commands::get_default_tool,
+            commands::set_default_tool,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| fatal("running tauri application", e));
