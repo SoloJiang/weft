@@ -7,7 +7,7 @@ Weft is a Tauri v2 desktop app with a React frontend and Rust backend.
 - `src/`: React + TypeScript UI. Key areas: `board/` for workspace/issue boards, `session/` for chat/observe/diff surfaces, `components/` for shared UI, `i18n/` for English/Chinese strings.
 - `src-tauri/src/`: Rust backend. Key modules: `lead_chat/` for headless agent sessions, `store/` for SQLite/SeaORM entities and migrations, `bus/` for local MCP/thread bus, `git.rs` and `materialize.rs` for worktree handling.
 - `src-tauri/tests/`: Rust integration tests.
-- `assets/`, `public/`, `designs/`: screenshots, icons, generated diagrams, and design references.
+- `assets/`, `public/`: screenshots, icons, and generated diagrams.
 
 ## Build, Test, and Development Commands
 
