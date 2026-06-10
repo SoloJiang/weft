@@ -49,3 +49,14 @@ pub async fn detect_tools() -> Result<Vec<ToolStatus>, String> {
         .await
         .map_err(|e| e.to_string())
 }
+
+/// The effective default coding tool: the Settings choice when that CLI is
+/// installed, else the first installed CLI by priority (codex > claude >
+/// opencode). Reads app_setting "default_tool"; resolution is detect.rs's.
+pub async fn default_tool(db: &crate::store::Db) -> String {
+    let configured = crate::store::repo::get_setting(db, "default_tool")
+        .await
+        .ok()
+        .flatten();
+    crate::detect::resolve_default_tool(configured.as_deref())
+}

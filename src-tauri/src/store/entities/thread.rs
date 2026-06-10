@@ -9,6 +9,8 @@ pub struct Model {
     pub title: String,
     pub slug: String,
     pub kind: String,
+    /// The coding CLI driving this thread's lead, stamped at creation.
+    pub lead_tool: String,
     pub created_at: String,
 }
 

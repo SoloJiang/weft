@@ -93,6 +93,7 @@ pub async fn create_thread(
     workspace_id: i32,
     title: &str,
     kind: &str,
+    lead_tool: &str,
 ) -> Result<thread::Model> {
     let existing: Vec<String> = thread::Entity::find()
         .filter(thread::Column::WorkspaceId.eq(workspace_id))
@@ -106,6 +107,7 @@ pub async fn create_thread(
         title: Set(title.to_string()),
         slug: Set(unique_slug(title, &existing)),
         kind: Set(kind.to_string()),
+        lead_tool: Set(lead_tool.to_string()),
         created_at: Set(now()),
         ..Default::default()
     };
@@ -580,7 +582,7 @@ mod tests {
         let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "claude")
             .await
             .unwrap();
-        let t = create_thread(&db, ws.id, "Add login", "feature")
+        let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
             .await
             .unwrap();
         let dir = create_direction(&db, t.id, "main", "claude", repo.id, "build the feature", "plan+impl")
@@ -612,7 +614,7 @@ mod tests {
         let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "claude")
             .await
             .unwrap();
-        let thread = create_thread(&db, ws.id, "T", "feature").await.unwrap();
+        let thread = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
         let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r", "impl-only")
             .await
             .unwrap();
@@ -631,7 +633,7 @@ mod tests {
     async fn direction_repo_of_none_when_unset() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
-        let t = create_thread(&db, ws.id, "Add login", "feature")
+        let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
             .await
             .unwrap();
         // A direction with repo_id == 0 (unset) has no bound write repo.
@@ -652,6 +654,16 @@ mod tests {
         .unwrap();
         assert_eq!(dir.repo_id, 0);
         assert!(direction_repo_of(&db, dir.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn create_thread_stamps_lead_tool() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "Add feature", "feature", "codex")
+            .await
+            .unwrap();
+        assert_eq!(t.lead_tool, "codex");
     }
 
     #[tokio::test]

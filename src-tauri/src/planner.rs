@@ -394,7 +394,7 @@ mod tests {
         let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "claude")
             .await
             .unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
         // Proposal: one known-repo write (pending) + one unknown-repo write (pending).
         let proposal = Proposal {

@@ -21,6 +21,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0008DirectionMandate),
             Box::new(M0009DropThreadStatus),
             Box::new(M0010AppSetting),
+            Box::new(M0011ThreadLeadTool),
         ]
     }
 }
@@ -392,5 +393,52 @@ impl MigrationTrait for M0010AppSetting {
             .drop_table(Table::drop().table(Alias::new("app_setting")).to_owned())
             .await?;
         Ok(())
+    }
+}
+
+/// Adds thread.lead_tool (the CLI driving the thread's lead), stamped at
+/// creation. Existing threads were always claude-led, so backfill "claude".
+/// M0001 reflects the current entity, so a FRESH db already has the column;
+/// sqlite has no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0011ThreadLeadTool;
+
+impl MigrationName for M0011ThreadLeadTool {
+    fn name(&self) -> &str {
+        "m0011_thread_lead_tool"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0011ThreadLeadTool {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("lead_tool"))
+                            .string()
+                            .not_null()
+                            .default("claude"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .drop_column(Alias::new("lead_tool"))
+                    .to_owned(),
+            )
+            .await
     }
 }
