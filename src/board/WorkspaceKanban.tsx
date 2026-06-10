@@ -22,7 +22,6 @@ export function WorkspaceKanban() {
   const {
     overview,
     refreshOverview,
-    sessions,
     needs,
     asks,
     checksByDirection,
@@ -34,6 +33,10 @@ export function WorkspaceKanban() {
     void refreshOverview();
   }, [refreshOverview]);
 
+  // Phase from the stored direction statuses — deterministic across restarts
+  // (no dependency on in-memory sessions). Needs-you overlays everything;
+  // planning = the thread is still being scoped (no tasks yet); any task not
+  // yet through coding = working; only review-and-beyond remains = review.
   const phaseOf = (o: ThreadOverview): Phase => {
     const attention =
       needs.some((n) => o.direction_ids.includes(n.direction_id)) ||
@@ -42,14 +45,9 @@ export function WorkspaceKanban() {
       (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
     );
     if (attention || failing) return "needs";
-    const live = Object.values(sessions).some(
-      (s) =>
-        (s.status === "running" || s.status === "starting") &&
-        o.direction_ids.includes(s.directionId),
-    );
-    if (live) return "working";
     if (o.direction_ids.length === 0) return "planning";
-    if (o.done >= o.direction_ids.length) return "done";
+    if (o.statuses.every((s) => s === "done")) return "done";
+    if (o.statuses.some((s) => s !== "done" && s !== "review")) return "working";
     return "review";
   };
 
@@ -146,6 +144,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   const live = Object.values(sessions).filter(
     (s) => s.status === "running" && o.direction_ids.includes(s.directionId),
   ).length;
+  const done = o.statuses.filter((s) => s === "done").length;
   const attention =
     needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +
     asks.filter((a) => o.direction_ids.includes(Number(a.dir))).length;
@@ -153,7 +152,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;
   const total = Math.max(o.direction_ids.length, 1);
-  const donePct = Math.min(100, Math.round((o.done / total) * 100));
+  const donePct = Math.min(100, Math.round((done / total) * 100));
 
   return (
     <motion.button
@@ -188,7 +187,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
           {t("workspace.aTask")}
         </span>
         <span className="ml-auto font-mono text-[11px] tabular-nums text-ink-faint">
-          {o.done}/{o.direction_ids.length || 0}
+          {done}/{o.direction_ids.length || 0}
         </span>
       </div>
 

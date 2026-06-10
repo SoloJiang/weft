@@ -85,7 +85,7 @@ export function ObserveView() {
   // jsonl projection: live chat session, or persisted chat rows after a
   // restart (chat_send rebuilds the engine on demand).
   const chatSessionId =
-    liveSession?.mode === "chat"
+    liveSession != null
       ? liveSession.info.session_id
       : ref?.session_id != null
         ? ref.session_id
@@ -94,8 +94,7 @@ export function ObserveView() {
     chatSessionId != null && activeThreadId != null
       ? (leadMessages[activeThreadId] ?? []).filter((m) => m.session_id === chatSessionId)
       : [];
-  const chatMode =
-    chatSessionId != null && (liveSession?.mode === "chat" || chatMsgs.length > 0);
+  const chatMode = chatSessionId != null && (liveSession != null || chatMsgs.length > 0);
 
   // Label: attach (live) → continue (has native id) → start (never dispatched).
   const driveLabel = liveSession

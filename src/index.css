@@ -314,8 +314,3 @@
   animation: weft-pop-in 160ms var(--ease-out-expo);
 }
 
-/* embedded terminal host fills its panel */
-.term-host {
-  width: 100%;
-  height: 100%;
-}

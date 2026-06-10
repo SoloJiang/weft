@@ -17,6 +17,8 @@ impl MigratorTrait for Migrator {
             Box::new(M0005DirectionRepoReason),
             Box::new(M0006DropDirectionRepo),
             Box::new(M0007LeadMessage),
+            Box::new(M0008DirectionMandate),
+            Box::new(M0009DropThreadStatus),
         ]
     }
 }
@@ -241,6 +243,89 @@ impl MigrationTrait for M0006DropDirectionRepo {
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         // Irreversible: the table is gone for good. No-op.
+        Ok(())
+    }
+}
+
+/// Adds the worker-mandate column to directions (plan+impl | impl-only). M0001
+/// reflects the current entity, so a FRESH db already has it; this only matters
+/// for dbs created before the column existed. sqlite has no ADD COLUMN IF NOT
+/// EXISTS, so tolerate the duplicate.
+pub struct M0008DirectionMandate;
+
+impl MigrationName for M0008DirectionMandate {
+    fn name(&self) -> &str {
+        "m0008_direction_mandate"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0008DirectionMandate {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("mandate"))
+                            .string()
+                            .not_null()
+                            .default("plan+impl"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .drop_column(Alias::new("mandate"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Drops the vestigial thread.status column: written once at insert ("active"),
+/// never read or updated — the workspace board derives a thread's phase from
+/// its directions. A FRESH db (M0001 reflects the entity) never has it; only
+/// dbs created before the removal do, so tolerate the missing column.
+pub struct M0009DropThreadStatus;
+
+impl MigrationName for M0009DropThreadStatus {
+    fn name(&self) -> &str {
+        "m0009_drop_thread_status"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0009DropThreadStatus {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .drop_column(Alias::new("status"))
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("no such column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Irreversible: the dead column is gone for good. No-op.
         Ok(())
     }
 }

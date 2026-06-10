@@ -1,6 +1,6 @@
 //! Sidecar: read a tool's own session transcript and normalize it into clean,
 //! app-native events (NormEvent) for the observe-mode chat view — so the common
-//! "watch the agent" case never depends on rendering a live TUI in xterm.
+//! "watch the agent" case never depends on a live process.
 //!
 //! Claude: jsonl under ~/.claude/projects/<encoded-cwd>/.
 //! Codex: rollout jsonl under ~/.codex/sessions/<date>/, located by matching the

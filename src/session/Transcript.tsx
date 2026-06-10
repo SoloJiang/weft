@@ -12,8 +12,8 @@ import { compactToolTarget, toolIcon, toolLabelKey } from "./transcriptBits";
  * Observe-mode chat for any agent (lead or worker): renders the session's
  * transcript from its sidecar (the tool's own jsonl), normalized to messages +
  * tool calls. App-native React, so it always renders correctly, reflows, and
- * costs nothing close to a live TUI. Polls while mounted; the PTY keeps running
- * underneath regardless.
+ * costs nothing close to a live TUI. Polls while mounted; the agent keeps
+ * running underneath regardless.
  */
 export function Transcript({
   cwd,

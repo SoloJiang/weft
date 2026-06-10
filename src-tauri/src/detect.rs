@@ -1,8 +1,8 @@
 //! Tool readiness: make GUI-launched Weft find CLIs installed via nvm/fnm/volta
 //! or native installers, and report each CLI's version. The core fix is
 //! augmenting THIS process's PATH from the user's login shell at startup —
-//! pty spawns copy std::env::vars() to the child (pty.rs), so one augment makes
-//! every later `claude`/`codex`/`opencode` spawn resolvable.
+//! engine spawns inherit this process's env, so one augment makes every later
+//! `claude`/`codex`/`opencode` spawn resolvable.
 
 use std::time::Duration;
 

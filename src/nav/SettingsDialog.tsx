@@ -240,7 +240,7 @@ function AppearanceSettings() {
 
   return (
     <SettingsGroup title={t("settings.interface")}>
-      <SettingRow label={t("settings.theme")} hint={t("settings.appearanceHint")}>
+      <SettingRow label={t("settings.theme")}>
         <Segmented
           value={theme}
           onChange={(v) => {

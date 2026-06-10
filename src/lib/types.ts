@@ -36,7 +36,6 @@ export interface Thread {
   title: string;
   slug: string;
   kind: string;
-  status: string;
   created_at: string;
 }
 
@@ -63,8 +62,10 @@ export interface Direction {
   slug: string;
   tool: string;
   branch: string;
-  /** agent/human-driven lifecycle: queued | working | review | done. */
+  /** agent/human-driven lifecycle: queued | planning | working | review | done. */
   status: string;
+  /** worker mandate: "plan+impl" (plans its direction first) | "impl-only". */
+  mandate: string;
   created_at: string;
 }
 
@@ -169,12 +170,7 @@ export interface LeadStateInfo {
 }
 
 /** UI-side runtime status for a live session panel. */
-export type SessionStatus =
-  | "starting"
-  | "running"
-  | "waiting-approval"
-  | "idle"
-  | "exited";
+export type SessionStatus = "running" | "idle" | "exited";
 
 export interface FileDiff {
   path: string;
@@ -226,6 +222,7 @@ export interface ProposedDirection {
   tool: string;
   repo: string;
   reason: string;
+  mandate?: string;
   decision?: string;
 }
 export interface Proposal {
@@ -244,6 +241,8 @@ export interface ResolvedDirection {
   tool: string;
   repo: ScopeEntry;
   reason: string;
+  /** "plan+impl" | "impl-only" */
+  mandate: string;
   decision: string;
 }
 export interface ResolvedProposal {
@@ -267,10 +266,9 @@ export interface ThreadOverview {
   thread_id: number;
   title: string;
   kind: string;
-  status: string;
   direction_ids: number[];
-  /** directions whose status is "done" (for the workspace board phase). */
-  done: number;
+  /** stored lifecycle status per direction (same order as direction_ids). */
+  statuses: string[];
   write_repos: { id: number; name: string }[];
 }
 

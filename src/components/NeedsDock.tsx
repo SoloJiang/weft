@@ -23,17 +23,9 @@ export function NeedsDock() {
           ? { kind: "question", item: needs[0] }
           : null;
 
-  if (total === 0) {
-    return (
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border bg-surface/45 px-5 text-[12px]">
-        <span className="flex items-center gap-1.5 text-running">
-          <span className="h-1.5 w-1.5 rounded-full bg-running weft-pulse" />
-          {t("needs.flowing")}
-        </span>
-        <span className="text-ink-faint">{t("needs.flowingHint")}</span>
-      </div>
-    );
-  }
+  // Nothing needs the human → no banner at all: "flowing automatically" is the
+  // default state, not an announcement worth a permanent strip on every screen.
+  if (total === 0) return null;
 
   return (
     <button

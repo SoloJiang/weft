@@ -25,13 +25,21 @@ import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
 
 /** Task lifecycle column. "needs" is a weft overlay (an open ask / failing
- *  check); the rest are the agent/human-set stored status (§4.6). */
-type TaskState = "queued" | "working" | "needs" | "review" | "done";
+ *  check). Under automation-first, queued/planning/working all mean "weft is
+ *  driving it" — one column, with the stored sub-state as a chip on the card. */
+type TaskState = "working" | "needs" | "review" | "done";
 
 const COLUMNS: { key: TaskState; label: string; dot: string }[] = [
-  { key: "queued", label: "thread.colQueued", dot: "bg-idle" },
   { key: "working", label: "thread.colRunning", dot: "bg-running" },
   { key: "needs", label: "thread.colNeeds", dot: "bg-waiting" },
+  { key: "review", label: "thread.colReview", dot: "bg-brand" },
+  { key: "done", label: "thread.colDone", dot: "bg-accent" },
+];
+
+/** Stored statuses a human may set directly (sub-states of the lifecycle). */
+const SETTABLE: { key: string; label: string; dot: string }[] = [
+  { key: "planning", label: "thread.statusPlanning", dot: "bg-idle" },
+  { key: "working", label: "thread.statusBuilding", dot: "bg-running" },
   { key: "review", label: "thread.colReview", dot: "bg-brand" },
   { key: "done", label: "thread.colDone", dot: "bg-accent" },
 ];
@@ -60,8 +68,9 @@ export function ThreadBoard() {
   if (!thread) return null;
   const dirs = directionsByThread[thread.id] ?? [];
 
-  // Column = the stored, agent/human-set status; an open ask/need or a failing
-  // check overlays the task into Needs-you (the exception lane weft owns).
+  // Column from the stored, agent/human-set status; an open ask/need or a
+  // failing check overlays the task into Needs-you (the exception lane weft
+  // owns). queued/planning/working share the driving column.
   const statusOf = (d: Direction): TaskState => {
     const need =
       needs.some((n) => n.direction_id === d.id) ||
@@ -70,9 +79,8 @@ export function ThreadBoard() {
       rc.checks.some((c) => c.status === "fail"),
     );
     if (need || failing) return "needs";
-    const s = d.status;
-    if (s === "working" || s === "review" || s === "done") return s;
-    return "queued";
+    if (d.status === "review" || d.status === "done") return d.status;
+    return "working";
   };
 
   return (
@@ -367,7 +375,8 @@ function ProvenanceMenu({
 type TFn = ReturnType<typeof useTranslation>["t"];
 
 function taskStatusLabel(t: TFn, status: Direction["status"]) {
-  if (status === "working") return t("thread.colRunning");
+  if (status === "planning") return t("thread.statusPlanning");
+  if (status === "working") return t("thread.statusBuilding");
   if (status === "review") return t("thread.colReview");
   if (status === "done") return t("thread.colDone");
   return t("thread.colQueued");
@@ -402,7 +411,7 @@ function TrustSignal({ kind, label }: { kind: TrustKind; label: string }) {
 function StatusMenu({ direction }: { direction: Direction }) {
   const { setTaskStatus } = useStore();
   const { t } = useTranslation();
-  const settable = COLUMNS.filter((c) => c.key !== "needs");
+  const settable = SETTABLE;
   const current = settable.find((c) => c.key === direction.status) ?? settable[0];
   return (
     <DM.Root>

@@ -138,10 +138,10 @@ pub struct ThreadOverview {
     pub thread_id: i32,
     pub title: String,
     pub kind: String,
-    pub status: String,
     pub direction_ids: Vec<i32>,
-    /// directions whose status is "done" (for the workspace board's phase).
-    pub done: u32,
+    /// Stored lifecycle status of each direction (same order as direction_ids),
+    /// so the workspace board derives the thread's phase deterministically.
+    pub statuses: Vec<String>,
     /// distinct repos this thread WRITES (across its directions).
     pub write_repos: Vec<RepoLite>,
 }
@@ -164,9 +164,8 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
             thread_id: t.id,
             title: t.title,
             kind: t.kind,
-            status: t.status,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
-            done: dirs.iter().filter(|d| d.status == "done").count() as u32,
+            statuses: dirs.iter().map(|d| d.status.clone()).collect(),
             write_repos: seen.into_iter().map(|(id, name)| RepoLite { id, name }).collect(),
         });
     }
@@ -262,10 +261,19 @@ pub async fn create_direction(
     tool: String,
     repo_id: i32,
     reason: String,
+    mandate: Option<String>,
 ) -> R<entities::direction::Model> {
-    let dir = repo::create_direction(&db, thread_id, &name, &tool, repo_id, &reason)
-        .await
-        .map_err(e)?;
+    let dir = repo::create_direction(
+        &db,
+        thread_id,
+        &name,
+        &tool,
+        repo_id,
+        &reason,
+        mandate.as_deref().unwrap_or("plan+impl"),
+    )
+    .await
+    .map_err(e)?;
     materialize::materialize_direction(&db, dir.id).await.map_err(e)?;
     Ok(dir)
 }
@@ -477,17 +485,90 @@ pub fn set_dangerous_mode(asks: tauri::State<'_, crate::ask::AskRegistry>, on: b
     Ok(())
 }
 
-/// Runaway guardrails (§7): idle + wall-clock caps the per-session watchdog uses
-/// to force-stop a stuck/runaway agent. Seconds; 0 disables that cap. Applies to
-/// sessions started after the change (the watchdog reads caps at spawn).
+/// Runaway-guardrail caps (§7 跑飞护栏), enforced per busy turn by the chat
+/// engine's watchdog (lead_chat::engine::spawn_watchdog). Configurable at
+/// runtime from Settings; seeded from the WEFT_* env defaults so an env
+/// override still sets the initial value. 0 on either disables that cap.
+pub struct GuardrailState {
+    inner: std::sync::Mutex<(u64, u64)>, // (idle_secs, wall_secs)
+}
+
+impl Default for GuardrailState {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new((
+                env_secs("WEFT_IDLE_WATCHDOG_SECS", 1800), // 30 min
+                env_secs("WEFT_WALL_CAP_SECS", 7200),      // 2 h
+            )),
+        }
+    }
+}
+
+impl GuardrailState {
+    pub fn set(&self, idle_secs: u64, wall_secs: u64) {
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = (idle_secs, wall_secs);
+    }
+    /// (idle_cap_secs, wall_cap_secs)
+    pub fn get(&self) -> (u64, u64) {
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Runaway guardrails (§7): idle + wall-clock caps in seconds; 0 disables that
+/// cap. See the GuardrailState note on enforcement.
 #[tauri::command]
 pub fn set_guardrails(
-    guard: tauri::State<'_, crate::pty::GuardrailState>,
+    guard: tauri::State<'_, GuardrailState>,
     idle_secs: u64,
     wall_secs: u64,
 ) -> R<()> {
     guard.set(idle_secs, wall_secs);
     Ok(())
+}
+
+/// Read-only snapshot backing the observe surface: the worktree to read
+/// transcript/diff from, plus the latest session's identity/status if any.
+/// `None` only when the (direction, repo) has no materialized worktree.
+#[derive(serde::Serialize, Clone)]
+pub struct ObserveRef {
+    pub worktree: String,
+    pub branch: String,
+    pub tool: String,
+    pub session_id: Option<i32>,
+    pub native_id: Option<String>,
+    pub status: Option<String>,
+}
+
+#[tauri::command]
+pub async fn session_for(
+    db: State<'_, Db>,
+    direction_id: i32,
+    repo_id: i32,
+) -> R<Option<ObserveRef>> {
+    let wt = match repo::worktree_for(&db, direction_id, repo_id).await.map_err(e)? {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    let dir = match repo::get_direction(&db, direction_id).await.map_err(e)? {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let latest = repo::latest_session_for(&db, direction_id, repo_id).await.map_err(e)?;
+    Ok(Some(ObserveRef {
+        worktree: wt.path,
+        branch: wt.branch,
+        tool: dir.tool,
+        session_id: latest.as_ref().map(|s| s.id),
+        native_id: latest.as_ref().and_then(|s| s.native_session_id.clone()),
+        status: latest.as_ref().map(|s| s.status.clone()),
+    }))
 }
 
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,

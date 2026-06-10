@@ -17,6 +17,8 @@ pub struct BriefData {
     pub task: String,
     pub kind: String,
     pub direction: String,
+    /// Worker mandate: "plan+impl" | "impl-only" — selects the status contract.
+    pub mandate: String,
     /// Repos this direction owns (its worktrees).
     pub writes: Vec<RepoBrief>,
     /// Human-readable cross-repo contract lines from the dependency graph.
@@ -63,9 +65,33 @@ pub fn format_brief(d: &BriefData) -> String {
          tools to post updates (bus_post / bus_broadcast), read your inbox \
          (bus_inbox), announce contract changes (announce_interface_change), and \
          ask_human when a decision is only the operator's to make. Stay within \
-         your write repos; read anything you need.\n\n\
-         Start now.\n",
+         your write repos; read anything you need.\n",
     );
+
+    // The status contract (§4.6): the board is only honest if YOU move your
+    // task with set_task_status as work really progresses.
+    if d.mandate == "impl-only" {
+        s.push_str(
+            "\n## Status contract\n\
+             You are dispatched impl-only: this direction is already scoped — \
+             skip planning and build straight away. When the code is done and \
+             your checks pass, call set_task_status(\"review\"). If the human \
+             sends you back for changes, set it to \"working\" again.\n\n\
+             Start now.\n",
+        );
+    } else {
+        s.push_str(
+            "\n## Status contract\n\
+             Your task starts in **planning**: first work out a short \
+             implementation plan for THIS direction (use your planning skill if \
+             you have one), and post the essentials to the bus (bus_post) so \
+             the lead can follow. When you move from planning to building, call \
+             set_task_status(\"working\"). When the code is done and your \
+             checks pass, call set_task_status(\"review\"). If the human sends \
+             you back for changes, set it to \"working\" again.\n\n\
+             Start by planning now.\n",
+        );
+    }
     s
 }
 
@@ -143,6 +169,7 @@ pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
         task: thread.title,
         kind: thread.kind,
         direction: dir.name,
+        mandate: repo::normalize_mandate(&dir.mandate).to_string(),
         writes,
         contracts,
         non_goals,
@@ -158,6 +185,7 @@ mod tests {
             task: "Add a discount code".into(),
             kind: "feature".into(),
             direction: "Backend endpoint".into(),
+            mandate: "plan+impl".into(),
             writes: vec![
                 RepoBrief { name: "api".into(), summary: "Checkout API".into() },
                 RepoBrief { name: "core".into(), summary: "Shared types".into() },
@@ -193,6 +221,29 @@ mod tests {
         assert!(!s.contains("do NOT edit"));
         // still has the coordinate section + start cue
         assert!(s.contains("Coordinate"));
+        assert!(s.contains("Start by planning now."));
+    }
+
+    #[test]
+    fn plan_impl_brief_carries_planning_contract() {
+        let s = format_brief(&data());
+        assert!(s.contains("Status contract"));
+        assert!(s.contains("starts in **planning**"));
+        assert!(s.contains("set_task_status(\"working\")"));
+        assert!(s.contains("set_task_status(\"review\")"));
+        assert!(s.contains("Start by planning now."));
+        assert!(!s.contains("impl-only"));
+    }
+
+    #[test]
+    fn impl_only_brief_skips_planning() {
+        let mut d = data();
+        d.mandate = "impl-only".into();
+        let s = format_brief(&d);
+        assert!(s.contains("impl-only"));
+        assert!(s.contains("skip planning"));
+        assert!(s.contains("set_task_status(\"review\")"));
         assert!(s.contains("Start now."));
+        assert!(!s.contains("Start by planning now."));
     }
 }

@@ -6,8 +6,8 @@ import { Button } from "../components/ui/Button";
 import { toolFullName } from "../components/ToolIcon";
 
 /**
- * The chat-session counterpart of the PTY approval bar: when this session's
- * agent is blocked on a tool permission (Ask Bridge), answer it right here —
+ * Approvals at the conversation: when this session's agent is blocked on a
+ * tool permission (Ask Bridge), answer it right here —
  * the conversation is the console, no detour through Needs-you required.
  */
 export function PermissionBar({ asks }: { asks: PermissionAsk[] }) {
