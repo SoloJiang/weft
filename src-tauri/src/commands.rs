@@ -609,7 +609,7 @@ pub fn effective_config(repo_path: String) -> R<Vec<crate::config::ConfigItem>> 
     ))
 }
 
-// --- Skills (M? skill sources): source CRUD, sync, parse preview, enable ---
+// --- Skills (git-hosted skill sources): source CRUD, sync, parse preview, enable ---
 
 #[tauri::command]
 pub async fn list_skill_sources(db: State<'_, Db>) -> R<Vec<entities::skill_source::Model>> {
