@@ -64,7 +64,7 @@ async fn lead_engine(
     if let Some(e) = state.get(lead_key(thread_id)) {
         return Ok(e);
     }
-    repo::get_thread(db, thread_id)
+    let t = repo::get_thread(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
     let cwd = crate::paths::weft_home()?.join("leads").join(thread_id.to_string());
@@ -76,14 +76,14 @@ async fn lead_engine(
         .current_dir(&cwd)
         .status();
     let base = app.state::<crate::BusBase>().0.clone();
-    let inj = crate::bus::inject::inject_planner(&base, thread_id, "claude", &cwd);
-    let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "lead", "claude", &cwd);
+    let inj = crate::bus::inject::inject_planner(&base, thread_id, &t.lead_tool, &cwd);
+    let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "lead", &t.lead_tool, &cwd);
     let mut extra = ask.args;
     extra.extend(inj.args);
     let system_prompt = format!("{}{}", lead_prompt(), lang_directive(lang));
     let inner = engine::EngineInner {
         thread_id,
-        tool: "claude".into(),
+        tool: t.lead_tool.clone(),
         session_id: None,
         cwd,
         extra_args: extra,
