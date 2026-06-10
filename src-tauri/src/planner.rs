@@ -13,13 +13,14 @@ use crate::store::{repo, Db};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// One proposed work line: a tool, the ONE repo it writes (by name), and the
-/// required reason it must change. Reads are unmanaged — agents read any repo
-/// freely (scope rework, spec Part 1).
+/// One proposed work line: the ONE repo it writes (by name), and the required
+/// reason it must change. Reads are unmanaged — agents read any repo freely
+/// (scope rework, spec Part 1). The tool is no longer part of the proposal;
+/// it is chosen by the human at approval time (or picked from the workspace
+/// default for batch confirm).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposedDirection {
     pub name: String,
-    pub tool: String,
     #[serde(default)]
     pub repo: String,
     #[serde(default)]
@@ -50,10 +51,11 @@ pub struct ScopeEntry {
 }
 
 /// A direction resolved against the workspace's repos, ready for the UI / confirm.
+/// The tool is absent from the resolved form; it is provided by the human on the
+/// approval card (approve_direction) or taken from the workspace default (confirm).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ResolvedDirection {
     pub name: String,
-    pub tool: String,
     /// The one write repo, resolved to a workspace repo.
     pub repo: ScopeEntry,
     pub reason: String,
@@ -68,7 +70,6 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
     let id = repos.iter().find(|(_, n)| *n == dir.repo).map(|(id, _)| *id);
     ResolvedDirection {
         name: dir.name.clone(),
-        tool: dir.tool.clone(),
         repo: ScopeEntry {
             repo_id: id.unwrap_or(-1),
             repo_name: dir.repo.clone(),
@@ -129,6 +130,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
     let mut created = Vec::new();
+    let tool = crate::tools::default_tool(db).await;
     for d in &resolved.directions {
         if !d.repo.known {
             continue; // unknown repo name never resolved to a worktree-able repo
@@ -138,7 +140,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         }
         let dir =
             repo::create_direction(
-                db, thread_id, &d.name, &d.tool, d.repo.repo_id, &d.reason, &d.mandate,
+                db, thread_id, &d.name, &tool, d.repo.repo_id, &d.reason, &d.mandate,
             )
             .await?;
         materialize::materialize_direction(db, dir.id).await?;
@@ -151,9 +153,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
 }
 
 /// Approve one proposed direction (by index): mark it approved in the stored
-/// proposal, create the real direction bound to its repo + reason, and
-/// materialize its worktree. Returns the new direction id.
-pub async fn approve_direction(db: &Db, thread_id: i32, index: usize) -> Result<i32> {
+/// proposal, create the real direction bound to its repo + reason using the
+/// human-selected `tool`, and materialize its worktree. Returns the new
+/// direction id.
+pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str) -> Result<i32> {
     let plan = repo::get_plan(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal for thread {thread_id}"))?;
@@ -184,7 +187,7 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize) -> Result<
         db,
         thread_id,
         &resolved.name,
-        &resolved.tool,
+        tool,
         resolved.repo.repo_id,
         &resolved.reason,
         &resolved.mandate,
@@ -283,7 +286,6 @@ mod tests {
     fn resolves_repo_name_to_id_with_reason() {
         let d = ProposedDirection {
             name: "Payments".into(),
-            tool: "claude".into(),
             repo: "api".into(),
             reason: "add the discount endpoint".into(),
             mandate: "".into(),
@@ -300,7 +302,6 @@ mod tests {
     fn unknown_repo_name_is_flagged_not_dropped() {
         let d = ProposedDirection {
             name: "X".into(),
-            tool: "codex".into(),
             repo: "ghost-repo".into(),
             reason: "whatever".into(),
             mandate: "impl-only".into(),
@@ -313,7 +314,8 @@ mod tests {
     }
 
     #[test]
-    fn proposal_parses_with_missing_optional_fields() {
+    fn proposal_parses_with_missing_and_legacy_fields() {
+        // Legacy proposals carried a "tool" per direction; serde must ignore it.
         let p: Proposal = serde_json::from_str(
             r#"{ "directions": [ { "name": "wip", "tool": "claude" } ] }"#,
         )
@@ -328,7 +330,6 @@ mod tests {
     fn resolve_carries_decision_through() {
         let d = ProposedDirection {
             name: "X".into(),
-            tool: "claude".into(),
             repo: "api".into(),
             reason: "r".into(),
             mandate: "plan+impl".into(),
@@ -341,9 +342,9 @@ mod tests {
     #[test]
     fn pending_filter_skips_decided_and_unknown() {
         let rs = vec![
-            resolve(&ProposedDirection { name: "a".into(), tool: "claude".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
-            resolve(&ProposedDirection { name: "b".into(), tool: "claude".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "approved".into() }, &repos()),
-            resolve(&ProposedDirection { name: "c".into(), tool: "claude".into(), repo: "ghost".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
+            resolve(&ProposedDirection { name: "a".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
+            resolve(&ProposedDirection { name: "b".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "approved".into() }, &repos()),
+            resolve(&ProposedDirection { name: "c".into(), repo: "ghost".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
         ];
         let pending: Vec<_> = rs.iter().enumerate()
             .filter(|(_, d)| d.repo.known && d.decision.is_empty())
@@ -402,7 +403,6 @@ mod tests {
             directions: vec![
                 ProposedDirection {
                     name: "Payments".into(),
-                    tool: "claude".into(),
                     repo: "api".into(),
                     reason: "add discount endpoint".into(),
                     mandate: "impl-only".into(),
@@ -410,7 +410,6 @@ mod tests {
                 },
                 ProposedDirection {
                     name: "Ghost".into(),
-                    tool: "claude".into(),
                     repo: "nope".into(),
                     reason: "n/a".into(),
                     mandate: "".into(),
@@ -428,12 +427,12 @@ mod tests {
         assert_eq!(pending[0].reason, "add discount endpoint");
 
         // Approve index 0 -> a real direction is created bound to the repo + reason.
-        let id = approve_direction(&db, t.id, 0).await.unwrap();
+        let id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         let dirs = repo::list_directions(&db, t.id).await.unwrap();
         assert_eq!(dirs.len(), 1, "exactly one direction created");
         assert_eq!(dirs[0].id, id);
         assert_eq!(dirs[0].repo_id, ra.id);
-        assert_eq!(dirs[0].reason, "add discount endpoint");
+        assert_eq!(dirs[0].tool, "codex", "card-picked tool lands on the direction");
         // No longer pending once approved.
         assert!(pending_writes(&db, t.id).await.unwrap().is_empty());
 
@@ -442,7 +441,7 @@ mod tests {
         assert_eq!(pending_writes(&db, t.id).await.unwrap().len(), 1);
 
         // Approve the SAME index again -> idempotent: same id, no second direction.
-        let id2 = approve_direction(&db, t.id, 0).await.unwrap();
+        let id2 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         assert_eq!(id2, id, "idempotent approve returns the existing direction");
         let dirs2 = repo::list_directions(&db, t.id).await.unwrap();
         assert_eq!(dirs2.len(), 1, "no second direction created on re-approve");

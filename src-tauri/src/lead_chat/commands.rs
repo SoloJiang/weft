@@ -33,7 +33,7 @@ Then DISCUSS the requirement and approach with the human; ask clarifying questio
 You do not write code, and you do not plan the directions' implementations — each worker plans its \
 own direction. Your job is to converge the scope and ASSIGN ROLES. When you and the human have \
 converged on how to split the work, call propose_directions with a short rationale and the directions \
-(name, tool, the ONE repo each writes, reason, mandate); only list repos each direction must WRITE \
+(name, the ONE repo each writes, reason, mandate); only list repos each direction must WRITE \
 (reads are free). Pick mandate per direction: plan+impl (default — the worker plans first) or \
 impl-only (small/fully-specified — build straight away). The human reviews and confirms in weft; you \
 can re-propose after more discussion. Prefer splitting frontend/backend/shared work to run in \

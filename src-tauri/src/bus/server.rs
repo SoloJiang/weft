@@ -356,12 +356,11 @@ fn planner_specs() -> Value {
                 "rationale": str_prop(),
                 "directions": { "type": "array", "items": { "type": "object", "properties": {
                     "name": str_prop(),
-                    "tool": str_prop(),
                     "repo": str_prop(),
                     "reason": str_prop(),
                     "mandate": { "type": "string", "enum": ["plan+impl", "impl-only"],
                         "description": "Granularity of the role: plan+impl (default) — the worker plans its own direction first, then builds; impl-only — the direction is small/fully specified, the worker builds straight away. Do NOT write the direction's implementation plan yourself; that is the worker's job." }
-                }, "required": ["name", "tool", "repo", "reason"] } }
+                }, "required": ["name", "repo", "reason"] } }
             }, "required": ["directions"] }
         }
     ])

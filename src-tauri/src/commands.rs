@@ -422,8 +422,9 @@ pub async fn approve_write_trigger(
     db: State<'_, Db>,
     thread_id: i32,
     index: usize,
+    tool: String,
 ) -> R<i32> {
-    crate::planner::approve_direction(&db, thread_id, index).await.map_err(e)
+    crate::planner::approve_direction(&db, thread_id, index, &tool).await.map_err(e)
 }
 
 /// Deny a write declaration: mark denied + relay to the lead's bus inbox.
