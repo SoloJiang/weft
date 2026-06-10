@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { Bot, Layers, Plus, SquarePen, X } from "lucide-react";
+import { Layers, Plus, SquarePen, X } from "lucide-react";
 import { useStore } from "../state/store";
 import type { ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
@@ -168,10 +168,6 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
       )}
     >
       <div className="flex items-start gap-2">
-        <Layers
-          size={14}
-          className={cn("mt-0.5 shrink-0", attention > 0 ? "text-waiting" : "text-ink-faint")}
-        />
         <span className="min-w-0 flex-1 text-[13px] font-semibold leading-snug text-ink">
           {o.title}
         </span>
@@ -189,75 +185,59 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
         )}
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-1.5">
         <span className="shrink-0 rounded-full border border-border bg-bg px-1.5 py-0.5 text-[10.5px] text-ink-faint">
           {t(`kind.${o.kind}`, o.kind)}
         </span>
-        <span className="flex items-center gap-1 text-[11px] text-ink-faint">
-          <Bot size={11} className="text-brand" />
-          {t("workspace.aTask")}
-        </span>
-        <span className="ml-auto font-mono text-[11px] tabular-nums text-ink-faint">
-          {done}/{o.direction_ids.length || 0}
-        </span>
+        {o.write_repos.slice(0, 3).map((r) => (
+          <span
+            key={r.id}
+            className="rounded-full border border-border bg-bg px-1.5 py-0.5 font-mono text-[10.5px] text-ink-muted"
+          >
+            {r.name}
+          </span>
+        ))}
+        {o.write_repos.length > 3 && (
+          <span className="rounded-full border border-border bg-bg px-1.5 py-0.5 font-mono text-[10.5px] text-ink-faint">
+            +{o.write_repos.length - 3}
+          </span>
+        )}
       </div>
 
-      {o.write_repos.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-          {o.write_repos.map((r) => (
+      {o.direction_ids.length > 0 && (
+        <div className="flex items-center gap-2">
+          <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-bg">
             <span
-              key={r.id}
-              className="rounded-full border border-border bg-bg px-1.5 py-0.5 font-mono text-[10.5px] text-ink-muted"
+              className={cn(
+                "block h-full rounded-full",
+                attention > 0 ? "bg-waiting" : failing > 0 ? "bg-danger" : "bg-brand",
+              )}
+              style={{ width: `${donePct}%` }}
+            />
+          </div>
+          <span className="font-mono text-[11px] tabular-nums text-ink-faint">
+            {done}/{o.direction_ids.length}
+          </span>
+          {live > 0 && (
+            <span
+              title={t("workspace.live", { count: live })}
+              className="flex items-center gap-1 text-[11px] tabular-nums text-running"
             >
-              {r.name}
+              <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
+              {live}
             </span>
-          ))}
+          )}
+          {failing > 0 && (
+            <span
+              title={t("workspace.failing", { count: failing })}
+              className="flex items-center gap-1 text-[11px] tabular-nums text-danger"
+            >
+              <X size={11} />
+              {failing}
+            </span>
+          )}
         </div>
       )}
-
-      <div className="h-1 overflow-hidden rounded-full bg-bg">
-        <span
-          className={cn(
-            "block h-full rounded-full",
-            attention > 0 ? "bg-waiting" : failing > 0 ? "bg-danger" : "bg-brand",
-          )}
-          style={{ width: `${donePct}%` }}
-        />
-      </div>
-
-      <div className="flex items-center gap-2 text-[11px] text-ink-faint">
-        <span>{t("workspace.directions", { count: o.direction_ids.length })}</span>
-        {live > 0 && (
-          <span className="flex items-center gap-1 text-running">
-            <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
-            {t("workspace.live", { count: live })}
-          </span>
-        )}
-        {failing > 0 && (
-          <span className="flex items-center gap-1 text-danger">
-            <X size={11} />
-            {t("workspace.failing", { count: failing })}
-          </span>
-        )}
-        {attention > 0 && (
-          <span
-            title={t("needs.title")}
-            onClick={(e) => {
-              e.stopPropagation();
-              openNeeds();
-            }}
-            className="ml-auto cursor-pointer rounded-full bg-waiting/15 px-1.5 py-0.5 font-medium text-waiting transition-colors hover:bg-waiting/25"
-          >
-            {t("workspace.needsYouBadge", { count: attention })}
-          </span>
-        )}
-        {attention === 0 && live === 0 && failing === 0 && (
-          <span className="ml-auto flex items-center gap-1 text-ink-faint">
-            <span className="h-1.5 w-1.5 rounded-full bg-brand" />
-            {t("workspace.auto")}
-          </span>
-        )}
-      </div>
     </motion.button>
   );
 }

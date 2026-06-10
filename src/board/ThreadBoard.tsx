@@ -198,7 +198,9 @@ function DirectionCard({ direction }: { direction: Direction }) {
       )}
     >
       <div className="flex items-start gap-2 px-3 py-2.5">
-        <ToolIcon tool={direction.tool} size={15} className="mt-0.5" />
+        <span title={toolFullName(direction.tool)} className="mt-0.5 shrink-0">
+          <ToolIcon tool={direction.tool} size={15} />
+        </span>
         <div className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-snug text-ink">
           {direction.name}
         </div>
@@ -217,20 +219,11 @@ function DirectionCard({ direction }: { direction: Direction }) {
         </div>
       </div>
 
-      {/* One left-aligned chips row: tool, status, then the write copies. */}
-      <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
-        <span className="rounded-full border border-border bg-bg px-1.5 py-0.5 text-[10.5px] text-ink-faint">
-          {toolFullName(direction.tool)}
-        </span>
-        <span className="rounded-full border border-border bg-bg px-1.5 py-0.5 text-[10.5px] text-ink-faint">
-          {taskStatusLabel(t, direction.status)}
-        </span>
-        {writes.length === 0 ? (
-          <span className="rounded-full border border-dashed border-border px-2 py-0.5 text-[11px] text-ink-faint">
-            {t("thread.noWriteCopy")}
-          </span>
-        ) : (
-          writes.map((w) => {
+      {/* The write copies — the card's working entry points. Tool lives in the
+          header icon; status is the column + the StatusMenu dot. */}
+      {writes.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
+          {writes.map((w) => {
             const repo = repos.find((r) => r.id === w.repo_id);
             const sess = Object.values(sessions).find(
               (s) => s.directionId === direction.id && s.repoId === w.repo_id,
@@ -246,11 +239,12 @@ function DirectionCard({ direction }: { direction: Direction }) {
                 {sess && <StatusDot status={sess.status as SessionStatus} />}
               </button>
             );
-          })
-        )}
-      </div>
+          })}
+        </div>
+      )}
 
-      <div className="flex flex-wrap gap-1.5 border-y border-border px-3 py-2">
+      {/* One honest trust signal (the real checks) + provenance, then actions. */}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-border px-3 py-2">
         <TrustSignal
           kind={testsKind}
           label={
@@ -259,14 +253,6 @@ function DirectionCard({ direction }: { direction: Direction }) {
               : t("thread.testsPending")
           }
         />
-        <TrustSignal
-          kind={testsKind}
-          label={failed > 0 ? t("thread.acceptFail", { count: failed }) : t("thread.typesSignal")}
-        />
-        <TrustSignal kind="pend" label={t("thread.contractSignal")} />
-      </div>
-
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 py-2">
         <ProvenanceMenu writes={writes} checks={checks} />
         <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1.5">
           <button
@@ -290,6 +276,7 @@ function DirectionCard({ direction }: { direction: Direction }) {
             size="sm"
             variant={action.variant}
             disabled={!firstWrite}
+            title={firstWrite ? undefined : t("thread.noWriteCopy")}
             onClick={() =>
               firstWrite &&
               viewDirection(direction.id, firstWrite.repo_id, { diff: action.diff })
@@ -376,16 +363,6 @@ function ProvenanceMenu({
       </DM.Portal>
     </DM.Root>
   );
-}
-
-type TFn = ReturnType<typeof useTranslation>["t"];
-
-function taskStatusLabel(t: TFn, status: Direction["status"]) {
-  if (status === "planning") return t("thread.statusPlanning");
-  if (status === "working") return t("thread.statusBuilding");
-  if (status === "review") return t("thread.colReview");
-  if (status === "done") return t("thread.colDone");
-  return t("thread.colQueued");
 }
 
 type TrustKind = "pass" | "fail" | "pend";
