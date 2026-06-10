@@ -11,18 +11,12 @@ import {
   Sun,
 } from "lucide-react";
 import { Input } from "../components/ui/Input";
+import { toolFullName } from "../components/ToolIcon";
 import { currentLang, setLang, type Lang } from "../i18n";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { useStore } from "../state/store";
 import { useTheme } from "../state/theme";
-
-const TOOLS = ["claude", "codex", "opencode"] as const;
-const TOOL_LABEL: Record<string, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  opencode: "OpenCode",
-};
 
 type SettingsPage = "general" | "appearance" | "automation";
 
@@ -156,12 +150,16 @@ function GeneralSettings() {
     setProjectsDir,
     defaultTool,
     setDefaultTool,
+    configuredTool,
+    installedTools,
     reviewSkill,
     setReviewSkill,
     autoReview,
     setAutoReview,
   } = useStore();
   const [lang, setLangState] = useState<Lang>(currentLang());
+
+  const installed = installedTools.filter((tl) => tl.installed);
 
   useEffect(() => {
     setLangState(currentLang());
@@ -176,11 +174,25 @@ function GeneralSettings() {
     <div className="flex flex-col gap-10">
       <SettingsGroup title={t("settings.defaults")}>
         <SettingRow label={t("settings.defaultTool")} hint={t("settings.defaultToolHint")}>
-          <Segmented
-            value={defaultTool}
-            onChange={setDefaultTool}
-            options={TOOLS.map((tool) => ({ value: tool, label: TOOL_LABEL[tool] }))}
-          />
+          {installed.length === 0 ? (
+            <span className="text-[12px] text-waiting">{t("settings.noTools")}</span>
+          ) : (
+            <div className="flex flex-col items-end gap-1">
+              <Segmented
+                value={defaultTool}
+                onChange={setDefaultTool}
+                options={installed.map((tl) => ({ value: tl.tool, label: toolFullName(tl.tool) }))}
+              />
+              {configuredTool && configuredTool !== defaultTool && (
+                <span className="text-[11px] text-waiting">
+                  {t("settings.toolFallback", {
+                    configured: toolFullName(configuredTool),
+                    tool: toolFullName(defaultTool),
+                  })}
+                </span>
+              )}
+            </div>
+          )}
         </SettingRow>
         <SettingRow label={t("settings.projectsDir")} hint={t("settings.projectsDirHint")}>
           <div className="flex w-[360px] max-w-[42vw] items-center gap-2">
