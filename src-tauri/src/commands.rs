@@ -117,7 +117,8 @@ pub async fn update_repo_profile(
 
 #[tauri::command]
 pub async fn create_thread(db: State<'_, Db>, workspace_id: i32, title: String, kind: String) -> R<entities::thread::Model> {
-    repo::create_thread(&db, workspace_id, &title, &kind).await.map_err(e)
+    let tool = crate::tools::default_tool(&db).await;
+    repo::create_thread(&db, workspace_id, &title, &kind, &tool).await.map_err(e)
 }
 
 #[tauri::command]
