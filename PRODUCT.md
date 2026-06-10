@@ -8,7 +8,7 @@ product
 
 Developers who deliver features and fixes that span several repositories and
 want coding agents (Claude Code, Codex, OpenCode) to carry the work from intent
-to pull request, not just chat. They think in tasks ("add a discount code to
+to reviewable multi-repo diffs and, next, pull requests, not just chat. They think in tasks ("add a discount code to
 checkout", "fix #4821"), not in worktrees or sessions. Their context: a focused
 desktop session beside an IDE, several work lines in flight at once, wanting to
 *supervise* delivery, not babysit terminals. They step in when something is
@@ -23,7 +23,8 @@ spawns the agents, coordinates them, verifies the result, and drives it out the
 door. You supervise and handle exceptions — you are not a required checkpoint in
 the loop.
 
-Delivery is **phased**: today each task lands as clean pull requests; the north
+Delivery is **phased**: current code reaches reviewable local worktree diffs
+with pre-PR checks; the next product boundary is clean pull requests. The north
 star is to carry it the rest of the way — **merge, then deploy across environments
 (staging → production)** — so the unit of *done* is shipped code, not an open PR.
 
@@ -45,9 +46,11 @@ The shape of the work:
    hands each a structured **brief** (scope + interface-contract + acceptance),
    and drives them to convergence over a per-thread **bus**. Workers' output is
    gated by **executable verification** (lint / type / test / contract /
-   review-agent), not by a human nod. Green opens a PR today — and, on the
-   roadmap, flows on through **merge and environment-aware deploy (staging →
-   production)**; red retries within bounds, then escalates.
+   configured in-worker review skill), not by a human nod. Green currently means
+   a reviewable worktree diff with pre-PR evidence; the next boundary is opening
+   or updating a PR, and the roadmap flows on through **merge and
+   environment-aware deploy (staging → production)**; red retries within bounds,
+   then escalates.
 
 **Home is a conversation, not a terminal grid.** The primary surface is the
 **lead** (your main chat + control tower): read-only across the repos, it plans,
@@ -64,14 +67,14 @@ irreversible-action boundary (e.g. merging a protected branch, or a production
 deploy). Everything else runs; "what's waiting on me" is the rare exception,
 surfaced at the top of every view.
 
-**Delivery is phased — today Task → PR, the goal Task → shipped.** Today the
-boundary is a PR per repo: weft drives the native CLIs (it doesn't bypass hooks),
-so opening a PR naturally triggers the repo's own checks, and weft does light
-pre-PR verification to avoid opening junk. The north star reaches past the PR —
-weft **drives merge, then deploy across environments (staging → production)** — by
-*orchestrating the repo's existing pipelines*, never re-implementing CI/CD. The
-unit of *done* becomes shipped code; irreversible steps stay gated by the
-configurable boundary above.
+**Delivery is phased — now reviewable diff, next Task → PR, the goal Task →
+shipped.** Current code reaches local worktree diffs with light pre-PR
+verification. The next boundary is a PR per repo: weft drives the native CLIs
+(it doesn't bypass hooks), so opening a PR naturally triggers the repo's own
+checks. The north star reaches past the PR — weft **drives merge, then deploy
+across environments (staging → production)** — by *orchestrating the repo's
+existing pipelines*, never re-implementing CI/CD. The unit of *done* becomes
+shipped code; irreversible steps stay gated by the configurable boundary above.
 
 It is explicitly **not** a terminal emulator, and not a "watch the agents go"
 dashboard. It is the workspace-and-automation fabric the agents deliver inside.
@@ -116,7 +119,7 @@ designed, system-following + toggleable).
    correction.
 5. **Trust through verification, shown.** Because no human gates the work, the
    board is a *trust dashboard*: each card carries its acceptance signals (tests
-   x/y, contract match, review-agent verdict) with expandable provenance. Green
+   x/y, contract match, review skill result where configured) with expandable provenance. Green
    you trust; red or escalated you open. Be honest where a repo isn't verifiable.
 6. **The board flows itself; the human acts, not drags.** A two-level kanban
    (workspace = threads, thread = directions) is a live projection of agent +
