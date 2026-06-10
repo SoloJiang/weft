@@ -24,6 +24,9 @@ pub struct ProposedDirection {
     pub repo: String,
     #[serde(default)]
     pub reason: String,
+    /// Worker mandate: "plan+impl" (default) | "impl-only".
+    #[serde(default)]
+    pub mandate: String,
     /// Human decision on this write declaration: "" (pending) | "approved" | "denied".
     #[serde(default)]
     pub decision: String,
@@ -54,6 +57,8 @@ pub struct ResolvedDirection {
     /// The one write repo, resolved to a workspace repo.
     pub repo: ScopeEntry,
     pub reason: String,
+    /// Worker mandate: "plan+impl" | "impl-only".
+    pub mandate: String,
     pub decision: String,
 }
 
@@ -70,6 +75,7 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
             known: id.is_some(),
         },
         reason: dir.reason.clone(),
+        mandate: repo::normalize_mandate(&dir.mandate).to_string(),
         decision: dir.decision.clone(),
     }
 }
@@ -131,8 +137,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             continue; // already handled via per-card approve/deny
         }
         let dir =
-            repo::create_direction(db, thread_id, &d.name, &d.tool, d.repo.repo_id, &d.reason)
-                .await?;
+            repo::create_direction(
+                db, thread_id, &d.name, &d.tool, d.repo.repo_id, &d.reason, &d.mandate,
+            )
+            .await?;
         materialize::materialize_direction(db, dir.id).await?;
         created.push(dir.id);
     }
@@ -179,6 +187,7 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize) -> Result<
         &resolved.tool,
         resolved.repo.repo_id,
         &resolved.reason,
+        &resolved.mandate,
     )
     .await?;
     materialize::materialize_direction(db, dir.id).await?;
@@ -277,10 +286,12 @@ mod tests {
             tool: "claude".into(),
             repo: "api".into(),
             reason: "add the discount endpoint".into(),
+            mandate: "".into(),
             decision: "".into(),
         };
         let r = resolve(&d, &repos());
         assert_eq!(r.name, "Payments");
+        assert_eq!(r.mandate, "plan+impl"); // empty mandate normalizes to the default
         assert_eq!(r.reason, "add the discount endpoint");
         assert_eq!(r.repo, ScopeEntry { repo_id: 2, repo_name: "api".into(), known: true });
     }
@@ -292,10 +303,12 @@ mod tests {
             tool: "codex".into(),
             repo: "ghost-repo".into(),
             reason: "whatever".into(),
+            mandate: "impl-only".into(),
             decision: "".into(),
         };
         let r = resolve(&d, &repos());
         assert!(!r.repo.known);
+        assert_eq!(r.mandate, "impl-only");
         assert_eq!(r.repo.repo_id, -1);
     }
 
@@ -318,6 +331,7 @@ mod tests {
             tool: "claude".into(),
             repo: "api".into(),
             reason: "r".into(),
+            mandate: "plan+impl".into(),
             decision: "approved".into(),
         };
         let r = resolve(&d, &repos());
@@ -327,9 +341,9 @@ mod tests {
     #[test]
     fn pending_filter_skips_decided_and_unknown() {
         let rs = vec![
-            resolve(&ProposedDirection { name: "a".into(), tool: "claude".into(), repo: "api".into(), reason: "r".into(), decision: "".into() }, &repos()),
-            resolve(&ProposedDirection { name: "b".into(), tool: "claude".into(), repo: "api".into(), reason: "r".into(), decision: "approved".into() }, &repos()),
-            resolve(&ProposedDirection { name: "c".into(), tool: "claude".into(), repo: "ghost".into(), reason: "r".into(), decision: "".into() }, &repos()),
+            resolve(&ProposedDirection { name: "a".into(), tool: "claude".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
+            resolve(&ProposedDirection { name: "b".into(), tool: "claude".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "approved".into() }, &repos()),
+            resolve(&ProposedDirection { name: "c".into(), tool: "claude".into(), repo: "ghost".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
         ];
         let pending: Vec<_> = rs.iter().enumerate()
             .filter(|(_, d)| d.repo.known && d.decision.is_empty())
@@ -391,6 +405,7 @@ mod tests {
                     tool: "claude".into(),
                     repo: "api".into(),
                     reason: "add discount endpoint".into(),
+                    mandate: "impl-only".into(),
                     decision: "".into(),
                 },
                 ProposedDirection {
@@ -398,6 +413,7 @@ mod tests {
                     tool: "claude".into(),
                     repo: "nope".into(),
                     reason: "n/a".into(),
+                    mandate: "".into(),
                     decision: "".into(),
                 },
             ],

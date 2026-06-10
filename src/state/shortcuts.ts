@@ -3,9 +3,9 @@ import { useStore } from "./store";
 
 /**
  * The app-wide keyboard layer. weft owns the ⌘ prefix (§4.3 key ownership), so
- * these run in the capture phase — they fire before a focused xterm grabs the
- * key, and only ever on ⌘/Ctrl-chords, so plain typing and the TUI's own keys
- * (and copy/paste) pass straight through. ⌘K is the palette's (handled there).
+ * these run in the capture phase — they fire before any focused input sees the
+ * key, and only ever on ⌘/Ctrl-chords, so plain typing (and copy/paste) passes
+ * straight through. ⌘K is the palette's (handled there).
  *
  *   ⌘\        toggle the sidebar
  *   ⌘1/2      workspace board / repo map

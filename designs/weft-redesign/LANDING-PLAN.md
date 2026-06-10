@@ -1,5 +1,7 @@
 # Weft · LOOM 落地推进计划
 
+> ⚠️ **部分内容已过时(superseded,2026-06-10)**:本稿写于 PTY/xterm 内嵌终端形态时期。该形态已整体移除(commit `2d26038`),全部会话改走 headless chat 引擎(`src-tauri/src/lead_chat/`)。文中涉及 PTY/xterm/合帧/`.term` 容器的条目仅作历史参考,以 `ARCHITECTURE.md` 现行版为准。
+
 从「设计提案 + 落地包」到**完整落地**的施工图。配套:[HANDOFF.md](HANDOFF.md)(token/术语/组件/规范)、原型 `designs/weft-redesign/`、drop-in [m-a-tokens.css](m-a-tokens.css)。
 
 > **交付边界**:当前止于 **Task → PR**(每仓干净 PR + 仓库自带 CI 触发)。北极星 **Task → 上线**(merge → staging → production)是后续维度,编排现有 CD,不在本计划主体。

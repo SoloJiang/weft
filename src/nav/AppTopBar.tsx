@@ -126,15 +126,11 @@ export function AppTopBar() {
               {toolFullName(activeSession.info.tool)}
             </span>
             <span className="min-w-0 truncate text-[13px] font-semibold text-ink">
-              {activeSession.kind === "lead"
-                ? t("session.leadPlanning")
-                : sessionDirection?.name ?? "task"}
+              {sessionDirection?.name ?? "task"}
             </span>
-            {activeSession.kind !== "lead" && (
-              <span className="hidden shrink-0 text-[11.5px] text-ink-faint sm:inline">
-                {sessionRepo?.name ?? "working copy"}
-              </span>
-            )}
+            <span className="hidden shrink-0 text-[11.5px] text-ink-faint sm:inline">
+              {sessionRepo?.name ?? "working copy"}
+            </span>
           </div>
         )}
         {inObserve && (

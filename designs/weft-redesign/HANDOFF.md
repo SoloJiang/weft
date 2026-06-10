@@ -1,5 +1,7 @@
 # Weft · LOOM 落地 handoff
 
+> ⚠️ **部分内容已过时(superseded,2026-06-10)**:本稿写于 PTY/xterm 内嵌终端形态时期。该形态已整体移除(commit `2d26038`),全部会话改走 headless chat 引擎(`src-tauri/src/lead_chat/`),会话界面为 weft 自有 chat 时间线。文中涉及 PTY/xterm/合帧/终端面板的部分仅作历史参考,以 `ARCHITECTURE.md` 现行版为准。
+
 把 `designs/weft-redesign/` 的 LOOM 设计提案落进真实 `src/`。原型是 React+Babel 演示,**不直接搬运**;本文件给的是 token 映射 + 组件清单 + 重构顺序。
 
 > 关键利好:你现有架构是 Tailwind `@theme` → `--c-*` 每主题变量,组件全用 `bg-surface` / `text-ink` / `bg-brand` 这类语义类。**所以 LOOM 改色 = 只换 `--c-*` 的值**,`@theme` 映射和组件 className 一律不动,整库自动换肤。先做这一步就能拿到 80% 的视觉差异,且零风险。

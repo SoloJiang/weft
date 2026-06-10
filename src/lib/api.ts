@@ -10,7 +10,6 @@ import type {
   NeedItem,
   NormEvent,
   ObserveRef,
-  // (LeadInfo retired with the PTY lead)
   PermissionAsk,
   Proposal,
   RepoChecks,
@@ -84,9 +83,6 @@ export const api = {
   listWorktrees: (directionId: number) =>
     invoke<Worktree[]>("list_worktrees", { directionId }),
 
-  openSession: (directionId: number, repoId: number, lang: string) =>
-    invoke<SessionInfo>("open_session", { directionId, repoId, lang }),
-
   // Lead chat engine: weft-owned conversation (headless stream-json claude).
   leadSend: (
     threadId: number,
@@ -117,22 +113,12 @@ export const api = {
   chatInterrupt: (sessionId: number) =>
     invoke<void>("chat_interrupt", { sessionId }),
   chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),
-  resumeSession: (sessionId: number) =>
-    invoke<SessionInfo>("resume_session", { sessionId }),
   sessionFor: (directionId: number, repoId: number) =>
     invoke<ObserveRef | null>("session_for", { directionId, repoId }),
-  driveSession: (directionId: number, repoId: number, lang: string) =>
-    invoke<SessionInfo>("drive_session", { directionId, repoId, lang }),
   readTranscript: (cwd: string, tool: string) =>
     invoke<NormEvent[]>("read_transcript", { cwd, tool }),
   worktreeDiff: (cwd: string) =>
     invoke<WorktreeDiff>("worktree_diff", { cwd }),
-  writePty: (sessionId: number, data: string) =>
-    invoke<void>("write_pty", { sessionId, data }),
-  resizePty: (sessionId: number, rows: number, cols: number) =>
-    invoke<void>("resize_pty", { sessionId, rows, cols }),
-  killSession: (sessionId: number) =>
-    invoke<void>("kill_session", { sessionId }),
 
   // Quality loop: run inferred checks across a direction's write worktrees.
   verifyDirection: (directionId: number) =>
@@ -173,8 +159,8 @@ export const api = {
   detectTools: () => invoke<ToolStatus[]>("detect_tools"),
   // Dangerous mode (global): every agent's tool asks auto-allow.
   setDangerousMode: (on: boolean) => invoke<void>("set_dangerous_mode", { on }),
-  // Runaway guardrails: idle + wall-clock caps (seconds; 0 disables) the
-  // per-session watchdog uses to force-stop a stuck/runaway agent.
+  // Runaway guardrails: idle + wall-clock caps (seconds; 0 disables) for
+  // force-stopping a stuck/runaway agent (enforcement pending on the engine).
   setGuardrails: (idleSecs: number, wallSecs: number) =>
     invoke<void>("set_guardrails", { idleSecs, wallSecs }),
   // Effective config (skills + rules) for a repo, tagged by layer + override.

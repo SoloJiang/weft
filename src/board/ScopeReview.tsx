@@ -222,6 +222,11 @@ function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
             <ToolIcon tool={lane.direction.tool} size={12} />
             {toolFullName(lane.direction.tool)}
           </span>
+          <span className="hidden shrink-0 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] text-ink-faint sm:inline">
+            {lane.direction.mandate === "impl-only"
+              ? t("scope.mandateImpl")
+              : t("scope.mandatePlan")}
+          </span>
           {index > 0 && (
             <span className="hidden shrink-0 items-center gap-1 rounded-full border border-brand/30 bg-brand-ghost px-2 py-0.5 text-[10.5px] text-brand lg:flex">
               <Clock size={11} />

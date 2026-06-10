@@ -12,7 +12,6 @@
 //! permission.
 
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 /// Pre-accept claude's one-time folder-trust onboarding for a dir weft created
 /// (a worktree or lead scratch dir), so a dispatched agent starts immediately
@@ -104,44 +103,6 @@ pub fn projects_dir_for(cwd: &Path) -> std::io::Result<PathBuf> {
         .join(encode_cwd(&canon)))
 }
 
-fn mtime_secs(p: &Path) -> u64 {
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Newest `*.jsonl` in `projects_dir` whose mtime is at/after `since`.
-/// Returns the session id (== file stem) only after cross-checking the file
-/// actually contains a matching `"sessionId":"<stem>"` — the stem and the
-/// recorded id must agree, or we don't trust the capture.
-pub fn capture_session_id(projects_dir: &Path, since: u64) -> Option<String> {
-    let mut best: Option<(u64, PathBuf)> = None;
-    for entry in std::fs::read_dir(projects_dir).ok()?.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let mt = mtime_secs(&p);
-        if mt + 2 < since {
-            continue; // 2s slack for clock granularity
-        }
-        if best.as_ref().map_or(true, |(bm, _)| mt >= *bm) {
-            best = Some((mt, p));
-        }
-    }
-    let (_, path) = best?;
-    let stem = path.file_stem()?.to_string_lossy().to_string();
-    let content = std::fs::read_to_string(&path).ok()?;
-    if content.contains(&format!("\"sessionId\":\"{}\"", stem)) {
-        Some(stem)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,31 +154,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn capture_requires_stem_id_agreement() {
-        let dir = std::env::temp_dir().join(format!("weft-claude-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // matching stem == sessionId -> captured
-        let sid = "11111111-2222-3333-4444-555555555555";
-        std::fs::write(
-            dir.join(format!("{sid}.jsonl")),
-            format!("{{\"sessionId\":\"{sid}\",\"x\":1}}\n"),
-        )
-        .unwrap();
-        assert_eq!(capture_session_id(&dir, 0).as_deref(), Some(sid));
-
-        // a jsonl whose stem does NOT appear inside -> not trusted
-        let dir2 = dir.join("mismatch");
-        std::fs::create_dir_all(&dir2).unwrap();
-        std::fs::write(
-            dir2.join("aaaa.jsonl"),
-            "{\"sessionId\":\"bbbb\"}\n".to_string(),
-        )
-        .unwrap();
-        assert_eq!(capture_session_id(&dir2, 0), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

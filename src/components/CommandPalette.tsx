@@ -37,7 +37,7 @@ export function openCommandPalette() {
  * ⌘K / Ctrl+K command palette — the silky cross-app jump (§ navigation unify).
  * One keystroke to reach any issue or workspace surface without hunting the
  * sidebar. Self-contained: a capture-phase window listener owns the hotkey (so
- * it beats xterm in a focused session), arrow/Enter drive selection.
+ * it beats any focused input), arrow/Enter drive selection.
  */
 export function CommandPalette() {
   const { t } = useTranslation();

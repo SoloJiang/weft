@@ -1,21 +1,20 @@
 //! Consumes bus Wake events and nudges the target direction's live session to
-//! read its inbox. Rate-limited per direction. Relies on the agent TUIs queueing
-//! mid-turn input (the wake runs after the current turn) rather than fragile idle
-//! detection — this is the honest "push" half of bus + coordinator = near-realtime.
+//! read its inbox. Rate-limited per direction. A busy engine queues the nudge
+//! for after the current turn rather than fragile idle detection — this is the
+//! honest "push" half of bus + coordinator = near-realtime.
 
 use crate::bus::{Wake, HUMAN};
-use crate::pty::PtyState;
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 const WAKE_PROMPT: &str =
-    "You have new messages on the thread bus. Call the bus_inbox tool to read them.\r";
+    "You have new messages on the thread bus. Call the bus_inbox tool to read them.";
 const RATE_LIMIT: Duration = Duration::from_secs(8);
 
 /// Run the coordinator loop on a dedicated OS thread (the mpsc Receiver is
-/// blocking). `app` provides access to the managed `PtyState`.
+/// blocking).
 pub fn run(app: AppHandle, rx: Receiver<Wake>) {
     std::thread::spawn(move || {
         let mut last: HashMap<i32, Instant> = HashMap::new();
@@ -37,13 +36,6 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
                     continue; // rate-limited: don't spam the agent
                 }
             }
-            // Legacy PTY sessions first; the chat engine is the normal path now.
-            if let Some(state) = app.try_state::<PtyState>() {
-                if state.wake_direction(dir, WAKE_PROMPT) {
-                    last.insert(dir, now);
-                    continue;
-                }
-            }
             // Chat-engine worker: deliver the wake as an invisible nudge (no
             // timeline row); a busy engine queues it for after the turn.
             last.insert(dir, now);
@@ -61,13 +53,7 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
                 else {
                     return;
                 };
-                let _ = crate::lead_chat::engine::nudge(
-                    &app2,
-                    &db,
-                    &eng,
-                    WAKE_PROMPT.trim_end_matches('\r'),
-                )
-                .await;
+                let _ = crate::lead_chat::engine::nudge(&app2, &db, &eng, WAKE_PROMPT).await;
             });
         }
     });

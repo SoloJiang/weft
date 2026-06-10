@@ -82,7 +82,6 @@ pub async fn create_thread(
         title: Set(title.to_string()),
         slug: Set(unique_slug(title, &existing)),
         kind: Set(kind.to_string()),
-        status: Set("active".to_string()),
         created_at: Set(now()),
         ..Default::default()
     };
@@ -192,6 +191,7 @@ pub async fn create_direction(
     tool: &str,
     repo_id: i32,
     reason: &str,
+    mandate: &str,
 ) -> Result<direction::Model> {
     let t = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
@@ -219,12 +219,18 @@ pub async fn create_direction(
         status: Set("queued".to_string()),
         repo_id: Set(repo_id),
         reason: Set(reason.to_string()),
+        mandate: Set(normalize_mandate(mandate).to_string()),
         created_at: Set(now()),
         ..Default::default()
     }
     .insert(&db.0)
     .await?;
     Ok(dir)
+}
+
+/// Anything that isn't explicitly "impl-only" is the default "plan+impl".
+pub fn normalize_mandate(m: &str) -> &'static str {
+    if m == "impl-only" { "impl-only" } else { "plan+impl" }
 }
 
 pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<direction::Model>> {
@@ -553,7 +559,7 @@ mod tests {
         let t = create_thread(&db, ws.id, "Add login", "feature")
             .await
             .unwrap();
-        let dir = create_direction(&db, t.id, "main", "claude", repo.id, "build the feature")
+        let dir = create_direction(&db, t.id, "main", "claude", repo.id, "build the feature", "plan+impl")
             .await
             .unwrap();
         assert_eq!(dir.branch, "ws/demo-ws/add-login/main");
@@ -583,7 +589,7 @@ mod tests {
             .await
             .unwrap();
         let thread = create_thread(&db, ws.id, "T", "feature").await.unwrap();
-        let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r")
+        let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r", "impl-only")
             .await
             .unwrap();
         // older session (no native), then newer (native captured)

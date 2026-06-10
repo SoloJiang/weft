@@ -193,10 +193,10 @@ async fn handle(
 /// Bus tool: the agent sets its own task's lifecycle status. `dir` is the
 /// direction id from the URL path, so the agent can't move another task.
 async fn set_task_status_tool(db: &Db, dir: &str, status: &str) -> Value {
-    let allowed = ["queued", "working", "review", "done"];
+    let allowed = ["queued", "planning", "working", "review", "done"];
     if !allowed.contains(&status) {
         return text_result(format!(
-            "invalid status '{status}'; use one of: queued, working, review, done"
+            "invalid status '{status}'; use one of: queued, planning, working, review, done"
         ));
     }
     match dir.parse::<i32>() {
@@ -358,7 +358,9 @@ fn planner_specs() -> Value {
                     "name": str_prop(),
                     "tool": str_prop(),
                     "repo": str_prop(),
-                    "reason": str_prop()
+                    "reason": str_prop(),
+                    "mandate": { "type": "string", "enum": ["plan+impl", "impl-only"],
+                        "description": "Granularity of the role: plan+impl (default) — the worker plans its own direction first, then builds; impl-only — the direction is small/fully specified, the worker builds straight away. Do NOT write the direction's implementation plan yourself; that is the worker's job." }
                 }, "required": ["name", "tool", "repo", "reason"] } }
             }, "required": ["directions"] }
         }
@@ -411,7 +413,7 @@ fn tool_specs() -> Value {
         },
         {
             "name": "set_task_status",
-            "description": "Move your task on the board as work really progresses: queued (not started), working (actively building), review (done coding, awaiting the human's look), done (delivered/accepted). Reversible — set it back to working if the human asks for changes. Use this to keep the human's board honest instead of leaving it to guesswork.",
+            "description": "Move your task on the board as work really progresses: queued (not started), planning (working out this direction's plan), working (actively building), review (done coding, awaiting the human's look), done (delivered/accepted). Reversible — set it back to working if the human asks for changes. Use this to keep the human's board honest instead of leaving it to guesswork.",
             "inputSchema": { "type": "object",
                 "properties": { "status": str_prop() }, "required": ["status"] }
         }

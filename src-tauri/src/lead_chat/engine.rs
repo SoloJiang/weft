@@ -8,7 +8,7 @@
 use crate::store::{repo, Db};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
@@ -103,6 +103,36 @@ pub fn per_turn(tool: &str) -> bool {
     tool != "claude"
 }
 
+/// Watchdog clocks for the in-flight turn (§7 跑飞护栏). An idle engine burns
+/// nothing, so only busy turns are clocked.
+pub struct TurnClock {
+    /// Wall-clock start of the in-flight turn; None while idle.
+    pub started: Option<std::time::Instant>,
+    /// Last stdout line seen from the child (any event counts as activity).
+    pub last_activity: std::time::Instant,
+}
+
+impl Default for TurnClock {
+    fn default() -> Self {
+        Self { started: None, last_activity: std::time::Instant::now() }
+    }
+}
+
+impl TurnClock {
+    fn begin_turn(&mut self) {
+        self.started = Some(std::time::Instant::now());
+        self.last_activity = std::time::Instant::now();
+    }
+    /// Re-sync with the queue state after a turn ends (queued pop = new turn).
+    fn on_turn_end(&mut self, still_busy: bool) {
+        if still_busy {
+            self.begin_turn();
+        } else {
+            self.started = None;
+        }
+    }
+}
+
 pub struct EngineInner {
     pub thread_id: i32,
     /// claude | codex | opencode — selects the wire dialect + process model.
@@ -117,6 +147,12 @@ pub struct EngineInner {
     pub slash_commands: Vec<String>,
     pub turn: TurnState,
     pub turn_id: i32,
+    /// Ask-bridge identity for suppressing the idle watchdog while the agent is
+    /// legitimately blocked on a human: a direction id for workers, "lead" for
+    /// the lead.
+    pub ask_dir: String,
+    /// Runaway-guard clocks for the in-flight turn.
+    pub clock: TurnClock,
     pub child: Option<Child>,
     pub stdin: Option<ChildStdin>,
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
@@ -214,6 +250,7 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     inner.child = Some(child);
     inner.generation += 1;
     inner.turn = TurnState::default();
+    inner.clock = TurnClock::default();
     inner.current = None;
     inner.interrupting = false;
     let generation = inner.generation;
@@ -260,6 +297,7 @@ pub async fn send(
     let direct = inner.turn.try_begin_send();
     if direct {
         inner.turn_id += 1;
+        inner.clock.begin_turn();
     }
     let turn = inner.turn_id;
     let status = if direct { "complete" } else { "queued" };
@@ -437,6 +475,7 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
     let out = Outgoing { text: text.to_string(), images: vec![], tracked: false };
     if inner.turn.try_begin_send() {
         inner.turn_id += 1;
+        inner.clock.begin_turn();
         if per_turn(&inner.tool) {
             drop(inner);
             spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
@@ -447,6 +486,97 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
         inner.turn.queue.push_back(out);
     }
     Ok(())
+}
+
+fn human_dur(secs: u64) -> String {
+    if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}min", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Decide whether the in-flight turn should be force-stopped (§7 跑飞护栏).
+/// `busy_secs` = None means the engine is idle → never touched (an idle engine
+/// burns nothing). `has_open_ask` = the agent is legitimately blocked on the
+/// human, so its silence is expected → never idle-kill. Wall-clock always
+/// applies. Both gates require the turn to be at least cap-old, so a young
+/// turn is never killed by a stale clock. Pure → unit-tested.
+pub(crate) fn turn_verdict(
+    busy_secs: Option<u64>,
+    quiet_secs: u64,
+    wall_cap: u64,
+    idle_cap: u64,
+    has_open_ask: bool,
+) -> Option<String> {
+    let busy = busy_secs?;
+    if wall_cap > 0 && busy >= wall_cap {
+        return Some(format!("the turn ran for over {}", human_dur(wall_cap)));
+    }
+    if idle_cap > 0 && !has_open_ask && busy >= idle_cap && quiet_secs >= idle_cap {
+        return Some(format!("no activity for {}", human_dur(idle_cap)));
+    }
+    None
+}
+
+/// Runaway guard (§7 跑飞护栏): every 30s, sweep all live engines and force-stop
+/// a turn that ran past the wall cap or went silent past the idle cap. The
+/// stopped engine surfaces via Needs-you (bus ask) and resumes losslessly on
+/// the next send (`--resume`). Caps come from GuardrailState (Settings / WEFT_*
+/// env); 0 disables a cap.
+pub fn spawn_watchdog(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let Some(guard) = app.try_state::<crate::commands::GuardrailState>() else {
+                continue;
+            };
+            let (idle_cap, wall_cap) = guard.get();
+            if idle_cap == 0 && wall_cap == 0 {
+                continue;
+            }
+            let engines: Vec<EngineRef> = {
+                let state = app.state::<LeadChatState>();
+                let g = state.0.lock().unwrap_or_else(|e| e.into_inner());
+                g.values().cloned().collect()
+            };
+            for eng in engines {
+                let (verdict, thread_id, ask_dir) = {
+                    let inner = eng.lock().await;
+                    if !inner.turn.busy {
+                        continue;
+                    }
+                    let busy = inner.clock.started.map(|t| t.elapsed().as_secs());
+                    let quiet = inner.clock.last_activity.elapsed().as_secs();
+                    let has_open_ask = app
+                        .try_state::<crate::ask::AskRegistry>()
+                        .map(|a| {
+                            a.open().iter().any(|k| {
+                                k.dir == inner.ask_dir
+                                    || (inner.ask_dir == "lead" && k.dir.is_empty())
+                            })
+                        })
+                        .unwrap_or(false);
+                    (
+                        turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
+                        inner.thread_id,
+                        inner.ask_dir.clone(),
+                    )
+                };
+                let Some(reason) = verdict else { continue };
+                stop(&app, &eng).await;
+                if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+                    bus.ask_human(
+                        thread_id,
+                        &ask_dir,
+                        &format!("⚠️ Agent auto-stopped by the runaway guard: {reason}. Review and resume if it was still needed."),
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover).
@@ -460,6 +590,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     inner.stdin = None;
     inner.current = None;
     inner.turn = TurnState::default();
+    inner.clock = TurnClock::default();
     let _ = app.emit(
         EVENT,
         Push::Turn {
@@ -486,6 +617,7 @@ fn spawn_reader(
             if inner.generation != generation {
                 return; // superseded by a respawn/stop
             }
+            inner.clock.last_activity = std::time::Instant::now();
             let thread_id = inner.thread_id;
             // Per-turn dialects carry the native session id on their events.
             if inner.native_id.is_none() {
@@ -637,7 +769,9 @@ fn spawn_reader(
                             write_user(&mut inner, &next).await;
                         }
                     }
-                    let state = if inner.turn.busy { "busy" } else { "idle" };
+                    let still_busy = inner.turn.busy;
+                    inner.clock.on_turn_end(still_busy);
+                    let state = if still_busy { "busy" } else { "idle" };
                     let _ = app.emit(EVENT, Push::Turn {
                         thread_id,
                         session_id: inner.session_id,
@@ -695,7 +829,9 @@ fn spawn_reader(
                     let _ = spawn_turn(a, d, e, next).await;
                 });
             }
-            let state = if inner.turn.busy { "busy" } else { "idle" };
+            let still_busy = inner.turn.busy;
+            inner.clock.on_turn_end(still_busy);
+            let state = if still_busy { "busy" } else { "idle" };
             let _ = app.emit(EVENT, Push::Turn {
                 thread_id: inner.thread_id,
                 session_id: inner.session_id,
@@ -722,6 +858,7 @@ fn spawn_reader(
             inner.child = None;
             inner.stdin = None;
             inner.turn = TurnState::default();
+            inner.clock = TurnClock::default();
             let _ = app.emit(EVENT, Push::Turn {
                 thread_id: inner.thread_id,
                 session_id: inner.session_id,
@@ -750,6 +887,65 @@ mod tests {
     }
 
     #[test]
+    fn wall_cap_fires_regardless_of_activity() {
+        assert!(turn_verdict(Some(7200), 1, 7200, 1800, false)
+            .unwrap()
+            .contains("ran for over 2h"));
+    }
+
+    #[test]
+    fn idle_fires_when_silent_and_not_waiting_on_human() {
+        assert!(turn_verdict(Some(2000), 1900, 0, 1800, false)
+            .unwrap()
+            .contains("no activity for 30min"));
+    }
+
+    #[test]
+    fn young_turn_never_idle_killed_even_with_stale_clock() {
+        // quiet since before the turn began (stale/foreign clock): age gates it.
+        assert_eq!(turn_verdict(Some(60), 99_999, 0, 1800, false), None);
+    }
+
+    #[test]
+    fn idle_suppressed_while_waiting_on_human() {
+        assert_eq!(turn_verdict(Some(2000), 1900, 0, 1800, true), None);
+    }
+
+    #[test]
+    fn active_turn_is_kept() {
+        assert_eq!(turn_verdict(Some(1000), 5, 7200, 1800, false), None);
+    }
+
+    #[test]
+    fn idle_engine_never_touched() {
+        assert_eq!(turn_verdict(None, 99_999, 60, 60, false), None);
+    }
+
+    #[test]
+    fn zero_caps_disable_each_check() {
+        assert_eq!(turn_verdict(Some(1_000_000), 1_000_000, 0, 0, false), None);
+    }
+
+    #[test]
+    fn human_dur_formats() {
+        assert_eq!(human_dur(7200), "2h");
+        assert_eq!(human_dur(1800), "30min");
+        assert_eq!(human_dur(45), "45s");
+    }
+
+    #[test]
+    fn turn_clock_follows_queue() {
+        let mut c = TurnClock::default();
+        assert!(c.started.is_none());
+        c.begin_turn();
+        assert!(c.started.is_some());
+        c.on_turn_end(true); // queued message popped → new turn
+        assert!(c.started.is_some());
+        c.on_turn_end(false); // queue drained → idle
+        assert!(c.started.is_none());
+    }
+
+    #[test]
     fn build_args_fresh_vs_resume() {
         let mut inner = EngineInner {
             thread_id: 1,
@@ -762,6 +958,8 @@ mod tests {
             slash_commands: vec![],
             turn: TurnState::default(),
             turn_id: 0,
+            ask_dir: "lead".into(),
+            clock: TurnClock::default(),
             child: None,
             stdin: None,
             current: None,

@@ -12,7 +12,6 @@ pub mod store;
 pub mod git;
 pub mod materialize;
 pub mod ask;
-mod batch;
 mod brief;
 pub mod bus;
 mod check;
@@ -22,13 +21,11 @@ pub mod config;
 mod coordinator;
 mod curator;
 mod detect;
-mod drivers;
 mod gc;
 mod inspect;
 pub mod lead_chat;
 mod planner;
 pub mod profile;
-mod pty;
 mod sidecar;
 mod tools;
 mod commands;
@@ -84,14 +81,14 @@ pub fn run() {
     builder
         .manage(db)
         .manage(lead_chat::engine::LeadChatState::default())
-        .manage(pty::PtyState::default())
-        .manage(pty::GuardrailState::default())
+        .manage(commands::GuardrailState::default())
         .manage(bus)
         .manage(asks)
         .manage(BusBase(bus_base))
         .setup(move |app| {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
+            lead_chat::engine::spawn_watchdog(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
             Ok(())
         })
@@ -129,6 +126,7 @@ pub fn run() {
             commands::answer_permission,
             commands::set_dangerous_mode,
             commands::set_guardrails,
+            commands::session_for,
             commands::effective_config,
             commands::needs_you,
             commands::write_triggers,
@@ -145,13 +143,6 @@ pub fn run() {
             lead_chat::commands::chat_send,
             lead_chat::commands::chat_interrupt,
             lead_chat::commands::chat_stop,
-            pty::open_session,
-            pty::resume_session,
-            pty::session_for,
-            pty::drive_session,
-            pty::write_pty,
-            pty::resize_pty,
-            pty::kill_session,
             inspect::open_terminal,
             inspect::reveal_path,
             inspect::open_url,

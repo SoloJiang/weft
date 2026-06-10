@@ -18,8 +18,7 @@ the choice persists (localStorage `weft-theme`), applied via `data-theme` on
 flash). Dark mood: a control room at night — violet-tinted near-black, the
 **indigo** brand glowing like the work lines of the weft mark, **orange** marking
 convergence. Light mood: violet-tinted paper, the same brand deepened for
-contrast. Both are designed palettes, not inverts; the embedded terminal stays
-dark in both (TUIs assume dark).
+contrast. Both are designed palettes, not inverts.
 
 Mechanism: Tailwind `@theme` colors reference per-theme `--c-*` vars; dark is the
 `:root` default, light overrides under `:root[data-theme="light"]`. Add a color
@@ -100,7 +99,7 @@ Three families, contrast-paired (UI sans + mono; no second sans):
 - **UI / display**: `Geist` (or `Inter` fallback). All headings, labels,
   body. Display = same family at larger size + tighter tracking.
 - **Mono**: `Geist Mono` (or `JetBrains Mono`). Code, file paths, branch
-  names, session ids, diffs, the embedded-terminal-adjacent metadata.
+  names, session ids, diffs, and other session metadata.
 
 Scale (dense; base 13px). Ratio ≥ 1.25 between steps via size + weight.
 
@@ -141,9 +140,9 @@ weft treatment:
 
 - **Status chip**: pill, glyph + color + label, used in nav, session headers,
   lists. The single most-repeated atom — must be perfect.
-- **Session panel**: framed xterm viewport with a header (tool, cwd, branch,
-  status chip) and the §4.3 interaction layer (focus ring, approval bar,
-  injection-queue banner, composer).
+- **Session panel**: the weft-owned chat timeline, framed with a header (tool,
+  cwd, branch, status chip) and the §4.3 interaction layer (composer,
+  Ask-Bridge approval bar, queued-message indicator).
 - **Nav tree**: workspace → thread → direction, with active = `--brand-ghost`
   fill + `--brand` left-edge indicator (a 2px indicator, NOT a decorative
   side-stripe border).
@@ -151,9 +150,9 @@ weft treatment:
   navigation/action surface.
 - **Diff view**: mono, per-repo, restrained add/remove tinting from the status
   ramp (green add, red remove) at low chroma so it stays calm.
-- **Approval bar**: appears in a session panel on `waiting-approval`; mirrors the
-  native TUI options as buttons (Approve / Deny / Always) — a convenience layer
-  over the native prompt, never a replacement.
+- **Approval bar**: appears when a tool raises a permission ask (Ask Bridge);
+  Allow / Always / Full / Deny buttons send the decision back to the blocked
+  tool — a structured passthrough of the tool's own prompt, never a new gate.
 - **Home (lead conversation)**: the default surface. A focused chat with the
   thread's lead — task in, scope/brief/decisions out — flanked by the board and
   a session region. Reads like a control tower, not a chatbot: structured cards

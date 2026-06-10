@@ -39,8 +39,8 @@ async fn m2_acceptance() {
 
     // ① one thread, two directions on different repos -> independent worktrees
     let t1 = repo::create_thread(&db, ws.id, "t1", "feature").await.unwrap();
-    let d1 = repo::create_direction(&db, t1.id, "da", "claude", ra.id, "modify repo-a").await.unwrap();
-    let d2 = repo::create_direction(&db, t1.id, "db", "claude", rb.id, "modify repo-b").await.unwrap();
+    let d1 = repo::create_direction(&db, t1.id, "da", "claude", ra.id, "modify repo-a", "plan+impl").await.unwrap();
+    let d2 = repo::create_direction(&db, t1.id, "db", "claude", rb.id, "modify repo-b", "plan+impl").await.unwrap();
     let w1 = materialize_direction(&db, d1.id).await.unwrap();
     let w2 = materialize_direction(&db, d2.id).await.unwrap();
     assert_eq!(w1.len(), 1);
@@ -51,7 +51,7 @@ async fn m2_acceptance() {
 
     // ③ same repo across two threads -> two worktrees, distinct branches/paths
     let t2 = repo::create_thread(&db, ws.id, "t2", "feature").await.unwrap();
-    let d3 = repo::create_direction(&db, t2.id, "da", "claude", ra.id, "modify repo-a").await.unwrap();
+    let d3 = repo::create_direction(&db, t2.id, "da", "claude", ra.id, "modify repo-a", "impl-only").await.unwrap();
     let w3 = materialize_direction(&db, d3.id).await.unwrap();
     assert_ne!(w3[0].path, w1[0].path, "same repo, different thread -> different path");
     assert_ne!(w3[0].branch, w1[0].branch, "branches must differ");

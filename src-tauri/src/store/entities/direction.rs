@@ -10,7 +10,7 @@ pub struct Model {
     pub slug: String,
     pub tool: String,
     pub branch: String,
-    /// Agent/human-driven lifecycle: queued | working | review | done.
+    /// Agent/human-driven lifecycle: queued | planning | working | review | done.
     /// Reversible; weft never forces it (an open ask overlays Needs-you in the UI).
     #[sea_orm(default_value = "queued")]
     pub status: String,
@@ -22,6 +22,11 @@ pub struct Model {
     /// in Needs-you and kept for audit.
     #[sea_orm(default_value = "")]
     pub reason: String,
+    /// Worker mandate, assigned with the role: "plan+impl" (plan its own
+    /// direction first, then build) or "impl-only" (fully scoped — build
+    /// straight away). The brief renders per-mandate.
+    #[sea_orm(default_value = "plan+impl")]
+    pub mandate: String,
     pub created_at: String,
 }
 
