@@ -222,7 +222,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [checkingDirections, setCheckingDirections] = useState<Record<number, boolean>>({});
   // Idle tracking for the auto-verify loop: last PTY-output time per session,
   // and which directions we've already auto-checked this idle episode.
-  const lastOutputRef = useRef<Record<number, number>>({});
   const autoCheckedRef = useRef<Set<number>>(new Set());
   // Directions with an auto-(re)dispatch in flight, so the poll-driven effect
   // never spawns a duplicate worker before the first spawn lands in `sessions`.
@@ -518,7 +517,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
-      lastOutputRef.current[info.session_id] = Date.now();
       autoCheckedRef.current.delete(directionId);
       setSessions((m) => ({
         ...m,
@@ -572,7 +570,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
-      lastOutputRef.current[info.session_id] = Date.now();
       autoCheckedRef.current.delete(directionId);
       setSessions((m) => {
         const pruned = Object.fromEntries(
@@ -672,11 +669,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const un = listen<LeadChatPush>("lead-chat", (e) => {
       const p = e.payload;
       if (p.type === "message") {
-        // Chat workers have no PTY output; their timeline activity feeds the
-        // same idle clock the auto-verify loop watches.
-        if (p.message.session_id != null) {
-          lastOutputRef.current[p.message.session_id] = Date.now();
-        }
         setLeadMessages((m) => {
           const list = m[p.thread_id] ?? [];
           if (list.some((x) => x.id === p.message.id)) return m;
@@ -709,7 +701,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const act = { name: p.name, summary: p.summary };
         if (p.session_id != null) {
           const sid = p.session_id;
-          lastOutputRef.current[sid] = Date.now();
           setWorkerActivity((a) => ({ ...a, [sid]: act }));
         } else {
           setLeadActivity((a) => ({ ...a, [p.thread_id]: act }));
@@ -717,7 +708,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } else if (p.type === "turn") {
         if (p.session_id != null) {
           const sid = p.session_id;
-          lastOutputRef.current[sid] = Date.now();
           setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queued: p.queued } }));
           setSessions((m) =>
@@ -1156,31 +1146,32 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
   }, [activeThreadId]);
 
-  // Auto-verify loop (ARCHITECTURE §4.13): run a direction's checks once per
-  // idle episode so "done" means "checks ran", not self-report. The clock is
-  // lastOutputRef, fed by the lead-chat pushes. KNOWN GAP: a worker flips to
-  // "idle" the moment its turn ends, so the `running` guard below excludes it
-  // exactly when the turn-end check should fire — the trigger needs to move to
-  // the busy→idle transition in the push handler (pre-existing; kept as-is in
-  // the PTY-removal commit, which is behavior-neutral).
+  // Auto-verify (ARCHITECTURE §4.13): a worker turning busy→idle means its
+  // queue drained and the turn finished — run that direction's checks once per
+  // idle episode so "done" means "checks ran", not self-report. Going busy
+  // again re-arms the latch (so the NEXT turn end verifies again); a fresh
+  // dispatch clears it too (spawnWorker/driveDirection).
+  const prevTurnRef = useRef<Record<number, string>>({});
   useEffect(() => {
-    const IDLE_MS = 20000;
-    const h = setInterval(() => {
-      const now = Date.now();
-      for (const s of Object.values(sessionsRef.current)) {
-        if (s.status !== "running") continue;
-        const last = lastOutputRef.current[s.info.session_id] ?? 0;
-        const idle = now - last > IDLE_MS;
-        if (idle && !autoCheckedRef.current.has(s.directionId)) {
-          autoCheckedRef.current.add(s.directionId);
-          void verifyDirection(s.directionId);
-        } else if (!idle) {
-          autoCheckedRef.current.delete(s.directionId);
-        }
+    for (const [sidStr, turn] of Object.entries(workerTurn)) {
+      const sid = Number(sidStr);
+      const prev = prevTurnRef.current[sid];
+      if (prev === turn.state) continue;
+      prevTurnRef.current[sid] = turn.state;
+      const sess = sessionsRef.current[sid];
+      if (!sess) continue;
+      if (turn.state === "busy") {
+        autoCheckedRef.current.delete(sess.directionId);
+      } else if (
+        prev === "busy" &&
+        turn.state === "idle" &&
+        !autoCheckedRef.current.has(sess.directionId)
+      ) {
+        autoCheckedRef.current.add(sess.directionId);
+        void verifyDirection(sess.directionId);
       }
-    }, 5000);
-    return () => clearInterval(h);
-  }, [verifyDirection]);
+    }
+  }, [workerTurn, verifyDirection]);
 
   useEffect(() => {
     if (activeThreadId == null) {
