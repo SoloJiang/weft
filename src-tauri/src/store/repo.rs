@@ -1,8 +1,8 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, direction, lead_message, plan, repo_profile, repo_ref, session, thread, worktree,
-    workspace,
+    app_setting, direction, lead_message, plan, repo_profile, repo_ref, session, skill_enable,
+    skill_source, thread, worktree, workspace,
 };
 use super::Db;
 use crate::slug::unique_slug;
@@ -36,6 +36,75 @@ pub async fn create_workspace(db: &Db, name: &str) -> Result<workspace::Model> {
 
 pub async fn list_workspaces(db: &Db) -> Result<Vec<workspace::Model>> {
     Ok(workspace::Entity::find().all(&db.0).await?)
+}
+
+pub async fn add_skill_source(db: &Db, git_url: &str, git_ref: Option<&str>) -> Result<skill_source::Model> {
+    let m = skill_source::ActiveModel {
+        git_url: Set(git_url.to_string()),
+        git_ref: Set(git_ref.unwrap_or("").to_string()),
+        last_synced: Set(String::new()),
+        last_status: Set("never".to_string()),
+        ..Default::default()
+    };
+    Ok(m.insert(&db.0).await?)
+}
+
+pub async fn list_skill_sources(db: &Db) -> Result<Vec<skill_source::Model>> {
+    Ok(skill_source::Entity::find().all(&db.0).await?)
+}
+
+pub async fn get_skill_source(db: &Db, id: i32) -> Result<Option<skill_source::Model>> {
+    Ok(skill_source::Entity::find_by_id(id).one(&db.0).await?)
+}
+
+pub async fn set_skill_source_status(db: &Db, id: i32, status: &str, synced: Option<&str>) -> Result<()> {
+    if let Some(m) = skill_source::Entity::find_by_id(id).one(&db.0).await? {
+        let mut a: skill_source::ActiveModel = m.into();
+        a.last_status = Set(status.to_string());
+        if let Some(s) = synced {
+            a.last_synced = Set(s.to_string());
+        }
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+pub async fn remove_skill_source(db: &Db, id: i32) -> Result<()> {
+    skill_enable::Entity::delete_many()
+        .filter(skill_enable::Column::SourceId.eq(id))
+        .exec(&db.0)
+        .await?;
+    skill_source::Entity::delete_by_id(id).exec(&db.0).await?;
+    Ok(())
+}
+
+pub async fn set_skill_enable(db: &Db, source_id: i32, skill_name: &str, scope: &str, on: bool) -> Result<()> {
+    let existing = skill_enable::Entity::find()
+        .filter(skill_enable::Column::SourceId.eq(source_id))
+        .filter(skill_enable::Column::SkillName.eq(skill_name))
+        .filter(skill_enable::Column::Scope.eq(scope))
+        .one(&db.0)
+        .await?;
+    match (on, existing) {
+        (true, None) => {
+            let m = skill_enable::ActiveModel {
+                source_id: Set(source_id),
+                skill_name: Set(skill_name.to_string()),
+                scope: Set(scope.to_string()),
+                ..Default::default()
+            };
+            m.insert(&db.0).await?;
+        }
+        (false, Some(m)) => {
+            skill_enable::Entity::delete_by_id(m.id).exec(&db.0).await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub async fn list_skill_enable(db: &Db) -> Result<Vec<skill_enable::Model>> {
+    Ok(skill_enable::Entity::find().all(&db.0).await?)
 }
 
 pub async fn get_setting(db: &Db, key: &str) -> Result<Option<String>> {
@@ -679,5 +748,32 @@ mod tests {
             get_setting(&db, "default_tool").await.unwrap(),
             Some("claude".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn skill_source_and_enable_roundtrip() {
+        let db = mem().await;
+        let s = add_skill_source(&db, "https://example.com/skills.git", None).await.unwrap();
+        assert_eq!(s.git_url, "https://example.com/skills.git");
+        assert_eq!(s.last_status, "never");
+        // update status
+        set_skill_source_status(&db, s.id, "ok", Some("123")).await.unwrap();
+        let got = list_skill_sources(&db).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].last_status, "ok");
+        assert_eq!(got[0].last_synced, "123");
+        // enable a skill globally, then list
+        set_skill_enable(&db, s.id, "deploy", "global", true).await.unwrap();
+        let en = list_skill_enable(&db).await.unwrap();
+        assert_eq!(en.len(), 1);
+        assert_eq!((en[0].skill_name.as_str(), en[0].scope.as_str()), ("deploy", "global"));
+        // toggling off removes it
+        set_skill_enable(&db, s.id, "deploy", "global", false).await.unwrap();
+        assert!(list_skill_enable(&db).await.unwrap().is_empty());
+        // remove source cascades its enables
+        set_skill_enable(&db, s.id, "x", "ws:1", true).await.unwrap();
+        remove_skill_source(&db, s.id).await.unwrap();
+        assert!(list_skill_sources(&db).await.unwrap().is_empty());
+        assert!(list_skill_enable(&db).await.unwrap().is_empty());
     }
 }

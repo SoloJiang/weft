@@ -1,6 +1,6 @@
 use crate::store::entities::{
-    app_setting, direction, lead_message, plan, repo_profile, repo_ref, session, thread, worktree,
-    workspace,
+    app_setting, direction, lead_message, plan, repo_profile, repo_ref, session, skill_enable,
+    skill_source, thread, worktree, workspace,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -23,6 +23,8 @@ impl MigratorTrait for Migrator {
             Box::new(M0010AppSetting),
             Box::new(M0011ThreadLeadTool),
             Box::new(M0012DropRepoDefaultTool),
+            Box::new(M0013SkillSource),
+            Box::new(M0014SkillEnable),
         ]
     }
 }
@@ -475,6 +477,46 @@ impl MigrationTrait for M0012DropRepoDefaultTool {
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         // Irreversible: the dead column is gone for good. No-op.
+        Ok(())
+    }
+}
+
+/// Adds the skill_source table (git-hosted skill sources).
+pub struct M0013SkillSource;
+impl MigrationName for M0013SkillSource {
+    fn name(&self) -> &str { "m0013_skill_source" }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0013SkillSource {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(skill_source::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        Ok(())
+    }
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager.drop_table(Table::drop().table(Alias::new("skill_source")).to_owned()).await?;
+        Ok(())
+    }
+}
+
+/// Adds the skill_enable table (per-skill, per-scope enablement).
+pub struct M0014SkillEnable;
+impl MigrationName for M0014SkillEnable {
+    fn name(&self) -> &str { "m0014_skill_enable" }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0014SkillEnable {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(skill_enable::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        Ok(())
+    }
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager.drop_table(Table::drop().table(Alias::new("skill_enable")).to_owned()).await?;
         Ok(())
     }
 }
