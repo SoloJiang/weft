@@ -31,6 +31,13 @@ pub fn worktree_home() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// ~/.weft/skills/sources — git-cloned skill source caches, one dir per source.
+pub fn skills_home() -> std::io::Result<PathBuf> {
+    let dir = weft_home()?.join("skills").join("sources");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Process-global lock guarding the shared `WEFT_HOME` env var across lib
 /// tests. The lib-test binary runs tests on parallel threads sharing one
 /// process env, so a test that *sets* WEFT_HOME (e.g. materialize tests) and a
@@ -55,5 +62,6 @@ mod tests {
         assert!(home.ends_with(".weft"));
         assert!(db_path().unwrap().ends_with("weft.db"));
         assert!(worktree_home().unwrap().ends_with("worktrees"));
+        assert!(skills_home().unwrap().ends_with("skills/sources"));
     }
 }

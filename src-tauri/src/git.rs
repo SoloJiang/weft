@@ -264,6 +264,40 @@ pub fn head_commit(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--short", "HEAD"])
 }
 
+/// Append `name` to a worktree's git exclude (info/exclude) so weft's injected,
+/// untracked files never show in `git status` / diffs / accidental commits.
+/// Resolves the real exclude path via git (worktrees use a separate gitdir).
+/// Best-effort: silently does nothing if git isn't available.
+pub fn git_exclude(cwd: &std::path::Path, name: &str) {
+    let out = std::process::Command::new("git")
+        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--git-path", "info/exclude"])
+        .output();
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if rel.is_empty() {
+        return;
+    }
+    let p = std::path::Path::new(&rel);
+    let exclude_path = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    if let Some(parent) = exclude_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == name) {
+        return;
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(name);
+    content.push('\n');
+    let _ = std::fs::write(&exclude_path, content);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

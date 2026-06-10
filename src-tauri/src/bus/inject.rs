@@ -53,7 +53,7 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
         return Injection { args: vec![] };
     }
     let _ = std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755));
-    git_exclude(cwd, ".weft-ask-hook.sh");
+    crate::git::git_exclude(cwd, ".weft-ask-hook.sh");
 
     match tool {
         "claude" => {
@@ -70,7 +70,7 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
             if std::fs::write(&settings, serde_json::to_vec_pretty(&json).unwrap_or_default()).is_err() {
                 return Injection { args: vec![] };
             }
-            git_exclude(cwd, ".weft-ask.settings.json");
+            crate::git::git_exclude(cwd, ".weft-ask.settings.json");
             Injection {
                 args: vec!["--settings".into(), settings.to_string_lossy().to_string()],
             }
@@ -121,7 +121,7 @@ export const WeftAsk = async () => ({
 "#;
     let body = template.replace("__URL__", &url);
     let _ = std::fs::write(plugins.join("weft-ask.js"), body);
-    git_exclude(cwd, ".opencode/plugins/weft-ask.js");
+    crate::git::git_exclude(cwd, ".opencode/plugins/weft-ask.js");
     Injection { args: vec![] }
 }
 
@@ -152,7 +152,7 @@ fn inject_mcp(server: &str, stem: &str, url: &str, tool: &str, cwd: &Path) -> In
                 "mcpServers": { server: { "type": "http", "url": url } }
             });
             let _ = std::fs::write(&cfg, serde_json::to_vec_pretty(&json).unwrap_or_default());
-            git_exclude(cwd, &file);
+            crate::git::git_exclude(cwd, &file);
             Injection {
                 args: vec!["--mcp-config".into(), cfg.to_string_lossy().to_string()],
             }
@@ -199,42 +199,7 @@ fn merge_opencode_config(cwd: &Path, server: &str, url: &str) {
     // Best-effort: only hides opencode.json from git when the sub-repo does NOT
     // track it. If the repo ships a tracked opencode.json, the merge still shows
     // as a modification — an accepted limitation of the worktree-local merge.
-    git_exclude(cwd, "opencode.json");
-}
-
-/// Append `name` to the worktree's git exclude file (so weft's injected,
-/// untracked config files never show in `git status` / diffs / accidental
-/// commits). Resolves the real exclude path via git (worktrees use a separate
-/// gitdir). Best-effort: silently does nothing if git isn't available.
-fn git_exclude(cwd: &Path, name: &str) {
-    let out = std::process::Command::new("git")
-        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--git-path", "info/exclude"])
-        .output();
-    let Ok(out) = out else { return };
-    if !out.status.success() {
-        return;
-    }
-    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if rel.is_empty() {
-        return;
-    }
-    // rev-parse returns a path relative to cwd (or absolute); resolve against cwd.
-    let p = std::path::Path::new(&rel);
-    let exclude_path = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
-    if let Some(parent) = exclude_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == name) {
-        return;
-    }
-    let mut content = existing;
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(name);
-    content.push('\n');
-    let _ = std::fs::write(&exclude_path, content);
+    crate::git::git_exclude(cwd, "opencode.json");
 }
 
 #[cfg(test)]
