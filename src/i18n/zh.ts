@@ -77,7 +77,7 @@ export const zh = {
     emptyTitleHas: "还没有 issue",
     emptyTitleNoWs: "无工作区",
     emptyBodyHas:
-      "issue 就是一条工作流——拆到多个仓库。新建后，weft 会规划范围、派发 agent，并把需要你处理的事情顶上来。",
+      "一个 issue 就是一条工作主线，可以拆到多个仓库同时推进。新建后，weft 会规划改动范围、派发 agent 去干活，需要你拍板的事会主动送到你面前。",
     emptyBodyNoWs: "先创建一个工作区。",
   },
   onboarding: {
@@ -387,7 +387,7 @@ export const zh = {
     cloneHint: "使用你的 git 凭据克隆到 {{path}}。",
     newHint: "在 {{path}} 创建，并带一个初始提交。",
     newThreadTitle: "新建 issue",
-    newThreadDesc: "issue 就是一条工作流，拆到多个仓库。",
+    newThreadDesc: "一个 issue 就是一条跨仓库推进的工作主线。",
     threadTitle: "标题",
     threadTitlePlaceholder: "在结算流程加优惠码",
     threadType: "类型",
