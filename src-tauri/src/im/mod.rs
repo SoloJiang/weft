@@ -2,6 +2,8 @@
 //! 通道无关核心：设置、卡片索引、Channel trait、入站执行、桥运行时。
 //! feishu/ 是第一个适配器。结构化动作全走确定性代码，LLM 不在路径上。
 
+pub mod outbound;
+
 use std::collections::HashMap;
 
 pub const K_APP_ID: &str = "im.feishu.app_id";
