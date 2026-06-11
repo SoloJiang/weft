@@ -14,7 +14,7 @@ pub struct ConfigItem {
     pub name: String,
     /// "skill" | "rule"
     pub kind: String,
-    /// "personal" | "repo" (room for "team" later)
+    /// "personal" | "weft-global" | "weft-workspace" | "repo" (room for "team" later)
     pub layer: String,
     pub path: String,
     /// A skill shadowed by a same-named one in a higher-precedence layer.
@@ -212,6 +212,18 @@ mod tests {
         // and weft-workspace beats weft-global beats personal in the shadow order
         assert!(out.iter().any(|i| i.layer == "weft-workspace" && i.overridden));
         assert!(out.iter().any(|i| i.layer == "weft-global" && i.overridden));
+
+        // weft-workspace shadows weft-global shadows personal when no repo skill exists
+        let out = resolve_effective(vec![
+            item("deploy", "skill", "personal"),
+            item("deploy", "skill", "weft-global"),
+            item("deploy", "skill", "weft-workspace"),
+        ]);
+        let eff: Vec<_> = out.iter().filter(|i| !i.overridden).collect();
+        assert_eq!(eff.len(), 1);
+        assert_eq!(eff[0].layer, "weft-workspace"); // beats weft-global AND personal
+        assert!(out.iter().any(|i| i.layer == "weft-global" && i.overridden));
+        assert!(out.iter().any(|i| i.layer == "personal" && i.overridden));
     }
 
     #[test]
