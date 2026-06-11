@@ -32,6 +32,7 @@ axum = "0.7"
 tower = "0.5"
 toml = "0.8"
 keepawake = "0.6"
+open-lark = { version = "0.14", default-features = false, features = ["im", "websocket"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
