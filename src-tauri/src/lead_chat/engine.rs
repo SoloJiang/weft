@@ -309,6 +309,7 @@ pub async fn send(
     if direct {
         inner.turn_id += 1;
         inner.clock.begin_turn();
+        crate::power::on_turn_began(app);
     }
     let turn = inner.turn_id;
     let status = if direct { "complete" } else { "queued" };
@@ -487,6 +488,7 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
     if inner.turn.try_begin_send() {
         inner.turn_id += 1;
         inner.clock.begin_turn();
+        crate::power::on_turn_began(app);
         if per_turn(&inner.tool) {
             drop(inner);
             spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;

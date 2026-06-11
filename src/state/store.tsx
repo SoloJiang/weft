@@ -209,6 +209,9 @@ interface Store {
   /** OS notifications for new Needs-you items / review-ready sub-tasks. */
   notifyEnabled: boolean;
   setNotifyEnabled: (on: boolean) => void;
+  /** Prevent system idle sleep while any session is running. */
+  keepAwake: boolean;
+  setKeepAwake: (on: boolean) => void;
   focusSession: (sessionId: number) => void;
 }
 
@@ -314,6 +317,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const setNotifyEnabled = useCallback((on: boolean) => {
     localStorage.setItem("weft-notify", on ? "1" : "0");
     setNotifyEnabledState(on);
+  }, []);
+  // Keep-awake: hold a "prevent idle sleep" OS assertion while any session is
+  // busy (the display may still turn off). Default ON; synced to the backend
+  // on launch — its state is in-memory (same pattern as dangerous mode).
+  const [keepAwake, setKeepAwakeState] = useState(
+    () => localStorage.getItem("weft-keep-awake") !== "0",
+  );
+  const setKeepAwake = useCallback((on: boolean) => {
+    localStorage.setItem("weft-keep-awake", on ? "1" : "0");
+    setKeepAwakeState(on);
+    void api.setKeepAwake(on);
+  }, []);
+  useEffect(() => {
+    void api.setKeepAwake(localStorage.getItem("weft-keep-awake") !== "0");
   }, []);
   const [dangerousMode, setDangerousModeState] = useState(
     () => localStorage.getItem("weft-dangerous") === "1",
@@ -1395,6 +1412,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setAutoReview,
     notifyEnabled,
     setNotifyEnabled,
+    keepAwake,
+    setKeepAwake,
     focusSession,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

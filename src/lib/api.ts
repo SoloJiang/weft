@@ -165,6 +165,8 @@ export const api = {
   setDefaultTool: (tool: string) => invoke<void>("set_default_tool", { tool }),
   // Dangerous mode (global): every agent's tool asks auto-allow.
   setDangerousMode: (on: boolean) => invoke<void>("set_dangerous_mode", { on }),
+  // Keep-awake: prevent system idle sleep while any session is running.
+  setKeepAwake: (on: boolean) => invoke<void>("set_keep_awake", { on }),
   // Runaway guardrails: idle + wall-clock caps (seconds; 0 disables) for
   // force-stopping a stuck/runaway agent (enforcement pending on the engine).
   setGuardrails: (idleSecs: number, wallSecs: number) =>
@@ -186,6 +188,13 @@ export const api = {
     invoke<void>("flag_session_skill_refresh", { sessionId }),
   flagLeadSkillRefresh: (threadId: number) =>
     invoke<void>("flag_lead_skill_refresh", { threadId }),
+  imGetSettings: () =>
+    invoke<{ app_id: string; has_secret: boolean; enabled: boolean; bound: boolean }>(
+      "im_get_settings",
+    ),
+  imSetSettings: (appId: string, appSecret: string, enabled: boolean) =>
+    invoke<void>("im_set_settings", { appId, appSecret, enabled }),
+  imStatus: () => invoke<string>("im_status"),
   // Native folder picker; returns the chosen absolute path, or null if cancelled.
   pickFolder: async (title?: string) => {
     const sel = await openDialog({ directory: true, multiple: false, title });

@@ -5,12 +5,14 @@ import {
   Bot,
   Boxes,
   FolderOpen,
+  MessageSquare,
   Moon,
   Palette,
   Search,
   Settings,
   Sun,
 } from "lucide-react";
+import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { Toggle } from "../components/ui/Toggle";
 import { SkillsSettings } from "../components/SkillsSettings";
@@ -27,7 +29,7 @@ import {
 import { useStore } from "../state/store";
 import { useTheme } from "../state/theme";
 
-type SettingsPage = "general" | "appearance" | "automation" | "skills";
+type SettingsPage = "general" | "appearance" | "automation" | "skills" | "im";
 
 type NavItem = {
   id: SettingsPage;
@@ -49,6 +51,7 @@ const NAV_GROUPS: { labelKey: string; items: NavItem[] }[] = [
     labelKey: "settings.groupIntegrations",
     items: [
       { id: "skills", icon: Boxes, labelKey: "settings.skills", implemented: true },
+      { id: "im", icon: MessageSquare, labelKey: "settings.im", implemented: true },
     ],
   },
 ];
@@ -124,6 +127,8 @@ export function SettingsScreen() {
               <AppearanceSettings />
             ) : active === "automation" ? (
               <AutomationSettings />
+            ) : active === "im" ? (
+              <ImSettings />
             ) : (
               <SkillsSettings />
             )}
@@ -169,10 +174,6 @@ function GeneralSettings() {
     setDefaultTool,
     configuredTool,
     installedTools,
-    reviewSkill,
-    setReviewSkill,
-    autoReview,
-    setAutoReview,
     notifyEnabled,
     setNotifyEnabled,
   } = useStore();
@@ -242,17 +243,6 @@ function GeneralSettings() {
               <FolderOpen size={14} />
             </button>
           </div>
-        </SettingRow>
-        <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>
-          <Input
-            value={reviewSkill}
-            placeholder="superpowers:requesting-code-review"
-            onChange={(e) => setReviewSkill(e.currentTarget.value)}
-            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
-          />
-        </SettingRow>
-        <SettingRow label={t("settings.autoReview")} hint={t("settings.autoReviewHint")}>
-          <Toggle on={autoReview} onChange={setAutoReview} label={t("settings.autoReview")} />
         </SettingRow>
         <SettingRow label={t("settings.notifications")} hint={t("settings.notificationsHint")}>
           <div className="flex flex-col items-end gap-1">
@@ -332,18 +322,132 @@ function AppearanceSettings() {
 
 function AutomationSettings() {
   const { t } = useTranslation();
-  const { dangerousMode, setDangerousMode } = useStore();
+  const {
+    dangerousMode,
+    setDangerousMode,
+    keepAwake,
+    setKeepAwake,
+    reviewSkill,
+    setReviewSkill,
+    autoReview,
+    setAutoReview,
+  } = useStore();
   const [loopGuard, setLoopGuard] = useState(true);
 
   return (
-    <SettingsGroup title={t("settings.rules")}>
-      <SettingRow label={t("settings.dangerTitle")} hint={t("settings.dangerDesc")}>
-        <Toggle on={dangerousMode} onChange={setDangerousMode} label={t("settings.dangerTitle")} />
-      </SettingRow>
-      <SettingRow label={t("settings.loopDetection")} hint={t("settings.loopDetectionHint")}>
-        <Toggle on={loopGuard} onChange={setLoopGuard} label={t("settings.loopDetection")} />
-      </SettingRow>
-    </SettingsGroup>
+    <div className="flex flex-col gap-10">
+      <SettingsGroup title={t("settings.rules")}>
+        <SettingRow label={t("settings.dangerTitle")} hint={t("settings.dangerDesc")}>
+          <Toggle on={dangerousMode} onChange={setDangerousMode} label={t("settings.dangerTitle")} />
+        </SettingRow>
+        <SettingRow label={t("settings.loopDetection")} hint={t("settings.loopDetectionHint")}>
+          <Toggle on={loopGuard} onChange={setLoopGuard} label={t("settings.loopDetection")} />
+        </SettingRow>
+        <SettingRow label={t("settings.keepAwakeTitle")} hint={t("settings.keepAwakeHint")}>
+          <Toggle on={keepAwake} onChange={setKeepAwake} label={t("settings.keepAwakeTitle")} />
+        </SettingRow>
+      </SettingsGroup>
+      <SettingsGroup title={t("settings.reviewGroup")}>
+        <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>
+          <Input
+            value={reviewSkill}
+            placeholder="superpowers:requesting-code-review"
+            onChange={(e) => setReviewSkill(e.currentTarget.value)}
+            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
+          />
+        </SettingRow>
+        <SettingRow label={t("settings.autoReview")} hint={t("settings.autoReviewHint")}>
+          <Toggle on={autoReview} onChange={setAutoReview} label={t("settings.autoReview")} />
+        </SettingRow>
+      </SettingsGroup>
+    </div>
+  );
+}
+
+function ImSettings() {
+  const { t } = useTranslation();
+  const [appId, setAppId] = useState("");
+  const [secret, setSecret] = useState("");
+  const [hasSecret, setHasSecret] = useState(false);
+  const [enabled, setEnabled] = useState(false);
+  const [bound, setBound] = useState(false);
+  const [status, setStatus] = useState("disabled");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    void api.imGetSettings().then((s) => {
+      setAppId(s.app_id);
+      setHasSecret(s.has_secret);
+      setEnabled(s.enabled);
+      setBound(s.bound);
+    });
+    void api.imStatus().then(setStatus);
+    const id = setInterval(() => void api.imStatus().then(setStatus), 3000);
+    return () => clearInterval(id);
+  }, []);
+
+  async function save() {
+    setSaving(true);
+    try {
+      await api.imSetSettings(appId, secret, enabled);
+      if (secret.length > 0) setHasSecret(true);
+      setSecret("");
+      void api.imStatus().then(setStatus);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // 连接状态点：online 绿、connecting 黄、error 红、disabled 灰。
+  const dot = status.startsWith("online")
+    ? "bg-success"
+    : status.startsWith("connecting")
+      ? "bg-waiting"
+      : status.startsWith("error")
+        ? "bg-danger"
+        : "bg-ink-faint";
+
+  return (
+    <div className="flex flex-col gap-10">
+      <SettingsGroup title={t("settings.imGroup")}>
+        <SettingRow label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
+          <Input
+            value={appId}
+            placeholder="cli_xxxxxxxxxxxx"
+            onChange={(e) => setAppId(e.currentTarget.value)}
+            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
+          />
+        </SettingRow>
+        <SettingRow label={t("settings.imAppSecret")} hint={t("settings.imAppSecretHint")}>
+          <Input
+            type="password"
+            value={secret}
+            placeholder={hasSecret ? "••••••••" : ""}
+            onChange={(e) => setSecret(e.currentTarget.value)}
+            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
+          />
+        </SettingRow>
+        <SettingRow label={t("settings.imEnabled")} hint={t("settings.imEnabledHint")}>
+          <Toggle on={enabled} onChange={setEnabled} label={t("settings.imEnabled")} />
+        </SettingRow>
+        <SettingRow label={t("settings.imStatusLabel")}>
+          <div className="flex flex-col items-end gap-1">
+            <span className="flex items-center gap-1.5 text-[12px] text-ink-muted">
+              <span className={cn("h-2 w-2 rounded-full", dot)} />
+              {status}
+            </span>
+            <span className="text-[11px] text-ink-faint">
+              {bound ? t("settings.imBound") : t("settings.imUnbound")}
+            </span>
+          </div>
+        </SettingRow>
+      </SettingsGroup>
+      <div className="flex justify-end">
+        <Button variant="primary" onClick={() => void save()} disabled={saving}>
+          {saving ? t("settings.imSaving") : t("settings.imSave")}
+        </Button>
+      </div>
+    </div>
   );
 }
 

@@ -21,6 +21,17 @@ pub struct Wake {
     pub dir: String,
 }
 
+/// Bus → IM 桥的通知：agent 的人类提问（ask_human）开/答。镜像 wake 的
+/// set_sender 模式；没装时零开销。Ask 的 from 是 direction id 字符串，
+/// 富化（thread 标题、direction 名）是消费侧查 DB 的责任。
+#[derive(Clone, Debug)]
+pub enum HumanAskEvent {
+    Asked { thread: i32, ask: Ask },
+    /// 携带人答的 text：飞书卡片终态要显示答案，而桌面侧作答时桥拿不到
+    /// 文本，必须由事件携带。
+    Answered { thread: i32, ask_id: u64, text: String },
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Msg {
     pub from: String,
@@ -56,6 +67,7 @@ pub struct BusRegistry {
     inner: Arc<Mutex<HashMap<i32, ThreadBus>>>,
     wake: Arc<Mutex<Option<Sender<Wake>>>>,
     next_ask_id: Arc<AtomicU64>,
+    ask_notify: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<HumanAskEvent>>>>,
 }
 
 fn now() -> u64 {
@@ -78,6 +90,25 @@ impl BusRegistry {
     fn emit_wake(&self, thread: i32, dir: &str) {
         if let Some(tx) = self.wake.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = tx.send(Wake { thread, dir: dir.to_string() });
+        }
+    }
+
+    /// Install the channel the IM bridge listens on for human-ask events
+    /// (called once at startup). Mirrors `set_wake_sender`.
+    ///
+    /// 与 `AskRegistry::set_notifier` 不同，本方法不返回 open asks 快照
+    /// （M1 范围）；只投递安装之后的事件。须在任何 agent 跑起来之前安装——
+    /// 安装前已 open 的提问不会补发，registry 也没有跨 thread 枚举接口。
+    pub fn set_ask_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<HumanAskEvent>) {
+        *self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// 须在持 `inner` 锁内调用，以保证通道顺序与状态迁移一致（事件是
+    /// edge-triggered、带 per-ask 身份，Asked/Answered 不可乱序）。锁顺序
+    /// 固定 inner → ask_notify；UnboundedSender::send 非阻塞，锁内发送安全。
+    fn emit_ask_event(&self, ev: HumanAskEvent) {
+        if let Some(tx) = self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.send(ev);
         }
     }
 
@@ -180,17 +211,18 @@ impl BusRegistry {
     /// so the UI knows attention is needed without polling.
     pub fn ask_human(&self, thread: i32, from: &str, text: &str) -> u64 {
         let id = self.next_ask_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let ts = now();
+        let ask = Ask {
+            id,
+            from: from.to_string(),
+            text: text.to_string(),
+            ts,
+            answered: false,
+        };
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            let ts = now();
-            bus.asks.push(Ask {
-                id,
-                from: from.to_string(),
-                text: text.to_string(),
-                ts,
-                answered: false,
-            });
+            bus.asks.push(ask.clone());
             bus.log.push(Msg {
                 from: from.to_string(),
                 to: HUMAN.to_string(),
@@ -198,6 +230,7 @@ impl BusRegistry {
                 ts,
                 kind: "ask".to_string(),
             });
+            self.emit_ask_event(HumanAskEvent::Asked { thread, ask });
         }
         self.emit_wake(thread, HUMAN);
         id
@@ -221,13 +254,21 @@ impl BusRegistry {
         let target = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            match bus.asks.iter_mut().find(|a| a.id == ask_id && !a.answered) {
+            let hit = match bus.asks.iter_mut().find(|a| a.id == ask_id && !a.answered) {
                 Some(a) => {
                     a.answered = true;
                     Some(a.from.clone())
                 }
                 None => None,
+            };
+            if hit.is_some() {
+                self.emit_ask_event(HumanAskEvent::Answered {
+                    thread,
+                    ask_id,
+                    text: text.to_string(),
+                });
             }
+            hit
         };
         match target {
             Some(dir) => {
@@ -356,5 +397,28 @@ mod tests {
         let w = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(w.thread, 7);
         assert_eq!(w.dir, "you");
+    }
+
+    #[tokio::test]
+    async fn human_ask_notifier_fires_on_ask_and_answer() {
+        let r = BusRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_ask_notifier(tx);
+        r.join(1, "10");
+        let id = r.ask_human(1, "10", "major or minor?");
+        match rx.recv().await.unwrap() {
+            HumanAskEvent::Asked { thread, ask } => {
+                assert_eq!(thread, 1);
+                assert_eq!(ask.id, id);
+                assert_eq!(ask.text, "major or minor?");
+            }
+            e => panic!("unexpected: {e:?}"),
+        }
+        assert!(r.answer_ask(1, id, "minor"));
+        assert!(matches!(rx.recv().await.unwrap(),
+            HumanAskEvent::Answered { thread: 1, ask_id, text } if ask_id == id && text == "minor"));
+        // 未命中/重复作答不发事件
+        assert!(!r.answer_ask(1, id, "again"));
+        assert!(rx.try_recv().is_err());
     }
 }
