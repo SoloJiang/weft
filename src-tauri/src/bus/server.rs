@@ -48,6 +48,7 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
     Router::new()
         .route("/bus/:thread/:dir/mcp", post(handle).get(get_not_allowed))
         .route("/planner/:thread/mcp", post(handle_planner).get(get_not_allowed))
+        .route("/global/mcp", post(crate::bus::global::handle_global).get(get_not_allowed))
         .route("/ask/:thread/:dir", post(handle_ask).get(get_not_allowed))
         .route("/health", get(|| async { "ok" }))
         .with_state(ServerState { bus, db, asks })

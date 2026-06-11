@@ -19,6 +19,10 @@ fn planner_url(base: &str, thread: i32) -> String {
     format!("{base}/planner/{thread}/mcp")
 }
 
+fn global_url(base: &str) -> String {
+    format!("{base}/global/mcp")
+}
+
 fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
     format!("{base}/ask/{thread}/{dir}?tool={tool}")
 }
@@ -135,6 +139,13 @@ pub fn inject(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Inj
 /// Same additive mechanism as the bus, a different server keyed to the thread.
 pub fn inject_planner(base: &str, thread: i32, tool: &str, cwd: &Path) -> Injection {
     inject_mcp("weft_planner", "planner", &planner_url(base, thread), tool, cwd)
+}
+
+/// Build the global-MCP injection for the Concierge engine (M3-2). Not
+/// per-thread — the URL has no thread/dir in path; identity is "the global
+/// helper running in IM single-chat". Same additive shape as planner.
+pub fn inject_global(base: &str, tool: &str, cwd: &Path) -> Injection {
+    inject_mcp("weft_global", "global", &global_url(base), tool, cwd)
 }
 
 /// Additively register one HTTP MCP `server` at `url` for `tool`, never

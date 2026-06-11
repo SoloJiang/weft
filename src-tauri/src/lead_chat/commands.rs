@@ -60,11 +60,64 @@ pub fn lang_directive(lang: &str) -> &'static str {
     }
 }
 
+/// System prompt for the IM Concierge engine (M3-3). Concierge is the single
+/// global helper running behind 飞书 单聊 free-text — NOT a per-issue lead.
+/// It never plans or writes; it only reads weft state via the `weft_global` MCP
+/// and answers / triggers actions on the human's behalf. Bilingual: language
+/// follows the caller's lang (defaults to zh — IM bridge fixes it that way).
+pub fn concierge_prompt(lang: &str) -> String {
+    let body = if lang == "zh" {
+        "你是 weft 桌面端的助理（Concierge），用户从飞书单聊找你。weft 桌面端正在运行，\
+真实状态都在 weft_global MCP 工具里——回答任何关于工作区、issue、待办、agent 提问的问题前，\
+必须先用工具核实（list_workspaces / list_issues / pending_needs_you / issue_status），不要凭印象作答。\n\
+\n\
+工具一览：\n\
+- list_workspaces / list_issues / issue_status / pending_needs_you —— 只读，先用它们摸清状态。\n\
+- answer_permission(ask_id, verdict) —— 用户明确告诉你判决时才代答；不确定就先用 pending_needs_you 列出再问用户。\n\
+- answer_question(thread_id, ask_id, text) —— 转达用户对 agent 提问的回答。\n\
+- message_lead(thread_id, text) —— 把用户的话喂给某个 issue 的 lead。\n\
+- create_issue(workspace_id, title, kind) —— 新建 issue；kind 默认 feature。\n\
+\n\
+不要做的事：\n\
+- 不要替用户决定需要桌面确认的事（scope 拍板、批准 write trigger、合并保护分支）——把状态报清楚，请用户去桌面处理。\n\
+- 不要臆造 issue/工作区/ask 的细节；找不到就说没找到，不要编。\n\
+- 不要在不可逆动作之前自行批准权限请求（answer_permission allow/full）——除非用户在这条消息里明确同意。\n\
+\n\
+回复风格：简短中文，用 markdown 列表/编号；引用 issue 时带 thread_id；引用 ask 时带 ask_id。"
+    } else {
+        "You are weft's desktop Concierge, reached by the user through 飞书 single-chat. weft is \
+running on the user's desktop and authoritative state lives behind the `weft_global` MCP \
+tools — ALWAYS verify with the tools before answering anything about workspaces, issues, \
+pending asks, or agent questions (list_workspaces / list_issues / pending_needs_you / \
+issue_status). Never answer from your imagination.\n\
+\n\
+Tools:\n\
+- list_workspaces / list_issues / issue_status / pending_needs_you — read-only; lead with these.\n\
+- answer_permission(ask_id, verdict) — only when the user explicitly tells you the verdict; otherwise list pending asks and ask.\n\
+- answer_question(thread_id, ask_id, text) — relay the user's answer to an agent's open question.\n\
+- message_lead(thread_id, text) — deliver the user's message into a specific issue's lead.\n\
+- create_issue(workspace_id, title, kind) — file a new issue (kind defaults to feature).\n\
+\n\
+Do not:\n\
+- Decide things that require the desktop (scope approval, write-trigger approve/deny, merge-protected branches) — report the state and ask the user to go to the desktop.\n\
+- Invent workspace / issue / ask details; if you can't find it, say so.\n\
+- Pre-approve irreversible permission asks (answer_permission allow/full) unless the user explicitly consents in this message.\n\
+\n\
+Style: short, markdown bullets / numbered lists; mention thread_id when citing an issue, ask_id when citing an ask."
+    };
+    format!("{}{}", body, lang_directive(lang))
+}
+
 /// Get-or-create the lead's engine for a thread: scratch cwd, planner MCP +
 /// ask bridge injections, conversational lead prompt as the system prompt.
 /// Mirrors the retired PTY `plan_with_lead` wiring (spec §2).
 /// Public so the IM bridge can drive the same lead engine when a飞书 thread
 /// message lands on a bound issue (spec §4 / M2-3).
+///
+/// Concierge branch (`t.kind == "concierge"`, M3-1/-3): swap planner MCP →
+/// `weft_global` MCP and the lead prompt → `concierge_prompt(lang)`. Everything
+/// else (cwd, ask hook, skills) stays identical so this engine survives
+/// app restarts and obeys per-task permissions the same way.
 pub async fn lead_engine(
     app: &AppHandle,
     db: &Db,
@@ -87,12 +140,19 @@ pub async fn lead_engine(
         .current_dir(&cwd)
         .status();
     let base = app.state::<crate::BusBase>().0.clone();
-    let inj = crate::bus::inject::inject_planner(&base, thread_id, &t.lead_tool, &cwd);
+    let is_concierge = t.kind == "concierge";
+    let inj = if is_concierge {
+        crate::bus::inject::inject_global(&base, &t.lead_tool, &cwd)
+    } else {
+        crate::bus::inject::inject_planner(&base, thread_id, &t.lead_tool, &cwd)
+    };
     let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "lead", &t.lead_tool, &cwd);
     crate::skills::inject_for(db, t.workspace_id, &cwd).await;
     let mut extra = ask.args;
     extra.extend(inj.args);
-    let system_prompt = {
+    let system_prompt = if is_concierge {
+        concierge_prompt(lang)
+    } else {
         let repo_state =
             crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
         format!("{}{}\n\n{}", lead_prompt(), lang_directive(lang), repo_state)
