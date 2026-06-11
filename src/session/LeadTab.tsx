@@ -1,11 +1,30 @@
-import { useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useStore } from "../state/store";
 import { ChatTimeline } from "./ChatTimeline";
 import { ChatComposer } from "./ChatComposer";
 import { PermissionBar } from "./PermissionBar";
+import { Dialog, DialogContent } from "../components/ui/Dialog";
+import { Input } from "../components/ui/Input";
+import { Button } from "../components/ui/Button";
+import { useRepoActions } from "./useRepoActions";
 import { api } from "../lib/api";
 import { resumeCommand } from "../lib/resume";
+
+type PromptState = {
+  title: string;
+  placeholder?: string;
+  value: string;
+  resolve: (v: string | null) => void;
+};
+
+// Host-owned local slash items. ChatComposer keeps the "what" generic
+// (a name + label); the kind is mapped to a useRepoActions invocation here.
+const LOCAL_SLASH = [
+  { name: "add-repo", kind: "add" as const, labelKey: "slashLocal.addRepo" },
+  { name: "new-repo", kind: "new" as const, labelKey: "slashLocal.newRepo" },
+  { name: "clone-repo", kind: "clone" as const, labelKey: "slashLocal.cloneRepo" },
+];
 
 /**
  * The issue console — a real chat, not a projection of the CLI's log. Messages
@@ -16,6 +35,7 @@ import { resumeCommand } from "../lib/resume";
 export function LeadTab({ onReview }: { onReview: () => void }) {
   const {
     activeThreadId,
+    activeWorkspaceId,
     leadMessages,
     leadTurn,
     leadSlash,
@@ -27,6 +47,20 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     asks,
   } = useStore();
   const { t } = useTranslation();
+  const { run, busy: actionsBusy } = useRepoActions();
+  const [promptState, setPromptState] = useState<PromptState | null>(null);
+
+  const promptText = (title: string, placeholder?: string) =>
+    new Promise<string | null>((resolve) =>
+      setPromptState({ title, placeholder, value: "", resolve }),
+    );
+
+  // Stable identity per language so ChatComposer's slashMatches useMemo
+  // doesn't recompute on every parent render.
+  const localSlash = useMemo(
+    () => LOCAL_SLASH.map((c) => ({ name: c.name, label: t(c.labelKey) })),
+    [t],
+  );
 
   useEffect(() => {
     if (activeThreadId != null) void loadLeadChat(activeThreadId);
@@ -36,6 +70,20 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[activeThreadId] ?? []).filter((m) => m.session_id == null);
   const turn = leadTurn[activeThreadId] ?? { state: "stopped" as const, queued: 0 };
+
+  const onLocalSlash = (name: string) => {
+    const item = LOCAL_SLASH.find((x) => x.name === name);
+    if (!item) return;
+    void run({
+      actionId: `local-${item.kind}-${Date.now()}`,
+      kind: item.kind,
+      ctx: {
+        threadId: activeThreadId,
+        preferredWorkspaceId: activeWorkspaceId,
+      },
+      promptText,
+    });
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-bg">
@@ -50,9 +98,16 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
           setReviewingProposal(true);
           onReview();
         }}
+        runAction={run}
+        actionsBusy={actionsBusy}
+        threadId={activeThreadId}
+        workspaceId={activeWorkspaceId}
+        promptText={promptText}
       />
       <ChatComposer
         slashCommands={leadSlash[activeThreadId] ?? []}
+        localSlash={localSlash}
+        onLocalSlash={onLocalSlash}
         busy={turn.state === "busy"}
         stopped={turn.state === "stopped"}
         queued={turn.queued}
@@ -72,6 +127,53 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
           return true;
         }}
       />
+      <Dialog
+        open={promptState != null}
+        onOpenChange={(open) => {
+          if (!open && promptState) {
+            promptState.resolve(null);
+            setPromptState(null);
+          }
+        }}
+      >
+        {promptState && (
+          <DialogContent title={promptState.title}>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const v = promptState.value.trim();
+                promptState.resolve(v || null);
+                setPromptState(null);
+              }}
+              className="flex flex-col gap-3"
+            >
+              <Input
+                autoFocus
+                placeholder={promptState.placeholder}
+                value={promptState.value}
+                onChange={(e) =>
+                  setPromptState((s) => (s ? { ...s, value: e.currentTarget.value } : s))
+                }
+              />
+              <div className="flex justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    promptState.resolve(null);
+                    setPromptState(null);
+                  }}
+                >
+                  {t("session.promptCancel")}
+                </Button>
+                <Button type="submit" variant="primary">
+                  {t("session.promptOk")}
+                </Button>
+              </div>
+            </form>
+          </DialogContent>
+        )}
+      </Dialog>
     </div>
   );
 }

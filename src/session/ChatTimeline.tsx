@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, FileText, Slash, Sparkles } from "lucide-react";
 import type { LeadMessage } from "../lib/types";
@@ -6,11 +6,9 @@ import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
 import { cleanToolName, compactToolTarget, toolIcon, toolLabelKey } from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
-import { useRepoActions, type RepoActionInvocation } from "./useRepoActions";
-import { useStore } from "../state/store";
-import { Dialog, DialogContent } from "../components/ui/Dialog";
-import { Input } from "../components/ui/Input";
-import { Button } from "../components/ui/Button";
+import type { useRepoActions } from "./useRepoActions";
+
+type RunAction = ReturnType<typeof useRepoActions>["run"];
 
 /**
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
@@ -18,35 +16,35 @@ import { Button } from "../components/ui/Button";
  * the flow, where they happened — the conversation IS the console. Tool calls
  * are NOT rows: the one currently running shows as a transient activity line
  * under the stream and disappears when the turn moves on.
+ *
+ * The lead host wires up runAction/promptText so action_card buttons trigger
+ * the real repo flows; worker hosts (Observe/Session) omit them and any
+ * historical action_card rows fall back to read-only display.
  */
 export function ChatTimeline({
   messages,
   busy,
   activity,
   onReviewProposal,
+  runAction,
+  actionsBusy,
+  threadId,
+  workspaceId,
+  promptText,
 }: {
   messages: LeadMessage[];
   busy: boolean;
   /** The tool call executing right now (transient), if any. */
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
+  /** Lead-only: dispatch a repo action card. Omit → cards render read-only. */
+  runAction?: RunAction;
+  actionsBusy?: Record<string, boolean>;
+  threadId?: number | null;
+  workspaceId?: number | null;
+  promptText?: (title: string, placeholder?: string) => Promise<string | null>;
 }) {
   const { t } = useTranslation();
-  const { activeThreadId, activeWorkspaceId } = useStore();
-  const { run: runAction, busy: actionsBusy } = useRepoActions();
-  const [promptState, setPromptState] = useState<
-    | null
-    | {
-        title: string;
-        placeholder?: string;
-        value: string;
-        resolve: (v: string | null) => void;
-      }
-  >(null);
-  const promptText = (title: string, placeholder?: string) =>
-    new Promise<string | null>((resolve) =>
-      setPromptState({ title, placeholder, value: "", resolve }),
-    );
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottomRef = useRef(true);
@@ -94,8 +92,8 @@ export function ChatTimeline({
             onReviewProposal={onReviewProposal}
             runAction={runAction}
             actionsBusy={actionsBusy}
-            threadId={activeThreadId}
-            workspaceId={activeWorkspaceId}
+            threadId={threadId ?? null}
+            workspaceId={workspaceId ?? null}
             promptText={promptText}
           />
         ))}
@@ -108,53 +106,6 @@ export function ChatTimeline({
         )}
       </div>
       <div ref={endRef} />
-      <Dialog
-        open={promptState != null}
-        onOpenChange={(open) => {
-          if (!open && promptState) {
-            promptState.resolve(null);
-            setPromptState(null);
-          }
-        }}
-      >
-        {promptState && (
-          <DialogContent title={promptState.title}>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                const v = promptState.value.trim();
-                promptState.resolve(v || null);
-                setPromptState(null);
-              }}
-              className="flex flex-col gap-3"
-            >
-              <Input
-                autoFocus
-                placeholder={promptState.placeholder}
-                value={promptState.value}
-                onChange={(e) =>
-                  setPromptState((s) => (s ? { ...s, value: e.target.value } : s))
-                }
-              />
-              <div className="flex justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  onClick={() => {
-                    promptState.resolve(null);
-                    setPromptState(null);
-                  }}
-                >
-                  {t("session.promptCancel")}
-                </Button>
-                <Button type="submit" variant="primary">
-                  {t("session.promptOk")}
-                </Button>
-              </div>
-            </form>
-          </DialogContent>
-        )}
-      </Dialog>
     </div>
   );
 }
@@ -231,11 +182,11 @@ function TimelineRow({
   m: LeadMessage;
   all: LeadMessage[];
   onReviewProposal: () => void;
-  runAction: (inv: RepoActionInvocation) => Promise<void>;
-  actionsBusy: Record<string, boolean>;
+  runAction?: RunAction;
+  actionsBusy?: Record<string, boolean>;
   threadId: number | null;
   workspaceId: number | null;
-  promptText: (title: string, placeholder?: string) => Promise<string | null>;
+  promptText?: (title: string, placeholder?: string) => Promise<string | null>;
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
@@ -249,25 +200,31 @@ function TimelineRow({
     const actions = Array.isArray(parsed.actions)
       ? (parsed.actions as ActionCardAction[])
       : [];
-    const readOnly = !isLastAssistant(m, all);
+    // Worker hosts (no runAction wired) and historical rows fall back to
+    // read-only — buttons render disabled so the card stays in context but
+    // can't fire a flow without a handler.
+    const readOnly = !runAction || !promptText || !isLastAssistant(m, all);
+    const onAction: ((a: ActionCardAction) => void) | undefined =
+      runAction && promptText
+        ? (a) =>
+            void runAction({
+              actionId: a.id,
+              kind: a.kind,
+              ctx: {
+                threadId: threadId ?? undefined,
+                preferredWorkspaceId: workspaceId,
+              },
+              promptText,
+            })
+        : undefined;
     return (
       <ActionCardBlock
         title={title}
         body={body}
         actions={actions}
         readOnly={readOnly}
-        busy={actionsBusy}
-        onAction={(a) =>
-          runAction({
-            actionId: a.id,
-            kind: a.kind,
-            ctx: {
-              threadId: threadId ?? undefined,
-              preferredWorkspaceId: workspaceId,
-            },
-            promptText,
-          })
-        }
+        busy={actionsBusy ?? {}}
+        onAction={onAction ?? (() => {})}
       />
     );
   }

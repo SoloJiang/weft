@@ -31,8 +31,12 @@ interface PendingImage extends ImageAttachment {
  * reads itself. While a turn runs the Stop button interrupts and extra sends
  * queue — same semantics as the native TUI's mid-turn input queue.
  */
+type SlashItem = { name: string; label: string; source: "local" | "cli" };
+
 export function ChatComposer({
   slashCommands,
+  localSlash,
+  onLocalSlash,
   busy,
   stopped,
   queued,
@@ -46,6 +50,11 @@ export function ChatComposer({
   onNeedSlashCommands,
 }: {
   slashCommands: string[];
+  /** Extra "local" slash items, prepended to the palette under a divider.
+   *  The host handles the action: when the user picks one, onLocalSlash is
+   *  called and the composer text is cleared (it is NOT sent). */
+  localSlash?: { name: string; label: string }[];
+  onLocalSlash?: (name: string) => void;
   busy: boolean;
   stopped: boolean;
   queued: number;
@@ -79,24 +88,44 @@ export function ChatComposer({
     el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
   }, [text]);
 
-  // Palette: leading "/" with no space yet → filter the CLI's command list.
+  // Palette: leading "/" with no space yet → filter the CLI's command list,
+  // plus host-injected local items (e.g. /add-repo, /new-repo, /clone-repo).
   // Prefix matches outrank substring matches so built-ins like /clear surface
-  // as soon as you type them, not buried under plugin skills.
+  // as soon as you type them, not buried under plugin skills. Locals lead.
   const slashQuery = text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
-  const slashMatches = useMemo(() => {
-    if (slashQuery == null || slashCommands.length === 0) return [];
+  const slashMatches = useMemo<SlashItem[]>(() => {
+    if (slashQuery == null) return [];
+    if (slashCommands.length === 0 && (!localSlash || localSlash.length === 0)) return [];
     const q = slashQuery.toLowerCase();
-    const exact: string[] = [];
-    const prefix: string[] = [];
-    const within: string[] = [];
-    for (const c of slashCommands) {
-      const lc = c.toLowerCase();
-      if (lc === q) exact.push(c);
-      else if (lc.startsWith(q)) prefix.push(c);
-      else if (lc.includes(q)) within.push(c);
-    }
-    return [...exact, ...prefix, ...within].slice(0, 16);
-  }, [slashQuery, slashCommands]);
+    const bucket = (items: SlashItem[]) => {
+      const exact: SlashItem[] = [];
+      const prefix: SlashItem[] = [];
+      const within: SlashItem[] = [];
+      for (const it of items) {
+        const lc = it.name.toLowerCase();
+        if (lc === q) exact.push(it);
+        else if (lc.startsWith(q)) prefix.push(it);
+        else if (lc.includes(q)) within.push(it);
+      }
+      return { exact, prefix, within };
+    };
+    const locals: SlashItem[] = (localSlash ?? []).map((x) => ({ ...x, source: "local" }));
+    const clis: SlashItem[] = slashCommands.map((name) => ({
+      name,
+      label: name,
+      source: "cli",
+    }));
+    const L = bucket(locals);
+    const C = bucket(clis);
+    return [
+      ...L.exact,
+      ...L.prefix,
+      ...L.within,
+      ...C.exact,
+      ...C.prefix,
+      ...C.within,
+    ].slice(0, 16);
+  }, [slashQuery, slashCommands, localSlash]);
   const paletteOpen = slashMatches.length > 0;
 
   useEffect(() => setSlashIdx(0), [slashQuery]);
@@ -124,8 +153,13 @@ export function ChatComposer({
     setFiles([]);
   };
 
-  const complete = (cmd: string) => {
-    setText(`/${cmd} `);
+  const complete = (item: SlashItem) => {
+    if (item.source === "local") {
+      onLocalSlash?.(item.name);
+      setText("");
+      return;
+    }
+    setText(`/${item.name} `);
     ref.current?.focus();
   };
 
@@ -174,19 +208,32 @@ export function ChatComposer({
       <div className="relative mx-auto max-w-[820px] rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-[0_12px_40px_-28px_rgba(0,0,0,0.65)]">
         {paletteOpen && (
           <div className="absolute inset-x-2 bottom-full mb-2 max-h-64 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-raised shadow-[0_12px_40px_-20px_rgba(0,0,0,0.6)]">
-            {slashMatches.map((cmd, i) => (
-              <button
-                key={cmd}
-                onMouseEnter={() => setSlashIdx(i)}
-                onClick={() => complete(cmd)}
-                className={cn(
-                  "flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-[12.5px]",
-                  i === slashIdx ? "bg-brand-ghost text-ink" : "text-ink-muted",
-                )}
-              >
-                <SlashSquare size={12} className="shrink-0 text-brand" />/{cmd}
-              </button>
-            ))}
+            {slashMatches.map((item, i) => {
+              const divider =
+                i > 0 && slashMatches[i - 1].source !== item.source
+                  ? "border-t border-border/50"
+                  : "";
+              return (
+                <button
+                  key={`${item.source}:${item.name}`}
+                  onMouseEnter={() => setSlashIdx(i)}
+                  onClick={() => complete(item)}
+                  className={cn(
+                    "flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-[12.5px]",
+                    i === slashIdx ? "bg-brand-ghost text-ink" : "text-ink-muted",
+                    divider,
+                  )}
+                >
+                  <SlashSquare size={12} className="shrink-0 text-brand" />
+                  <span>/{item.name}</span>
+                  {item.source === "local" && (
+                    <span className="ml-auto truncate text-[10.5px] text-ink-faint">
+                      {item.label}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
         )}
 
@@ -254,11 +301,17 @@ export function ChatComposer({
               if (e.key === "Enter") {
                 e.preventDefault();
                 // Enter SENDS when you've typed a complete command (exact match,
-                // regardless of highlight); it completes otherwise.
-                if (slashQuery != null && slashMatches.includes(slashQuery)) {
+                // regardless of highlight); it completes otherwise. Local items
+                // are host-side actions, so even an exact local match still
+                // routes through complete() to fire the host callback.
+                const exact =
+                  slashQuery != null
+                    ? slashMatches.find((x) => x.name === slashQuery)
+                    : undefined;
+                if (exact && exact.source === "cli") {
                   send();
                 } else {
-                  complete(slashMatches[slashIdx]);
+                  complete(exact ?? slashMatches[slashIdx]);
                 }
                 return;
               }
