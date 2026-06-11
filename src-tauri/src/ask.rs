@@ -18,6 +18,17 @@ pub enum Decision {
     Deny,
 }
 
+/// Registry → IM 桥的通知：第二呈现面（IM 卡片）靠它与桌面保持同步。
+/// Opened 在 request() 时发；Resolved 在 answer()（含 Always/Full 连带覆盖、
+/// Dangerous 释放积压）时按被解决的每个 ask 发；Cancelled 在 cancel()（超时
+/// 回落）时发。没装通知器时零开销。
+#[derive(Clone, Debug)]
+pub enum AskEvent {
+    Opened(Ask),
+    Resolved { id: u64 },
+    Cancelled { id: u64 },
+}
+
 /// The human's answer to a permission Ask. `Always` remembers this action for
 /// the asking task; `Full` auto-approves everything from that task. Both are
 /// weft-side passthrough rules, scoped per (thread, task), kept in memory.
@@ -74,6 +85,8 @@ struct Inner {
     /// Dangerous mode: when on, EVERY ask from EVERY agent auto-allows (never
     /// surfaced). The global "skip all permission prompts" setting.
     dangerous: bool,
+    /// IM 桥的通知器：装上后 Ask 开/答/撤事件外发；未装时零开销。
+    notify: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
 }
 
 /// Cloneable handle to all pending Asks.
@@ -94,6 +107,11 @@ impl AskRegistry {
         Self::default()
     }
 
+    /// 安装 IM 桥的通知器（重装时替换旧的；旧消费者随 sender drop 收尾）。
+    pub fn set_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<AskEvent>) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).notify = Some(tx);
+    }
+
     /// Register a permission request; returns its id and a receiver that resolves
     /// when the human (or a timeout) answers. The caller awaits the receiver.
     pub fn request(
@@ -109,7 +127,7 @@ impl AskRegistry {
         g.next_id += 1;
         let id = g.next_id;
         g.waiters.insert(id, tx);
-        g.open.push(Ask {
+        let ask = Ask {
             id,
             thread,
             dir: dir.to_string(),
@@ -119,7 +137,11 @@ impl AskRegistry {
             ts: now(),
             thread_title: String::new(),
             dir_name: String::new(),
-        });
+        };
+        g.open.push(ask.clone());
+        if let Some(ntx) = &g.notify {
+            let _ = ntx.send(AskEvent::Opened(ask));
+        }
         (id, rx)
     }
 
@@ -137,6 +159,9 @@ impl AskRegistry {
         for id in ids {
             if let Some(tx) = g.waiters.remove(&id) {
                 let _ = tx.send(Decision::Allow);
+            }
+            if let Some(ntx) = &g.notify {
+                let _ = ntx.send(AskEvent::Resolved { id });
             }
         }
     }
@@ -205,6 +230,9 @@ impl AskRegistry {
             if let Some(tx) = g.waiters.remove(&cid) {
                 woke = tx.send(decision).is_ok() || woke;
             }
+            if let Some(ntx) = &g.notify {
+                let _ = ntx.send(AskEvent::Resolved { id: cid });
+            }
         }
         woke
     }
@@ -213,8 +241,15 @@ impl AskRegistry {
     /// board. The waiter's receiver errors, which the endpoint treats as fallback.
     pub fn cancel(&self, id: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = g.open.len();
         g.open.retain(|a| a.id != id);
+        let hit = g.open.len() != before;
         g.waiters.remove(&id);
+        if hit {
+            if let Some(ntx) = &g.notify {
+                let _ = ntx.send(AskEvent::Cancelled { id });
+            }
+        }
     }
 
     /// All Asks across threads (for the workspace-wide Needs-you surface).
@@ -287,6 +322,36 @@ mod tests {
         r.cancel(id);
         assert!(r.open().is_empty());
         assert!(rx.await.is_err()); // sender dropped
+    }
+
+    #[tokio::test]
+    async fn notifier_fires_on_open_resolve_and_cancel() {
+        let r = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_notifier(tx);
+        let (id, _drx) = r.request(1, "10", "claude", "Run: x", "x");
+        assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id));
+        r.answer(id, Answer::Allow);
+        assert!(matches!(rx.recv().await.unwrap(), AskEvent::Resolved { id: rid } if rid == id));
+        let (id2, _drx2) = r.request(1, "10", "claude", "Run: y", "y");
+        let _ = rx.recv().await; // Opened(id2)
+        r.cancel(id2);
+        assert!(matches!(rx.recv().await.unwrap(), AskEvent::Cancelled { id: c } if c == id2));
+    }
+
+    #[tokio::test]
+    async fn full_answer_resolves_every_covered_ask_via_notifier() {
+        let r = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_notifier(tx);
+        let (id1, _a) = r.request(1, "10", "claude", "Run: a", "a");
+        let (id2, _b) = r.request(1, "10", "claude", "Run: b", "b");
+        let _ = rx.recv().await; let _ = rx.recv().await; // two Opened
+        r.answer(id1, Answer::Full); // 覆盖 id2
+        let mut got = vec![];
+        for _ in 0..2 { if let AskEvent::Resolved { id } = rx.recv().await.unwrap() { got.push(id); } }
+        got.sort();
+        assert_eq!(got, vec![id1, id2]);
     }
 
     #[test]
