@@ -215,6 +215,12 @@ interface Store {
   /** Prevent system idle sleep while any session is running. */
   keepAwake: boolean;
   setKeepAwake: (on: boolean) => void;
+  /** App updater: available update metadata, or null if none. */
+  updateAvailable: { version: string; body: string } | null;
+  /** Download, install, and relaunch into the new version. */
+  installUpdate: () => Promise<void>;
+  /** Dismiss the update nudge for this session. */
+  dismissUpdate: () => void;
   focusSession: (sessionId: number) => void;
 }
 
@@ -334,6 +340,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
   useEffect(() => {
     void api.setKeepAwake(localStorage.getItem("weft-keep-awake") !== "0");
+  }, []);
+  // Auto-check for app updates on launch (silent; only surface when found).
+  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body: string } | null>(null);
+  useEffect(() => {
+    void (async () => {
+      try {
+        const { checkUpdate } = await import("../lib/updater");
+        const info = await checkUpdate();
+        if (info) setUpdateAvailable(info);
+      } catch {
+        /* updater unavailable in dev or offline */
+      }
+    })();
+  }, []);
+  const installUpdate = useCallback(async () => {
+    const { installUpdate: doInstall } = await import("../lib/updater");
+    await doInstall();
+  }, []);
+  const dismissUpdate = useCallback(() => {
+    setUpdateAvailable(null);
   }, []);
   const [dangerousMode, setDangerousModeState] = useState(
     () => localStorage.getItem("weft-dangerous") === "1",
@@ -1465,6 +1491,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     keepAwake,
     setKeepAwake,
     focusSession,
+    updateAvailable,
+    installUpdate,
+    dismissUpdate,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

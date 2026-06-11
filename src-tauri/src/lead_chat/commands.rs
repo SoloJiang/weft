@@ -60,22 +60,24 @@ pub fn lang_directive(lang: &str) -> &'static str {
     }
 }
 
-/// System prompt for the IM Concierge engine (M3-3). Concierge is the single
-/// global helper running behind 飞书 单聊 free-text — NOT a per-issue lead.
+/// System prompt for the IM Concierge engine (M3-3). Concierge is scoped to
+/// the current IM conversation — NOT a per-issue lead.
 /// It never plans or writes; it only reads weft state via the `weft_global` MCP
 /// and answers / triggers actions on the human's behalf. Bilingual: language
 /// follows the caller's lang (defaults to zh — IM bridge fixes it that way).
 pub fn concierge_prompt(lang: &str) -> String {
     let body = if lang == "zh" {
-        "你是 weft 桌面端的助理（Concierge），用户从飞书单聊找你。weft 桌面端正在运行，\
+        "你是 weft 桌面端的助理（Concierge），用户从某个飞书会话找你。weft 桌面端正在运行，\
 真实状态都在 weft_global MCP 工具里——回答任何关于工作区、issue、待办、agent 提问的问题前，\
 必须先用工具核实（list_workspaces / list_issues / pending_needs_you / issue_status），不要凭印象作答。\n\
+如果用户消息里带有 feishu_chat_id，那就是当前飞书会话的 chat_id；只有用户语义明确要求为某个已有 issue 创建、打开或继续飞书 topic 时，才可把这个 chat_id 传给 ensure_issue_topic。\n\
 \n\
 工具一览：\n\
 - list_workspaces / list_issues / issue_status / pending_needs_you —— 只读，先用它们摸清状态。\n\
 - answer_permission(ask_id, verdict) —— 用户明确告诉你判决时才代答；不确定就先用 pending_needs_you 列出再问用户。\n\
 - answer_question(thread_id, ask_id, text) —— 转达用户对 agent 提问的回答。\n\
 - message_lead(thread_id, text) —— 把用户的话喂给某个 issue 的 lead。\n\
+- ensure_issue_topic(thread_id, chat_id) —— 当用户语义明确要为某个已有 issue 创建/打开/继续飞书 topic 时调用；普通聊天不要调用。\n\
 - create_issue(workspace_id, title, kind) —— 新建 issue；kind 默认 feature。\n\
 \n\
 不要做的事：\n\
@@ -85,17 +87,19 @@ pub fn concierge_prompt(lang: &str) -> String {
 \n\
 回复风格：简短中文，用 markdown 列表/编号；引用 issue 时带 thread_id；引用 ask 时带 ask_id。"
     } else {
-        "You are weft's desktop Concierge, reached by the user through 飞书 single-chat. weft is \
+        "You are weft's desktop Concierge, reached by the user through one Feishu conversation. weft is \
 running on the user's desktop and authoritative state lives behind the `weft_global` MCP \
 tools — ALWAYS verify with the tools before answering anything about workspaces, issues, \
 pending asks, or agent questions (list_workspaces / list_issues / pending_needs_you / \
 issue_status). Never answer from your imagination.\n\
+If the user's message includes feishu_chat_id, that is the current Feishu chat_id; only pass it to ensure_issue_topic when the user semantically asks to create, open, or continue a Feishu topic for an existing issue.\n\
 \n\
 Tools:\n\
 - list_workspaces / list_issues / issue_status / pending_needs_you — read-only; lead with these.\n\
 - answer_permission(ask_id, verdict) — only when the user explicitly tells you the verdict; otherwise list pending asks and ask.\n\
 - answer_question(thread_id, ask_id, text) — relay the user's answer to an agent's open question.\n\
 - message_lead(thread_id, text) — deliver the user's message into a specific issue's lead.\n\
+- ensure_issue_topic(thread_id, chat_id) — call only when the user semantically asks to create/open/continue a Feishu topic for an existing issue; do not call for ordinary chat.\n\
 - create_issue(workspace_id, title, kind) — file a new issue (kind defaults to feature).\n\
 \n\
 Do not:\n\
@@ -131,7 +135,9 @@ pub async fn lead_engine(
     let t = repo::get_thread(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
-    let cwd = crate::paths::weft_home()?.join("leads").join(thread_id.to_string());
+    let cwd = crate::paths::weft_home()?
+        .join("leads")
+        .join(thread_id.to_string());
     std::fs::create_dir_all(&cwd)?;
     // git-init so claude's session store (keyed by cwd) behaves like any other
     // cwd; harmless if it already exists.
@@ -155,7 +161,12 @@ pub async fn lead_engine(
     } else {
         let repo_state =
             crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
-        format!("{}{}\n\n{}", lead_prompt(), lang_directive(lang), repo_state)
+        format!(
+            "{}{}\n\n{}",
+            lead_prompt(),
+            lang_directive(lang),
+            repo_state
+        )
     };
     let inner = engine::EngineInner {
         thread_id,
@@ -210,15 +221,24 @@ pub async fn lead_send(
     let eng = lead_engine(&app, &db, thread_id, lang.as_deref().unwrap_or("en"))
         .await
         .map_err(|e| e.to_string())?;
-    engine::send(&app, &db, &eng, &text, to_pairs(images), files.unwrap_or_default())
-        .await
-        .map_err(|e| e.to_string())
+    engine::send(
+        &app,
+        &db,
+        &eng,
+        &text,
+        to_pairs(images),
+        files.unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn lead_interrupt(app: AppHandle, thread_id: i32) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
-        engine::interrupt(&app, &eng).await.map_err(|e| e.to_string())?;
+        engine::interrupt(&app, &eng)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -235,7 +255,9 @@ pub async fn lead_ensure(
     let eng = lead_engine(&app, &db, thread_id, lang.as_deref().unwrap_or("en"))
         .await
         .map_err(|e| e.to_string())?;
-    engine::ensure_running(&app, &db, &eng).await.map_err(|e| e.to_string())
+    engine::ensure_running(&app, &db, &eng)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Stop the lead engine (terminal takeover: the session must have one writer).
@@ -270,7 +292,12 @@ pub async fn lead_state(
             native_id: repo::lead_native_id(&db, thread_id).await.ok().flatten(),
             slash_commands: vec![],
             cwd: crate::paths::weft_home()
-                .map(|h| h.join("leads").join(thread_id.to_string()).to_string_lossy().into_owned())
+                .map(|h| {
+                    h.join("leads")
+                        .join(thread_id.to_string())
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .unwrap_or_default(),
         }),
         Some(e) => {
@@ -303,16 +330,9 @@ pub async fn list_lead_messages(
     db: State<'_, Db>,
     thread_id: i32,
 ) -> Result<Vec<crate::store::entities::lead_message::Model>, String> {
-    let msgs = repo::list_lead_messages(&db, thread_id).await.map_err(|e| e.to_string())?;
-    if !msgs.iter().any(|m| m.kind != "meta") {
-        // Legacy thread: lazily import the old PTY lead's jsonl transcript once.
-        if let Ok(n) = import_legacy(&db, thread_id).await {
-            if n > 0 {
-                return repo::list_lead_messages(&db, thread_id).await.map_err(|e| e.to_string());
-            }
-        }
-    }
-    Ok(msgs)
+    repo::list_lead_messages(&db, thread_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ───────────────────── chat-mode workers ─────────────────────
@@ -333,9 +353,15 @@ pub async fn chat_open_worker(
     repo_id: i32,
     lang: Option<String>,
 ) -> Result<SessionInfo, String> {
-    chat_open_worker_impl(&app, &db, direction_id, repo_id, lang.as_deref().unwrap_or("en"))
-        .await
-        .map_err(|e| e.to_string())
+    chat_open_worker_impl(
+        &app,
+        &db,
+        direction_id,
+        repo_id,
+        lang.as_deref().unwrap_or("en"),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn chat_open_worker_impl(
@@ -365,8 +391,20 @@ async fn chat_open_worker_impl(
     };
 
     let base = app.state::<crate::BusBase>().0.clone();
-    let inj = crate::bus::inject::inject(&base, dir.thread_id, &direction_id.to_string(), &dir.tool, &cwd);
-    let ask = crate::bus::inject::inject_ask_hook(&base, dir.thread_id, &direction_id.to_string(), &dir.tool, &cwd);
+    let inj = crate::bus::inject::inject(
+        &base,
+        dir.thread_id,
+        &direction_id.to_string(),
+        &dir.tool,
+        &cwd,
+    );
+    let ask = crate::bus::inject::inject_ask_hook(
+        &base,
+        dir.thread_id,
+        &direction_id.to_string(),
+        &dir.tool,
+        &cwd,
+    );
     if let Ok(Some(th)) = repo::get_thread(db, dir.thread_id).await {
         crate::skills::inject_for(db, th.workspace_id, &cwd).await;
     }
@@ -407,7 +445,9 @@ async fn chat_open_worker_impl(
     // A fresh conversation gets its brief as the opening message (the brief is
     // a message, not a system prompt).
     if !resumed {
-        let mut brief = crate::brief::assemble(db, direction_id).await.unwrap_or_default();
+        let mut brief = crate::brief::assemble(db, direction_id)
+            .await
+            .unwrap_or_default();
         if !brief.trim().is_empty() {
             brief.push_str(lang_directive(lang));
             engine::send(app, db, &eng, &brief, vec![], vec![]).await?;
@@ -453,8 +493,20 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         .ok_or_else(|| anyhow::anyhow!("direction not found"))?;
     let cwd = std::path::PathBuf::from(&sess.cwd);
     let base = app.state::<crate::BusBase>().0.clone();
-    let inj = crate::bus::inject::inject(&base, dir.thread_id, &sess.direction_id.to_string(), &sess.tool, &cwd);
-    let ask = crate::bus::inject::inject_ask_hook(&base, dir.thread_id, &sess.direction_id.to_string(), &sess.tool, &cwd);
+    let inj = crate::bus::inject::inject(
+        &base,
+        dir.thread_id,
+        &sess.direction_id.to_string(),
+        &sess.tool,
+        &cwd,
+    );
+    let ask = crate::bus::inject::inject_ask_hook(
+        &base,
+        dir.thread_id,
+        &sess.direction_id.to_string(),
+        &sess.tool,
+        &cwd,
+    );
     if let Ok(Some(th)) = repo::get_thread(db, dir.thread_id).await {
         crate::skills::inject_for(db, th.workspace_id, &cwd).await;
     }
@@ -493,16 +545,27 @@ pub async fn chat_send(
     images: Option<Vec<ImageIn>>,
     files: Option<Vec<String>>,
 ) -> Result<(), String> {
-    let eng = worker_engine(&app, &db, session_id).await.map_err(|e| e.to_string())?;
-    engine::send(&app, &db, &eng, &text, to_pairs(images), files.unwrap_or_default())
+    let eng = worker_engine(&app, &db, session_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    engine::send(
+        &app,
+        &db,
+        &eng,
+        &text,
+        to_pairs(images),
+        files.unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn chat_interrupt(app: AppHandle, session_id: i32) -> Result<(), String> {
     if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
-        engine::interrupt(&app, &eng).await.map_err(|e| e.to_string())?;
+        engine::interrupt(&app, &eng)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -519,7 +582,11 @@ pub async fn chat_stop(app: AppHandle, session_id: i32) -> Result<(), String> {
 /// into the live session's cwd and flag the engine so the next send silently
 /// restarts the resident process to pick them up. No-op if the engine is gone.
 #[tauri::command]
-pub async fn flag_session_skill_refresh(app: AppHandle, db: State<'_, Db>, session_id: i32) -> Result<(), String> {
+pub async fn flag_session_skill_refresh(
+    app: AppHandle,
+    db: State<'_, Db>,
+    session_id: i32,
+) -> Result<(), String> {
     let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) else {
         return Ok(());
     };
@@ -536,7 +603,11 @@ pub async fn flag_session_skill_refresh(app: AppHandle, db: State<'_, Db>, sessi
 
 /// idle-time skill refresh (lead). Same as the worker variant, keyed by thread.
 #[tauri::command]
-pub async fn flag_lead_skill_refresh(app: AppHandle, db: State<'_, Db>, thread_id: i32) -> Result<(), String> {
+pub async fn flag_lead_skill_refresh(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+) -> Result<(), String> {
     let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) else {
         return Ok(());
     };
@@ -546,35 +617,6 @@ pub async fn flag_lead_skill_refresh(app: AppHandle, db: State<'_, Db>, thread_i
     }
     eng.lock().await.pending_skill_refresh = true;
     Ok(())
-}
-
-/// One-shot import of a legacy PTY-lead transcript (the tool's own jsonl,
-/// parsed by the sidecar) into lead_message rows. Best-effort: any failure
-/// leaves the timeline empty — history remains reachable in a terminal.
-async fn import_legacy(db: &Db, thread_id: i32) -> anyhow::Result<usize> {
-    let cwd = crate::paths::weft_home()?.join("leads").join(thread_id.to_string());
-    if !cwd.exists() {
-        return Ok(0);
-    }
-    let events = crate::sidecar::read_transcript(&cwd, "claude").await;
-    let mut n = 0usize;
-    for e in events {
-        match e {
-            crate::sidecar::NormEvent::Message { role, text, .. } => {
-                let content = serde_json::json!({ "text": text }).to_string();
-                repo::insert_lead_message(db, thread_id, None, 1, &role, "text", &content, "complete")
-                    .await?;
-                n += 1;
-            }
-            crate::sidecar::NormEvent::Tool { name, summary, .. } => {
-                let content = serde_json::json!({ "name": name, "summary": summary }).to_string();
-                repo::insert_lead_message(db, thread_id, None, 1, "assistant", "tool", &content, "complete")
-                    .await?;
-                n += 1;
-            }
-        }
-    }
-    Ok(n)
 }
 
 /// Frontend callback after a repo onboarding action card finishes (add /
@@ -600,7 +642,11 @@ pub async fn post_lead_tool_result(
             // no-engine. Acceptable now — action cards are visual + ephemeral
             // — revisit if "card click did nothing" debugging gets noisy.
             let mut inner = eng.lock().await;
-            let out = engine::Outgoing { text, images: vec![], tracked: false };
+            let out = engine::Outgoing {
+                text,
+                images: vec![],
+                tracked: false,
+            };
             if inner.turn.try_begin_send() {
                 inner.turn_id += 1;
                 inner.clock.begin_turn();

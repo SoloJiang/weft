@@ -80,7 +80,10 @@ pub async fn materialize_direction(
 pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Result<()> {
     use sea_orm::EntityTrait;
     for (repo_id, path, branch) in removed {
-        if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id).one(&db.0).await? {
+        if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id)
+            .one(&db.0)
+            .await?
+        {
             let repo_path = std::path::Path::new(&r.local_git_path);
             if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
                 eprintln!("[weft] worktree remove failed for {path}: {e}");
@@ -99,7 +102,13 @@ mod tests {
 
     #[test]
     fn worktree_path_is_namespaced_ws_thread_dir_repo() {
-        let p = worktree_path(Path::new("/home/wt"), "acme", "checkout-promo", "api", "billing");
+        let p = worktree_path(
+            Path::new("/home/wt"),
+            "acme",
+            "checkout-promo",
+            "api",
+            "billing",
+        );
         assert_eq!(p, Path::new("/home/wt/acme/checkout-promo/api/billing"));
     }
 

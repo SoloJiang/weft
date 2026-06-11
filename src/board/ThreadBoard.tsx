@@ -212,6 +212,7 @@ function DirectionCard({
     : direction.status === "review"
       ? { label: t("thread.viewChanges"), variant: "primary" as const, diff: true }
       : { label: t("thread.openSession"), variant: "default" as const, diff: false };
+  const canRunReview = direction.status === "review";
 
   return (
     <motion.div
@@ -221,41 +222,48 @@ function DirectionCard({
         hasNeed ? "border-waiting/45" : "border-border",
       )}
     >
-      <div className="flex items-start gap-2 px-3 py-2.5">
-        <span title={toolFullName(direction.tool)} className="mt-0.5 shrink-0">
-          <ToolIcon tool={direction.tool} size={15} />
+      <div className="flex items-start gap-2.5 px-3 pb-2.5 pt-3">
+        <span
+          title={toolFullName(direction.tool)}
+          className="grid h-6 w-6 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-border bg-bg text-ink-muted"
+        >
+          <ToolIcon tool={direction.tool} size={14} />
         </span>
-        <div className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-snug text-ink">
-          {direction.name}
-        </div>
-        <div className="ml-auto flex shrink-0 items-center gap-1.5">
-          {hasNeed && (
-            <button
-              type="button"
-              title={t("needs.title")}
-              onClick={() => openNeeds()}
-              className="rounded-full bg-waiting/15 px-1.5 py-0.5 text-[10.5px] font-medium text-waiting transition-colors hover:bg-waiting/25"
-            >
-              {t("thread.colNeeds")}
-            </button>
-          )}
-          <button
-            type="button"
-            title={t("thread.renameTask")}
-            aria-label={t("thread.renameTask")}
-            onClick={() => onRename(direction.id)}
-            className="grid h-6 w-6 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-faint opacity-0 transition-opacity hover:bg-brand-ghost hover:text-ink group-hover:opacity-100"
-          >
-            <Pencil size={12} />
-          </button>
-          <StatusMenu direction={direction} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-start gap-2">
+            <div className="min-w-0 flex-1 break-words text-[13px] font-semibold leading-snug text-ink">
+              {direction.name}
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              {hasNeed && (
+                <button
+                  type="button"
+                  title={t("needs.title")}
+                  onClick={() => openNeeds()}
+                  className="rounded-full bg-waiting/15 px-1.5 py-0.5 text-[10.5px] font-medium text-waiting transition-colors hover:bg-waiting/25"
+                >
+                  {t("thread.colNeeds")}
+                </button>
+              )}
+              <button
+                type="button"
+                title={t("thread.renameTask")}
+                aria-label={t("thread.renameTask")}
+                onClick={() => onRename(direction.id)}
+                className="grid h-6 w-6 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-faint opacity-0 transition-opacity hover:bg-brand-ghost hover:text-ink group-hover:opacity-100"
+              >
+                <Pencil size={12} />
+              </button>
+              <StatusMenu direction={direction} />
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* The write copies — the card's working entry points. Tool lives in the
-          header icon; status is the column + the StatusMenu dot. */}
+      {/* The write copies are the card's working entry points. Keep them
+          quiet so status and review state remain the strongest signals. */}
       {writes.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
+        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2 pl-11">
           {writes.map((w) => {
             const repo = repos.find((r) => r.id === w.repo_id);
             const sess = Object.values(sessions).find(
@@ -265,9 +273,9 @@ function DirectionCard({
               <button
                 key={w.id}
                 onClick={() => viewDirection(direction.id, w.repo_id)}
-                className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-accent/30 bg-accent-ghost px-2 py-0.5 text-[11px] text-accent transition-colors hover:border-accent/60"
+                className="inline-flex h-6 max-w-full items-center gap-1.5 rounded-[var(--radius-sm)] border border-border bg-bg px-2 text-[11px] text-ink-muted transition-colors hover:border-brand/45 hover:bg-brand-ghost hover:text-ink"
               >
-                <TerminalSquare size={11} className="shrink-0" />
+                <TerminalSquare size={11} className="shrink-0 text-brand" />
                 <span className="truncate font-mono">{repo?.name ?? `repo ${w.repo_id}`}</span>
                 {sess && <StatusDot status={sess.status as SessionStatus} />}
               </button>
@@ -277,34 +285,40 @@ function DirectionCard({
       )}
 
       {/* One honest trust signal (the real checks) + provenance, then actions. */}
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-border px-3 py-2">
-        <TrustSignal
-          kind={testsKind}
-          label={
-            allChecks.length > 0
-              ? t("thread.testsProgress", { passed, count: allChecks.length })
-              : t("thread.testsPending")
-          }
-        />
-        <ProvenanceMenu writes={writes} checks={checks} />
-        <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1.5">
-          <button
-            onClick={() => {
-              setReviewSent(true);
-              window.setTimeout(() => setReviewSent(false), 2500);
-              void requestSkillReview(direction.id);
-            }}
-            disabled={writes.length === 0}
-            title={t("thread.reviewTip")}
-            className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] px-1.5 py-1 text-[11px] text-ink-muted outline-none transition-colors hover:bg-brand-ghost hover:text-ink disabled:opacity-40"
-          >
-            {reviewSent ? (
-              <Check size={12} className="text-running" />
-            ) : (
-              <ScanEye size={12} className="text-brand" />
-            )}
-            {reviewSent ? t("thread.reviewSent") : t("thread.review")}
-          </button>
+      <div className="flex items-center justify-between gap-2 border-t border-border bg-bg/55 px-3 py-2">
+        <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
+          <TrustSignal
+            kind={testsKind}
+            label={
+              allChecks.length > 0
+                ? t("thread.testsProgress", { passed, count: allChecks.length })
+                : t("thread.testsPending")
+            }
+          />
+          <ProvenanceMenu writes={writes} checks={checks} />
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {canRunReview && (
+            <Tooltip label={reviewSent ? t("thread.reviewSent") : t("thread.reviewTip")}>
+              <button
+                type="button"
+                onClick={() => {
+                  setReviewSent(true);
+                  window.setTimeout(() => setReviewSent(false), 2500);
+                  void requestSkillReview(direction.id);
+                }}
+                disabled={writes.length === 0}
+                aria-label={t("thread.review")}
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-muted outline-none transition-colors hover:bg-brand-ghost hover:text-ink disabled:opacity-40"
+              >
+                {reviewSent ? (
+                  <Check size={13} className="text-running" />
+                ) : (
+                  <ScanEye size={13} className="text-brand" />
+                )}
+              </button>
+            </Tooltip>
+          )}
           <Button
             size="sm"
             variant={action.variant}

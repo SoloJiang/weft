@@ -3,51 +3,53 @@
 
 ### Local-first delivery hub for coding agents
 
-Give Weft one task, let a lead agent split it into scoped sub-tasks, then drive
-Claude Code, Codex, or OpenCode workers in isolated git worktrees until there is
-a reviewable diff.
+Give Weft a feature, bugfix, or refactor. A lead agent turns it into scoped
+worker lanes, Weft materializes each approved lane as an isolated `git worktree`,
+and Claude Code, Codex, or OpenCode drive the work until there is a diff you can
+review.
 
-<sub>Tauri v2 · React 19 · Rust · SQLite · headless agent sessions</sub>
+<sub>Tauri v2 · React 19 · Rust · SQLite · native coding-agent CLIs</sub>
 
 [中文说明](README.zh-CN.md)
 </div>
 
----
-
 <p align="center">
-  <img src="assets/screenshots/board-workspace.png" alt="Weft workspace board" width="920" />
-  <br><sub><i>The workspace board shows active issues, their sub-tasks, live agent state, checks, and asks.</i></sub>
+  <img src="assets/readme/weft-overview.png" alt="Weft overview: repositories feed a lead workspace, scoped workers produce checked review diffs" width="940" />
 </p>
 
-## What Weft Is
+## Why Weft
 
-Weft is a desktop app for running agent work across local repositories. It keeps
-your source on your machine, uses native CLIs rather than a remote runtime, and
-materializes each approved sub-task into its own `git worktree`.
+Coding agents are strongest when they get tight scope, real repository context,
+and a clear handoff back to a human. Weft keeps that loop local:
 
-The product model is:
+- Your source stays on your machine.
+- Workers run through the native CLIs you already use and authenticate.
+- Every worker gets an explicit write repository and its own worktree.
+- The product UI shows the plan, live sessions, permission asks, diffs, and
+  pre-PR checks without embedding a terminal as the main experience.
 
-- **Workspace**: a logical set of repositories plus profiles, rules, and tools.
-- **Issue**: a user-facing work line for a feature, bugfix, refactor, or spike.
+The core product model is small:
+
+- **Workspace**: a logical set of repositories, profiles, rules, and tools.
+- **Issue**: one user-facing work line for a feature, bugfix, refactor, or spike.
 - **Sub-task**: one scoped worker lane, currently with one write repository.
-- **Session**: one native agent session attached to a worktree.
+- **Session**: one native agent run attached to a worktree.
 
-The internal store uses `thread` for the Issue layer and `direction` for the
-Sub-task layer. User-facing docs and UI call them **Issue** and **Sub-task**.
+Internally the store still uses `thread` for Issues and `direction` for
+Sub-tasks. User-facing docs and UI use **Issue** and **Sub-task**.
 
-## How It Works
+## Workflow
 
 <p align="center">
   <img src="assets/diagrams/flow-en.svg" alt="Task to scoped sub-tasks to verified worktree diffs" width="940" />
 </p>
 
-1. Add or create repositories in a workspace — or just open the lead and let it
-   render an action card to add / clone / create one when no repos exist yet.
-2. Start an issue and discuss the task with the lead agent.
+1. Add, clone, or create repositories in a workspace.
+2. Start an issue and discuss the goal with the lead agent.
 3. The lead proposes sub-tasks with write scope, tool choice, reason, and mandate.
 4. You approve the write declarations that should become worktrees.
-5. Workers run in headless Claude/Codex/OpenCode sessions and stream into Weft's own chat UI.
-6. Observe activity, inspect diffs, answer permission asks (in the app or via IM), and run pre-PR checks.
+5. Workers run in headless Claude/Codex/OpenCode sessions and stream into Weft.
+6. You observe progress, answer asks, inspect diffs, and run checks before PR.
 
 ## Product Surfaces
 
@@ -66,9 +68,9 @@ Sub-task layer. User-facing docs and UI call them **Issue** and **Sub-task**.
 </p>
 
 The Rust backend owns the local SQLite store, git worktree lifecycle, headless
-agent processes, Ask Bridge, local MCP bus, and sidecar observation. The React
-frontend renders boards, chat timelines, observe/diff views, settings, and the
-Needs-you queue.
+agent processes, Ask Bridge, local MCP bus, IM bridge, skill sources, and sidecar
+observation. The React frontend renders the workspace board, issue board, lead
+conversation, worker sessions, observe/diff views, settings, and Needs-you queue.
 
 <p align="center">
   <img src="assets/diagrams/model-en.svg" alt="Workspace, issue, sub-task, session model" width="860" />
@@ -77,62 +79,41 @@ Needs-you queue.
 ## IM Remote Control
 
 <p align="center">
-  <img src="assets/diagrams/im-en.svg" alt="IM remote control — Feishu cards mirror permission asks and agent questions" width="940" />
+  <img src="assets/diagrams/im-en.svg" alt="IM remote control: Feishu cards mirror permission asks and agent questions" width="940" />
 </p>
 
-Permission asks and agent questions raised by workers mirror to a long-lived
-Feishu websocket as interactive cards. Replying to a card answers it through the
-same function the desktop UI uses — both surfaces stay in sync (the card patches
-to its resolved state regardless of where you answered). First p2p sender
-auto-binds as owner; group messages can never trigger binding; DB errors are
-fail-closed.
+Workers can mirror permission asks and agent questions to Feishu/Lark as
+interactive cards. Replying on mobile resolves the same underlying ask the
+desktop UI would resolve, and both surfaces patch to the same final state.
 
-Beyond cards, the bridge carries three surfaces end-to-end:
+The bridge currently covers:
 
-- **Issue threads.** Bind an issue (`thread_id`) to a Feishu thread via the
-  desktop's Settings → IM → Routes panel. Group messages in that thread are
-  routed into the issue's lead engine and the lead's replies post back to the
-  same thread (with a 👀 reaction held until the lead actually responds, so the
-  IM side sees real backpressure instead of silence).
-- **Concierge (single-chat).** Any free-text DM to the bot is routed into a
-  Concierge lead engine that has the `weft_global` MCP server attached
-  (`list_workspaces / list_issues / pending_needs_you / issue_status /
-  answer_permission / answer_question / message_lead / create_issue`). The
-  Concierge verifies state with tools before answering and only acts on the
-  human's behalf when they explicitly consent (irreversible decisions stay
-  on the desktop).
-- **Online resync.** Each time the bridge transitions to *online* (initial
-  start or after a settings/credential bump), it sends the owner a one-shot
-  summary of every pending Needs-you so nothing silently piles up while you
-  were away. Reconnect-within-the-same-generation does not re-fire.
+- Permission asks and agent questions.
+- Issue-to-Feishu thread routes for lead messages; bind a topic by sending
+  `/bind <issue-id>` from that Feishu topic.
+- Concierge-style direct chat backed by the `weft_global` MCP tools.
+- Online resync summaries for pending Needs-you items.
+
+Binding is conservative: the first private-chat sender can become owner, group
+messages cannot bind ownership, and DB errors fail closed.
 
 ## Current Capabilities
 
-- Local-first Tauri desktop app; no hosted service or account model.
 - Workspace repo add/clone/create flows with deterministic repo profiles.
 - Claude lead sessions with planner MCP and write-scope review.
-- Lead-driven onboarding: the system prompt carries a live `<repo_state>` snapshot,
-  and the lead can render in-chat action cards (`<weft:action_card>`) to add,
-  clone, or create a repo without leaving the conversation.
+- Lead action cards for adding, cloning, or creating repos from the conversation.
 - Worker sessions for Claude Code, Codex, and OpenCode.
-- Weft-owned chat timeline with queueing, interrupt, resume, slash commands, and attachment handling.
-- Ask Bridge for tool permission requests with Allow, Always, Full, and Deny.
-- IM bridge (Feishu): mirror permission asks and agent questions to a long-lived
-  Lark websocket as interactive cards; reply on mobile to resolve them. First
-  private-chat sender auto-binds; settings live in `app_setting` and the bridge
-  is fail-closed. Issue ↔ Feishu thread binding (lead messages flow both ways),
-  a Concierge single-chat helper backed by the `weft_global` MCP, and a one-shot
-  resync summary on every (re)online transition.
-- Skill source manager: register git-backed skill repos, sync on demand, and
-  toggle individual skills on globally or per-workspace.
+- Weft-owned chat timeline with queueing, interrupt, resume, slash commands, and attachments.
+- Ask Bridge for tool permission requests: Allow, Always, Full, and Deny.
+- Skill source manager with git-backed sync and global/workspace enablement.
 - Sidecar observation for Claude jsonl, Codex rollout jsonl, and OpenCode SQLite.
-- Diff and pre-PR check surfaces from the materialized worktree.
-- Rename / cascade-delete for workspaces, issues, and sub-tasks (display-only;
-  slugs and branches stay stable).
-- Workspace and issue boards, Needs-you queue, settings, inspect views, and English/Chinese UI.
+- Diff and pre-PR check surfaces from materialized worktrees.
+- Rename and cascade-delete for workspaces, issues, and sub-tasks.
+- English and Chinese UI.
 
 Not yet productized: automatic PR creation, protected-branch merge orchestration,
-CI/CD observation, team marketplace sync, and the long-running semantic Curator.
+CI/CD observation, deployment orchestration, team marketplace sync, and the
+long-running semantic Curator.
 
 ## Development
 
@@ -152,14 +133,14 @@ git diff --check
 src/
   board/                workspace and issue boards
   session/              chat, observe, diff, permissions
-    blocks/             chat-timeline rich blocks (e.g. ActionCardBlock)
-    useRepoActions.ts   add / clone / create repo from a lead action card
+    blocks/             chat-timeline rich blocks
+    useRepoActions.ts   add / clone / create repo from lead action cards
   components/           shared React UI
   i18n/                 English and Chinese strings
 src-tauri/src/
   lead_chat/            headless agent session engine
     sentinels.rs        parse <weft:action_card> / <weft:list_repos/> markers
-    repo_state.rs       <repo_state> snapshot injected into the lead's prompt
+    repo_state.rs       <repo_state> snapshot injected into the lead prompt
   im/                   IM bridge (Channel trait + Feishu adapter, ws + cards)
   store/                SQLite/SeaORM entities and migrations
   bus/                  local MCP/thread bus + human-ask notifier
@@ -169,6 +150,7 @@ src-tauri/src/
 assets/
   screenshots/          README screenshots
   diagrams/             architecture and model diagrams
+  readme/               generated README overview art
 ```
 
 ## Design Constraints

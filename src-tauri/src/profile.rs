@@ -89,8 +89,23 @@ fn infer_node(f: &mut RepoFacts, dir: &Path, raw: &str) {
     f.role = node_role(&json, &f.deps);
 }
 
-const FRONTEND: &[&str] = &["react", "vue", "svelte", "next", "@angular/core", "solid-js", "vite"];
-const BACKEND: &[&str] = &["express", "fastify", "koa", "@nestjs/core", "hono", "@hapi/hapi"];
+const FRONTEND: &[&str] = &[
+    "react",
+    "vue",
+    "svelte",
+    "next",
+    "@angular/core",
+    "solid-js",
+    "vite",
+];
+const BACKEND: &[&str] = &[
+    "express",
+    "fastify",
+    "koa",
+    "@nestjs/core",
+    "hono",
+    "@hapi/hapi",
+];
 
 fn node_role(json: &serde_json::Value, deps: &[String]) -> String {
     let has = |set: &[&str]| deps.iter().any(|d| set.contains(&d.as_str()));
@@ -113,7 +128,9 @@ fn node_role(json: &serde_json::Value, deps: &[String]) -> String {
 
 fn infer_rust(f: &mut RepoFacts, dir: &Path, raw: &str) {
     f.stack.push("rust".into());
-    let doc: toml::Value = raw.parse().unwrap_or(toml::Value::Table(Default::default()));
+    let doc: toml::Value = raw
+        .parse()
+        .unwrap_or(toml::Value::Table(Default::default()));
     if let Some(pkg) = doc.get("package") {
         if let Some(name) = pkg.get("name").and_then(|v| v.as_str()) {
             f.published.push(name.to_string());
@@ -130,7 +147,11 @@ fn infer_rust(f: &mut RepoFacts, dir: &Path, raw: &str) {
     // A crate with a binary target is a runnable service/app; otherwise treat it
     // as a library (the common default for a bare or lib-only crate).
     let has_bin = exists(dir, "src/main.rs") || doc.get("bin").is_some();
-    f.role = if has_bin { "service".into() } else { "library".into() };
+    f.role = if has_bin {
+        "service".into()
+    } else {
+        "library".into()
+    };
 }
 
 fn infer_go(f: &mut RepoFacts, dir: &Path, raw: &str) {
@@ -285,7 +306,10 @@ mod tests {
     #[test]
     fn rust_binary_is_service() {
         let dir = tmp_repo(&[
-            ("Cargo.toml", "[package]\nname = \"api\"\n\n[dependencies]\naxum = \"0.7\"\n"),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"api\"\n\n[dependencies]\naxum = \"0.7\"\n",
+            ),
             ("src/main.rs", "fn main() {}"),
         ]);
         let f = super::infer_repo_facts(&dir);
@@ -311,7 +335,10 @@ mod tests {
     fn readme_summary_when_manifest_has_none() {
         let dir = tmp_repo(&[
             ("Cargo.toml", "[package]\nname = \"thing\"\n"),
-            ("README.md", "# Thing\n\nA small utility for parsing logs.\n"),
+            (
+                "README.md",
+                "# Thing\n\nA small utility for parsing logs.\n",
+            ),
         ]);
         let f = super::infer_repo_facts(&dir);
         assert_eq!(f.summary, "A small utility for parsing logs.");

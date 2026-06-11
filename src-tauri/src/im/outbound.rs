@@ -1,16 +1,20 @@
 //! 出站渲染：语义通知 → 飞书卡片 JSON（卡片 1.0 schema）。纯函数。
 //! 文案按 lang 双语内联（与 lead_chat lang_directive 同模式——后端无 i18n 框架）。
-//! M1 此层直接产飞书卡片 JSON（Channel 以 Value 传卡）；第二通道引入时
+//! 当前此层直接产飞书卡片 JSON（Channel 以 Value 传卡）；第二通道引入时
 //! 渲染下沉到适配器。
 
 use serde_json::{json, Value};
 
-/// 卡片按钮开关：Task 2 spike 结论 A 时翻 true。基线 = 回复消息作答，
+/// 卡片按钮开关：基线 = 回复消息作答，
 /// 按钮只是增强（飞书长连接官方仅保证事件订阅，spec §1）。
 pub const CARD_BUTTONS: bool = false;
 
 fn t(lang: &str, zh: &'static str, en: &'static str) -> &'static str {
-    if lang == "zh" { zh } else { en }
+    if lang == "zh" {
+        zh
+    } else {
+        en
+    }
 }
 
 /// 按字符截断（CJK 安全：字节切片落在多字节字符中间会 panic，生产路径
@@ -31,7 +35,11 @@ pub fn perm_card(ask: &crate::ask::Ask, lang: &str) -> Value {
     let title = format!(
         "{} · {}",
         t(lang, "权限请求", "Permission ask"),
-        if ask.thread_title.is_empty() { "weft" } else { &ask.thread_title }
+        if ask.thread_title.is_empty() {
+            "weft"
+        } else {
+            &ask.thread_title
+        }
     );
     let who = if ask.dir_name.is_empty() {
         ask.tool.clone()
@@ -50,10 +58,12 @@ pub fn perm_card(ask: &crate::ask::Ask, lang: &str) -> Value {
             "Reply to this message to answer: **allow** / **deny** / **always** / **full** (or 1/2/3/4)")}}),
     ];
     if CARD_BUTTONS {
-        let btn = |label: &str, answer: &str, style: &str| json!({
-            "tag": "button", "text": {"tag": "plain_text", "content": label}, "type": style,
-            "value": {"kind": "perm", "ask_id": ask.id, "answer": answer}
-        });
+        let btn = |label: &str, answer: &str, style: &str| {
+            json!({
+                "tag": "button", "text": {"tag": "plain_text", "content": label}, "type": style,
+                "value": {"kind": "perm", "ask_id": ask.id, "answer": answer}
+            })
+        };
         elements.push(json!({"tag": "action", "actions": [
             btn(t(lang, "允许", "Allow"), "allow", "primary"),
             btn(t(lang, "总是", "Always"), "always", "default"),
@@ -77,7 +87,10 @@ pub fn resolved_card(summary: &str, verdict: &str, lang: &str) -> Value {
         "always" => (t(lang, "已允许（总是）✓", "Always-allowed ✓"), "green"),
         "full" => (t(lang, "已放行（任务全权）✓", "Full access ✓"), "green"),
         "deny" => (t(lang, "已拒绝 ✕", "Denied ✕"), "red"),
-        "cancelled" => (t(lang, "已过期（回落工具自答）", "Expired (tool fallback)"), "grey"),
+        "cancelled" => (
+            t(lang, "已过期（回落工具自答）", "Expired (tool fallback)"),
+            "grey",
+        ),
         _ => (t(lang, "已处理", "Resolved"), "grey"),
     };
     let body = if summary.is_empty() {
@@ -96,7 +109,11 @@ pub fn resolved_card(summary: &str, verdict: &str, lang: &str) -> Value {
 
 /// agent 提问（ask_human）卡：回复本条消息即作答。
 pub fn human_card(thread_title: &str, from: &str, text: &str, lang: &str) -> Value {
-    let title = format!("{} · {}", t(lang, "agent 提问", "Agent question"), thread_title);
+    let title = format!(
+        "{} · {}",
+        t(lang, "agent 提问", "Agent question"),
+        thread_title
+    );
     json!({
         "config": {"wide_screen_mode": true},
         "header": {"template": "blue", "title": {"tag": "plain_text", "content": title}},
@@ -144,8 +161,12 @@ pub fn resync_summary(lang: &str, items: &[(i32, String)]) -> String {
         return String::new();
     }
     let head = if items.len() == 1 {
-        t(lang, "Weft 桥已上线，当前 1 项待你处理：", "Weft bridge online — 1 ask waiting:")
-            .to_string()
+        t(
+            lang,
+            "Weft 桥已上线，当前 1 项待你处理：",
+            "Weft bridge online — 1 ask waiting:",
+        )
+        .to_string()
     } else {
         let tmpl = t(
             lang,
@@ -178,9 +199,15 @@ mod tests {
 
     fn ask() -> crate::ask::Ask {
         crate::ask::Ask {
-            id: 42, thread: 1, dir: "10".into(), tool: "claude".into(),
-            summary: "Run: npm test".into(), detail: "npm test".into(), ts: 0,
-            thread_title: "登录超时修复".into(), dir_name: "backend".into(),
+            id: 42,
+            thread: 1,
+            dir: "10".into(),
+            tool: "claude".into(),
+            summary: "Run: npm test".into(),
+            detail: "npm test".into(),
+            ts: 0,
+            thread_title: "登录超时修复".into(),
+            dir_name: "backend".into(),
         }
     }
 
@@ -212,7 +239,10 @@ mod tests {
         a.detail = "**bold** ~~x~~ <a href='e'>y</a>".into();
         let c = perm_card(&a, "zh");
         assert_eq!(c["elements"][1]["text"]["tag"], "plain_text");
-        assert_eq!(c["elements"][1]["text"]["content"], "**bold** ~~x~~ <a href='e'>y</a>");
+        assert_eq!(
+            c["elements"][1]["text"]["content"],
+            "**bold** ~~x~~ <a href='e'>y</a>"
+        );
     }
 
     #[test]
@@ -246,9 +276,15 @@ mod tests {
     #[test]
     fn resolved_card_verdict_labels_zh_en() {
         use crate::ask::Answer;
-        assert!(resolved_card("x", Answer::Deny.as_str(), "zh").to_string().contains("已拒绝 ✕"));
-        assert!(resolved_card("x", Answer::Full.as_str(), "en").to_string().contains("Full access ✓"));
-        assert!(resolved_card("x", "???", "zh").to_string().contains("已处理"));
+        assert!(resolved_card("x", Answer::Deny.as_str(), "zh")
+            .to_string()
+            .contains("已拒绝 ✕"));
+        assert!(resolved_card("x", Answer::Full.as_str(), "en")
+            .to_string()
+            .contains("Full access ✓"));
+        assert!(resolved_card("x", "???", "zh")
+            .to_string()
+            .contains("已处理"));
     }
 
     #[test]
@@ -284,7 +320,9 @@ mod tests {
         let s = issue_reply_text("zh", &"汉".repeat(10_000));
         assert!(s.starts_with("Lead："));
         assert!(s.ends_with("…(truncated)"));
-        assert!(s.chars().count() <= "Lead：".chars().count() + 9000 + "…(truncated)".chars().count());
+        assert!(
+            s.chars().count() <= "Lead：".chars().count() + 9000 + "…(truncated)".chars().count()
+        );
     }
 
     #[test]
@@ -300,10 +338,7 @@ mod tests {
         assert!(one.contains("#7"));
         assert!(one.contains("Run: npm test"));
 
-        let many = resync_summary(
-            "en",
-            &[(1, "a".into()), (2, "b".into())],
-        );
+        let many = resync_summary("en", &[(1, "a".into()), (2, "b".into())]);
         assert!(many.contains("2 asks"));
         assert!(many.contains("#1") && many.contains("#2"));
         assert!(many.contains("Reply to the matching card"));

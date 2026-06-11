@@ -6,32 +6,32 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
-pub mod paths;
-pub mod slug;
-pub mod store;
-pub mod git;
-pub mod materialize;
 pub mod ask;
 mod brief;
 pub mod bus;
 mod check;
 mod claude;
 mod codex;
+pub mod commands;
 pub mod config;
-pub mod skills;
 mod coordinator;
 mod curator;
 mod detect;
 mod gc;
+pub mod git;
+pub mod im;
 mod inspect;
 pub mod lead_chat;
-pub mod im;
+pub mod materialize;
+pub mod paths;
 mod planner;
 mod power;
 pub mod profile;
 mod sidecar;
+pub mod skills;
+pub mod slug;
+pub mod store;
 mod tools;
-pub mod commands;
 
 /// The bus server's base URL, e.g. "http://127.0.0.1:54321".
 pub struct BusBase(pub String);
@@ -75,7 +75,9 @@ pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init());
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build());
 
     #[cfg(debug_assertions)]
     {
@@ -177,6 +179,7 @@ pub fn run() {
             commands::workspace_skills,
             commands::im_get_settings,
             commands::im_set_settings,
+            commands::im_set_enabled,
             commands::im_status,
             commands::im_bind_thread,
             commands::im_unbind_thread,

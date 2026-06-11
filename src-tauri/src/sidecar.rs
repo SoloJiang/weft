@@ -17,9 +17,17 @@ use std::time::SystemTime;
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum NormEvent {
     /// A conversation turn (human or agent prose).
-    Message { role: String, text: String, ts: String },
+    Message {
+        role: String,
+        text: String,
+        ts: String,
+    },
     /// An agent tool call, summarized to one line.
-    Tool { name: String, summary: String, ts: String },
+    Tool {
+        name: String,
+        summary: String,
+        ts: String,
+    },
 }
 
 /// Read the full normalized transcript for a session's cwd. Best-effort: an
@@ -123,7 +131,11 @@ fn parse_claude_line(v: &serde_json::Value, out: &mut Vec<NormEvent>) {
     if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
         return;
     }
-    let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let ts = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
     let msg = v.get("message");
     let role = msg
         .and_then(|m| m.get("role"))
@@ -212,7 +224,10 @@ fn read_codex(cwd: &Path) -> Option<Vec<NormEvent>> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let mcwd = meta.pointer("/payload/cwd").and_then(|c| c.as_str()).unwrap_or("");
+        let mcwd = meta
+            .pointer("/payload/cwd")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
         if mcwd != raw && Some(mcwd.to_string()) != canon {
             continue;
         }
@@ -253,11 +268,19 @@ fn parse_codex_line(v: &serde_json::Value, out: &mut Vec<NormEvent>) {
     if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
         return; // session_meta / event_msg (UI mirror) — skip
     }
-    let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let ts = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
     let Some(p) = v.get("payload") else { return };
     match p.get("type").and_then(|t| t.as_str()) {
         Some("message") => {
-            let role = p.get("role").and_then(|r| r.as_str()).unwrap_or("assistant").to_string();
+            let role = p
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("assistant")
+                .to_string();
             let mut text = String::new();
             if let Some(arr) = p.get("content").and_then(|c| c.as_array()) {
                 for b in arr {
@@ -268,7 +291,11 @@ fn parse_codex_line(v: &serde_json::Value, out: &mut Vec<NormEvent>) {
             }
             let text = text.trim();
             if !text.is_empty() && !(role == "user" && is_seed(text)) {
-                out.push(NormEvent::Message { role, text: text.to_string(), ts });
+                out.push(NormEvent::Message {
+                    role,
+                    text: text.to_string(),
+                    ts,
+                });
             }
         }
         Some("function_call") => {
@@ -288,7 +315,11 @@ fn parse_codex_line(v: &serde_json::Value, out: &mut Vec<NormEvent>) {
 fn parse_opencode_part(role: &str, data: &serde_json::Value, out: &mut Vec<NormEvent>) {
     match data.get("type").and_then(|t| t.as_str()) {
         Some("text") => {
-            let text = data.get("text").and_then(|t| t.as_str()).unwrap_or("").trim();
+            let text = data
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .trim();
             if !text.is_empty() && !(role == "user" && is_seed(text)) {
                 out.push(NormEvent::Message {
                     role: role.to_string(),
@@ -312,8 +343,7 @@ fn parse_opencode_part(role: &str, data: &serde_json::Value, out: &mut Vec<NormE
 async fn read_opencode(cwd: &Path) -> Option<Vec<NormEvent>> {
     use std::collections::HashMap;
     let home = std::env::var("HOME").ok()?;
-    let db = PathBuf::from(home)
-        .join(".local/share/opencode/opencode.db");
+    let db = PathBuf::from(home).join(".local/share/opencode/opencode.db");
     if !db.exists() {
         return None;
     }
@@ -411,9 +441,21 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                NormEvent::Message { role: "user".into(), text: "add a discount field".into(), ts: "t1".into() },
-                NormEvent::Tool { name: "Bash".into(), summary: "ls -la /very/long/path/that/keeps/going".into(), ts: "t2".into() },
-                NormEvent::Message { role: "assistant".into(), text: "On it.".into(), ts: "t2".into() },
+                NormEvent::Message {
+                    role: "user".into(),
+                    text: "add a discount field".into(),
+                    ts: "t1".into()
+                },
+                NormEvent::Tool {
+                    name: "Bash".into(),
+                    summary: "ls -la /very/long/path/that/keeps/going".into(),
+                    ts: "t2".into()
+                },
+                NormEvent::Message {
+                    role: "assistant".into(),
+                    text: "On it.".into(),
+                    ts: "t2".into()
+                },
             ]
         );
     }
@@ -451,8 +493,16 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                NormEvent::Message { role: "user".into(), text: "add a field".into(), ts: "t1".into() },
-                NormEvent::Tool { name: "exec_command".into(), summary: "git status".into(), ts: "t2".into() },
+                NormEvent::Message {
+                    role: "user".into(),
+                    text: "add a field".into(),
+                    ts: "t1".into()
+                },
+                NormEvent::Tool {
+                    name: "exec_command".into(),
+                    summary: "git status".into(),
+                    ts: "t2".into()
+                },
             ]
         );
     }
@@ -479,8 +529,16 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                NormEvent::Message { role: "user".into(), text: "build the gift-card field".into(), ts: String::new() },
-                NormEvent::Tool { name: "bash".into(), summary: "npm test".into(), ts: String::new() },
+                NormEvent::Message {
+                    role: "user".into(),
+                    text: "build the gift-card field".into(),
+                    ts: String::new()
+                },
+                NormEvent::Tool {
+                    name: "bash".into(),
+                    summary: "npm test".into(),
+                    ts: String::new()
+                },
             ]
         );
     }
@@ -489,7 +547,10 @@ mod tests {
     fn cleans_mcp_tool_prefixes() {
         assert_eq!(clean_tool_name("mcp__weft_bus__bus_post"), "bus_post");
         assert_eq!(clean_tool_name("weft_bus_bus_post"), "bus_post");
-        assert_eq!(clean_tool_name("weft_planner_propose_directions"), "propose_directions");
+        assert_eq!(
+            clean_tool_name("weft_planner_propose_directions"),
+            "propose_directions"
+        );
         assert_eq!(clean_tool_name("Bash"), "Bash");
         assert_eq!(clean_tool_name("exec_command"), "exec_command");
     }
@@ -497,7 +558,10 @@ mod tests {
     #[test]
     fn skips_system_and_sidechain() {
         let mut out = Vec::new();
-        parse_claude_line(&serde_json::json!({"type":"summary","summary":"x"}), &mut out);
+        parse_claude_line(
+            &serde_json::json!({"type":"summary","summary":"x"}),
+            &mut out,
+        );
         parse_claude_line(
             &serde_json::json!({"type":"assistant","isSidechain":true,
                 "message":{"role":"assistant","content":[{"type":"text","text":"sub"}]}}),

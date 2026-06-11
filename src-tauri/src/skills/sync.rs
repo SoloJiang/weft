@@ -11,9 +11,16 @@ fn run(dir: Option<&Path>, args: &[&str]) -> Result<()> {
     if let Some(d) = dir {
         cmd.current_dir(d);
     }
-    let out = cmd.args(args).output().map_err(|e| anyhow!("git spawn: {e}"))?;
+    let out = cmd
+        .args(args)
+        .output()
+        .map_err(|e| anyhow!("git spawn: {e}"))?;
     if !out.status.success() {
-        return Err(anyhow!("git {:?}: {}", args, String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(anyhow!(
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(())
 }
@@ -56,8 +63,16 @@ mod tests {
     use std::process::Command;
 
     fn sh(dir: &std::path::Path, args: &[&str]) {
-        assert!(Command::new(args[0]).args(&args[1..]).current_dir(dir).status().unwrap().success(),
-            "cmd {:?}", args);
+        assert!(
+            Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success(),
+            "cmd {:?}",
+            args
+        );
     }
 
     #[test]
@@ -71,7 +86,11 @@ mod tests {
         sh(&origin, &["git", "config", "user.email", "t@t.t"]);
         sh(&origin, &["git", "config", "user.name", "t"]);
         std::fs::create_dir_all(origin.join("skills/deploy")).unwrap();
-        std::fs::write(origin.join("skills/deploy/SKILL.md"), "---\nname: deploy\n---\n").unwrap();
+        std::fs::write(
+            origin.join("skills/deploy/SKILL.md"),
+            "---\nname: deploy\n---\n",
+        )
+        .unwrap();
         sh(&origin, &["git", "add", "-A"]);
         sh(&origin, &["git", "commit", "-q", "-m", "init"]);
 
@@ -80,7 +99,11 @@ mod tests {
         sync_to(&url, "", &cache).unwrap();
         assert!(cache.join("skills/deploy/SKILL.md").exists());
         // add a second commit upstream, re-sync pulls it
-        std::fs::write(origin.join("skills/deploy/SKILL.md"), "---\nname: deploy\ndescription: v2\n---\n").unwrap();
+        std::fs::write(
+            origin.join("skills/deploy/SKILL.md"),
+            "---\nname: deploy\ndescription: v2\n---\n",
+        )
+        .unwrap();
         sh(&origin, &["git", "add", "-A"]);
         sh(&origin, &["git", "commit", "-q", "-m", "v2"]);
         sync_to(&url, "", &cache).unwrap();

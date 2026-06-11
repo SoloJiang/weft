@@ -1,5 +1,6 @@
 import {
   ArrowLeft,
+  Download,
   FolderPlus,
   Languages,
   LayoutGrid,
@@ -8,6 +9,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Sun,
+  X,
 } from "lucide-react";
 import { useState } from "react";
 import { motion } from "motion/react";
@@ -45,6 +47,9 @@ export function AppTopBar() {
     setThreadTab,
     backToBoard,
     closeObserve,
+    updateAvailable,
+    installUpdate,
+    dismissUpdate,
   } = useStore();
   const { t } = useTranslation();
   const { theme, toggle } = useTheme();
@@ -92,16 +97,44 @@ export function AppTopBar() {
     { key: "board" as const, label: t("thread.tabBoard"), icon: LayoutGrid, dot: null as string | null },
   ];
   return (
-    <header className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border bg-bg px-3">
-      <button
-        type="button"
-        onClick={() => setNavCollapsed(!navCollapsed)}
-        aria-label={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
-        title={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
-        className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-      >
-        {navCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-      </button>
+    <>
+      {updateAvailable && (
+        <motion.div
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex shrink-0 items-center gap-2 border-b border-border-strong bg-brand px-3 py-1.5 text-[12px] text-brand-ink"
+        >
+          <span className="mr-auto">
+            {t("updater.newVersion", { version: updateAvailable.version })}
+          </span>
+          <button
+            type="button"
+            onClick={() => void installUpdate()}
+            className="flex items-center gap-1 rounded-[var(--radius-sm)] bg-white/15 px-2 py-0.5 font-medium hover:bg-white/25"
+          >
+            <Download size={12} />
+            {t("updater.install")}
+          </button>
+          <button
+            type="button"
+            onClick={dismissUpdate}
+            className="grid h-5 w-5 place-items-center rounded-[var(--radius-sm)] hover:bg-white/15"
+            aria-label={t("updater.dismiss")}
+          >
+            <X size={12} />
+          </button>
+        </motion.div>
+      )}
+      <header className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border bg-bg px-3">
+        <button
+          type="button"
+          onClick={() => setNavCollapsed(!navCollapsed)}
+          aria-label={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
+          title={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+        >
+          {navCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+        </button>
 
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
         {navCollapsed && (
@@ -250,5 +283,6 @@ export function AppTopBar() {
       </button>
       <AddRepoDialog open={repoDialogOpen} onOpenChange={setRepoDialogOpen} />
     </header>
+    </>
   );
 }

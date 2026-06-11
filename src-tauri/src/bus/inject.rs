@@ -71,7 +71,12 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
                     ] }
                 ] }
             });
-            if std::fs::write(&settings, serde_json::to_vec_pretty(&json).unwrap_or_default()).is_err() {
+            if std::fs::write(
+                &settings,
+                serde_json::to_vec_pretty(&json).unwrap_or_default(),
+            )
+            .is_err()
+            {
                 return Injection { args: vec![] };
             }
             crate::git::git_exclude(cwd, ".weft-ask.settings.json");
@@ -138,7 +143,13 @@ pub fn inject(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Inj
 /// Build the planner-MCP injection for a lead session (read-only planning).
 /// Same additive mechanism as the bus, a different server keyed to the thread.
 pub fn inject_planner(base: &str, thread: i32, tool: &str, cwd: &Path) -> Injection {
-    inject_mcp("weft_planner", "planner", &planner_url(base, thread), tool, cwd)
+    inject_mcp(
+        "weft_planner",
+        "planner",
+        &planner_url(base, thread),
+        tool,
+        cwd,
+    )
 }
 
 /// Build the global-MCP injection for the Concierge engine (M3-2). Not
@@ -231,8 +242,13 @@ mod tests {
     #[test]
     fn codex_uses_config_override() {
         let inj = inject("http://127.0.0.1:9", 2, "30", "codex", Path::new("/tmp"));
-        assert_eq!(inj.args, vec!["-c".to_string(),
-            "mcp_servers.weft_bus.url=http://127.0.0.1:9/bus/2/30/mcp".to_string()]);
+        assert_eq!(
+            inj.args,
+            vec![
+                "-c".to_string(),
+                "mcp_servers.weft_bus.url=http://127.0.0.1:9/bus/2/30/mcp".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -244,7 +260,10 @@ mod tests {
         let cfg = std::fs::read_to_string(dir.join(".weft-planner.mcp.json")).unwrap();
         assert!(cfg.contains("weft_planner") && cfg.contains("/planner/7/mcp"));
         // the bus config is a SEPARATE file — planner doesn't clobber it
-        assert_ne!(inj.args[1], dir.join(".weft-bus.mcp.json").to_string_lossy());
+        assert_ne!(
+            inj.args[1],
+            dir.join(".weft-bus.mcp.json").to_string_lossy()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -256,9 +275,10 @@ mod tests {
         assert_eq!(inj.args[0], "--settings");
         let script = std::fs::read_to_string(dir.join(".weft-ask-hook.sh")).unwrap();
         assert!(script.contains("/ask/1/10?tool=claude"));
-        let settings: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".weft-ask.settings.json")).unwrap())
-                .unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".weft-ask.settings.json")).unwrap(),
+        )
+        .unwrap();
         assert!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
@@ -280,14 +300,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn opencode_ask_plugin_written_and_excluded() {
         let dir = std::env::temp_dir().join(format!("weft-inj-oask-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let inj = inject_ask_hook("http://127.0.0.1:9", 1, "10", "opencode", &dir);
-        assert!(inj.args.is_empty(), "opencode plugin auto-loads, no launch flag");
+        assert!(
+            inj.args.is_empty(),
+            "opencode plugin auto-loads, no launch flag"
+        );
         let plugin = std::fs::read_to_string(dir.join(".opencode/plugins/weft-ask.js")).unwrap();
         assert!(plugin.contains("tool.execute.before"));
         assert!(plugin.contains("/ask/1/10?tool=opencode"));
@@ -298,8 +320,13 @@ mod tests {
     #[test]
     fn planner_codex_override_targets_planner_server() {
         let inj = inject_planner("http://127.0.0.1:9", 3, "codex", Path::new("/tmp"));
-        assert_eq!(inj.args, vec!["-c".to_string(),
-            "mcp_servers.weft_planner.url=http://127.0.0.1:9/planner/3/mcp".to_string()]);
+        assert_eq!(
+            inj.args,
+            vec![
+                "-c".to_string(),
+                "mcp_servers.weft_planner.url=http://127.0.0.1:9/planner/3/mcp".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -318,7 +345,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("opencode.json")).unwrap())
                 .unwrap();
         // both the repo's server AND weft_bus must be present
-        assert!(merged["mcp"]["repo_own"].is_object(), "repo's own server preserved");
+        assert!(
+            merged["mcp"]["repo_own"].is_object(),
+            "repo's own server preserved"
+        );
         assert_eq!(merged["mcp"]["weft_bus"]["type"], "remote");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -332,7 +362,12 @@ mod tests {
         let wt = root.join("wt");
         std::fs::create_dir_all(&repo).unwrap();
         let sh = |dir: &Path, args: &[&str]| {
-            assert!(Command::new(args[0]).args(&args[1..]).current_dir(dir).status().unwrap().success());
+            assert!(Command::new(args[0])
+                .args(&args[1..])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
         };
         sh(&repo, &["git", "init", "-q"]);
         sh(&repo, &["git", "config", "user.email", "t@t.t"]);
@@ -340,13 +375,23 @@ mod tests {
         std::fs::write(repo.join("README.md"), "x\n").unwrap();
         sh(&repo, &["git", "add", "-A"]);
         sh(&repo, &["git", "commit", "-q", "-m", "init"]);
-        sh(&repo, &["git", "worktree", "add", "-q", wt.to_str().unwrap()]);
+        sh(
+            &repo,
+            &["git", "worktree", "add", "-q", wt.to_str().unwrap()],
+        );
 
         let _ = inject("http://127.0.0.1:9", 1, "1", "claude", &wt);
         assert!(wt.join(".weft-bus.mcp.json").exists(), "file written");
-        let status = Command::new("git").args(["status", "--porcelain"]).current_dir(&wt).output().unwrap();
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
         let s = String::from_utf8_lossy(&status.stdout);
-        assert!(!s.contains(".weft-bus.mcp.json"), "injected file must be git-excluded, got: {s}");
+        assert!(
+            !s.contains(".weft-bus.mcp.json"),
+            "injected file must be git-excluded, got: {s}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

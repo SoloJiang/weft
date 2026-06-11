@@ -18,7 +18,10 @@ pub fn ensure_codex_trusted(cwd: &Path) {
     let Some(root) = repo_root(cwd) else {
         return;
     };
-    ensure_codex_trusted_in(&PathBuf::from(&home).join(".codex").join("config.toml"), &root);
+    ensure_codex_trusted_in(
+        &PathBuf::from(&home).join(".codex").join("config.toml"),
+        &root,
+    );
 }
 
 /// The git repository root Codex trusts (a worktree → its main repo root).

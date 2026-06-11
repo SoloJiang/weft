@@ -9,7 +9,9 @@ use std::time::Duration;
 /// POSIX shells we will invoke as `-ilc`. fish has different syntax → excluded.
 fn is_supported_login_shell(shell: &str) -> bool {
     matches!(
-        std::path::Path::new(shell).file_name().and_then(|s| s.to_str()),
+        std::path::Path::new(shell)
+            .file_name()
+            .and_then(|s| s.to_str()),
         Some("bash" | "zsh" | "sh" | "dash" | "ksh")
     )
 }
@@ -33,7 +35,11 @@ fn login_shell_path() -> Option<String> {
         .ok()?;
     let out = wait_with_timeout(&mut child, Duration::from_secs(3))?;
     let path = String::from_utf8_lossy(&out).trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 /// Wait up to `dur` for the child; kill + return None on timeout. Reads stdout
@@ -79,7 +85,9 @@ pub(crate) fn merge_path(base: &str, extra: &str) -> String {
 
 /// Run once at startup: fold the login shell's PATH into this process's PATH.
 pub fn augment_path_from_login_shell() {
-    let Some(shell_path) = login_shell_path() else { return };
+    let Some(shell_path) = login_shell_path() else {
+        return;
+    };
     let base = std::env::var("PATH").unwrap_or_default();
     let merged = merge_path(&base, &shell_path);
     if merged != base {

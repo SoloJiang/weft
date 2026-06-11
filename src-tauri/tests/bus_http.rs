@@ -32,7 +32,10 @@ async fn two_directions_exchange_a_message() {
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
         )
         .await;
-        assert!(out.contains("weft_bus"), "initialize must return serverInfo");
+        assert!(
+            out.contains("weft_bus"),
+            "initialize must return serverInfo"
+        );
     }
 
     // tools/list exposes bus_post
@@ -64,6 +67,9 @@ async fn two_directions_exchange_a_message() {
             "params":{"name":"bus_inbox","arguments":{}}}),
     )
     .await;
-    assert!(inbox.contains("hello-20"), "inbox should contain the posted message: {inbox}");
+    assert!(
+        inbox.contains("hello-20"),
+        "inbox should contain the posted message: {inbox}"
+    );
     assert!(inbox.contains("\\\"from\\\":\\\"10\\\"") || inbox.contains("\"from\":\"10\""));
 }

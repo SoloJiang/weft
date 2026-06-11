@@ -28,7 +28,9 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// already exists in EITHER target (repo-owned) is skipped entirely.
 pub fn materialize(skills: &[ParsedSkill], cwd: &Path) {
     for sk in skills {
-        let exists = TARGET_DIRS.iter().any(|d| cwd.join(d).join(&sk.name).exists());
+        let exists = TARGET_DIRS
+            .iter()
+            .any(|d| cwd.join(d).join(&sk.name).exists());
         if exists {
             continue; // repo-owned same-name wins
         }
@@ -51,7 +53,11 @@ mod tests {
         let d = base.join(name);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("SKILL.md"), format!("---\nname: {name}\n---\nx")).unwrap();
-        ParsedSkill { name: name.into(), description: String::new(), dir: d.to_string_lossy().into() }
+        ParsedSkill {
+            name: name.into(),
+            description: String::new(),
+            dir: d.to_string_lossy().into(),
+        }
     }
 
     #[test]

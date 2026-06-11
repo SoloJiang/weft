@@ -53,7 +53,10 @@ pub fn reveal_path(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").args(["-R", &path]).status().map_err(err)?;
+        Command::new("open")
+            .args(["-R", &path])
+            .status()
+            .map_err(err)?;
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]

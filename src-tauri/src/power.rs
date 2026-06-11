@@ -26,7 +26,11 @@ struct PowerState {
 impl Default for PowerState {
     fn default() -> Self {
         // Default ON, matching the frontend default ("weft-keep-awake" !== "0").
-        Self { enabled: true, busy: false, idle_since: None }
+        Self {
+            enabled: true,
+            busy: false,
+            idle_since: None,
+        }
     }
 }
 
@@ -103,7 +107,10 @@ pub struct PowerGuard {
 
 impl Default for PowerGuard {
     fn default() -> Self {
-        Self { state: std::sync::Mutex::new(PowerState::default()), tx: spawn_holder() }
+        Self {
+            state: std::sync::Mutex::new(PowerState::default()),
+            tx: spawn_holder(),
+        }
     }
 }
 

@@ -1,24 +1,24 @@
 <svg viewBox="0 0 1320 740" xmlns="http://www.w3.org/2000/svg" font-family="'Inter','SF Pro Display',-apple-system,'Segoe UI','PingFang SC','Noto Sans CJK SC',sans-serif">
   <defs>
-    <marker id="a3" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#5b5866"/></marker>
-    <marker id="a3u" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#5b5866"/></marker>
+    <marker id="a3" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#6b655c"/></marker>
+    <marker id="a3u" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#6b655c"/></marker>
     <style>
-      .ct{fill:#cfcdd6;font-size:14px;font-weight:600;letter-spacing:.2px}
-      .cs{fill:#75727f;font-size:11px}
-      .chip{fill:#211f29;stroke:#383640;stroke-width:1}
-      .clbl{fill:#eceaf2;font-size:13.5px;font-weight:600}
-      .csub{fill:#827f8c;font-size:10.5px}
+      .ct{fill:#d7d0c5;font-size:14px;font-weight:600;letter-spacing:.2px}
+      .cs{fill:#8e887f;font-size:11px}
+      .chip{fill:#22201b;stroke:#3a352e;stroke-width:1}
+      .clbl{fill:#eee8df;font-size:13.5px;font-weight:600}
+      .csub{fill:#9b948a;font-size:10.5px}
       .gl{stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
-      .pill{fill:#211f33;stroke:#4f46e5;stroke-width:1.2}
+      .pill{fill:#173034;stroke:#49c0c9;stroke-width:1.2}
     </style>
   </defs>
 
-  <rect x="0" y="0" width="1320" height="740" rx="18" fill="#15141a"/>
+  <rect x="0" y="0" width="1320" height="740" rx="18" fill="#171512"/>
 
   <!-- Frontend container -->
-  <rect x="40" y="40" width="1240" height="168" rx="16" fill="#191820" stroke="#34323d"/>
+  <rect x="40" y="40" width="1240" height="168" rx="16" fill="#1b1915" stroke="#3a352e"/>
   <g transform="translate(64,66)">
-    <rect x="0" y="-2" width="16" height="13" rx="2.5" fill="none" stroke="#9a93f7" class="gl"/><path d="M0,2 h16" stroke="#9a93f7" class="gl" opacity=".6"/>
+    <rect x="0" y="-2" width="16" height="13" rx="2.5" fill="none" stroke="#9de5e8" class="gl"/><path d="M0,2 h16" stroke="#9de5e8" class="gl" opacity=".6"/>
   </g>
   <text class="ct" x="90" y="76">Frontend</text>
   <text class="cs" x="176" y="76">React 19 · TypeScript · Tailwind</text>
@@ -26,38 +26,38 @@
   <!-- FE chips -->
   <g>
     <rect class="chip" x="64" y="98" width="284" height="86" rx="11"/>
-    <g transform="translate(88,132)"><path class="gl" stroke="#b8b5c2" d="M-7,-6 h14 a2,2 0 0 1 2,2 v6 a2,2 0 0 1 -2,2 h-9 l-4,4 v-4 h-1 a2,2 0 0 1 -2,-2 v-6 a2,2 0 0 1 2,-2 z"/></g>
-    <text class="clbl" x="110" y="130">Lead conversation</text>
-    <text class="csub" x="80" y="160">home surface · action cards</text>
+    <g transform="translate(88,132)"><path class="gl" stroke="#c4bdb2" d="M-7,-6 h14 a2,2 0 0 1 2,2 v6 a2,2 0 0 1 -2,2 h-9 l-4,4 v-4 h-1 a2,2 0 0 1 -2,-2 v-6 a2,2 0 0 1 2,-2 z"/></g>
+    <text class="clbl" x="112" y="130">Lead conversation</text>
+    <text class="csub" x="112" y="160">home surface · action cards</text>
   </g>
   <g>
     <rect class="chip" x="366" y="98" width="284" height="86" rx="11"/>
-    <g transform="translate(390,132)" class="gl" stroke="#b8b5c2"><rect x="-7" y="-7" width="6" height="6" rx="1"/><rect x="1" y="-7" width="6" height="6" rx="1"/><rect x="-7" y="1" width="6" height="6" rx="1"/><rect x="1" y="1" width="6" height="6" rx="1"/></g>
-    <text class="clbl" x="412" y="130">Two-level board</text>
-    <text class="csub" x="382" y="160">workspace · issue</text>
+    <g transform="translate(390,132)" class="gl" stroke="#c4bdb2"><rect x="-7" y="-7" width="6" height="6" rx="1"/><rect x="1" y="-7" width="6" height="6" rx="1"/><rect x="-7" y="1" width="6" height="6" rx="1"/><rect x="1" y="1" width="6" height="6" rx="1"/></g>
+    <text class="clbl" x="414" y="130">Two-level board</text>
+    <text class="csub" x="414" y="160">workspace · issue</text>
   </g>
   <g>
     <rect class="chip" x="668" y="98" width="284" height="86" rx="11"/>
-    <g transform="translate(692,132)" class="gl" stroke="#b8b5c2"><rect x="-8" y="-7" width="16" height="14" rx="2"/><path d="M-4,-2 l3,3 l-3,3"/><path d="M1,4 h4"/></g>
-    <text class="clbl" x="714" y="130">Session chat</text>
-    <text class="csub" x="684" y="160">weft-owned timeline · composer</text>
+    <g transform="translate(692,132)" class="gl" stroke="#c4bdb2"><rect x="-8" y="-7" width="16" height="14" rx="2"/><path d="M-4,-2 l3,3 l-3,3"/><path d="M1,4 h4"/></g>
+    <text class="clbl" x="716" y="130">Session chat</text>
+    <text class="csub" x="716" y="160">weft-owned timeline · composer</text>
   </g>
   <g>
     <rect class="chip" x="970" y="98" width="284" height="86" rx="11"/>
-    <g transform="translate(994,132)" class="gl" stroke="#b8b5c2"><circle cx="-6" cy="-4" r="2.2" fill="#b8b5c2" stroke="none"/><circle cx="6" cy="-5" r="2.2" fill="#b8b5c2" stroke="none"/><circle cx="3" cy="6" r="2.2" fill="#b8b5c2" stroke="none"/><path d="M-6,-4 L6,-5 M6,-5 L3,6 M-6,-4 L3,6"/></g>
-    <text class="clbl" x="1016" y="130">Scope · graph · diff</text>
-    <text class="csub" x="986" y="160">decisions, made legible</text>
+    <g transform="translate(994,132)" class="gl" stroke="#c4bdb2"><circle cx="-6" cy="-4" r="2.2" fill="#c4bdb2" stroke="none"/><circle cx="6" cy="-5" r="2.2" fill="#c4bdb2" stroke="none"/><circle cx="3" cy="6" r="2.2" fill="#c4bdb2" stroke="none"/><path d="M-6,-4 L6,-5 M6,-5 L3,6 M-6,-4 L3,6"/></g>
+    <text class="clbl" x="1018" y="130">Scope · graph · diff</text>
+    <text class="csub" x="1018" y="160">decisions, made legible</text>
   </g>
 
   <!-- IPC connector -->
-  <path class="gl" d="M620,208 V236" stroke="#5b5866" marker-end="url(#a3)"/>
-  <path class="gl" d="M700,278 V250" stroke="#5b5866" marker-end="url(#a3u)"/>
+  <path class="gl" d="M620,208 V236" stroke="#6b655c" marker-end="url(#a3)"/>
+  <path class="gl" d="M700,278 V250" stroke="#6b655c" marker-end="url(#a3u)"/>
   <rect class="pill" x="595" y="222" width="130" height="34" rx="17"/>
-  <text x="660" y="244" text-anchor="middle" fill="#cfcbf6" font-size="12.5" font-weight="600">Tauri IPC ⇅</text>
+  <text x="660" y="244" text-anchor="middle" fill="#b8ecef" font-size="12.5" font-weight="600">Tauri IPC ⇅</text>
 
   <!-- Backend container -->
-  <rect x="40" y="278" width="1240" height="324" rx="16" fill="#191820" stroke="#34323d"/>
-  <g transform="translate(64,304)" class="gl" stroke="#f0a07a"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#f0a07a" stroke="none"/><path d="M0,-7 v3 M0,9 v3 M-7,2 h3 M9,2 h-3"/></g>
+  <rect x="40" y="278" width="1240" height="324" rx="16" fill="#1b1915" stroke="#3a352e"/>
+  <g transform="translate(64,304)" class="gl" stroke="#f27d53"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#f27d53" stroke="none"/><path d="M0,-7 v3 M0,9 v3 M-7,2 h3 M9,2 h-3"/></g>
   <text class="ct" x="90" y="314">Backend</text>
   <text class="cs" x="168" y="314">Rust · Tauri v2</text>
 
@@ -111,15 +111,15 @@
   </g>
 
   <!-- to native CLIs -->
-  <path class="gl" d="M256,592 V630" stroke="#5b5866" marker-end="url(#a3)"/>
-  <text class="cs" x="266" y="618" fill="#75727f">spawn · JSON stream</text>
-  <path class="gl" d="M660,592 V630" stroke="#5b5866" marker-end="url(#a3)"/>
-  <path class="gl" d="M1010,630 C1010,610 980,630 980,592" stroke="#5b5866" stroke-dasharray="3 5" opacity=".8" marker-end="url(#a3u)"/>
-  <text class="cs" x="1020" y="618" fill="#75727f">normalize events</text>
+  <path class="gl" d="M256,592 V630" stroke="#6b655c" marker-end="url(#a3)"/>
+  <text class="cs" x="266" y="618" fill="#8e887f">spawn · JSON stream</text>
+  <path class="gl" d="M660,592 V630" stroke="#6b655c" marker-end="url(#a3)"/>
+  <path class="gl" d="M1010,630 C1010,610 980,630 980,592" stroke="#6b655c" stroke-dasharray="3 5" opacity=".8" marker-end="url(#a3u)"/>
+  <text class="cs" x="1020" y="618" fill="#8e887f">normalize events</text>
 
   <!-- Native CLIs -->
-  <rect x="40" y="630" width="1240" height="86" rx="14" fill="#1d1b24" stroke="#46424f"/>
-  <g transform="translate(74,673)" class="gl" stroke="#b8b5c2"><rect x="-9" y="-9" width="18" height="18" rx="3"/><path d="M-4,-3 l4,3 l-4,3"/><path d="M1,5 h4"/></g>
+  <rect x="40" y="630" width="1240" height="86" rx="14" fill="#1d1b24" stroke="#514b43"/>
+  <g transform="translate(74,673)" class="gl" stroke="#c4bdb2"><rect x="-9" y="-9" width="18" height="18" rx="3"/><path d="M-4,-3 l4,3 l-4,3"/><path d="M1,5 h4"/></g>
   <text class="clbl" x="100" y="668" font-size="14.5">Native agent CLIs</text>
   <text class="csub" x="100" y="689" font-size="11">claude · codex · opencode — plus their sidecar session logs (read-only)</text>
 </svg>

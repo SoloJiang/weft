@@ -152,7 +152,10 @@ pub fn run_check(cwd: &Path, c: &Check) -> CheckResult {
 
 /// Infer + run all check rungs for a worktree.
 pub fn run_checks(cwd: &Path) -> Vec<CheckResult> {
-    infer_checks(cwd).iter().map(|c| run_check(cwd, c)).collect()
+    infer_checks(cwd)
+        .iter()
+        .map(|c| run_check(cwd, c))
+        .collect()
 }
 
 #[cfg(test)]
@@ -186,7 +189,10 @@ mod tests {
     #[test]
     fn node_honors_package_manager_from_lockfile() {
         let pnpm = tmp(&[
-            ("package.json", r#"{ "scripts": { "lint": "eslint", "test": "vitest" } }"#),
+            (
+                "package.json",
+                r#"{ "scripts": { "lint": "eslint", "test": "vitest" } }"#,
+            ),
             ("pnpm-lock.yaml", ""),
         ]);
         assert!(infer_checks(&pnpm).iter().all(|c| c.program == "pnpm"));
@@ -233,10 +239,16 @@ mod tests {
     fn python_without_tool_config_has_no_checks() {
         // A bare Python repo (deps but no ruff/mypy/pytest config) gets NO rungs —
         // we never invent a runner, same discipline as Node's defined-scripts-only.
-        let d = tmp(&[("requirements.txt", "requests\n"), ("pyproject.toml", "[project]\nname='x'\n")]);
+        let d = tmp(&[
+            ("requirements.txt", "requests\n"),
+            ("pyproject.toml", "[project]\nname='x'\n"),
+        ]);
         assert!(infer_checks(&d).is_empty());
         // conftest.py alone is enough evidence of pytest, though.
-        let d2 = tmp(&[("setup.py", "from setuptools import setup\n"), ("conftest.py", "")]);
+        let d2 = tmp(&[
+            ("setup.py", "from setuptools import setup\n"),
+            ("conftest.py", ""),
+        ]);
         let names: Vec<String> = infer_checks(&d2).into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["test"]);
     }

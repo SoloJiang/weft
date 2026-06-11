@@ -1,5 +1,5 @@
 //! 入站路由（spec §4 顺序判定）：归一化事件 → Route。纯函数、无 IO、无 LLM。
-//! M1 范围：绑定 / 卡片按钮 / 卡片回复作答 / 自由文本提示；群消息 M2。
+//! 当前覆盖 owner 绑定、卡片回复/按钮路由、issue 话题绑定、话题消息与 Concierge 私聊。
 
 use crate::ask::Answer;
 use crate::im::{CardIndex, ReplyTarget};
@@ -7,11 +7,15 @@ use crate::im::{CardIndex, ReplyTarget};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Inbound {
     /// 卡片按钮回调（CARD_BUTTONS 启用时才会出现）。
-    Action { operator_open_id: String, message_id: String, value: serde_json::Value },
+    Action {
+        operator_open_id: String,
+        message_id: String,
+        value: serde_json::Value,
+    },
     Text {
         sender_open_id: String,
-        chat_type: String, // "p2p" | "group"
-        chat_id: String,   // 飞书群/单聊 id（群路由用，M2-3）
+        chat_type: String,         // "p2p" | "group"
+        chat_id: String,           // 飞书群/单聊 id（群路由用，M2-3）
         thread_id: Option<String>, // 飞书话题 id（群里 issue 话题用，M2-3）
         message_id: String,
         parent_id: Option<String>,
@@ -27,12 +31,38 @@ pub enum Route {
     /// 契约：route 读的是 allow 的内存快照；执行侧落库前必须重查白名单
     /// 仍为空（防并发首绑竞态——两条消息同时拿到空快照会各自 Bind）。
     /// 桥运行时单循环串行消费是第一道防线，但不应是唯一防线。
-    Bind { open_id: String },
-    AnswerPerm { ask_id: u64, answer: Answer },
-    AnswerHuman { thread: i32, ask_id: u64, text: String },
+    Bind {
+        open_id: String,
+        chat_id: String,
+        text: String,
+    },
+    /// 已绑定 owner 在飞书群话题里发送 `/bind <thread_id>`，把当前飞书
+    /// 话题绑定到指定 Weft issue。群消息仍不能绑定 owner；只有 allowlist
+    /// 中的 sender 可以改 issue↔话题路由。
+    BindIssueThread {
+        thread_id: i32,
+        chat_id: String,
+        im_thread_ref: String,
+    },
+    /// 已绑定 owner 在飞书群普通消息里发送 `/topic <thread_id>`，为已有
+    /// Weft issue 创建或复用一个飞书 topic。
+    EnsureIssueTopic {
+        thread_id: i32,
+        chat_id: String,
+        reply_to: String,
+    },
+    AnswerPerm {
+        ask_id: u64,
+        answer: Answer,
+    },
+    AnswerHuman {
+        thread: i32,
+        ask_id: u64,
+        text: String,
+    },
     /// 回复了权限卡但动词解析不出 → 回用法提示。
     BadVerdict,
-    /// 飞书话题里给已绑定 issue 的自由文本 → 灌进 lead engine（M2-3）。
+    /// 飞书话题里给已绑定 issue 的自由文本 → 灌进 lead engine。
     /// 解析路径在 inbound 之外：执行侧用 (chat_id, im_thread_ref) 查 im_route。
     IssueMessage {
         chat_id: String,
@@ -40,9 +70,12 @@ pub enum Route {
         sender_open_id: String,
         text: String,
     },
-    /// 单聊自由文本：M3 之前回 Concierge 占位；M3 起接入 Concierge engine。
+    /// 私聊或普通群聊自由文本：接入该 IM 会话独立的 Concierge engine。
     FreeText {
         sender_open_id: String,
+        chat_id: String,
+        im_thread_ref: String,
+        reply_to: Option<String>,
         text: String,
     },
 }
@@ -60,48 +93,123 @@ pub fn parse_verdict(text: &str) -> Option<Answer> {
 }
 
 /// 按钮 value 里的 ask_id 双形态解析：outbound 写入的是数字（见 outbound.rs
-/// CARD_BUTTONS 的按钮 value），但飞书回调 JSON 往返后可能变字符串——实际
-/// 形态待 Task 2 spike 验证，先两头都兜住。
+/// CARD_BUTTONS 的按钮 value），但飞书回调 JSON 往返后可能变字符串——两头都兜住。
 fn as_ask_id(v: &serde_json::Value) -> Option<u64> {
-    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+fn parse_bind_issue(text: &str) -> Option<i32> {
+    let mut parts = text.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("/bind"), Some(id), None) => id.parse::<i32>().ok().filter(|n| *n > 0),
+        _ => None,
+    }
+}
+
+fn parse_topic_issue(text: &str) -> Option<i32> {
+    let mut parts = text.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("/topic" | "/issue"), Some(id), None) => id.parse::<i32>().ok().filter(|n| *n > 0),
+        _ => None,
+    }
 }
 
 pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
     match inb {
-        Inbound::Action { operator_open_id, value, .. } => {
+        Inbound::Action {
+            operator_open_id,
+            value,
+            ..
+        } => {
             // 空白名单下 Action 也是 Ignore：Bind 唯一入口是 p2p Text。
             if !allow.iter().any(|a| a == operator_open_id) {
                 return Route::Ignore;
             }
             let kind = value.get("kind").and_then(|v| v.as_str());
             let ask_id = value.get("ask_id").and_then(as_ask_id);
-            let answer = value.get("answer").and_then(|v| v.as_str()).and_then(Answer::parse);
+            let answer = value
+                .get("answer")
+                .and_then(|v| v.as_str())
+                .and_then(Answer::parse);
             match (kind, ask_id, answer) {
-                (Some("perm"), Some(id), Some(ans)) => {
-                    Route::AnswerPerm { ask_id: id, answer: ans }
-                }
+                (Some("perm"), Some(id), Some(ans)) => Route::AnswerPerm {
+                    ask_id: id,
+                    answer: ans,
+                },
                 // fail-closed：kind/ask_id/answer 任一非法即丢弃，与文本
                 // 回复路径的 parse_verdict 同强度不变式。
                 _ => Route::Ignore,
             }
         }
-        Inbound::Text { sender_open_id, chat_type, chat_id, thread_id, parent_id, text, .. } => {
-            // 群消息：白名单/绑定都不适用——issue 线程消息由执行侧用 (chat_id, thread_id)
-            // 查 im_route 决定路由。话题外的群消息一律忽略（避免引入「机器人 @ 触发」
-            // 这种不在 spec 内的入口）。
+        Inbound::Text {
+            sender_open_id,
+            chat_type,
+            chat_id,
+            thread_id,
+            message_id,
+            parent_id,
+            text,
+        } => {
+            // 群消息：不能绑定 owner。话题内 `/bind <thread_id>` 只有已绑定
+            // owner 可用；其余话题消息由执行侧用 (chat_id, thread_id) 查
+            // im_route 决定路由。话题外群消息一律忽略（避免引入「机器人 @」
+            // 触发这种不在 spec 内的入口）。
             if chat_type != "p2p" {
                 return match thread_id {
-                    Some(tref) => Route::IssueMessage {
-                        chat_id: chat_id.clone(),
-                        im_thread_ref: tref.clone(),
-                        sender_open_id: sender_open_id.clone(),
-                        text: text.clone(),
-                    },
-                    None => Route::Ignore,
+                    Some(tref) => {
+                        if text.split_whitespace().next() == Some("/bind") {
+                            if allow.iter().any(|a| a == sender_open_id) {
+                                if let Some(thread_id) = parse_bind_issue(text) {
+                                    return Route::BindIssueThread {
+                                        thread_id,
+                                        chat_id: chat_id.clone(),
+                                        im_thread_ref: tref.clone(),
+                                    };
+                                }
+                            }
+                            return Route::Ignore;
+                        }
+                        Route::IssueMessage {
+                            chat_id: chat_id.clone(),
+                            im_thread_ref: tref.clone(),
+                            sender_open_id: sender_open_id.clone(),
+                            text: text.clone(),
+                        }
+                    }
+                    None => {
+                        // 普通群聊没有飞书 thread_id；只有已绑定 owner 可以为已有
+                        // issue 创建 topic，避免机器人被拉进群后被任意群成员刷 route。
+                        if allow.iter().any(|a| a == sender_open_id) {
+                            if let Some(thread_id) = parse_topic_issue(text) {
+                                return Route::EnsureIssueTopic {
+                                    thread_id,
+                                    chat_id: chat_id.clone(),
+                                    reply_to: message_id.clone(),
+                                };
+                            }
+                            if text.split_whitespace().next() == Some("/bind") {
+                                return Route::Ignore;
+                            }
+                            Route::FreeText {
+                                sender_open_id: sender_open_id.clone(),
+                                chat_id: chat_id.clone(),
+                                im_thread_ref: format!("chat:{chat_id}"),
+                                reply_to: Some(message_id.clone()),
+                                text: text.clone(),
+                            }
+                        } else {
+                            Route::Ignore
+                        }
+                    }
                 };
             }
             if allow.is_empty() {
-                return Route::Bind { open_id: sender_open_id.clone() };
+                return Route::Bind {
+                    open_id: sender_open_id.clone(),
+                    chat_id: chat_id.clone(),
+                    text: text.clone(),
+                };
             }
             if !allow.iter().any(|a| a == sender_open_id) {
                 return Route::Ignore;
@@ -110,19 +218,32 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
                 match cards.target_of(pid) {
                     Some(ReplyTarget::Perm { ask_id }) => {
                         return match parse_verdict(text) {
-                            Some(ans) => Route::AnswerPerm { ask_id, answer: ans },
+                            Some(ans) => Route::AnswerPerm {
+                                ask_id,
+                                answer: ans,
+                            },
                             None => Route::BadVerdict,
                         };
                     }
                     Some(ReplyTarget::Human { thread, ask_id }) => {
-                        return Route::AnswerHuman { thread, ask_id, text: text.clone() };
+                        return Route::AnswerHuman {
+                            thread,
+                            ask_id,
+                            text: text.clone(),
+                        };
                     }
                     // parent_id 不命中索引（卡已终态/重启丢索引/回复无关消息）
                     // → fall through 当自由文本，不猜测语义。
                     None => {}
                 }
             }
-            Route::FreeText { sender_open_id: sender_open_id.clone(), text: text.clone() }
+            Route::FreeText {
+                sender_open_id: sender_open_id.clone(),
+                chat_id: chat_id.clone(),
+                im_thread_ref: format!("dm:{sender_open_id}"),
+                reply_to: None,
+                text: text.clone(),
+            }
         }
     }
 }
@@ -163,14 +284,21 @@ mod tests {
     fn empty_allowlist_binds_first_p2p_sender() {
         assert_eq!(
             route(&text("ou_x", None, "hi"), &[], &cards()),
-            Route::Bind { open_id: "ou_x".into() }
+            Route::Bind {
+                open_id: "ou_x".into(),
+                chat_id: "oc_dm".into(),
+                text: "hi".into(),
+            }
         );
     }
 
     #[test]
     fn unknown_sender_is_ignored() {
         let allow = vec!["ou_me".to_string()];
-        assert_eq!(route(&text("ou_evil", None, "允许"), &allow, &cards()), Route::Ignore);
+        assert_eq!(
+            route(&text("ou_evil", None, "允许"), &allow, &cards()),
+            Route::Ignore
+        );
     }
 
     #[test]
@@ -178,14 +306,24 @@ mod tests {
         let allow = vec!["ou_me".to_string()];
         assert_eq!(
             route(&text("ou_me", Some("om_perm"), " 允许 "), &allow, &cards()),
-            Route::AnswerPerm { ask_id: 42, answer: Answer::Allow }
+            Route::AnswerPerm {
+                ask_id: 42,
+                answer: Answer::Allow
+            }
         );
         assert_eq!(
             route(&text("ou_me", Some("om_perm"), "2"), &allow, &cards()),
-            Route::AnswerPerm { ask_id: 42, answer: Answer::Deny }
+            Route::AnswerPerm {
+                ask_id: 42,
+                answer: Answer::Deny
+            }
         );
         assert_eq!(
-            route(&text("ou_me", Some("om_perm"), "whatever"), &allow, &cards()),
+            route(
+                &text("ou_me", Some("om_perm"), "whatever"),
+                &allow,
+                &cards()
+            ),
             Route::BadVerdict
         );
     }
@@ -195,7 +333,11 @@ mod tests {
         let allow = vec!["ou_me".to_string()];
         assert_eq!(
             route(&text("ou_me", Some("om_q"), "minor 就行"), &allow, &cards()),
-            Route::AnswerHuman { thread: 3, ask_id: 9, text: "minor 就行".into() }
+            Route::AnswerHuman {
+                thread: 3,
+                ask_id: 9,
+                text: "minor 就行".into()
+            }
         );
     }
 
@@ -206,7 +348,13 @@ mod tests {
         let allow = vec!["ou_me".to_string()];
         assert_eq!(
             route(&text("ou_me", Some("om_gone"), "允许"), &allow, &cards()),
-            Route::FreeText { sender_open_id: "ou_me".into(), text: "允许".into() }
+            Route::FreeText {
+                sender_open_id: "ou_me".into(),
+                chat_id: "oc_dm".into(),
+                im_thread_ref: "dm:ou_me".into(),
+                reply_to: None,
+                text: "允许".into(),
+            }
         );
     }
 
@@ -215,7 +363,13 @@ mod tests {
         let allow = vec!["ou_me".to_string()];
         assert_eq!(
             route(&text("ou_me", None, "今天进展如何"), &allow, &cards()),
-            Route::FreeText { sender_open_id: "ou_me".into(), text: "今天进展如何".into() }
+            Route::FreeText {
+                sender_open_id: "ou_me".into(),
+                chat_id: "oc_dm".into(),
+                im_thread_ref: "dm:ou_me".into(),
+                reply_to: None,
+                text: "今天进展如何".into(),
+            }
         );
         let g_no_thread = Inbound::Text {
             sender_open_id: "ou_me".into(),
@@ -226,8 +380,18 @@ mod tests {
             parent_id: None,
             text: "hi".into(),
         };
-        // 没 thread_id = 群闲聊，忽略（spec: 不走「机器人 @」入口）
-        assert_eq!(route(&g_no_thread, &allow, &cards()), Route::Ignore);
+        // 普通群消息来自 owner：交给 Concierge 语义判断；chat_id 注入上下文，
+        // 让它只在用户语义明确时调用 ensure_issue_topic。
+        assert_eq!(
+            route(&g_no_thread, &allow, &cards()),
+            Route::FreeText {
+                sender_open_id: "ou_me".into(),
+                chat_id: "oc_g".into(),
+                im_thread_ref: "chat:oc_g".into(),
+                reply_to: Some("om".into()),
+                text: "hi".into(),
+            }
+        );
 
         let g_in_thread = Inbound::Text {
             sender_open_id: "ou_x".into(),
@@ -238,7 +402,7 @@ mod tests {
             parent_id: None,
             text: "推一下".into(),
         };
-        // 话题内消息无视白名单（绑定语义在 im_route 上）；执行侧拿 (chat_id, thread_id) 反查
+        // 话题内普通消息无视白名单（绑定语义在 im_route 上）；执行侧拿 (chat_id, thread_id) 反查
         assert_eq!(
             route(&g_in_thread, &allow, &cards()),
             Route::IssueMessage {
@@ -251,9 +415,75 @@ mod tests {
     }
 
     #[test]
+    fn group_thread_bind_command_requires_owner() {
+        let allow = vec!["ou_me".to_string()];
+        let bind = Inbound::Text {
+            sender_open_id: "ou_me".into(),
+            chat_type: "group".into(),
+            chat_id: "oc_g".into(),
+            thread_id: Some("omt_42".into()),
+            message_id: "om".into(),
+            parent_id: None,
+            text: "/bind 7".into(),
+        };
+        assert_eq!(
+            route(&bind, &allow, &cards()),
+            Route::BindIssueThread {
+                thread_id: 7,
+                chat_id: "oc_g".into(),
+                im_thread_ref: "omt_42".into(),
+            }
+        );
+
+        let stranger = Inbound::Text {
+            sender_open_id: "ou_x".into(),
+            chat_type: "group".into(),
+            chat_id: "oc_g".into(),
+            thread_id: Some("omt_42".into()),
+            message_id: "om".into(),
+            parent_id: None,
+            text: "/bind 7".into(),
+        };
+        assert_eq!(route(&stranger, &allow, &cards()), Route::Ignore);
+    }
+
+    #[test]
+    fn group_topic_command_requires_owner() {
+        let allow = vec!["ou_me".to_string()];
+        let topic = Inbound::Text {
+            sender_open_id: "ou_me".into(),
+            chat_type: "group".into(),
+            chat_id: "oc_g".into(),
+            thread_id: None,
+            message_id: "om_cmd".into(),
+            parent_id: None,
+            text: "/topic 7".into(),
+        };
+        assert_eq!(
+            route(&topic, &allow, &cards()),
+            Route::EnsureIssueTopic {
+                thread_id: 7,
+                chat_id: "oc_g".into(),
+                reply_to: "om_cmd".into(),
+            }
+        );
+
+        let stranger = Inbound::Text {
+            sender_open_id: "ou_x".into(),
+            chat_type: "group".into(),
+            chat_id: "oc_g".into(),
+            thread_id: None,
+            message_id: "om_cmd".into(),
+            parent_id: None,
+            text: "/topic 7".into(),
+        };
+        assert_eq!(route(&stranger, &allow, &cards()), Route::Ignore);
+    }
+
+    #[test]
     fn group_with_empty_allowlist_never_binds() {
-        // 顺序锁：群消息（含 thread 与否）都不得通过 Bind 路径——空白名单 + 群消息
-        // 一律不绑定。话题内 → IssueMessage（让 im_route 决定），话题外 → Ignore。
+        // 顺序锁：群消息不得通过 Bind 路径。空白名单 + 普通群消息忽略；
+        // 话题内消息仍可走 IssueMessage，让执行侧按已存在的 im_route 反查 issue。
         let no_thread = Inbound::Text {
             sender_open_id: "ou_stranger".into(),
             chat_type: "group".into(),
@@ -290,16 +520,25 @@ mod tests {
         let ok = serde_json::json!({"kind": "perm", "ask_id": 42, "answer": "allow"});
         assert_eq!(
             route(&action("ou_me", ok.clone()), &allow, &cards()),
-            Route::AnswerPerm { ask_id: 42, answer: Answer::Allow }
+            Route::AnswerPerm {
+                ask_id: 42,
+                answer: Answer::Allow
+            }
         );
-        assert_eq!(route(&action("ou_evil", ok), &allow, &cards()), Route::Ignore);
+        assert_eq!(
+            route(&action("ou_evil", ok), &allow, &cards()),
+            Route::Ignore
+        );
     }
 
     #[test]
     fn card_action_with_empty_allowlist_is_ignored() {
-        // Bind 唯一入口是 p2p Text；Action 不触发绑定（M1 默认无按钮，
+        // Bind 唯一入口是 p2p Text；Action 不触发绑定（默认无按钮，
         // 且未绑定时不该有任何已发卡片可点）。
-        let a = action("ou_x", serde_json::json!({"kind": "perm", "ask_id": 42, "answer": "allow"}));
+        let a = action(
+            "ou_x",
+            serde_json::json!({"kind": "perm", "ask_id": 42, "answer": "allow"}),
+        );
         assert_eq!(route(&a, &[], &cards()), Route::Ignore);
     }
 
@@ -309,15 +548,24 @@ mod tests {
         // 飞书回调 JSON 往返后 ask_id 可能变字符串——双形态都路由成功。
         assert_eq!(
             route(
-                &action("ou_me", serde_json::json!({"kind": "perm", "ask_id": "42", "answer": "allow"})),
+                &action(
+                    "ou_me",
+                    serde_json::json!({"kind": "perm", "ask_id": "42", "answer": "allow"})
+                ),
                 &allow,
                 &cards()
             ),
-            Route::AnswerPerm { ask_id: 42, answer: Answer::Allow }
+            Route::AnswerPerm {
+                ask_id: 42,
+                answer: Answer::Allow
+            }
         );
         assert_eq!(
             route(
-                &action("ou_me", serde_json::json!({"kind": "perm", "ask_id": "abc", "answer": "allow"})),
+                &action(
+                    "ou_me",
+                    serde_json::json!({"kind": "perm", "ask_id": "abc", "answer": "allow"})
+                ),
                 &allow,
                 &cards()
             ),
@@ -331,7 +579,10 @@ mod tests {
         // kind != "perm" → Ignore（未来新增 kind 前先在这里解锁）。
         assert_eq!(
             route(
-                &action("ou_me", serde_json::json!({"kind": "human", "ask_id": 42, "answer": "allow"})),
+                &action(
+                    "ou_me",
+                    serde_json::json!({"kind": "human", "ask_id": 42, "answer": "allow"})
+                ),
                 &allow,
                 &cards()
             ),
@@ -341,7 +592,10 @@ mod tests {
         // 与文本回复路径 parse_verdict 同强度不变式）。
         assert_eq!(
             route(
-                &action("ou_me", serde_json::json!({"kind": "perm", "ask_id": 42, "answer": "yolo"})),
+                &action(
+                    "ou_me",
+                    serde_json::json!({"kind": "perm", "ask_id": 42, "answer": "yolo"})
+                ),
                 &allow,
                 &cards()
             ),

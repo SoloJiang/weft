@@ -32,3 +32,7 @@ docs/
 
 # weft local worktrees (materialized per task)
 .claude/worktrees/
+
+# Local Tauri signing keys
+src-tauri/weft.key
+src-tauri/weft.key.pub

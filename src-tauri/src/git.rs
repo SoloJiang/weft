@@ -41,7 +41,12 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
     let resolves = |r: &str| {
         !r.is_empty()
             && Command::new("git")
-                .args(["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")])
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{r}^{{commit}}"),
+                ])
                 .current_dir(repo)
                 .output()
                 .map(|o| o.status.success())
@@ -74,7 +79,12 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
 /// off `base_ref` (resolved defensively; see resolve_base_ref). Idempotent: an
 /// existing path is reused, and an existing branch is checked out rather than
 /// recreated.
-pub fn add_worktree(repo: &Path, branch: &str, worktree_path: &Path, base_ref: &str) -> Result<PathBuf> {
+pub fn add_worktree(
+    repo: &Path,
+    branch: &str,
+    worktree_path: &Path,
+    base_ref: &str,
+) -> Result<PathBuf> {
     if worktree_path.exists() {
         return Ok(worktree_path.to_path_buf());
     }
@@ -110,12 +120,22 @@ pub fn delete_branch(repo: &Path, branch: &str) -> Result<()> {
 /// (which need a commit-ish) work immediately. Fails if `at` is a non-empty dir.
 /// Relies on the user's global git identity for the commit.
 pub fn init_repo(at: &Path) -> Result<()> {
-    if at.exists() && std::fs::read_dir(at).map(|mut d| d.next().is_some()).unwrap_or(false) {
-        bail!("a folder already exists at {} and isn't empty", at.display());
+    if at.exists()
+        && std::fs::read_dir(at)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    {
+        bail!(
+            "a folder already exists at {} and isn't empty",
+            at.display()
+        );
     }
     std::fs::create_dir_all(at)?;
     git(at, &["init", "-q"])?;
-    git(at, &["commit", "-q", "--allow-empty", "-m", "Initial commit"])?;
+    git(
+        at,
+        &["commit", "-q", "--allow-empty", "-m", "Initial commit"],
+    )?;
     Ok(())
 }
 
@@ -123,8 +143,15 @@ pub fn init_repo(at: &Path) -> Result<()> {
 /// system git credentials / SSH agent; weft never prompts for secrets, so a
 /// private repo without configured credentials fails with git's own error.
 pub fn clone_repo(url: &str, dest: &Path) -> Result<()> {
-    if dest.exists() && std::fs::read_dir(dest).map(|mut d| d.next().is_some()).unwrap_or(false) {
-        bail!("a folder already exists at {} and isn't empty", dest.display());
+    if dest.exists()
+        && std::fs::read_dir(dest)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    {
+        bail!(
+            "a folder already exists at {} and isn't empty",
+            dest.display()
+        );
     }
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -171,7 +198,10 @@ pub struct WorktreeDiff {
 /// very large files.
 pub fn repo_patch(worktree_path: &Path) -> Result<String> {
     let mut out = git(worktree_path, &["diff", "HEAD"])?;
-    let untracked = git(worktree_path, &["ls-files", "--others", "--exclude-standard"])?;
+    let untracked = git(
+        worktree_path,
+        &["ls-files", "--others", "--exclude-standard"],
+    )?;
     for rel in untracked.lines().filter(|l| !l.is_empty()) {
         let Ok(content) = std::fs::read_to_string(worktree_path.join(rel)) else {
             continue; // binary / unreadable
@@ -224,7 +254,11 @@ pub fn repo_diff(worktree_path: &Path) -> Result<DiffSummary> {
         let added = parts.next().unwrap_or("0").parse().unwrap_or(0);
         let removed = parts.next().unwrap_or("0").parse().unwrap_or(0);
         if let Some(path) = parts.next() {
-            files.push(FileDiff { path: path.to_string(), added, removed });
+            files.push(FileDiff {
+                path: path.to_string(),
+                added,
+                removed,
+            });
         }
     }
     let untracked = git(
@@ -236,7 +270,11 @@ pub fn repo_diff(worktree_path: &Path) -> Result<DiffSummary> {
         let added = std::fs::read_to_string(&full)
             .map(|c| c.lines().count() as u32)
             .unwrap_or(0);
-        files.push(FileDiff { path: path.to_string(), added, removed: 0 });
+        files.push(FileDiff {
+            path: path.to_string(),
+            added,
+            removed: 0,
+        });
     }
     Ok(DiffSummary { files })
 }
@@ -270,7 +308,13 @@ pub fn head_commit(repo: &Path) -> Result<String> {
 /// Best-effort: silently does nothing if git isn't available.
 pub fn git_exclude(cwd: &std::path::Path, name: &str) {
     let out = std::process::Command::new("git")
-        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--git-path", "info/exclude"])
+        .args([
+            "-C",
+            &cwd.to_string_lossy(),
+            "rev-parse",
+            "--git-path",
+            "info/exclude",
+        ])
         .output();
     let Ok(out) = out else { return };
     if !out.status.success() {
@@ -281,7 +325,11 @@ pub fn git_exclude(cwd: &std::path::Path, name: &str) {
         return;
     }
     let p = std::path::Path::new(&rel);
-    let exclude_path = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    let exclude_path = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
     if let Some(parent) = exclude_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -322,7 +370,10 @@ mod tests {
         let wt = tmp("base-wt");
         add_worktree(&repo, "ws/x/t/d", &wt, &base).unwrap();
         let wt_head = git(&wt, &["rev-parse", "HEAD"]).unwrap();
-        assert_eq!(wt_head, base_commit, "must branch from recorded base, not current HEAD");
+        assert_eq!(
+            wt_head, base_commit,
+            "must branch from recorded base, not current HEAD"
+        );
         assert_ne!(wt_head, other_commit);
 
         let _ = remove_worktree(&repo, &wt);

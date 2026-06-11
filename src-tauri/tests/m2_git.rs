@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn sh(dir: &PathBuf, args: &[&str]) {
-    let st = Command::new(args[0]).args(&args[1..]).current_dir(dir).status().unwrap();
+    let st = Command::new(args[0])
+        .args(&args[1..])
+        .current_dir(dir)
+        .status()
+        .unwrap();
     assert!(st.success(), "cmd {:?} failed", args);
 }
 
@@ -20,7 +24,18 @@ fn worktree_list_and_diff() {
     std::fs::write(repo.join("README.md"), "# x\n").unwrap();
     sh(&repo, &["git", "add", "-A"]);
     sh(&repo, &["git", "commit", "-q", "-m", "init"]);
-    sh(&repo, &["git", "worktree", "add", "-q", "-b", "ws/d/t/m", wt.to_str().unwrap()]);
+    sh(
+        &repo,
+        &[
+            "git",
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "ws/d/t/m",
+            wt.to_str().unwrap(),
+        ],
+    );
 
     // new untracked file in the worktree
     std::fs::write(wt.join("hello.txt"), "a\nb\n").unwrap();

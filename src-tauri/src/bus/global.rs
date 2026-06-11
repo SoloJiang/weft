@@ -1,5 +1,5 @@
 //! `weft_global` MCP server (spec §5 / M3-2): a stable, NOT-per-thread tool face
-//! exposed to the Concierge engine — so the IM 单聊全局助理 can read workspaces /
+//! exposed to the Concierge engine — so the IM conversation assistant can read workspaces /
 //! issues / Needs-you, answer asks on behalf of the user, message a lead, or
 //! file a new issue. Pure tool dispatch; the human is still the decision side
 //! for `confirm_scope` / `approve_direction` (those go through the desktop,
@@ -51,8 +51,14 @@ pub async fn handle_global(
         }),
         "tools/list" => json!({ "tools": global_specs() }),
         "tools/call" => {
-            let name = req.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
-            let args = req.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
+            let name = req
+                .pointer("/params/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args = req
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             call_global(&db, &asks, &bus, name, &args).await
         }
         _ => json!({}),
@@ -84,14 +90,21 @@ pub async fn call_global(
             Err(e) => text_result(format!("error: {e}")),
         },
         "list_issues" => {
-            let ws = args.get("workspace_id").and_then(|v| v.as_i64()).map(|x| x as i32);
+            let ws = args
+                .get("workspace_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32);
             match list_issues(db, ws).await {
                 Ok(v) => json_result(v),
                 Err(e) => text_result(format!("error: {e}")),
             }
         }
         "issue_status" => {
-            let Some(tid) = args.get("thread_id").and_then(|v| v.as_i64()).map(|x| x as i32) else {
+            let Some(tid) = args
+                .get("thread_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32)
+            else {
                 return text_result("error: thread_id required".into());
             };
             match issue_status(db, asks, tid).await {
@@ -109,7 +122,9 @@ pub async fn call_global(
             };
             let verdict = args.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
             let Some(ans) = Answer::parse(verdict) else {
-                return text_result(format!("error: unknown verdict '{verdict}' (use allow/deny/always/full)"));
+                return text_result(format!(
+                    "error: unknown verdict '{verdict}' (use allow/deny/always/full)"
+                ));
             };
             if asks.answer(ask_id, ans) {
                 text_result(format!("answered ask #{ask_id} as {verdict}"))
@@ -118,7 +133,11 @@ pub async fn call_global(
             }
         }
         "answer_question" => {
-            let Some(tid) = args.get("thread_id").and_then(|v| v.as_i64()).map(|x| x as i32) else {
+            let Some(tid) = args
+                .get("thread_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32)
+            else {
                 return text_result("error: thread_id required".into());
             };
             let Some(ask_id) = args.get("ask_id").and_then(|v| v.as_u64()) else {
@@ -134,10 +153,18 @@ pub async fn call_global(
             }
         }
         "message_lead" => {
-            let Some(tid) = args.get("thread_id").and_then(|v| v.as_i64()).map(|x| x as i32) else {
+            let Some(tid) = args
+                .get("thread_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32)
+            else {
                 return text_result("error: thread_id required".into());
             };
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if text.trim().is_empty() {
                 return text_result("error: text required".into());
             }
@@ -146,12 +173,45 @@ pub async fn call_global(
                 Err(e) => text_result(format!("error: {e}")),
             }
         }
+        "ensure_issue_topic" => {
+            let Some(tid) = args
+                .get("thread_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32)
+            else {
+                return text_result("error: thread_id required".into());
+            };
+            let chat_id = args
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if chat_id.is_empty() {
+                return text_result("error: chat_id required".into());
+            }
+            match ensure_issue_topic(db, tid, chat_id).await {
+                Ok(v) => json_result(v),
+                Err(e) => text_result(format!("error: {e}")),
+            }
+        }
         "create_issue" => {
-            let Some(ws) = args.get("workspace_id").and_then(|v| v.as_i64()).map(|x| x as i32) else {
+            let Some(ws) = args
+                .get("workspace_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32)
+            else {
                 return text_result("error: workspace_id required".into());
             };
-            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("feature").to_string();
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let kind = args
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("feature")
+                .to_string();
             if title.trim().is_empty() {
                 return text_result("error: title required".into());
             }
@@ -169,7 +229,10 @@ pub async fn call_global(
 async fn list_workspaces(db: &Db) -> anyhow::Result<Value> {
     let mut out = Vec::new();
     for w in repo::list_workspaces(db).await? {
-        let count = repo::list_threads(db, w.id).await.map(|v| v.len()).unwrap_or(0);
+        let count = repo::list_threads(db, w.id)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
         out.push(json!({ "id": w.id, "name": w.name, "thread_count": count }));
     }
     Ok(Value::Array(out))
@@ -178,7 +241,11 @@ async fn list_workspaces(db: &Db) -> anyhow::Result<Value> {
 async fn list_issues(db: &Db, ws: Option<i32>) -> anyhow::Result<Value> {
     let workspaces = match ws {
         Some(id) => vec![id],
-        None => repo::list_workspaces(db).await?.into_iter().map(|w| w.id).collect(),
+        None => repo::list_workspaces(db)
+            .await?
+            .into_iter()
+            .map(|w| w.id)
+            .collect(),
     };
     let mut out = Vec::new();
     for w in workspaces {
@@ -258,6 +325,25 @@ async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Resu
     }))
 }
 
+async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::Result<Value> {
+    let before = repo::im_route_of_thread(db, thread_id).await?;
+    let settings = crate::im::ImSettings::load(db).await?;
+    if !settings.ready() {
+        anyhow::bail!("Feishu app credentials are not configured");
+    }
+    let ch = crate::im::feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret);
+    crate::im::ensure_issue_topic(db, &ch, thread_id, chat_id, None, "zh").await?;
+    let after = repo::im_route_of_thread(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("topic route was not created"))?;
+    Ok(json!({
+        "thread_id": after.thread_id,
+        "chat_id": after.chat_id,
+        "im_thread_ref": after.im_thread_ref,
+        "created": before.is_none(),
+    }))
+}
+
 // ───────────────────── tool specs ─────────────────────
 
 pub fn global_specs() -> Value {
@@ -307,6 +393,13 @@ pub fn global_specs() -> Value {
                 "required": ["thread_id", "text"] }
         },
         {
+            "name": "ensure_issue_topic",
+            "description": "Ensure an existing issue has a Feishu topic in chat_id. Use only when the user semantically asks to create/open/continue an issue-specific Feishu topic; do not call for ordinary chat.",
+            "inputSchema": { "type": "object",
+                "properties": { "thread_id": i(), "chat_id": s() },
+                "required": ["thread_id", "chat_id"] }
+        },
+        {
             "name": "create_issue",
             "description": "File a new issue in a workspace. kind ∈ feature|bugfix|refactor|spike (defaults to feature).",
             "inputSchema": { "type": "object",
@@ -331,10 +424,15 @@ mod tests {
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
         let w = repo::create_workspace(&db, "alpha").await.unwrap();
-        let _t = repo::create_thread(&db, w.id, "first", "feature", "claude").await.unwrap();
-        let _t2 = repo::create_thread(&db, w.id, "second", "bugfix", "claude").await.unwrap();
+        let _t = repo::create_thread(&db, w.id, "first", "feature", "claude")
+            .await
+            .unwrap();
+        let _t2 = repo::create_thread(&db, w.id, "second", "bugfix", "claude")
+            .await
+            .unwrap();
         let v = call_global(&db, &asks, &bus, "list_workspaces", &json!({})).await;
-        let parsed: Value = serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed[0]["name"], "alpha");
         assert_eq!(parsed[0]["thread_count"], 2);
     }
@@ -346,10 +444,22 @@ mod tests {
         let bus = BusRegistry::new();
         let w1 = repo::create_workspace(&db, "a").await.unwrap();
         let w2 = repo::create_workspace(&db, "b").await.unwrap();
-        repo::create_thread(&db, w1.id, "in-a", "feature", "claude").await.unwrap();
-        repo::create_thread(&db, w2.id, "in-b", "feature", "claude").await.unwrap();
-        let v = call_global(&db, &asks, &bus, "list_issues", &json!({ "workspace_id": w1.id })).await;
-        let parsed: Value = serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
+        repo::create_thread(&db, w1.id, "in-a", "feature", "claude")
+            .await
+            .unwrap();
+        repo::create_thread(&db, w2.id, "in-b", "feature", "claude")
+            .await
+            .unwrap();
+        let v = call_global(
+            &db,
+            &asks,
+            &bus,
+            "list_issues",
+            &json!({ "workspace_id": w1.id }),
+        )
+        .await;
+        let parsed: Value =
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 1);
         assert_eq!(parsed[0]["title"], "in-a");
     }
@@ -360,10 +470,13 @@ mod tests {
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
         let w = repo::create_workspace(&db, "ws").await.unwrap();
-        let t = repo::create_thread(&db, w.id, "登录修复", "bugfix", "claude").await.unwrap();
+        let t = repo::create_thread(&db, w.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
         let (id, _rx) = asks.request(t.id, "10", "claude", "Run: npm test", "npm test");
         let v = call_global(&db, &asks, &bus, "pending_needs_you", &json!({})).await;
-        let parsed: Value = serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed[0]["ask_id"], id);
         assert_eq!(parsed[0]["thread_id"], t.id);
         assert_eq!(parsed[0]["thread_title"], "登录修复");
@@ -377,11 +490,17 @@ mod tests {
         let bus = BusRegistry::new();
         let (id, rx) = asks.request(1, "10", "claude", "Run: npm test", "npm test");
         let v = call_global(
-            &db, &asks, &bus, "answer_permission",
+            &db,
+            &asks,
+            &bus,
+            "answer_permission",
             &json!({ "ask_id": id, "verdict": "allow" }),
         )
         .await;
-        assert!(v["content"][0]["text"].as_str().unwrap().contains("answered"));
+        assert!(v["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("answered"));
         assert_eq!(rx.await.unwrap(), crate::ask::Decision::Allow);
     }
 
@@ -392,7 +511,10 @@ mod tests {
         let bus = BusRegistry::new();
         let (id, _rx) = asks.request(1, "10", "claude", "x", "x");
         let v = call_global(
-            &db, &asks, &bus, "answer_permission",
+            &db,
+            &asks,
+            &bus,
+            "answer_permission",
             &json!({ "ask_id": id, "verdict": "maybe" }),
         )
         .await;
@@ -406,11 +528,21 @@ mod tests {
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
         let w = repo::create_workspace(&db, "ws").await.unwrap();
-        let t = repo::create_thread(&db, w.id, "issue", "feature", "claude").await.unwrap();
+        let t = repo::create_thread(&db, w.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
         let _ = asks.request(t.id, "10", "claude", "a", "a");
         let _ = asks.request(t.id, "10", "claude", "b", "b");
-        let v = call_global(&db, &asks, &bus, "issue_status", &json!({ "thread_id": t.id })).await;
-        let parsed: Value = serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
+        let v = call_global(
+            &db,
+            &asks,
+            &bus,
+            "issue_status",
+            &json!({ "thread_id": t.id }),
+        )
+        .await;
+        let parsed: Value =
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["open_asks_count"], 2);
         assert_eq!(parsed["title"], "issue");
     }
@@ -422,11 +554,15 @@ mod tests {
         let bus = BusRegistry::new();
         let w = repo::create_workspace(&db, "ws").await.unwrap();
         let v = call_global(
-            &db, &asks, &bus, "create_issue",
+            &db,
+            &asks,
+            &bus,
+            "create_issue",
             &json!({ "workspace_id": w.id, "title": "new feature", "kind": "feature" }),
         )
         .await;
-        let parsed: Value = serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["title"], "new feature");
         assert_eq!(parsed["kind"], "feature");
         // confirm it landed in the DB
@@ -441,6 +577,9 @@ mod tests {
         let asks = AskRegistry::new();
         let bus = BusRegistry::new();
         let v = call_global(&db, &asks, &bus, "bogus", &json!({})).await;
-        assert!(v["content"][0]["text"].as_str().unwrap().contains("unknown tool"));
+        assert!(v["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool"));
     }
 }

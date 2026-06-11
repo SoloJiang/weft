@@ -1,7 +1,7 @@
 //! weft-managed skills: git-sourced, synced, injected into worker/lead cwds.
+pub mod inject;
 pub mod parse;
 pub mod sync;
-pub mod inject;
 
 use crate::skills::parse::{parse_source, ParsedSkill};
 use crate::store::{repo, Db};
@@ -82,18 +82,28 @@ pub async fn enabled_for_workspace(db: &Db, ws_id: i32) -> Result<Vec<EnabledSki
         .map(|e| (e.source_id, e.skill_name, e.scope))
         .collect();
     // key is already the i32 id rendered as string; map back trivially.
-    let tagged: Vec<(String, ParsedSkill)> =
-        parsed.into_iter().map(|(id, p)| (id.to_string(), p)).collect();
-    Ok(resolve_enabled(&tagged, &enables, ws_id, |k| k.parse().unwrap_or(-1)))
+    let tagged: Vec<(String, ParsedSkill)> = parsed
+        .into_iter()
+        .map(|(id, p)| (id.to_string(), p))
+        .collect();
+    Ok(resolve_enabled(&tagged, &enables, ws_id, |k| {
+        k.parse().unwrap_or(-1)
+    }))
 }
 
 /// Materialize the ws's enabled (non-overridden) skills into `cwd`. Best-effort.
 pub async fn inject_for(db: &Db, ws_id: i32, cwd: &Path) {
-    let Ok(enabled) = enabled_for_workspace(db, ws_id).await else { return };
+    let Ok(enabled) = enabled_for_workspace(db, ws_id).await else {
+        return;
+    };
     let active: Vec<ParsedSkill> = enabled
         .into_iter()
         .filter(|e| !e.overridden)
-        .map(|e| ParsedSkill { name: e.name, description: e.description, dir: e.dir })
+        .map(|e| ParsedSkill {
+            name: e.name,
+            description: e.description,
+            dir: e.dir,
+        })
         .collect();
     inject::materialize(&active, cwd);
 }
@@ -149,14 +159,35 @@ mod tests {
     #[tokio::test]
     async fn enabled_resolves_global_and_ws_and_dedupes_by_name() {
         let parsed = vec![
-            ("s1".to_string(), crate::skills::parse::ParsedSkill { name: "deploy".into(), description: "".into(), dir: "/a/deploy".into() }),
-            ("s2".to_string(), crate::skills::parse::ParsedSkill { name: "deploy".into(), description: "".into(), dir: "/b/deploy".into() }),
-            ("s1".to_string(), crate::skills::parse::ParsedSkill { name: "lint".into(), description: "".into(), dir: "/a/lint".into() }),
+            (
+                "s1".to_string(),
+                crate::skills::parse::ParsedSkill {
+                    name: "deploy".into(),
+                    description: "".into(),
+                    dir: "/a/deploy".into(),
+                },
+            ),
+            (
+                "s2".to_string(),
+                crate::skills::parse::ParsedSkill {
+                    name: "deploy".into(),
+                    description: "".into(),
+                    dir: "/b/deploy".into(),
+                },
+            ),
+            (
+                "s1".to_string(),
+                crate::skills::parse::ParsedSkill {
+                    name: "lint".into(),
+                    description: "".into(),
+                    dir: "/a/lint".into(),
+                },
+            ),
         ];
         // s1.deploy enabled globally; s2.deploy enabled in ws:1; s1.lint not enabled
         let enables = vec![
-            (1i32, "deploy".to_string(), "global".to_string()),   // source_id=1
-            (2i32, "deploy".to_string(), "ws:1".to_string()),     // source_id=2
+            (1i32, "deploy".to_string(), "global".to_string()), // source_id=1
+            (2i32, "deploy".to_string(), "ws:1".to_string()),   // source_id=2
         ];
         let by_id = |sid: &str| if sid == "s1" { 1 } else { 2 };
         let resolved = resolve_enabled(&parsed, &enables, 1, by_id);
@@ -166,7 +197,9 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name, "deploy");
         assert_eq!(active[0].dir, "/a/deploy");
-        assert!(resolved.iter().any(|e| e.name == "deploy" && e.dir == "/b/deploy" && e.overridden));
+        assert!(resolved
+            .iter()
+            .any(|e| e.name == "deploy" && e.dir == "/b/deploy" && e.overridden));
         // lint not enabled → absent
         assert!(!resolved.iter().any(|e| e.name == "lint"));
     }

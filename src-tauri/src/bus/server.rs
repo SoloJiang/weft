@@ -47,8 +47,14 @@ impl FromRef<ServerState> for AskRegistry {
 pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
     Router::new()
         .route("/bus/:thread/:dir/mcp", post(handle).get(get_not_allowed))
-        .route("/planner/:thread/mcp", post(handle_planner).get(get_not_allowed))
-        .route("/global/mcp", post(crate::bus::global::handle_global).get(get_not_allowed))
+        .route(
+            "/planner/:thread/mcp",
+            post(handle_planner).get(get_not_allowed),
+        )
+        .route(
+            "/global/mcp",
+            post(crate::bus::global::handle_global).get(get_not_allowed),
+        )
         .route("/ask/:thread/:dir", post(handle_ask).get(get_not_allowed))
         .route("/health", get(|| async { "ok" }))
         .with_state(ServerState { bus, db, asks })
@@ -73,7 +79,10 @@ async fn handle_ask(
     Json(req): Json<Value>,
 ) -> Response {
     let tool = q.get("tool").map(|s| s.as_str()).unwrap_or("claude");
-    let tool_name = req.get("tool_name").and_then(|v| v.as_str()).unwrap_or("tool");
+    let tool_name = req
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tool");
     let (summary, detail) = summarize(tool_name, req.get("tool_input"));
 
     // A standing rule (full access / always-allow) decides without surfacing.
@@ -116,7 +125,12 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
 /// claude (Bash / file_path) and opencode (bash / filePath, lowercase names):
 /// a command reads as "Run: …", a file op as "<tool> <file>".
 fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String) {
-    let s = |k: &str| input.and_then(|v| v.get(k)).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let s = |k: &str| {
+        input
+            .and_then(|v| v.get(k))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
     if let Some(cmd) = s("command") {
         let first = cmd.lines().next().unwrap_or("").to_string();
         return (format!("Run: {first}"), cmd);
@@ -214,7 +228,12 @@ fn text_result(s: String) -> Value {
 }
 
 fn call_tool(reg: &BusRegistry, thread: i32, me: &str, name: &str, args: &Value) -> Value {
-    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s = |k: &str| {
+        args.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     match name {
         "bus_post" => {
             reg.post(thread, me, &s("to"), &s("text"), "message");
@@ -269,8 +288,14 @@ async fn handle_planner(
         }),
         "tools/list" => json!({ "tools": planner_specs() }),
         "tools/call" => {
-            let name = req.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
-            let args = req.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
+            let name = req
+                .pointer("/params/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args = req
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             call_planner(&db, thread, name, &args).await
         }
         _ => json!({}),
@@ -285,9 +310,7 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "get_task" => match crate::store::repo::get_thread(db, thread).await {
-            Ok(Some(t)) => text_result(
-                json!({ "title": t.title, "type": t.kind }).to_string(),
-            ),
+            Ok(Some(t)) => text_result(json!({ "title": t.title, "type": t.kind }).to_string()),
             Ok(None) => text_result("error: thread not found".into()),
             Err(e) => text_result(format!("error: {e}")),
         },
@@ -304,9 +327,19 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
                         "count": n,
                     })
                     .to_string();
-                    let turn = crate::store::repo::next_turn_id(db, thread).await.unwrap_or(1) - 1;
+                    let turn = crate::store::repo::next_turn_id(db, thread)
+                        .await
+                        .unwrap_or(1)
+                        - 1;
                     if let Ok(m) = crate::store::repo::insert_lead_message(
-                        db, thread, None, turn.max(1), "system", "proposal", &content, "complete",
+                        db,
+                        thread,
+                        None,
+                        turn.max(1),
+                        "system",
+                        "proposal",
+                        &content,
+                        "complete",
                     )
                     .await
                     {
@@ -314,7 +347,10 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
                             use tauri::Emitter;
                             let _ = app.emit(
                                 crate::lead_chat::engine::EVENT,
-                                crate::lead_chat::engine::Push::Message { thread_id: thread, message: m },
+                                crate::lead_chat::engine::Push::Message {
+                                    thread_id: thread,
+                                    message: m,
+                                },
                             );
                         }
                     }

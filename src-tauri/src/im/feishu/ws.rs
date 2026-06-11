@@ -1,13 +1,13 @@
 //! 飞书长连接：事件 → 归一化 Inbound。启动调用以 open-lark 0.14 实测 API：
 //! `LarkWsClient::open(Arc<Config>, EventDispatcherHandler)`，阻塞到连接结束；
-//! 断线由外层循环指数退避重连。M1 默认无卡片按钮（CARD_BUTTONS=false），
-//! 故只订阅 im.message.receive_v1；按钮回调（Action）随 spike 结论 A 再加。
+//! 断线由外层循环指数退避重连。当前默认无卡片按钮（CARD_BUTTONS=false），
+//! 故只订阅 im.message.receive_v1；按钮回调（Action）等开关打开时再注册。
 
 use crate::im::inbound::Inbound;
 use open_lark::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// "text" 消息的 content 是 {"text":"..."}；其余类型 M1 不收。纯函数。
+/// "text" 消息的 content 是 {"text":"..."}；其余类型不收。纯函数。
 pub fn text_of(message_type: &str, content: &str) -> Option<String> {
     if message_type != "text" {
         return None;
@@ -67,6 +67,13 @@ pub async fn run_ws(
                 &m.message_type,
                 &m.content,
             ) {
+                eprintln!(
+                    "[weft][im] inbound feishu text chat_type={} chat_id={} thread_id={} message_id={}",
+                    m.chat_type,
+                    m.chat_id,
+                    m.thread_id.as_deref().unwrap_or("-"),
+                    m.message_id
+                );
                 let _ = tx.send(inb);
             }
         })
@@ -84,7 +91,10 @@ mod tests {
 
     #[test]
     fn text_of_parses_text_and_rejects_others() {
-        assert_eq!(text_of("text", r#"{"text":"允许"}"#).as_deref(), Some("允许"));
+        assert_eq!(
+            text_of("text", r#"{"text":"允许"}"#).as_deref(),
+            Some("允许")
+        );
         assert_eq!(text_of("image", r#"{"image_key":"k"}"#), None);
         assert_eq!(text_of("text", "not json"), None);
         // text 类型但缺 text 字段 → None（不 panic）
@@ -147,9 +157,16 @@ mod tests {
 
     #[test]
     fn to_inbound_drops_non_text() {
-        assert!(
-            to_inbound("ou_a", "p2p", "oc_dm", None, "om_1", None, "image", r#"{"image_key":"k"}"#)
-                .is_none()
-        );
+        assert!(to_inbound(
+            "ou_a",
+            "p2p",
+            "oc_dm",
+            None,
+            "om_1",
+            None,
+            "image",
+            r#"{"image_key":"k"}"#
+        )
+        .is_none());
     }
 }

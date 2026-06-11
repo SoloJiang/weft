@@ -210,7 +210,9 @@ mod tests {
         assert_eq!(effective.len(), 1);
         assert_eq!(effective[0].layer, "repo");
         // and weft-workspace beats weft-global beats personal in the shadow order
-        assert!(out.iter().any(|i| i.layer == "weft-workspace" && i.overridden));
+        assert!(out
+            .iter()
+            .any(|i| i.layer == "weft-workspace" && i.overridden));
         assert!(out.iter().any(|i| i.layer == "weft-global" && i.overridden));
 
         // weft-workspace shadows weft-global shadows personal when no repo skill exists
@@ -240,7 +242,9 @@ mod tests {
         let planner: Vec<_> = out.iter().filter(|i| i.name == "planner").collect();
         assert_eq!(planner.len(), 2);
         assert!(planner.iter().any(|i| i.layer == "repo" && !i.overridden));
-        assert!(planner.iter().any(|i| i.layer == "personal" && i.overridden));
+        assert!(planner
+            .iter()
+            .any(|i| i.layer == "personal" && i.overridden));
         // repo-only skill + repo rule present
         assert!(out.iter().any(|i| i.name == "deploy" && i.kind == "skill"));
         assert!(out.iter().any(|i| i.kind == "rule" && i.layer == "repo"));

@@ -1,9 +1,10 @@
-//! The chat engine: one long-lived headless `claude -p` stream-json process per
-//! timeline (lead = `-thread_id`, chat-mode worker = `session_id`). stdin takes
-//! user messages; stdout is parsed (proto.rs), persisted (lead_message), and
+//! The chat engine: each timeline (lead = `-thread_id`, chat-mode worker =
+//! `session_id`) runs through the selected tool stored on the thread/session.
+//! Claude keeps a long-lived stream-json process; codex/opencode spawn one
+//! process per turn. stdout is parsed (proto.rs), persisted (lead_message), and
 //! pushed to the frontend over the `lead-chat` Tauri event. Interrupt rides the
-//! protocol's control_request (verified live), with a kill fallback; a dead
-//! process resumes losslessly via `--resume <native_id>` on the next send.
+//! tool protocol when available, with a kill fallback; a dead process resumes
+//! via the stored native session id on the next send.
 
 use crate::store::{repo, Db};
 use std::collections::{HashMap, VecDeque};
@@ -100,7 +101,7 @@ impl TurnState {
 /// Per-turn dialects (codex `exec --json`, opencode `run --format json`) spawn
 /// one process per human turn; only claude keeps a long-lived stream process.
 pub fn per_turn(tool: &str) -> bool {
-    tool != "claude"
+    matches!(tool, "codex" | "opencode")
 }
 
 /// Watchdog clocks for the in-flight turn (§7 跑飞护栏). An idle engine burns
@@ -114,7 +115,10 @@ pub struct TurnClock {
 
 impl Default for TurnClock {
     fn default() -> Self {
-        Self { started: None, last_activity: std::time::Instant::now() }
+        Self {
+            started: None,
+            last_activity: std::time::Instant::now(),
+        }
     }
 }
 
@@ -175,7 +179,11 @@ pub struct LeadChatState(pub std::sync::Mutex<HashMap<i64, EngineRef>>);
 
 impl LeadChatState {
     pub fn get(&self, key: i64) -> Option<EngineRef> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
     }
 
     /// Atomic get-or-insert: concurrent constructors (e.g. React StrictMode's
@@ -219,6 +227,9 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     let mut inner = eng.lock().await;
     if per_turn(&inner.tool) {
         return Ok(());
+    }
+    if inner.tool != "claude" {
+        anyhow::bail!("unknown lead tool {}", inner.tool);
     }
     if let Some(c) = inner.child.as_mut() {
         if c.try_wait().ok().flatten().is_none() {
@@ -328,9 +339,16 @@ pub async fn send(
     } else {
         serde_json::json!({ "text": text, "images": image_uris, "files": files }).to_string()
     };
-    let m = repo::insert_lead_message(db, thread_id, sid, turn, "user", kind, &content, status).await?;
+    let m =
+        repo::insert_lead_message(db, thread_id, sid, turn, "user", kind, &content, status).await?;
     let row_id = m.id;
-    let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+    let _ = app.emit(
+        EVENT,
+        Push::Message {
+            thread_id,
+            message: m,
+        },
+    );
     let mut outbound = text.to_string();
     if !files.is_empty() {
         outbound.push_str("\n\nAttached files (read them as needed):\n");
@@ -358,7 +376,11 @@ pub async fn send(
     } else {
         images
     };
-    let out = Outgoing { text: outbound, images, tracked: true };
+    let out = Outgoing {
+        text: outbound,
+        images,
+        tracked: true,
+    };
     let spawn_now = direct && per_turn(&inner.tool);
     if direct && !spawn_now {
         write_user(&mut inner, &out).await;
@@ -399,7 +421,7 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
             }
             ("codex".into(), a)
         }
-        _ => {
+        "opencode" => {
             // opencode: cwd is the project; injections live in its merged config.
             let mut a: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
             if let Some(id) = &inner.native_id {
@@ -408,6 +430,7 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
             }
             ("opencode".into(), a)
         }
+        other => anyhow::bail!("unknown per-turn lead tool {other}"),
     };
     args.push(out.text.clone());
     let mut child = Command::new(&program)
@@ -484,7 +507,11 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
 pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> anyhow::Result<()> {
     ensure_running(app, db, eng).await?;
     let mut inner = eng.lock().await;
-    let out = Outgoing { text: text.to_string(), images: vec![], tracked: false };
+    let out = Outgoing {
+        text: text.to_string(),
+        images: vec![],
+        tracked: false,
+    };
     if inner.turn.try_begin_send() {
         inner.turn_id += 1;
         inner.clock.begin_turn();
@@ -649,19 +676,28 @@ fn spawn_reader(
                     } else {
                         let _ = repo::set_lead_native_id(&db, thread_id, &native).await;
                     }
-                    let _ = app.emit(EVENT, Push::Init {
-                        thread_id,
-                        session_id: inner.session_id,
-                        native_id: native,
-                        slash_commands: inner.slash_commands.clone(),
-                    });
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Init {
+                            thread_id,
+                            session_id: inner.session_id,
+                            native_id: native,
+                            slash_commands: inner.slash_commands.clone(),
+                        },
+                    );
                 }
             }
-            if !matches!(super::proto::parse_line_for(&inner.tool, &line), super::proto::ChatEvent::Other) {
+            if !matches!(
+                super::proto::parse_line_for(&inner.tool, &line),
+                super::proto::ChatEvent::Other
+            ) {
                 saw_event = true;
             }
             match super::proto::parse_line_for(&inner.tool, &line) {
-                super::proto::ChatEvent::Init { session_id, slash_commands } => {
+                super::proto::ChatEvent::Init {
+                    session_id,
+                    slash_commands,
+                } => {
                     inner.native_id = Some(session_id.clone());
                     inner.slash_commands = slash_commands.clone();
                     if let Some(sid) = inner.session_id {
@@ -669,21 +705,27 @@ fn spawn_reader(
                     } else {
                         let _ = repo::set_lead_native_id(&db, thread_id, &session_id).await;
                     }
-                    let _ = app.emit(EVENT, Push::Init {
-                        thread_id,
-                        session_id: inner.session_id,
-                        native_id: session_id,
-                        slash_commands,
-                    });
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Init {
+                            thread_id,
+                            session_id: inner.session_id,
+                            native_id: session_id,
+                            slash_commands,
+                        },
+                    );
                 }
                 super::proto::ChatEvent::Commands { commands } => {
                     inner.slash_commands = commands.clone();
-                    let _ = app.emit(EVENT, Push::Init {
-                        thread_id,
-                        session_id: inner.session_id,
-                        native_id: inner.native_id.clone().unwrap_or_default(),
-                        slash_commands: commands,
-                    });
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Init {
+                            thread_id,
+                            session_id: inner.session_id,
+                            native_id: inner.native_id.clone().unwrap_or_default(),
+                            slash_commands: commands,
+                        },
+                    );
                 }
                 super::proto::ChatEvent::TextDelta { text } => {
                     let sid = inner.session_id;
@@ -695,8 +737,14 @@ fn spawn_reader(
                         }
                         None => {
                             let Ok(m) = repo::insert_lead_message(
-                                &db, thread_id, sid, turn, "assistant", "text",
-                                r#"{"text":""}"#, "streaming",
+                                &db,
+                                thread_id,
+                                sid,
+                                turn,
+                                "assistant",
+                                "text",
+                                r#"{"text":""}"#,
+                                "streaming",
                             )
                             .await
                             else {
@@ -704,7 +752,13 @@ fn spawn_reader(
                             };
                             let id = m.id;
                             inner.current = Some((id, text.clone(), std::time::Instant::now()));
-                            let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                            let _ = app.emit(
+                                EVENT,
+                                Push::Message {
+                                    thread_id,
+                                    message: m,
+                                },
+                            );
                             id
                         }
                     };
@@ -713,10 +767,18 @@ fn spawn_reader(
                         if c.2.elapsed().as_millis() >= 500 {
                             c.2 = std::time::Instant::now();
                             let content = serde_json::json!({ "text": c.1 }).to_string();
-                            let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
+                            let _ =
+                                repo::update_lead_message(&db, row, &content, "streaming").await;
                         }
                     }
-                    let _ = app.emit(EVENT, Push::Delta { thread_id, message_id: row, text });
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Delta {
+                            thread_id,
+                            message_id: row,
+                            text,
+                        },
+                    );
                 }
                 super::proto::ChatEvent::Assistant { texts, tools } => {
                     // A finished text block: finalize the streaming row with the
@@ -736,21 +798,40 @@ fn spawn_reader(
                         let content = serde_json::json!({ "text": clean }).to_string();
                         match inner.current.take() {
                             Some((id, _, _)) => {
-                                let _ = repo::update_lead_message(&db, id, &content, "complete").await;
-                                let _ = app.emit(EVENT, Push::Finalize {
-                                    thread_id, message_id: id, status: "complete".into(),
-                                });
+                                let _ =
+                                    repo::update_lead_message(&db, id, &content, "complete").await;
+                                let _ = app.emit(
+                                    EVENT,
+                                    Push::Finalize {
+                                        thread_id,
+                                        message_id: id,
+                                        status: "complete".into(),
+                                    },
+                                );
                                 emit_lead_out(&app, thread_id, id, &clean);
                             }
                             None => {
                                 let (sid, turn) = (inner.session_id, inner.turn_id);
                                 if let Ok(m) = repo::insert_lead_message(
-                                    &db, thread_id, sid, turn, "assistant", "text", &content, "complete",
+                                    &db,
+                                    thread_id,
+                                    sid,
+                                    turn,
+                                    "assistant",
+                                    "text",
+                                    &content,
+                                    "complete",
                                 )
                                 .await
                                 {
                                     let mid = m.id;
-                                    let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                                    let _ = app.emit(
+                                        EVENT,
+                                        Push::Message {
+                                            thread_id,
+                                            message: m,
+                                        },
+                                    );
                                     emit_lead_out(&app, thread_id, mid, &clean);
                                 }
                             }
@@ -810,7 +891,8 @@ fn spawn_reader(
                                         }
                                     };
                                     if let Some(workspace_id) = ws_id {
-                                        let repos = match repo::list_repos(&db, workspace_id).await {
+                                        let repos = match repo::list_repos(&db, workspace_id).await
+                                        {
                                             Ok(r) => r,
                                             Err(e) => {
                                                 eprintln!(
@@ -857,12 +939,15 @@ fn spawn_reader(
                     // Tool calls are transient activity, not timeline rows:
                     // show the one currently running, gone when the turn moves on.
                     for (name, summary) in tools {
-                        let _ = app.emit(EVENT, Push::Activity {
-                            thread_id,
-                            session_id: inner.session_id,
-                            name,
-                            summary,
-                        });
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Activity {
+                                thread_id,
+                                session_id: inner.session_id,
+                                name,
+                                summary,
+                            },
+                        );
                     }
                 }
                 super::proto::ChatEvent::TurnEnd { is_error } => {
@@ -876,14 +961,20 @@ fn spawn_reader(
                     inner.interrupting = false;
                     if let Some((id, text, _)) = inner.current.take() {
                         let _ = repo::update_lead_message(
-                            &db, id,
+                            &db,
+                            id,
                             &serde_json::json!({ "text": text }).to_string(),
                             status,
                         )
                         .await;
-                        let _ = app.emit(EVENT, Push::Finalize {
-                            thread_id, message_id: id, status: status.into(),
-                        });
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Finalize {
+                                thread_id,
+                                message_id: id,
+                                status: status.into(),
+                            },
+                        );
                         if status == "complete" {
                             emit_lead_out(&app, thread_id, id, &text);
                         }
@@ -905,12 +996,15 @@ fn spawn_reader(
                     let still_busy = inner.turn.busy;
                     inner.clock.on_turn_end(still_busy);
                     let state = if still_busy { "busy" } else { "idle" };
-                    let _ = app.emit(EVENT, Push::Turn {
-                        thread_id,
-                        session_id: inner.session_id,
-                        state: state.into(),
-                        queued: inner.turn.queue.len(),
-                    });
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Turn {
+                            thread_id,
+                            session_id: inner.session_id,
+                            state: state.into(),
+                            queued: inner.turn.queue.len(),
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -920,7 +1014,11 @@ fn spawn_reader(
         // next send resumes.
         let mut inner = eng.lock().await;
         if inner.generation == generation && per_turn(&inner.tool) {
-            let status = if inner.interrupting { "interrupted" } else { "complete" };
+            let status = if inner.interrupting {
+                "interrupted"
+            } else {
+                "complete"
+            };
             inner.interrupting = false;
             // A turn that produced ZERO events died on startup (auth, bad args,
             // session lock …) — surface it instead of completing silently.
@@ -942,14 +1040,20 @@ fn spawn_reader(
             }
             if let Some((id, text, _)) = inner.current.take() {
                 let _ = repo::update_lead_message(
-                    &db, id,
+                    &db,
+                    id,
                     &serde_json::json!({ "text": text }).to_string(),
                     status,
                 )
                 .await;
-                let _ = app.emit(EVENT, Push::Finalize {
-                    thread_id: inner.thread_id, message_id: id, status: status.into(),
-                });
+                let _ = app.emit(
+                    EVENT,
+                    Push::Finalize {
+                        thread_id: inner.thread_id,
+                        message_id: id,
+                        status: status.into(),
+                    },
+                );
                 // 仅 complete 才回流 IM——interrupted/error 的半截不应上桥。
                 if status == "complete" {
                     emit_lead_out(&app, inner.thread_id, id, &text);
@@ -969,39 +1073,55 @@ fn spawn_reader(
             let still_busy = inner.turn.busy;
             inner.clock.on_turn_end(still_busy);
             let state = if still_busy { "busy" } else { "idle" };
-            let _ = app.emit(EVENT, Push::Turn {
-                thread_id: inner.thread_id,
-                session_id: inner.session_id,
-                state: state.into(),
-                queued: inner.turn.queue.len(),
-            });
+            let _ = app.emit(
+                EVENT,
+                Push::Turn {
+                    thread_id: inner.thread_id,
+                    session_id: inner.session_id,
+                    state: state.into(),
+                    queued: inner.turn.queue.len(),
+                },
+            );
             return;
         }
         if inner.generation == generation {
             // A row still streaming at death closes as interrupted/error.
-            let status = if inner.interrupting { "interrupted" } else { "error" };
+            let status = if inner.interrupting {
+                "interrupted"
+            } else {
+                "error"
+            };
             inner.interrupting = false;
             if let Some((id, text, _)) = inner.current.take() {
                 let _ = repo::update_lead_message(
-                    &db, id,
+                    &db,
+                    id,
                     &serde_json::json!({ "text": text }).to_string(),
                     status,
                 )
                 .await;
-                let _ = app.emit(EVENT, Push::Finalize {
-                    thread_id: inner.thread_id, message_id: id, status: status.into(),
-                });
+                let _ = app.emit(
+                    EVENT,
+                    Push::Finalize {
+                        thread_id: inner.thread_id,
+                        message_id: id,
+                        status: status.into(),
+                    },
+                );
             }
             inner.child = None;
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
-            let _ = app.emit(EVENT, Push::Turn {
-                thread_id: inner.thread_id,
-                session_id: inner.session_id,
-                state: "stopped".into(),
-                queued: 0,
-            });
+            let _ = app.emit(
+                EVENT,
+                Push::Turn {
+                    thread_id: inner.thread_id,
+                    session_id: inner.session_id,
+                    state: "stopped".into(),
+                    queued: 0,
+                },
+            );
         }
     });
 }
@@ -1032,7 +1152,11 @@ mod tests {
         let mut t = TurnState::default();
         assert!(t.try_begin_send()); // idle → busy: send through
         assert!(!t.try_begin_send()); // busy: enqueue
-        t.queue.push_back(Outgoing { text: "second".into(), images: vec![], tracked: true });
+        t.queue.push_back(Outgoing {
+            text: "second".into(),
+            images: vec![],
+            tracked: true,
+        });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
         assert!(t.busy); // popped → still busy
@@ -1085,6 +1209,14 @@ mod tests {
         assert_eq!(human_dur(7200), "2h");
         assert_eq!(human_dur(1800), "30min");
         assert_eq!(human_dur(45), "45s");
+    }
+
+    #[test]
+    fn per_turn_only_accepts_known_per_turn_tools() {
+        assert!(!per_turn("claude"));
+        assert!(per_turn("codex"));
+        assert!(per_turn("opencode"));
+        assert!(!per_turn("mystery"));
     }
 
     #[test]

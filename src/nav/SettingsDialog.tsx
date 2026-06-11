@@ -367,27 +367,48 @@ function AutomationSettings() {
 function ImSettings() {
   const { t } = useTranslation();
   const [appId, setAppId] = useState("");
+  const [savedAppId, setSavedAppId] = useState("");
   const [secret, setSecret] = useState("");
   const [hasSecret, setHasSecret] = useState(false);
   const [bound, setBound] = useState(false);
+  const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState("disabled");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
       setAppId(s.app_id);
+      setSavedAppId(s.app_id);
       setHasSecret(s.has_secret);
       setBound(s.bound);
+      setEnabled(s.enabled);
     });
     void api.imStatus().then(setStatus);
     const id = setInterval(() => void api.imStatus().then(setStatus), 3000);
     return () => clearInterval(id);
   }, []);
 
-  async function save() {
+  // 开关 = 启用/断开。乐观翻转：展开/收起即时响应，后台再落库重启桥。
+  async function toggle(on: boolean) {
+    const prev = enabled;
+    setEnabled(on);
+    try {
+      await api.imSetEnabled(on);
+      void api.imStatus().then(setStatus);
+    } catch (err) {
+      setEnabled(prev);
+      throw err;
+    }
+  }
+
+  // 已连接卡片常驻展开，所以编辑即就地改；有未提交改动才点亮「重新连接」。
+  const dirty = appId.trim() !== savedAppId.trim() || secret.length > 0;
+
+  async function reconnect() {
     setSaving(true);
     try {
       await api.imSetSettings(appId, secret);
+      setSavedAppId(appId);
       if (secret.length > 0) setHasSecret(true);
       setSecret("");
       void api.imStatus().then(setStatus);
@@ -396,59 +417,108 @@ function ImSettings() {
     }
   }
 
-  // 连接状态点：online 绿、connecting 黄、error 红、disabled 灰。
-  const dot = status.startsWith("online")
+  const online = status.startsWith("online");
+  const connecting = status.startsWith("connecting");
+  const errored = status.startsWith("error");
+  const dot = online
     ? "bg-success"
-    : status.startsWith("connecting")
+    : connecting
       ? "bg-waiting"
-      : status.startsWith("error")
+      : errored
         ? "bg-danger"
         : "bg-ink-faint";
+  const statusTone = online
+    ? "border-success/30 bg-success/15 text-success"
+    : connecting
+      ? "border-waiting/30 bg-waiting/15 text-waiting"
+      : errored
+        ? "border-danger/30 bg-danger/15 text-danger"
+        : "border-border bg-bg text-ink-faint";
+  const statusText = online
+    ? t("settings.imOnline")
+    : connecting
+      ? t("settings.imConnecting")
+      : errored
+        ? t("settings.imError")
+        : t("settings.imOffline");
 
   return (
     <div className="flex flex-col gap-10">
-      <SettingsGroup title={t("settings.imGroup")}>
-        <SettingRow label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
-          <Input
-            value={appId}
-            placeholder="cli_xxxxxxxxxxxx"
-            onChange={(e) => setAppId(e.currentTarget.value)}
-            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
-          />
-        </SettingRow>
-        <SettingRow label={t("settings.imAppSecret")} hint={t("settings.imAppSecretHint")}>
-          <Input
-            type="password"
-            value={secret}
-            placeholder={hasSecret ? "••••••••" : ""}
-            onChange={(e) => setSecret(e.currentTarget.value)}
-            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
-          />
-        </SettingRow>
-        <SettingRow label={t("settings.imStatusLabel")}>
-          <div className="flex flex-col items-end gap-1">
-            <span className="flex items-center gap-1.5 text-[12px] text-ink-muted">
-              <span className={cn("h-2 w-2 rounded-full", dot)} />
-              {status}
-            </span>
-            <span className="text-[11px] text-ink-faint">
-              {bound ? t("settings.imBound") : t("settings.imUnbound")}
-            </span>
+      <div className="rounded-[var(--radius-lg)] border border-border bg-surface">
+        <div className="flex items-center gap-3 px-4 py-3.5">
+          <div className="grid h-8 w-8 shrink-0 place-items-center rounded-[var(--radius-md)] bg-bg text-ink-muted">
+            <MessageSquare size={16} />
           </div>
-        </SettingRow>
-      </SettingsGroup>
-      <div className="flex justify-end">
-        <Button variant="primary" onClick={() => void save()} disabled={saving}>
-          {saving ? t("settings.imSaving") : t("settings.imSave")}
-        </Button>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-semibold text-ink">{t("settings.imProvider")}</span>
+              {enabled && (
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium tabular-nums",
+                    statusTone,
+                  )}
+                >
+                  <span className={cn("h-1.5 w-1.5 rounded-full", dot)} />
+                  {statusText}
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 text-[12px] text-ink-faint">
+              {enabled
+                ? bound
+                  ? t("settings.imBound")
+                  : t("settings.imUnbound")
+                : t("settings.imCollapsedHint")}
+            </p>
+          </div>
+          <Toggle on={enabled} onChange={(v) => void toggle(v)} label={t("settings.imProvider")} />
+        </div>
+
+        {enabled && (
+          <div className="flex flex-col gap-4 border-t border-border px-4 py-4">
+            <ImField label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
+              <Input
+                value={appId}
+                placeholder="cli_xxxxxxxxxxxx"
+                onChange={(e) => setAppId(e.currentTarget.value)}
+                className="h-8 w-full bg-bg/80 font-mono text-[12px]"
+              />
+            </ImField>
+            <ImField label={t("settings.imAppSecret")} hint={t("settings.imAppSecretHint")}>
+              <Input
+                type="password"
+                value={secret}
+                placeholder={hasSecret ? "••••••••" : ""}
+                onChange={(e) => setSecret(e.currentTarget.value)}
+                className="h-8 w-full bg-bg/80 font-mono text-[12px]"
+              />
+            </ImField>
+            <div className="flex justify-end">
+              <Button variant="primary" onClick={() => void reconnect()} disabled={saving || !dirty}>
+                {online ? t("settings.imReconnect") : t("settings.imConnect")}
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
       <ImRoutes />
     </div>
   );
 }
 
-/** 已绑定的 issue ↔ 飞书话题映射；提供解绑入口。绑定动作走「在飞书话题里
- *  发 `/bind <thread_id>` 给 bot」的入站协议（计划中）；MVP 阶段只读 + 解绑。 */
+function ImField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="text-[12.5px] font-medium text-ink">{label}</div>
+      {children}
+      {hint && <p className="text-[11.5px] leading-relaxed text-ink-faint">{hint}</p>}
+    </div>
+  );
+}
+
+/** 已绑定的 issue ↔ 飞书话题映射；绑定动作走「在飞书话题里
+ *  发 `/bind <thread_id>` 给 bot」的入站协议；Settings 提供查看与解绑。 */
 function ImRoutes() {
   const { t } = useTranslation();
   const [rows, setRows] = useState<import("../lib/types").ImRoute[]>([]);

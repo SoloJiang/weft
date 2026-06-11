@@ -11,11 +11,17 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn env_secs(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// Canonicalize for robust path comparison (resolves macOS /var→/private/var
@@ -29,8 +35,13 @@ fn canon_str(p: &Path) -> String {
 
 /// Dir mtime in unix secs, None if unreadable (→ "unknown age" = never swept).
 fn dir_mtime_secs(p: &Path) -> Option<u64> {
-    std::fs::metadata(p).ok()?.modified().ok()?
-        .duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+    std::fs::metadata(p)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// True iff `path_canon` is at or under `home_canon` with a real path boundary
@@ -99,7 +110,13 @@ pub async fn sweep_orphan_worktrees(db: &Db, ttl_secs: u64) -> anyhow::Result<us
     let mut removed = 0;
     for ws in repo::list_workspaces(db).await? {
         for r in repo::list_repos(db, ws.id).await? {
-            removed += sweep_repo(Path::new(&r.local_git_path), &home_canon, &tracked, ttl_secs, now);
+            removed += sweep_repo(
+                Path::new(&r.local_git_path),
+                &home_canon,
+                &tracked,
+                ttl_secs,
+                now,
+            );
         }
     }
     Ok(removed)
@@ -132,25 +149,67 @@ mod tests {
 
     #[test]
     fn sweeps_untracked_old_under_home() {
-        assert!(should_sweep("/h/worktrees/ws/t/d/repo", "/h/worktrees", &set(&[]), 100, 1000, Some(800)));
+        assert!(should_sweep(
+            "/h/worktrees/ws/t/d/repo",
+            "/h/worktrees",
+            &set(&[]),
+            100,
+            1000,
+            Some(800)
+        ));
     }
     #[test]
     fn never_sweeps_tracked() {
         let t = set(&["/h/worktrees/ws/t/d/repo"]);
-        assert!(!should_sweep("/h/worktrees/ws/t/d/repo", "/h/worktrees", &t, 100, 10_000, Some(0)));
+        assert!(!should_sweep(
+            "/h/worktrees/ws/t/d/repo",
+            "/h/worktrees",
+            &t,
+            100,
+            10_000,
+            Some(0)
+        ));
     }
     #[test]
     fn never_sweeps_outside_home() {
-        assert!(!should_sweep("/h/some-real-repo", "/h/worktrees", &set(&[]), 100, 10_000, Some(0)));
-        assert!(!should_sweep("/h/worktrees-evil/x", "/h/worktrees", &set(&[]), 100, 10_000, Some(0)));
+        assert!(!should_sweep(
+            "/h/some-real-repo",
+            "/h/worktrees",
+            &set(&[]),
+            100,
+            10_000,
+            Some(0)
+        ));
+        assert!(!should_sweep(
+            "/h/worktrees-evil/x",
+            "/h/worktrees",
+            &set(&[]),
+            100,
+            10_000,
+            Some(0)
+        ));
     }
     #[test]
     fn never_sweeps_too_new() {
-        assert!(!should_sweep("/h/worktrees/x", "/h/worktrees", &set(&[]), 100, 1000, Some(950)));
+        assert!(!should_sweep(
+            "/h/worktrees/x",
+            "/h/worktrees",
+            &set(&[]),
+            100,
+            1000,
+            Some(950)
+        ));
     }
     #[test]
     fn unknown_mtime_is_kept() {
-        assert!(!should_sweep("/h/worktrees/x", "/h/worktrees", &set(&[]), 100, 10_000, None));
+        assert!(!should_sweep(
+            "/h/worktrees/x",
+            "/h/worktrees",
+            &set(&[]),
+            100,
+            10_000,
+            None
+        ));
     }
     #[test]
     fn is_under_equality_and_boundary() {

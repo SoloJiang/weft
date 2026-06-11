@@ -22,14 +22,20 @@ impl FeishuChannel {
         Self { client }
     }
 
-    /// 发 p2p 消息（msg_type 由调用方定，content 为序列化好的 JSON 字符串）。
+    /// 发消息（msg_type 由调用方定，content 为序列化好的 JSON 字符串）。
     /// 返回飞书 message_id。
-    async fn create(&self, open_id: &str, msg_type: &str, content: String) -> anyhow::Result<String> {
+    async fn create(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: String,
+    ) -> anyhow::Result<String> {
         let req = CreateMessageRequest::builder()
-            .receive_id_type("open_id")
+            .receive_id_type(receive_id_type)
             .request_body(
                 CreateMessageRequestBody::builder()
-                    .receive_id(open_id)
+                    .receive_id(receive_id)
                     .msg_type(msg_type)
                     .content(content)
                     .build(),
@@ -50,7 +56,8 @@ impl FeishuChannel {
 #[async_trait::async_trait]
 impl super::Channel for FeishuChannel {
     async fn send_card(&self, open_id: &str, card: serde_json::Value) -> anyhow::Result<String> {
-        self.create(open_id, "interactive", card.to_string()).await
+        self.create("open_id", open_id, "interactive", card.to_string())
+            .await
     }
 
     async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()> {
@@ -67,8 +74,13 @@ impl super::Channel for FeishuChannel {
 
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
         let content = serde_json::json!({ "text": text }).to_string();
-        self.create(open_id, "text", content).await?;
+        self.create("open_id", open_id, "text", content).await?;
         Ok(())
+    }
+
+    async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
+        let content = serde_json::json!({ "text": text }).to_string();
+        self.create("chat_id", chat_id, "text", content).await
     }
 
     async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
@@ -110,11 +122,7 @@ impl super::Channel for FeishuChannel {
         Ok(String::new())
     }
 
-    async fn delete_reaction(
-        &self,
-        message_id: &str,
-        reaction_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> anyhow::Result<()> {
         if reaction_id.is_empty() {
             return Ok(()); // add_reaction 没回 id：跳过 delete。
         }

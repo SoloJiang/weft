@@ -12,32 +12,48 @@ pub const K_APP_ID: &str = "im.feishu.app_id";
 pub const K_APP_SECRET: &str = "im.feishu.app_secret";
 /// 白名单：逗号分隔的飞书 open_id；空 = 未绑定（首个私聊发送者自动绑定）。
 pub const K_ALLOW: &str = "im.feishu.allow_open_ids";
+/// 启用开关：用户可不删凭证地断开桥。键从未写过时默认「双凭证齐全即开」，
+/// 保住升级前「凭证齐全即跑」的老用户不被这次改动断连。
+pub const K_ENABLED: &str = "im.feishu.enabled";
 
 #[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
     pub app_id: String,
     pub app_secret: String,
     pub allow_open_ids: Vec<String>,
+    /// 用户是否启用了桥（独立于凭证是否齐全）。off = 保留凭证但断开。
+    pub enabled: bool,
 }
 
 impl std::fmt::Debug for ImSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImSettings")
             .field("app_id", &self.app_id)
-            .field("app_secret", &if self.app_secret.is_empty() { "" } else { "***" })
+            .field(
+                "app_secret",
+                &if self.app_secret.is_empty() {
+                    ""
+                } else {
+                    "***"
+                },
+            )
             .field("allow_open_ids", &self.allow_open_ids)
+            .field("enabled", &self.enabled)
             .finish()
     }
 }
 
 impl ImSettings {
-    /// 桥能否启动：双凭证齐全即跑——无独立 enable 开关（spec MVP 单机即信任边界）。
+    /// 凭证是否齐全（与 enable 开关正交）。桥真正启动还需 `enabled`，见 [`spawn`]。
     pub fn ready(&self) -> bool {
         !self.app_id.is_empty() && !self.app_secret.is_empty()
     }
 
     pub fn parse_allow(s: &str) -> Vec<String> {
-        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
     }
 
     /// 从 app_setting 读取设置。「键不存在」是默认值；DB 错误原样传播。
@@ -48,10 +64,20 @@ impl ImSettings {
         let g = |k: &'static str| async move {
             anyhow::Ok(get_setting(db, k).await?.unwrap_or_default())
         };
+        let app_id: String = g(K_APP_ID).await?;
+        let app_secret: String = g(K_APP_SECRET).await?;
+        let allow_open_ids = Self::parse_allow(&g(K_ALLOW).await?);
+        // 键写过就用其值；从未写过则回落到「凭证齐全即开」——保住升级前老用户。
+        let has_creds = !app_id.is_empty() && !app_secret.is_empty();
+        let enabled = match get_setting(db, K_ENABLED).await? {
+            Some(v) => v == "1" || v == "true",
+            None => has_creds,
+        };
         Ok(Self {
-            app_id: g(K_APP_ID).await?,
-            app_secret: g(K_APP_SECRET).await?,
-            allow_open_ids: Self::parse_allow(&g(K_ALLOW).await?),
+            app_id,
+            app_secret,
+            allow_open_ids,
+            enabled,
         })
     }
 }
@@ -75,18 +101,26 @@ pub struct CardIndex {
 
 impl CardIndex {
     pub fn record_perm(&mut self, ask_id: u64, message_id: &str, summary: &str) {
-        if let Some((old, _)) =
-            self.perm_msg.insert(ask_id, (message_id.to_string(), summary.to_string()))
+        if let Some((old, _)) = self
+            .perm_msg
+            .insert(ask_id, (message_id.to_string(), summary.to_string()))
         {
             self.by_message.remove(&old);
         }
-        self.by_message.insert(message_id.to_string(), ReplyTarget::Perm { ask_id });
+        self.by_message
+            .insert(message_id.to_string(), ReplyTarget::Perm { ask_id });
     }
     pub fn record_human(&mut self, thread: i32, ask_id: u64, message_id: &str) {
-        if let Some(old) = self.human_msg.insert((thread, ask_id), message_id.to_string()) {
+        if let Some(old) = self
+            .human_msg
+            .insert((thread, ask_id), message_id.to_string())
+        {
             self.by_message.remove(&old);
         }
-        self.by_message.insert(message_id.to_string(), ReplyTarget::Human { thread, ask_id });
+        self.by_message.insert(
+            message_id.to_string(),
+            ReplyTarget::Human { thread, ask_id },
+        );
     }
     pub fn target_of(&self, message_id: &str) -> Option<ReplyTarget> {
         self.by_message.get(message_id).copied()
@@ -104,8 +138,8 @@ impl CardIndex {
     }
 }
 
-/// IM 通道抽象（spec §2.1）：M1 仅飞书实现 + 测试替身。能力开关后续随
-/// 第二通道引入（M1 飞书全支持，YAGNI）。
+/// IM 通道抽象（spec §2.1）：当前提供飞书实现 + 测试替身；第二通道出现时
+/// 在这里复用 owner、卡片索引、路由执行与回流语义。
 #[async_trait::async_trait]
 pub trait Channel: Send + Sync {
     /// 发交互卡片到用户（p2p），返回 message_id。
@@ -114,6 +148,10 @@ pub trait Channel: Send + Sync {
     async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()>;
     /// 发纯文本到用户（p2p）。
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()>;
+    /// 发纯文本到群聊，返回根 message_id；用作 issue topic 的锚点。
+    async fn send_chat_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<String> {
+        anyhow::bail!("send_chat_text unsupported by this channel")
+    }
     /// 回复一条已存在的消息（M2-4：lead 回流飞书话题）。reply_to 必须是话题
     /// 根消息或话题内任意一条消息——飞书 `reply` API 自动把回复挂到同一话题。
     /// 返回新发消息的 message_id（供后续 reaction 之类的回执使用）。
@@ -124,11 +162,7 @@ pub trait Channel: Send + Sync {
         Ok(String::new())
     }
     /// 删除之前加上的 reaction（M2-6：首次出站前清掉 👀）。
-    async fn delete_reaction(
-        &self,
-        _message_id: &str,
-        _reaction_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn delete_reaction(&self, _message_id: &str, _reaction_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -165,9 +199,15 @@ pub async fn execute(
     let t = |zh: &'static str, en: &'static str| if lang == "zh" { zh } else { en };
     match route {
         inbound::Route::Ignore => {}
-        inbound::Route::Bind { open_id } => {
+        inbound::Route::Bind {
+            open_id,
+            chat_id,
+            text,
+        } => {
             // Route 读的是 allow 快照；落库前重查仍为空（Route::Bind doc 的竞态契约）。
-            let cur = crate::store::repo::get_setting(db, K_ALLOW).await?.unwrap_or_default();
+            let cur = crate::store::repo::get_setting(db, K_ALLOW)
+                .await?
+                .unwrap_or_default();
             if !ImSettings::parse_allow(&cur).is_empty() {
                 return Ok(()); // 已有 owner：本次绑定静默放弃
             }
@@ -184,6 +224,67 @@ pub async fn execute(
             {
                 eprintln!("[weft][im] bind confirm: {e}");
             }
+            if let Some(app) = app {
+                if !text.trim().is_empty() {
+                    let im_thread_ref = format!("dm:{open_id}");
+                    if let Err(e) = consume_free_text(
+                        app,
+                        db,
+                        &open_id,
+                        &chat_id,
+                        &im_thread_ref,
+                        None,
+                        &text,
+                        lang,
+                    )
+                    .await
+                    {
+                        eprintln!("[weft][im] concierge after bind: {e}");
+                    }
+                }
+            }
+        }
+        inbound::Route::BindIssueThread {
+            thread_id,
+            chat_id,
+            im_thread_ref,
+        } => {
+            let thread = crate::store::repo::get_thread(db, thread_id).await?;
+            let Some(thread) = thread else {
+                if let Err(e) = channel
+                    .send_text(
+                        sender,
+                        &t("没有找到这个 issue。", "No issue with that id was found."),
+                    )
+                    .await
+                {
+                    eprintln!("[weft][im] bind-issue missing hint: {e}");
+                }
+                return Ok(());
+            };
+            crate::store::repo::bind_im_route(db, thread_id, "feishu", &chat_id, &im_thread_ref)
+                .await?;
+            if let Err(e) = channel
+                .send_text(
+                    sender,
+                    &format!(
+                        "{} #{} · {}",
+                        t("已绑定飞书话题到", "Bound this Feishu topic to"),
+                        thread.id,
+                        thread.title
+                    ),
+                )
+                .await
+            {
+                eprintln!("[weft][im] bind-issue confirm: {e}");
+            }
+        }
+        inbound::Route::EnsureIssueTopic {
+            thread_id,
+            chat_id,
+            reply_to,
+        } => {
+            ensure_issue_topic(db, channel, thread_id, &chat_id, Some(&reply_to), lang).await?;
         }
         inbound::Route::AnswerPerm { ask_id, answer } => {
             if !asks.answer(ask_id, answer) {
@@ -202,12 +303,19 @@ pub async fn execute(
             }
             // 终态卡 patch 由桥的 AskEvent::Resolved 消费侧统一做（双面同源）。
         }
-        inbound::Route::AnswerHuman { thread, ask_id, text } => {
+        inbound::Route::AnswerHuman {
+            thread,
+            ask_id,
+            text,
+        } => {
             if !bus.answer_ask(thread, ask_id, &text) {
                 if let Err(e) = channel
                     .send_text(
                         sender,
-                        t("这个提问已被回答过了。", "That question was already answered."),
+                        t(
+                            "这个提问已被回答过了。",
+                            "That question was already answered.",
+                        ),
                     )
                     .await
                 {
@@ -229,21 +337,28 @@ pub async fn execute(
                 eprintln!("[weft][im] verdict hint: {e}");
             }
         }
-        inbound::Route::FreeText { sender_open_id, text } => {
-            // M3: 接 Concierge engine。无 app 句柄（测试路径）或 Concierge 未就绪
-            // 时退化成提示。Concierge 入口通过 lead_chat thread_id=0（spec §5 M3-1）
-            // 在 app 上挂载。
-            let _ = (&sender_open_id, &text);
+        inbound::Route::FreeText {
+            sender_open_id,
+            chat_id,
+            im_thread_ref,
+            reply_to,
+            text,
+        } => {
+            // 每个 IM 会话独立 Concierge：同一个飞书私聊/群聊复用自己的
+            // concierge thread，不把不同 IM 上下文混进全局单例。
+            let _ = (&sender_open_id, &chat_id, &im_thread_ref, &reply_to, &text);
             if let Some(app) = app {
-                if let Err(e) = consume_free_text(app, db, &sender_open_id, &text, lang).await {
+                if let Err(e) =
+                    consume_free_text(app, db, &sender_open_id, &chat_id, &im_thread_ref, reply_to.as_deref(), &text, lang).await
+                {
                     eprintln!("[weft][im] concierge: {e}");
                 }
             } else if let Err(e) = channel
                 .send_text(
                     sender,
                     t(
-                        "自由对话（全局助理）将在后续版本上线；当前请回复卡片消息作答权限与提问。",
-                        "Free chat (the global concierge) lands in a later milestone; for now reply to cards.",
+                        "自由对话（当前 IM 会话助理）需要桌面 app 运行上下文；当前路径无法处理，请回复卡片消息作答权限与提问。",
+                        "Free chat (this IM conversation's concierge) needs the desktop app context; this path cannot handle it, so reply to cards for asks.",
                     ),
                 )
                 .await
@@ -251,24 +366,49 @@ pub async fn execute(
                 eprintln!("[weft][im] freetext hint: {e}");
             }
         }
-        inbound::Route::IssueMessage { chat_id, im_thread_ref, sender_open_id: _, text } => {
-            // 飞书话题里的消息 → 反查 im_route 命中 issue → 灌进 lead engine。
-            // 未绑定（话题尚未 bind 过 issue）静默忽略：M2-5 提供桌面/IM 主动绑定入口。
+        inbound::Route::IssueMessage {
+            chat_id,
+            im_thread_ref,
+            sender_open_id: _,
+            text,
+        } => {
+            // 飞书话题/群会话里的消息 → 反查 im_route 命中 issue → 灌进 lead engine。
+            // 未绑定不自动创建 issue；issue 是主对象，topic 通过 `/topic <issue-id>`
+            // 或桌面绑定动作创建/绑定。
             let r =
                 crate::store::repo::im_route_of_thread_ref(db, "feishu", &chat_id, &im_thread_ref)
                     .await?;
-            let Some(route) = r else { return Ok(()) };
+            let Some(route) = r else {
+                if let Some(ctx) = ctx {
+                    if let Some(mid) = ctx.inbound_message_id.as_deref() {
+                        if let Err(e) = channel
+                            .reply_text(
+                                mid,
+                                "这段飞书话题还没有绑定 Weft issue。发送 /bind <issue-id> 绑定当前话题，或在群里发送 /topic <issue-id> 创建 issue topic。",
+                            )
+                            .await
+                        {
+                            eprintln!("[weft][im] unbound topic hint: {e}");
+                        }
+                    }
+                }
+                return Ok(());
+            };
             // M2-6 回执：在投递 engine 之前先挂 👀——出站前批量 delete。
             // ctx 没给 message_id / acks 则跳过；reaction add 失败不阻挡后续灌入。
-            if let (Some(ctx), true) =
-                (ctx, ctx.map(|c| c.inbound_message_id.is_some()).unwrap_or(false))
-            {
+            if let (Some(ctx), true) = (
+                ctx,
+                ctx.map(|c| c.inbound_message_id.is_some()).unwrap_or(false),
+            ) {
                 if let (Some(mid), Some(acks)) =
                     (ctx.inbound_message_id.as_deref(), ctx.acks.as_ref())
                 {
                     match channel.add_reaction(mid, "EYES").await {
                         Ok(rid) => {
-                            acks.lock().await.entry(route.thread_id).or_default()
+                            acks.lock()
+                                .await
+                                .entry(route.thread_id)
+                                .or_default()
                                 .push((mid.to_string(), rid));
                         }
                         Err(e) => eprintln!("[weft][im] add reaction: {e}"),
@@ -276,9 +416,7 @@ pub async fn execute(
                 }
             }
             let Some(app) = app else { return Ok(()) }; // 测试路径不进 engine
-            if let Err(e) =
-                feed_issue_message(app, db, route.thread_id, &text, lang).await
-            {
+            if let Err(e) = feed_issue_message(app, db, route.thread_id, &text, lang).await {
                 eprintln!("[weft][im] issue lead send: {e}");
             }
         }
@@ -318,7 +456,11 @@ struct BridgeInner {
 impl ImBridge {
     pub fn status(&self) -> String {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.status.is_empty() { "disabled".to_string() } else { g.status.clone() }
+        if g.status.is_empty() {
+            "disabled".to_string()
+        } else {
+            g.status.clone()
+        }
     }
     fn set_status(&self, s: &str) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).status = s.to_string();
@@ -338,7 +480,11 @@ impl ImBridge {
         (g.generation, g.cards.clone(), g.pending_acks.clone())
     }
     fn live(&self, generation: u64) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).generation == generation
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+            == generation
     }
 }
 
@@ -360,21 +506,26 @@ pub fn spawn(app: tauri::AppHandle) {
                 return;
             }
         };
-        if !settings.ready() {
+        // 启动需「已启用 且 凭证齐全」。关开关 = 保留凭证但断开（status 回 disabled，
+        // 旧代任务下次 live() 检查时退出）。
+        if !(settings.enabled && settings.ready()) {
             bridge.set_status("disabled");
             return;
         }
         bridge.set_status("connecting");
 
-        let channel: Arc<dyn Channel> =
-            Arc::new(feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret));
+        let channel: Arc<dyn Channel> = Arc::new(feishu::FeishuChannel::new(
+            &settings.app_id,
+            &settings.app_secret,
+        ));
 
         // —— 出站：registry 通知 → 发卡/patch ——
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
         let (hum_tx, mut hum_rx) = tokio::sync::mpsc::unbounded_channel();
         // set_notifier 返回挂接瞬间已 open 的快照：桥重启时补发卡片（无 miss/dup）。
         let snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
-        app.state::<crate::bus::BusRegistry>().set_ask_notifier(hum_tx);
+        app.state::<crate::bus::BusRegistry>()
+            .set_ask_notifier(hum_tx);
         {
             let (app2, db2, ch, cards2) = (app.clone(), db.clone(), channel.clone(), cards.clone());
             tauri::async_runtime::spawn(async move {
@@ -384,8 +535,13 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    consume_ask_event(crate::ask::AskEvent::Opened(ask), &db2, ch.as_ref(), &cards2)
-                        .await;
+                    consume_ask_event(
+                        crate::ask::AskEvent::Opened(ask),
+                        &db2,
+                        ch.as_ref(),
+                        &cards2,
+                    )
+                    .await;
                 }
                 loop {
                     if !bridge.live(generation) {
@@ -408,8 +564,13 @@ pub fn spawn(app: tauri::AppHandle) {
         // —— 入站：ws → 路由 → 执行 ——
         let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
         {
-            let (app2, db2, ch, cards2, acks2) =
-                (app.clone(), db.clone(), channel.clone(), cards.clone(), acks.clone());
+            let (app2, db2, ch, cards2, acks2) = (
+                app.clone(),
+                db.clone(),
+                channel.clone(),
+                cards.clone(),
+                acks.clone(),
+            );
             tauri::async_runtime::spawn(async move {
                 let bridge = app2.state::<ImBridge>();
                 while let Some(inb) = in_rx.recv().await {
@@ -425,14 +586,28 @@ pub fn spawn(app: tauri::AppHandle) {
                         }
                     };
                     let (sender, in_mid) = match &inb {
-                        inbound::Inbound::Text { sender_open_id, message_id, .. } => {
-                            (sender_open_id.clone(), Some(message_id.clone()))
-                        }
-                        inbound::Inbound::Action { operator_open_id, .. } => {
-                            (operator_open_id.clone(), None)
-                        }
+                        inbound::Inbound::Text {
+                            sender_open_id,
+                            message_id,
+                            ..
+                        } => (sender_open_id.clone(), Some(message_id.clone())),
+                        inbound::Inbound::Action {
+                            operator_open_id, ..
+                        } => (operator_open_id.clone(), None),
                     };
                     let r = { inbound::route(&inb, &allow, &*cards2.lock().await) };
+                    let route_name = match &r {
+                        inbound::Route::Ignore => "ignore",
+                        inbound::Route::Bind { .. } => "bind",
+                        inbound::Route::BindIssueThread { .. } => "bind_issue_thread",
+                        inbound::Route::EnsureIssueTopic { .. } => "ensure_issue_topic",
+                        inbound::Route::AnswerPerm { .. } => "answer_perm",
+                        inbound::Route::AnswerHuman { .. } => "answer_human",
+                        inbound::Route::BadVerdict => "bad_verdict",
+                        inbound::Route::IssueMessage { .. } => "issue_message",
+                        inbound::Route::FreeText { .. } => "free_text",
+                    };
+                    eprintln!("[weft][im] route={route_name} sender={sender}");
                     let asks = app2.state::<crate::ask::AskRegistry>();
                     let bus = app2.state::<crate::bus::BusRegistry>();
                     let ctx = ExecuteCtx {
@@ -495,7 +670,10 @@ pub fn spawn(app: tauri::AppHandle) {
         let app3 = app.clone();
         let ch_for_summary = channel.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("[weft][im] ws runtime: {e}");
@@ -623,13 +801,22 @@ async fn consume_human_event(
                     .unwrap_or_else(|| ask.from.clone()),
                 Err(_) => ask.from.clone(),
             };
-            match ch.send_card(&owner, outbound::human_card(&title, &from, &ask.text, IM_LANG)).await
+            match ch
+                .send_card(
+                    &owner,
+                    outbound::human_card(&title, &from, &ask.text, IM_LANG),
+                )
+                .await
             {
                 Ok(mid) => cards.lock().await.record_human(thread, ask.id, &mid),
                 Err(e) => eprintln!("[weft][im] send human card: {e}"),
             }
         }
-        crate::bus::state::HumanAskEvent::Answered { thread, ask_id, text } => {
+        crate::bus::state::HumanAskEvent::Answered {
+            thread,
+            ask_id,
+            text,
+        } => {
             if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
                 let card = outbound::human_resolved_card(&text, IM_LANG);
                 if let Err(e) = ch.patch_card(&mid, card).await {
@@ -653,6 +840,92 @@ async fn feed_issue_message(
     crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new()).await
 }
 
+pub async fn ensure_issue_topic(
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    thread_id: i32,
+    chat_id: &str,
+    reply_to: Option<&str>,
+    lang: &str,
+) -> anyhow::Result<()> {
+    let Some(thread) = crate::store::repo::get_thread(db, thread_id).await? else {
+        if let Some(reply_to) = reply_to {
+            if let Err(e) = ch
+                .reply_text(
+                    reply_to,
+                    if lang == "zh" {
+                        "没有找到这个 issue。"
+                    } else {
+                        "No issue with that id was found."
+                    },
+                )
+                .await
+            {
+                eprintln!("[weft][im] ensure-topic missing issue: {e}");
+            }
+        }
+        return Ok(());
+    };
+
+    if let Some(route) = crate::store::repo::im_route_of_thread(db, thread_id).await? {
+        if let Some(reply_to) = reply_to {
+            if let Err(e) = ch
+                .reply_text(
+                    reply_to,
+                    &format!(
+                        "{} #{} · {}",
+                        if lang == "zh" {
+                            "这个 issue 已有飞书 topic"
+                        } else {
+                            "This issue already has a Feishu topic"
+                        },
+                        thread.id,
+                        thread.title
+                    ),
+                )
+                .await
+            {
+                eprintln!("[weft][im] ensure-topic existing hint: {e}");
+            }
+        }
+        // route 保持不变：后续 lead 输出仍会进入已有 topic。
+        let _ = route;
+        return Ok(());
+    }
+
+    let root = ch
+        .send_chat_text(
+            chat_id,
+            &format!(
+                "Weft issue #{} · {}\n这个飞书话题已绑定到 Weft issue。",
+                thread.id, thread.title
+            ),
+        )
+        .await?;
+    crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &root).await?;
+    if let Some(reply_to) = reply_to {
+        if let Err(e) = ch
+            .reply_text(
+                reply_to,
+                &format!(
+                    "{} #{} · {}",
+                    if lang == "zh" {
+                        "已创建并绑定飞书 topic 到"
+                    } else {
+                        "Created and bound a Feishu topic to"
+                    },
+                    thread.id,
+                    thread.title
+                ),
+            )
+            .await
+        {
+            eprintln!("[weft][im] ensure-topic created hint: {e}");
+        }
+    }
+    Ok(())
+}
+
 /// M2-4: lead engine 的 assistant 文本完成 → 反查 im_route → 飞书话题 reply。
 /// 同时把这个 thread 挂账的 👀 reactions 一次性 delete（spec §4 回执语义：
 /// 「轮到这条被回复」才取下 👀，排队期间一直在）。pub 给集成测试用。
@@ -662,7 +935,8 @@ pub async fn consume_lead_out(
     ch: &dyn Channel,
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
 ) {
-    // 反查 im_route：thread 没绑定 → engine 文本只走桌面，不上桥。
+    // 反查 im_route：普通 issue 通过绑定话题回飞书；Concierge 通过
+    // feishu_concierge route 回到发起它的 IM 会话。
     let route = match crate::store::repo::im_route_of_thread(db, out.thread_id).await {
         Ok(Some(r)) => r,
         Ok(None) => return,
@@ -671,6 +945,24 @@ pub async fn consume_lead_out(
             return;
         }
     };
+    if route.channel == "feishu_concierge" {
+        let send = if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+            ch.send_text(open_id, &out.text).await.map(|_| ())
+        } else if route.im_thread_ref.starts_with("chat:") {
+            ch.send_chat_text(&route.chat_id, &out.text)
+                .await
+                .map(|_| ())
+        } else {
+            Err(anyhow::anyhow!(
+                "unknown concierge im_thread_ref {}",
+                route.im_thread_ref
+            ))
+        };
+        if let Err(e) = send {
+            eprintln!("[weft][im] concierge reply: {e}");
+        }
+        return;
+    }
     let body = outbound::issue_reply_text(IM_LANG, &out.text);
     // im_thread_ref 即话题根 message_id：飞书 reply API 会把回复挂同一话题。
     if let Err(e) = ch.reply_text(&route.im_thread_ref, &body).await {
@@ -689,19 +981,81 @@ pub async fn consume_lead_out(
     }
 }
 
-/// M3-3: 单聊自由文本 → Concierge engine（lead_chat thread_id=0 占位）。
-/// 占位实现：未配置 Concierge 时退化为提示——M3-1 把 thread_id=0 的 lead 装上。
+async fn ensure_concierge_workspace(db: &crate::store::Db) -> anyhow::Result<i32> {
+    if let Some(id) = crate::store::repo::get_setting(db, crate::store::repo::K_CONCIERGE_WORKSPACE)
+        .await?
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        if crate::store::repo::list_workspaces(db)
+            .await?
+            .into_iter()
+            .any(|ws| ws.id == id)
+        {
+            return Ok(id);
+        }
+    }
+
+    let ws = crate::store::repo::create_workspace(db, "Concierge").await?;
+    crate::store::repo::set_setting(
+        db,
+        crate::store::repo::K_CONCIERGE_WORKSPACE,
+        &ws.id.to_string(),
+    )
+    .await?;
+    Ok(ws.id)
+}
+
+async fn ensure_im_concierge_thread(
+    db: &crate::store::Db,
+    sender_open_id: &str,
+    chat_id: &str,
+    im_thread_ref: &str,
+) -> anyhow::Result<i32> {
+    if let Some(route) =
+        crate::store::repo::im_route_of_thread_ref(db, "feishu_concierge", chat_id, im_thread_ref)
+            .await?
+    {
+        if crate::store::repo::get_thread(db, route.thread_id)
+            .await?
+            .is_some()
+        {
+            return Ok(route.thread_id);
+        }
+        crate::store::repo::unbind_im_route(db, route.thread_id).await?;
+    }
+
+    let ws_id = ensure_concierge_workspace(db).await?;
+    let title = if im_thread_ref.starts_with("dm:") {
+        format!("飞书私聊 · {sender_open_id}")
+    } else {
+        format!("飞书群聊 · {chat_id}")
+    };
+    let tool = crate::tools::default_tool(db).await;
+    let thread = crate::store::repo::create_thread(db, ws_id, &title, "concierge", &tool).await?;
+    crate::store::repo::bind_im_route(db, thread.id, "feishu_concierge", chat_id, im_thread_ref)
+        .await?;
+    Ok(thread.id)
+}
+
+/// M3-3: IM 自由文本 → 该 IM 会话独立的 Concierge engine。
 async fn consume_free_text(
     app: &tauri::AppHandle,
     db: &crate::store::Db,
     sender_open_id: &str,
+    chat_id: &str,
+    im_thread_ref: &str,
+    reply_to: Option<&str>,
     text: &str,
     lang: &str,
 ) -> anyhow::Result<()> {
-    // 确保 Concierge thread 存在并拿到 id（spec §5 占位 thread；首次自动建 workspace）。
-    let thread_id = crate::store::repo::ensure_concierge_thread(db).await?;
+    let thread_id = ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref).await?;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
-    let framed = format!("[from {sender_open_id}] {text}");
+    let framed = match reply_to {
+        Some(mid) => format!(
+            "[from {sender_open_id}; feishu_chat_id={chat_id}; feishu_message_id={mid}] {text}"
+        ),
+        None => format!("[from {sender_open_id}; feishu_chat_id={chat_id}] {text}"),
+    };
     crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new()).await
 }
 
@@ -769,7 +1123,11 @@ mod tests {
 
     #[test]
     fn ready_requires_creds() {
-        let mut s = ImSettings { app_id: "a".into(), app_secret: "s".into(), ..Default::default() };
+        let mut s = ImSettings {
+            app_id: "a".into(),
+            app_secret: "s".into(),
+            ..Default::default()
+        };
         assert!(s.ready());
         s.app_secret.clear();
         assert!(!s.ready());
@@ -785,19 +1143,30 @@ mod tests {
         assert_eq!(s, ImSettings::default());
         assert!(!s.ready());
         // 写入后读回
-        crate::store::repo::set_setting(&db, K_APP_ID, "cli_x").await.unwrap();
-        crate::store::repo::set_setting(&db, K_APP_SECRET, "sec").await.unwrap();
-        crate::store::repo::set_setting(&db, K_ALLOW, "ou_a, ou_b").await.unwrap();
+        crate::store::repo::set_setting(&db, K_APP_ID, "cli_x")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_APP_SECRET, "sec")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, K_ALLOW, "ou_a, ou_b")
+            .await
+            .unwrap();
         let s = ImSettings::load(&db).await.unwrap();
         assert!(s.ready());
-        assert_eq!(s.allow_open_ids, vec!["ou_a".to_string(), "ou_b".to_string()]);
+        assert_eq!(
+            s.allow_open_ids,
+            vec!["ou_a".to_string(), "ou_b".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn settings_load_propagates_db_errors() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         use sea_orm::ConnectionTrait;
-        db.0.execute_unprepared("DROP TABLE app_setting").await.unwrap();
+        db.0.execute_unprepared("DROP TABLE app_setting")
+            .await
+            .unwrap();
         // DB 错误必须传播为 Err（fail-closed），不得折叠成默认设置
         assert!(ImSettings::load(&db).await.is_err());
     }
@@ -808,9 +1177,18 @@ mod tests {
         c.record_perm(7, "om_1", "Run: npm test");
         c.record_human(3, 9, "om_2");
         assert_eq!(c.target_of("om_1"), Some(ReplyTarget::Perm { ask_id: 7 }));
-        assert_eq!(c.target_of("om_2"), Some(ReplyTarget::Human { thread: 3, ask_id: 9 }));
+        assert_eq!(
+            c.target_of("om_2"),
+            Some(ReplyTarget::Human {
+                thread: 3,
+                ask_id: 9
+            })
+        );
         // take_perm 连 summary 一起取回（Resolved 事件不带 summary，终态卡靠这里）
-        assert_eq!(c.take_perm(7), Some(("om_1".to_string(), "Run: npm test".to_string())));
+        assert_eq!(
+            c.take_perm(7),
+            Some(("om_1".to_string(), "Run: npm test".to_string()))
+        );
         assert_eq!(c.target_of("om_1"), None); // 反向索引同步清
         assert_eq!(c.take_human(3, 9).as_deref(), Some("om_2"));
         assert_eq!(c.take_perm(7), None);
@@ -826,8 +1204,17 @@ mod tests {
         c.record_human(3, 9, "om_2");
         c.record_human(3, 9, "om_2b");
         assert_eq!(c.target_of("om_2"), None);
-        assert_eq!(c.target_of("om_2b"), Some(ReplyTarget::Human { thread: 3, ask_id: 9 }));
-        assert_eq!(c.take_perm(7), Some(("om_1b".to_string(), "s2".to_string())));
+        assert_eq!(
+            c.target_of("om_2b"),
+            Some(ReplyTarget::Human {
+                thread: 3,
+                ask_id: 9
+            })
+        );
+        assert_eq!(
+            c.take_perm(7),
+            Some(("om_1b".to_string(), "s2".to_string()))
+        );
         assert_eq!(c.take_human(3, 9).as_deref(), Some("om_2b"));
     }
 
@@ -835,9 +1222,15 @@ mod tests {
     async fn build_resync_items_pairs_thread_titles_with_summaries() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let asks = crate::ask::AskRegistry::new();
-        let w = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
-        let t1 = crate::store::repo::create_thread(&db, w.id, "登录修复", "bugfix", "claude").await.unwrap();
-        let t2 = crate::store::repo::create_thread(&db, w.id, "结算优化", "feature", "claude").await.unwrap();
+        let w = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let t1 = crate::store::repo::create_thread(&db, w.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        let t2 = crate::store::repo::create_thread(&db, w.id, "结算优化", "feature", "claude")
+            .await
+            .unwrap();
         let _ = asks.request(t1.id, "10", "claude", "Run: npm test", "npm test");
         let _ = asks.request(t2.id, "20", "codex", "Edit src/foo.rs", "src/foo.rs");
 
@@ -865,5 +1258,25 @@ mod tests {
         let _ = asks.request(999, "10", "claude", "Run: npm test", "npm test");
         let items = build_resync_items(&db, &asks).await;
         assert_eq!(items, vec![(999, "Run: npm test".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn im_concierge_thread_uses_effective_default_tool() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::set_setting(&db, "default_tool", "codex")
+            .await
+            .unwrap();
+        let expected = crate::tools::default_tool(&db).await;
+
+        let thread_id = ensure_im_concierge_thread(&db, "ou_owner", "oc_dm", "dm:ou_owner")
+            .await
+            .unwrap();
+
+        let thread = crate::store::repo::get_thread(&db, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.kind, "concierge");
+        assert_eq!(thread.lead_tool, expected);
     }
 }

@@ -26,10 +26,17 @@ pub struct Wake {
 /// 富化（thread 标题、direction 名）是消费侧查 DB 的责任。
 #[derive(Clone, Debug)]
 pub enum HumanAskEvent {
-    Asked { thread: i32, ask: Ask },
+    Asked {
+        thread: i32,
+        ask: Ask,
+    },
     /// 携带人答的 text：飞书卡片终态要显示答案，而桌面侧作答时桥拿不到
     /// 文本，必须由事件携带。
-    Answered { thread: i32, ask_id: u64, text: String },
+    Answered {
+        thread: i32,
+        ask_id: u64,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -89,7 +96,10 @@ impl BusRegistry {
 
     fn emit_wake(&self, thread: i32, dir: &str) {
         if let Some(tx) = self.wake.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            let _ = tx.send(Wake { thread, dir: dir.to_string() });
+            let _ = tx.send(Wake {
+                thread,
+                dir: dir.to_string(),
+            });
         }
     }
 
@@ -107,7 +117,12 @@ impl BusRegistry {
     /// edge-triggered、带 per-ask 身份，Asked/Answered 不可乱序）。锁顺序
     /// 固定 inner → ask_notify；UnboundedSender::send 非阻塞，锁内发送安全。
     fn emit_ask_event(&self, ev: HumanAskEvent) {
-        if let Some(tx) = self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(tx) = self
+            .ask_notify
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             let _ = tx.send(ev);
         }
     }

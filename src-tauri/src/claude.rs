@@ -138,7 +138,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert_eq!(v["numStartups"], 3);
         assert_eq!(v["projects"]["/existing"]["hasTrustDialogAccepted"], true);
-        let canon = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+        let canon = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert_eq!(v["projects"][&canon]["hasTrustDialogAccepted"], true);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -153,5 +156,4 @@ mod tests {
         assert!(!cfg.exists(), "must not fabricate a claude config");
         let _ = std::fs::remove_dir_all(&base);
     }
-
 }

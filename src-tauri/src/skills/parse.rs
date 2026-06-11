@@ -23,7 +23,10 @@ fn read_skill(dir: &Path) -> Option<(String, String)> {
     let text = std::fs::read_to_string(&md).ok()?;
     let (name, desc) = parse_frontmatter(&text);
     let name = if name.is_empty() {
-        dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
     } else {
         name
     };
@@ -63,7 +66,11 @@ fn push_skill(dir: &Path, out: &mut Vec<ParsedSkill>) {
     }
     if let Some((name, description)) = read_skill(dir) {
         if !out.iter().any(|s| s.name == name) {
-            out.push(ParsedSkill { name, description, dir: dir.to_string_lossy().into_owned() });
+            out.push(ParsedSkill {
+                name,
+                description,
+                dir: dir.to_string_lossy().into_owned(),
+            });
         }
     }
 }
@@ -73,11 +80,19 @@ fn push_skill(dir: &Path, out: &mut Vec<ParsedSkill>) {
 /// `skills/<name>/SKILL.md`.
 fn from_marketplace(root: &Path, out: &mut Vec<ParsedSkill>) {
     let mf = root.join(".claude-plugin/marketplace.json");
-    let Ok(text) = std::fs::read_to_string(&mf) else { return };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
-    let Some(plugins) = v.get("plugins").and_then(|p| p.as_array()) else { return };
+    let Ok(text) = std::fs::read_to_string(&mf) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(plugins) = v.get("plugins").and_then(|p| p.as_array()) else {
+        return;
+    };
     for p in plugins {
-        let Some(src) = p.get("source").and_then(|s| s.as_str()) else { continue };
+        let Some(src) = p.get("source").and_then(|s| s.as_str()) else {
+            continue;
+        };
         let base: PathBuf = root.join(src.trim_start_matches("./"));
         push_skill(&base, out); // base itself may be a skill dir
         scan_skills_dir(&base.join("skills"), out); // or contain skills/<name>
@@ -98,7 +113,9 @@ fn from_first_level(root: &Path, out: &mut Vec<ParsedSkill>) {
 }
 
 fn scan_skills_dir(dir: &Path, out: &mut Vec<ParsedSkill>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -145,7 +162,10 @@ mod tests {
         write_skill(&root.join("planner"), "planner", "plan it"); // root-level <name>/SKILL.md
         let mut got = parse_source(&root);
         got.sort_by(|a, b| a.name.cmp(&b.name));
-        assert_eq!(got.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["deploy", "planner"]);
+        assert_eq!(
+            got.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["deploy", "planner"]
+        );
         assert_eq!(got[0].description, "ship it");
     }
 
@@ -165,7 +185,10 @@ mod tests {
         let got = parse_source(&root);
         let deploy: Vec<_> = got.iter().filter(|s| s.name == "deploy").collect();
         assert_eq!(deploy.len(), 1, "dup name deduped");
-        assert_eq!(deploy[0].description, "from marketplace", "marketplace path wins");
+        assert_eq!(
+            deploy[0].description, "from marketplace",
+            "marketplace path wins"
+        );
     }
 
     #[test]

@@ -67,7 +67,10 @@ pub struct ResolvedDirection {
 /// Resolve one proposed direction's write-repo name to a workspace repo id.
 /// `repos` is (id, name); an unknown name is kept with `known = false`.
 pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDirection {
-    let id = repos.iter().find(|(_, n)| *n == dir.repo).map(|(id, _)| *id);
+    let id = repos
+        .iter()
+        .find(|(_, n)| *n == dir.repo)
+        .map(|(id, _)| *id);
     ResolvedDirection {
         name: dir.name.clone(),
         repo: ScopeEntry {
@@ -105,7 +108,11 @@ pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProp
     };
     let proposal: Proposal = serde_json::from_str(&p.proposal).unwrap_or_default();
     let repos = workspace_repos(db, thread_id).await?;
-    let directions = proposal.directions.iter().map(|d| resolve(d, &repos)).collect();
+    let directions = proposal
+        .directions
+        .iter()
+        .map(|d| resolve(d, &repos))
+        .collect();
     Ok(Some(ResolvedProposal {
         thread_id,
         rationale: proposal.rationale,
@@ -138,11 +145,16 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         if d.decision == "approved" || d.decision == "denied" {
             continue; // already handled via per-card approve/deny
         }
-        let dir =
-            repo::create_direction(
-                db, thread_id, &d.name, &tool, d.repo.repo_id, &d.reason, &d.mandate,
-            )
-            .await?;
+        let dir = repo::create_direction(
+            db,
+            thread_id,
+            &d.name,
+            &tool,
+            d.repo.repo_id,
+            &d.reason,
+            &d.mandate,
+        )
+        .await?;
         materialize::materialize_direction(db, dir.id).await?;
         created.push(dir.id);
     }
@@ -161,7 +173,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
 /// returned and a differing `tool` pick is ignored — the first pick wins.
 pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str) -> Result<i32> {
     if !crate::detect::TOOL_PRIORITY.contains(&tool) {
-        anyhow::bail!("unknown tool {tool:?}; expected one of {:?}", crate::detect::TOOL_PRIORITY);
+        anyhow::bail!(
+            "unknown tool {tool:?}; expected one of {:?}",
+            crate::detect::TOOL_PRIORITY
+        );
     }
     let plan = repo::get_plan(db, thread_id)
         .await?
@@ -175,7 +190,10 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
     let repos = workspace_repos(db, thread_id).await?;
     let resolved = resolve(&pd, &repos);
     if !resolved.repo.known {
-        anyhow::bail!("repo {:?} is not a known workspace repo", resolved.repo.repo_name);
+        anyhow::bail!(
+            "repo {:?} is not a known workspace repo",
+            resolved.repo.repo_name
+        );
     }
     let dirs = repo::list_directions(db, thread_id).await?;
     if let Some(existing) = dirs
@@ -301,7 +319,14 @@ mod tests {
         assert_eq!(r.name, "Payments");
         assert_eq!(r.mandate, "plan+impl"); // empty mandate normalizes to the default
         assert_eq!(r.reason, "add the discount endpoint");
-        assert_eq!(r.repo, ScopeEntry { repo_id: 2, repo_name: "api".into(), known: true });
+        assert_eq!(
+            r.repo,
+            ScopeEntry {
+                repo_id: 2,
+                repo_name: "api".into(),
+                known: true
+            }
+        );
     }
 
     #[test]
@@ -322,10 +347,9 @@ mod tests {
     #[test]
     fn proposal_parses_with_missing_and_legacy_fields() {
         // Legacy proposals carried a "tool" per direction; serde must ignore it.
-        let p: Proposal = serde_json::from_str(
-            r#"{ "directions": [ { "name": "wip", "tool": "claude" } ] }"#,
-        )
-        .unwrap();
+        let p: Proposal =
+            serde_json::from_str(r#"{ "directions": [ { "name": "wip", "tool": "claude" } ] }"#)
+                .unwrap();
         assert_eq!(p.rationale, "");
         assert_eq!(p.directions.len(), 1);
         assert_eq!(p.directions[0].repo, "");
@@ -348,11 +372,40 @@ mod tests {
     #[test]
     fn pending_filter_skips_decided_and_unknown() {
         let rs = vec![
-            resolve(&ProposedDirection { name: "a".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
-            resolve(&ProposedDirection { name: "b".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), decision: "approved".into() }, &repos()),
-            resolve(&ProposedDirection { name: "c".into(), repo: "ghost".into(), reason: "r".into(), mandate: "".into(), decision: "".into() }, &repos()),
+            resolve(
+                &ProposedDirection {
+                    name: "a".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "".into(),
+                    decision: "".into(),
+                },
+                &repos(),
+            ),
+            resolve(
+                &ProposedDirection {
+                    name: "b".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "".into(),
+                    decision: "approved".into(),
+                },
+                &repos(),
+            ),
+            resolve(
+                &ProposedDirection {
+                    name: "c".into(),
+                    repo: "ghost".into(),
+                    reason: "r".into(),
+                    mandate: "".into(),
+                    decision: "".into(),
+                },
+                &repos(),
+            ),
         ];
-        let pending: Vec<_> = rs.iter().enumerate()
+        let pending: Vec<_> = rs
+            .iter()
+            .enumerate()
             .filter(|(_, d)| d.repo.known && d.decision.is_empty())
             .map(|(i, _)| i)
             .collect();
@@ -387,7 +440,9 @@ mod tests {
     async fn approve_deny_pending_against_db() {
         // Hold the shared env lock for the whole window WEFT_HOME is set, so the
         // default-home paths test can't observe our override. Panic-tolerant.
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tag = format!("weft-planner-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
@@ -401,7 +456,9 @@ mod tests {
         let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main")
             .await
             .unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
 
         // Proposal: one known-repo write (pending) + one unknown-repo write (pending).
         let proposal = Proposal {
@@ -448,7 +505,10 @@ mod tests {
         assert_eq!(dirs.len(), 1, "exactly one direction created");
         assert_eq!(dirs[0].id, id);
         assert_eq!(dirs[0].repo_id, ra.id);
-        assert_eq!(dirs[0].tool, "codex", "card-picked tool lands on the direction");
+        assert_eq!(
+            dirs[0].tool, "codex",
+            "card-picked tool lands on the direction"
+        );
         // No longer pending once approved.
         assert!(pending_writes(&db, t.id).await.unwrap().is_empty());
 
@@ -465,9 +525,16 @@ mod tests {
         // Re-approve with a DIFFERENT tool -> still idempotent: the first pick
         // wins, the new pick is ignored, and no second direction appears.
         let id3 = approve_direction(&db, t.id, 0, "claude").await.unwrap();
-        assert_eq!(id3, id, "idempotent re-approve ignores a different tool pick");
+        assert_eq!(
+            id3, id,
+            "idempotent re-approve ignores a different tool pick"
+        );
         let dirs3 = repo::list_directions(&db, t.id).await.unwrap();
-        assert_eq!(dirs3.len(), 1, "no second direction created on differing re-approve");
+        assert_eq!(
+            dirs3.len(),
+            1,
+            "no second direction created on differing re-approve"
+        );
         assert_eq!(dirs3[0].tool, "codex", "first tool pick wins on re-approve");
 
         // Deny the unknown-repo write -> returns (name, repo), marks it denied,

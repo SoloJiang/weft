@@ -36,8 +36,7 @@ mod tests {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         // a table from the migration must exist
         use sea_orm::ConnectionTrait;
-        db.0
-            .execute_unprepared("SELECT id FROM workspace LIMIT 0")
+        db.0.execute_unprepared("SELECT id FROM workspace LIMIT 0")
             .await
             .unwrap();
     }

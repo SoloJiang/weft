@@ -29,8 +29,13 @@ pub enum AskEvent {
     Opened(Ask),
     /// `answer` 是该 ask 的真实判决（Dangerous 释放积压记为 Allow；
     /// Always/Full 连带覆盖的 ask 记为人答的那个 Answer）。
-    Resolved { id: u64, answer: Answer },
-    Cancelled { id: u64 },
+    Resolved {
+        id: u64,
+        answer: Answer,
+    },
+    Cancelled {
+        id: u64,
+    },
 }
 
 /// The human's answer to a permission Ask. `Always` remembers this action for
@@ -188,7 +193,10 @@ impl AskRegistry {
             if let Some(tx) = g.waiters.remove(&id) {
                 let _ = tx.send(Decision::Allow);
             }
-            g.emit(AskEvent::Resolved { id, answer: Answer::Allow });
+            g.emit(AskEvent::Resolved {
+                id,
+                answer: Answer::Allow,
+            });
         }
     }
 
@@ -220,7 +228,10 @@ impl AskRegistry {
         let key = (ask.thread, ask.dir.clone());
         match ans {
             Answer::Always => {
-                g.always.entry(key.clone()).or_default().insert(ask.summary.clone());
+                g.always
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(ask.summary.clone());
             }
             Answer::Full => {
                 g.full.insert(key.clone());
@@ -230,7 +241,11 @@ impl AskRegistry {
 
         // Every open ask this answer now covers (the target + any others the new
         // rule sweeps up) resolves to the same verdict.
-        let decision = if ans == Answer::Deny { Decision::Deny } else { Decision::Allow };
+        let decision = if ans == Answer::Deny {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        };
         let covered: Vec<u64> = g
             .open
             .iter()
@@ -256,7 +271,10 @@ impl AskRegistry {
             if let Some(tx) = g.waiters.remove(&cid) {
                 woke = tx.send(decision).is_ok() || woke;
             }
-            g.emit(AskEvent::Resolved { id: cid, answer: ans });
+            g.emit(AskEvent::Resolved {
+                id: cid,
+                answer: ans,
+            });
         }
         woke
     }
@@ -276,7 +294,11 @@ impl AskRegistry {
 
     /// All Asks across threads (for the workspace-wide Needs-you surface).
     pub fn open(&self) -> Vec<Ask> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).open.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+            .clone()
     }
 
     /// Open Asks for one thread.
@@ -323,7 +345,10 @@ mod tests {
         assert!(r.auto_decision(1, "10", "Run: npm test").is_none());
         assert!(r.answer(id, Answer::Always));
         // same action in the same task now auto-allows
-        assert_eq!(r.auto_decision(1, "10", "Run: npm test"), Some(Decision::Allow));
+        assert_eq!(
+            r.auto_decision(1, "10", "Run: npm test"),
+            Some(Decision::Allow)
+        );
         // a different action still asks
         assert!(r.auto_decision(1, "10", "Run: rm -rf /").is_none());
         // another task is unaffected
@@ -341,7 +366,10 @@ mod tests {
         assert_eq!(rx2.await.unwrap(), Decision::Allow);
         assert!(r.open().is_empty());
         // and any future ask auto-allows
-        assert_eq!(r.auto_decision(1, "10", "Run: anything"), Some(Decision::Allow));
+        assert_eq!(
+            r.auto_decision(1, "10", "Run: anything"),
+            Some(Decision::Allow)
+        );
     }
 
     #[tokio::test]

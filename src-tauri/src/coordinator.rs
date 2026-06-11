@@ -41,7 +41,9 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
             last.insert(dir, now);
             let app2 = app.clone();
             tauri::async_runtime::spawn(async move {
-                let Some(db) = app2.try_state::<crate::store::Db>() else { return };
+                let Some(db) = app2.try_state::<crate::store::Db>() else {
+                    return;
+                };
                 let db = crate::store::Db(db.0.clone());
                 let Ok(Some(s)) = crate::store::repo::latest_session_for_direction(&db, dir).await
                 else {

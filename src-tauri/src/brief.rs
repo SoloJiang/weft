@@ -152,7 +152,9 @@ pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
         } else if from_w && !to_w {
             contracts.push(format!(
                 "Your {} depends on {} (via {}) — read it for the contract; don't edit it.",
-                name_of(e.from), name_of(e.to), e.via
+                name_of(e.from),
+                name_of(e.to),
+                e.via
             ));
         }
     }

@@ -9,5 +9,5 @@ pub mod session;
 pub mod skill_enable;
 pub mod skill_source;
 pub mod thread;
-pub mod worktree;
 pub mod workspace;
+pub mod worktree;

@@ -69,7 +69,10 @@ fn parse_codex(line: &str) -> ChatEvent {
             let item = &v["item"];
             match item["type"].as_str() {
                 Some("agent_message") if v["type"] == "item.completed" => ChatEvent::Assistant {
-                    texts: item["text"].as_str().map(|t| vec![t.to_string()]).unwrap_or_default(),
+                    texts: item["text"]
+                        .as_str()
+                        .map(|t| vec![t.to_string()])
+                        .unwrap_or_default(),
                     tools: vec![],
                 },
                 Some("agent_message") => ChatEvent::Other,
@@ -103,7 +106,10 @@ fn parse_opencode(line: &str) -> ChatEvent {
     let part = &v["part"];
     match v["type"].as_str() {
         Some("text") => ChatEvent::Assistant {
-            texts: part["text"].as_str().map(|t| vec![t.to_string()]).unwrap_or_default(),
+            texts: part["text"]
+                .as_str()
+                .map(|t| vec![t.to_string()])
+                .unwrap_or_default(),
             tools: vec![],
         },
         Some("tool_use") => ChatEvent::Assistant {
@@ -126,7 +132,11 @@ pub fn parse_line(line: &str) -> ChatEvent {
             session_id: v["session_id"].as_str().unwrap_or_default().to_string(),
             slash_commands: v["slash_commands"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
         },
         Some("stream_event") => {
@@ -142,7 +152,11 @@ pub fn parse_line(line: &str) -> ChatEvent {
         Some("assistant") => {
             let mut texts = vec![];
             let mut tools = vec![];
-            for b in v["message"]["content"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            for b in v["message"]["content"]
+                .as_array()
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
                 match b["type"].as_str() {
                     Some("text") => {
                         if let Some(t) = b["text"].as_str() {
@@ -185,15 +199,23 @@ pub fn parse_line(line: &str) -> ChatEvent {
 /// compact activity pill. An empty/opaque input yields "" (render nothing),
 /// never "{}" noise.
 fn compact_input(input: &Value) -> String {
-    let s = ["file_path", "path", "command", "pattern", "query", "url", "description"]
-        .iter()
-        .find_map(|k| input[k].as_str())
-        .map(String::from)
-        .unwrap_or_else(|| match input {
-            Value::Object(o) if o.is_empty() => String::new(),
-            Value::Null => String::new(),
-            other => other.to_string(),
-        });
+    let s = [
+        "file_path",
+        "path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+        "description",
+    ]
+    .iter()
+    .find_map(|k| input[k].as_str())
+    .map(String::from)
+    .unwrap_or_else(|| match input {
+        Value::Object(o) if o.is_empty() => String::new(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    });
     s.chars().take(120).collect()
 }
 
@@ -205,7 +227,10 @@ mod tests {
     fn parses_init() {
         let l = r#"{"type":"system","subtype":"init","session_id":"abc-123","slash_commands":["compact","commit"]}"#;
         match parse_line(l) {
-            ChatEvent::Init { session_id, slash_commands } => {
+            ChatEvent::Init {
+                session_id,
+                slash_commands,
+            } => {
                 assert_eq!(session_id, "abc-123");
                 assert_eq!(slash_commands, vec!["compact", "commit"]);
             }
@@ -270,12 +295,20 @@ mod tests {
             extract_native("codex", r#"{"type":"thread.started","thread_id":"abc-1"}"#).as_deref(),
             Some("abc-1")
         );
-        match parse_line_for("codex", r#"{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"ok"}}"#) {
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"ok"}}"#,
+        ) {
             ChatEvent::Assistant { texts, .. } => assert_eq!(texts, vec!["ok"]),
             e => panic!("{e:?}"),
         }
-        match parse_line_for("codex", r#"{"type":"item.started","item":{"type":"command_execution","command":"npm test"}}"#) {
-            ChatEvent::Assistant { tools, .. } => assert_eq!(tools[0], ("command_execution".into(), "npm test".into())),
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"npm test"}}"#,
+        ) {
+            ChatEvent::Assistant { tools, .. } => {
+                assert_eq!(tools[0], ("command_execution".into(), "npm test".into()))
+            }
             e => panic!("{e:?}"),
         }
         assert!(matches!(
@@ -292,8 +325,13 @@ mod tests {
             ChatEvent::Assistant { texts, .. } => assert_eq!(texts, vec!["done"]),
             e => panic!("{e:?}"),
         }
-        match parse_line_for("opencode", r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"echo hi"}}}}"#) {
-            ChatEvent::Assistant { tools, .. } => assert_eq!(tools[0], ("bash".into(), "echo hi".into())),
+        match parse_line_for(
+            "opencode",
+            r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"echo hi"}}}}"#,
+        ) {
+            ChatEvent::Assistant { tools, .. } => {
+                assert_eq!(tools[0], ("bash".into(), "echo hi".into()))
+            }
             e => panic!("{e:?}"),
         }
         assert!(matches!(
@@ -307,7 +345,10 @@ mod tests {
         let l = r#"{"type":"control_response","response":{"subtype":"success","request_id":"weft-init","response":{"commands":[{"name":"compact","description":"x"},{"name":"superpowers:requesting-code-review"}]}}}"#;
         match parse_line(l) {
             ChatEvent::Commands { commands } => {
-                assert_eq!(commands, vec!["compact", "superpowers:requesting-code-review"]);
+                assert_eq!(
+                    commands,
+                    vec!["compact", "superpowers:requesting-code-review"]
+                );
             }
             e => panic!("{e:?}"),
         }
@@ -331,6 +372,9 @@ mod tests {
             parse_line(r#"{"type":"system","subtype":"hook_started"}"#),
             ChatEvent::Other
         ));
-        assert!(matches!(parse_line(r#"{"type":"rate_limit_event"}"#), ChatEvent::Other));
+        assert!(matches!(
+            parse_line(r#"{"type":"rate_limit_event"}"#),
+            ChatEvent::Other
+        ));
     }
 }

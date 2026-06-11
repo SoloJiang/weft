@@ -11,11 +11,11 @@ Weft is a Tauri v2 desktop app with a React frontend and Rust backend.
 
 ## Build, Test, and Development Commands
 
-- `npm install`: install frontend dependencies.
-- `npm run dev`: run Vite for frontend-only iteration.
-- `npm run build`: run TypeScript checking and create the production frontend bundle.
-- `npm run tauri dev`: run the full desktop app in development mode.
-- `npm run tauri build`: build a release app bundle.
+- `pnpm install`: install frontend dependencies.
+- `pnpm dev`: run Vite for frontend-only iteration.
+- `pnpm build`: run TypeScript checking and create the production frontend bundle.
+- `pnpm tauri dev`: run the full desktop app in development mode.
+- `pnpm tauri build`: build a release app bundle.
 - `cd src-tauri && cargo test`: run Rust unit and integration tests.
 - `git diff --check`: check patches for whitespace errors before committing.
 

@@ -55,7 +55,11 @@ mod tests {
         let hub = LeadOutHub::default();
         let mut a = hub.subscribe();
         let mut b = hub.subscribe();
-        hub.emit(LeadOut { thread_id: 1, message_id: 10, text: "hi".into() });
+        hub.emit(LeadOut {
+            thread_id: 1,
+            message_id: 10,
+            text: "hi".into(),
+        });
         let ra = a.recv().await.unwrap();
         let rb = b.recv().await.unwrap();
         assert_eq!(ra.message_id, 10);
@@ -65,6 +69,10 @@ mod tests {
     #[tokio::test]
     async fn emit_with_no_subscribers_is_silent() {
         let hub = LeadOutHub::default();
-        hub.emit(LeadOut { thread_id: 1, message_id: 1, text: "x".into() }); // 不应 panic
+        hub.emit(LeadOut {
+            thread_id: 1,
+            message_id: 1,
+            text: "x".into(),
+        }); // 不应 panic
     }
 }

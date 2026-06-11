@@ -1,135 +1,135 @@
 <svg viewBox="0 0 1720 540" xmlns="http://www.w3.org/2000/svg" font-family="'Inter','PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Hiragino Sans GB',sans-serif">
   <defs>
-    <marker id="arr" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#5b5866"/></marker>
-    <marker id="arrB" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#7c74f0"/></marker>
-    <marker id="arrG" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#35c98b"/></marker>
-    <marker id="arrA" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#caa14e"/></marker>
-    <marker id="arrO" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#f2683c"/></marker>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#6b655c"/></marker>
+    <marker id="arrB" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#49c0c9"/></marker>
+    <marker id="arrG" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#65d6a1"/></marker>
+    <marker id="arrA" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#e7bd61"/></marker>
+    <marker id="arrO" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#f27d53"/></marker>
     <filter id="glow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="22"/></filter>
     <style>
-      .ttl{fill:#f3f2f7;font-size:15px;font-weight:600}
-      .sub{fill:#8b8896;font-size:11px}
-      .lbl{fill:#75727f;font-size:11px;font-weight:500}
-      .node{fill:#1f1d27;stroke:#36333f;stroke-width:1}
+      .ttl{fill:#f1eee8;font-size:15px;font-weight:600}
+      .sub{fill:#9b948a;font-size:11px}
+      .lbl{fill:#8e887f;font-size:11px;font-weight:500}
+      .node{fill:#211f1a;stroke:#3a352e;stroke-width:1}
       .gl{stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
     </style>
   </defs>
 
-  <rect x="0" y="0" width="1720" height="540" rx="18" fill="#15141a"/>
-  <circle cx="319" cy="260" r="62" fill="#4f46e5" opacity="0.15" filter="url(#glow)"/>
-  <circle cx="1576" cy="260" r="66" fill="#f2683c" opacity="0.17" filter="url(#glow)"/>
+  <rect x="0" y="0" width="1720" height="540" rx="18" fill="#171512"/>
+  <circle cx="319" cy="260" r="62" fill="#49c0c9" opacity="0.04"/>
+  <circle cx="1576" cy="260" r="66" fill="#f27d53" opacity="0.05"/>
 
-  <path class="gl" d="M190,260 H224" stroke="#5b5866" marker-end="url(#arr)"/>
-  <path class="gl" d="M319,194 V212" stroke="#7c74f0" stroke-dasharray="2 6" opacity=".85" marker-end="url(#arrB)"/>
-  <text class="lbl" x="328" y="208" fill="#8b84e8">燃料</text>
+  <path class="gl" d="M190,260 H224" stroke="#6b655c" marker-end="url(#arr)"/>
+  <path class="gl" d="M319,194 V212" stroke="#49c0c9" stroke-dasharray="2 6" opacity=".85" marker-end="url(#arrB)"/>
+  <text class="lbl" x="328" y="208" fill="#78d6dc">上下文</text>
 
-  <path class="gl" d="M414,244 C444,210 444,172 470,150" stroke="#7c74f0" marker-end="url(#arrB)"/>
-  <path class="gl" d="M414,260 H470" stroke="#7c74f0" marker-end="url(#arrB)"/>
-  <path class="gl" d="M414,276 C444,310 444,348 470,370" stroke="#7c74f0" marker-end="url(#arrB)"/>
+  <path class="gl" d="M414,244 C444,210 444,172 470,150" stroke="#49c0c9" marker-end="url(#arrB)"/>
+  <path class="gl" d="M414,260 H470" stroke="#49c0c9" marker-end="url(#arrB)"/>
+  <path class="gl" d="M414,276 C444,310 444,348 470,370" stroke="#49c0c9" marker-end="url(#arrB)"/>
 
-  <path class="gl" d="M680,150 C710,172 710,232 740,256" stroke="#5b5866" marker-end="url(#arr)"/>
-  <path class="gl" d="M680,260 H740" stroke="#5b5866" marker-end="url(#arr)"/>
-  <path class="gl" d="M680,370 C710,348 710,288 740,264" stroke="#5b5866" marker-end="url(#arr)"/>
+  <path class="gl" d="M680,150 C710,172 710,232 740,256" stroke="#6b655c" marker-end="url(#arr)"/>
+  <path class="gl" d="M680,260 H740" stroke="#6b655c" marker-end="url(#arr)"/>
+  <path class="gl" d="M680,370 C710,348 710,288 740,264" stroke="#6b655c" marker-end="url(#arr)"/>
 
-  <path class="gl" d="M898,260 H940" stroke="#35c98b" marker-end="url(#arrG)"/>
-  <text class="lbl" x="906" y="250" fill="#35c98b">绿</text>
-  <path class="gl" d="M1090,260 H1124" stroke="#5b5866" marker-end="url(#arr)"/>
-  <path class="gl" d="M1274,260 H1308" stroke="#5b5866" marker-end="url(#arr)"/>
-  <path class="gl" d="M1458,260 H1492" stroke="#f2683c" marker-end="url(#arrO)"/>
-  <text class="lbl" x="1462" y="250" fill="#c98a5e">晋级</text>
+  <path class="gl" d="M898,260 H940" stroke="#65d6a1" marker-end="url(#arrG)"/>
+  <text class="lbl" x="906" y="250" fill="#65d6a1">绿</text>
+  <path class="gl" d="M1090,260 H1124" stroke="#6b655c" marker-end="url(#arr)"/>
+  <path class="gl" d="M1274,260 H1308" stroke="#6b655c" marker-end="url(#arr)"/>
+  <path class="gl" d="M1458,260 H1492" stroke="#f27d53" marker-end="url(#arrO)"/>
+  <text class="lbl" x="1462" y="250" fill="#d8956d">晋级</text>
 
-  <path class="gl" d="M828,308 C828,468 470,468 319,310" stroke="#caa14e" stroke-dasharray="5 5" opacity=".8" marker-end="url(#arrA)"/>
-  <text class="lbl" x="520" y="486" fill="#caa14e">红 · 有界重试 / 升级</text>
+  <path class="gl" d="M828,308 C828,468 470,468 319,310" stroke="#e7bd61" stroke-dasharray="5 5" opacity=".8" marker-end="url(#arrA)"/>
+  <text class="lbl" x="520" y="486" fill="#e7bd61">红 · 有界重试 / 升级</text>
 
   <!-- Task -->
   <rect class="node" x="40" y="215" width="150" height="90" rx="13"/>
-  <circle cx="70" cy="246" r="13" fill="#4f46e5" opacity="0.16"/>
-  <circle cx="70" cy="246" r="6.5" fill="none" stroke="#8b84e8" class="gl"/><circle cx="70" cy="246" r="2.2" fill="#8b84e8"/>
+  <circle cx="70" cy="246" r="13" fill="#49c0c9" opacity="0.16"/>
+  <circle cx="70" cy="246" r="6.5" fill="none" stroke="#78d6dc" class="gl"/><circle cx="70" cy="246" r="2.2" fill="#78d6dc"/>
   <text class="ttl" x="92" y="252">Task</text>
   <text class="sub" x="56" y="288">PRD · bug · 重构</text>
 
   <!-- Repo map -->
   <rect class="node" x="224" y="120" width="190" height="74" rx="13"/>
-  <circle cx="252" cy="150" r="13" fill="#2a2734"/>
-  <g class="gl" stroke="#b8b5c2"><circle cx="247" cy="145" r="2" fill="#b8b5c2" stroke="none"/><circle cx="259" cy="142" r="2" fill="#b8b5c2" stroke="none"/><circle cx="256" cy="156" r="2" fill="#b8b5c2" stroke="none"/><path d="M247,145 L259,142 M259,142 L256,156 M247,145 L256,156"/></g>
+  <circle cx="252" cy="150" r="13" fill="#2a2621"/>
+  <g class="gl" stroke="#c4bdb2"><circle cx="247" cy="145" r="2" fill="#c4bdb2" stroke="none"/><circle cx="259" cy="142" r="2" fill="#c4bdb2" stroke="none"/><circle cx="256" cy="156" r="2" fill="#c4bdb2" stroke="none"/><path d="M247,145 L259,142 M259,142 L256,156 M247,145 L256,156"/></g>
   <text class="ttl" x="274" y="150" font-size="14">仓库地图</text>
   <text class="sub" x="240" y="178">Profile + 依赖图</text>
 
   <!-- Lead -->
-  <rect x="224" y="212" width="190" height="96" rx="13" fill="#211f33" stroke="#4f46e5" stroke-width="1.4"/>
-  <circle cx="254" cy="246" r="14" fill="#4f46e5" opacity="0.2"/>
-  <circle cx="254" cy="246" r="8" fill="none" stroke="#9a93f7" class="gl"/>
-  <path d="M254,239 L258,246 L254,253 L250,246 Z" fill="#9a93f7"/>
+  <rect x="224" y="212" width="190" height="96" rx="13" fill="#173034" stroke="#49c0c9" stroke-width="1.4"/>
+  <circle cx="254" cy="246" r="14" fill="#49c0c9" opacity="0.2"/>
+  <circle cx="254" cy="246" r="8" fill="none" stroke="#9de5e8" class="gl"/>
+  <path d="M254,239 L258,246 L254,253 L250,246 Z" fill="#9de5e8"/>
   <text class="ttl" x="278" y="244">Lead 主 agent</text>
   <text class="sub" x="240" y="288">分类 · 规划 · scope</text>
 
   <!-- Workers -->
   <g>
     <rect class="node" x="470" y="106" width="210" height="88" rx="13"/>
-    <circle cx="500" cy="140" r="13" fill="#2a2734"/>
-    <g class="gl" stroke="#b8b5c2"><path d="M495,135 l4,5 l-4,5"/><path d="M502,146 h6"/></g>
+    <circle cx="500" cy="140" r="13" fill="#2a2621"/>
+    <g class="gl" stroke="#c4bdb2"><path d="M495,135 l4,5 l-4,5"/><path d="M502,146 h6"/></g>
     <text class="ttl" x="523" y="138">Worker · 仓 A</text>
     <text class="sub" x="486" y="162">worktree · brief</text>
-    <circle cx="660" cy="138" r="4" fill="#35c98b"/>
-    <text x="486" y="182" class="sub" fill="#6f6c79">Claude</text>
+    <circle cx="660" cy="138" r="4" fill="#65d6a1"/>
+    <text x="486" y="182" class="sub" fill="#8e887f">Claude</text>
   </g>
   <g>
     <rect class="node" x="470" y="216" width="210" height="88" rx="13"/>
-    <circle cx="500" cy="250" r="13" fill="#2a2734"/>
-    <g class="gl" stroke="#b8b5c2"><path d="M495,245 l4,5 l-4,5"/><path d="M502,256 h6"/></g>
+    <circle cx="500" cy="250" r="13" fill="#2a2621"/>
+    <g class="gl" stroke="#c4bdb2"><path d="M495,245 l4,5 l-4,5"/><path d="M502,256 h6"/></g>
     <text class="ttl" x="523" y="248">Worker · 仓 B</text>
     <text class="sub" x="486" y="272">worktree · brief</text>
-    <circle cx="660" cy="248" r="4" fill="#35c98b"/>
-    <text x="486" y="292" class="sub" fill="#6f6c79">Codex</text>
+    <circle cx="660" cy="248" r="4" fill="#65d6a1"/>
+    <text x="486" y="292" class="sub" fill="#8e887f">Codex</text>
   </g>
   <g>
     <rect class="node" x="470" y="326" width="210" height="88" rx="13"/>
-    <circle cx="500" cy="360" r="13" fill="#2a2734"/>
-    <g class="gl" stroke="#b8b5c2"><path d="M495,355 l4,5 l-4,5"/><path d="M502,366 h6"/></g>
+    <circle cx="500" cy="360" r="13" fill="#2a2621"/>
+    <g class="gl" stroke="#c4bdb2"><path d="M495,355 l4,5 l-4,5"/><path d="M502,366 h6"/></g>
     <text class="ttl" x="523" y="358">Worker · 仓 C</text>
     <text class="sub" x="486" y="382">worktree · brief</text>
-    <circle cx="660" cy="358" r="4" fill="#35c98b"/>
-    <text x="486" y="402" class="sub" fill="#6f6c79">OpenCode</text>
+    <circle cx="660" cy="358" r="4" fill="#65d6a1"/>
+    <text x="486" y="402" class="sub" fill="#8e887f">OpenCode</text>
   </g>
 
   <!-- Verify -->
-  <rect class="node" x="740" y="212" width="158" height="96" rx="13" stroke="#3a5a48"/>
-  <circle cx="770" cy="246" r="14" fill="#35c98b" opacity="0.16"/>
-  <path class="gl" d="M764,246 l4,4 l8,-9" stroke="#4fd49b"/>
+  <rect class="node" x="740" y="212" width="158" height="96" rx="13" stroke="#315748"/>
+  <circle cx="770" cy="246" r="14" fill="#65d6a1" opacity="0.16"/>
+  <path class="gl" d="M764,246 l4,4 l8,-9" stroke="#73dca9"/>
   <text class="ttl" x="792" y="244" font-size="14">验证</text>
   <text class="sub" x="756" y="288">lint · type · test</text>
 
   <!-- Open PR -->
   <rect class="node" x="940" y="212" width="150" height="96" rx="13"/>
-  <circle cx="970" cy="246" r="13" fill="#2a2734"/>
-  <g class="gl" stroke="#b8b5c2"><circle cx="965" cy="241" r="2.4" fill="#b8b5c2" stroke="none"/><circle cx="965" cy="252" r="2.4" fill="#b8b5c2" stroke="none"/><path d="M965,243 v7"/><path d="M965,244 C972,244 976,247 976,252"/><circle cx="976" cy="252" r="2.4" fill="#b8b5c2" stroke="none"/></g>
+  <circle cx="970" cy="246" r="13" fill="#2a2621"/>
+  <g class="gl" stroke="#c4bdb2"><circle cx="965" cy="241" r="2.4" fill="#c4bdb2" stroke="none"/><circle cx="965" cy="252" r="2.4" fill="#c4bdb2" stroke="none"/><path d="M965,243 v7"/><path d="M965,244 C972,244 976,247 976,252"/><circle cx="976" cy="252" r="2.4" fill="#c4bdb2" stroke="none"/></g>
   <text class="ttl" x="992" y="244" font-size="14">开 PR</text>
   <text class="sub" x="956" y="288">起草改动</text>
 
   <!-- Merge -->
   <rect class="node" x="1124" y="212" width="150" height="96" rx="13"/>
-  <circle cx="1154" cy="246" r="13" fill="#2a2734"/>
-  <g class="gl" stroke="#b8b5c2"><circle cx="1149" cy="240" r="2.4" fill="#b8b5c2" stroke="none"/><path d="M1149,242 v6 a8,8 0 0 0 8,8"/><circle cx="1149" cy="253" r="2.4" fill="#b8b5c2" stroke="none"/><circle cx="1160" cy="256" r="2.4" fill="#b8b5c2" stroke="none"/></g>
+  <circle cx="1154" cy="246" r="13" fill="#2a2621"/>
+  <g class="gl" stroke="#c4bdb2"><circle cx="1149" cy="240" r="2.4" fill="#c4bdb2" stroke="none"/><path d="M1149,242 v6 a8,8 0 0 0 8,8"/><circle cx="1149" cy="253" r="2.4" fill="#c4bdb2" stroke="none"/><circle cx="1160" cy="256" r="2.4" fill="#c4bdb2" stroke="none"/></g>
   <text class="ttl" x="1176" y="244" font-size="14">合并</text>
   <text class="sub" x="1140" y="288">并入主干</text>
 
   <!-- Deploy: staging -->
   <rect class="node" x="1308" y="212" width="150" height="96" rx="13"/>
-  <circle cx="1338" cy="246" r="13" fill="#2a2734"/>
-  <g class="gl" stroke="#b8b5c2"><path d="M1333,251 h10" /><path d="M1338,251 v-9" /><path d="M1334,246 l4,-4 l4,4" /></g>
+  <circle cx="1338" cy="246" r="13" fill="#2a2621"/>
+  <g class="gl" stroke="#c4bdb2"><path d="M1333,251 h10" /><path d="M1338,251 v-9" /><path d="M1334,246 l4,-4 l4,4" /></g>
   <text class="ttl" x="1360" y="244" font-size="14">预发</text>
   <text class="sub" x="1324" y="288">部署 · 验证</text>
 
   <!-- Deploy: production (outcome) -->
-  <rect x="1492" y="212" width="168" height="96" rx="13" fill="#2a1c18" stroke="#f2683c" stroke-width="1.5"/>
-  <circle cx="1522" cy="246" r="14" fill="#f2683c" opacity="0.9"/>
-  <path class="gl" d="M1516,246 l4,4 l8,-9" stroke="#1a120f" stroke-width="2.1"/>
-  <text x="1546" y="244" fill="#f7b094" font-size="14.5" font-weight="600">生产</text>
-  <text class="sub" x="1508" y="288" fill="#bd8f74">上线 · 已发布</text>
+  <rect x="1492" y="212" width="168" height="96" rx="13" fill="#2d1d18" stroke="#f27d53" stroke-width="1.5"/>
+  <circle cx="1522" cy="246" r="14" fill="#f27d53" opacity="0.9"/>
+  <path class="gl" d="M1516,246 l4,4 l8,-9" stroke="#171512" stroke-width="2.1"/>
+  <text x="1546" y="244" fill="#ffb092" font-size="14.5" font-weight="600">生产</text>
+  <text class="sub" x="1508" y="288" fill="#c7977c">上线 · 已发布</text>
 
   <!-- now / roadmap brackets -->
-  <path class="gl" d="M940,322 v7 M940,329 H1090 M1090,329 v-7" stroke="#3a5a48" stroke-width="1.2" opacity=".8"/>
-  <text class="lbl" x="1015" y="348" fill="#5fbf92" text-anchor="middle">当前</text>
-  <path class="gl" d="M1124,322 v7 M1124,329 H1660 M1660,329 v-7" stroke="#7a5a24" stroke-width="1.2" stroke-dasharray="4 4" opacity=".9"/>
-  <text class="lbl" x="1392" y="348" fill="#caa14e" text-anchor="middle">路线图 —— 自动合并 &amp; 跨环境部署(预发 → 生产)</text>
+  <path class="gl" d="M940,322 v7 M940,329 H1090 M1090,329 v-7" stroke="#315748" stroke-width="1.2" opacity=".8"/>
+  <text class="lbl" x="1015" y="348" fill="#65d6a1" text-anchor="middle">当前</text>
+  <path class="gl" d="M1124,322 v7 M1124,329 H1660 M1660,329 v-7" stroke="#725927" stroke-width="1.2" stroke-dasharray="4 4" opacity=".9"/>
+  <text class="lbl" x="1392" y="348" fill="#e7bd61" text-anchor="middle">路线图 —— 自动合并 &amp; 跨环境部署(预发 → 生产)</text>
 </svg>

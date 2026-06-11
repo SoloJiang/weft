@@ -18,7 +18,13 @@ const TOOLS: [&str; 3] = ["claude", "codex", "opencode"];
 
 fn probe(tool: &str) -> ToolStatus {
     let Some(path) = crate::detect::resolve_tool_path(tool) else {
-        return ToolStatus { tool: tool.into(), installed: false, version: None, path: None, meets_min: true };
+        return ToolStatus {
+            tool: tool.into(),
+            installed: false,
+            version: None,
+            path: None,
+            meets_min: true,
+        };
     };
     let version = std::process::Command::new(&path)
         .arg("--version")
@@ -33,7 +39,10 @@ fn probe(tool: &str) -> ToolStatus {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         });
-    let meets_min = version.as_deref().map(|v| crate::detect::meets_min(tool, v)).unwrap_or(true);
+    let meets_min = version
+        .as_deref()
+        .map(|v| crate::detect::meets_min(tool, v))
+        .unwrap_or(true);
     ToolStatus {
         tool: tool.into(),
         installed: true,

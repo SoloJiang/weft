@@ -1,74 +1,74 @@
 <svg viewBox="0 0 1320 480" xmlns="http://www.w3.org/2000/svg" font-family="'Inter','PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Hiragino Sans GB',sans-serif">
   <defs>
-    <marker id="b4" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#5b5866"/></marker>
-    <marker id="b4a" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#caa14e"/></marker>
+    <marker id="b4" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#6b655c"/></marker>
+    <marker id="b4a" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#e7bd61"/></marker>
     <style>
       .hd{font-size:12px;font-weight:600;letter-spacing:.8px}
-      .lane{fill:#17161e;stroke:#2c2a34;stroke-width:1}
-      .card{fill:#211f29;stroke:#383640;stroke-width:1}
-      .cl{fill:#eceaf2;font-size:13px;font-weight:600}
-      .tg{fill:#827f8c;font-size:10.5px}
+      .lane{fill:#1a1814;stroke:#3a352e;stroke-width:1}
+      .card{fill:#22201b;stroke:#3a352e;stroke-width:1}
+      .cl{fill:#eee8df;font-size:13px;font-weight:600}
+      .tg{fill:#9b948a;font-size:10.5px}
       .gl{stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
-      .nl{fill:#caa14e;font-size:10.5px;font-weight:500}
+      .nl{fill:#e7bd61;font-size:10.5px;font-weight:500}
     </style>
   </defs>
 
-  <rect x="0" y="0" width="1320" height="480" rx="18" fill="#15141a"/>
+  <rect x="0" y="0" width="1320" height="480" rx="18" fill="#171512"/>
 
-  <path class="gl" d="M334,128 H354" stroke="#5b5866" marker-end="url(#b4)"/>
-  <path class="gl" d="M650,128 H670" stroke="#5b5866" marker-end="url(#b4)"/>
-  <path class="gl" d="M966,128 H986" stroke="#5b5866" marker-end="url(#b4)"/>
+  <path class="gl" d="M334,128 H354" stroke="#6b655c" marker-end="url(#b4)"/>
+  <path class="gl" d="M650,128 H670" stroke="#6b655c" marker-end="url(#b4)"/>
+  <path class="gl" d="M966,128 H986" stroke="#6b655c" marker-end="url(#b4)"/>
 
   <!-- 排队 -->
-  <circle cx="50" cy="49" r="4" fill="#8b8896"/>
-  <text class="hd" x="62" y="53" fill="#a7a4b0">排队</text>
+  <circle cx="50" cy="49" r="4" fill="#9b948a"/>
+  <text class="hd" x="62" y="53" fill="#b8b0a4">排队</text>
   <rect class="lane" x="40" y="66" width="292" height="206" rx="13"/>
   <rect class="card" x="58" y="90" width="256" height="74" rx="10"/>
-  <circle cx="80" cy="118" r="4" fill="#8b8896"/>
+  <circle cx="80" cy="118" r="4" fill="#9b948a"/>
   <text class="cl" x="94" y="122">排队的任务</text>
-  <rect x="74" y="138" width="58" height="18" rx="6" fill="#26242e"/><text class="tg" x="86" y="151">Claude</text>
+  <rect x="74" y="138" width="58" height="18" rx="6" fill="#28241f"/><text class="tg" x="86" y="151">Claude</text>
 
   <!-- 进行中 -->
-  <circle cx="356" cy="49" r="4" fill="#35c98b"/>
-  <text class="hd" x="368" y="53" fill="#a7a4b0">进行中</text>
+  <circle cx="356" cy="49" r="4" fill="#65d6a1"/>
+  <text class="hd" x="368" y="53" fill="#b8b0a4">进行中</text>
   <rect class="lane" x="356" y="66" width="292" height="206" rx="13"/>
   <rect class="card" x="374" y="90" width="256" height="74" rx="10"/>
-  <circle cx="396" cy="118" r="4" fill="#35c98b"/>
+  <circle cx="396" cy="118" r="4" fill="#65d6a1"/>
   <text class="cl" x="410" y="122">运行中的任务</text>
-  <rect x="390" y="138" width="68" height="18" rx="6" fill="#26242e"/><text class="tg" x="402" y="151">OpenCode</text>
+  <rect x="390" y="138" width="68" height="18" rx="6" fill="#28241f"/><text class="tg" x="402" y="151">OpenCode</text>
 
   <!-- Review -->
-  <circle cx="672" cy="49" r="4" fill="#7c74f0"/>
-  <text class="hd" x="684" y="53" fill="#a7a4b0">REVIEW</text>
+  <circle cx="672" cy="49" r="4" fill="#49c0c9"/>
+  <text class="hd" x="684" y="53" fill="#b8b0a4">REVIEW</text>
   <rect class="lane" x="672" y="66" width="292" height="206" rx="13"/>
   <rect class="card" x="690" y="90" width="256" height="74" rx="10"/>
-  <circle cx="712" cy="118" r="4" fill="#7c74f0"/>
+  <circle cx="712" cy="118" r="4" fill="#49c0c9"/>
   <text class="cl" x="726" y="122">审阅中</text>
-  <rect x="706" y="138" width="58" height="18" rx="6" fill="#26242e"/><text class="tg" x="718" y="151">Codex</text>
+  <rect x="706" y="138" width="58" height="18" rx="6" fill="#28241f"/><text class="tg" x="718" y="151">Codex</text>
 
   <!-- 完成 -->
-  <circle cx="988" cy="49" r="4" fill="#f2683c"/>
-  <text class="hd" x="1000" y="53" fill="#a7a4b0">完成</text>
+  <circle cx="988" cy="49" r="4" fill="#f27d53"/>
+  <text class="hd" x="1000" y="53" fill="#b8b0a4">完成</text>
   <rect class="lane" x="988" y="66" width="292" height="206" rx="13"/>
   <rect class="card" x="1006" y="90" width="256" height="74" rx="10"/>
-  <g class="gl" stroke="#f2683c"><path d="M1024,118 l3,3 l6,-7"/></g>
+  <g class="gl" stroke="#f27d53"><path d="M1024,118 l3,3 l6,-7"/></g>
   <text class="cl" x="1044" y="122">已上线</text>
   <text class="tg" x="1022" y="151">已合并 · 已部署</text>
 
   <!-- overlay arrows -->
-  <path class="gl" d="M502,164 V312" stroke="#caa14e" stroke-dasharray="4 5" opacity=".85" marker-end="url(#b4a)"/>
+  <path class="gl" d="M502,164 V312" stroke="#e7bd61" stroke-dasharray="4 5" opacity=".85" marker-end="url(#b4a)"/>
   <text class="nl" x="512" y="246">待答 ask /</text>
   <text class="nl" x="512" y="262">检查失败</text>
-  <path class="gl" d="M820,164 V312" stroke="#caa14e" stroke-dasharray="4 5" opacity=".85" marker-end="url(#b4a)"/>
+  <path class="gl" d="M820,164 V312" stroke="#e7bd61" stroke-dasharray="4 5" opacity=".85" marker-end="url(#b4a)"/>
   <text class="nl" x="830" y="254">检查失败</text>
 
   <!-- Needs you lane -->
-  <rect x="356" y="316" width="608" height="120" rx="13" fill="#1d1812" stroke="#7a5a24" stroke-width="1.2"/>
-  <g class="gl" stroke="#e6b24e" transform="translate(386,348)"><path d="M0,-9 L9,7 H-9 Z"/><path d="M0,-2 v5"/><circle cx="0" cy="6" r="0.6" fill="#e6b24e"/></g>
-  <text x="408" y="346" fill="#f0c977" font-size="15" font-weight="600">Needs you</text>
-  <text x="408" y="366" fill="#b79355" font-size="11">Weft 拥有的例外车道 —— 聚合 · 永远置顶</text>
-  <rect class="card" x="376" y="380" width="300" height="40" rx="9" fill="#241d12" stroke="#5a461f"/>
-  <circle cx="398" cy="400" r="4" fill="#e6b24e"/>
-  <text class="cl" x="412" y="404" fill="#f0e6cf" font-size="12.5">权限请求 · 检查失败</text>
-  <text x="700" y="404" fill="#b79355" font-size="11">Approve · Answer · Open · Review</text>
+  <rect x="356" y="316" width="608" height="120" rx="13" fill="#211b12" stroke="#725927" stroke-width="1.2"/>
+  <g class="gl" stroke="#e7bd61" transform="translate(386,348)"><path d="M0,-9 L9,7 H-9 Z"/><path d="M0,-2 v5"/><circle cx="0" cy="6" r="0.6" fill="#e7bd61"/></g>
+  <text x="408" y="346" fill="#f1cf82" font-size="15" font-weight="600">Needs you</text>
+  <text x="408" y="366" fill="#c5a56a" font-size="11">Weft 拥有的例外车道 —— 聚合 · 永远置顶</text>
+  <rect class="card" x="376" y="380" width="300" height="40" rx="9" fill="#282015" stroke="#6b5224"/>
+  <circle cx="398" cy="400" r="4" fill="#e7bd61"/>
+  <text class="cl" x="412" y="404" fill="#f3e5c7" font-size="12.5">权限请求 · 检查失败</text>
+  <text x="700" y="404" fill="#c5a56a" font-size="11">Approve · Answer · Open · Review</text>
 </svg>

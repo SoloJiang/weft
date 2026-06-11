@@ -1,12 +1,14 @@
 //! Tauri command surface for the M2 workspace model. Thin wrappers; all logic
 //! lives in store::repo and materialize.
 
-use crate::store::{entities, repo, Db};
 use crate::materialize;
+use crate::store::{entities, repo, Db};
 use tauri::State;
 
 type R<T> = Result<T, String>;
-fn e<E: ToString>(x: E) -> String { x.to_string() }
+fn e<E: ToString>(x: E) -> String {
+    x.to_string()
+}
 
 #[tauri::command]
 pub async fn create_workspace(db: State<'_, Db>, name: String) -> R<entities::workspace::Model> {
@@ -14,8 +16,14 @@ pub async fn create_workspace(db: State<'_, Db>, name: String) -> R<entities::wo
 }
 
 #[tauri::command]
-pub async fn rename_workspace(db: State<'_, Db>, workspace_id: i32, name: String) -> R<entities::workspace::Model> {
-    repo::rename_workspace(&db, workspace_id, &name).await.map_err(e)
+pub async fn rename_workspace(
+    db: State<'_, Db>,
+    workspace_id: i32,
+    name: String,
+) -> R<entities::workspace::Model> {
+    repo::rename_workspace(&db, workspace_id, &name)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
@@ -52,8 +60,11 @@ async fn register_repo(
         return Err("not a git repository".into());
     }
     // default base ref = current branch of the repo
-    let base = crate::git::current_branch(std::path::Path::new(path)).unwrap_or_else(|_| "main".into());
-    let r = repo::add_repo_ref(db, workspace_id, name, path, &base).await.map_err(e)?;
+    let base =
+        crate::git::current_branch(std::path::Path::new(path)).unwrap_or_else(|_| "main".into());
+    let r = repo::add_repo_ref(db, workspace_id, name, path, &base)
+        .await
+        .map_err(e)?;
     // Eager, deterministic profiling (ARCHITECTURE §4.9): best-effort, never
     // blocks adding the repo if inference/git hiccups.
     let _ = crate::curator::profile_repo(db, &r).await;
@@ -121,7 +132,10 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
 
 #[tauri::command]
 pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
-    let r = repo::get_repo(&db, repo_id).await.map_err(e)?.ok_or("repo not found")?;
+    let r = repo::get_repo(&db, repo_id)
+        .await
+        .map_err(e)?
+        .ok_or("repo not found")?;
     crate::curator::profile_repo(&db, &r).await.map_err(e)?;
     Ok(())
 }
@@ -133,18 +147,31 @@ pub async fn update_repo_profile(
     summary: String,
     role: String,
 ) -> R<()> {
-    crate::curator::edit_profile(&db, repo_id, &summary, &role).await.map_err(e)?;
+    crate::curator::edit_profile(&db, repo_id, &summary, &role)
+        .await
+        .map_err(e)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn create_thread(db: State<'_, Db>, workspace_id: i32, title: String, kind: String) -> R<entities::thread::Model> {
+pub async fn create_thread(
+    db: State<'_, Db>,
+    workspace_id: i32,
+    title: String,
+    kind: String,
+) -> R<entities::thread::Model> {
     let tool = crate::tools::default_tool(&db).await;
-    repo::create_thread(&db, workspace_id, &title, &kind, &tool).await.map_err(e)
+    repo::create_thread(&db, workspace_id, &title, &kind, &tool)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
-pub async fn rename_thread(db: State<'_, Db>, thread_id: i32, title: String) -> R<entities::thread::Model> {
+pub async fn rename_thread(
+    db: State<'_, Db>,
+    thread_id: i32,
+    title: String,
+) -> R<entities::thread::Model> {
     repo::rename_thread(&db, thread_id, &title).await.map_err(e)
 }
 
@@ -194,7 +221,10 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
             kind: t.kind,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
             statuses: dirs.iter().map(|d| d.status.clone()).collect(),
-            write_repos: seen.into_iter().map(|(id, name)| RepoLite { id, name }).collect(),
+            write_repos: seen
+                .into_iter()
+                .map(|(id, name)| RepoLite { id, name })
+                .collect(),
         });
     }
     Ok(out)
@@ -206,7 +236,10 @@ pub async fn list_repos(db: State<'_, Db>, workspace_id: i32) -> R<Vec<entities:
 }
 
 #[tauri::command]
-pub async fn list_directions(db: State<'_, Db>, thread_id: i32) -> R<Vec<entities::direction::Model>> {
+pub async fn list_directions(
+    db: State<'_, Db>,
+    thread_id: i32,
+) -> R<Vec<entities::direction::Model>> {
     repo::list_directions(&db, thread_id).await.map_err(e)
 }
 
@@ -217,7 +250,9 @@ pub async fn get_proposal(
     db: State<'_, Db>,
     thread_id: i32,
 ) -> R<Option<crate::planner::ResolvedProposal>> {
-    crate::planner::get_resolved(&db, thread_id).await.map_err(e)
+    crate::planner::get_resolved(&db, thread_id)
+        .await
+        .map_err(e)
 }
 
 /// Save a (human-edited) proposal back, keeping it in "proposed" state.
@@ -227,7 +262,9 @@ pub async fn save_proposal(
     thread_id: i32,
     proposal: crate::planner::Proposal,
 ) -> R<()> {
-    crate::planner::save_proposal(&db, thread_id, &proposal).await.map_err(e)
+    crate::planner::save_proposal(&db, thread_id, &proposal)
+        .await
+        .map_err(e)
 }
 
 /// Confirm the stored proposal: create its directions + materialize worktrees.
@@ -254,7 +291,9 @@ pub struct RepoChecks {
 /// "worker done = checks green, not self-report." Runs off the async runtime.
 #[tauri::command]
 pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<RepoChecks>> {
-    let wts = repo::list_worktrees(&db, Some(direction_id)).await.map_err(e)?;
+    let wts = repo::list_worktrees(&db, Some(direction_id))
+        .await
+        .map_err(e)?;
     let mut targets: Vec<(String, String)> = Vec::new();
     for w in wts {
         let name = repo::get_repo(&db, w.repo_id)
@@ -269,7 +308,11 @@ pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<Rep
             .into_iter()
             .map(|(repo, worktree)| {
                 let checks = crate::check::run_checks(std::path::Path::new(&worktree));
-                RepoChecks { repo, worktree, checks }
+                RepoChecks {
+                    repo,
+                    worktree,
+                    checks,
+                }
             })
             .collect::<Vec<_>>()
     })
@@ -302,7 +345,9 @@ pub async fn create_direction(
     )
     .await
     .map_err(e)?;
-    materialize::materialize_direction(&db, dir.id).await.map_err(e)?;
+    materialize::materialize_direction(&db, dir.id)
+        .await
+        .map_err(e)?;
     Ok(dir)
 }
 
@@ -310,12 +355,20 @@ pub async fn create_direction(
 /// bus tool). queued | working | review | done — freely reversible.
 #[tauri::command]
 pub async fn set_task_status(db: State<'_, Db>, direction_id: i32, status: String) -> R<()> {
-    repo::set_direction_status(&db, direction_id, &status).await.map_err(e)
+    repo::set_direction_status(&db, direction_id, &status)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
-pub async fn rename_direction(db: State<'_, Db>, direction_id: i32, name: String) -> R<entities::direction::Model> {
-    repo::rename_direction(&db, direction_id, &name).await.map_err(e)
+pub async fn rename_direction(
+    db: State<'_, Db>,
+    direction_id: i32,
+    name: String,
+) -> R<entities::direction::Model> {
+    repo::rename_direction(&db, direction_id, &name)
+        .await
+        .map_err(e)
 }
 
 /// The worker's worktree diff (file stats + unified patch) for the Diff tab.
@@ -335,22 +388,32 @@ pub async fn read_transcript(cwd: String, tool: String) -> R<Vec<crate::sidecar:
 }
 
 #[tauri::command]
-pub async fn list_worktrees(db: State<'_, Db>, direction_id: Option<i32>) -> R<Vec<entities::worktree::Model>> {
+pub async fn list_worktrees(
+    db: State<'_, Db>,
+    direction_id: Option<i32>,
+) -> R<Vec<entities::worktree::Model>> {
     repo::list_worktrees(&db, direction_id).await.map_err(e)
 }
 
 #[tauri::command]
 pub async fn repo_diff(db: State<'_, Db>, worktree_id: i32) -> R<crate::git::DiffSummary> {
     use sea_orm::EntityTrait;
-    let w = entities::worktree::Entity::find_by_id(worktree_id).one(&db.0).await.map_err(e)?
+    let w = entities::worktree::Entity::find_by_id(worktree_id)
+        .one(&db.0)
+        .await
+        .map_err(e)?
         .ok_or("worktree not found")?;
     crate::git::repo_diff(std::path::Path::new(&w.path)).map_err(e)
 }
 
 #[tauri::command]
 pub async fn delete_thread(db: State<'_, Db>, thread_id: i32) -> R<()> {
-    let removed = repo::delete_thread_cascade(&db, thread_id).await.map_err(e)?;
-    materialize::cleanup_worktrees(&db, &removed).await.map_err(e)
+    let removed = repo::delete_thread_cascade(&db, thread_id)
+        .await
+        .map_err(e)?;
+    materialize::cleanup_worktrees(&db, &removed)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
@@ -431,9 +494,14 @@ pub async fn get_default_tool(db: State<'_, Db>) -> R<DefaultTool> {
 #[tauri::command]
 pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
     if !crate::detect::TOOL_PRIORITY.contains(&tool.as_str()) {
-        return Err(format!("unknown tool {tool:?}; expected one of {:?}", crate::detect::TOOL_PRIORITY));
+        return Err(format!(
+            "unknown tool {tool:?}; expected one of {:?}",
+            crate::detect::TOOL_PRIORITY
+        ));
     }
-    repo::set_setting(&db, "default_tool", &tool).await.map_err(e)
+    repo::set_setting(&db, "default_tool", &tool)
+        .await
+        .map_err(e)
 }
 
 /// One pending write declaration waiting on the human, with thread context.
@@ -450,10 +518,7 @@ pub struct WriteTrigger {
 /// Every pending write declaration across the workspace's threads — the
 /// data behind the Needs-you "approve a write" cards.
 #[tauri::command]
-pub async fn write_triggers(
-    db: State<'_, Db>,
-    workspace_id: i32,
-) -> R<Vec<WriteTrigger>> {
+pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<WriteTrigger>> {
     let threads = repo::list_threads(&db, workspace_id).await.map_err(e)?;
     let mut out = Vec::new();
     for t in threads {
@@ -480,7 +545,9 @@ pub async fn approve_write_trigger(
     index: usize,
     tool: String,
 ) -> R<i32> {
-    crate::planner::approve_direction(&db, thread_id, index, &tool).await.map_err(e)
+    crate::planner::approve_direction(&db, thread_id, index, &tool)
+        .await
+        .map_err(e)
 }
 
 /// Deny a write declaration: mark denied + relay to the lead's bus inbox.
@@ -491,7 +558,9 @@ pub async fn deny_write_trigger(
     thread_id: i32,
     index: usize,
 ) -> R<()> {
-    let (name, repo) = crate::planner::deny_direction(&db, thread_id, index).await.map_err(e)?;
+    let (name, repo) = crate::planner::deny_direction(&db, thread_id, index)
+        .await
+        .map_err(e)?;
     let msg = format!(
         "The human DENIED the write declaration \"{name}\" (repo {repo}). Do not create it; revise the plan or ask why.",
     );
@@ -619,7 +688,10 @@ pub async fn session_for(
     direction_id: i32,
     repo_id: i32,
 ) -> R<Option<ObserveRef>> {
-    let wt = match repo::worktree_for(&db, direction_id, repo_id).await.map_err(e)? {
+    let wt = match repo::worktree_for(&db, direction_id, repo_id)
+        .await
+        .map_err(e)?
+    {
         Some(w) => w,
         None => return Ok(None),
     };
@@ -627,7 +699,9 @@ pub async fn session_for(
         Some(d) => d,
         None => return Ok(None),
     };
-    let latest = repo::latest_session_for(&db, direction_id, repo_id).await.map_err(e)?;
+    let latest = repo::latest_session_for(&db, direction_id, repo_id)
+        .await
+        .map_err(e)?;
     Ok(Some(ObserveRef {
         worktree: wt.path,
         branch: wt.branch,
@@ -644,7 +718,11 @@ pub async fn session_for(
 /// is optional — when absent, weft-managed layers are omitted (personal + repo
 /// only), keeping backward-compat with existing frontend calls that don't pass it.
 #[tauri::command]
-pub async fn effective_config(db: State<'_, Db>, repo_path: String, ws_id: Option<i32>) -> R<Vec<crate::config::ConfigItem>> {
+pub async fn effective_config(
+    db: State<'_, Db>,
+    repo_path: String,
+    ws_id: Option<i32>,
+) -> R<Vec<crate::config::ConfigItem>> {
     let home = dirs::home_dir().ok_or_else(|| "no home".to_string())?;
     let weft: Vec<(String, String, String)> = match ws_id {
         Some(w) => crate::skills::enabled_for_workspace(&db, w)
@@ -653,13 +731,21 @@ pub async fn effective_config(db: State<'_, Db>, repo_path: String, ws_id: Optio
             .into_iter()
             .filter(|s| !s.overridden)
             .map(|s| {
-                let layer = if s.global { "weft-global" } else { "weft-workspace" };
+                let layer = if s.global {
+                    "weft-global"
+                } else {
+                    "weft-workspace"
+                };
                 (s.name, layer.to_string(), s.dir)
             })
             .collect(),
         None => Vec::new(),
     };
-    Ok(crate::config::effective_for_with_weft(std::path::Path::new(&repo_path), &home, &weft))
+    Ok(crate::config::effective_for_with_weft(
+        std::path::Path::new(&repo_path),
+        &home,
+        &weft,
+    ))
 }
 
 // --- Skills (git-hosted skill sources): source CRUD, sync, parse preview, enable ---
@@ -670,10 +756,19 @@ pub async fn list_skill_sources(db: State<'_, Db>) -> R<Vec<entities::skill_sour
 }
 
 #[tauri::command]
-pub async fn add_skill_source(db: State<'_, Db>, git_url: String, git_ref: Option<String>) -> R<entities::skill_source::Model> {
-    let src = repo::add_skill_source(&db, &git_url, git_ref.as_deref()).await.map_err(e)?;
+pub async fn add_skill_source(
+    db: State<'_, Db>,
+    git_url: String,
+    git_ref: Option<String>,
+) -> R<entities::skill_source::Model> {
+    let src = repo::add_skill_source(&db, &git_url, git_ref.as_deref())
+        .await
+        .map_err(e)?;
     let _ = crate::skills::sync_source(&db, src.id).await;
-    repo::get_skill_source(&db, src.id).await.map_err(e)?.ok_or_else(|| "source vanished".to_string())
+    repo::get_skill_source(&db, src.id)
+        .await
+        .map_err(e)?
+        .ok_or_else(|| "source vanished".to_string())
 }
 
 #[tauri::command]
@@ -688,7 +783,10 @@ pub async fn remove_skill_source(db: State<'_, Db>, id: i32) -> R<()> {
 #[tauri::command]
 pub async fn sync_skill_source(db: State<'_, Db>, id: i32) -> R<entities::skill_source::Model> {
     crate::skills::sync_source(&db, id).await.map_err(e)?;
-    repo::get_skill_source(&db, id).await.map_err(e)?.ok_or_else(|| "source not found".to_string())
+    repo::get_skill_source(&db, id)
+        .await
+        .map_err(e)?
+        .ok_or_else(|| "source not found".to_string())
 }
 
 #[tauri::command]
@@ -702,17 +800,32 @@ pub async fn sync_all_skill_sources(db: State<'_, Db>) -> R<Vec<entities::skill_
 #[tauri::command]
 pub async fn list_parsed_skills(id: i32) -> R<Vec<crate::skills::parse::ParsedSkill>> {
     let home = crate::paths::skills_home().map_err(e)?;
-    Ok(crate::skills::parse::parse_source(&home.join(id.to_string())))
+    Ok(crate::skills::parse::parse_source(
+        &home.join(id.to_string()),
+    ))
 }
 
 #[tauri::command]
-pub async fn set_skill_enabled(db: State<'_, Db>, source_id: i32, name: String, scope: String, on: bool) -> R<()> {
-    repo::set_skill_enable(&db, source_id, &name, &scope, on).await.map_err(e)
+pub async fn set_skill_enabled(
+    db: State<'_, Db>,
+    source_id: i32,
+    name: String,
+    scope: String,
+    on: bool,
+) -> R<()> {
+    repo::set_skill_enable(&db, source_id, &name, &scope, on)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]
-pub async fn workspace_skills(db: State<'_, Db>, ws_id: i32) -> R<Vec<crate::skills::EnabledSkill>> {
-    crate::skills::enabled_for_workspace(&db, ws_id).await.map_err(e)
+pub async fn workspace_skills(
+    db: State<'_, Db>,
+    ws_id: i32,
+) -> R<Vec<crate::skills::EnabledSkill>> {
+    crate::skills::enabled_for_workspace(&db, ws_id)
+        .await
+        .map_err(e)
 }
 
 /// Pending "needs you" count per workspace (agent questions + tool asks), so the
@@ -732,9 +845,15 @@ pub async fn workspace_needs_counts(
         let mut count: u32 = 0;
         for t in &threads {
             count += bus.open_asks(t.id).len() as u32;
-            count += crate::planner::pending_writes(&db, t.id).await.map_err(e)?.len() as u32;
+            count += crate::planner::pending_writes(&db, t.id)
+                .await
+                .map_err(e)?
+                .len() as u32;
         }
-        count += open_asks.iter().filter(|a| tids.contains(&a.thread)).count() as u32;
+        count += open_asks
+            .iter()
+            .filter(|a| tids.contains(&a.thread))
+            .count() as u32;
         out.push((w.id, count));
     }
     Ok(out)
@@ -782,6 +901,7 @@ pub struct ImSettingsView {
     pub app_id: String,
     pub has_secret: bool,
     pub bound: bool,
+    pub enabled: bool,
 }
 
 #[tauri::command]
@@ -791,11 +911,12 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
         app_id: s.app_id,
         has_secret: !s.app_secret.is_empty(),
         bound: !s.allow_open_ids.is_empty(),
+        enabled: s.enabled,
     })
 }
 
-/// 保存并重启桥。secret 传空字符串 = 保持原值（不覆盖已存的密钥）。
-/// 双凭证齐全 → 桥自动启动；没有独立 enable 开关。
+/// 保存凭证并重启桥。secret 传空字符串 = 保持原值（不覆盖已存的密钥）。
+/// 是否真正连接由 `im.feishu.enabled` 和双凭证共同决定。
 #[tauri::command]
 pub async fn im_set_settings(
     app: tauri::AppHandle,
@@ -803,10 +924,25 @@ pub async fn im_set_settings(
     app_id: String,
     app_secret: String,
 ) -> R<()> {
-    repo::set_setting(&db, crate::im::K_APP_ID, app_id.trim()).await.map_err(e)?;
+    repo::set_setting(&db, crate::im::K_APP_ID, app_id.trim())
+        .await
+        .map_err(e)?;
     if !app_secret.is_empty() {
-        repo::set_setting(&db, crate::im::K_APP_SECRET, app_secret.trim()).await.map_err(e)?;
+        repo::set_setting(&db, crate::im::K_APP_SECRET, app_secret.trim())
+            .await
+            .map_err(e)?;
     }
+    crate::im::spawn(app);
+    Ok(())
+}
+
+/// 开关桥：写 enabled 标志并重启。off = 断开但保留凭证；on = 凭证齐全则连接
+/// （缺凭证时置 disabled，等用户在已展开的表单里补齐再保存）。
+#[tauri::command]
+pub async fn im_set_enabled(app: tauri::AppHandle, db: State<'_, Db>, enabled: bool) -> R<()> {
+    repo::set_setting(&db, crate::im::K_ENABLED, if enabled { "1" } else { "0" })
+        .await
+        .map_err(e)?;
     crate::im::spawn(app);
     Ok(())
 }
@@ -856,7 +992,9 @@ pub async fn im_bind_thread(
     if ch.is_empty() || chat.is_empty() || r.is_empty() {
         return Err("channel/chat_id/im_thread_ref must be non-empty".into());
     }
-    let m = repo::bind_im_route(&db, thread_id, ch, chat, r).await.map_err(e)?;
+    let m = repo::bind_im_route(&db, thread_id, ch, chat, r)
+        .await
+        .map_err(e)?;
     Ok(route_view(m))
 }
 
@@ -866,10 +1004,7 @@ pub async fn im_unbind_thread(db: State<'_, Db>, thread_id: i32) -> R<()> {
 }
 
 #[tauri::command]
-pub async fn im_route_for_thread(
-    db: State<'_, Db>,
-    thread_id: i32,
-) -> R<Option<ImRouteView>> {
+pub async fn im_route_for_thread(db: State<'_, Db>, thread_id: i32) -> R<Option<ImRouteView>> {
     let m = repo::im_route_of_thread(&db, thread_id).await.map_err(e)?;
     Ok(m.map(route_view))
 }

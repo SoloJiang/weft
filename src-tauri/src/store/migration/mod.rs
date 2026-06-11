@@ -1,6 +1,6 @@
 use crate::store::entities::{
     app_setting, direction, im_route, lead_message, plan, repo_profile, repo_ref, session,
-    skill_enable, skill_source, thread, worktree, workspace,
+    skill_enable, skill_source, thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -51,18 +51,35 @@ impl M0001Init {
 impl MigrationTrait for M0001Init {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let schema = Schema::new(manager.get_database_backend());
-        manager.create_table(Self::table(&schema, workspace::Entity)).await?;
-        manager.create_table(Self::table(&schema, repo_ref::Entity)).await?;
-        manager.create_table(Self::table(&schema, thread::Entity)).await?;
-        manager.create_table(Self::table(&schema, direction::Entity)).await?;
-        manager.create_table(Self::table(&schema, worktree::Entity)).await?;
-        manager.create_table(Self::table(&schema, session::Entity)).await?;
+        manager
+            .create_table(Self::table(&schema, workspace::Entity))
+            .await?;
+        manager
+            .create_table(Self::table(&schema, repo_ref::Entity))
+            .await?;
+        manager
+            .create_table(Self::table(&schema, thread::Entity))
+            .await?;
+        manager
+            .create_table(Self::table(&schema, direction::Entity))
+            .await?;
+        manager
+            .create_table(Self::table(&schema, worktree::Entity))
+            .await?;
+        manager
+            .create_table(Self::table(&schema, session::Entity))
+            .await?;
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for t in [
-            "session", "worktree", "direction", "thread", "repo_ref", "workspace",
+            "session",
+            "worktree",
+            "direction",
+            "thread",
+            "repo_ref",
+            "workspace",
         ] {
             manager
                 .drop_table(Table::drop().table(Alias::new(t)).to_owned())
@@ -189,8 +206,16 @@ impl MigrationName for M0005DirectionRepoReason {
 impl MigrationTrait for M0005DirectionRepoReason {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for col in [
-            ColumnDef::new(Alias::new("repo_id")).integer().not_null().default(0).to_owned(),
-            ColumnDef::new(Alias::new("reason")).string().not_null().default("").to_owned(),
+            ColumnDef::new(Alias::new("repo_id"))
+                .integer()
+                .not_null()
+                .default(0)
+                .to_owned(),
+            ColumnDef::new(Alias::new("reason"))
+                .string()
+                .not_null()
+                .default("")
+                .to_owned(),
         ] {
             let r = manager
                 .alter_table(
@@ -485,7 +510,9 @@ impl MigrationTrait for M0012DropRepoDefaultTool {
 /// Adds the skill_source table (git-hosted skill sources).
 pub struct M0013SkillSource;
 impl MigrationName for M0013SkillSource {
-    fn name(&self) -> &str { "m0013_skill_source" }
+    fn name(&self) -> &str {
+        "m0013_skill_source"
+    }
 }
 #[async_trait::async_trait]
 impl MigrationTrait for M0013SkillSource {
@@ -497,7 +524,9 @@ impl MigrationTrait for M0013SkillSource {
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(Alias::new("skill_source")).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(Alias::new("skill_source")).to_owned())
+            .await?;
         Ok(())
     }
 }
@@ -505,7 +534,9 @@ impl MigrationTrait for M0013SkillSource {
 /// Adds the skill_enable table (per-skill, per-scope enablement).
 pub struct M0014SkillEnable;
 impl MigrationName for M0014SkillEnable {
-    fn name(&self) -> &str { "m0014_skill_enable" }
+    fn name(&self) -> &str {
+        "m0014_skill_enable"
+    }
 }
 #[async_trait::async_trait]
 impl MigrationTrait for M0014SkillEnable {
@@ -517,7 +548,9 @@ impl MigrationTrait for M0014SkillEnable {
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(Alias::new("skill_enable")).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(Alias::new("skill_enable")).to_owned())
+            .await?;
         Ok(())
     }
 }
@@ -525,7 +558,9 @@ impl MigrationTrait for M0014SkillEnable {
 /// Adds the im_route table — issue ↔ IM thread binding (spec §6, M2).
 pub struct M0015ImRoute;
 impl MigrationName for M0015ImRoute {
-    fn name(&self) -> &str { "m0015_im_route" }
+    fn name(&self) -> &str {
+        "m0015_im_route"
+    }
 }
 #[async_trait::async_trait]
 impl MigrationTrait for M0015ImRoute {
@@ -551,7 +586,9 @@ impl MigrationTrait for M0015ImRoute {
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(Alias::new("im_route")).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(Alias::new("im_route")).to_owned())
+            .await?;
         Ok(())
     }
 }

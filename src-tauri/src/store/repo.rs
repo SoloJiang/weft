@@ -2,12 +2,14 @@
 
 use super::entities::{
     app_setting, direction, im_route, lead_message, plan, repo_profile, repo_ref, session,
-    skill_enable, skill_source, thread, worktree, workspace,
+    skill_enable, skill_source, thread, workspace, worktree,
 };
 use super::Db;
 use crate::slug::unique_slug;
 use anyhow::Result;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TryIntoModel};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TryIntoModel,
+};
 
 fn now() -> String {
     // RFC3339 without pulling chrono: seconds since epoch is enough for ordering.
@@ -83,7 +85,11 @@ pub async fn latest_workspace(db: &Db) -> Result<Option<workspace::Model>> {
         .await?)
 }
 
-pub async fn add_skill_source(db: &Db, git_url: &str, git_ref: Option<&str>) -> Result<skill_source::Model> {
+pub async fn add_skill_source(
+    db: &Db,
+    git_url: &str,
+    git_ref: Option<&str>,
+) -> Result<skill_source::Model> {
     let m = skill_source::ActiveModel {
         git_url: Set(git_url.to_string()),
         git_ref: Set(git_ref.unwrap_or("").to_string()),
@@ -102,7 +108,12 @@ pub async fn get_skill_source(db: &Db, id: i32) -> Result<Option<skill_source::M
     Ok(skill_source::Entity::find_by_id(id).one(&db.0).await?)
 }
 
-pub async fn set_skill_source_status(db: &Db, id: i32, status: &str, synced: Option<&str>) -> Result<()> {
+pub async fn set_skill_source_status(
+    db: &Db,
+    id: i32,
+    status: &str,
+    synced: Option<&str>,
+) -> Result<()> {
     if let Some(m) = skill_source::Entity::find_by_id(id).one(&db.0).await? {
         let mut a: skill_source::ActiveModel = m.into();
         a.last_status = Set(status.to_string());
@@ -123,7 +134,13 @@ pub async fn remove_skill_source(db: &Db, id: i32) -> Result<()> {
     Ok(())
 }
 
-pub async fn set_skill_enable(db: &Db, source_id: i32, skill_name: &str, scope: &str, on: bool) -> Result<()> {
+pub async fn set_skill_enable(
+    db: &Db,
+    source_id: i32,
+    skill_name: &str,
+    scope: &str,
+    on: bool,
+) -> Result<()> {
     let existing = skill_enable::Entity::find()
         .filter(skill_enable::Column::SourceId.eq(source_id))
         .filter(skill_enable::Column::SkillName.eq(skill_name))
@@ -175,41 +192,8 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Concierge 占位 thread（spec §5 / M3-1）：跨 workspace 的「全局助理」timeline。
-/// 在专用 workspace 下落地一条 thread，并把 id 缓存到 app_setting，复用时直接返回。
-/// 调用方拿到的 id 之后即可走 lead_engine + lead_chat::engine::send。
-pub const K_CONCIERGE_THREAD: &str = "concierge.thread_id";
+/// Workspace container used by per-IM-conversation Concierge threads.
 pub const K_CONCIERGE_WORKSPACE: &str = "concierge.workspace_id";
-
-pub async fn ensure_concierge_thread(db: &Db) -> Result<i32> {
-    if let Some(s) = get_setting(db, K_CONCIERGE_THREAD).await? {
-        if let Ok(id) = s.parse::<i32>() {
-            // 验证 thread 仍在（被清库的兜底：重建一条而不是 panic）。
-            if get_thread(db, id).await?.is_some() {
-                return Ok(id);
-            }
-        }
-    }
-    let ws_id = match get_setting(db, K_CONCIERGE_WORKSPACE).await? {
-        Some(s) => s.parse::<i32>().ok(),
-        None => None,
-    };
-    let ws_id = match ws_id {
-        Some(id)
-            if workspace::Entity::find_by_id(id).one(&db.0).await?.is_some() =>
-        {
-            id
-        }
-        _ => {
-            let ws = create_workspace(db, "Concierge").await?;
-            set_setting(db, K_CONCIERGE_WORKSPACE, &ws.id.to_string()).await?;
-            ws.id
-        }
-    };
-    let t = create_thread(db, ws_id, "Concierge", "concierge", "claude").await?;
-    set_setting(db, K_CONCIERGE_THREAD, &t.id.to_string()).await?;
-    Ok(t.id)
-}
 
 pub async fn add_repo_ref(
     db: &Db,
@@ -425,16 +409,25 @@ pub async fn create_direction(
 
 /// Anything that isn't explicitly "impl-only" is the default "plan+impl".
 pub fn normalize_mandate(m: &str) -> &'static str {
-    if m == "impl-only" { "impl-only" } else { "plan+impl" }
+    if m == "impl-only" {
+        "impl-only"
+    } else {
+        "plan+impl"
+    }
 }
 
 pub async fn get_direction(db: &Db, direction_id: i32) -> Result<Option<direction::Model>> {
-    Ok(direction::Entity::find_by_id(direction_id).one(&db.0).await?)
+    Ok(direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?)
 }
 
 /// Set a direction's lifecycle status (agent- or human-driven). No-op if gone.
 pub async fn set_direction_status(db: &Db, direction_id: i32, status: &str) -> Result<()> {
-    if let Some(d) = direction::Entity::find_by_id(direction_id).one(&db.0).await? {
+    if let Some(d) = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+    {
         let mut a: direction::ActiveModel = d.into();
         a.status = Set(status.to_string());
         a.update(&db.0).await?;
@@ -466,7 +459,10 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
 /// The single write repo bound to a direction (scope rework). None if the
 /// direction has no repo set (repo_id = 0) or the repo row is gone.
 pub async fn direction_repo_of(db: &Db, direction_id: i32) -> Result<Option<repo_ref::Model>> {
-    let Some(d) = direction::Entity::find_by_id(direction_id).one(&db.0).await? else {
+    let Some(d) = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+    else {
         return Ok(None);
     };
     if d.repo_id == 0 {
@@ -712,8 +708,10 @@ pub async fn set_lead_native_id(db: &Db, thread_id: i32, native_id: &str) -> Res
             a.update(&db.0).await?;
         }
         None => {
-            insert_lead_message(db, thread_id, None, 0, "system", "meta", &content, "complete")
-                .await?;
+            insert_lead_message(
+                db, thread_id, None, 0, "system", "meta", &content, "complete",
+            )
+            .await?;
         }
     }
     Ok(())
@@ -730,8 +728,10 @@ pub async fn bind_im_route(
     chat_id: &str,
     im_thread_ref: &str,
 ) -> Result<im_route::Model> {
-    if let Some(existing) =
-        im_route::Entity::find().filter(im_route::Column::ThreadId.eq(thread_id)).one(&db.0).await?
+    if let Some(existing) = im_route::Entity::find()
+        .filter(im_route::Column::ThreadId.eq(thread_id))
+        .one(&db.0)
+        .await?
     {
         let mut a: im_route::ActiveModel = existing.into();
         a.channel = Set(channel.to_string());
@@ -799,11 +799,22 @@ mod tests {
     #[tokio::test]
     async fn lead_message_roundtrip() {
         let db = mem().await;
-        let m = insert_lead_message(&db, 1, None, 1, "user", "text", r#"{"text":"hi"}"#, "complete")
+        let m = insert_lead_message(
+            &db,
+            1,
+            None,
+            1,
+            "user",
+            "text",
+            r#"{"text":"hi"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        assert_eq!(m.thread_id, 1);
+        update_lead_message(&db, m.id, r#"{"text":"hi!"}"#, "complete")
             .await
             .unwrap();
-        assert_eq!(m.thread_id, 1);
-        update_lead_message(&db, m.id, r#"{"text":"hi!"}"#, "complete").await.unwrap();
         let all = list_lead_messages(&db, 1).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].content, r#"{"text":"hi!"}"#);
@@ -813,9 +824,18 @@ mod tests {
     #[tokio::test]
     async fn queued_flips_to_complete() {
         let db = mem().await;
-        insert_lead_message(&db, 2, None, 2, "user", "text", r#"{"text":"later"}"#, "queued")
-            .await
-            .unwrap();
+        insert_lead_message(
+            &db,
+            2,
+            None,
+            2,
+            "user",
+            "text",
+            r#"{"text":"later"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
         complete_queued(&db, 2, "later").await.unwrap();
         let all = list_lead_messages(&db, 2).await.unwrap();
         assert_eq!(all[0].status, "complete");
@@ -827,7 +847,10 @@ mod tests {
         assert!(lead_native_id(&db, 3).await.unwrap().is_none());
         set_lead_native_id(&db, 3, "abc").await.unwrap();
         set_lead_native_id(&db, 3, "def").await.unwrap();
-        assert_eq!(lead_native_id(&db, 3).await.unwrap().as_deref(), Some("def"));
+        assert_eq!(
+            lead_native_id(&db, 3).await.unwrap().as_deref(),
+            Some("def")
+        );
         // meta row stays single + out of turn numbering
         assert_eq!(list_lead_messages(&db, 3).await.unwrap().len(), 1);
     }
@@ -835,7 +858,9 @@ mod tests {
     #[tokio::test]
     async fn im_route_bind_and_lookup() {
         let db = mem().await;
-        let r = bind_im_route(&db, 7, "feishu", "oc_chat", "th_1").await.unwrap();
+        let r = bind_im_route(&db, 7, "feishu", "oc_chat", "th_1")
+            .await
+            .unwrap();
         assert_eq!(r.thread_id, 7);
         // forward lookup by thread_id
         let got = im_route_of_thread(&db, 7).await.unwrap().unwrap();
@@ -847,7 +872,9 @@ mod tests {
             .unwrap();
         assert_eq!(got.thread_id, 7);
         // re-bind same issue: row count stays 1, target replaced
-        bind_im_route(&db, 7, "feishu", "oc_chat", "th_2").await.unwrap();
+        bind_im_route(&db, 7, "feishu", "oc_chat", "th_2")
+            .await
+            .unwrap();
         assert_eq!(list_im_routes(&db).await.unwrap().len(), 1);
         assert!(im_route_of_thread_ref(&db, "feishu", "oc_chat", "th_1")
             .await
@@ -862,7 +889,9 @@ mod tests {
     async fn im_route_thread_ref_is_unique_across_issues() {
         // Same (channel, chat_id, im_thread_ref) cannot bind to two different issues.
         let db = mem().await;
-        bind_im_route(&db, 1, "feishu", "oc_chat", "th_1").await.unwrap();
+        bind_im_route(&db, 1, "feishu", "oc_chat", "th_1")
+            .await
+            .unwrap();
         let err = bind_im_route(&db, 2, "feishu", "oc_chat", "th_1").await;
         assert!(err.is_err(), "second bind should violate unique index");
     }
@@ -878,9 +907,17 @@ mod tests {
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
             .await
             .unwrap();
-        let dir = create_direction(&db, t.id, "main", "claude", repo.id, "build the feature", "plan+impl")
-            .await
-            .unwrap();
+        let dir = create_direction(
+            &db,
+            t.id,
+            "main",
+            "claude",
+            repo.id,
+            "build the feature",
+            "plan+impl",
+        )
+        .await
+        .unwrap();
         assert_eq!(dir.branch, "ws/demo-ws/add-login/main");
         assert_eq!(dir.repo_id, repo.id);
         assert_eq!(dir.reason, "build the feature");
@@ -894,7 +931,14 @@ mod tests {
 
         // cascade delete returns the path to clean and empties the rows
         let removed = delete_thread_cascade(&db, t.id).await.unwrap();
-        assert_eq!(removed, vec![(repo.id, "/tmp/wt".to_string(), "ws/demo-ws/add-login/main".to_string())]);
+        assert_eq!(
+            removed,
+            vec![(
+                repo.id,
+                "/tmp/wt".to_string(),
+                "ws/demo-ws/add-login/main".to_string()
+            )]
+        );
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
         assert_eq!(list_threads(&db, ws.id).await.unwrap().len(), 0);
         assert_eq!(list_worktrees(&db, None).await.unwrap().len(), 0);
@@ -907,19 +951,31 @@ mod tests {
         let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main")
             .await
             .unwrap();
-        let thread = create_thread(&db, ws.id, "T", "feature", "claude").await.unwrap();
+        let thread = create_thread(&db, ws.id, "T", "feature", "claude")
+            .await
+            .unwrap();
         let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r", "impl-only")
             .await
             .unwrap();
         // older session (no native), then newer (native captured)
-        let _s1 = create_session(&db, dir.id, repo.id, "claude", "/tmp/x").await.unwrap();
-        let s2 = create_session(&db, dir.id, repo.id, "claude", "/tmp/x").await.unwrap();
+        let _s1 = create_session(&db, dir.id, repo.id, "claude", "/tmp/x")
+            .await
+            .unwrap();
+        let s2 = create_session(&db, dir.id, repo.id, "claude", "/tmp/x")
+            .await
+            .unwrap();
         set_session_native_id(&db, s2.id, "abc-123").await.unwrap();
 
-        let latest = latest_session_for(&db, dir.id, repo.id).await.unwrap().unwrap();
+        let latest = latest_session_for(&db, dir.id, repo.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(latest.id, s2.id);
         assert_eq!(latest.native_session_id.as_deref(), Some("abc-123"));
-        assert!(latest_session_for(&db, dir.id, 99999).await.unwrap().is_none());
+        assert!(latest_session_for(&db, dir.id, 99999)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -1060,25 +1116,38 @@ mod tests {
     #[tokio::test]
     async fn skill_source_and_enable_roundtrip() {
         let db = mem().await;
-        let s = add_skill_source(&db, "https://example.com/skills.git", None).await.unwrap();
+        let s = add_skill_source(&db, "https://example.com/skills.git", None)
+            .await
+            .unwrap();
         assert_eq!(s.git_url, "https://example.com/skills.git");
         assert_eq!(s.last_status, "never");
         // update status
-        set_skill_source_status(&db, s.id, "ok", Some("123")).await.unwrap();
+        set_skill_source_status(&db, s.id, "ok", Some("123"))
+            .await
+            .unwrap();
         let got = list_skill_sources(&db).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].last_status, "ok");
         assert_eq!(got[0].last_synced, "123");
         // enable a skill globally, then list
-        set_skill_enable(&db, s.id, "deploy", "global", true).await.unwrap();
+        set_skill_enable(&db, s.id, "deploy", "global", true)
+            .await
+            .unwrap();
         let en = list_skill_enable(&db).await.unwrap();
         assert_eq!(en.len(), 1);
-        assert_eq!((en[0].skill_name.as_str(), en[0].scope.as_str()), ("deploy", "global"));
+        assert_eq!(
+            (en[0].skill_name.as_str(), en[0].scope.as_str()),
+            ("deploy", "global")
+        );
         // toggling off removes it
-        set_skill_enable(&db, s.id, "deploy", "global", false).await.unwrap();
+        set_skill_enable(&db, s.id, "deploy", "global", false)
+            .await
+            .unwrap();
         assert!(list_skill_enable(&db).await.unwrap().is_empty());
         // remove source cascades its enables
-        set_skill_enable(&db, s.id, "x", "ws:1", true).await.unwrap();
+        set_skill_enable(&db, s.id, "x", "ws:1", true)
+            .await
+            .unwrap();
         remove_skill_source(&db, s.id).await.unwrap();
         assert!(list_skill_sources(&db).await.unwrap().is_empty());
         assert!(list_skill_enable(&db).await.unwrap().is_empty());

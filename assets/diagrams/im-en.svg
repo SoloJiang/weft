@@ -1,34 +1,34 @@
 <svg viewBox="0 0 1320 600" xmlns="http://www.w3.org/2000/svg" font-family="'Inter','SF Pro Display',-apple-system,'Segoe UI','PingFang SC','Noto Sans CJK SC',sans-serif">
   <defs>
-    <marker id="im_a" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#5b5866"/></marker>
-    <marker id="im_aB" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#7c74f0"/></marker>
-    <marker id="im_aG" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#35c98b"/></marker>
+    <marker id="im_a" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#6b655c"/></marker>
+    <marker id="im_aB" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#49c0c9"/></marker>
+    <marker id="im_aG" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#65d6a1"/></marker>
     <filter id="imglow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="20"/></filter>
     <style>
-      .ttl{fill:#f3f2f7;font-size:14.5px;font-weight:600}
-      .sub{fill:#8b8896;font-size:11px}
-      .lbl{fill:#75727f;font-size:11px;font-weight:500;letter-spacing:.2px}
-      .node{fill:#1f1d27;stroke:#36333f;stroke-width:1}
+      .ttl{fill:#f1eee8;font-size:14.5px;font-weight:600}
+      .sub{fill:#9b948a;font-size:11px}
+      .lbl{fill:#8e887f;font-size:11px;font-weight:500;letter-spacing:.2px}
+      .node{fill:#211f1a;stroke:#3a352e;stroke-width:1}
       .gl{stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
-      .pill{fill:#211f33;stroke:#4f46e5;stroke-width:1.2}
-      .ct{fill:#cfcdd6;font-size:13px;font-weight:600;letter-spacing:.2px}
-      .cs{fill:#75727f;font-size:10.5px}
-      .card{fill:#1a1822;stroke:#3a3744;stroke-width:1}
-      .ch{fill:#eceaf2;font-size:11.5px;font-weight:600}
-      .cb{fill:#8b8896;font-size:10.5px}
+      .pill{fill:#173034;stroke:#49c0c9;stroke-width:1.2}
+      .ct{fill:#d7d0c5;font-size:13px;font-weight:600;letter-spacing:.2px}
+      .cs{fill:#8e887f;font-size:10.5px}
+      .card{fill:#211f1a;stroke:#3a352e;stroke-width:1}
+      .ch{fill:#eee8df;font-size:11.5px;font-weight:600}
+      .cb{fill:#9b948a;font-size:10.5px}
     </style>
   </defs>
 
-  <rect x="0" y="0" width="1320" height="600" rx="18" fill="#15141a"/>
-  <circle cx="660" cy="300" r="80" fill="#4f46e5" opacity="0.12" filter="url(#imglow)"/>
+  <rect x="0" y="0" width="1320" height="600" rx="18" fill="#171512"/>
+  <circle cx="660" cy="300" r="80" fill="#49c0c9" opacity="0.04"/>
 
-  <text x="40" y="48" fill="#f3f2f7" font-size="18" font-weight="600">IM remote control</text>
-  <text x="200" y="48" fill="#75727f" font-size="12">Long-lived Feishu ws · one source of truth · per-issue threads on the roadmap</text>
+  <text x="40" y="48" fill="#f1eee8" font-size="18" font-weight="600">IM remote control</text>
+  <text x="200" y="48" fill="#8e887f" font-size="12">Long-lived Feishu ws · one source of truth · per-issue topics</text>
 
   <!-- Left: Weft (desktop) -->
-  <rect x="40" y="80" width="290" height="440" rx="16" fill="#191820" stroke="#34323d"/>
+  <rect x="40" y="80" width="290" height="440" rx="16" fill="#1b1915" stroke="#3a352e"/>
   <g transform="translate(64,108)">
-    <rect x="0" y="-2" width="16" height="13" rx="2.5" fill="none" stroke="#9a93f7" class="gl"/><path d="M0,2 h16" stroke="#9a93f7" class="gl" opacity=".6"/>
+    <rect x="0" y="-2" width="16" height="13" rx="2.5" fill="none" stroke="#9de5e8" class="gl"/><path d="M0,2 h16" stroke="#9de5e8" class="gl" opacity=".6"/>
   </g>
   <text class="ct" x="92" y="118">Weft desktop</text>
   <text class="cs" x="92" y="134">local · Tauri</text>
@@ -46,21 +46,21 @@
     <text class="sub" x="84" y="298">blocked until answered</text>
   </g>
 
-  <rect x="64" y="324" width="242" height="76" rx="11" fill="#1f1d2e" stroke="#4f46e5" stroke-opacity="0.7"/>
-  <text class="ttl" x="84" y="352" fill="#cfcbf6">Ask Registry · Bus</text>
+  <rect x="64" y="324" width="242" height="76" rx="11" fill="#173034" stroke="#49c0c9" stroke-opacity="0.7"/>
+  <text class="ttl" x="84" y="352" fill="#b8ecef">Ask Registry · Bus</text>
   <text class="sub" x="84" y="372">events Opened / Resolved</text>
   <text class="sub" x="84" y="386">desktop + IM, same function</text>
 
   <g>
     <rect class="node" x="64" y="412" width="242" height="72" rx="11"/>
     <text class="ttl" x="84" y="440">Settings · status</text>
-    <text class="sub" x="84" y="460">app_id / secret / enabled</text>
+    <text class="sub" x="84" y="460">app_id / secret / status</text>
     <text class="sub" x="84" y="474">link: disabled / online …</text>
   </g>
 
   <!-- Middle: IM bridge -->
-  <rect x="370" y="80" width="280" height="440" rx="16" fill="#191820" stroke="#34323d"/>
-  <g transform="translate(394,108)" class="gl" stroke="#f0a07a"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#f0a07a" stroke="none"/><path d="M0,-7 v3 M0,9 v3 M-7,2 h3 M9,2 h-3"/></g>
+  <rect x="370" y="80" width="280" height="440" rx="16" fill="#1b1915" stroke="#3a352e"/>
+  <g transform="translate(394,108)" class="gl" stroke="#f27d53"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#f27d53" stroke="none"/><path d="M0,-7 v3 M0,9 v3 M-7,2 h3 M9,2 h-3"/></g>
   <text class="ct" x="420" y="118">IM bridge</text>
   <text class="cs" x="420" y="134">src-tauri/src/im · channel-agnostic</text>
 
@@ -88,31 +88,31 @@
   </g>
 
   <rect class="pill" x="394" y="476" width="232" height="32" rx="16"/>
-  <text x="510" y="497" text-anchor="middle" fill="#cfcbf6" font-size="11.5" font-weight="600">Channel trait (M1: Feishu)</text>
+  <text x="510" y="497" text-anchor="middle" fill="#b8ecef" font-size="11.5" font-weight="600">Channel trait · Feishu</text>
 
   <!-- Right: Feishu / user -->
-  <rect x="690" y="80" width="590" height="440" rx="16" fill="#191820" stroke="#34323d"/>
-  <g transform="translate(714,108)" class="gl" stroke="#5fbf92"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#5fbf92" stroke="none"/></g>
+  <rect x="690" y="80" width="590" height="440" rx="16" fill="#1b1915" stroke="#3a352e"/>
+  <g transform="translate(714,108)" class="gl" stroke="#65d6a1"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#65d6a1" stroke="none"/></g>
   <text class="ct" x="740" y="118">Feishu</text>
   <text class="cs" x="740" y="134">long-lived ws · open-lark · cards 1.0</text>
 
   <g>
     <rect class="card" x="714" y="156" width="262" height="146" rx="10"/>
-    <rect x="714" y="156" width="262" height="26" rx="10" fill="#3a2418"/>
-    <rect x="714" y="172" width="262" height="10" fill="#3a2418"/>
-    <text x="726" y="174" fill="#f7b094" font-size="11.5" font-weight="600">Permission ask · login-timeout fix</text>
+    <rect x="714" y="156" width="262" height="26" rx="10" fill="#332119"/>
+    <rect x="714" y="172" width="262" height="10" fill="#332119"/>
+    <text x="726" y="174" fill="#ffb092" font-size="11.5" font-weight="600">Permission ask · login-timeout fix</text>
     <text class="ch" x="726" y="204">Run: npm test</text>
     <text class="cb" x="726" y="222">backend · claude</text>
-    <text class="cb" x="726" y="248" font-style="italic" fill="#75727f">npm test</text>
+    <text class="cb" x="726" y="248" font-style="italic" fill="#8e887f">npm test</text>
     <text class="cb" x="726" y="280">Reply to this message to answer:</text>
-    <text class="cb" x="726" y="294" fill="#cfcbf6">allow / deny / always / full (1/2/3/4)</text>
+    <text class="cb" x="726" y="294" fill="#b8ecef">allow / deny / always / full (1/2/3/4)</text>
   </g>
 
   <g>
     <rect class="card" x="1000" y="156" width="262" height="146" rx="10"/>
-    <rect x="1000" y="156" width="262" height="26" rx="10" fill="#1d2640"/>
-    <rect x="1000" y="172" width="262" height="10" fill="#1d2640"/>
-    <text x="1012" y="174" fill="#9ec2ff" font-size="11.5" font-weight="600">Agent question · login-timeout fix</text>
+    <rect x="1000" y="156" width="262" height="26" rx="10" fill="#173034"/>
+    <rect x="1000" y="172" width="262" height="10" fill="#173034"/>
+    <text x="1012" y="174" fill="#9de5e8" font-size="11.5" font-weight="600">Agent question · login-timeout fix</text>
     <text class="ch" x="1012" y="204">backend</text>
     <text class="cb" x="1012" y="226">major or minor bump?</text>
     <text class="cb" x="1012" y="280">Reply to this message; your answer</text>
@@ -121,55 +121,53 @@
 
   <g>
     <rect class="card" x="714" y="318" width="262" height="92" rx="10"/>
-    <rect x="714" y="318" width="262" height="26" rx="10" fill="#1c3324"/>
-    <rect x="714" y="334" width="262" height="10" fill="#1c3324"/>
-    <text x="726" y="336" fill="#7ddca7" font-size="11.5" font-weight="600">Allowed ✓</text>
+    <rect x="714" y="318" width="262" height="26" rx="10" fill="#183024"/>
+    <rect x="714" y="334" width="262" height="10" fill="#183024"/>
+    <text x="726" y="336" fill="#73dca9" font-size="11.5" font-weight="600">Allowed ✓</text>
     <text class="cb" x="726" y="368" text-decoration="line-through">Run: npm test</text>
     <text class="cb" x="726" y="392">card patched in place (mirrored)</text>
   </g>
 
   <g>
-    <rect x="1000" y="318" width="262" height="92" rx="10" fill="#1d1924" stroke="#7a5a24" stroke-dasharray="4 4" stroke-width="1.2"/>
-    <text class="ch" x="1012" y="344" fill="#caa14e">Roadmap · per-issue thread</text>
-    <text class="cb" x="1012" y="368">One Feishu thread per issue,</text>
-    <text class="cb" x="1012" y="382">collecting scope decisions, progress</text>
-    <text class="cb" x="1012" y="396">and needs-you into one place.</text>
+    <rect class="card" x="1000" y="318" width="262" height="92" rx="10"/>
+    <text class="ch" x="1012" y="344" fill="#9de5e8">Issue topic route</text>
+    <text class="cb" x="1012" y="368">/bind &lt;issue-id&gt; in a topic;</text>
+    <text class="cb" x="1012" y="382">messages feed the lead and</text>
+    <text class="cb" x="1012" y="396">lead replies post back here.</text>
   </g>
 
   <g>
-    <rect x="714" y="426" width="548" height="78" rx="10" fill="#1d1924" stroke="#7a5a24" stroke-dasharray="4 4" stroke-width="1.2"/>
-    <text class="ch" x="726" y="452" fill="#caa14e">Roadmap · free-chat concierge</text>
-    <text class="cb" x="726" y="474">M1 is reply-to-card only; a global concierge that takes orders ("start an</text>
-    <text class="cb" x="726" y="490">issue", "check what's pending", "interrupt worker B") lands in a later milestone.</text>
+    <rect class="card" x="714" y="426" width="548" height="78" rx="10"/>
+    <text class="ch" x="726" y="452" fill="#9de5e8">Free-chat concierge</text>
+    <text class="cb" x="726" y="474">Direct chat uses weft_global MCP tools to list workspaces/issues, answer asks,</text>
+    <text class="cb" x="726" y="490">message a lead, or create a new issue without guessing state.</text>
   </g>
 
   <!-- Arrows: Weft → bridge -->
-  <path class="gl" d="M306,188 H394" stroke="#7c74f0" marker-end="url(#im_aB)"/>
-  <path class="gl" d="M306,272 H394" stroke="#7c74f0" marker-end="url(#im_aB)"/>
-  <text class="lbl" x="316" y="180" fill="#8b84e8">event</text>
-  <text class="lbl" x="316" y="264" fill="#8b84e8">event</text>
+  <path class="gl" d="M306,188 H394" stroke="#49c0c9" marker-end="url(#im_aB)"/>
+  <path class="gl" d="M306,272 H394" stroke="#49c0c9" marker-end="url(#im_aB)"/>
+  <text class="lbl" x="316" y="180" fill="#78d6dc">event</text>
+  <text class="lbl" x="316" y="264" fill="#78d6dc">event</text>
 
   <!-- Arrow: bridge → Feishu -->
-  <path class="gl" d="M626,188 H714" stroke="#7c74f0" marker-end="url(#im_aB)"/>
-  <path class="gl" d="M626,272 C654,272 690,250 714,228" stroke="#7c74f0" marker-end="url(#im_aB)"/>
-  <text class="lbl" x="636" y="180" fill="#8b84e8">send card</text>
-  <text class="lbl" x="636" y="252" fill="#8b84e8">question card</text>
-  <path class="gl" d="M626,352 C654,352 690,352 714,352" stroke="#7c74f0" marker-end="url(#im_aB)"/>
-  <text class="lbl" x="636" y="344" fill="#8b84e8">patch resolved</text>
+  <path class="gl" d="M626,188 H714" stroke="#49c0c9" marker-end="url(#im_aB)"/>
+  <path class="gl" d="M626,272 C654,272 690,250 714,228" stroke="#49c0c9" marker-end="url(#im_aB)"/>
+  <text class="lbl" x="636" y="180" fill="#78d6dc">send card</text>
+  <text class="lbl" x="636" y="252" fill="#78d6dc">question card</text>
+  <path class="gl" d="M626,352 C654,352 690,352 714,352" stroke="#49c0c9" marker-end="url(#im_aB)"/>
+  <text class="lbl" x="636" y="344" fill="#78d6dc">patch resolved</text>
 
   <!-- Arrow: Feishu → bridge -->
-  <path class="gl" d="M714,260 C690,295 654,295 626,260" stroke="#35c98b" marker-end="url(#im_aG)"/>
-  <text class="lbl" x="640" y="296" fill="#5fbf92">reply (ws)</text>
+  <path class="gl" d="M714,260 C690,295 654,295 626,260" stroke="#65d6a1" marker-end="url(#im_aG)"/>
+  <text class="lbl" x="640" y="296" fill="#65d6a1">reply (ws)</text>
 
   <!-- Arrow: bridge → Weft -->
-  <path class="gl" d="M394,360 H306" stroke="#5b5866" marker-end="url(#im_a)"/>
+  <path class="gl" d="M394,360 H306" stroke="#6b655c" marker-end="url(#im_a)"/>
   <text class="lbl" x="316" y="354">same answer fn</text>
 
   <g transform="translate(40,548)">
-    <rect width="14" height="6" rx="3" fill="#7c74f0"/>
-    <text x="22" y="6" fill="#8b84e8" font-size="11">today</text>
-    <rect x="74" width="14" height="6" rx="3" fill="#7a5a24"/>
-    <text x="96" y="6" fill="#caa14e" font-size="11">roadmap</text>
-    <text x="170" y="6" fill="#75727f" font-size="11">Bind: first p2p sender = owner · group msgs never bind · DB errors fail-closed</text>
+    <rect width="14" height="6" rx="3" fill="#49c0c9"/>
+    <text x="22" y="6" fill="#78d6dc" font-size="11">current bridge</text>
+    <text x="132" y="6" fill="#8e887f" font-size="11">Owner: first p2p sender · topic bind: /bind &lt;issue-id&gt; · DB errors fail-closed</text>
   </g>
 </svg>
