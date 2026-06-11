@@ -55,6 +55,81 @@ impl PowerState {
     }
 }
 
+/// Spawn the thread that owns the OS assertion handle. Send `true`/`false` to
+/// acquire/release (repeats are no-ops). The thread exits when every sender is
+/// dropped, releasing any held assertion with it.
+fn spawn_holder() -> std::sync::mpsc::Sender<bool> {
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let spawned = std::thread::Builder::new()
+        .name("weft-power-holder".into())
+        .spawn(move || {
+            // Created and dropped on this thread only (Windows thread affinity).
+            let mut held: Option<keepawake::KeepAwake> = None;
+            while let Ok(want) = rx.recv() {
+                if want && held.is_none() {
+                    match keepawake::Builder::default()
+                        .idle(true) // PreventUserIdleSystemSleep: 熄屏不受影响
+                        .reason("Weft: agent session running")
+                        .app_name("Weft")
+                        .app_reverse_domain("com.weft.app")
+                        .create()
+                    {
+                        Ok(h) => {
+                            held = Some(h);
+                            eprintln!("[weft] keep-awake: assertion acquired");
+                        }
+                        // Best-effort by design: keep-awake failing must never
+                        // affect the sessions themselves.
+                        Err(e) => eprintln!("[weft] keep-awake: acquire failed: {e}"),
+                    }
+                } else if !want && held.is_some() {
+                    held = None;
+                    eprintln!("[weft] keep-awake: assertion released");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[weft] keep-awake: holder thread failed to start: {e}");
+    }
+    tx
+}
+
+/// Managed Tauri state. The Settings command flips `enabled`; the chat engine
+/// reports turn starts; the 30s sweep loop reconciles and expires the linger.
+pub struct PowerGuard {
+    state: std::sync::Mutex<PowerState>,
+    tx: std::sync::mpsc::Sender<bool>,
+}
+
+impl Default for PowerGuard {
+    fn default() -> Self {
+        Self { state: std::sync::Mutex::new(PowerState::default()), tx: spawn_holder() }
+    }
+}
+
+impl PowerGuard {
+    /// The Settings toggle (re-pushed from localStorage on every launch).
+    pub fn set_enabled(&self, on: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.enabled = on;
+        let _ = self.tx.send(st.desired());
+    }
+
+    /// A turn just began: hold immediately instead of waiting for a sweep.
+    pub fn note_busy(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.note_busy();
+        let _ = self.tx.send(st.desired());
+    }
+
+    /// Periodic reconciliation: ground truth from the engine registry.
+    pub fn sweep(&self, any_busy: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.sweep(any_busy, Instant::now());
+        let _ = self.tx.send(st.desired());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +176,24 @@ mod tests {
         assert!(st.desired(), "linger restarted by the busy sweep");
         st.sweep(false, t1 + LINGER);
         assert!(!st.desired());
+    }
+
+    #[test]
+    fn holder_thread_tolerates_rapid_toggles() {
+        let tx = spawn_holder();
+        for on in [true, true, false, true, false, false] {
+            tx.send(on).expect("holder thread alive");
+        }
+        drop(tx); // thread exits, releasing anything held
+    }
+
+    #[test]
+    fn guard_end_to_end_does_not_panic() {
+        let guard = PowerGuard::default();
+        guard.note_busy();
+        guard.sweep(true);
+        guard.sweep(false);
+        guard.set_enabled(false);
+        guard.set_enabled(true);
     }
 }
