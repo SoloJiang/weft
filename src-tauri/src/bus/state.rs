@@ -27,7 +27,9 @@ pub struct Wake {
 #[derive(Clone, Debug)]
 pub enum HumanAskEvent {
     Asked { thread: i32, ask: Ask },
-    Answered { thread: i32, ask_id: u64 },
+    /// 携带人答的 text：飞书卡片终态要显示答案，而桌面侧作答时桥拿不到
+    /// 文本，必须由事件携带。
+    Answered { thread: i32, ask_id: u64, text: String },
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -93,10 +95,17 @@ impl BusRegistry {
 
     /// Install the channel the IM bridge listens on for human-ask events
     /// (called once at startup). Mirrors `set_wake_sender`.
+    ///
+    /// 与 `AskRegistry::set_notifier` 不同，本方法不返回 open asks 快照
+    /// （M1 范围）；只投递安装之后的事件。须在任何 agent 跑起来之前安装——
+    /// 安装前已 open 的提问不会补发，registry 也没有跨 thread 枚举接口。
     pub fn set_ask_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<HumanAskEvent>) {
         *self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
+    /// 须在持 `inner` 锁内调用，以保证通道顺序与状态迁移一致（事件是
+    /// edge-triggered、带 per-ask 身份，Asked/Answered 不可乱序）。锁顺序
+    /// 固定 inner → ask_notify；UnboundedSender::send 非阻塞，锁内发送安全。
     fn emit_ask_event(&self, ev: HumanAskEvent) {
         if let Some(tx) = self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = tx.send(ev);
@@ -221,9 +230,9 @@ impl BusRegistry {
                 ts,
                 kind: "ask".to_string(),
             });
+            self.emit_ask_event(HumanAskEvent::Asked { thread, ask });
         }
         self.emit_wake(thread, HUMAN);
-        self.emit_ask_event(HumanAskEvent::Asked { thread, ask });
         id
     }
 
@@ -245,18 +254,25 @@ impl BusRegistry {
         let target = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            match bus.asks.iter_mut().find(|a| a.id == ask_id && !a.answered) {
+            let hit = match bus.asks.iter_mut().find(|a| a.id == ask_id && !a.answered) {
                 Some(a) => {
                     a.answered = true;
                     Some(a.from.clone())
                 }
                 None => None,
+            };
+            if hit.is_some() {
+                self.emit_ask_event(HumanAskEvent::Answered {
+                    thread,
+                    ask_id,
+                    text: text.to_string(),
+                });
             }
+            hit
         };
         match target {
             Some(dir) => {
                 self.post(thread, HUMAN, &dir, text, "message");
-                self.emit_ask_event(HumanAskEvent::Answered { thread, ask_id });
                 true
             }
             None => false,
@@ -400,6 +416,9 @@ mod tests {
         }
         assert!(r.answer_ask(1, id, "minor"));
         assert!(matches!(rx.recv().await.unwrap(),
-            HumanAskEvent::Answered { thread: 1, ask_id } if ask_id == id));
+            HumanAskEvent::Answered { thread: 1, ask_id, text } if ask_id == id && text == "minor"));
+        // 未命中/重复作答不发事件
+        assert!(!r.answer_ask(1, id, "again"));
+        assert!(rx.try_recv().is_err());
     }
 }
