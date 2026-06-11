@@ -10,7 +10,6 @@ use std::collections::HashMap;
 
 pub const K_APP_ID: &str = "im.feishu.app_id";
 pub const K_APP_SECRET: &str = "im.feishu.app_secret";
-pub const K_ENABLED: &str = "im.feishu.enabled";
 /// 白名单：逗号分隔的飞书 open_id；空 = 未绑定（首个私聊发送者自动绑定）。
 pub const K_ALLOW: &str = "im.feishu.allow_open_ids";
 
@@ -18,7 +17,6 @@ pub const K_ALLOW: &str = "im.feishu.allow_open_ids";
 pub struct ImSettings {
     pub app_id: String,
     pub app_secret: String,
-    pub enabled: bool,
     pub allow_open_ids: Vec<String>,
 }
 
@@ -27,15 +25,15 @@ impl std::fmt::Debug for ImSettings {
         f.debug_struct("ImSettings")
             .field("app_id", &self.app_id)
             .field("app_secret", &if self.app_secret.is_empty() { "" } else { "***" })
-            .field("enabled", &self.enabled)
             .field("allow_open_ids", &self.allow_open_ids)
             .finish()
     }
 }
 
 impl ImSettings {
+    /// 桥能否启动：双凭证齐全即跑——无独立 enable 开关（spec MVP 单机即信任边界）。
     pub fn ready(&self) -> bool {
-        self.enabled && !self.app_id.is_empty() && !self.app_secret.is_empty()
+        !self.app_id.is_empty() && !self.app_secret.is_empty()
     }
 
     pub fn parse_allow(s: &str) -> Vec<String> {
@@ -53,7 +51,6 @@ impl ImSettings {
         Ok(Self {
             app_id: g(K_APP_ID).await?,
             app_secret: g(K_APP_SECRET).await?,
-            enabled: g(K_ENABLED).await? == "1",
             allow_open_ids: Self::parse_allow(&g(K_ALLOW).await?),
         })
     }
@@ -713,12 +710,12 @@ mod tests {
     }
 
     #[test]
-    fn ready_requires_enabled_and_creds() {
-        let mut s = ImSettings { app_id: "a".into(), app_secret: "s".into(), enabled: true, ..Default::default() };
+    fn ready_requires_creds() {
+        let mut s = ImSettings { app_id: "a".into(), app_secret: "s".into(), ..Default::default() };
         assert!(s.ready());
-        s.enabled = false;
+        s.app_secret.clear();
         assert!(!s.ready());
-        s = ImSettings { enabled: true, ..Default::default() };
+        s = ImSettings::default();
         assert!(!s.ready());
     }
 
@@ -732,7 +729,6 @@ mod tests {
         // 写入后读回
         crate::store::repo::set_setting(&db, K_APP_ID, "cli_x").await.unwrap();
         crate::store::repo::set_setting(&db, K_APP_SECRET, "sec").await.unwrap();
-        crate::store::repo::set_setting(&db, K_ENABLED, "1").await.unwrap();
         crate::store::repo::set_setting(&db, K_ALLOW, "ou_a, ou_b").await.unwrap();
         let s = ImSettings::load(&db).await.unwrap();
         assert!(s.ready());

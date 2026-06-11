@@ -781,7 +781,6 @@ pub fn bus_post_human(
 pub struct ImSettingsView {
     pub app_id: String,
     pub has_secret: bool,
-    pub enabled: bool,
     pub bound: bool,
 }
 
@@ -791,27 +790,23 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     Ok(ImSettingsView {
         app_id: s.app_id,
         has_secret: !s.app_secret.is_empty(),
-        enabled: s.enabled,
         bound: !s.allow_open_ids.is_empty(),
     })
 }
 
 /// 保存并重启桥。secret 传空字符串 = 保持原值（不覆盖已存的密钥）。
+/// 双凭证齐全 → 桥自动启动；没有独立 enable 开关。
 #[tauri::command]
 pub async fn im_set_settings(
     app: tauri::AppHandle,
     db: State<'_, Db>,
     app_id: String,
     app_secret: String,
-    enabled: bool,
 ) -> R<()> {
     repo::set_setting(&db, crate::im::K_APP_ID, app_id.trim()).await.map_err(e)?;
     if !app_secret.is_empty() {
         repo::set_setting(&db, crate::im::K_APP_SECRET, app_secret.trim()).await.map_err(e)?;
     }
-    repo::set_setting(&db, crate::im::K_ENABLED, if enabled { "1" } else { "0" })
-        .await
-        .map_err(e)?;
     crate::im::spawn(app);
     Ok(())
 }

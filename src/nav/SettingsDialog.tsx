@@ -369,7 +369,6 @@ function ImSettings() {
   const [appId, setAppId] = useState("");
   const [secret, setSecret] = useState("");
   const [hasSecret, setHasSecret] = useState(false);
-  const [enabled, setEnabled] = useState(false);
   const [bound, setBound] = useState(false);
   const [status, setStatus] = useState("disabled");
   const [saving, setSaving] = useState(false);
@@ -378,7 +377,6 @@ function ImSettings() {
     void api.imGetSettings().then((s) => {
       setAppId(s.app_id);
       setHasSecret(s.has_secret);
-      setEnabled(s.enabled);
       setBound(s.bound);
     });
     void api.imStatus().then(setStatus);
@@ -389,7 +387,7 @@ function ImSettings() {
   async function save() {
     setSaving(true);
     try {
-      await api.imSetSettings(appId, secret, enabled);
+      await api.imSetSettings(appId, secret);
       if (secret.length > 0) setHasSecret(true);
       setSecret("");
       void api.imStatus().then(setStatus);
@@ -426,9 +424,6 @@ function ImSettings() {
             onChange={(e) => setSecret(e.currentTarget.value)}
             className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
           />
-        </SettingRow>
-        <SettingRow label={t("settings.imEnabled")} hint={t("settings.imEnabledHint")}>
-          <Toggle on={enabled} onChange={setEnabled} label={t("settings.imEnabled")} />
         </SettingRow>
         <SettingRow label={t("settings.imStatusLabel")}>
           <div className="flex flex-col items-end gap-1">

@@ -503,9 +503,7 @@ export const en = {
     imAppIdHint:
       "Create a self-built app on Feishu Open Platform; subscribe im.message.receive_v1 over long connection.",
     imAppSecret: "App Secret",
-    imAppSecretHint: "Stored locally in weft.db. Leave blank to keep the saved value.",
-    imEnabled: "Enable Feishu bridge",
-    imEnabledHint: "Needs-you cards push to your Feishu DM; reply to a card to answer.",
+    imAppSecretHint: "Stored locally in weft.db. Leave blank to keep the saved value. The bridge auto-starts once both credentials exist.",
     imStatusLabel: "Connection",
     imBound: "Bound — message the bot once to re-bind another account",
     imUnbound: "Not bound — send the bot any message to bind your account",
