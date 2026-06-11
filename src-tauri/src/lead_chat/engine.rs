@@ -162,6 +162,9 @@ pub struct EngineInner {
     pub interrupting: bool,
     /// Bumped per spawn; stale reader tasks compare and exit.
     pub generation: u64,
+    /// Set on idle when skills changed; the next send silently restarts the
+    /// resident process so it picks up newly-injected skills. UI never sees it.
+    pub pending_skill_refresh: bool,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -288,6 +291,14 @@ pub async fn send(
     images: Vec<(String, String)>,
     files: Vec<String>,
 ) -> anyhow::Result<()> {
+    // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
+    // Silently bounce the resident process so the relaunch (resume) reads them.
+    // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
+    let pending = { eng.lock().await.pending_skill_refresh };
+    if pending {
+        stop_quiet(eng).await;
+        eng.lock().await.pending_skill_refresh = false;
+    }
     ensure_running(app, db, eng).await?;
     let mut inner = eng.lock().await;
     let thread_id = inner.thread_id;
@@ -579,8 +590,10 @@ pub fn spawn_watchdog(app: AppHandle) {
     });
 }
 
-/// Stop the engine outright (e.g. before a terminal takeover).
-pub async fn stop(app: &AppHandle, eng: &EngineRef) {
+/// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
+/// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
+/// bounce is invisible; `stop` wraps this and then emits "stopped".
+pub async fn stop_quiet(eng: &EngineRef) {
     let mut inner = eng.lock().await;
     inner.generation += 1; // orphan the reader so EOF handling is ours
     if let Some(c) = inner.child.as_mut() {
@@ -591,6 +604,12 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     inner.current = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+}
+
+/// Stop the engine outright (e.g. before a terminal takeover).
+pub async fn stop(app: &AppHandle, eng: &EngineRef) {
+    stop_quiet(eng).await;
+    let inner = eng.lock().await;
     let _ = app.emit(
         EVENT,
         Push::Turn {
@@ -965,6 +984,7 @@ mod tests {
             current: None,
             interrupting: false,
             generation: 0,
+            pending_skill_refresh: false,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));
