@@ -130,6 +130,43 @@ impl PowerGuard {
     }
 }
 
+/// Event hook for the chat engine: a turn just began (instant acquire).
+pub fn on_turn_began(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+    if let Some(guard) = app.try_state::<PowerGuard>() {
+        guard.note_busy();
+    }
+}
+
+/// Every 30s: is any live engine's turn busy? Feeds `PowerGuard::sweep`, which
+/// also expires the linger. The event hooks give instant acquire; this loop is
+/// the release path and the safety net — a crashed engine can't leak the
+/// assertion past one interval + linger. Deliberately NOT piggybacked on
+/// `spawn_watchdog`: that loop short-circuits when both guardrail caps are 0.
+pub fn spawn_sweep(app: tauri::AppHandle) {
+    use tauri::Manager as _;
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let engines: Vec<crate::lead_chat::engine::EngineRef> = {
+                let state = app.state::<crate::lead_chat::engine::LeadChatState>();
+                let g = state.0.lock().unwrap_or_else(|e| e.into_inner());
+                g.values().cloned().collect()
+            };
+            let mut any_busy = false;
+            for eng in engines {
+                if eng.lock().await.turn.busy {
+                    any_busy = true;
+                    break;
+                }
+            }
+            if let Some(guard) = app.try_state::<PowerGuard>() {
+                guard.sweep(any_busy);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

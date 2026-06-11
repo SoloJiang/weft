@@ -85,6 +85,7 @@ pub fn run() {
         .manage(db)
         .manage(lead_chat::engine::LeadChatState::default())
         .manage(commands::GuardrailState::default())
+        .manage(power::PowerGuard::default())
         .manage(bus)
         .manage(asks)
         .manage(BusBase(bus_base))
@@ -92,6 +93,7 @@ pub fn run() {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
             lead_chat::engine::spawn_watchdog(app.handle().clone());
+            power::spawn_sweep(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             Ok(())
@@ -129,6 +131,7 @@ pub fn run() {
             commands::workspace_needs_counts,
             commands::answer_permission,
             commands::set_dangerous_mode,
+            commands::set_keep_awake,
             commands::set_guardrails,
             commands::session_for,
             commands::effective_config,

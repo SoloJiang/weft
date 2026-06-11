@@ -511,6 +511,15 @@ pub fn set_dangerous_mode(asks: tauri::State<'_, crate::ask::AskRegistry>, on: b
     Ok(())
 }
 
+/// Keep-awake (global): hold a "prevent idle sleep" OS assertion while any
+/// session is busy (display may still sleep). Re-pushed from the frontend on
+/// every launch — the backend state is in-memory, default ON.
+#[tauri::command]
+pub fn set_keep_awake(power: tauri::State<'_, crate::power::PowerGuard>, on: bool) -> R<()> {
+    power.set_enabled(on);
+    Ok(())
+}
+
 /// Runaway-guardrail caps (§7 跑飞护栏), enforced per busy turn by the chat
 /// engine's watchdog (lead_chat::engine::spawn_watchdog). Configurable at
 /// runtime from Settings; seeded from the WEFT_* env defaults so an env
