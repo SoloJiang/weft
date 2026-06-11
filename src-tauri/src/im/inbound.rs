@@ -107,7 +107,7 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::im::{CardIndex, ReplyTarget};
+    use crate::im::CardIndex;
 
     fn text(sender: &str, parent: Option<&str>, body: &str) -> Inbound {
         Inbound::Text {

@@ -2,6 +2,7 @@
 //! 通道无关核心：设置、卡片索引、Channel trait、入站执行、桥运行时。
 //! feishu/ 是第一个适配器。结构化动作全走确定性代码，LLM 不在路径上。
 
+pub mod feishu;
 pub mod inbound;
 pub mod outbound;
 
@@ -213,6 +214,293 @@ pub async fn execute(
         }
     }
     Ok(())
+}
+
+// ───────────────────────── 桥运行时（Task 10）─────────────────────────
+
+use std::sync::Arc;
+use tauri::Manager;
+
+/// IM 出站文案默认语言。后端无持久化 UI 语言设置（lang 是 lead/worker 的
+/// 逐命令入参），桥侧固定中文优先（项目主语言）。
+const IM_LANG: &str = "zh";
+
+/// 桥的共享态：代际号杀旧任务（设置变更/重连后旧 spawn 自然退出）；状态串供
+/// Settings 显示；卡片索引跨出站/入站任务共享。
+#[derive(Default)]
+pub struct ImBridge {
+    inner: Arc<std::sync::Mutex<BridgeInner>>,
+}
+
+#[derive(Default)]
+struct BridgeInner {
+    generation: u64,
+    /// "disabled" | "connecting" | "online" | "error: …"
+    status: String,
+    cards: Arc<tokio::sync::Mutex<CardIndex>>,
+}
+
+impl ImBridge {
+    pub fn status(&self) -> String {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.status.is_empty() { "disabled".to_string() } else { g.status.clone() }
+    }
+    fn set_status(&self, s: &str) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).status = s.to_string();
+    }
+    /// 起新一代：自增代际号、换一张干净的卡片索引（旧任务下次 live() 检查时退出）。
+    fn bump(&self) -> (u64, Arc<tokio::sync::Mutex<CardIndex>>) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.generation += 1;
+        g.cards = Arc::new(tokio::sync::Mutex::new(CardIndex::default()));
+        (g.generation, g.cards.clone())
+    }
+    fn live(&self, generation: u64) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).generation == generation
+    }
+}
+
+/// 启动（或重启）桥：读设置→不 ready 则置 disabled；ready 则装通知器、起出站
+/// 消费与 ws 入站两个任务。设置变更后再次调用即可（代际号淘汰旧任务）。
+/// 通知器在「不 ready 提前返回」前不安装——避免 disabled 时仍堆积事件。
+pub fn spawn(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let bridge = app.state::<ImBridge>();
+        let (generation, cards) = bridge.bump();
+        let db = app.state::<crate::store::Db>().inner().clone();
+
+        let settings = match ImSettings::load(&db).await {
+            Ok(s) => s,
+            Err(e) => {
+                // fail-closed：DB/连接错误不当作未配置，置 error 并退出本代。
+                bridge.set_status(&format!("error: {e}"));
+                eprintln!("[weft][im] load settings: {e}");
+                return;
+            }
+        };
+        if !settings.ready() {
+            bridge.set_status("disabled");
+            return;
+        }
+        bridge.set_status("connecting");
+
+        let channel: Arc<dyn Channel> =
+            Arc::new(feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret));
+
+        // —— 出站：registry 通知 → 发卡/patch ——
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hum_tx, mut hum_rx) = tokio::sync::mpsc::unbounded_channel();
+        // set_notifier 返回挂接瞬间已 open 的快照：桥重启时补发卡片（无 miss/dup）。
+        let snapshot = app.state::<crate::ask::AskRegistry>().set_notifier(ask_tx);
+        app.state::<crate::bus::BusRegistry>().set_ask_notifier(hum_tx);
+        {
+            let (app2, db2, ch, cards2) = (app.clone(), db.clone(), channel.clone(), cards.clone());
+            tauri::async_runtime::spawn(async move {
+                let bridge = app2.state::<ImBridge>();
+                // 先补发快照里的已开 Ask（挂接前就 open 的，不会再有 Opened 事件）。
+                for ask in snapshot {
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    consume_ask_event(crate::ask::AskEvent::Opened(ask), &db2, ch.as_ref(), &cards2)
+                        .await;
+                }
+                loop {
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    tokio::select! {
+                        ev = ask_rx.recv() => match ev {
+                            None => return,
+                            Some(ev) => consume_ask_event(ev, &db2, ch.as_ref(), &cards2).await,
+                        },
+                        ev = hum_rx.recv() => match ev {
+                            None => return,
+                            Some(ev) => consume_human_event(ev, &db2, ch.as_ref(), &cards2).await,
+                        },
+                    }
+                }
+            });
+        }
+
+        // —— 入站：ws → 路由 → 执行 ——
+        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let (app2, db2, ch, cards2) = (app.clone(), db.clone(), channel.clone(), cards.clone());
+            tauri::async_runtime::spawn(async move {
+                let bridge = app2.state::<ImBridge>();
+                while let Some(inb) = in_rx.recv().await {
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    // 每条入站重读白名单（绑定后即时生效）；Err 丢弃该条（fail-closed）。
+                    let allow = match ImSettings::load(&db2).await {
+                        Ok(s) => s.allow_open_ids,
+                        Err(e) => {
+                            eprintln!("[weft][im] reload allowlist: {e}");
+                            continue;
+                        }
+                    };
+                    let sender = match &inb {
+                        inbound::Inbound::Text { sender_open_id, .. } => sender_open_id.clone(),
+                        inbound::Inbound::Action { operator_open_id, .. } => operator_open_id.clone(),
+                    };
+                    let r = { inbound::route(&inb, &allow, &*cards2.lock().await) };
+                    let asks = app2.state::<crate::ask::AskRegistry>();
+                    let bus = app2.state::<crate::bus::BusRegistry>();
+                    if let Err(e) =
+                        execute(r, &db2, &asks, &bus, ch.as_ref(), &sender, IM_LANG).await
+                    {
+                        eprintln!("[weft][im] execute: {e}");
+                    }
+                }
+            });
+        }
+
+        // —— ws 长连接（断线指数退避重连） ——
+        // open-lark 的 EventDispatcherHandler 含 Box<dyn EventHandler>（无 Send
+        // 约束），LarkWsClient::open 的 future 因此 !Send，过不了 Tauri 的
+        // async_runtime::spawn（要求 Send）。故起一条独立 OS 线程跑 current-thread
+        // 运行时——!Send future 在 block_on 下合法。跨线程的只有 in_tx / 凭证串 /
+        // AppHandle（都是 Send）；!Send 的 handler 全程留在该线程。
+        let (app_id, app_secret) = (settings.app_id.clone(), settings.app_secret.clone());
+        let app3 = app.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("[weft][im] ws runtime: {e}");
+                    app3.state::<ImBridge>().set_status(&format!("error: {e}"));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let bridge = app3.state::<ImBridge>();
+                let mut backoff = 1u64;
+                loop {
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    bridge.set_status("online"); // 连接建立细节在 run_ws 内
+                    match feishu::ws::run_ws(app_id.clone(), app_secret.clone(), in_tx.clone())
+                        .await
+                    {
+                        Ok(()) => backoff = 1,
+                        Err(e) => {
+                            bridge.set_status(&format!("error: {e}"));
+                            eprintln!("[weft][im] ws: {e}");
+                        }
+                    }
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
+                }
+            });
+        });
+    });
+}
+
+/// 权限 Ask 事件 → 发卡（Opened，查 DB 富化 thread 标题/direction 名）/
+/// patch 终态（Resolved 带真实判决；Cancelled = 过期回落）。未绑定不出站。
+async fn consume_ask_event(
+    ev: crate::ask::AskEvent,
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    cards: &tokio::sync::Mutex<CardIndex>,
+) {
+    let owner = match ImSettings::load(db).await {
+        Ok(s) => s.allow_open_ids.into_iter().next(),
+        Err(e) => {
+            eprintln!("[weft][im] consume_ask load owner: {e}");
+            return;
+        }
+    };
+    let Some(owner) = owner else { return }; // 未绑定不出站
+    match ev {
+        crate::ask::AskEvent::Opened(mut a) => {
+            if let Ok(Some(t)) = crate::store::repo::get_thread(db, a.thread).await {
+                a.thread_title = t.title;
+            }
+            if let Ok(id) = a.dir.parse::<i32>() {
+                if let Ok(Some(d)) = crate::store::repo::get_direction(db, id).await {
+                    a.dir_name = d.name;
+                }
+            }
+            let summary = a.summary.clone();
+            match ch.send_card(&owner, outbound::perm_card(&a, IM_LANG)).await {
+                Ok(mid) => cards.lock().await.record_perm(a.id, &mid, &summary),
+                Err(e) => eprintln!("[weft][im] send perm card: {e}"),
+            }
+        }
+        crate::ask::AskEvent::Resolved { id, answer } => {
+            if let Some((mid, summary)) = cards.lock().await.take_perm(id) {
+                let card = outbound::resolved_card(&summary, answer.as_str(), IM_LANG);
+                if let Err(e) = ch.patch_card(&mid, card).await {
+                    eprintln!("[weft][im] patch resolved card: {e}");
+                }
+            }
+        }
+        crate::ask::AskEvent::Cancelled { id } => {
+            if let Some((mid, summary)) = cards.lock().await.take_perm(id) {
+                let card = outbound::resolved_card(&summary, "cancelled", IM_LANG);
+                if let Err(e) = ch.patch_card(&mid, card).await {
+                    eprintln!("[weft][im] patch cancelled card: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// ask_human 事件 → 发提问卡（查 DB 富化 thread 标题/提问 direction 名）/
+/// patch 已答终态（带人答文本）。未绑定不出站。
+async fn consume_human_event(
+    ev: crate::bus::state::HumanAskEvent,
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    cards: &tokio::sync::Mutex<CardIndex>,
+) {
+    let owner = match ImSettings::load(db).await {
+        Ok(s) => s.allow_open_ids.into_iter().next(),
+        Err(e) => {
+            eprintln!("[weft][im] consume_human load owner: {e}");
+            return;
+        }
+    };
+    let Some(owner) = owner else { return };
+    match ev {
+        crate::bus::state::HumanAskEvent::Asked { thread, ask } => {
+            let title = crate::store::repo::get_thread(db, thread)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.title)
+                .unwrap_or_default();
+            let from = match ask.from.parse::<i32>() {
+                Ok(d) => crate::store::repo::get_direction(db, d)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|d| d.name)
+                    .unwrap_or_else(|| ask.from.clone()),
+                Err(_) => ask.from.clone(),
+            };
+            match ch.send_card(&owner, outbound::human_card(&title, &from, &ask.text, IM_LANG)).await
+            {
+                Ok(mid) => cards.lock().await.record_human(thread, ask.id, &mid),
+                Err(e) => eprintln!("[weft][im] send human card: {e}"),
+            }
+        }
+        crate::bus::state::HumanAskEvent::Answered { thread, ask_id, text } => {
+            if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
+                let card = outbound::human_resolved_card(&text, IM_LANG);
+                if let Err(e) = ch.patch_card(&mid, card).await {
+                    eprintln!("[weft][im] patch human resolved card: {e}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
