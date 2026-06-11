@@ -24,8 +24,12 @@ pub enum Decision {
 /// 回落）时发。没装通知器时零开销。
 #[derive(Clone, Debug)]
 pub enum AskEvent {
+    /// 携带的 Ask 中 `thread_title`/`dir_name` 为空；富化（查 DB 填充）是
+    /// 消费侧（桥/命令层）的责任。
     Opened(Ask),
-    Resolved { id: u64 },
+    /// `answer` 是该 ask 的真实判决（Dangerous 释放积压记为 Allow；
+    /// Always/Full 连带覆盖的 ask 记为人答的那个 Answer）。
+    Resolved { id: u64, answer: Answer },
     Cancelled { id: u64 },
 }
 
@@ -89,6 +93,15 @@ struct Inner {
     notify: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
 }
 
+impl Inner {
+    /// 事件外发（持锁内调用）：没装通知器时零开销；桥不在线不报错。
+    fn emit(&self, ev: AskEvent) {
+        if let Some(tx) = &self.notify {
+            let _ = tx.send(ev);
+        }
+    }
+}
+
 /// Cloneable handle to all pending Asks.
 #[derive(Default, Clone)]
 pub struct AskRegistry {
@@ -108,8 +121,12 @@ impl AskRegistry {
     }
 
     /// 安装 IM 桥的通知器（重装时替换旧的；旧消费者随 sender drop 收尾）。
-    pub fn set_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<AskEvent>) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).notify = Some(tx);
+    /// 返回挂接瞬间已 open 的 Ask 快照；快照与后续事件流无重叠、无遗漏
+    /// （同锁内完成）——供桥重启/重连时补发已有卡片，消除 miss/duplicate 竞态。
+    pub fn set_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<AskEvent>) -> Vec<Ask> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.notify = Some(tx);
+        g.open.clone()
     }
 
     /// Register a permission request; returns its id and a receiver that resolves
@@ -139,9 +156,7 @@ impl AskRegistry {
             dir_name: String::new(),
         };
         g.open.push(ask.clone());
-        if let Some(ntx) = &g.notify {
-            let _ = ntx.send(AskEvent::Opened(ask));
-        }
+        g.emit(AskEvent::Opened(ask));
         (id, rx)
     }
 
@@ -160,9 +175,7 @@ impl AskRegistry {
             if let Some(tx) = g.waiters.remove(&id) {
                 let _ = tx.send(Decision::Allow);
             }
-            if let Some(ntx) = &g.notify {
-                let _ = ntx.send(AskEvent::Resolved { id });
-            }
+            g.emit(AskEvent::Resolved { id, answer: Answer::Allow });
         }
     }
 
@@ -230,9 +243,7 @@ impl AskRegistry {
             if let Some(tx) = g.waiters.remove(&cid) {
                 woke = tx.send(decision).is_ok() || woke;
             }
-            if let Some(ntx) = &g.notify {
-                let _ = ntx.send(AskEvent::Resolved { id: cid });
-            }
+            g.emit(AskEvent::Resolved { id: cid, answer: ans });
         }
         woke
     }
@@ -246,9 +257,7 @@ impl AskRegistry {
         let hit = g.open.len() != before;
         g.waiters.remove(&id);
         if hit {
-            if let Some(ntx) = &g.notify {
-                let _ = ntx.send(AskEvent::Cancelled { id });
-            }
+            g.emit(AskEvent::Cancelled { id });
         }
     }
 
@@ -328,13 +337,16 @@ mod tests {
     async fn notifier_fires_on_open_resolve_and_cancel() {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        r.set_notifier(tx);
+        assert!(r.set_notifier(tx).is_empty()); // 空 registry 挂接 → 空快照
         let (id, _drx) = r.request(1, "10", "claude", "Run: x", "x");
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id));
         r.answer(id, Answer::Allow);
-        assert!(matches!(rx.recv().await.unwrap(), AskEvent::Resolved { id: rid } if rid == id));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            AskEvent::Resolved { id: rid, answer: Answer::Allow } if rid == id
+        ));
         let (id2, _drx2) = r.request(1, "10", "claude", "Run: y", "y");
-        let _ = rx.recv().await; // Opened(id2)
+        assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id2));
         r.cancel(id2);
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Cancelled { id: c } if c == id2));
     }
@@ -343,15 +355,43 @@ mod tests {
     async fn full_answer_resolves_every_covered_ask_via_notifier() {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        r.set_notifier(tx);
+        assert!(r.set_notifier(tx).is_empty());
         let (id1, _a) = r.request(1, "10", "claude", "Run: a", "a");
         let (id2, _b) = r.request(1, "10", "claude", "Run: b", "b");
-        let _ = rx.recv().await; let _ = rx.recv().await; // two Opened
+        assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id1));
+        assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id2));
         r.answer(id1, Answer::Full); // 覆盖 id2
         let mut got = vec![];
-        for _ in 0..2 { if let AskEvent::Resolved { id } = rx.recv().await.unwrap() { got.push(id); } }
+        for _ in 0..2 {
+            if let AskEvent::Resolved { id, answer } = rx.recv().await.unwrap() {
+                assert_eq!(answer, Answer::Full); // 连带覆盖也携带人答的判决
+                got.push(id);
+            }
+        }
         got.sort();
         assert_eq!(got, vec![id1, id2]);
+    }
+
+    #[tokio::test]
+    async fn dangerous_release_resolves_backlog_via_notifier() {
+        let r = AskRegistry::new();
+        let (id1, _a) = r.request(1, "10", "claude", "Run: a", "a");
+        let (id2, _b) = r.request(2, "", "codex", "Edit b", "b");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // 挂接晚于 request：快照补齐已 open 的 ask，且不会再收到它们的 Opened
+        let snap: Vec<u64> = r.set_notifier(tx).iter().map(|a| a.id).collect();
+        assert_eq!(snap, vec![id1, id2]);
+        r.set_dangerous(true);
+        let mut got = vec![];
+        for _ in 0..2 {
+            if let AskEvent::Resolved { id, answer } = rx.recv().await.unwrap() {
+                assert_eq!(answer, Answer::Allow); // 释放积压记为 Allow
+                got.push(id);
+            }
+        }
+        got.sort();
+        assert_eq!(got, vec![id1, id2]);
+        assert!(r.open().is_empty());
     }
 
     #[test]
