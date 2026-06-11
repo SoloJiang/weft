@@ -10,12 +10,23 @@ pub const K_ENABLED: &str = "im.feishu.enabled";
 /// 白名单：逗号分隔的飞书 open_id；空 = 未绑定（首个私聊发送者自动绑定）。
 pub const K_ALLOW: &str = "im.feishu.allow_open_ids";
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
     pub app_id: String,
     pub app_secret: String,
     pub enabled: bool,
     pub allow_open_ids: Vec<String>,
+}
+
+impl std::fmt::Debug for ImSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImSettings")
+            .field("app_id", &self.app_id)
+            .field("app_secret", &if self.app_secret.is_empty() { "" } else { "***" })
+            .field("enabled", &self.enabled)
+            .field("allow_open_ids", &self.allow_open_ids)
+            .finish()
+    }
 }
 
 impl ImSettings {
@@ -27,22 +38,25 @@ impl ImSettings {
         s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
     }
 
-    pub async fn load(db: &crate::store::Db) -> Self {
+    /// 从 app_setting 读取设置。「键不存在」是默认值；DB 错误原样传播。
+    /// Err 必须 fail-closed：桥侧把 Err 当连接错误处理，绝不当作未配置/空白名单
+    /// （否则瞬时 DB 错误会清空白名单，导致首个私聊发送者被自动绑定）。
+    pub async fn load(db: &crate::store::Db) -> anyhow::Result<Self> {
         use crate::store::repo::get_setting;
         let g = |k: &'static str| async move {
-            get_setting(db, k).await.ok().flatten().unwrap_or_default()
+            anyhow::Ok(get_setting(db, k).await?.unwrap_or_default())
         };
-        Self {
-            app_id: g(K_APP_ID).await,
-            app_secret: g(K_APP_SECRET).await,
-            enabled: g(K_ENABLED).await == "1",
-            allow_open_ids: Self::parse_allow(&g(K_ALLOW).await),
-        }
+        Ok(Self {
+            app_id: g(K_APP_ID).await?,
+            app_secret: g(K_APP_SECRET).await?,
+            enabled: g(K_ENABLED).await? == "1",
+            allow_open_ids: Self::parse_allow(&g(K_ALLOW).await?),
+        })
     }
 }
 
 /// 一张已发出的卡片背后等待的应答目标（回复路由用）。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ReplyTarget {
     Perm { ask_id: u64 },
     Human { thread: i32, ask_id: u64 },
@@ -58,15 +72,19 @@ pub struct CardIndex {
 
 impl CardIndex {
     pub fn record_perm(&mut self, ask_id: u64, message_id: &str) {
-        self.perm_msg.insert(ask_id, message_id.to_string());
+        if let Some(old) = self.perm_msg.insert(ask_id, message_id.to_string()) {
+            self.by_message.remove(&old);
+        }
         self.by_message.insert(message_id.to_string(), ReplyTarget::Perm { ask_id });
     }
     pub fn record_human(&mut self, thread: i32, ask_id: u64, message_id: &str) {
-        self.human_msg.insert((thread, ask_id), message_id.to_string());
+        if let Some(old) = self.human_msg.insert((thread, ask_id), message_id.to_string()) {
+            self.by_message.remove(&old);
+        }
         self.by_message.insert(message_id.to_string(), ReplyTarget::Human { thread, ask_id });
     }
-    pub fn target_of(&self, message_id: &str) -> Option<&ReplyTarget> {
-        self.by_message.get(message_id)
+    pub fn target_of(&self, message_id: &str) -> Option<ReplyTarget> {
+        self.by_message.get(message_id).copied()
     }
     /// 解决后取走（patch 终态用），并清反向索引。
     pub fn take_perm(&mut self, ask_id: u64) -> Option<String> {
@@ -120,7 +138,7 @@ mod tests {
     async fn settings_load_roundtrip() {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         // 未设置时全默认
-        let s = ImSettings::load(&db).await;
+        let s = ImSettings::load(&db).await.unwrap();
         assert_eq!(s, ImSettings::default());
         assert!(!s.ready());
         // 写入后读回
@@ -128,9 +146,18 @@ mod tests {
         crate::store::repo::set_setting(&db, K_APP_SECRET, "sec").await.unwrap();
         crate::store::repo::set_setting(&db, K_ENABLED, "1").await.unwrap();
         crate::store::repo::set_setting(&db, K_ALLOW, "ou_a, ou_b").await.unwrap();
-        let s = ImSettings::load(&db).await;
+        let s = ImSettings::load(&db).await.unwrap();
         assert!(s.ready());
         assert_eq!(s.allow_open_ids, vec!["ou_a".to_string(), "ou_b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn settings_load_propagates_db_errors() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        use sea_orm::ConnectionTrait;
+        db.0.execute_unprepared("DROP TABLE app_setting").await.unwrap();
+        // DB 错误必须传播为 Err（fail-closed），不得折叠成默认设置
+        assert!(ImSettings::load(&db).await.is_err());
     }
 
     #[test]
@@ -138,11 +165,26 @@ mod tests {
         let mut c = CardIndex::default();
         c.record_perm(7, "om_1");
         c.record_human(3, 9, "om_2");
-        assert_eq!(c.target_of("om_1"), Some(&ReplyTarget::Perm { ask_id: 7 }));
-        assert_eq!(c.target_of("om_2"), Some(&ReplyTarget::Human { thread: 3, ask_id: 9 }));
+        assert_eq!(c.target_of("om_1"), Some(ReplyTarget::Perm { ask_id: 7 }));
+        assert_eq!(c.target_of("om_2"), Some(ReplyTarget::Human { thread: 3, ask_id: 9 }));
         assert_eq!(c.take_perm(7).as_deref(), Some("om_1"));
         assert_eq!(c.target_of("om_1"), None); // 反向索引同步清
         assert_eq!(c.take_human(3, 9).as_deref(), Some("om_2"));
         assert_eq!(c.take_perm(7), None);
+    }
+
+    #[test]
+    fn rerecord_clears_old_reverse_index() {
+        let mut c = CardIndex::default();
+        c.record_perm(7, "om_1");
+        c.record_perm(7, "om_1b");
+        assert_eq!(c.target_of("om_1"), None); // 旧 message_id 不再可路由
+        assert_eq!(c.target_of("om_1b"), Some(ReplyTarget::Perm { ask_id: 7 }));
+        c.record_human(3, 9, "om_2");
+        c.record_human(3, 9, "om_2b");
+        assert_eq!(c.target_of("om_2"), None);
+        assert_eq!(c.target_of("om_2b"), Some(ReplyTarget::Human { thread: 3, ask_id: 9 }));
+        assert_eq!(c.take_perm(7).as_deref(), Some("om_1b"));
+        assert_eq!(c.take_human(3, 9).as_deref(), Some("om_2b"));
     }
 }
