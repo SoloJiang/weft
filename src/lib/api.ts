@@ -188,6 +188,13 @@ export const api = {
     invoke<void>("flag_session_skill_refresh", { sessionId }),
   flagLeadSkillRefresh: (threadId: number) =>
     invoke<void>("flag_lead_skill_refresh", { threadId }),
+  imGetSettings: () =>
+    invoke<{ app_id: string; has_secret: boolean; enabled: boolean; bound: boolean }>(
+      "im_get_settings",
+    ),
+  imSetSettings: (appId: string, appSecret: string, enabled: boolean) =>
+    invoke<void>("im_set_settings", { appId, appSecret, enabled }),
+  imStatus: () => invoke<string>("im_status"),
   // Native folder picker; returns the chosen absolute path, or null if cancelled.
   pickFolder: async (title?: string) => {
     const sel = await openDialog({ directory: true, multiple: false, title });
