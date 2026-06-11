@@ -492,6 +492,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (threadId: number, title: string) => {
       const t = await api.renameThread(threadId, title);
       setThreads((cur) => cur.map((x) => (x.id === t.id ? t : x)));
+      // needs/asks/write-triggers carry a snapshot of thread_title; patch in place
+      setNeeds((cur) =>
+        cur.map((n) => (n.thread_id === t.id ? { ...n, thread_title: t.title } : n)),
+      );
+      setAsks((cur) =>
+        cur.map((a) => (a.thread === t.id ? { ...a, thread_title: t.title } : a)),
+      );
+      setWriteTriggers((cur) =>
+        cur.map((w) => (w.thread_id === t.id ? { ...w, thread_title: t.title } : w)),
+      );
       void refreshOverview();
     },
     [refreshOverview],
@@ -499,13 +509,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const renameDirection = useCallback(async (directionId: number, name: string) => {
     const d = await api.renameDirection(directionId, name);
-    setDirections((m) => {
-      const next: Record<number, Direction[]> = {};
-      for (const [tid, list] of Object.entries(m)) {
-        next[Number(tid)] = list.map((x) => (x.id === d.id ? d : x));
-      }
-      return next;
-    });
+    setDirections((m) => ({
+      ...m,
+      [d.thread_id]: (m[d.thread_id] ?? []).map((x) => (x.id === d.id ? d : x)),
+    }));
+    // needs.direction_name and asks.dir_name carry the direction's display name;
+    // patch them in place so cards/notifications reflect the rename without
+    // waiting for the next refreshNeeds poll. (WriteTrigger.name is a planned
+    // direction not yet created, so it is unrelated to this rename.)
+    setNeeds((cur) =>
+      cur.map((n) => (n.direction_id === d.id ? { ...n, direction_name: d.name } : n)),
+    );
+    setAsks((cur) =>
+      cur.map((a) =>
+        a.thread === d.thread_id && a.dir === d.slug ? { ...a, dir_name: d.name } : a,
+      ),
+    );
   }, []);
 
   const refreshAfterRepo = useCallback(async (ws: number) => {
