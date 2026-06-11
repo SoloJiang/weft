@@ -25,6 +25,7 @@ mod detect;
 mod gc;
 mod inspect;
 pub mod lead_chat;
+pub mod im;
 mod planner;
 mod power;
 pub mod profile;
