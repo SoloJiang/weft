@@ -100,6 +100,7 @@ async fn lead_engine(
         current: None,
         interrupting: false,
         generation: 0,
+        pending_skill_refresh: false,
     };
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(lead_key(thread_id), eng))
@@ -320,6 +321,7 @@ async fn chat_open_worker_impl(
                 current: None,
                 interrupting: false,
                 generation: 0,
+                pending_skill_refresh: false,
             };
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
             state.get_or_insert(key, e)
@@ -401,6 +403,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         current: None,
         interrupting: false,
         generation: 0,
+        pending_skill_refresh: false,
     };
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(session_id as i64, e))
