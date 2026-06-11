@@ -36,6 +36,8 @@ pub enum AskEvent {
 /// The human's answer to a permission Ask. `Always` remembers this action for
 /// the asking task; `Full` auto-approves everything from that task. Both are
 /// weft-side passthrough rules, scoped per (thread, task), kept in memory.
+/// IM 回复作答的中英动词/序号宽松解析见 `im::inbound::parse_verdict`，
+/// 落点即本枚举（`parse`/`as_str` 是 verdict 串的严格双向映射）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answer {
     Allow,
