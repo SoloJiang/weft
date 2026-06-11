@@ -44,13 +44,13 @@
   <text class="ttl" x="398" y="204">Issue</text>
   <text class="sub" x="356" y="240">一个任务 / 需求</text>
 
-  <!-- Direction -->
+  <!-- Sub-task -->
   <rect class="node" x="640" y="170" width="240" height="104" rx="14"/>
   <circle cx="674" cy="206" r="14" fill="#2a2734"/>
   <g class="gl" stroke="#b8b5c2"><path d="M667,206 h12"/><path d="M675,201 l5,5 l-5,5"/></g>
-  <text class="ttl" x="698" y="204">Direction</text>
-  <text class="sub" x="656" y="234">一片工作</text>
-  <text class="sub" x="656" y="252">write/read 仓 · 一个工具</text>
+  <text class="ttl" x="698" y="204">子任务</text>
+  <text class="sub" x="656" y="234">一段写入工作</text>
+  <text class="sub" x="656" y="252">一个写入仓库 · 一个工具</text>
 
   <!-- Session -->
   <rect class="node" x="940" y="170" width="240" height="104" rx="14"/>
@@ -80,5 +80,5 @@
   <circle cx="956" cy="409" r="13" fill="#2a2734"/>
   <g class="gl" stroke="#5fbf92"><path d="M951,404 l4,5 l-4,5"/><path d="M958,415 h6"/></g>
   <text class="rt" x="978" y="402">worker</text>
-  <text class="rs" x="978" y="421">执行单个方向</text>
+  <text class="rs" x="978" y="421">执行单个子任务</text>
 </svg>

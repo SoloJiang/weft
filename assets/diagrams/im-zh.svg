@@ -1,0 +1,182 @@
+<svg viewBox="0 0 1320 600" xmlns="http://www.w3.org/2000/svg" font-family="'Inter','PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Hiragino Sans GB',sans-serif">
+  <defs>
+    <marker id="im_a" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#5b5866"/></marker>
+    <marker id="im_aB" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#7c74f0"/></marker>
+    <marker id="im_aO" markerWidth="9" markerHeight="9" refX="6.5" refY="3.2" orient="auto"><path d="M0,0 L6.5,3.2 L0,6.4 z" fill="#caa14e"/></marker>
+    <filter id="imglow" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="20"/></filter>
+    <style>
+      .ttl{fill:#f3f2f7;font-size:14.5px;font-weight:600}
+      .sub{fill:#8b8896;font-size:11px}
+      .lbl{fill:#75727f;font-size:11px;font-weight:500;letter-spacing:.2px}
+      .node{fill:#1f1d27;stroke:#36333f;stroke-width:1}
+      .gl{stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
+      .pill{fill:#211f33;stroke:#4f46e5;stroke-width:1.2}
+      .ct{fill:#cfcdd6;font-size:13px;font-weight:600;letter-spacing:.2px}
+      .cs{fill:#75727f;font-size:10.5px}
+      .card{fill:#1a1822;stroke:#3a3744;stroke-width:1}
+      .ch{fill:#eceaf2;font-size:11.5px;font-weight:600}
+      .cb{fill:#8b8896;font-size:10.5px}
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1320" height="600" rx="18" fill="#15141a"/>
+  <circle cx="660" cy="300" r="80" fill="#4f46e5" opacity="0.12" filter="url(#imglow)"/>
+
+  <!-- Title -->
+  <text x="40" y="48" fill="#f3f2f7" font-size="18" font-weight="600">IM 远程指挥</text>
+  <text x="158" y="48" fill="#75727f" font-size="12">飞书长连 · 同源应答 · 未来按 Issue 起 thread</text>
+
+  <!-- Left: Weft (desktop) -->
+  <rect x="40" y="80" width="290" height="440" rx="16" fill="#191820" stroke="#34323d"/>
+  <g transform="translate(64,108)">
+    <rect x="0" y="-2" width="16" height="13" rx="2.5" fill="none" stroke="#9a93f7" class="gl"/><path d="M0,2 h16" stroke="#9a93f7" class="gl" opacity=".6"/>
+  </g>
+  <text class="ct" x="92" y="118">Weft 桌面端</text>
+  <text class="cs" x="92" y="134">本机 · Tauri</text>
+
+  <g>
+    <rect class="node" x="64" y="152" width="242" height="72" rx="11"/>
+    <text class="ttl" x="84" y="180">Worker 触发权限</text>
+    <text class="sub" x="84" y="200">claude / codex / opencode</text>
+    <text class="sub" x="84" y="214">tool use → Ask Bridge</text>
+  </g>
+  <g>
+    <rect class="node" x="64" y="236" width="242" height="72" rx="11"/>
+    <text class="ttl" x="84" y="264">Agent 提问</text>
+    <text class="sub" x="84" y="284">ask_human(从 worker)</text>
+    <text class="sub" x="84" y="298">需要人答才能继续</text>
+  </g>
+
+  <rect x="64" y="324" width="242" height="76" rx="11" fill="#1f1d2e" stroke="#4f46e5" stroke-opacity="0.7"/>
+  <text class="ttl" x="84" y="352" fill="#cfcbf6">Ask Registry · Bus</text>
+  <text class="sub" x="84" y="372">事件 Opened / Resolved</text>
+  <text class="sub" x="84" y="386">桌面 + IM 同源应答</text>
+
+  <g>
+    <rect class="node" x="64" y="412" width="242" height="72" rx="11"/>
+    <text class="ttl" x="84" y="440">Settings · 状态</text>
+    <text class="sub" x="84" y="460">app_id / secret / enabled</text>
+    <text class="sub" x="84" y="474">连接：disabled / online …</text>
+  </g>
+
+  <!-- Middle: IM bridge -->
+  <rect x="370" y="80" width="280" height="440" rx="16" fill="#191820" stroke="#34323d"/>
+  <g transform="translate(394,108)" class="gl" stroke="#f0a07a"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#f0a07a" stroke="none"/><path d="M0,-7 v3 M0,9 v3 M-7,2 h3 M9,2 h-3"/></g>
+  <text class="ct" x="420" y="118">IM 桥</text>
+  <text class="cs" x="420" y="134">src-tauri/src/im · 通道无关</text>
+
+  <g>
+    <rect class="node" x="394" y="152" width="232" height="72" rx="11"/>
+    <text class="ttl" x="414" y="180">出站渲染</text>
+    <text class="sub" x="414" y="200">perm_card / human_card</text>
+    <text class="sub" x="414" y="214">截断 30KB · zh/en</text>
+  </g>
+  <g>
+    <rect class="node" x="394" y="236" width="232" height="72" rx="11"/>
+    <text class="ttl" x="414" y="264">入站路由</text>
+    <text class="sub" x="414" y="284">回复匹配 message_id</text>
+    <text class="sub" x="414" y="298">允许 / 拒绝 / 总是 / 放行</text>
+  </g>
+  <g>
+    <rect class="node" x="394" y="320" width="232" height="64" rx="11"/>
+    <text class="ttl" x="414" y="348">CardIndex（内存）</text>
+    <text class="sub" x="414" y="368">ask_id ↔ message_id</text>
+  </g>
+  <g>
+    <rect class="node" x="394" y="396" width="232" height="64" rx="11"/>
+    <text class="ttl" x="414" y="424">绑定 · 白名单</text>
+    <text class="sub" x="414" y="444">首位私聊自动绑定 owner</text>
+  </g>
+
+  <!-- channel pills -->
+  <rect class="pill" x="394" y="476" width="232" height="32" rx="16"/>
+  <text x="510" y="497" text-anchor="middle" fill="#cfcbf6" font-size="11.5" font-weight="600">Channel trait（M1：飞书）</text>
+
+  <!-- Right: Feishu / user -->
+  <rect x="690" y="80" width="590" height="440" rx="16" fill="#191820" stroke="#34323d"/>
+  <g transform="translate(714,108)" class="gl" stroke="#5fbf92"><circle cx="0" cy="2" r="7"/><circle cx="0" cy="2" r="2.4" fill="#5fbf92" stroke="none"/></g>
+  <text class="ct" x="740" y="118">飞书</text>
+  <text class="cs" x="740" y="134">长连 ws · open-lark · 卡片 1.0</text>
+
+  <!-- Permission card (current) -->
+  <g>
+    <rect class="card" x="714" y="156" width="262" height="146" rx="10"/>
+    <rect x="714" y="156" width="262" height="26" rx="10" fill="#3a2418"/>
+    <rect x="714" y="172" width="262" height="10" fill="#3a2418"/>
+    <text x="726" y="174" fill="#f7b094" font-size="11.5" font-weight="600">权限请求 · 登录超时修复</text>
+    <text class="ch" x="726" y="204">Run: npm test</text>
+    <text class="cb" x="726" y="222">backend · claude</text>
+    <text class="cb" x="726" y="248" font-style="italic" fill="#75727f">npm test</text>
+    <text class="cb" x="726" y="280">回复本条消息作答：</text>
+    <text class="cb" x="726" y="294" fill="#cfcbf6">允许 / 拒绝 / 总是 / 放行（1/2/3/4）</text>
+  </g>
+
+  <!-- Human-ask card (current) -->
+  <g>
+    <rect class="card" x="1000" y="156" width="262" height="146" rx="10"/>
+    <rect x="1000" y="156" width="262" height="26" rx="10" fill="#1d2640"/>
+    <rect x="1000" y="172" width="262" height="10" fill="#1d2640"/>
+    <text x="1012" y="174" fill="#9ec2ff" font-size="11.5" font-weight="600">agent 提问 · 登录超时修复</text>
+    <text class="ch" x="1012" y="204">backend</text>
+    <text class="cb" x="1012" y="226">major or minor 版本？</text>
+    <text class="cb" x="1012" y="280">回复本条消息，你的回答</text>
+    <text class="cb" x="1012" y="294">会送回给该 agent。</text>
+  </g>
+
+  <!-- Resolved patch (current) -->
+  <g>
+    <rect class="card" x="714" y="318" width="262" height="92" rx="10"/>
+    <rect x="714" y="318" width="262" height="26" rx="10" fill="#1c3324"/>
+    <rect x="714" y="334" width="262" height="10" fill="#1c3324"/>
+    <text x="726" y="336" fill="#7ddca7" font-size="11.5" font-weight="600">已允许 ✓</text>
+    <text class="cb" x="726" y="368" text-decoration="line-through">Run: npm test</text>
+    <text class="cb" x="726" y="392">同步 patch 终态卡（双面同源）</text>
+  </g>
+
+  <!-- Roadmap: per-issue thread / concierge -->
+  <g>
+    <rect x="1000" y="318" width="262" height="92" rx="10" fill="#1d1924" stroke="#7a5a24" stroke-dasharray="4 4" stroke-width="1.2"/>
+    <text class="ch" x="1012" y="344" fill="#caa14e">路线图 · Issue 飞书 thread</text>
+    <text class="cb" x="1012" y="368">每个 Issue 一条群/话题，把</text>
+    <text class="cb" x="1012" y="382">scope 决策、进度、需你处理</text>
+    <text class="cb" x="1012" y="396">汇总到同一条对话里</text>
+  </g>
+
+  <g>
+    <rect x="714" y="426" width="548" height="78" rx="10" fill="#1d1924" stroke="#7a5a24" stroke-dasharray="4 4" stroke-width="1.2"/>
+    <text class="ch" x="726" y="452" fill="#caa14e">路线图 · 自由对话 concierge</text>
+    <text class="cb" x="726" y="474">M1 仅卡片回复作答；自由聊天“remote control 全局助理”——把任务下发给 Lead /</text>
+    <text class="cb" x="726" y="490">查 Issue / 打断 worker——将在后续 milestone 上线。</text>
+  </g>
+
+  <!-- Arrows: Weft → bridge (outbound) -->
+  <path class="gl" d="M306,188 H394" stroke="#7c74f0" marker-end="url(#im_aB)"/>
+  <path class="gl" d="M306,272 H394" stroke="#7c74f0" marker-end="url(#im_aB)"/>
+  <text class="lbl" x="316" y="180" fill="#8b84e8">事件</text>
+  <text class="lbl" x="316" y="264" fill="#8b84e8">事件</text>
+
+  <!-- Arrow: bridge → Feishu (send_card / patch_card) -->
+  <path class="gl" d="M626,188 H714" stroke="#7c74f0" marker-end="url(#im_aB)"/>
+  <path class="gl" d="M626,272 C654,272 690,250 714,228" stroke="#7c74f0" marker-end="url(#im_aB)"/>
+  <text class="lbl" x="636" y="180" fill="#8b84e8">发卡</text>
+  <text class="lbl" x="636" y="252" fill="#8b84e8">提问卡</text>
+  <path class="gl" d="M626,352 C654,352 690,352 714,352" stroke="#7c74f0" marker-end="url(#im_aB)"/>
+  <text class="lbl" x="636" y="344" fill="#8b84e8">patch 终态</text>
+
+  <!-- Arrow: Feishu → bridge (inbound reply, ws) -->
+  <path class="gl" d="M714,260 C690,295 654,295 626,260" stroke="#35c98b" marker-end="url(#im_aB)" stroke-dasharray="0"/>
+  <text class="lbl" x="640" y="296" fill="#5fbf92">回复 ws</text>
+
+  <!-- Arrow: bridge → Weft (registry.answer / bus.answer_ask) -->
+  <path class="gl" d="M394,360 H306" stroke="#5b5866" marker-end="url(#im_a)"/>
+  <text class="lbl" x="316" y="354">同函数应答</text>
+
+  <!-- bottom legend -->
+  <g transform="translate(40,548)">
+    <rect width="14" height="6" rx="3" fill="#7c74f0"/>
+    <text x="22" y="6" fill="#8b84e8" font-size="11">当前能力</text>
+    <rect x="120" width="14" height="6" rx="3" fill="#7a5a24"/>
+    <text x="142" y="6" fill="#caa14e" font-size="11">路线图</text>
+    <text x="220" y="6" fill="#75727f" font-size="11">绑定：首位私聊自动 owner · 群消息不可绑定 · DB 错误 fail-closed</text>
+  </g>
+</svg>
