@@ -116,6 +116,8 @@ interface Store {
   /** Active issue-level tab: console first, board second. */
   threadTab: ThreadTab;
   setThreadTab: (tab: ThreadTab) => void;
+  /** Mark skills as changed; idle sessions/leads lazily refresh their engines. */
+  markSkillsDirty: () => void;
 
   /** Open agent→human questions across the workspace; the Needs-you surface. */
   needs: NeedItem[];
@@ -694,6 +696,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [workerActivity, setWorkerActivity] = useState<
     Record<number, { name: string; summary: string } | null>
   >({});
+  // Skills dirty latch: bump on any skills mutation; idle sessions/leads compare
+  // against their last-refreshed stamp to flag one engine refresh per episode.
+  const [skillsDirtyAt, setSkillsDirtyAt] = useState(0);
+  const markSkillsDirty = useCallback(() => setSkillsDirtyAt(Date.now()), []);
+  const skillsRefreshedRef = useRef<Record<number, number>>({});
 
   useEffect(() => {
     const un = listen<LeadChatPush>("lead-chat", (e) => {
@@ -1208,6 +1215,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [workerTurn, verifyDirection, directionsByThread]);
 
+  // Idle skill-refresh: when skills changed (dirty timestamp) and a session goes
+  // busy→idle, flag its engine once so the next send picks up new skills.
+  const prevWorkerTurnRef = useRef<Record<number, string>>({});
+  useEffect(() => {
+    for (const [sidStr, turn] of Object.entries(workerTurn)) {
+      const sid = Number(sidStr);
+      const prev = prevWorkerTurnRef.current[sid];
+      prevWorkerTurnRef.current[sid] = turn.state;
+      if (prev === "busy" && turn.state === "idle" &&
+          skillsDirtyAt > (skillsRefreshedRef.current[sid] ?? 0)) {
+        skillsRefreshedRef.current[sid] = Date.now();
+        void api.flagSessionSkillRefresh(sid).catch(() => {});
+      }
+    }
+  }, [workerTurn, skillsDirtyAt]);
+
+  const prevLeadTurnRef = useRef<Record<number, string>>({});
+  useEffect(() => {
+    for (const [tidStr, turn] of Object.entries(leadTurn)) {
+      const tid = Number(tidStr);
+      const prev = prevLeadTurnRef.current[tid];
+      prevLeadTurnRef.current[tid] = turn.state;
+      // lead engines refreshed in the same per-id ref space, negative-keyed to
+      // avoid colliding with worker session ids.
+      const key = -tid;
+      if (prev === "busy" && turn.state === "idle" &&
+          skillsDirtyAt > (skillsRefreshedRef.current[key] ?? 0)) {
+        skillsRefreshedRef.current[key] = Date.now();
+        void api.flagLeadSkillRefresh(tid).catch(() => {});
+      }
+    }
+  }, [leadTurn, skillsDirtyAt]);
+
   useEffect(() => {
     if (activeThreadId == null) {
       setMessages([]);
@@ -1285,6 +1325,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setReviewingProposal,
     threadTab,
     setThreadTab,
+    markSkillsDirty,
     projectsDir,
     setProjectsDir,
     defaultTool,

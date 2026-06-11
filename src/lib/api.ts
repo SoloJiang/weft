@@ -182,6 +182,10 @@ export const api = {
   setSkillEnabled: (sourceId: number, name: string, scope: string, on: boolean) =>
     invoke<void>("set_skill_enabled", { sourceId, name, scope, on }),
   workspaceSkills: (wsId: number) => invoke<EnabledSkill[]>("workspace_skills", { wsId }),
+  flagSessionSkillRefresh: (sessionId: number) =>
+    invoke<void>("flag_session_skill_refresh", { sessionId }),
+  flagLeadSkillRefresh: (threadId: number) =>
+    invoke<void>("flag_lead_skill_refresh", { threadId }),
   // Native folder picker; returns the chosen absolute path, or null if cancelled.
   pickFolder: async (title?: string) => {
     const sel = await openDialog({ directory: true, multiple: false, title });

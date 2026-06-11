@@ -11,7 +11,7 @@ import { cn } from "../lib/cn";
 
 export function SkillsSettings() {
   const { t } = useTranslation();
-  const { activeWorkspaceId } = useStore();
+  const { activeWorkspaceId, markSkillsDirty } = useStore();
   const [sources, setSources] = useState<SkillSource[]>([]);
   const [url, setUrl] = useState("");
   const [ref, setRef] = useState("");
@@ -29,6 +29,7 @@ export function SkillsSettings() {
       await api.addSkillSource(url.trim(), ref.trim() || undefined);
       setUrl("");
       setRef("");
+      markSkillsDirty();
       refresh();
     } finally {
       setBusy(false);
@@ -77,6 +78,7 @@ function SourceRow({
   onChanged: () => void;
 }) {
   const { t } = useTranslation();
+  const { markSkillsDirty } = useStore();
   const [skills, setSkills] = useState<ParsedSkill[]>([]);
   const [enabled, setEnabled] = useState<EnabledSkill[]>([]);
   const [syncing, setSyncing] = useState(false);
@@ -96,6 +98,7 @@ function SourceRow({
     setSyncing(true);
     try {
       await api.syncSkillSource(source.id);
+      markSkillsDirty();
       onChanged();
     } finally {
       setSyncing(false);
@@ -127,7 +130,12 @@ function SourceRow({
         <button
           type="button"
           title={t("settings.skillsRemove")}
-          onClick={() => void api.removeSkillSource(source.id).then(onChanged)}
+          onClick={() =>
+            void api.removeSkillSource(source.id).then(() => {
+              markSkillsDirty();
+              onChanged();
+            })
+          }
           className="grid h-7 w-7 place-items-center rounded-[var(--radius-sm)] text-ink-faint hover:bg-hover hover:text-danger"
         >
           <Trash2 size={13} />
@@ -162,6 +170,7 @@ function SkillRow({
   enabled: EnabledSkill[];
 }) {
   const { t } = useTranslation();
+  const { markSkillsDirty } = useStore();
   const mine = enabled.find((e) => e.source_id === sourceId && e.name === skill.name);
   const overriddenBy = enabled.find((e) => e.name === skill.name && !e.overridden && e.source_id !== sourceId);
   const [global, setGlobal] = useState(false);
@@ -176,12 +185,14 @@ function SkillRow({
   async function toggleGlobal(on: boolean) {
     setGlobal(on);
     await api.setSkillEnabled(sourceId, skill.name, "global", on);
+    markSkillsDirty();
     onChanged();
   }
   async function toggleWs(on: boolean) {
     if (wsId == null) return;
     setThisWs(on);
     await api.setSkillEnabled(sourceId, skill.name, `ws:${wsId}`, on);
+    markSkillsDirty();
     onChanged();
   }
 
