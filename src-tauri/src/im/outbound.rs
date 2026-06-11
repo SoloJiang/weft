@@ -136,6 +136,42 @@ pub fn issue_reply_text(lang: &str, body: &str) -> String {
     format!("{}{}", prefix, clamp(trimmed, 9000))
 }
 
+/// M3-4：桥（重）上线后发给 owner 的一次性摘要。items 是「待你处理」清单
+/// （每项 (thread_id, summary)）。无积压则返回空串——调用方据此跳过发送。
+/// 上限 8 条避免单条消息溢出；超出部分给个 "+N more" 角标。
+pub fn resync_summary(lang: &str, items: &[(i32, String)]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let head = if items.len() == 1 {
+        t(lang, "Weft 桥已上线，当前 1 项待你处理：", "Weft bridge online — 1 ask waiting:")
+            .to_string()
+    } else {
+        let tmpl = t(
+            lang,
+            "Weft 桥已上线，当前 {n} 项待你处理：",
+            "Weft bridge online — {n} asks waiting:",
+        );
+        tmpl.replace("{n}", &items.len().to_string())
+    };
+    let cap = 8;
+    let mut body = String::new();
+    body.push_str(&head);
+    for (tid, summary) in items.iter().take(cap) {
+        body.push_str(&format!("\n• #{tid} — {}", clamp(summary, 80)));
+    }
+    if items.len() > cap {
+        let more = t(lang, " 等（+{n} 条）", " (+{n} more)");
+        body.push_str(&more.replace("{n}", &(items.len() - cap).to_string()));
+    }
+    body.push_str(t(
+        lang,
+        "\n回复对应卡片消息作答；其他请在桌面端处理。",
+        "\nReply to the matching card to answer; handle the rest on desktop.",
+    ));
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +285,42 @@ mod tests {
         assert!(s.starts_with("Lead："));
         assert!(s.ends_with("…(truncated)"));
         assert!(s.chars().count() <= "Lead：".chars().count() + 9000 + "…(truncated)".chars().count());
+    }
+
+    #[test]
+    fn resync_summary_empty_returns_empty_string() {
+        assert!(resync_summary("zh", &[]).is_empty());
+        assert!(resync_summary("en", &[]).is_empty());
+    }
+
+    #[test]
+    fn resync_summary_singular_and_plural_zh_en() {
+        let one = resync_summary("zh", &[(7, "Run: npm test".into())]);
+        assert!(one.contains("1 项"));
+        assert!(one.contains("#7"));
+        assert!(one.contains("Run: npm test"));
+
+        let many = resync_summary(
+            "en",
+            &[(1, "a".into()), (2, "b".into())],
+        );
+        assert!(many.contains("2 asks"));
+        assert!(many.contains("#1") && many.contains("#2"));
+        assert!(many.contains("Reply to the matching card"));
+    }
+
+    #[test]
+    fn resync_summary_caps_at_eight_and_reports_more() {
+        let items: Vec<(i32, String)> = (1..=12).map(|i| (i, format!("s{i}"))).collect();
+        let s = resync_summary("zh", &items);
+        // 头 8 条要出现
+        for i in 1..=8 {
+            assert!(s.contains(&format!("#{i}")));
+        }
+        // 第 9..12 不显式出现
+        for i in 9..=12 {
+            assert!(!s.contains(&format!("#{i}")));
+        }
+        assert!(s.contains("+4 条"));
     }
 }

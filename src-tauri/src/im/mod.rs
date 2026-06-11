@@ -493,6 +493,7 @@ pub fn spawn(app: tauri::AppHandle) {
         // AppHandle（都是 Send）；!Send 的 handler 全程留在该线程。
         let (app_id, app_secret) = (settings.app_id.clone(), settings.app_secret.clone());
         let app3 = app.clone();
+        let ch_for_summary = channel.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -505,11 +506,19 @@ pub fn spawn(app: tauri::AppHandle) {
             rt.block_on(async move {
                 let bridge = app3.state::<ImBridge>();
                 let mut backoff = 1u64;
+                // M3-4：本代际只发一次「上线摘要」。bump() 起新代际时本变量随
+                // 闭包一起被新线程重建，于是重启桥（设置变化/凭证更新）会自然
+                // 再播一次；ws 重连（同代际内 sleep+retry）不重发。
+                let mut sent_resync = false;
                 loop {
                     if !bridge.live(generation) {
                         return;
                     }
                     bridge.set_status("online"); // 连接建立细节在 run_ws 内
+                    if !sent_resync {
+                        send_resync_summary(&app3, ch_for_summary.as_ref()).await;
+                        sent_resync = true;
+                    }
                     match feishu::ws::run_ws(app_id.clone(), app_secret.clone(), in_tx.clone())
                         .await
                     {
@@ -696,6 +705,55 @@ async fn consume_free_text(
     crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new()).await
 }
 
+/// M3-4: 桥上线后向 owner 私聊推一次「待办摘要」。整段 best-effort：任一
+/// 步骤出错都只 log——失败不能阻挡 ws 入站消费（spec §4「上线即可用」）。
+/// 未绑定 owner / 无待办 / channel 发送失败都 silent-skip。
+async fn send_resync_summary(app: &tauri::AppHandle, ch: &dyn Channel) {
+    let db = app.state::<crate::store::Db>().inner().clone();
+    let asks = app.state::<crate::ask::AskRegistry>();
+    let owner = match ImSettings::load(&db).await {
+        Ok(s) => s.allow_open_ids.into_iter().next(),
+        Err(e) => {
+            eprintln!("[weft][im] resync load owner: {e}");
+            return;
+        }
+    };
+    let Some(owner) = owner else { return };
+    let items = build_resync_items(&db, asks.inner()).await;
+    let body = outbound::resync_summary(IM_LANG, &items);
+    if body.is_empty() {
+        return; // 无积压：spec 明确「上线时无待办则不打扰」
+    }
+    if let Err(e) = ch.send_text(&owner, &body).await {
+        eprintln!("[weft][im] resync send: {e}");
+    }
+}
+
+/// 把 AskRegistry 当前快照拉成 `(thread_id, "标题：summary")` 列表供
+/// [`outbound::resync_summary`] 渲染。pub(super) 仅为单测可见；正式调用
+/// 入口是 [`send_resync_summary`]。
+pub(crate) async fn build_resync_items(
+    db: &crate::store::Db,
+    asks: &crate::ask::AskRegistry,
+) -> Vec<(i32, String)> {
+    let mut out = Vec::new();
+    for a in asks.open() {
+        let title = crate::store::repo::get_thread(db, a.thread)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.title)
+            .unwrap_or_default();
+        let label = if title.is_empty() {
+            a.summary.clone()
+        } else {
+            format!("{}：{}", title, a.summary)
+        };
+        out.push((a.thread, label));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +829,41 @@ mod tests {
         assert_eq!(c.target_of("om_2b"), Some(ReplyTarget::Human { thread: 3, ask_id: 9 }));
         assert_eq!(c.take_perm(7), Some(("om_1b".to_string(), "s2".to_string())));
         assert_eq!(c.take_human(3, 9).as_deref(), Some("om_2b"));
+    }
+
+    #[tokio::test]
+    async fn build_resync_items_pairs_thread_titles_with_summaries() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let w = crate::store::repo::create_workspace(&db, "ws").await.unwrap();
+        let t1 = crate::store::repo::create_thread(&db, w.id, "登录修复", "bugfix", "claude").await.unwrap();
+        let t2 = crate::store::repo::create_thread(&db, w.id, "结算优化", "feature", "claude").await.unwrap();
+        let _ = asks.request(t1.id, "10", "claude", "Run: npm test", "npm test");
+        let _ = asks.request(t2.id, "20", "codex", "Edit src/foo.rs", "src/foo.rs");
+
+        let items = build_resync_items(&db, &asks).await;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, t1.id);
+        assert!(items[0].1.starts_with("登录修复："));
+        assert!(items[0].1.ends_with("Run: npm test"));
+        assert_eq!(items[1].0, t2.id);
+        assert!(items[1].1.contains("结算优化"));
+    }
+
+    #[tokio::test]
+    async fn build_resync_items_empty_when_no_open_asks() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        assert!(build_resync_items(&db, &asks).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_resync_items_falls_back_when_thread_row_missing() {
+        // 异常路径：DB 里没有这个 thread 行（route 残留），label 退化为 summary。
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let _ = asks.request(999, "10", "claude", "Run: npm test", "npm test");
+        let items = build_resync_items(&db, &asks).await;
+        assert_eq!(items, vec![(999, "Run: npm test".to_string())]);
     }
 }
