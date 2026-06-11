@@ -29,7 +29,7 @@ mod planner;
 pub mod profile;
 mod sidecar;
 mod tools;
-mod commands;
+pub mod commands;
 
 /// The bus server's base URL, e.g. "http://127.0.0.1:54321".
 pub struct BusBase(pub String);
@@ -98,6 +98,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::create_workspace,
             commands::list_workspaces,
+            commands::ensure_default_workspace,
             commands::add_repo_ref,
             commands::clone_repo,
             commands::create_repo,

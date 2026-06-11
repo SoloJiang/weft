@@ -18,6 +18,23 @@ pub async fn list_workspaces(db: State<'_, Db>) -> R<Vec<entities::workspace::Mo
     repo::list_workspaces(&db).await.map_err(e)
 }
 
+/// Return the id of the most-recently created workspace, creating a "Default"
+/// workspace first if the DB has none. Used by first-run onboarding so the UI
+/// always has a workspace id to attach a repo/thread to. Kept as a free
+/// function so integration tests can drive it without a Tauri runtime.
+pub async fn ensure_default_workspace_inner(db: &Db) -> R<i32> {
+    if let Some(w) = repo::latest_workspace(db).await.map_err(e)? {
+        return Ok(w.id);
+    }
+    let created = repo::create_workspace(db, "Default").await.map_err(e)?;
+    Ok(created.id)
+}
+
+#[tauri::command]
+pub async fn ensure_default_workspace(db: State<'_, Db>) -> R<i32> {
+    ensure_default_workspace_inner(&db).await
+}
+
 /// Register an existing local git repo: validate, record, profile. Shared by
 /// add (existing) / clone / create — they all converge on "a path weft refs".
 async fn register_repo(
