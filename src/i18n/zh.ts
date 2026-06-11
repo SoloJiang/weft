@@ -454,6 +454,7 @@ export const zh = {
     issueBudgetValue: "空闲 {{idle}} 分钟 · 总时长 {{wall}} 分钟",
     loopDetection: "重复失败检测",
     loopDetectionHint: "同一失败反复出现时停止自动重试，并把问题交给你处理。",
+    reviewGroup: "Review",
     keepAwakeTitle: "运行时防止休眠",
     keepAwakeHint: "有会话运行时阻止系统进入空闲休眠，屏幕仍可正常熄灭。合盖或电池策略仍可能休眠。",
     detecting: "检测中…",

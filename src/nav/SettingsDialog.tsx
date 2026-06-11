@@ -169,10 +169,6 @@ function GeneralSettings() {
     setDefaultTool,
     configuredTool,
     installedTools,
-    reviewSkill,
-    setReviewSkill,
-    autoReview,
-    setAutoReview,
     notifyEnabled,
     setNotifyEnabled,
   } = useStore();
@@ -242,17 +238,6 @@ function GeneralSettings() {
               <FolderOpen size={14} />
             </button>
           </div>
-        </SettingRow>
-        <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>
-          <Input
-            value={reviewSkill}
-            placeholder="superpowers:requesting-code-review"
-            onChange={(e) => setReviewSkill(e.currentTarget.value)}
-            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
-          />
-        </SettingRow>
-        <SettingRow label={t("settings.autoReview")} hint={t("settings.autoReviewHint")}>
-          <Toggle on={autoReview} onChange={setAutoReview} label={t("settings.autoReview")} />
         </SettingRow>
         <SettingRow label={t("settings.notifications")} hint={t("settings.notificationsHint")}>
           <div className="flex flex-col items-end gap-1">
@@ -332,21 +317,45 @@ function AppearanceSettings() {
 
 function AutomationSettings() {
   const { t } = useTranslation();
-  const { dangerousMode, setDangerousMode, keepAwake, setKeepAwake } = useStore();
+  const {
+    dangerousMode,
+    setDangerousMode,
+    keepAwake,
+    setKeepAwake,
+    reviewSkill,
+    setReviewSkill,
+    autoReview,
+    setAutoReview,
+  } = useStore();
   const [loopGuard, setLoopGuard] = useState(true);
 
   return (
-    <SettingsGroup title={t("settings.rules")}>
-      <SettingRow label={t("settings.dangerTitle")} hint={t("settings.dangerDesc")}>
-        <Toggle on={dangerousMode} onChange={setDangerousMode} label={t("settings.dangerTitle")} />
-      </SettingRow>
-      <SettingRow label={t("settings.loopDetection")} hint={t("settings.loopDetectionHint")}>
-        <Toggle on={loopGuard} onChange={setLoopGuard} label={t("settings.loopDetection")} />
-      </SettingRow>
-      <SettingRow label={t("settings.keepAwakeTitle")} hint={t("settings.keepAwakeHint")}>
-        <Toggle on={keepAwake} onChange={setKeepAwake} label={t("settings.keepAwakeTitle")} />
-      </SettingRow>
-    </SettingsGroup>
+    <div className="flex flex-col gap-10">
+      <SettingsGroup title={t("settings.rules")}>
+        <SettingRow label={t("settings.dangerTitle")} hint={t("settings.dangerDesc")}>
+          <Toggle on={dangerousMode} onChange={setDangerousMode} label={t("settings.dangerTitle")} />
+        </SettingRow>
+        <SettingRow label={t("settings.loopDetection")} hint={t("settings.loopDetectionHint")}>
+          <Toggle on={loopGuard} onChange={setLoopGuard} label={t("settings.loopDetection")} />
+        </SettingRow>
+        <SettingRow label={t("settings.keepAwakeTitle")} hint={t("settings.keepAwakeHint")}>
+          <Toggle on={keepAwake} onChange={setKeepAwake} label={t("settings.keepAwakeTitle")} />
+        </SettingRow>
+      </SettingsGroup>
+      <SettingsGroup title={t("settings.reviewGroup")}>
+        <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>
+          <Input
+            value={reviewSkill}
+            placeholder="superpowers:requesting-code-review"
+            onChange={(e) => setReviewSkill(e.currentTarget.value)}
+            className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
+          />
+        </SettingRow>
+        <SettingRow label={t("settings.autoReview")} hint={t("settings.autoReviewHint")}>
+          <Toggle on={autoReview} onChange={setAutoReview} label={t("settings.autoReview")} />
+        </SettingRow>
+      </SettingsGroup>
+    </div>
   );
 }
 
