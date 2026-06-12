@@ -31,10 +31,10 @@ const ROLE_ICON: Record<string, ComponentType<LucideProps>> = {
   unknown: CircleDashed,
 };
 
-const NODE_W = 188;
-const NODE_H = 92;
-const COL_GAP = 70;
-const ROW_GAP = 16;
+const NODE_W = 224;
+const NODE_H = 108;
+const COL_GAP = 82;
+const ROW_GAP = 18;
 const PAD = 18;
 const MIN_Z = 0.35;
 const MAX_Z = 2.5;
@@ -215,6 +215,17 @@ export function RepoGraph() {
               >
                 <path d="M0 0 L8 4 L0 8 z" className="fill-border-strong" />
               </marker>
+              <marker
+                id="weft-arrow-active"
+                viewBox="0 0 8 8"
+                refX="6"
+                refY="4"
+                markerWidth="6"
+                markerHeight="6"
+                orient="auto-start-reverse"
+              >
+                <path d="M0 0 L8 4 L0 8 z" className="fill-brand" />
+              </marker>
             </defs>
             {repoEdges.map((e, i) => {
               const dependent = layout.pos.get(e.from);
@@ -231,9 +242,9 @@ export function RepoGraph() {
                   key={i}
                   d={`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`}
                   className={cn(active ? "stroke-brand" : "stroke-border-strong")}
-                  strokeWidth={active ? 2 : 1.5}
-                  opacity={active ? 0.9 : 0.55}
-                  markerEnd="url(#weft-arrow)"
+                  strokeWidth={active ? 1.8 : 1.25}
+                  opacity={active ? 0.72 : 0.34}
+                  markerEnd={active ? "url(#weft-arrow-active)" : "url(#weft-arrow)"}
                 />
               );
             })}
@@ -255,7 +266,7 @@ export function RepoGraph() {
                   setProfileOpen(true);
                 }}
                 className={cn(
-                  "group absolute flex flex-col gap-1.5 overflow-hidden rounded-[var(--radius-md)] border bg-surface px-3 py-2.5 text-left transition-[transform,border-color,background-color] hover:-translate-y-px",
+                  "group absolute flex flex-col gap-2 overflow-hidden rounded-[var(--radius-md)] border bg-surface px-3 py-2.5 text-left transition-[transform,border-color,background-color] hover:-translate-y-px",
                   selected
                     ? "border-brand/60 bg-brand-ghost/60"
                     : core
@@ -268,7 +279,10 @@ export function RepoGraph() {
                   <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
                     <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
                   </span>
-                  <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-ink">
+                  <span
+                    title={p.repo_name}
+                    className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink"
+                  >
                     {p.repo_name}
                   </span>
                   {p.stale && (
@@ -290,27 +304,7 @@ export function RepoGraph() {
                   </button>
                 </div>
 
-                <div className="flex flex-nowrap items-center gap-1 overflow-hidden">
-                  <span className="shrink-0 rounded-full bg-bg px-1.5 py-px text-[10px] text-ink-faint">
-                    {t(`repomap.role_${p.role}`, p.role)}
-                  </span>
-                  {p.stack.slice(0, 3).map((s) => (
-                    <span
-                      key={s}
-                      className="shrink-0 rounded bg-bg px-1.5 py-px font-mono text-[10px] text-ink-faint"
-                    >
-                      {s}
-                    </span>
-                  ))}
-                  {core && (
-                    <span
-                      title={t("repomap.rippleTitle", { count: dependents })}
-                      className="ml-auto shrink-0 rounded-full bg-accent-ghost px-1.5 py-px text-[10px] font-medium text-accent"
-                    >
-                      {t("repomap.coreDependents", { count: dependents })}
-                    </span>
-                  )}
-                </div>
+                <NodeBadges role={p.role} stack={p.stack} core={core} dependents={dependents} />
 
                 <NodeSummary profile={p} />
               </div>
@@ -494,6 +488,74 @@ function EmptyProfilePane() {
   );
 }
 
+function NodeBadges({
+  role,
+  stack,
+  core,
+  dependents,
+}: {
+  role: string;
+  stack: string[];
+  core: boolean;
+  dependents: number;
+}) {
+  const { t } = useTranslation();
+  const visibleStack = stack.slice(0, 2);
+  const hiddenStack = stack.slice(2);
+  const roleLabel = t(`repomap.role_${role}`, role);
+
+  return (
+    <div className="flex min-h-[20px] min-w-0 items-center gap-1 overflow-hidden">
+      <MiniPill title={roleLabel} rounded>
+        {roleLabel}
+      </MiniPill>
+      {visibleStack.map((s) => (
+        <MiniPill key={s} title={s} mono>
+          {s}
+        </MiniPill>
+      ))}
+      {hiddenStack.length > 0 && (
+        <MiniPill title={hiddenStack.join(", ")} mono>
+          +{hiddenStack.length}
+        </MiniPill>
+      )}
+      {core && (
+        <span
+          title={t("repomap.rippleTitle", { count: dependents })}
+          className="ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-accent-ghost px-1.5 text-[10px] font-medium tabular-nums text-accent"
+        >
+          {dependents}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function MiniPill({
+  title,
+  mono,
+  rounded,
+  children,
+}: {
+  title: string;
+  mono?: boolean;
+  rounded?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <span
+      title={title}
+      className={cn(
+        "min-w-0 max-w-[76px] shrink-0 truncate bg-bg px-1.5 py-px text-[10.5px] leading-5 text-ink-faint",
+        mono && "font-mono",
+        rounded ? "rounded-full" : "rounded-[var(--radius-sm)]",
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
 function ProfileSection({
   title,
   children,
@@ -604,11 +666,11 @@ function NodeSummary({ profile }: { profile: RepoProfile }) {
         setEditing(true);
       }}
       title={t("repomap.editHint")}
-      className="group/sum flex items-start gap-1 text-left"
+      className="group/sum flex min-w-0 items-start gap-1 text-left"
     >
       <span
         className={cn(
-          "text-[11.5px] leading-snug",
+          "min-w-0 text-[11.5px] leading-snug",
           profile.summary ? "text-ink-muted" : "text-ink-faint italic",
         )}
         style={{

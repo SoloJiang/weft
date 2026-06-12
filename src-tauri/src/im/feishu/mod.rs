@@ -83,8 +83,13 @@ impl FeishuChannel {
 #[async_trait::async_trait]
 impl super::Channel for FeishuChannel {
     async fn send_card(&self, open_id: &str, card: serde_json::Value) -> anyhow::Result<String> {
-        self.create(ReceiveIdType::OpenId, open_id, "interactive", card.to_string())
-            .await
+        self.create(
+            ReceiveIdType::OpenId,
+            open_id,
+            "interactive",
+            card.to_string(),
+        )
+        .await
     }
 
     async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()> {

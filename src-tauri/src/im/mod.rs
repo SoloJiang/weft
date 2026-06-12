@@ -222,6 +222,13 @@ pub trait Channel: Send + Sync {
 pub struct ExecuteCtx {
     pub inbound_message_id: Option<String>,
     pub acks: Option<Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>>,
+    pub reaction_tx: Option<tokio::sync::mpsc::UnboundedSender<InboundAckJob>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboundAckJob {
+    pub thread_id: i32,
+    pub message_id: String,
 }
 
 /// Route execution requires an AppHandle when an issue message has to be fed
@@ -460,6 +467,19 @@ async fn record_inbound_reaction(ctx: Option<&ExecuteCtx>, channel: &dyn Channel
         return;
     };
 
+    if let Some(tx) = ctx.reaction_tx.as_ref() {
+        if tx
+            .send(InboundAckJob {
+                thread_id,
+                message_id: mid.to_string(),
+            })
+            .is_err()
+        {
+            eprintln!("[weft][im] queue reaction: worker closed");
+        }
+        return;
+    }
+
     match channel.add_reaction(mid, INBOUND_ACK_EMOJI).await {
         Ok(rid) if !rid.is_empty() => {
             acks.lock()
@@ -497,6 +517,20 @@ use tauri::Manager;
 /// IM 出站文案默认语言。后端无持久化 UI 语言设置（lang 是 lead/worker 的
 /// 逐命令入参），桥侧固定中文优先（项目主语言）。
 const IM_LANG: &str = "zh";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsLoopAction {
+    SpawnResyncTask,
+    OpenWs,
+}
+
+fn ws_loop_actions(sent_resync: bool) -> Vec<WsLoopAction> {
+    if sent_resync {
+        vec![WsLoopAction::OpenWs]
+    } else {
+        vec![WsLoopAction::SpawnResyncTask, WsLoopAction::OpenWs]
+    }
+}
 
 /// 桥的共享态：代际号杀旧任务（设置变更/重连后旧 spawn 自然退出）；状态串供
 /// Settings 显示；卡片索引跨出站/入站任务共享。
@@ -594,6 +628,37 @@ pub fn spawn(app: tauri::AppHandle) {
                 }
             };
 
+        // 入站 👀 reaction 是回执增强，不应挡住消息进入 lead engine。所有飞书
+        // reaction REST 调用放到独立 worker 串行处理；失败只影响回执，不影响投递。
+        let (reaction_tx, mut reaction_rx) =
+            tokio::sync::mpsc::unbounded_channel::<InboundAckJob>();
+        {
+            let (app_ack, ch_ack, acks_ack) = (app.clone(), channel.clone(), acks.clone());
+            tauri::async_runtime::spawn(async move {
+                let bridge = app_ack.state::<ImBridge>();
+                while let Some(job) = reaction_rx.recv().await {
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    match ch_ack
+                        .add_reaction(&job.message_id, INBOUND_ACK_EMOJI)
+                        .await
+                    {
+                        Ok(rid) if !rid.is_empty() => {
+                            acks_ack
+                                .lock()
+                                .await
+                                .entry(job.thread_id)
+                                .or_default()
+                                .push((job.message_id, rid));
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[weft][im] add reaction: {e}"),
+                    }
+                }
+            });
+        }
+
         // —— 出站：registry 通知 → 发卡/patch ——
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
         let (hum_tx, mut hum_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -688,6 +753,7 @@ pub fn spawn(app: tauri::AppHandle) {
                     let ctx = ExecuteCtx {
                         inbound_message_id: in_mid,
                         acks: Some(acks2.clone()),
+                        reaction_tx: Some(reaction_tx.clone()),
                     };
                     if let Err(e) = execute(
                         r,
@@ -740,7 +806,7 @@ pub fn spawn(app: tauri::AppHandle) {
         // 流式不可用时在 done 帧回落普通发送，保证不丢消息。
         if let Some(hub) = app.try_state::<crate::lead_chat::delta_hub::LeadDeltaHub>() {
             let mut rx = hub.subscribe();
-            let (db2, ch) = (db.clone(), channel.clone());
+            let (db2, ch, acks2) = (db.clone(), channel.clone(), acks.clone());
             let app5 = app.clone();
             tauri::async_runtime::spawn(async move {
                 let bridge = app5.state::<ImBridge>();
@@ -758,82 +824,20 @@ pub fn spawn(app: tauri::AppHandle) {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     };
-                    // Concierge（主会话→出口 agent，新消息）和 issue 话题（→lead，
-                    // 回复挂话题）都流式；其它路由由 LeadOut 整段发。
-                    let route = match crate::store::repo::im_route_of_thread(&db2, d.thread_id)
-                        .await
-                    {
-                        Ok(Some(r)) if r.channel == "feishu_concierge" || r.channel == "feishu" => {
-                            r
-                        }
-                        _ => continue,
-                    };
-                    let is_topic = route.channel == "feishu";
-                    // 话题里加「Lead：」前缀保持归属（与 issue_reply_text 一致）；DM 原样。
-                    let content = if is_topic {
-                        format!(
-                            "{}{}",
-                            if IM_LANG == "zh" { "Lead：" } else { "Lead: " },
-                            d.accumulated
-                        )
-                    } else {
-                        d.accumulated.clone()
-                    };
-                    // 首帧建卡：空内容的中间帧先等真正内容；done 帧总处理。
-                    if !streams.contains_key(&d.message_id) {
-                        if d.accumulated.trim().is_empty() && !d.done {
-                            continue;
-                        }
-                        // 话题→回复式卡片挂到话题根；DM→新消息发给 open_id/chat_id。
-                        let begun = if is_topic {
-                            ch.stream_begin_reply(&route.im_thread_ref).await
-                        } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
-                            ch.stream_begin("open_id", open_id).await
-                        } else if route.im_thread_ref.starts_with("chat:") {
-                            ch.stream_begin("chat_id", &route.chat_id).await
-                        } else {
-                            continue;
-                        };
-                        match begun {
-                            Ok(Some(s)) => {
-                                streams.insert(d.message_id, s);
+                    let mut pending = Vec::new();
+                    loop {
+                        match rx.try_recv() {
+                            Ok(next) => pending.push(next),
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                                eprintln!("[weft][im] lead-delta lagged: {n} dropped");
                             }
-                            _ => {
-                                // 流式不可用/建卡失败：done 时回落普通发送一次，不丢消息。
-                                if d.done {
-                                    let sent = if is_topic {
-                                        let body =
-                                            outbound::issue_reply_text(IM_LANG, &d.accumulated);
-                                        ch.reply_text(&route.im_thread_ref, &body).await.map(|_| ())
-                                    } else if let Some(open_id) =
-                                        route.im_thread_ref.strip_prefix("dm:")
-                                    {
-                                        ch.send_text(open_id, &d.accumulated).await.map(|_| ())
-                                    } else {
-                                        ch.send_chat_text(&route.chat_id, &d.accumulated)
-                                            .await
-                                            .map(|_| ())
-                                    };
-                                    if let Err(e) = sent {
-                                        eprintln!("[weft][im] stream fallback send: {e}");
-                                    }
-                                }
-                                continue;
-                            }
+                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return,
                         }
                     }
-                    if let Some(session) = streams.get_mut(&d.message_id) {
-                        let r = if d.done {
-                            ch.stream_end(session, &content).await
-                        } else {
-                            ch.stream_push(session, &content).await
-                        };
-                        if let Err(e) = r {
-                            eprintln!("[weft][im] stream push/end: {e}");
-                        }
-                        if d.done {
-                            streams.remove(&d.message_id);
-                        }
+                    for frame in coalesce_delta_frames(d, pending) {
+                        consume_lead_delta_frame(frame, &db2, ch.as_ref(), &mut streams, &acks2)
+                            .await;
                     }
                 }
             });
@@ -871,19 +875,43 @@ pub fn spawn(app: tauri::AppHandle) {
                     if !bridge.live(generation) {
                         return;
                     }
-                    bridge.set_status("online"); // 连接建立细节在 run_ws 内
-                    if !sent_resync {
-                        send_resync_summary(&app3, ch_for_summary.as_ref()).await;
-                        sent_resync = true;
-                    }
-                    match feishu::ws::run_ws(app_id.clone(), app_secret.clone(), in_tx.clone())
-                        .await
-                    {
-                        Ok(()) => backoff = 1,
-                        Err(e) => {
-                            bridge.set_status(&format!("error: {e}"));
-                            eprintln!("[weft][im] ws: {e}");
+                    let mut opened = false;
+                    for action in ws_loop_actions(sent_resync) {
+                        match action {
+                            WsLoopAction::SpawnResyncTask => {
+                                sent_resync = true;
+                                let app_summary = app3.clone();
+                                let ch_summary = ch_for_summary.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    if !app_summary.state::<ImBridge>().live(generation) {
+                                        return;
+                                    }
+                                    eprintln!("[weft][im] resync summary task start");
+                                    send_resync_summary(&app_summary, ch_summary.as_ref()).await;
+                                });
+                            }
+                            WsLoopAction::OpenWs => {
+                                opened = true;
+                                bridge.set_status("online"); // 连接建立细节在 run_ws 内
+                                eprintln!("[weft][im] ws loop entering run_ws");
+                                match feishu::ws::run_ws(
+                                    app_id.clone(),
+                                    app_secret.clone(),
+                                    in_tx.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => backoff = 1,
+                                    Err(e) => {
+                                        bridge.set_status(&format!("error: {e}"));
+                                        eprintln!("[weft][im] ws: {e}");
+                                    }
+                                }
+                            }
                         }
+                    }
+                    if !opened {
+                        return;
                     }
                     if !bridge.live(generation) {
                         return;
@@ -1105,6 +1133,142 @@ pub async fn ensure_issue_topic(
     Ok(())
 }
 
+async fn send_delta_fallback(
+    route: &crate::store::entities::im_route::Model,
+    is_topic: bool,
+    ch: &dyn Channel,
+    text: &str,
+) -> anyhow::Result<()> {
+    if is_topic {
+        let body = outbound::issue_reply_text(IM_LANG, text);
+        ch.reply_text(&route.im_thread_ref, &body).await.map(|_| ())
+    } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+        ch.send_text(open_id, text).await.map(|_| ())
+    } else {
+        ch.send_chat_text(&route.chat_id, text).await.map(|_| ())
+    }
+}
+
+fn coalesce_delta_frames<I>(
+    first: crate::lead_chat::delta_hub::LeadDelta,
+    rest: I,
+) -> Vec<crate::lead_chat::delta_hub::LeadDelta>
+where
+    I: IntoIterator<Item = crate::lead_chat::delta_hub::LeadDelta>,
+{
+    let mut order = Vec::new();
+    let mut latest = HashMap::new();
+    for d in std::iter::once(first).chain(rest) {
+        let key = (d.thread_id, d.message_id);
+        if !latest.contains_key(&key) {
+            order.push(key);
+        }
+        latest.insert(key, d);
+    }
+    order
+        .into_iter()
+        .filter_map(|key| latest.remove(&key))
+        .collect()
+}
+
+async fn consume_lead_delta_frame(
+    d: crate::lead_chat::delta_hub::LeadDelta,
+    db: &crate::store::Db,
+    ch: &dyn Channel,
+    streams: &mut HashMap<i32, feishu::streaming::StreamSession>,
+    acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
+) {
+    // Concierge（主会话→出口 agent，新消息）和 issue 话题（→lead，回复挂话题）
+    // 都流式；其它路由由 LeadOut 整段发。
+    let route = match crate::store::repo::im_route_of_thread(db, d.thread_id).await {
+        Ok(Some(r)) if r.channel == "feishu_concierge" || r.channel == "feishu" => r,
+        _ => return,
+    };
+    let is_topic = route.channel == "feishu";
+    // 话题里加「Lead：」前缀保持归属（与 issue_reply_text 一致）；DM 原样。
+    let content = if is_topic {
+        format!(
+            "{}{}",
+            if IM_LANG == "zh" { "Lead：" } else { "Lead: " },
+            d.accumulated
+        )
+    } else {
+        d.accumulated.clone()
+    };
+
+    // 首帧建卡：空内容的中间帧先等真正内容；done 帧总处理。
+    if !streams.contains_key(&d.message_id) {
+        if d.accumulated.trim().is_empty() && !d.done {
+            return;
+        }
+        // 话题→回复式卡片挂到话题根；DM→新消息发给 open_id/chat_id。
+        let begun = if is_topic {
+            ch.stream_begin_reply(&route.im_thread_ref).await
+        } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+            ch.stream_begin("open_id", open_id).await
+        } else if route.im_thread_ref.starts_with("chat:") {
+            ch.stream_begin("chat_id", &route.chat_id).await
+        } else {
+            return;
+        };
+        match begun {
+            Ok(Some(s)) => {
+                streams.insert(d.message_id, s);
+            }
+            Ok(None) => {
+                if d.done {
+                    if let Err(e) = send_delta_fallback(&route, is_topic, ch, &d.accumulated).await
+                    {
+                        eprintln!("[weft][im] stream fallback send: {e}");
+                    } else {
+                        drain_inbound_reactions(d.thread_id, ch, acks).await;
+                    }
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("[weft][im] stream begin: {e}");
+                if d.done {
+                    if let Err(e) = send_delta_fallback(&route, is_topic, ch, &d.accumulated).await
+                    {
+                        eprintln!("[weft][im] stream fallback send: {e}");
+                    } else {
+                        drain_inbound_reactions(d.thread_id, ch, acks).await;
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    if let Some(session) = streams.get_mut(&d.message_id) {
+        let r = if d.done {
+            ch.stream_end(session, &content).await
+        } else {
+            ch.stream_push(session, &content).await
+        };
+        match r {
+            Ok(()) if d.done => {
+                streams.remove(&d.message_id);
+                drain_inbound_reactions(d.thread_id, ch, acks).await;
+            }
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[weft][im] stream push/end: {e}");
+                if d.done {
+                    streams.remove(&d.message_id);
+                    if let Err(e) = send_delta_fallback(&route, is_topic, ch, &d.accumulated).await
+                    {
+                        eprintln!("[weft][im] stream fallback send: {e}");
+                    } else {
+                        drain_inbound_reactions(d.thread_id, ch, acks).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// M2-4: lead engine 的 assistant 文本完成 → 反查 im_route → 飞书话题 reply。
 /// 同时把这个 thread 挂账的 👀 reactions 一次性 delete（spec §4 回执语义：
 /// 「轮到这条被回复」才取下 👀，排队期间一直在）。pub 给集成测试用。
@@ -1127,9 +1291,9 @@ pub async fn consume_lead_out(
     };
     if route.channel == "feishu_concierge" {
         // streaming 开启时，Concierge 回复整段交给 LeadDelta 消费者流式发送
-        // （stream 或失败回落），此处不再重复发一遍——见 spawn 的 delta 消费者。
+        // （stream 或失败回落），此处不再重复发一遍，也不提前清回执——见
+        // consume_lead_delta_frame 的 done 帧处理。
         if streaming {
-            drain_inbound_reactions(out.thread_id, ch, acks).await;
             return;
         }
         let send = if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
@@ -1152,7 +1316,7 @@ pub async fn consume_lead_out(
         return;
     }
     // issue 话题：streaming 时 reply 由 LeadDelta 消费者发流式卡（stream 或回落），
-    // 这里跳过一次性 reply，只负责清 👀（acks 在本函数手里）；否则照旧整段 reply。
+    // 这里跳过一次性 reply；成功后的 👀 清理由 done 帧处理。否则照旧整段 reply。
     if !streaming {
         let body = outbound::issue_reply_text(IM_LANG, &out.text);
         // im_thread_ref 即话题根 message_id：飞书 reply API 会把回复挂同一话题。
@@ -1160,9 +1324,8 @@ pub async fn consume_lead_out(
             eprintln!("[weft][im] reply lead text: {e}");
             return; // reply 失败就不 clear 回执——下一条 lead 还会带它走。
         }
+        drain_inbound_reactions(out.thread_id, ch, acks).await;
     }
-    // 出站成功（或 streaming 接管）→ 清掉这个 thread 上挂的所有 👀。
-    drain_inbound_reactions(out.thread_id, ch, acks).await;
 }
 
 async fn ensure_concierge_workspace(db: &crate::store::Db) -> anyhow::Result<i32> {
@@ -1465,5 +1628,181 @@ mod tests {
             .unwrap();
         assert_eq!(thread.kind, "concierge");
         assert_eq!(thread.lead_tool, expected);
+    }
+
+    #[derive(Default)]
+    struct StreamEndFailsChannel {
+        texts: std::sync::Mutex<Vec<(String, String)>>,
+        deletions: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for StreamEndFailsChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("om_card".into())
+        }
+
+        async fn patch_card(
+            &self,
+            _message_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
+            self.texts
+                .lock()
+                .unwrap()
+                .push((open_id.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
+            self.texts
+                .lock()
+                .unwrap()
+                .push((reply_to.to_string(), text.to_string()));
+            Ok("om_reply".into())
+        }
+
+        async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> anyhow::Result<()> {
+            self.deletions
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), reaction_id.to_string()));
+            Ok(())
+        }
+
+        async fn stream_begin(
+            &self,
+            _receive_id_type: &str,
+            _receive_id: &str,
+        ) -> anyhow::Result<Option<feishu::streaming::StreamSession>> {
+            Ok(Some(feishu::streaming::StreamSession::new(
+                "card".into(),
+                feishu::streaming::ELEMENT_ID.into(),
+                "om_stream".into(),
+            )))
+        }
+
+        async fn stream_end(
+            &self,
+            _session: &mut feishu::streaming::StreamSession,
+            _final_text: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("stream put failed")
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_delta_done_falls_back_to_text_when_stream_end_fails() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "Concierge")
+            .await
+            .unwrap();
+        let thread = crate::store::repo::create_thread(
+            &db,
+            ws.id,
+            "飞书私聊 · ou_owner",
+            "concierge",
+            "claude",
+        )
+        .await
+        .unwrap();
+        crate::store::repo::bind_im_route(
+            &db,
+            thread.id,
+            "feishu_concierge",
+            "oc_dm",
+            "dm:ou_owner",
+        )
+        .await
+        .unwrap();
+        let ch = StreamEndFailsChannel::default();
+        let mut streams = HashMap::new();
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+        acks.lock()
+            .await
+            .insert(thread.id, vec![("om_in".into(), "re_in".into())]);
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: thread.id,
+                message_id: 11,
+                accumulated: "我查到了。".into(),
+                done: true,
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        assert_eq!(
+            ch.texts.lock().unwrap().as_slice(),
+            [("ou_owner".into(), "我查到了。".into())]
+        );
+        assert!(streams.is_empty());
+        assert!(acks.lock().await.get(&thread.id).is_none());
+        assert_eq!(
+            ch.deletions.lock().unwrap().as_slice(),
+            [("om_in".into(), "re_in".into())]
+        );
+    }
+
+    #[test]
+    fn coalesces_streaming_delta_frames_to_latest_per_message() {
+        let frames = coalesce_delta_frames(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: 1,
+                message_id: 10,
+                accumulated: "h".into(),
+                done: false,
+            },
+            vec![
+                crate::lead_chat::delta_hub::LeadDelta {
+                    thread_id: 1,
+                    message_id: 10,
+                    accumulated: "he".into(),
+                    done: false,
+                },
+                crate::lead_chat::delta_hub::LeadDelta {
+                    thread_id: 2,
+                    message_id: 20,
+                    accumulated: "x".into(),
+                    done: false,
+                },
+                crate::lead_chat::delta_hub::LeadDelta {
+                    thread_id: 1,
+                    message_id: 10,
+                    accumulated: "hello".into(),
+                    done: true,
+                },
+            ],
+        );
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].message_id, 10);
+        assert_eq!(frames[0].accumulated, "hello");
+        assert!(frames[0].done);
+        assert_eq!(frames[1].message_id, 20);
+        assert_eq!(frames[1].accumulated, "x");
+    }
+
+    #[test]
+    fn ws_loop_spawns_resync_without_blocking_open() {
+        assert_eq!(
+            ws_loop_actions(false),
+            vec![WsLoopAction::SpawnResyncTask, WsLoopAction::OpenWs]
+        );
+        assert_eq!(ws_loop_actions(true), vec![WsLoopAction::OpenWs]);
     }
 }

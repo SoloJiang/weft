@@ -36,6 +36,7 @@ tower = "0.5"
 # 此处仅复用，编译成本已付）。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
+roxmltree = "0.20"
 keepawake = "0.6"
 # Package renamed open-lark -> openlark (0.15+); lib import path stays `open_lark::*`.
 openlark = { version = "0.17", default-features = false, features = ["communication", "cardkit", "websocket"] }

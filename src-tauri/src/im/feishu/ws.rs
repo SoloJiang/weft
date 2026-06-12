@@ -69,6 +69,15 @@ pub fn inbound_from_raw(env: &serde_json::Value) -> Option<Inbound> {
     )
 }
 
+fn event_type_of_raw(payload: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()?
+        .get("header")?
+        .get("event_type")?
+        .as_str()
+        .map(String::from)
+}
+
 /// register_raw 的事件处理器：拿到原始 envelope 字节，解析成 Inbound 后投递 tx。
 /// `EventHandler::handle` 是 `&self`，故把 sender 存进结构体（Send + Sync）。
 struct RawInbound {
@@ -77,12 +86,27 @@ struct RawInbound {
 
 impl EventHandler for RawInbound {
     fn handle(&self, payload: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 解析失败（非 JSON / 非目标事件）静默丢弃——长连接还会送别的事件，不该报错断流。
-        if let Ok(env) = serde_json::from_slice::<serde_json::Value>(payload) {
-            if let Some(inb) = inbound_from_raw(&env) {
-                eprintln!("[weft][im] inbound feishu text (raw event)");
-                let _ = self.tx.send(inb);
+        let event_type = event_type_of_raw(payload);
+        match event_type.as_deref() {
+            Some(t) => eprintln!("[weft][im] ws raw event_type={t}"),
+            None => eprintln!(
+                "[weft][im] ws raw payload without event_type len={}",
+                payload.len()
+            ),
+        }
+
+        let env = match serde_json::from_slice::<serde_json::Value>(payload) {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("[weft][im] ws raw json parse failed: {e}");
+                return Ok(());
             }
+        };
+        if let Some(inb) = inbound_from_raw(&env) {
+            eprintln!("[weft][im] inbound feishu text (raw event)");
+            let _ = self.tx.send(inb);
+        } else if event_type.as_deref() == Some("im.message.receive_v1") {
+            eprintln!("[weft][im] ws message event dropped by parser");
         }
         Ok(())
     }
@@ -114,6 +138,7 @@ pub async fn run_ws(
         .map_err(|e| anyhow::anyhow!("feishu ws register raw: {e}"))?
         .build();
 
+    eprintln!("[weft][im] ws opening long connection");
     LarkWsClient::open(config, handler)
         .await
         .map_err(|e| anyhow::anyhow!("feishu ws closed: {e:?}"))
@@ -272,5 +297,15 @@ mod tests {
             &serde_json::json!({"header": {"event_type": "im.message.receive_v1"}})
         )
         .is_none());
+    }
+
+    #[test]
+    fn event_type_of_raw_extracts_type_for_logging() {
+        assert_eq!(
+            event_type_of_raw(br#"{"header":{"event_type":"im.message.receive_v1"}}"#).as_deref(),
+            Some("im.message.receive_v1")
+        );
+        assert_eq!(event_type_of_raw(b"not json"), None);
+        assert_eq!(event_type_of_raw(br#"{"header":{}}"#), None);
     }
 }

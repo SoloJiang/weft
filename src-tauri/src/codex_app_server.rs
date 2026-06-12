@@ -189,6 +189,9 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             match item["type"].as_str() {
                 Some("agentMessage") | None => None,
                 Some("reasoning") => None,
+                Some("error") => Some(ChatEvent::TextDelta {
+                    text: crate::lead_chat::proto::error_text_from_item(item),
+                }),
                 Some(kind) => Some(ChatEvent::Assistant {
                     texts: vec![],
                     tools: vec![(kind.to_string(), item_summary(kind, item))],
@@ -575,6 +578,13 @@ mod tests {
             Some(ChatEvent::Assistant { tools, .. }) => {
                 assert_eq!(tools[0], ("commandExecution".into(), "npm test".into()));
             }
+            e => panic!("{e:?}"),
+        }
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
+        ) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "unknown slash command"),
             e => panic!("{e:?}"),
         }
         // agentMessage text already streamed via deltas — item/completed is a

@@ -16,6 +16,11 @@ struct FakeChannel {
     deletions: Arc<Mutex<Vec<(String, String)>>>, // (message_id, reaction_id) — deletes
 }
 
+struct SlowReactionChannel {
+    inner: FakeChannel,
+    delay: std::time::Duration,
+}
+
 #[async_trait::async_trait]
 impl Channel for FakeChannel {
     async fn send_card(&self, _open_id: &str, _card: serde_json::Value) -> anyhow::Result<String> {
@@ -58,6 +63,32 @@ impl Channel for FakeChannel {
             .unwrap()
             .push((message_id.into(), reaction_id.into()));
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Channel for SlowReactionChannel {
+    async fn send_card(&self, open_id: &str, card: serde_json::Value) -> anyhow::Result<String> {
+        self.inner.send_card(open_id, card).await
+    }
+    async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()> {
+        self.inner.patch_card(message_id, card).await
+    }
+    async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
+        self.inner.send_text(open_id, text).await
+    }
+    async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
+        self.inner.send_chat_text(chat_id, text).await
+    }
+    async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
+        self.inner.reply_text(reply_to, text).await
+    }
+    async fn add_reaction(&self, message_id: &str, emoji: &str) -> anyhow::Result<String> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.add_reaction(message_id, emoji).await
+    }
+    async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> anyhow::Result<()> {
+        self.inner.delete_reaction(message_id, reaction_id).await
     }
 }
 
@@ -111,7 +142,7 @@ async fn answer_human_route_lands_in_asker_inbox() {
 }
 
 #[tokio::test]
-async fn bind_route_appends_allowlist_and_confirms() {
+async fn bind_route_appends_allowlist_without_legacy_confirmation() {
     let db = mem_db().await;
     let (asks, bus, ch) = (
         AskRegistry::new(),
@@ -129,8 +160,7 @@ async fn bind_route_appends_allowlist_and_confirms() {
     let saved = repo::get_setting(&db, im::K_ALLOW).await.unwrap();
     assert_eq!(saved.as_deref(), Some("ou_me"));
     let texts = ch.texts.lock().unwrap();
-    assert_eq!(texts.len(), 1); // 绑定确认
-    assert_eq!(texts[0].0, "ou_me");
+    assert!(texts.is_empty()); // 首绑不再单发确认；有 app 时首句直接进 Concierge。
 }
 
 #[tokio::test]
@@ -353,6 +383,7 @@ async fn issue_message_route_unbound_thread_hints_without_creating_issue() {
     let ctx = im::ExecuteCtx {
         inbound_message_id: Some("om_in".into()),
         acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
+        reaction_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -391,6 +422,7 @@ async fn issue_message_with_ctx_adds_eyes_reaction() {
     let ctx = im::ExecuteCtx {
         inbound_message_id: Some("om_in_1".into()),
         acks: Some(acks.clone()),
+        reaction_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -406,6 +438,44 @@ async fn issue_message_with_ctx_adds_eyes_reaction() {
     assert_eq!(rxns[0], ("om_in_1".into(), "MeMeMe".into()));
     let acks_g = acks.lock().await;
     assert_eq!(acks_g.get(&t.id).map(|v| v.len()), Some(1));
+}
+
+#[tokio::test]
+async fn issue_message_with_reaction_queue_does_not_wait_for_feishu_reaction_api() {
+    use std::collections::HashMap;
+    let db = mem_db().await;
+    let (asks, bus) = (AskRegistry::new(), BusRegistry::new());
+    let ch = SlowReactionChannel {
+        inner: FakeChannel::default(),
+        delay: std::time::Duration::from_millis(200),
+    };
+    let ws = repo::create_workspace(&db, "ws").await.unwrap();
+    let t = repo::create_thread(&db, ws.id, "issue-x", "feature", "claude")
+        .await
+        .unwrap();
+    repo::bind_im_route(&db, t.id, "feishu", "oc_g", "omt_42")
+        .await
+        .unwrap();
+    let (reaction_tx, _reaction_rx) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = im::ExecuteCtx {
+        inbound_message_id: Some("om_in_slow".into()),
+        acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
+        reaction_tx: Some(reaction_tx),
+    };
+    let r = Route::IssueMessage {
+        chat_id: "oc_g".into(),
+        im_thread_ref: "omt_42".into(),
+        sender_open_id: "ou_x".into(),
+        text: "看下进展".into(),
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        im::execute(r, &db, &asks, &bus, &ch, "ou_x", "zh", None, Some(&ctx)),
+    )
+    .await;
+
+    assert!(result.is_ok(), "inbound execution waited for add_reaction");
 }
 
 #[tokio::test]

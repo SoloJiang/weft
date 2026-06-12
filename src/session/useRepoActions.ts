@@ -39,7 +39,7 @@ type Translate = (key: string, opts?: Record<string, unknown>) => string;
 
 export function useRepoActions() {
   const { t } = useTranslation();
-  const { activeWorkspaceId } = useStore();
+  const { activeWorkspaceId, refreshReposAndMap } = useStore();
   const [busy, setBusy] = useState<Record<string, boolean>>({});
 
   const setBusyFor = useCallback((id: string, v: boolean) => {
@@ -86,6 +86,11 @@ export function useRepoActions() {
         const result = await dispatch(inv, wsId, t as Translate);
         if (result.status === "ok") {
           toast(t("repoActions.addedToast", { name: result.name }));
+          try {
+            await refreshReposAndMap(wsId);
+          } catch {
+            // The repo is already registered; a later workspace refresh will recover.
+          }
         } else if (result.status === "error") {
           toast(t("repoActions.failedToast", { message: result.message }));
         }
@@ -94,7 +99,7 @@ export function useRepoActions() {
         setBusyFor(inv.actionId, false);
       }
     },
-    [maybePost, resolveWorkspaceId, setBusyFor, t],
+    [maybePost, refreshReposAndMap, resolveWorkspaceId, setBusyFor, t],
   );
 
   return { run, busy };

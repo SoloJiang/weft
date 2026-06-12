@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, FileText, Slash, Sparkles } from "lucide-react";
+import { ArrowRight, FileText, Sparkles } from "lucide-react";
 import type { LeadMessage } from "../lib/types";
 import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
@@ -230,6 +230,9 @@ function TimelineRow({
   }
 
   if (m.kind === "command") {
+    const command = typeof c.command === "string" ? c.command : "";
+    const args = typeof c.args === "string" ? c.args.trim() : "";
+    const label = [command, args].filter(Boolean).join(" ");
     return (
       <div className="flex justify-end">
         <span
@@ -238,10 +241,7 @@ function TimelineRow({
             m.status === "queued" && "opacity-60",
           )}
         >
-          <Slash size={12} className="shrink-0 text-brand" />
-          <span className="truncate">
-            {String(c.command ?? "")} {String(c.args ?? "")}
-          </span>
+          <span className="truncate">{label}</span>
           {m.status === "queued" && <QueuedChip />}
         </span>
       </div>

@@ -230,11 +230,33 @@ fn merge_init_slash_commands(
     existing: &[super::proto::SlashCmd],
     init: Vec<super::proto::SlashCmd>,
 ) -> Vec<super::proto::SlashCmd> {
-    if existing.is_empty() {
-        init
-    } else {
-        existing.to_vec()
+    if init.is_empty() {
+        return existing.to_vec();
     }
+    if existing.is_empty() {
+        return init;
+    }
+
+    let by_name: HashMap<&str, &super::proto::SlashCmd> =
+        existing.iter().map(|c| (c.name.as_str(), c)).collect();
+    init.into_iter()
+        .map(|mut incoming| {
+            if let Some(old) = by_name.get(incoming.name.as_str()) {
+                if incoming
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    incoming.description = old.description.clone();
+                }
+                if incoming.arg_hint.as_deref().unwrap_or_default().is_empty() {
+                    incoming.arg_hint = old.arg_hint.clone();
+                }
+            }
+            incoming
+        })
+        .collect()
 }
 
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
@@ -616,6 +638,22 @@ async fn codex_consumer(
                     if status == "complete" {
                         emit_lead_out(&app, thread_id, id, &text);
                     }
+                } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
+                    &db,
+                    thread_id,
+                    inner.session_id,
+                    inner.turn_id,
+                    status,
+                )
+                .await
+                {
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Message {
+                            thread_id,
+                            message: m,
+                        },
+                    );
                 }
                 let next = inner.turn.on_turn_end();
                 if let Some(n) = &next {
@@ -819,6 +857,32 @@ fn human_dur(secs: u64) -> String {
     }
 }
 
+async fn insert_terminal_assistant_if_missing(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn_id: i32,
+    status: &str,
+) -> anyhow::Result<Option<crate::store::entities::lead_message::Model>> {
+    let text = match status {
+        "error" => "The agent turn ended with an error before producing output.",
+        "interrupted" => "The agent turn was interrupted before producing output.",
+        _ => return Ok(None),
+    };
+    let m = repo::insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        turn_id,
+        "assistant",
+        "text",
+        &serde_json::json!({ "text": text }).to_string(),
+        status,
+    )
+    .await?;
+    Ok(Some(m))
+}
+
 /// Decide whether the in-flight turn should be force-stopped (§7 跑飞护栏).
 /// `busy_secs` = None means the engine is idle → never touched (an idle engine
 /// burns nothing). `has_open_ask` = the agent is legitimately blocked on the
@@ -1001,6 +1065,7 @@ fn spawn_reader(
                     );
                 }
                 super::proto::ChatEvent::Commands { commands } => {
+                    let commands = merge_init_slash_commands(&inner.slash_commands, commands);
                     inner.slash_commands = commands.clone();
                     let _ = app.emit(
                         EVENT,
@@ -1264,6 +1329,22 @@ fn spawn_reader(
                         if status == "complete" {
                             emit_lead_out(&app, thread_id, id, &text);
                         }
+                    } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
+                        &db,
+                        thread_id,
+                        inner.session_id,
+                        inner.turn_id,
+                        status,
+                    )
+                    .await
+                    {
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Message {
+                                thread_id,
+                                message: m,
+                            },
+                        );
                     }
                     if let Some(next) = inner.turn.on_turn_end() {
                         inner.turn_id += 1;
@@ -1524,6 +1605,54 @@ mod tests {
         let merged = merge_init_slash_commands(&rich, bare);
 
         assert_eq!(merged, rich);
+    }
+
+    #[test]
+    fn initialize_merge_adds_new_dynamic_commands() {
+        let existing = vec![crate::lead_chat::proto::SlashCmd {
+            name: "compact".into(),
+            description: Some("Summarize context".into()),
+            arg_hint: None,
+        }];
+        let init = vec![
+            crate::lead_chat::proto::SlashCmd::bare("compact"),
+            crate::lead_chat::proto::SlashCmd {
+                name: "superpowers:requesting-code-review".into(),
+                description: Some("Review current work".into()),
+                arg_hint: None,
+            },
+        ];
+
+        let merged = merge_init_slash_commands(&existing, init);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], existing[0]);
+        assert_eq!(merged[1].name, "superpowers:requesting-code-review");
+    }
+
+    #[tokio::test]
+    async fn terminal_error_without_current_row_is_persisted() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        let m = insert_terminal_assistant_if_missing(&db, 7, None, 3, "error")
+            .await
+            .unwrap()
+            .expect("error turn should create an assistant row");
+
+        assert_eq!(m.thread_id, 7);
+        assert_eq!(m.turn_id, 3);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.kind, "text");
+        assert_eq!(m.status, "error");
+        assert!(m.content.contains("ended with an error"));
+        let all = repo::list_lead_messages(&db, 7).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, m.id);
+
+        let complete = insert_terminal_assistant_if_missing(&db, 7, None, 4, "complete")
+            .await
+            .unwrap();
+        assert!(complete.is_none());
     }
 
     #[test]

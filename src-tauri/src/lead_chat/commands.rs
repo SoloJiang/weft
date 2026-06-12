@@ -379,7 +379,10 @@ pub async fn discover_slash(
             return Ok(vec![]);
         };
         return Ok(match sess.tool.as_str() {
-            "opencode" => crate::opencode::discover_commands(&sess.cwd).await,
+            "opencode" => merge_local_skill_commands(
+                crate::opencode::discover_commands(&sess.cwd).await,
+                std::path::Path::new(&sess.cwd),
+            ),
             "claude" => {
                 let eng = match state.get(sid as i64) {
                     Some(eng) => eng,
@@ -390,9 +393,14 @@ pub async fn discover_slash(
                 engine::ensure_running(&app, &db, &eng)
                     .await
                     .map_err(|e| e.to_string())?;
-                wait_for_slash_commands(&eng).await
+                merge_local_skill_commands(
+                    wait_for_slash_commands(&eng).await,
+                    std::path::Path::new(&sess.cwd),
+                )
             }
-            "codex" => crate::codex_slash::discover_commands().await,
+            "codex" => {
+                crate::codex_slash::discover_commands_for_cwd(std::path::Path::new(&sess.cwd)).await
+            }
             _ => vec![],
         });
     }
@@ -401,32 +409,76 @@ pub async fn discover_slash(
     // composer still gets a palette before the lead process has emitted init.
     if let Some(tid) = thread_id {
         if let Some(eng) = state.get(lead_key(tid)) {
-            let inner = eng.lock().await;
-            let live = inner.slash_commands.clone();
-            if !live.is_empty() {
-                return Ok(live);
+            let (live, tool, cwd) = {
+                let inner = eng.lock().await;
+                (
+                    inner.slash_commands.clone(),
+                    inner.tool.clone(),
+                    inner.cwd.clone(),
+                )
+            };
+            let discovered = match tool.as_str() {
+                "claude" if live.is_empty() => {
+                    engine::ensure_running(&app, &db, &eng)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    merge_local_skill_commands(wait_for_slash_commands(&eng).await, &cwd)
+                }
+                "claude" => merge_local_skill_commands(live, &cwd),
+                "opencode" => {
+                    let cmds = crate::opencode::discover_commands(&cwd.to_string_lossy()).await;
+                    let cmds = if cmds.is_empty() { live } else { cmds };
+                    merge_local_skill_commands(cmds, &cwd)
+                }
+                "codex" => {
+                    let cmds = crate::codex_slash::discover_commands_for_cwd(&cwd).await;
+                    if cmds.is_empty() {
+                        live
+                    } else {
+                        cmds
+                    }
+                }
+                _ => live,
+            };
+            if !discovered.is_empty() {
+                eng.lock().await.slash_commands = discovered.clone();
             }
-            let tool = inner.tool.clone();
-            let cwd = inner.cwd.to_string_lossy().into_owned();
-            drop(inner);
-            return Ok(match tool.as_str() {
-                "opencode" => crate::opencode::discover_commands(&cwd).await,
-                "codex" => crate::codex_slash::discover_commands().await,
-                _ => vec![],
-            });
+            return Ok(discovered);
         } else if let Ok(Some(t)) = repo::get_thread(&db, tid).await {
             // Lead engine not spawned yet — composer still wants a palette.
             return Ok(match t.lead_tool.as_str() {
                 "opencode" => {
                     let cwd = ensure_lead_cwd(tid).map_err(|e| e.to_string())?;
-                    crate::opencode::discover_commands(&cwd.to_string_lossy()).await
+                    crate::skills::inject_for(&db, t.workspace_id, &cwd).await;
+                    merge_local_skill_commands(
+                        crate::opencode::discover_commands(&cwd.to_string_lossy()).await,
+                        &cwd,
+                    )
                 }
-                "codex" => crate::codex_slash::discover_commands().await,
+                "codex" => {
+                    let cwd = ensure_lead_cwd(tid).map_err(|e| e.to_string())?;
+                    crate::skills::inject_for(&db, t.workspace_id, &cwd).await;
+                    crate::codex_slash::discover_commands_for_cwd(&cwd).await
+                }
                 _ => vec![],
             });
         }
     }
     Ok(vec![])
+}
+
+fn merge_local_skill_commands(
+    mut commands: Vec<crate::lead_chat::proto::SlashCmd>,
+    cwd: &std::path::Path,
+) -> Vec<crate::lead_chat::proto::SlashCmd> {
+    let mut seen: std::collections::HashSet<String> =
+        commands.iter().map(|c| c.name.clone()).collect();
+    for c in crate::codex_slash::local_skill_commands_for_cwd(cwd) {
+        if seen.insert(c.name.clone()) {
+            commands.push(c);
+        }
+    }
+    commands
 }
 
 async fn wait_for_slash_commands(eng: &EngineRef) -> Vec<crate::lead_chat::proto::SlashCmd> {

@@ -12,6 +12,8 @@
 //!   curl -fsSL https://raw.githubusercontent.com/openai/codex/main/codex-rs/tui/src/slash_command.rs
 
 use crate::lead_chat::proto::SlashCmd;
+use std::collections::HashSet;
+use std::path::Path;
 
 struct Builtin {
     name: &'static str,
@@ -305,7 +307,26 @@ fn builtins() -> Vec<Builtin> {
 /// when reachable; failures degrade silently to just the built-ins so the
 /// composer never blocks on discovery.
 pub async fn discover_commands() -> Vec<SlashCmd> {
-    let mut out: Vec<SlashCmd> = builtins()
+    let mut out = builtin_commands();
+
+    if let Ok(skills) = fetch_skills().await {
+        push_unique(&mut out, skills);
+    }
+    out
+}
+
+/// Built-ins + app-server skills + skills materialized into this session cwd.
+/// The app-server `skills/list` is global, while Weft injects workspace skills
+/// into each lead/worker cwd under `.agents/skills`, so local discovery is the
+/// reliable path for workspace-scoped skill commands.
+pub async fn discover_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
+    let mut out = discover_commands().await;
+    push_unique(&mut out, local_skill_commands_for_cwd(cwd.as_ref()));
+    out
+}
+
+fn builtin_commands() -> Vec<SlashCmd> {
+    builtins()
         .into_iter()
         .filter(|b| b.visible)
         .map(|b| SlashCmd {
@@ -313,15 +334,30 @@ pub async fn discover_commands() -> Vec<SlashCmd> {
             description: Some(b.description.into()),
             arg_hint: None,
         })
-        .collect();
+        .collect()
+}
 
-    if let Ok(skills) = fetch_skills().await {
-        let seen: std::collections::HashSet<String> = out.iter().map(|c| c.name.clone()).collect();
-        for s in skills {
-            if !seen.contains(&s.name) {
-                out.push(s);
-            }
+fn push_unique(out: &mut Vec<SlashCmd>, commands: impl IntoIterator<Item = SlashCmd>) {
+    let mut seen: HashSet<String> = out.iter().map(|c| c.name.clone()).collect();
+    for c in commands {
+        if seen.insert(c.name.clone()) {
+            out.push(c);
         }
+    }
+}
+
+pub(crate) fn local_skill_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
+    let cwd = cwd.as_ref();
+    let mut out = Vec::new();
+    for root in [cwd.join(".agents"), cwd.join(".claude")] {
+        let commands = crate::skills::parse::parse_source(&root)
+            .into_iter()
+            .map(|s| SlashCmd {
+                name: s.name,
+                description: (!s.description.is_empty()).then_some(s.description),
+                arg_hint: None,
+            });
+        push_unique(&mut out, commands);
     }
     out
 }
@@ -398,5 +434,34 @@ mod tests {
         ] {
             assert!(names.contains(must), "missing codex built-in /{must}");
         }
+    }
+
+    #[test]
+    fn local_skill_commands_read_injected_agents_skills() {
+        let base = std::env::temp_dir().join(format!(
+            "weft-codex-slash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let skill_dir = base.join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review current work\n---\nbody",
+        )
+        .unwrap();
+
+        let commands = local_skill_commands_for_cwd(&base);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "review");
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("Review current work")
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

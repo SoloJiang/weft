@@ -71,6 +71,8 @@ interface Store {
   leadSlash: Record<number, SlashCmd[]>;
   /** Hydrate a thread's timeline from DB + make sure the engine runs. */
   loadLeadChat: (threadId: number) => Promise<void>;
+  /** Pull a lead's slash commands on demand. */
+  discoverLeadSlash: (threadId: number) => void;
   /** Send a human message to the lead (optimistic; engine queues when busy). */
   sendLeadChat: (
     threadId: number,
@@ -156,6 +158,7 @@ interface Store {
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
+  refreshReposAndMap: (workspaceId?: number) => Promise<void>;
   reprofileRepo: (repoId: number) => Promise<void>;
   editRepoProfile: (repoId: number, summary: string, role: string) => Promise<void>;
 
@@ -609,7 +612,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
-  const refreshAfterRepo = useCallback(async (ws: number) => {
+  const refreshReposAndMap = useCallback(async (workspaceId?: number) => {
+    const ws = workspaceId ?? activeWorkspaceId;
+    if (ws == null || ws !== activeWorkspaceId) return;
     setRepos(await api.listRepos(ws));
     // a freshly added repo is eagerly profiled server-side; pull the new map
     try {
@@ -619,33 +624,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       /* ignore */
     }
-  }, []);
+  }, [activeWorkspaceId]);
 
   const addRepo = useCallback(
     async (name: string, path: string) => {
       if (activeWorkspaceId == null) return;
       await api.addRepoRef(activeWorkspaceId, name, path);
-      await refreshAfterRepo(activeWorkspaceId);
+      await refreshReposAndMap(activeWorkspaceId);
     },
-    [activeWorkspaceId, refreshAfterRepo],
+    [activeWorkspaceId, refreshReposAndMap],
   );
 
   const cloneRepo = useCallback(
     async (url: string, dest: string, name: string) => {
       if (activeWorkspaceId == null) return;
       await api.cloneRepo(activeWorkspaceId, url, dest, name);
-      await refreshAfterRepo(activeWorkspaceId);
+      await refreshReposAndMap(activeWorkspaceId);
     },
-    [activeWorkspaceId, refreshAfterRepo],
+    [activeWorkspaceId, refreshReposAndMap],
   );
 
   const createRepo = useCallback(
     async (name: string, dest: string) => {
       if (activeWorkspaceId == null) return;
       await api.createRepo(activeWorkspaceId, name, dest);
-      await refreshAfterRepo(activeWorkspaceId);
+      await refreshReposAndMap(activeWorkspaceId);
     },
-    [activeWorkspaceId, refreshAfterRepo],
+    [activeWorkspaceId, refreshReposAndMap],
   );
 
   const createThread = useCallback(
@@ -948,14 +953,32 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  const discoverLeadSlash = useCallback((threadId: number) => {
+    void (async () => {
+      try {
+        await api.leadEnsure(threadId, currentLang());
+      } catch {
+        /* discovery can still try the non-resident fallback below */
+      }
+      try {
+        const cmds = await api.discoverSlash(threadId, null);
+        if (cmds.length > 0) {
+          setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
+        }
+      } catch {
+        /* slash discovery is best-effort */
+      }
+    })();
+  }, []);
+
   const loadLeadChat = useCallback(async (threadId: number) => {
     const msgs = await api.listLeadMessages(threadId);
     setLeadMessages((m) => ({
       ...m,
       [threadId]: msgs.filter((x) => x.kind !== "meta"),
     }));
-    // Fire the engine up so init delivers slash commands + the console is live.
-    void api.leadEnsure(threadId, currentLang()).catch(() => {});
+    // Fire the engine up and refresh slash commands, including workspace skills.
+    discoverLeadSlash(threadId);
     try {
       const st = await api.leadState(threadId);
       setLeadTurn((t) => ({
@@ -968,7 +991,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       /* engine state is cosmetic at load time */
     }
-  }, []);
+  }, [discoverLeadSlash]);
 
   // Pull a worker's slash commands on demand: opencode runs live GET /command,
   // claude returns its initialize list, codex mirrors TUI built-ins plus skills.
@@ -1469,6 +1492,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     leadTurn,
     leadSlash,
     loadLeadChat,
+    discoverLeadSlash,
     sendLeadChat,
     interruptLead,
     workerTurn,
@@ -1519,6 +1543,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     closeSettings,
     openRepoMap,
     refreshRepoMap,
+    refreshReposAndMap,
     reprofileRepo,
     editRepoProfile,
     proposal,

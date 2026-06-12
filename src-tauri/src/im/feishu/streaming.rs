@@ -102,7 +102,9 @@ impl StreamClient {
         }
         let resp: serde_json::Value = self
             .http
-            .post(format!("{BASE}/open-apis/auth/v3/tenant_access_token/internal"))
+            .post(format!(
+                "{BASE}/open-apis/auth/v3/tenant_access_token/internal"
+            ))
             .json(&serde_json::json!({"app_id": self.app_id, "app_secret": self.app_secret}))
             .send()
             .await?
@@ -110,7 +112,10 @@ impl StreamClient {
             .await?;
         let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
-            anyhow::bail!("feishu token: code={code} msg={}", resp.get("msg").and_then(|m| m.as_str()).unwrap_or("?"));
+            anyhow::bail!(
+                "feishu token: code={code} msg={}",
+                resp.get("msg").and_then(|m| m.as_str()).unwrap_or("?")
+            );
         }
         let token = resp
             .get("tenant_access_token")
@@ -193,11 +198,7 @@ impl StreamClient {
 
     /// 把卡 entity 作为**回复**挂到 `reply_to`（话题根 message_id）下，返回新消息 id。
     /// 用于 issue 话题：lead 的流式卡挂在话题里，与一次性 reply_text 同一线程语义。
-    pub async fn reply_entity_card(
-        &self,
-        reply_to: &str,
-        card_id: &str,
-    ) -> anyhow::Result<String> {
+    pub async fn reply_entity_card(&self, reply_to: &str, card_id: &str) -> anyhow::Result<String> {
         let content = serde_json::json!({"type": "card", "data": {"card_id": card_id}}).to_string();
         let token = self.token().await?;
         let resp: serde_json::Value = self
@@ -249,7 +250,9 @@ impl StreamClient {
         let settings = serde_json::json!({"config": {"streaming_mode": false}}).to_string();
         let resp: serde_json::Value = self
             .http
-            .patch(format!("{BASE}/open-apis/cardkit/v1/cards/{card_id}/settings"))
+            .patch(format!(
+                "{BASE}/open-apis/cardkit/v1/cards/{card_id}/settings"
+            ))
             .bearer_auth(&token)
             .json(&serde_json::json!({"settings": settings, "sequence": sequence}))
             .send()
