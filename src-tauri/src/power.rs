@@ -1,5 +1,6 @@
 //! Keep-awake: hold a system-level "prevent idle sleep" assertion while any
-//! agent session is busy (Settings-controlled). Display sleep stays allowed.
+//! agent session is busy (Settings-controlled) or IM remote standby is on.
+//! Display sleep stays allowed.
 //! Spec: docs/superpowers/specs/2026-06-11-keep-awake-remote-standby-design.md
 //!
 //! Two parts: `PowerState` is the pure decision logic (unit-tested); the
@@ -13,6 +14,10 @@ use std::time::{Duration, Instant};
 /// back-to-back turns (queued sends, coordinator nudge bursts) don't flap it.
 const LINGER: Duration = Duration::from_secs(60);
 
+/// Assertion reasons, visible in `pmset -g assertions` / `powercfg /requests`.
+const REASON_RUNNING: &str = "Weft: agent session running";
+const REASON_STANDBY: &str = "Weft: remote standby (IM)";
+
 /// Pure decision state: should the assertion be held right now?
 struct PowerState {
     /// The "prevent sleep while running" setting (re-pushed on every launch).
@@ -21,6 +26,9 @@ struct PowerState {
     busy: bool,
     /// When a sweep first saw all engines idle (linger anchor).
     idle_since: Option<Instant>,
+    /// IM remote standby: hold while the bridge is enabled so remote commands
+    /// always reach an awake machine. Independent of the run toggle.
+    standby: bool,
 }
 
 impl Default for PowerState {
@@ -30,6 +38,7 @@ impl Default for PowerState {
             enabled: true,
             busy: false,
             idle_since: None,
+            standby: false,
         }
     }
 }
@@ -54,41 +63,53 @@ impl PowerState {
         }
     }
 
-    fn desired(&self) -> bool {
-        self.enabled && self.busy
+    /// Which assertion to hold right now (None = release). The session-running
+    /// reason wins when both apply — it's the more specific cause.
+    fn desired(&self) -> Option<&'static str> {
+        if self.enabled && self.busy {
+            Some(REASON_RUNNING)
+        } else if self.standby {
+            Some(REASON_STANDBY)
+        } else {
+            None
+        }
     }
 }
 
-/// Spawn the thread that owns the OS assertion handle. Send `true`/`false` to
-/// acquire/release (repeats are no-ops). The thread exits when every sender is
-/// dropped, releasing any held assertion with it.
-fn spawn_holder() -> std::sync::mpsc::Sender<bool> {
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+/// Spawn the thread that owns the OS assertion handle. Send `Some(reason)` to
+/// acquire (re-created if the reason changes), `None` to release; repeats are
+/// no-ops. The thread exits when every sender is dropped, releasing any held
+/// assertion with it.
+fn spawn_holder() -> std::sync::mpsc::Sender<Option<&'static str>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<&'static str>>();
     let spawned = std::thread::Builder::new()
         .name("weft-power-holder".into())
         .spawn(move || {
             // Created and dropped on this thread only (Windows thread affinity).
-            let mut held: Option<keepawake::KeepAwake> = None;
+            let mut held: Option<(&'static str, keepawake::KeepAwake)> = None;
             while let Ok(want) = rx.recv() {
-                if want && held.is_none() {
-                    match keepawake::Builder::default()
-                        .idle(true) // PreventUserIdleSystemSleep: 熄屏不受影响
-                        .reason("Weft: agent session running")
-                        .app_name("Weft")
-                        .app_reverse_domain("com.weft.app")
-                        .create()
-                    {
-                        Ok(h) => {
-                            held = Some(h);
-                            eprintln!("[weft] keep-awake: assertion acquired");
-                        }
-                        // Best-effort by design: keep-awake failing must never
-                        // affect the sessions themselves.
-                        Err(e) => eprintln!("[weft] keep-awake: acquire failed: {e}"),
-                    }
-                } else if !want && held.is_some() {
-                    held = None;
+                if held.as_ref().map(|(r, _)| *r) == want {
+                    continue; // already in the desired state
+                }
+                if held.take().is_some() {
+                    // release first (reason change or plain release)
                     eprintln!("[weft] keep-awake: assertion released");
+                }
+                let Some(reason) = want else { continue };
+                match keepawake::Builder::default()
+                    .idle(true) // PreventUserIdleSystemSleep: 熄屏不受影响
+                    .reason(reason)
+                    .app_name("Weft")
+                    .app_reverse_domain("com.weft.app")
+                    .create()
+                {
+                    Ok(h) => {
+                        held = Some((reason, h));
+                        eprintln!("[weft] keep-awake: assertion acquired ({reason})");
+                    }
+                    // Best-effort by design: keep-awake failing must never
+                    // affect the sessions themselves.
+                    Err(e) => eprintln!("[weft] keep-awake: acquire failed: {e}"),
                 }
             }
         });
@@ -99,10 +120,11 @@ fn spawn_holder() -> std::sync::mpsc::Sender<bool> {
 }
 
 /// Managed Tauri state. The Settings command flips `enabled`; the chat engine
-/// reports turn starts; the 30s sweep loop reconciles and expires the linger.
+/// reports turn starts; the 30s sweep loop reconciles and expires the linger;
+/// the IM bridge flips `standby`.
 pub struct PowerGuard {
     state: std::sync::Mutex<PowerState>,
-    tx: std::sync::mpsc::Sender<bool>,
+    tx: std::sync::mpsc::Sender<Option<&'static str>>,
 }
 
 impl Default for PowerGuard {
@@ -135,6 +157,14 @@ impl PowerGuard {
         st.sweep(any_busy, Instant::now());
         let _ = self.tx.send(st.desired());
     }
+
+    /// IM remote standby (phase 2): hold while the bridge is enabled. No
+    /// linger — intent flips are explicit, not turn-boundary noise.
+    pub fn set_standby(&self, on: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.standby = on;
+        let _ = self.tx.send(st.desired());
+    }
 }
 
 /// Event hook for the chat engine: a turn just began (instant acquire).
@@ -142,6 +172,15 @@ pub fn on_turn_began(app: &tauri::AppHandle) {
     use tauri::Manager as _;
     if let Some(guard) = app.try_state::<PowerGuard>() {
         guard.note_busy();
+    }
+}
+
+/// IM bridge hook: remote standby intent changed (bridge enable/disable and
+/// credential transitions all converge through here).
+pub fn set_standby(app: &tauri::AppHandle, on: bool) {
+    use tauri::Manager as _;
+    if let Some(guard) = app.try_state::<PowerGuard>() {
+        guard.set_standby(on);
     }
 }
 
@@ -188,13 +227,13 @@ mod tests {
     fn disabled_never_desires_hold() {
         let mut st = busy_state();
         st.enabled = false;
-        assert!(!st.desired());
+        assert!(st.desired().is_none());
     }
 
     #[test]
     fn busy_desires_hold_when_enabled() {
-        assert!(busy_state().desired());
-        assert!(!PowerState::default().desired());
+        assert_eq!(busy_state().desired(), Some(REASON_RUNNING));
+        assert!(PowerState::default().desired().is_none());
     }
 
     #[test]
@@ -202,11 +241,11 @@ mod tests {
         let mut st = busy_state();
         let t0 = Instant::now();
         st.sweep(false, t0);
-        assert!(st.desired(), "still held during linger");
+        assert!(st.desired().is_some(), "still held during linger");
         st.sweep(false, t0 + LINGER - Duration::from_secs(1));
-        assert!(st.desired(), "still held just before expiry");
+        assert!(st.desired().is_some(), "still held just before expiry");
         st.sweep(false, t0 + LINGER);
-        assert!(!st.desired(), "released after linger");
+        assert!(st.desired().is_none(), "released after linger");
     }
 
     #[test]
@@ -217,15 +256,49 @@ mod tests {
         st.sweep(true, t0 + Duration::from_secs(30)); // busy again mid-linger
         let t1 = t0 + LINGER + Duration::from_secs(10);
         st.sweep(false, t1); // new linger anchored at t1
-        assert!(st.desired(), "linger restarted by the busy sweep");
+        assert!(st.desired().is_some(), "linger restarted by the busy sweep");
         st.sweep(false, t1 + LINGER);
-        assert!(!st.desired());
+        assert!(st.desired().is_none());
+    }
+
+    #[test]
+    fn standby_holds_independent_of_run_toggle() {
+        let mut st = PowerState::default();
+        st.enabled = false; // 关掉「运行时防休眠」也不影响远程待命
+        st.standby = true;
+        assert_eq!(st.desired(), Some(REASON_STANDBY));
+        st.standby = false;
+        assert_eq!(st.desired(), None, "standby 关闭立即释放，无 linger");
+    }
+
+    #[test]
+    fn running_reason_wins_over_standby() {
+        let mut st = busy_state();
+        st.standby = true;
+        assert_eq!(st.desired(), Some(REASON_RUNNING));
+    }
+
+    #[test]
+    fn sweep_never_clears_standby() {
+        let mut st = PowerState::default();
+        st.standby = true;
+        let t0 = Instant::now();
+        st.sweep(false, t0);
+        st.sweep(false, t0 + LINGER + LINGER);
+        assert_eq!(st.desired(), Some(REASON_STANDBY));
     }
 
     #[test]
     fn holder_thread_tolerates_rapid_toggles() {
         let tx = spawn_holder();
-        for on in [true, true, false, true, false, false] {
+        for on in [
+            Some(REASON_RUNNING),
+            Some(REASON_RUNNING),
+            Some(REASON_STANDBY), // reason 切换：释放旧断言 + 持新 reason
+            None,
+            Some(REASON_STANDBY),
+            None,
+        ] {
             tx.send(on).expect("holder thread alive");
         }
         drop(tx); // thread exits, releasing anything held
@@ -237,6 +310,8 @@ mod tests {
         guard.note_busy();
         guard.sweep(true);
         guard.sweep(false);
+        guard.set_standby(true);
+        guard.set_standby(false);
         guard.set_enabled(false);
         guard.set_enabled(true);
     }
