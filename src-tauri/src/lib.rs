@@ -217,6 +217,7 @@ pub fn run() {
             commands::im_set_settings,
             commands::im_set_enabled,
             commands::im_set_streaming,
+            commands::im_set_remote_standby,
             commands::im_status,
             commands::im_bind_thread,
             commands::im_unbind_thread,

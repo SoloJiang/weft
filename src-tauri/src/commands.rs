@@ -904,6 +904,8 @@ pub struct ImSettingsView {
     pub enabled: bool,
     /// Phase 2 流式卡片开关（im.streaming）。
     pub streaming: bool,
+    /// 远程待命（im.remote_standby）：桥启用期间保持系统唤醒。
+    pub remote_standby: bool,
 }
 
 #[tauri::command]
@@ -920,6 +922,7 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
         bound: !s.allow_open_ids.is_empty(),
         enabled: s.enabled,
         streaming,
+        remote_standby: s.remote_standby,
     })
 }
 
@@ -963,6 +966,26 @@ pub async fn im_set_streaming(app: tauri::AppHandle, db: State<'_, Db>, enabled:
         .await
         .map_err(e)?;
     crate::im::spawn(app);
+    Ok(())
+}
+
+/// 远程待命：桥启用期间持有「防空闲休眠」断言，保证飞书指令随时可达。
+/// 纯电源层开关——不重启桥、不断 WS；写库后立即收敛 PowerGuard。
+#[tauri::command]
+pub async fn im_set_remote_standby(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    enabled: bool,
+) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::im::K_REMOTE_STANDBY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)?;
+    let s = crate::im::ImSettings::load(&db).await.map_err(e)?;
+    crate::power::set_standby(&app, enabled && s.enabled && s.ready());
     Ok(())
 }
 
