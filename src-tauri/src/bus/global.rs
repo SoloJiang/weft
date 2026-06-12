@@ -331,7 +331,7 @@ async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::R
     if !settings.ready() {
         anyhow::bail!("Feishu app credentials are not configured");
     }
-    let ch = crate::im::feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret);
+    let ch = crate::im::feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret)?;
     crate::im::ensure_issue_topic(db, &ch, thread_id, chat_id, None, "zh").await?;
     let after = repo::im_route_of_thread(db, thread_id)
         .await?

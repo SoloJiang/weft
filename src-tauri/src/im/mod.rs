@@ -514,10 +514,15 @@ pub fn spawn(app: tauri::AppHandle) {
         }
         bridge.set_status("connecting");
 
-        let channel: Arc<dyn Channel> = Arc::new(feishu::FeishuChannel::new(
-            &settings.app_id,
-            &settings.app_secret,
-        ));
+        let channel: Arc<dyn Channel> =
+            match feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    eprintln!("[weft][im] feishu client build: {e}");
+                    bridge.set_status("error");
+                    return;
+                }
+            };
 
         // —— 出站：registry 通知 → 发卡/patch ——
         let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel();
