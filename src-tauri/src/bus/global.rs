@@ -173,6 +173,48 @@ pub async fn call_global(
                 Err(e) => text_result(format!("error: {e}")),
             }
         }
+        "create_issue_from_im" => {
+            let Some(ws) = args
+                .get("workspace_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32)
+            else {
+                return text_result("error: workspace_id required".into());
+            };
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let kind = args
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if title.is_empty() {
+                return text_result("error: title required".into());
+            }
+            if kind.is_empty() {
+                return text_result("error: kind required".into());
+            }
+            match create_issue_from_im(db, ws, title, kind, args).await {
+                Ok(v) => json_result(v),
+                Err(e) => text_result(format!("error: {e}")),
+            }
+        }
+        "ensure_issue_im_thread" => {
+            let Some(tid) = args
+                .get("thread_id")
+                .and_then(|v| v.as_i64())
+                .map(|x| x as i32)
+            else {
+                return text_result("error: thread_id required".into());
+            };
+            match ensure_issue_im_thread(db, tid, args).await {
+                Ok(v) => json_result(v),
+                Err(e) => text_result(format!("error: {e}")),
+            }
+        }
         "ensure_issue_topic" => {
             let Some(tid) = args
                 .get("thread_id")
@@ -317,6 +359,128 @@ async fn message_lead(db: &Db, thread_id: i32, text: &str) -> anyhow::Result<()>
     crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new()).await
 }
 
+fn im_provider(args: &Value) -> &str {
+    args.pointer("/im_context/provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+fn im_issue_thread_supported(args: &Value) -> bool {
+    args.pointer("/im_context/capabilities/issue_thread/supported")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn im_chat_id(args: &Value) -> Option<&str> {
+    args.pointer("/im_context/conversation/chat_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+async fn create_issue_from_im(
+    db: &Db,
+    ws: i32,
+    title: &str,
+    kind: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    let issue = create_issue(db, ws, title, kind).await?;
+    let thread_id = issue["id"].as_i64().unwrap_or_default() as i32;
+    let provider = im_provider(args);
+    let supported = im_issue_thread_supported(args);
+    let mut im = json!({
+        "provider": provider,
+        "thread_exists": false,
+        "thread_created": false,
+        "thread_ref": null,
+        "open_hint": "provider does not support issue thread/topic in this conversation"
+    });
+    if provider == "feishu" && supported {
+        if let Some(chat_id) = im_chat_id(args) {
+            match ensure_issue_topic(db, thread_id, chat_id).await {
+                Ok(v) => {
+                    im = json!({
+                        "provider": provider,
+                        "thread_exists": true,
+                        "thread_created": v.get("created").and_then(|x| x.as_bool()).unwrap_or(false),
+                        "thread_ref": v.get("im_thread_ref").cloned().unwrap_or(Value::Null),
+                        "chat_id": v.get("chat_id").cloned().unwrap_or(Value::Null),
+                        "open_hint": "已创建或复用飞书 topic，请进入该 topic 继续讨论"
+                    });
+                }
+                Err(e) => {
+                    im = json!({
+                        "provider": provider,
+                        "thread_exists": false,
+                        "thread_created": false,
+                        "thread_ref": null,
+                        "open_hint": format!("issue created, but IM topic was not created: {e}")
+                    });
+                }
+            }
+        }
+    }
+    Ok(json!({ "issue": issue, "im": im }))
+}
+
+async fn ensure_issue_im_thread(db: &Db, thread_id: i32, args: &Value) -> anyhow::Result<Value> {
+    let issue = repo::get_thread(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+    let provider = im_provider(args);
+    let supported = im_issue_thread_supported(args);
+    let initial_message = args
+        .get("initial_message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let mut im = json!({
+        "provider": provider,
+        "thread_exists": false,
+        "thread_created": false,
+        "thread_ref": null,
+        "open_hint": "provider does not support issue thread/topic in this conversation"
+    });
+    if let Some(route) = repo::im_route_of_thread(db, thread_id).await? {
+        im = json!({
+            "provider": route.channel,
+            "thread_exists": true,
+            "thread_created": false,
+            "thread_ref": route.im_thread_ref,
+            "chat_id": route.chat_id,
+            "open_hint": "已有 issue topic/thread，请进入那里继续讨论"
+        });
+    } else if provider == "feishu" && supported {
+        if let Some(chat_id) = im_chat_id(args) {
+            let v = ensure_issue_topic(db, thread_id, chat_id).await?;
+            im = json!({
+                "provider": provider,
+                "thread_exists": true,
+                "thread_created": v.get("created").and_then(|x| x.as_bool()).unwrap_or(false),
+                "thread_ref": v.get("im_thread_ref").cloned().unwrap_or(Value::Null),
+                "chat_id": v.get("chat_id").cloned().unwrap_or(Value::Null),
+                "open_hint": "已创建或复用飞书 topic，请进入该 topic 继续讨论"
+            });
+        }
+    }
+    let delivered = if !initial_message.is_empty() {
+        message_lead(db, thread_id, initial_message).await.is_ok()
+    } else {
+        false
+    };
+    Ok(json!({
+        "issue": {
+            "id": issue.id,
+            "workspace_id": issue.workspace_id,
+            "title": issue.title,
+            "kind": issue.kind
+        },
+        "im": im,
+        "lead_message_delivered": delivered
+    }))
+}
+
 async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Result<Value> {
     let tool = crate::tools::default_tool(db).await;
     let t = repo::create_thread(db, ws, title, kind, &tool).await?;
@@ -394,6 +558,20 @@ pub fn global_specs() -> Value {
             "inputSchema": { "type": "object",
                 "properties": { "thread_id": i(), "text": s() },
                 "required": ["thread_id", "text"] }
+        },
+        {
+            "name": "create_issue_from_im",
+            "description": "Create a Weft issue from the current IM conversation. If the provider supports issue threads/topics in this conversation, create or bind one by default so the user continues in the issue-specific discussion location.",
+            "inputSchema": { "type": "object",
+                "properties": { "workspace_id": i(), "title": s(), "kind": s(), "im_context": { "type": "object" } },
+                "required": ["workspace_id", "title", "kind", "im_context"] }
+        },
+        {
+            "name": "ensure_issue_im_thread",
+            "description": "Ensure an existing issue has a provider-native IM thread/topic and guide the user there. Use when the user wants to open, enter, intervene in, or continue an issue from IM. initial_message is optional and should be set only when the user gave concrete text to relay to the lead.",
+            "inputSchema": { "type": "object",
+                "properties": { "thread_id": i(), "im_context": { "type": "object" }, "initial_message": s() },
+                "required": ["thread_id", "im_context"] }
         },
         {
             "name": "ensure_issue_topic",
@@ -548,6 +726,101 @@ mod tests {
             serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["open_asks_count"], 2);
         assert_eq!(parsed["title"], "issue");
+    }
+
+    #[test]
+    fn global_specs_include_im_aware_issue_tools() {
+        let specs = global_specs();
+        let names: Vec<String> = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect();
+        assert!(names.contains(&"create_issue_from_im".to_string()));
+        assert!(names.contains(&"ensure_issue_im_thread".to_string()));
+    }
+
+    #[tokio::test]
+    async fn create_issue_from_im_without_thread_support_creates_issue_only() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let args = json!({
+            "workspace_id": ws.id,
+            "title": "New task",
+            "kind": "feature",
+            "im_context": {
+                "provider": "none",
+                "conversation": { "chat_id": "c" },
+                "capabilities": { "issue_thread": { "supported": false } }
+            }
+        });
+
+        let result = call_global(&db, &asks, &bus, "create_issue_from_im", &args).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("New task"));
+        assert!(text.contains("thread_created"));
+        assert!(text.contains("false"));
+    }
+
+    #[tokio::test]
+    async fn ensure_issue_im_thread_reuses_existing_route() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+        repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "om_root")
+            .await
+            .unwrap();
+        let args = json!({
+            "thread_id": issue.id,
+            "im_context": {
+                "provider": "feishu",
+                "conversation": { "chat_id": "oc_chat" },
+                "capabilities": { "issue_thread": { "supported": true } }
+            }
+        });
+
+        let result = call_global(&db, &asks, &bus, "ensure_issue_im_thread", &args).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("om_root"));
+        assert!(text.contains("\"thread_created\":false"));
+    }
+
+    #[tokio::test]
+    async fn read_only_global_queries_do_not_create_im_routes() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let ws = repo::create_workspace(&db, "alpha").await.unwrap();
+        let issue = repo::create_thread(&db, ws.id, "Existing", "feature", "claude")
+            .await
+            .unwrap();
+
+        let _ = call_global(
+            &db,
+            &asks,
+            &bus,
+            "list_issues",
+            &json!({ "workspace_id": ws.id }),
+        )
+        .await;
+        let _ = call_global(
+            &db,
+            &asks,
+            &bus,
+            "issue_status",
+            &json!({ "thread_id": issue.id }),
+        )
+        .await;
+
+        let route = repo::im_route_of_thread(&db, issue.id).await.unwrap();
+        assert!(route.is_none());
     }
 
     #[tokio::test]

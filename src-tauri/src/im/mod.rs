@@ -21,6 +21,61 @@ pub const K_REMOTE_STANDBY: &str = "im.remote_standby";
 /// 飞书 👀「看我看我」表情的 reaction key。
 const INBOUND_ACK_EMOJI: &str = "MeMeMe";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImProviderCapabilities {
+    pub provider_id: &'static str,
+    pub issue_thread_supported: bool,
+    pub default_create_thread_for_new_issue: bool,
+    pub can_create_thread_from_current_conversation: bool,
+    pub can_reply_to_message: bool,
+    pub terminology_zh: &'static str,
+    pub terminology_en: &'static str,
+}
+
+pub fn feishu_provider_capabilities() -> ImProviderCapabilities {
+    ImProviderCapabilities {
+        provider_id: "feishu",
+        issue_thread_supported: true,
+        default_create_thread_for_new_issue: true,
+        can_create_thread_from_current_conversation: true,
+        can_reply_to_message: true,
+        terminology_zh: "飞书 topic",
+        terminology_en: "Feishu topic",
+    }
+}
+
+pub fn format_im_user_message(
+    sender_open_id: &str,
+    chat_id: &str,
+    im_thread_ref: &str,
+    reply_to: Option<&str>,
+    text: &str,
+    caps: &ImProviderCapabilities,
+) -> String {
+    let ctx = serde_json::json!({
+        "provider": caps.provider_id,
+        "conversation": {
+            "chat_id": chat_id,
+            "thread_ref": im_thread_ref,
+            "reply_to": reply_to,
+            "sender_id": sender_open_id,
+        },
+        "capabilities": {
+            "issue_thread": {
+                "supported": caps.issue_thread_supported,
+                "default_on_create_issue": caps.default_create_thread_for_new_issue,
+                "can_create_from_current_conversation": caps.can_create_thread_from_current_conversation,
+                "terminology": { "zh": caps.terminology_zh, "en": caps.terminology_en },
+            },
+            "reply": { "supported": caps.can_reply_to_message }
+        }
+    });
+    format!(
+        "<weft:im_context>{ctx}</weft:im_context>\n\n<weft:user_message>{}</weft:user_message>",
+        text.trim()
+    )
+}
+
 #[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
     pub app_id: String,
@@ -1400,12 +1455,14 @@ async fn consume_free_text(
     let thread_id = ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref).await?;
     record_inbound_reaction(ctx, channel, thread_id).await;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
-    let framed = match reply_to {
-        Some(mid) => format!(
-            "[from {sender_open_id}; feishu_chat_id={chat_id}; feishu_message_id={mid}] {text}"
-        ),
-        None => format!("[from {sender_open_id}; feishu_chat_id={chat_id}] {text}"),
-    };
+    let framed = format_im_user_message(
+        sender_open_id,
+        chat_id,
+        im_thread_ref,
+        reply_to,
+        text,
+        &feishu_provider_capabilities(),
+    );
     crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new()).await
 }
 
@@ -1519,6 +1576,25 @@ mod tests {
             .unwrap();
         // DB 错误必须传播为 Err（fail-closed），不得折叠成默认设置
         assert!(ImSettings::load(&db).await.is_err());
+    }
+
+    #[test]
+    fn feishu_im_context_frame_contains_provider_capabilities() {
+        let frame = super::format_im_user_message(
+            "ou_sender",
+            "oc_chat",
+            "chat:oc_chat",
+            Some("om_msg"),
+            "创建一个 issue",
+            &super::feishu_provider_capabilities(),
+        );
+
+        assert!(frame.contains("<weft:im_context>"));
+        assert!(frame.contains("\"provider\":\"feishu\""));
+        assert!(frame.contains("\"issue_thread\""));
+        assert!(frame.contains("\"default_on_create_issue\":true"));
+        assert!(frame.contains("<weft:user_message>创建一个 issue</weft:user_message>"));
+        assert!(!frame.contains("feishu_chat_id="));
     }
 
     #[test]

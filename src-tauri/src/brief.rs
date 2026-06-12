@@ -68,29 +68,14 @@ pub fn format_brief(d: &BriefData) -> String {
          your write repos; read anything you need.\n",
     );
 
-    // The status contract (§4.6): the board is only honest if YOU move your
-    // task with set_task_status as work really progresses.
-    if d.mandate == "impl-only" {
-        s.push_str(
-            "\n## Status contract\n\
-             You are dispatched impl-only: this direction is already scoped — \
-             skip planning and build straight away. When the code is done and \
-             your checks pass, call set_task_status(\"review\"). If the human \
-             sends you back for changes, set it to \"working\" again.\n\n\
-             Start now.\n",
-        );
+    s.push_str("\n## Delivery contract\n");
+    s.push_str("You own delivery for this direction in your write repo. You may decide how much planning is needed before editing. Use existing repository conventions and configured checks; do not invent toolchains. Coordinate when your changes affect other directions, and announce interface/contract changes before relying on them. Ask the human only for missing requirements, product judgment, or permission decisions. Move your task status when material progress changes. When ready for review, report what changed, what was verified, and remaining risks.\n");
+
+    let mandate = d.mandate.as_str();
+    if mandate == "impl-only" {
+        s.push_str("\nMandate hint: **impl-only** — this scope is considered concrete enough to build directly unless you discover ambiguity that materially changes the work.\n");
     } else {
-        s.push_str(
-            "\n## Status contract\n\
-             Your task starts in **planning**: first work out a short \
-             implementation plan for THIS direction (use your planning skill if \
-             you have one), and post the essentials to the bus (bus_post) so \
-             the lead can follow. When you move from planning to building, call \
-             set_task_status(\"working\"). When the code is done and your \
-             checks pass, call set_task_status(\"review\"). If the human sends \
-             you back for changes, set it to \"working\" again.\n\n\
-             Start by planning now.\n",
-        );
+        s.push_str("\nMandate hint: **plan+impl** — expect to plan your approach first unless the path is obvious, then build and verify.\n");
     }
     s
 }
@@ -221,31 +206,27 @@ mod tests {
         let s = format_brief(&d);
         assert!(!s.contains("Contracts to respect"));
         assert!(!s.contains("do NOT edit"));
-        // still has the coordinate section + start cue
+        // still has the coordinate section + delivery contract
         assert!(s.contains("Coordinate"));
-        assert!(s.contains("Start by planning now."));
+        assert!(s.contains("Delivery contract"));
     }
 
     #[test]
-    fn plan_impl_brief_carries_planning_contract() {
+    fn plan_impl_brief_carries_delivery_contract() {
         let s = format_brief(&data());
-        assert!(s.contains("Status contract"));
-        assert!(s.contains("starts in **planning**"));
-        assert!(s.contains("set_task_status(\"working\")"));
-        assert!(s.contains("set_task_status(\"review\")"));
-        assert!(s.contains("Start by planning now."));
-        assert!(!s.contains("impl-only"));
+        assert!(s.contains("Delivery contract"));
+        assert!(s.contains("You may decide how much planning is needed"));
+        assert!(s.contains("plan+impl"));
+        assert!(!s.contains("starts in **planning**"));
     }
 
     #[test]
-    fn impl_only_brief_skips_planning() {
+    fn impl_only_brief_is_a_planning_depth_hint() {
         let mut d = data();
         d.mandate = "impl-only".into();
         let s = format_brief(&d);
         assert!(s.contains("impl-only"));
-        assert!(s.contains("skip planning"));
-        assert!(s.contains("set_task_status(\"review\")"));
-        assert!(s.contains("Start now."));
-        assert!(!s.contains("Start by planning now."));
+        assert!(s.contains("scope is considered concrete enough to build directly"));
+        assert!(!s.contains("skip planning"));
     }
 }
