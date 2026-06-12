@@ -274,7 +274,7 @@ pub struct LeadStateInfo {
     pub state: String,
     pub queued: usize,
     pub native_id: Option<String>,
-    pub slash_commands: Vec<String>,
+    pub slash_commands: Vec<crate::lead_chat::proto::SlashCmd>,
     pub cwd: String,
 }
 
@@ -323,6 +323,41 @@ pub async fn lead_state(
             })
         }
     }
+}
+
+/// Discover the slash commands a session's CLI actually supports — never
+/// hardcoded. claude: the live `initialize` list the engine already holds;
+/// opencode: GET /command off a lazily-started `opencode serve`, keyed by the
+/// session's project cwd; codex: none (headless `exec` has no slash surface).
+/// `session_id` selects a worker; `thread_id` selects the (claude) lead.
+#[tauri::command]
+pub async fn discover_slash(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: Option<i32>,
+    session_id: Option<i32>,
+) -> Result<Vec<crate::lead_chat::proto::SlashCmd>, String> {
+    let state = app.state::<LeadChatState>();
+    if let Some(sid) = session_id {
+        let Some(sess) = repo::get_session(&db, sid).await.map_err(|e| e.to_string())? else {
+            return Ok(vec![]);
+        };
+        return Ok(match sess.tool.as_str() {
+            "opencode" => crate::opencode::discover_commands(&sess.cwd).await,
+            "claude" => match state.get(sid as i64) {
+                Some(eng) => eng.lock().await.slash_commands.clone(),
+                None => vec![],
+            },
+            _ => vec![], // codex: no headless slash commands
+        });
+    }
+    // Lead console (always claude): the engine's live initialize list.
+    if let Some(tid) = thread_id {
+        if let Some(eng) = state.get(lead_key(tid)) {
+            return Ok(eng.lock().await.slash_commands.clone());
+        }
+    }
+    Ok(vec![])
 }
 
 #[tauri::command]

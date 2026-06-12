@@ -6,12 +6,14 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+mod adapters;
 pub mod ask;
 mod brief;
 pub mod bus;
 mod check;
 mod claude;
 mod codex;
+mod codex_app_server;
 pub mod commands;
 pub mod config;
 mod coordinator;
@@ -23,6 +25,7 @@ pub mod im;
 mod inspect;
 pub mod lead_chat;
 pub mod materialize;
+mod opencode;
 pub mod paths;
 mod planner;
 mod power;
@@ -156,6 +159,7 @@ pub fn run() {
             lead_chat::commands::lead_stop,
             lead_chat::commands::lead_state,
             lead_chat::commands::list_lead_messages,
+            lead_chat::commands::discover_slash,
             lead_chat::commands::post_lead_tool_result,
             lead_chat::commands::chat_open_worker,
             lead_chat::commands::chat_send,

@@ -27,6 +27,7 @@ import type {
   ThreadOverview,
   SessionInfo,
   SessionStatus,
+  SlashCmd,
   Thread,
   ToolStatus,
   Workspace,
@@ -67,7 +68,7 @@ interface Store {
   /** Lead engine turn state per thread: busy/idle/stopped + queue depth. */
   leadTurn: Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>;
   /** Slash commands the lead's CLI reports as available (init event). */
-  leadSlash: Record<number, string[]>;
+  leadSlash: Record<number, SlashCmd[]>;
   /** Hydrate a thread's timeline from DB + make sure the engine runs. */
   loadLeadChat: (threadId: number) => Promise<void>;
   /** Send a human message to the lead (optimistic; engine queues when busy). */
@@ -81,7 +82,8 @@ interface Store {
   interruptLead: (threadId: number) => Promise<void>;
   /** Chat-mode worker engine state, keyed by session id. */
   workerTurn: Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>;
-  workerSlash: Record<number, string[]>;
+  workerSlash: Record<number, SlashCmd[]>;
+  discoverWorkerSlash: (sessionId: number) => void;
   /** The tool call running right now (transient): lead by thread, worker by session. */
   leadActivity: Record<number, { name: string; summary: string } | null>;
   workerActivity: Record<number, { name: string; summary: string } | null>;
@@ -100,6 +102,7 @@ interface Store {
   configuredTool: string | null;
   /** detect_tools result, loaded once at startup (for tool pickers). */
   installedTools: ToolStatus[];
+  refreshInstalledTools: () => Promise<void>;
   /** Dangerous mode: agents skip all permission prompts (global). */
   dangerousMode: boolean;
   setDangerousMode: (on: boolean) => void;
@@ -284,6 +287,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [defaultTool, setDefaultToolState] = useState("codex");
   const [configuredTool, setConfiguredTool] = useState<string | null>(null);
   const [installedTools, setInstalledTools] = useState<ToolStatus[]>([]);
+  // Re-probe the CLIs on demand (the diagnostics panel's Refresh button).
+  const refreshInstalledTools = useCallback(async () => {
+    try {
+      setInstalledTools(await api.detectTools());
+    } catch {
+      // Pure-vite dev without the Tauri backend.
+    }
+  }, []);
   useEffect(() => {
     void (async () => {
       try {
@@ -775,11 +786,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [leadTurn, setLeadTurn] = useState<
     Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
   >({});
-  const [leadSlash, setLeadSlash] = useState<Record<number, string[]>>({});
+  const [leadSlash, setLeadSlash] = useState<Record<number, SlashCmd[]>>({});
   const [workerTurn, setWorkerTurn] = useState<
     Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
   >({});
-  const [workerSlash, setWorkerSlash] = useState<Record<number, string[]>>({});
+  const [workerSlash, setWorkerSlash] = useState<Record<number, SlashCmd[]>>({});
   const [leadActivity, setLeadActivity] = useState<
     Record<number, { name: string; summary: string } | null>
   >({});
@@ -914,6 +925,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Pull a worker's slash commands on demand: opencode runs live GET /command
+  // discovery, claude returns its cached initialize list, codex returns none.
+  // Best-effort — an empty result leaves the existing palette untouched.
+  const discoverWorkerSlash = useCallback((sessionId: number) => {
+    void api
+      .discoverSlash(null, sessionId)
+      .then((cmds) => {
+        if (cmds.length > 0) setWorkerSlash((s) => ({ ...s, [sessionId]: cmds }));
+      })
+      .catch(() => {});
+  }, []);
+
   const sendLeadChat = useCallback(
     async (threadId: number, text: string, images?: ImageAttachment[], files?: string[]) => {
       await api.leadSend(threadId, text, currentLang(), images, files);
@@ -964,7 +987,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (configured) return configured;
     const all = [...Object.values(leadSlash), ...Object.values(workerSlash)].flat();
     return (
-      all.find((c) => /(^|:)requesting-code-review$/.test(c)) ??
+      all.find((c) => /(^|:)requesting-code-review$/.test(c.name))?.name ??
       "superpowers:requesting-code-review"
     );
   }, [reviewSkill, leadSlash, workerSlash]);
@@ -1405,6 +1428,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     interruptLead,
     workerTurn,
     workerSlash,
+    discoverWorkerSlash,
     leadActivity,
     workerActivity,
     showBus,
@@ -1422,6 +1446,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setDefaultTool,
     configuredTool,
     installedTools,
+    refreshInstalledTools,
     dangerousMode,
     setDangerousMode,
     dangerNudge,

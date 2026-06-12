@@ -135,6 +135,63 @@ pub fn meets_min(tool: &str, version: &str) -> bool {
     }
 }
 
+/// The soft minimum version as a display string ("0.20.0"), or "" if none.
+pub(crate) fn min_version_str(tool: &str) -> String {
+    min_version(tool)
+        .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+        .unwrap_or_default()
+}
+
+/// Why a CLI probe didn't yield a usable, up-to-date tool — surfaced in the
+/// Settings diagnostics panel so a missing/old CLI explains itself.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum DiagnosticKind {
+    MissingTarget,
+    NotExecutable,
+    SpawnFailed,
+    VersionProbeFailed,
+    BelowMinimum,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ToolDiagnostic {
+    pub kind: DiagnosticKind,
+    pub message: String,
+}
+
+impl ToolDiagnostic {
+    pub fn missing_target(tool: &str) -> Self {
+        Self {
+            kind: DiagnosticKind::MissingTarget,
+            message: format!("{tool} is not on PATH. Install it or check your shell profile."),
+        }
+    }
+    pub fn not_executable(path: &str) -> Self {
+        Self {
+            kind: DiagnosticKind::NotExecutable,
+            message: format!("{path} exists but is not executable (permission denied)."),
+        }
+    }
+    pub fn spawn_failed(tool: &str, err: &str) -> Self {
+        Self {
+            kind: DiagnosticKind::SpawnFailed,
+            message: format!("Could not run {tool}: {err}"),
+        }
+    }
+    pub fn version_probe_failed(tool: &str) -> Self {
+        Self {
+            kind: DiagnosticKind::VersionProbeFailed,
+            message: format!("{tool} ran but --version returned no usable version."),
+        }
+    }
+    pub fn below_minimum(tool: &str, version: &str, min: &str) -> Self {
+        Self {
+            kind: DiagnosticKind::BelowMinimum,
+            message: format!("{tool} {version} is below the recommended {min}. Update recommended."),
+        }
+    }
+}
+
 /// Preference order when the user hasn't chosen a tool explicitly.
 pub(crate) const TOOL_PRIORITY: [&str; 3] = ["codex", "claude", "opencode"];
 
@@ -201,6 +258,20 @@ fn which_on_path(tool: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_target_diagnostic_has_helpful_message() {
+        let d = ToolDiagnostic::missing_target("claude");
+        assert_eq!(d.kind, DiagnosticKind::MissingTarget);
+        assert!(d.message.contains("not on PATH"));
+    }
+
+    #[test]
+    fn below_minimum_message_contains_versions() {
+        let d = ToolDiagnostic::below_minimum("codex", "0.1.0", &min_version_str("codex"));
+        assert!(d.message.contains("0.1.0"));
+        assert!(d.message.contains("0.20.0"));
+    }
 
     #[test]
     fn merge_path_appends_only_new_entries() {

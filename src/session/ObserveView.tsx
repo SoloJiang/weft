@@ -28,6 +28,7 @@ export function ObserveView() {
     leadMessages,
     workerTurn,
     workerSlash,
+    discoverWorkerSlash,
     workerActivity,
     loadLeadChat,
     sendToDirection,
@@ -184,6 +185,7 @@ export function ObserveView() {
             />
             <ChatComposer
               slashCommands={workerSlash[chatSessionId] ?? []}
+              onNeedSlashCommands={() => discoverWorkerSlash(chatSessionId)}
               busy={(workerTurn[chatSessionId]?.state ?? "stopped") === "busy"}
               stopped={(workerTurn[chatSessionId]?.state ?? "stopped") === "stopped"}
               queued={workerTurn[chatSessionId]?.queued ?? 0}

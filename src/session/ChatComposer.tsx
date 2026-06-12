@@ -11,7 +11,7 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
-import type { ImageAttachment } from "../lib/types";
+import type { ImageAttachment, SlashCmd } from "../lib/types";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { Button } from "../components/ui/Button";
@@ -31,7 +31,13 @@ interface PendingImage extends ImageAttachment {
  * reads itself. While a turn runs the Stop button interrupts and extra sends
  * queue — same semantics as the native TUI's mid-turn input queue.
  */
-type SlashItem = { name: string; label: string; source: "local" | "cli" };
+type SlashItem = {
+  name: string;
+  label: string;
+  source: "local" | "cli";
+  description?: string;
+  argHint?: string;
+};
 
 export function ChatComposer({
   slashCommands,
@@ -49,7 +55,7 @@ export function ChatComposer({
   placeholder,
   onNeedSlashCommands,
 }: {
-  slashCommands: string[];
+  slashCommands: SlashCmd[];
   /** Extra "local" slash items, prepended to the palette under a divider.
    *  The host handles the action: when the user picks one, onLocalSlash is
    *  called and the composer text is cleared (it is NOT sent). */
@@ -110,10 +116,12 @@ export function ChatComposer({
       return { exact, prefix, within };
     };
     const locals: SlashItem[] = (localSlash ?? []).map((x) => ({ ...x, source: "local" }));
-    const clis: SlashItem[] = slashCommands.map((name) => ({
-      name,
-      label: name,
+    const clis: SlashItem[] = slashCommands.map((c) => ({
+      name: c.name,
+      label: c.name,
       source: "cli",
+      description: c.description,
+      argHint: c.arg_hint,
     }));
     const L = bucket(locals);
     const C = bucket(clis);
@@ -225,11 +233,20 @@ export function ChatComposer({
                   )}
                 >
                   <SlashSquare size={12} className="shrink-0 text-brand" />
-                  <span>/{item.name}</span>
-                  {item.source === "local" && (
+                  <span className="shrink-0">/{item.name}</span>
+                  {item.argHint && (
+                    <span className="shrink-0 text-[10.5px] text-ink-faint">{item.argHint}</span>
+                  )}
+                  {item.source === "local" ? (
                     <span className="ml-auto truncate text-[10.5px] text-ink-faint">
                       {item.label}
                     </span>
+                  ) : (
+                    item.description && (
+                      <span className="ml-auto truncate pl-3 text-[10.5px] text-ink-faint">
+                        {item.description}
+                      </span>
+                    )
                   )}
                 </button>
               );

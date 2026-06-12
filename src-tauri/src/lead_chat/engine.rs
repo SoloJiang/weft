@@ -44,7 +44,7 @@ pub enum Push {
         thread_id: i32,
         session_id: Option<i32>,
         native_id: String,
-        slash_commands: Vec<String>,
+        slash_commands: Vec<super::proto::SlashCmd>,
     },
     /// The tool call currently executing — transient: rendered while it runs,
     /// replaced by the next one, cleared by the Turn event. Never persisted.
@@ -101,7 +101,7 @@ impl TurnState {
 /// Per-turn dialects (codex `exec --json`, opencode `run --format json`) spawn
 /// one process per human turn; only claude keeps a long-lived stream process.
 pub fn per_turn(tool: &str) -> bool {
-    matches!(tool, "codex" | "opencode")
+    crate::adapters::adapter_for(tool).is_some_and(|a| a.per_turn())
 }
 
 /// Watchdog clocks for the in-flight turn (§7 跑飞护栏). An idle engine burns
@@ -148,7 +148,7 @@ pub struct EngineInner {
     pub extra_args: Vec<String>,
     pub system_prompt: String,
     pub native_id: Option<String>,
-    pub slash_commands: Vec<String>,
+    pub slash_commands: Vec<super::proto::SlashCmd>,
     pub turn: TurnState,
     pub turn_id: i32,
     /// Ask-bridge identity for suppressing the idle watchdog while the agent is
@@ -381,8 +381,11 @@ pub async fn send(
         images,
         tracked: true,
     };
-    let spawn_now = direct && per_turn(&inner.tool);
-    if direct && !spawn_now {
+    // codex (app-server): no resident stdin, no per-turn process — the shared
+    // connection drives the turn after the lock drops. Gated; default stays exec.
+    let is_codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
+    let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
+    if direct && !spawn_now && !is_codex_appserver {
         write_user(&mut inner, &out).await;
     } else if !direct {
         inner.turn.queue.push_back(out.clone());
@@ -399,40 +402,239 @@ pub async fn send(
     drop(inner);
     if spawn_now {
         spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
+    } else if direct && is_codex_appserver {
+        // Fall back to exec if the app-server can't be reached (old codex, crash):
+        // the thread id is shared with exec's rollout store, so resume is seamless.
+        if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
+            eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
+            spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
+        }
     }
     Ok(())
+}
+
+/// codex transport selector. Default = `app-server` (the migration target);
+/// `WEFT_CODEX_EXEC=1` forces the legacy exec path as an escape hatch. A failed
+/// app-server connection ALSO falls back to exec at send time (see [`send`]), so
+/// an older codex without the `app-server` subcommand keeps working transparently
+/// — the thread id is shared with exec's rollout store, so resume is seamless.
+fn codex_appserver_enabled() -> bool {
+    !std::env::var("WEFT_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Drive a codex turn over the shared, multiplexed `codex app-server` connection
+/// (gated by [`codex_appserver_enabled`]). Resolves/creates the thread (id ==
+/// native session id), ensures one long-lived [`codex_consumer`] per session,
+/// then starts the turn. Streaming + finalize + queue-flush live in the consumer.
+async fn spawn_codex_turn(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    out: Outgoing,
+) -> anyhow::Result<()> {
+    let client = crate::codex_app_server::client().await?;
+    let (native, cwd, sid, thread_id_i) = {
+        let i = eng.lock().await;
+        (i.native_id.clone(), i.cwd.to_string_lossy().into_owned(), i.session_id, i.thread_id)
+    };
+    let had_native = native.is_some();
+    let thread = match native {
+        Some(t) => t,
+        None => {
+            let t = client.start_thread(&cwd).await?;
+            eng.lock().await.native_id = Some(t.clone());
+            if let Some(sid) = sid {
+                let _ = repo::set_session_native_id(&db, sid, &t).await;
+            } else {
+                let _ = repo::set_lead_native_id(&db, thread_id_i, &t).await;
+            }
+            t
+        }
+    };
+    if !client.is_subscribed(&thread).await {
+        // First attach this process: a pre-existing thread is resumed so the
+        // app-server re-loads its rollout; a just-started one is already loaded.
+        if had_native {
+            let _ = client.resume_thread(&thread).await;
+        }
+        let rx = client.subscribe(&thread).await;
+        let (a, d, e, c, th) =
+            (app.clone(), db.clone(), eng.clone(), client.clone(), thread.clone());
+        tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
+    }
+    let turn = client.start_turn(&thread, &out.text).await?;
+    client.set_active_turn(&thread, &turn).await;
+    Ok(())
+}
+
+/// One long-lived task per codex session: consume the thread's app-server
+/// stream, driving the SAME timeline-row / Push pipeline the stdout reader uses,
+/// and flushing the queue on turn end. Mirrors [`spawn_reader`]'s event handling.
+async fn codex_consumer(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    client: crate::codex_app_server::Client,
+    thread: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::codex_app_server::ThreadMsg>,
+) {
+    use crate::codex_app_server::ThreadMsg;
+    use super::proto::ChatEvent;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
+                let mut inner = eng.lock().await;
+                inner.clock.last_activity = std::time::Instant::now();
+                let thread_id = inner.thread_id;
+                let (sid, turn) = (inner.session_id, inner.turn_id);
+                let row = match &mut inner.current {
+                    Some(c) => {
+                        c.1.push_str(&text);
+                        c.0
+                    }
+                    None => {
+                        let Ok(m) = repo::insert_lead_message(
+                            &db, thread_id, sid, turn, "assistant", "text", r#"{"text":""}"#,
+                            "streaming",
+                        )
+                        .await
+                        else {
+                            continue;
+                        };
+                        let id = m.id;
+                        inner.current = Some((id, text.clone(), std::time::Instant::now()));
+                        let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                        id
+                    }
+                };
+                if let Some(c) = &mut inner.current {
+                    if c.2.elapsed().as_millis() >= 500 {
+                        c.2 = std::time::Instant::now();
+                        let content = serde_json::json!({ "text": c.1 }).to_string();
+                        let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
+                    }
+                }
+                let _ = app.emit(EVENT, Push::Delta { thread_id, message_id: row, text });
+            }
+            ThreadMsg::Event(ChatEvent::Assistant { texts: _, tools }) => {
+                // Codex streams text via deltas; only non-text items arrive here,
+                // as transient activity pills.
+                let inner = eng.lock().await;
+                let (thread_id, sid) = (inner.thread_id, inner.session_id);
+                drop(inner);
+                for (name, summary) in tools {
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Activity { thread_id, session_id: sid, name, summary },
+                    );
+                }
+            }
+            ThreadMsg::Event(ChatEvent::TurnEnd { is_error }) => {
+                let mut inner = eng.lock().await;
+                let thread_id = inner.thread_id;
+                let status = if inner.interrupting {
+                    "interrupted"
+                } else if is_error {
+                    "error"
+                } else {
+                    "complete"
+                };
+                inner.interrupting = false;
+                if let Some((id, text, _)) = inner.current.take() {
+                    let _ = repo::update_lead_message(
+                        &db,
+                        id,
+                        &serde_json::json!({ "text": text }).to_string(),
+                        status,
+                    )
+                    .await;
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Finalize { thread_id, message_id: id, status: status.into() },
+                    );
+                    if status == "complete" {
+                        emit_lead_out(&app, thread_id, id, &text);
+                    }
+                }
+                let next = inner.turn.on_turn_end();
+                if let Some(n) = &next {
+                    inner.turn_id += 1;
+                    if n.tracked {
+                        let _ = repo::complete_queued(&db, thread_id, &n.text).await;
+                    }
+                }
+                let still_busy = inner.turn.busy;
+                inner.clock.on_turn_end(still_busy);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Turn {
+                        thread_id,
+                        session_id: inner.session_id,
+                        state: if still_busy { "busy" } else { "idle" }.into(),
+                        queued: inner.turn.queue.len(),
+                    },
+                );
+                drop(inner);
+                // Flush: start the next queued message as a fresh turn on this thread.
+                if let Some(n) = next {
+                    match client.start_turn(&thread, &n.text).await {
+                        Ok(t) => client.set_active_turn(&thread, &t).await,
+                        Err(e) => eprintln!("[weft][codex] flush next turn: {e}"),
+                    }
+                }
+            }
+            ThreadMsg::Event(_) => {}
+            ThreadMsg::Approval { id, method, params } => {
+                // Route the app-server's approval request through Weft's Ask Bridge
+                // (the same Needs-you surface the exec path uses), then reply with
+                // the v2 decision. accept = run, decline = deny but continue.
+                let (thread_id, dir) = {
+                    let i = eng.lock().await;
+                    (i.thread_id, i.ask_dir.clone())
+                };
+                let (tool, summary) = if method.contains("commandExecution") {
+                    ("Bash", params["command"].as_str().unwrap_or("(command)").to_string())
+                } else {
+                    ("Edit", "apply file changes".to_string())
+                };
+                let detail = params["cwd"].as_str().unwrap_or_default().to_string();
+                let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
+                let decision = match registry.auto_decision(thread_id, &dir, &summary) {
+                    Some(d) => d, // dangerous mode / full access / always-allow
+                    None => {
+                        let (_aid, rx) = registry.request(thread_id, &dir, tool, &summary, &detail);
+                        // Receiver dropped (timeout/cancel) → deny-but-continue (safe).
+                        rx.await.unwrap_or(crate::ask::Decision::Deny)
+                    }
+                };
+                let verdict = match decision {
+                    crate::ask::Decision::Allow => "accept",
+                    crate::ask::Decision::Deny => "decline",
+                };
+                let _ = client.reply_approval(&id, verdict).await;
+            }
+        }
+    }
 }
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
 /// stream from stdout, EOF ends the turn (the reader then flushes the queue).
 async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
-    let (program, mut args): (String, Vec<String>) = match inner.tool.as_str() {
-        "codex" => {
-            crate::codex::ensure_codex_trusted(&inner.cwd);
-            let mut a: Vec<String> = vec!["exec".into()];
-            a.extend(inner.extra_args.iter().cloned());
-            a.push("--json".into());
-            a.push("--cd".into());
-            a.push(inner.cwd.to_string_lossy().into_owned());
-            if let Some(id) = &inner.native_id {
-                a.push("resume".into());
-                a.push(id.clone());
-            }
-            ("codex".into(), a)
-        }
-        "opencode" => {
-            // opencode: cwd is the project; injections live in its merged config.
-            let mut a: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
-            if let Some(id) = &inner.native_id {
-                a.push("--session".into());
-                a.push(id.clone());
-            }
-            ("opencode".into(), a)
-        }
-        other => anyhow::bail!("unknown per-turn lead tool {other}"),
-    };
-    args.push(out.text.clone());
+    // Per-turn argv (incl. codex's message-on-argv and opencode's /cmd→--command
+    // peel) is built by the tool's adapter; `prepare` does the folder-trust
+    // pre-accept. Identical output to the former inline match.
+    let adapter = crate::adapters::adapter_for(&inner.tool)
+        .ok_or_else(|| anyhow::anyhow!("unknown per-turn lead tool {}", inner.tool))?;
+    adapter.prepare(&inner.cwd);
+    let (program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
+        cwd: &inner.cwd,
+        system_prompt: &inner.system_prompt,
+        extra_args: &inner.extra_args,
+        native_id: inner.native_id.as_deref(),
+        message: &out.text,
+        slash_commands: &inner.slash_commands,
+    })?;
     let mut child = Command::new(&program)
         .args(&args)
         .current_dir(&inner.cwd)
@@ -465,22 +667,36 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
         return Ok(());
     }
     inner.interrupting = true;
-    // Per-turn dialects have no interrupt protocol: kill ends the turn (EOF
-    // path finalizes as interrupted) and resume picks the session back up.
-    if per_turn(&inner.tool) {
+    // codex app-server: no child to kill — interrupt the in-flight turn over the
+    // shared connection (turn/interrupt {threadId, turnId}); the consumer's
+    // TurnEnd then finalizes the row as `interrupted`.
+    if inner.tool == "codex" && codex_appserver_enabled() {
+        let thread = inner.native_id.clone();
+        drop(inner);
+        if let (Some(thread), Ok(client)) =
+            (thread, crate::codex_app_server::client().await)
+        {
+            if let Some(turn) = client.active_turn(&thread).await {
+                let _ = client.interrupt(&thread, &turn).await;
+            }
+        }
+        return Ok(());
+    }
+    // Process-tool interrupt by transport (via the adapter): per-turn dialects
+    // (codex exec / opencode) kill the per-turn child; the claude resident gets a
+    // protocol interrupt payload + the delayed kill below.
+    let kind = crate::adapters::adapter_for(&inner.tool).map(|a| a.interrupt());
+    if !matches!(kind, Some(crate::adapters::Interrupt::Protocol)) {
         if let Some(c) = inner.child.as_mut() {
             let _ = c.kill().await;
         }
         return Ok(());
     }
-    let request_id = format!("weft-int-{}", inner.generation);
+    let payload = crate::adapters::adapter_for(&inner.tool)
+        .map(|a| a.interrupt_payload(inner.generation))
+        .unwrap_or_default();
     if let Some(stdin) = inner.stdin.as_mut() {
-        let req = serde_json::json!({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": { "subtype": "interrupt" }
-        });
-        let _ = stdin.write_all(format!("{req}\n").as_bytes()).await;
+        let _ = stdin.write_all(payload.as_bytes()).await;
         let _ = stdin.flush().await;
     }
     let gen = inner.generation;
@@ -669,7 +885,9 @@ fn spawn_reader(
             let thread_id = inner.thread_id;
             // Per-turn dialects carry the native session id on their events.
             if inner.native_id.is_none() {
-                if let Some(native) = super::proto::extract_native(&inner.tool, &line) {
+                if let Some(native) = crate::adapters::adapter_for(&inner.tool)
+                    .and_then(|a| a.extract_native_id(&line))
+                {
                     inner.native_id = Some(native.clone());
                     if let Some(sid) = inner.session_id {
                         let _ = repo::set_session_native_id(&db, sid, &native).await;
@@ -687,13 +905,13 @@ fn spawn_reader(
                     );
                 }
             }
-            if !matches!(
-                super::proto::parse_line_for(&inner.tool, &line),
-                super::proto::ChatEvent::Other
-            ) {
+            let event = crate::adapters::adapter_for(&inner.tool)
+                .map(|a| a.parse_line(&line))
+                .unwrap_or(super::proto::ChatEvent::Other);
+            if !matches!(event, super::proto::ChatEvent::Other) {
                 saw_event = true;
             }
-            match super::proto::parse_line_for(&inner.tool, &line) {
+            match event {
                 super::proto::ChatEvent::Init {
                     session_id,
                     slash_commands,

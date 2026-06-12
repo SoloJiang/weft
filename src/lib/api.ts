@@ -22,6 +22,7 @@ import type {
   ResolvedProposal,
   SessionInfo,
   SkillSource,
+  SlashCmd,
   Thread,
   ThreadOverview,
   ToolStatus,
@@ -115,6 +116,10 @@ export const api = {
     invoke<LeadStateInfo>("lead_state", { threadId }),
   listLeadMessages: (threadId: number) =>
     invoke<LeadMessage[]>("list_lead_messages", { threadId }),
+  /** Live slash-command discovery for a worker (sessionId) or the lead
+   *  (threadId) — claude's initialize list, opencode's GET /command, codex none. */
+  discoverSlash: (threadId: number | null, sessionId: number | null) =>
+    invoke<SlashCmd[]>("discover_slash", { threadId, sessionId }),
 
   // Chat-mode workers (claude): same engine, keyed by session id.
   chatOpenWorker: (directionId: number, repoId: number, lang: string) =>

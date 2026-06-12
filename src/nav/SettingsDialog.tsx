@@ -174,6 +174,7 @@ function GeneralSettings() {
     setDefaultTool,
     configuredTool,
     installedTools,
+    refreshInstalledTools,
     notifyEnabled,
     setNotifyEnabled,
   } = useStore();
@@ -276,6 +277,46 @@ function GeneralSettings() {
           />
         </SettingRow>
       </SettingsGroup>
+      <SettingsGroup title={t("settings.diagnostics")}>
+        <div className="flex flex-col gap-2.5 px-3 py-3">
+          {installedTools.map((tl) => (
+            <ToolDiagnosticCard key={tl.tool} tool={tl} />
+          ))}
+          <div className="flex justify-end pt-1">
+            <Button variant="default" onClick={() => void refreshInstalledTools()}>
+              {t("settings.refreshDiagnostics")}
+            </Button>
+          </div>
+        </div>
+      </SettingsGroup>
+    </div>
+  );
+}
+
+function ToolDiagnosticCard({ tool }: { tool: import("../lib/types").ToolStatus }) {
+  const { t } = useTranslation();
+  const status = !tool.installed ? "error" : !tool.meets_min ? "warning" : "ok";
+  const color =
+    status === "ok" ? "text-success" : status === "warning" ? "text-waiting" : "text-danger";
+  return (
+    <div className="rounded-[var(--radius-md)] border border-border bg-bg p-3">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[13px] font-medium text-ink">{toolFullName(tool.tool)}</span>
+        <span className={cn("text-[11px]", color)}>{t(`settings.diag_${status}`)}</span>
+      </div>
+      {tool.path && (
+        <div className="mt-1 truncate font-mono text-[11px] text-ink-faint">{tool.path}</div>
+      )}
+      {tool.version && <div className="text-[11px] text-ink-muted">{tool.version}</div>}
+      {tool.diagnostics.length > 0 && (
+        <ul className="mt-2 flex flex-col gap-1">
+          {tool.diagnostics.map((d, i) => (
+            <li key={i} className="text-[11px] text-ink-muted">
+              • {d.message}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

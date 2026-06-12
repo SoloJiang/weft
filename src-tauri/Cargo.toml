@@ -31,6 +31,8 @@ futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 axum = "0.7"
 tower = "0.5"
+# opencode slash-command discovery hits http://127.0.0.1 only — no TLS needed.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 toml = "0.8"
 keepawake = "0.6"
 open-lark = { version = "0.14", default-features = false, features = ["im", "websocket"] }

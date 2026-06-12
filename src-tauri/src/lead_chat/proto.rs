@@ -7,11 +7,30 @@
 
 use serde_json::Value;
 
+/// One slash command for the composer palette: the token plus whatever metadata
+/// the CLI reported. `name` is the match + dispatch key; claude's `initialize`
+/// adds `description` + `argumentHint`, opencode's GET /command adds a description.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct SlashCmd {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arg_hint: Option<String>,
+}
+
+impl SlashCmd {
+    /// Name-only command (claude's init list, codex prompt stems): no metadata.
+    pub fn bare(name: impl Into<String>) -> Self {
+        Self { name: name.into(), description: None, arg_hint: None }
+    }
+}
+
 #[derive(Debug)]
 pub enum ChatEvent {
     Init {
         session_id: String,
-        slash_commands: Vec<String>,
+        slash_commands: Vec<SlashCmd>,
     },
     TextDelta {
         text: String,
@@ -29,7 +48,7 @@ pub enum ChatEvent {
     /// Sent right after spawn — the `init` system message only arrives with the
     /// FIRST user turn, far too late for the composer's palette.
     Commands {
-        commands: Vec<String>,
+        commands: Vec<SlashCmd>,
     },
     Other,
 }
@@ -134,7 +153,7 @@ pub fn parse_line(line: &str) -> ChatEvent {
                 .as_array()
                 .map(|a| {
                     a.iter()
-                        .filter_map(|c| c.as_str().map(String::from))
+                        .filter_map(|c| c.as_str().map(SlashCmd::bare))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -184,7 +203,17 @@ pub fn parse_line(line: &str) -> ChatEvent {
                     return ChatEvent::Commands {
                         commands: cmds
                             .iter()
-                            .filter_map(|c| c["name"].as_str().map(String::from))
+                            .filter_map(|c| {
+                                let name = c["name"].as_str()?.to_string();
+                                let pick = |k: &str| {
+                                    c[k].as_str().filter(|s| !s.is_empty()).map(String::from)
+                                };
+                                Some(SlashCmd {
+                                    name,
+                                    description: pick("description"),
+                                    arg_hint: pick("argumentHint"),
+                                })
+                            })
                             .collect(),
                     };
                 }
@@ -232,7 +261,10 @@ mod tests {
                 slash_commands,
             } => {
                 assert_eq!(session_id, "abc-123");
-                assert_eq!(slash_commands, vec!["compact", "commit"]);
+                assert_eq!(
+                    slash_commands,
+                    vec![SlashCmd::bare("compact"), SlashCmd::bare("commit")]
+                );
             }
             e => panic!("{e:?}"),
         }
@@ -346,9 +378,10 @@ mod tests {
         match parse_line(l) {
             ChatEvent::Commands { commands } => {
                 assert_eq!(
-                    commands,
+                    commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
                     vec!["compact", "superpowers:requesting-code-review"]
                 );
+                assert_eq!(commands[0].description.as_deref(), Some("x"));
             }
             e => panic!("{e:?}"),
         }

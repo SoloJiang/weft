@@ -149,7 +149,7 @@ export type LeadChatPush =
       thread_id: number;
       session_id: number | null;
       native_id: string;
-      slash_commands: string[];
+      slash_commands: SlashCmd[];
     }
   | {
       /** The tool call currently executing — transient, cleared by `turn`. */
@@ -159,6 +159,15 @@ export type LeadChatPush =
       name: string;
       summary: string;
     };
+
+/** One slash command for the composer palette: the token plus whatever metadata
+ *  the CLI reported (claude adds description + arg hint; opencode adds a
+ *  description). `name` is the match + dispatch key. */
+export interface SlashCmd {
+  name: string;
+  description?: string;
+  arg_hint?: string;
+}
 
 /** One composer attachment heading to the engine (pasted or picked image). */
 export interface ImageAttachment {
@@ -172,7 +181,7 @@ export interface LeadStateInfo {
   state: "busy" | "idle" | "stopped";
   queued: number;
   native_id: string | null;
-  slash_commands: string[];
+  slash_commands: SlashCmd[];
   cwd: string;
 }
 
@@ -259,6 +268,17 @@ export interface ResolvedProposal {
 }
 
 /** A thread's roll-up for the workspace board (cards = threads). */
+/** Why a CLI is missing / unusable / outdated, for the diagnostics panel. */
+export interface ToolDiagnostic {
+  kind:
+    | "MissingTarget"
+    | "NotExecutable"
+    | "SpawnFailed"
+    | "VersionProbeFailed"
+    | "BelowMinimum";
+  message: string;
+}
+
 /** A locally-installed coding-agent CLI, for Settings' default-tool picker. */
 export interface ToolStatus {
   tool: string;
@@ -266,6 +286,7 @@ export interface ToolStatus {
   version: string | null;
   path: string | null;
   meets_min: boolean;
+  diagnostics: ToolDiagnostic[];
 }
 
 export interface SkillSource {

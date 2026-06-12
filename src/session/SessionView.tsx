@@ -26,6 +26,7 @@ export function SessionView() {
     leadMessages,
     workerTurn,
     workerSlash,
+    discoverWorkerSlash,
     workerActivity,
     loadLeadChat,
   } = useStore();
@@ -106,6 +107,7 @@ export function SessionView() {
           />
           <ChatComposer
             slashCommands={workerSlash[info.session_id] ?? []}
+            onNeedSlashCommands={() => discoverWorkerSlash(info.session_id)}
             busy={(workerTurn[info.session_id]?.state ?? "stopped") === "busy"}
             stopped={(workerTurn[info.session_id]?.state ?? "stopped") === "stopped"}
             queued={workerTurn[info.session_id]?.queued ?? 0}
