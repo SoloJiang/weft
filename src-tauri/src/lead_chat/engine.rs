@@ -457,13 +457,11 @@ pub async fn send(
     Ok(())
 }
 
-/// codex transport selector. Default = `app-server` (the migration target);
-/// `WEFT_CODEX_EXEC=1` forces the legacy exec path as an escape hatch. A failed
-/// app-server connection ALSO falls back to exec at send time (see [`send`]), so
-/// an older codex without the `app-server` subcommand keeps working transparently
-/// — the thread id is shared with exec's rollout store, so resume is seamless.
+/// Codex app-server transport selector. Default = exec; app-server is opt-in via
+/// `WEFT_CODEX_APPSERVER=1` because its `initialized` handshake may initialize
+/// ChatGPT Apps and fail on network/auth state before a normal Weft turn starts.
 fn codex_appserver_enabled() -> bool {
-    !std::env::var("WEFT_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0")
+    crate::adapters::codex_prefers_appserver()
 }
 
 /// Drive a codex turn over the shared, multiplexed `codex app-server` connection
