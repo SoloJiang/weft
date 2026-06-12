@@ -1,4 +1,5 @@
 pub mod app_setting;
+pub mod backup_config;
 pub mod direction;
 pub mod im_route;
 pub mod lead_message;

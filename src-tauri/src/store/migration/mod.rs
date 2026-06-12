@@ -1,6 +1,6 @@
 use crate::store::entities::{
-    app_setting, direction, im_route, lead_message, plan, repo_profile, repo_ref, session,
-    skill_enable, skill_source, thread, workspace, worktree,
+    app_setting, backup_config, direction, im_route, lead_message, plan, repo_profile, repo_ref,
+    session, skill_enable, skill_source, thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -26,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0013SkillSource),
             Box::new(M0014SkillEnable),
             Box::new(M0015ImRoute),
+            Box::new(M0016BackupConfig),
         ]
     }
 }
@@ -588,6 +589,30 @@ impl MigrationTrait for M0015ImRoute {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .drop_table(Table::drop().table(Alias::new("im_route")).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
+/// Adds backup_config — singleton config for git-remote backup.
+pub struct M0016BackupConfig;
+impl MigrationName for M0016BackupConfig {
+    fn name(&self) -> &str {
+        "m0016_backup_config"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0016BackupConfig {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(backup_config::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await?;
+        Ok(())
+    }
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("backup_config")).to_owned())
             .await?;
         Ok(())
     }

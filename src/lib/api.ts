@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
+  BackupStatusDto,
   BusMsg,
   ConfigItem,
   DefaultToolInfo,
@@ -220,6 +221,26 @@ export const api = {
   imRouteForThread: (threadId: number) =>
     invoke<ImRoute | null>("im_route_for_thread", { threadId }),
   imListRoutes: () => invoke<ImRoute[]>("im_list_routes"),
+  backupGetStatus: () => invoke<BackupStatusDto>("backup_get_status"),
+  backupSavePrefs: (
+    enabled: boolean,
+    remoteUrl: string,
+    autoBackupEnabled: boolean,
+    backupOnExit: boolean,
+  ) =>
+    invoke<void>("backup_save_prefs", {
+      enabled,
+      remoteUrl,
+      autoBackupEnabled,
+      backupOnExit,
+    }),
+  backupTestRemote: (remoteUrl: string) =>
+    invoke<void>("backup_test_remote", { remoteUrl }),
+  backupRunNow: () => invoke<BackupStatusDto>("backup_run_now"),
+  backupExportRecoveryKey: (targetPath: string) =>
+    invoke<void>("backup_export_recovery_key", { targetPath }),
+  backupRestore: (remoteUrl: string, recoveryKeyPath: string) =>
+    invoke<void>("backup_restore", { remoteUrl, recoveryKeyPath }),
   // Native folder picker; returns the chosen absolute path, or null if cancelled.
   pickFolder: async (title?: string) => {
     const sel = await openDialog({ directory: true, multiple: false, title });

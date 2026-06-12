@@ -40,6 +40,15 @@ keepawake = "0.6"
 # Package renamed open-lark -> openlark (0.15+); lib import path stays `open_lark::*`.
 openlark = { version = "0.17", default-features = false, features = ["communication", "cardkit", "websocket"] }
 tauri-plugin-process = "2.3.1"
+# SQLCipher: replace SQLite with the encrypted variant statically. The feature
+# must be declared on the top-level manifest so it propagates via Cargo feature
+# unification to sqlx-sqlite's indirect dep on libsqlite3-sys.
+libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher-vendored-openssl"] }
+keyring = "3"
+rand = "0.8"
+sha1 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"

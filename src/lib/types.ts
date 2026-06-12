@@ -369,3 +369,17 @@ export interface ImRoute {
   im_thread_ref: string;
   created_at: string;
 }
+
+/** Backup config + last-run telemetry surfaced to the Settings panel. Mirrors
+ *  `commands_backup::BackupStatusDto` (Rust uses serde rename_all = camelCase). */
+export interface BackupStatusDto {
+  enabled: boolean;
+  remoteUrl: string;
+  autoBackupEnabled: boolean;
+  backupOnExit: boolean;
+  intervalSeconds: number;
+  lastBackupAt: string | null;
+  lastBackupCommitSha: string | null;
+  lastBackupBytes: number | null;
+  lastError: string | null;
+}

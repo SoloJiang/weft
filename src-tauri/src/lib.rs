@@ -8,6 +8,7 @@
 
 mod adapters;
 pub mod ask;
+pub mod backup;
 mod brief;
 pub mod bus;
 mod check;
@@ -15,6 +16,7 @@ mod claude;
 mod codex;
 mod codex_app_server;
 pub mod commands;
+mod commands_backup;
 pub mod config;
 mod coordinator;
 mod curator;
@@ -58,6 +60,12 @@ pub fn run() {
     let db = tauri::async_runtime::block_on(async { store::Db::open_default().await })
         .unwrap_or_else(|e| fatal("open weft.db", e));
 
+    // App-level backup handle: scheduler + on-exit + commands all share it.
+    let backup_svc = backup::BackupService::new(
+        db.clone(),
+        paths::weft_home().unwrap_or_else(|e| fatal("weft_home for backup", e)),
+    );
+
     // Start the local HTTP server (thread bus MCP + planner MCP + Ask Bridge).
     let bus = bus::BusRegistry::new();
     let asks = ask::AskRegistry::new();
@@ -98,6 +106,21 @@ pub fn run() {
         .manage(asks)
         .manage(BusBase(bus_base))
         .manage(im::ImBridge::default())
+        .manage(backup_svc.clone())
+        .on_window_event({
+            let svc = backup_svc.clone();
+            move |_window, event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    // Don't block the close path — `run_on_exit` is bounded
+                    // at 10s internally, but we still detach so the user
+                    // never sees the window hang.
+                    let svc = svc.clone();
+                    tauri::async_runtime::spawn(async move {
+                        backup::scheduler::run_on_exit(&svc).await;
+                    });
+                }
+            }
+        })
         .setup(move |app| {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
@@ -106,6 +129,7 @@ pub fn run() {
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             im::spawn(app.handle().clone());
+            backup::scheduler::spawn(backup_svc.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -190,6 +214,12 @@ pub fn run() {
             commands::im_unbind_thread,
             commands::im_route_for_thread,
             commands::im_list_routes,
+            commands_backup::backup_get_status,
+            commands_backup::backup_save_prefs,
+            commands_backup::backup_test_remote,
+            commands_backup::backup_run_now,
+            commands_backup::backup_export_recovery_key,
+            commands_backup::backup_restore,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| fatal("running tauri application", e));
