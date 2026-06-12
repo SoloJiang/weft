@@ -56,7 +56,7 @@ async fn full_lifecycle_plain_enable_change_disable() {
     let db = weft::store::Db::open_default().await.unwrap();
     assert!(!db.encrypted());
     seed_marker(&db, "lifecycle").await;
-    drop(db);
+    db.0.close().await; // release the weft.db handle before the encryption file-swap (Windows)
     assert_eq!(&header(&path)[..], b"SQLite format 3\0");
 
     // 2. Enable encryption with password "first".
@@ -67,7 +67,7 @@ async fn full_lifecycle_plain_enable_change_disable() {
     let db = weft::store::Db::open_default().await.unwrap();
     assert!(db.encrypted());
     assert_eq!(read_marker(&db).await, "lifecycle");
-    drop(db);
+    db.0.close().await; // release the weft.db handle before the encryption file-swap (Windows)
 
     // 3. Change the password.
     weft::store::encryption::change_password(&path, "first", "second")
@@ -76,7 +76,7 @@ async fn full_lifecycle_plain_enable_change_disable() {
     let db = weft::store::Db::open_default().await.unwrap();
     assert!(db.encrypted());
     assert_eq!(read_marker(&db).await, "lifecycle");
-    drop(db);
+    db.0.close().await; // release the weft.db handle before the encryption file-swap (Windows)
 
     // 4. Disable: file goes back to plaintext magic; env-bypass is cleared.
     weft::store::encryption::disable(&path, "second").await.unwrap();
@@ -93,7 +93,8 @@ async fn enable_rejects_empty_password() {
     let tmp = tempfile::tempdir().unwrap();
     fresh_env(tmp.path());
     let path = weft::paths::db_path().unwrap();
-    weft::store::Db::open_default().await.unwrap();
+    let db = weft::store::Db::open_default().await.unwrap();
+    db.0.close().await; // release the handle before enable() (Windows)
     let err = weft::store::encryption::enable(&path, "")
         .await
         .err()
@@ -107,7 +108,8 @@ async fn change_password_with_wrong_old_fails() {
     let tmp = tempfile::tempdir().unwrap();
     fresh_env(tmp.path());
     let path = weft::paths::db_path().unwrap();
-    weft::store::Db::open_default().await.unwrap();
+    let db = weft::store::Db::open_default().await.unwrap();
+    db.0.close().await; // release the handle before enable() swaps weft.db (Windows)
     weft::store::encryption::enable(&path, "right").await.unwrap();
     let err = weft::store::encryption::change_password(&path, "WRONG", "new")
         .await
@@ -129,7 +131,8 @@ async fn disable_with_wrong_password_fails() {
     let tmp = tempfile::tempdir().unwrap();
     fresh_env(tmp.path());
     let path = weft::paths::db_path().unwrap();
-    weft::store::Db::open_default().await.unwrap();
+    let db = weft::store::Db::open_default().await.unwrap();
+    db.0.close().await; // release the handle before enable() swaps weft.db (Windows)
     weft::store::encryption::enable(&path, "real").await.unwrap();
     let err = weft::store::encryption::disable(&path, "wrong")
         .await
