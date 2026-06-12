@@ -44,9 +44,7 @@ export function ChatComposer({
   localSlash,
   onLocalSlash,
   busy,
-  stopped,
   queued,
-  stoppedHint,
   onSend,
   onStop,
   onTakeOver,
@@ -62,10 +60,7 @@ export function ChatComposer({
   localSlash?: { name: string; label: string }[];
   onLocalSlash?: (name: string) => void;
   busy: boolean;
-  stopped: boolean;
   queued: number;
-  /** Footer hint while the engine is stopped (sending resumes it). */
-  stoppedHint: string;
   onSend: (text: string, images: ImageAttachment[], files: string[]) => void;
   onStop: () => void;
   /** Stop the engine + copy the terminal resume command; false = unavailable. */
@@ -357,7 +352,7 @@ export function ChatComposer({
             </button>
           </Tooltip>
           <span className="hidden truncate text-[11px] text-ink-faint sm:block">
-            {stopped ? stoppedHint : busy ? t("lead.busyHint") : t("lead.slashHint")}
+            {t("lead.slashHint")}
           </span>
           <span className="ml-auto" />
           {queued > 0 && (

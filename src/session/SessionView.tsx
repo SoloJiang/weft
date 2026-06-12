@@ -109,9 +109,7 @@ export function SessionView() {
             slashCommands={workerSlash[info.session_id] ?? []}
             onNeedSlashCommands={() => discoverWorkerSlash(info.session_id)}
             busy={(workerTurn[info.session_id]?.state ?? "stopped") === "busy"}
-            stopped={(workerTurn[info.session_id]?.state ?? "stopped") === "stopped"}
             queued={workerTurn[info.session_id]?.queued ?? 0}
-            stoppedHint={t("session.chatStopped")}
             placeholder={t("session.message")}
             onSend={(v, images, files) => void api.chatSend(info.session_id, v, images, files)}
             onStop={() => void api.chatInterrupt(info.session_id)}
