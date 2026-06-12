@@ -85,15 +85,30 @@ jobs:
           winget install -e --id Google.Protobuf --accept-package-agreements --accept-source-agreements
           $protoc = Get-Command protoc -ErrorAction SilentlyContinue
           if ($protoc) {
-            protoc --version
+            $protocPath = $protoc.Source
           } else {
             $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter protoc.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $installed) {
               throw "protoc.exe not found after winget install"
             }
-            $installed.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-            & $installed.FullName --version
+            $protocPath = $installed.FullName
           }
+          & $protocPath --version
+          # Supply protoc to prost-build via $PROTOC instead of prepending the
+          # WinGet package dir to PATH. That dir ships its own DLLs (abseil, etc.)
+          # which would otherwise land on the runtime DLL search path and can
+          # shadow the C-runtime / crypto DLLs the test exe loads, crashing it at
+          # startup with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139).
+          "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Windows protoc package contents (diagnostic)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dir = Split-Path -Parent $env:PROTOC
+          Write-Host "protoc dir: $dir"
+          Get-ChildItem -Path $dir -Filter *.dll -ErrorAction SilentlyContinue | Select-Object Name, Length
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
