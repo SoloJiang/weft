@@ -46,6 +46,7 @@ export function CommandPalette() {
     selectThread,
     backToWorkspace,
     setHomeTab,
+    openSettings,
     openRepoMap,
     openNeeds,
     navCollapsed,
@@ -167,8 +168,7 @@ export function CommandPalette() {
         label: t("settings.title"),
         icon: <Settings size={14} />,
         run: () => {
-          backToWorkspace();
-          setHomeTab("settings");
+          openSettings();
         },
       },
     ];
@@ -178,6 +178,7 @@ export function CommandPalette() {
     selectThread,
     backToWorkspace,
     setHomeTab,
+    openSettings,
     openRepoMap,
     openNeeds,
     navCollapsed,

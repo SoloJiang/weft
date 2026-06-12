@@ -63,7 +63,7 @@ const NAV_GROUPS: { labelKey: string; items: NavItem[] }[] = [
 
 export function SettingsScreen() {
   const { t } = useTranslation();
-  const { setHomeTab } = useStore();
+  const { closeSettings } = useStore();
   const [active, setActive] = useState<SettingsPage>("general");
   const [query, setQuery] = useState("");
 
@@ -84,7 +84,7 @@ export function SettingsScreen() {
         <div className="px-3 pb-3 pt-5">
           <button
             type="button"
-            onClick={() => setHomeTab("board")}
+            onClick={closeSettings}
             className="mb-4 flex items-center gap-2 rounded-[var(--radius-md)] px-2 py-1.5 text-[13px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
           >
             <ArrowLeft size={15} />

@@ -149,6 +149,10 @@ interface Store {
   /** Which workspace-home tab is active (Board · Repos). */
   homeTab: HomeTab;
   setHomeTab: (t: HomeTab) => void;
+  /** Switch to Settings, snapshotting the current view so closeSettings can restore it. */
+  openSettings: () => void;
+  /** Leave Settings and restore the view that was active when openSettings ran. */
+  closeSettings: () => void;
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
@@ -268,6 +272,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
+  // Snapshot of the view that was active when the user opened Settings, so
+  // the back arrow restores it instead of dropping them on the board.
+  const prevHomeRef = useRef<{
+    homeTab: HomeTab;
+    activeThreadId: number | null;
+    activeSessionId: number | null;
+    viewing: { directionId: number; repoId: number; diff?: boolean } | null;
+    showNeeds: boolean;
+  } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
   // Thread-bus drawer + proposal-review state.
@@ -509,6 +522,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setShowNeeds(false);
     setHomeTab("board");
     setThreadTab("lead");
+  }, []);
+
+  const openSettings = useCallback(() => {
+    // Snapshot first — once we flip homeTab + clear thread/session/viewing the
+    // info is gone and the back arrow can't restore it.
+    prevHomeRef.current = {
+      homeTab,
+      activeThreadId,
+      activeSessionId,
+      viewing,
+      showNeeds,
+    };
+    setActiveThreadId(null);
+    setActiveSessionId(null);
+    setViewing(null);
+    setShowNeeds(false);
+    setHomeTab("settings");
+  }, [homeTab, activeThreadId, activeSessionId, viewing, showNeeds]);
+
+  const closeSettings = useCallback(() => {
+    const prev = prevHomeRef.current;
+    prevHomeRef.current = null;
+    if (!prev) {
+      // First-launch / direct deep link into Settings — nothing to restore.
+      setHomeTab("board");
+      return;
+    }
+    setShowNeeds(prev.showNeeds);
+    setViewing(prev.viewing);
+    setActiveSessionId(prev.activeSessionId);
+    setActiveThreadId(prev.activeThreadId);
+    setHomeTab(prev.homeTab === "settings" ? "board" : prev.homeTab);
   }, []);
 
   const createWorkspace = useCallback(
@@ -1470,6 +1515,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     repoEdges,
     homeTab,
     setHomeTab,
+    openSettings,
+    closeSettings,
     openRepoMap,
     refreshRepoMap,
     reprofileRepo,
