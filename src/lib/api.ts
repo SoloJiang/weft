@@ -206,13 +206,19 @@ export const api = {
   flagLeadSkillRefresh: (threadId: number) =>
     invoke<void>("flag_lead_skill_refresh", { threadId }),
   imGetSettings: () =>
-    invoke<{ app_id: string; has_secret: boolean; bound: boolean; enabled: boolean }>(
-      "im_get_settings",
-    ),
+    invoke<{
+      app_id: string;
+      has_secret: boolean;
+      bound: boolean;
+      enabled: boolean;
+      streaming: boolean;
+    }>("im_get_settings"),
   imSetSettings: (appId: string, appSecret: string) =>
     invoke<void>("im_set_settings", { appId, appSecret }),
   imSetEnabled: (enabled: boolean) =>
     invoke<void>("im_set_enabled", { enabled }),
+  imSetStreaming: (enabled: boolean) =>
+    invoke<void>("im_set_streaming", { enabled }),
   imStatus: () => invoke<string>("im_status"),
   imBindThread: (threadId: number, chatId: string, imThreadRef: string, channel = "feishu") =>
     invoke<ImRoute>("im_bind_thread", { threadId, channel, chatId, imThreadRef }),

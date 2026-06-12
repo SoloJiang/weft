@@ -902,16 +902,24 @@ pub struct ImSettingsView {
     pub has_secret: bool,
     pub bound: bool,
     pub enabled: bool,
+    /// Phase 2 流式卡片开关（im.streaming）。
+    pub streaming: bool,
 }
 
 #[tauri::command]
 pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     let s = crate::im::ImSettings::load(&db).await.map_err(e)?;
+    let streaming = repo::get_setting(&db, repo::K_IM_STREAMING)
+        .await
+        .map_err(e)?
+        .as_deref()
+        == Some("1");
     Ok(ImSettingsView {
         app_id: s.app_id,
         has_secret: !s.app_secret.is_empty(),
         bound: !s.allow_open_ids.is_empty(),
         enabled: s.enabled,
+        streaming,
     })
 }
 
@@ -941,6 +949,17 @@ pub async fn im_set_settings(
 #[tauri::command]
 pub async fn im_set_enabled(app: tauri::AppHandle, db: State<'_, Db>, enabled: bool) -> R<()> {
     repo::set_setting(&db, crate::im::K_ENABLED, if enabled { "1" } else { "0" })
+        .await
+        .map_err(e)?;
+    crate::im::spawn(app);
+    Ok(())
+}
+
+/// Phase 2 流式开关：写 im.streaming 并重启桥（桥启动期读一次该标志）。on = Concierge
+/// 与话题回复都以飞书 CardKit 流式卡逐字渲染；off = 整段一次性发。
+#[tauri::command]
+pub async fn im_set_streaming(app: tauri::AppHandle, db: State<'_, Db>, enabled: bool) -> R<()> {
+    repo::set_setting(&db, repo::K_IM_STREAMING, if enabled { "1" } else { "0" })
         .await
         .map_err(e)?;
     crate::im::spawn(app);

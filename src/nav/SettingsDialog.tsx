@@ -433,6 +433,7 @@ function ImSettings() {
   const [status, setStatus] = useState("disabled");
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [streaming, setStreaming] = useState(false);
   const copiedTimer = useRef<number | null>(null);
 
   useEffect(
@@ -461,6 +462,7 @@ function ImSettings() {
       setHasSecret(s.has_secret);
       setBound(s.bound);
       setEnabled(s.enabled);
+      setStreaming(s.streaming);
     });
     void api.imStatus().then(setStatus);
     const id = setInterval(() => void api.imStatus().then(setStatus), 3000);
@@ -476,6 +478,19 @@ function ImSettings() {
       void api.imStatus().then(setStatus);
     } catch (err) {
       setEnabled(prev);
+      throw err;
+    }
+  }
+
+  // 流式开关：写库后重启桥（桥启动期读一次该标志）。乐观翻转 + 失败回滚。
+  async function toggleStreaming(on: boolean) {
+    const prev = streaming;
+    setStreaming(on);
+    try {
+      await api.imSetStreaming(on);
+      void api.imStatus().then(setStatus);
+    } catch (err) {
+      setStreaming(prev);
       throw err;
     }
   }
@@ -589,6 +604,21 @@ function ImSettings() {
                 </Button>
               </div>
             </ImField>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-medium text-ink">
+                  {t("settings.imStreaming")}
+                </div>
+                <p className="mt-0.5 text-[11.5px] leading-relaxed text-ink-faint">
+                  {t("settings.imStreamingHint")}
+                </p>
+              </div>
+              <Toggle
+                on={streaming}
+                onChange={(v) => void toggleStreaming(v)}
+                label={t("settings.imStreaming")}
+              />
+            </div>
             <div className="flex justify-end">
               <Button variant="primary" onClick={() => void reconnect()} disabled={saving || !dirty}>
                 {online ? t("settings.imReconnect") : t("settings.imConnect")}

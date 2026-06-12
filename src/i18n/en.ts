@@ -518,6 +518,9 @@ export const en = {
       "Enable these scopes under Permissions on the Open Platform: im:message covers send / reply / card update / reactions; the two readonly scopes receive 1:1 and group messages over long connection. group_msg is a sensitive scope and needs review approval.",
     imPermsCopy: "Copy scopes",
     imPermsCopied: "Copied",
+    imStreaming: "Streaming replies",
+    imStreamingHint:
+      "Render replies as live typewriter cards (Feishu CardKit): the Concierge in DMs and the lead in issue topics. Off = whole reply sent at once. Toggling restarts the bridge.",
     imBound: "Bound — message the bot once to re-bind another account",
     imUnbound: "Not bound — send the bot any message to bind your account",
     imConnect: "Save & connect",

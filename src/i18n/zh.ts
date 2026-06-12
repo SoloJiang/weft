@@ -503,6 +503,9 @@ export const zh = {
       "在开放平台「权限管理」开通这些权限点：im:message 一条覆盖发消息/回复/更新卡片/表情回复，两条 readonly 用于长连接接收单聊与群聊消息。group_msg 属敏感权限，需提交审核。",
     imPermsCopy: "复制权限点",
     imPermsCopied: "已复制",
+    imStreaming: "流式回复",
+    imStreamingHint:
+      "把回复渲染成飞书 CardKit 流式打字机卡片：私聊里的 Concierge 和 issue 话题里的 lead。关 = 整段一次性发。切换会重启桥。",
     imBound: "已绑定——再次私聊 bot 可重新绑定其他账号",
     imUnbound: "未绑定——给 bot 发任意一句话即可绑定你的账号",
     imConnect: "保存并连接",
