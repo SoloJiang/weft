@@ -2,8 +2,8 @@
 //! the lead's system prompt: count, current workspace id, up to 8 repos
 //! (name @ path, single-lined + 80-char-clipped), with truncation tail and
 //! a "no repos" action_card hint for empty workspaces.
-use weft_app_lib::lead_chat::repo_state::render_repo_state;
-use weft_app_lib::store::{repo, Db};
+use weft::lead_chat::repo_state::render_repo_state;
+use weft::store::{repo, Db};
 
 #[tokio::test]
 async fn renders_empty_with_hint() {

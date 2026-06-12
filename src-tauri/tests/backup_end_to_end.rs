@@ -1,20 +1,18 @@
 //! End-to-end backup check: configure → run_now → assert the bare remote
 //! actually grew a commit and the backup_config row was updated.
 
-use base64::Engine;
 use std::process::Command;
 use std::sync::Mutex;
-use weft_app_lib::backup::{BackupService, config};
-use weft_app_lib::store::Db;
+use weft::backup::{BackupService, config};
+use weft::store::Db;
 
 // Integration tests share one process; serialize env mutations.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn iso_env(home: &std::path::Path) {
     std::env::set_var("WEFT_HOME", home);
-    let raw = [0xCDu8; 48];
-    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-    std::env::set_var("WEFT_TEST_DB_KEY_B64", &b64);
+    // Default DB is plaintext; clear any stale password env from sibling tests.
+    std::env::remove_var("WEFT_TEST_DB_PASSWORD");
 }
 
 #[tokio::test]
@@ -51,7 +49,7 @@ async fn end_to_end_backup_creates_commit_in_bare_remote() {
     let r = svc.run_now().await.unwrap();
     assert!(matches!(
         r,
-        weft_app_lib::backup::RunOutcome::Success { .. }
+        weft::backup::RunOutcome::Success { .. }
     ));
 
     let out = Command::new("git")

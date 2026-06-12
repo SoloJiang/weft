@@ -118,7 +118,8 @@ export const api = {
   listLeadMessages: (threadId: number) =>
     invoke<LeadMessage[]>("list_lead_messages", { threadId }),
   /** Live slash-command discovery for a worker (sessionId) or the lead
-   *  (threadId) — claude's initialize list, opencode's GET /command, codex none. */
+   *  (threadId) — claude's initialize list, opencode's GET /command,
+   *  codex's mirrored TUI built-ins plus dynamic skills. */
   discoverSlash: (threadId: number | null, sessionId: number | null) =>
     invoke<SlashCmd[]>("discover_slash", { threadId, sessionId }),
 
@@ -211,15 +212,12 @@ export const api = {
       has_secret: boolean;
       bound: boolean;
       enabled: boolean;
-      streaming: boolean;
       remote_standby: boolean;
     }>("im_get_settings"),
   imSetSettings: (appId: string, appSecret: string) =>
     invoke<void>("im_set_settings", { appId, appSecret }),
   imSetEnabled: (enabled: boolean) =>
     invoke<void>("im_set_enabled", { enabled }),
-  imSetStreaming: (enabled: boolean) =>
-    invoke<void>("im_set_streaming", { enabled }),
   imSetRemoteStandby: (enabled: boolean) =>
     invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),
@@ -250,6 +248,14 @@ export const api = {
     invoke<void>("backup_export_recovery_key", { targetPath }),
   backupRestore: (remoteUrl: string, recoveryKeyPath: string) =>
     invoke<void>("backup_restore", { remoteUrl, recoveryKeyPath }),
+  // Database encryption
+  dbEncryptionStatus: () => invoke<{ encrypted: boolean }>("db_encryption_status"),
+  dbEnableEncryption: (password: string) =>
+    invoke<{ restart_required: boolean }>("db_enable_encryption", { password }),
+  dbDisableEncryption: (password: string) =>
+    invoke<{ restart_required: boolean }>("db_disable_encryption", { password }),
+  dbChangePassword: (oldPassword: string, newPassword: string) =>
+    invoke<{ restart_required: boolean }>("db_change_password", { oldPassword, newPassword }),
   // Native folder picker; returns the chosen absolute path, or null if cancelled.
   pickFolder: async (title?: string) => {
     const sel = await openDialog({ directory: true, multiple: false, title });
@@ -258,6 +264,8 @@ export const api = {
   // Native multi-file picker; [] when cancelled.
   pickFiles: async (title?: string) => {
     const sel = await openDialog({ directory: false, multiple: true, title });
-    return Array.isArray(sel) ? sel : typeof sel === "string" ? [sel] : [];
+    if (Array.isArray(sel)) return sel;
+    if (typeof sel === "string") return [sel];
+    return [];
   },
 };

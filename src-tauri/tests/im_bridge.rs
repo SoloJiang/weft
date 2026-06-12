@@ -1,11 +1,11 @@
 //! IM 桥集成测试：FakeChannel + 真 registry + 内存 Db。不打真飞书。
 
 use std::sync::{Arc, Mutex};
-use weft_app_lib::ask::{Answer, AskRegistry, Decision};
-use weft_app_lib::bus::BusRegistry;
-use weft_app_lib::im::{self, inbound::Route, Channel};
-use weft_app_lib::store::repo;
-use weft_app_lib::store::Db;
+use weft::ask::{Answer, AskRegistry, Decision};
+use weft::bus::BusRegistry;
+use weft::im::{self, inbound::Route, Channel};
+use weft::store::repo;
+use weft::store::Db;
 
 #[derive(Default)]
 struct FakeChannel {
@@ -403,7 +403,7 @@ async fn issue_message_with_ctx_adds_eyes_reaction() {
         .unwrap();
     let rxns = ch.reactions.lock().unwrap();
     assert_eq!(rxns.len(), 1);
-    assert_eq!(rxns[0], ("om_in_1".into(), "EYES".into()));
+    assert_eq!(rxns[0], ("om_in_1".into(), "MeMeMe".into()));
     let acks_g = acks.lock().await;
     assert_eq!(acks_g.get(&t.id).map(|v| v.len()), Some(1));
 }
@@ -413,7 +413,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
     // 端到端 M2-4 + M2-6：bind im_route → 模拟入站累计两条 👀 →
     // consume_lead_out 一次回流 + 清空两条 reaction。
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
     let db = mem_db().await;
     let ch = FakeChannel::default();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
@@ -457,7 +457,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
 async fn consume_lead_out_unbound_thread_is_noop() {
     // thread 没绑 im_route → 桥不 reply、不动 reactions。
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
     let db = mem_db().await;
     let ch = FakeChannel::default();
     let acks = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -503,7 +503,7 @@ async fn ensure_issue_topic_creates_feishu_root_and_binds_issue() {
 #[tokio::test]
 async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
 
     let db = mem_db().await;
     let ch = FakeChannel::default();
@@ -523,6 +523,12 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
     let acks = std::sync::Arc::new(tokio::sync::Mutex::new(
         HashMap::<i32, Vec<(String, String)>>::new(),
     ));
+    {
+        let mut g = acks.lock().await;
+        g.entry(concierge.id)
+            .or_default()
+            .push(("om_in_dm".into(), "re_dm".into()));
+    }
     let out = LeadOut {
         thread_id: concierge.id,
         message_id: 1,
@@ -535,12 +541,17 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
     assert_eq!(texts.len(), 1);
     assert_eq!(texts[0], ("ou_owner".into(), "我查到了。".into()));
     assert!(ch.replies.lock().unwrap().is_empty());
+    assert_eq!(
+        ch.deletions.lock().unwrap().as_slice(),
+        [("om_in_dm".into(), "re_dm".into())]
+    );
+    assert!(acks.lock().await.get(&concierge.id).is_none());
 }
 
 #[tokio::test]
 async fn consume_lead_out_concierge_replies_to_bound_group_route() {
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
 
     let db = mem_db().await;
     let ch = FakeChannel::default();

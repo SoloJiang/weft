@@ -27,7 +27,10 @@ pub async fn write_snapshot(db: &Db, staging_dir: &Path) -> Result<i64> {
         "db_bytes": bytes,
         "weft_version": env!("CARGO_PKG_VERSION"),
     });
-    std::fs::write(staging_dir.join(META_NAME), serde_json::to_vec_pretty(&meta)?)?;
+    std::fs::write(
+        staging_dir.join(META_NAME),
+        serde_json::to_vec_pretty(&meta)?,
+    )?;
     Ok(bytes)
 }
 
@@ -50,13 +53,10 @@ fn now_unix_secs() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
 
     fn iso_env(home: &std::path::Path) {
         std::env::set_var("WEFT_HOME", home);
-        let raw = [0x55u8; 48];
-        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-        std::env::set_var("WEFT_TEST_DB_KEY_B64", &b64);
+        std::env::remove_var("WEFT_TEST_DB_PASSWORD");
     }
 
     #[tokio::test]

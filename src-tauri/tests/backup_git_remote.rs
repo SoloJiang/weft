@@ -2,7 +2,7 @@
 //! local `git init --bare` repo as the "remote".
 
 use std::process::Command;
-use weft_app_lib::backup::git_remote;
+use weft::backup::git_remote;
 
 fn make_bare_remote(parent: &std::path::Path) -> std::path::PathBuf {
     let bare = parent.join("remote.git");

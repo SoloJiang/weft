@@ -1,12 +1,12 @@
 [package]
-name = "weft-app"
+name = "weft"
 version = "0.1.0"
 description = "weft — multi-repo / multi-tool session orchestrator"
 authors = ["weft"]
 edition = "2021"
 
 [lib]
-name = "weft_app_lib"
+name = "weft"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -26,7 +26,8 @@ struct Serve {
 
 fn serve() -> Arc<Mutex<Serve>> {
     static S: OnceLock<Arc<Mutex<Serve>>> = OnceLock::new();
-    S.get_or_init(|| Arc::new(Mutex::new(Serve::default()))).clone()
+    S.get_or_init(|| Arc::new(Mutex::new(Serve::default())))
+        .clone()
 }
 
 /// Discover slash commands for `cwd`, or an empty list on any failure (opencode
@@ -62,7 +63,11 @@ async fn discover_inner(cwd: &str) -> anyhow::Result<Vec<SlashCmd>> {
                 .and_then(|d| d.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from);
-            Some(SlashCmd { name, description, arg_hint: None })
+            Some(SlashCmd {
+                name,
+                description,
+                arg_hint: None,
+            })
         })
         .collect())
 }

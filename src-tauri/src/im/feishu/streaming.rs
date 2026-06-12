@@ -9,7 +9,7 @@
 //! （把卡 entity 发给收件人，拿 message_id）→ 多次 `put_content`（带递增 sequence 追加
 //! 文本，客户端渲染打字机）→ `finalize`（关 streaming_mode，停掉「正在输入」指示）。
 //!
-//! `Channel::stream_*` 默认 no-op；只有飞书通道 + `K_IM_STREAMING` 开关打开时才走这里。
+//! `Channel::stream_*` 默认 no-op；飞书通道会走这里。
 
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -258,6 +258,27 @@ impl StreamClient {
             .await?;
         Self::check(&resp, "finalize")
     }
+
+    /// 删除消息表情回复。typed openlark 0.17 会把成功但无 `data` 的响应当成
+    /// 验证错误；这里用 raw REST 只校验飞书通用 `code`。
+    pub async fn delete_message_reaction(
+        &self,
+        message_id: &str,
+        reaction_id: &str,
+    ) -> anyhow::Result<()> {
+        let token = self.token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .delete(format!(
+                "{BASE}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        Self::check(&resp, "delete_message_reaction")
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +300,18 @@ mod tests {
         s.mark_sent("hello");
         assert!(!s.should_send("hello")); // 没变：跳过
         assert!(s.should_send("hello!")); // 变了：发
+    }
+
+    #[test]
+    fn check_accepts_success_without_data() {
+        let resp = serde_json::json!({"code": 0, "msg": "success"});
+        assert!(StreamClient::check(&resp, "delete_message_reaction").is_ok());
+    }
+
+    #[test]
+    fn check_rejects_nonzero_code() {
+        let resp = serde_json::json!({"code": 230001, "msg": "reaction not found"});
+        let err = StreamClient::check(&resp, "delete_message_reaction").unwrap_err();
+        assert!(err.to_string().contains("230001"));
     }
 }

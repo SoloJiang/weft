@@ -26,6 +26,7 @@
   --color-accent-ghost: var(--c-accent-ghost);
 
   --color-running: var(--c-running);
+  --color-success: var(--c-success);
   --color-waiting: var(--c-waiting);
   --color-approval: var(--c-approval);
   --color-inject: var(--c-inject);
@@ -69,6 +70,7 @@
   --c-accent: oklch(0.715 0.155 40); /* coral weft — convergence / delivered */
   --c-accent-ghost: oklch(0.715 0.155 40 / 0.16);
   --c-running: oklch(0.770 0.150 158);
+  --c-success: oklch(0.740 0.170 145);
   --c-waiting: oklch(0.815 0.120 88);
   --c-approval: oklch(0.745 0.150 52);
   --c-inject: oklch(0.745 0.100 220);
@@ -96,6 +98,7 @@
   --c-accent: oklch(0.585 0.175 38);
   --c-accent-ghost: oklch(0.585 0.175 38 / 0.12);
   --c-running: oklch(0.580 0.150 158);
+  --c-success: oklch(0.510 0.160 145);
   --c-waiting: oklch(0.620 0.130 75);
   --c-approval: oklch(0.585 0.150 52);
   --c-inject: oklch(0.560 0.110 222);
@@ -313,4 +316,3 @@
 .weft-pop[data-state="open"] {
   animation: weft-pop-in 160ms var(--ease-out-expo);
 }
-

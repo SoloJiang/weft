@@ -1,7 +1,7 @@
 //! lead_chat::sentinels::extract_sentinels — pulls `<weft:action_card>{...}`
 //! and `<weft:list_repos/>` markers out of assistant text so the engine can
 //! persist action_card rows and answer list_repos via stdin separately.
-use weft_app_lib::lead_chat::sentinels::{extract_sentinels, Sentinel};
+use weft::lead_chat::sentinels::{extract_sentinels, Sentinel};
 
 #[test]
 fn extracts_action_card() {

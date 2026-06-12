@@ -26,6 +26,7 @@ pub fn now_unix() -> String {
 }
 
 pub async fn create_workspace(db: &Db, name: &str) -> Result<workspace::Model> {
+    let name = validate_display_name(name, "workspace name")?;
     let existing: Vec<String> = workspace::Entity::find()
         .all(&db.0)
         .await?
@@ -207,10 +208,6 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
 /// Workspace container used by per-IM-conversation Concierge threads.
 pub const K_CONCIERGE_WORKSPACE: &str = "concierge.workspace_id";
 
-/// Phase 2 流式卡片开关（"1" = 开）。默认关：开了才把 Concierge 回复以飞书
-/// CardKit streaming 卡片逐字渲染；issue 话题仍走整段 reply。
-pub const K_IM_STREAMING: &str = "im.streaming";
-
 pub async fn add_repo_ref(
     db: &Db,
     workspace_id: i32,
@@ -243,6 +240,8 @@ pub async fn create_thread(
     kind: &str,
     lead_tool: &str,
 ) -> Result<thread::Model> {
+    let title = validate_display_name(title, "issue title")?;
+    let kind = validate_display_name(kind, "issue kind")?;
     let existing: Vec<String> = thread::Entity::find()
         .filter(thread::Column::WorkspaceId.eq(workspace_id))
         .all(&db.0)
@@ -961,6 +960,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_workspace_rejects_empty_name() {
+        let db = mem().await;
+
+        assert!(create_workspace(&db, "   ").await.is_err());
+        assert!(list_workspaces(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn latest_session_for_returns_newest_with_native() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
@@ -1029,6 +1036,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.lead_tool, "codex");
+    }
+
+    #[tokio::test]
+    async fn create_thread_rejects_missing_title_or_kind() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+
+        assert!(create_thread(&db, ws.id, "   ", "feature", "codex")
+            .await
+            .is_err());
+        assert!(create_thread(&db, ws.id, "Add feature", "   ", "codex")
+            .await
+            .is_err());
+        assert!(list_threads(&db, ws.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]

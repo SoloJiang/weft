@@ -138,7 +138,7 @@ pub fn spawn_periodic(app: tauri::AppHandle) {
             .max(60);
         loop {
             if let Some(db) = app.try_state::<Db>() {
-                let db = Db(db.0.clone());
+                let db = Db(db.0.clone(), db.1);
                 tauri::async_runtime::spawn(async move {
                     if let Ok(sources) = repo::list_skill_sources(&db).await {
                         for s in sources {

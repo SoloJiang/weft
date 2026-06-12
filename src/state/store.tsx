@@ -970,8 +970,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // Pull a worker's slash commands on demand: opencode runs live GET /command
-  // discovery, claude returns its cached initialize list, codex returns none.
+  // Pull a worker's slash commands on demand: opencode runs live GET /command,
+  // claude returns its initialize list, codex mirrors TUI built-ins plus skills.
   // Best-effort — an empty result leaves the existing palette untouched.
   const discoverWorkerSlash = useCallback((sessionId: number) => {
     void api

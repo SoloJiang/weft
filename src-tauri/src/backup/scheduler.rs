@@ -9,9 +9,9 @@
 
 use anyhow::Result;
 use std::time::Duration;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{sleep_until, Instant};
 
-use crate::backup::{BackupService, config};
+use crate::backup::{config, BackupService};
 
 /// Spawn the long-lived scheduler task. The handle is intentionally discarded
 /// — the task lives for the lifetime of the tokio runtime, which dies with

@@ -18,7 +18,7 @@ export interface RepoActionContext {
   /** When present, the result is posted back to the lead thread. */
   threadId?: number;
   /** Override the active workspace (e.g., when invoked from a card pinned
-   *  to a specific workspace). Falls back to store / ensureDefaultWorkspace. */
+   *  to a specific workspace). Falls back to the active workspace. */
   preferredWorkspaceId?: number | null;
 }
 
@@ -48,14 +48,10 @@ export function useRepoActions() {
 
   const resolveWorkspaceId = useCallback(
     async (ctx: RepoActionContext): Promise<number | null> => {
-      if (ctx.preferredWorkspaceId) return ctx.preferredWorkspaceId;
-      if (activeWorkspaceId) return activeWorkspaceId;
-      try {
-        return await api.ensureDefaultWorkspace();
-      } catch {
-        toast(t("repoActions.noWorkspaceToast"));
-        return null;
-      }
+      if (ctx.preferredWorkspaceId != null) return ctx.preferredWorkspaceId;
+      if (activeWorkspaceId != null) return activeWorkspaceId;
+      toast(t("repoActions.noWorkspaceToast"));
+      return null;
     },
     [activeWorkspaceId, t],
   );

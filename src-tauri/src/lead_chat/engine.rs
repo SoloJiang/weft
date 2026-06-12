@@ -226,6 +226,17 @@ fn build_args(inner: &EngineInner) -> Vec<String> {
     a
 }
 
+fn merge_init_slash_commands(
+    existing: &[super::proto::SlashCmd],
+    init: Vec<super::proto::SlashCmd>,
+) -> Vec<super::proto::SlashCmd> {
+    if existing.is_empty() {
+        init
+    } else {
+        existing.to_vec()
+    }
+}
+
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
 /// Per-turn dialects have no resident process — sending spawns one per turn.
 pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
@@ -446,7 +457,12 @@ async fn spawn_codex_turn(
     let client = crate::codex_app_server::client().await?;
     let (native, cwd, sid, thread_id_i) = {
         let i = eng.lock().await;
-        (i.native_id.clone(), i.cwd.to_string_lossy().into_owned(), i.session_id, i.thread_id)
+        (
+            i.native_id.clone(),
+            i.cwd.to_string_lossy().into_owned(),
+            i.session_id,
+            i.thread_id,
+        )
     };
     let had_native = native.is_some();
     let thread = match native {
@@ -469,8 +485,13 @@ async fn spawn_codex_turn(
             let _ = client.resume_thread(&thread).await;
         }
         let rx = client.subscribe(&thread).await;
-        let (a, d, e, c, th) =
-            (app.clone(), db.clone(), eng.clone(), client.clone(), thread.clone());
+        let (a, d, e, c, th) = (
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            client.clone(),
+            thread.clone(),
+        );
         tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
     }
     let turn = client.start_turn(&thread, &out.text).await?;
@@ -489,8 +510,8 @@ async fn codex_consumer(
     thread: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::codex_app_server::ThreadMsg>,
 ) {
-    use crate::codex_app_server::ThreadMsg;
     use super::proto::ChatEvent;
+    use crate::codex_app_server::ThreadMsg;
     while let Some(msg) = rx.recv().await {
         match msg {
             ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
@@ -505,7 +526,13 @@ async fn codex_consumer(
                     }
                     None => {
                         let Ok(m) = repo::insert_lead_message(
-                            &db, thread_id, sid, turn, "assistant", "text", r#"{"text":""}"#,
+                            &db,
+                            thread_id,
+                            sid,
+                            turn,
+                            "assistant",
+                            "text",
+                            r#"{"text":""}"#,
                             "streaming",
                         )
                         .await
@@ -514,7 +541,13 @@ async fn codex_consumer(
                         };
                         let id = m.id;
                         inner.current = Some((id, text.clone(), std::time::Instant::now()));
-                        let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Message {
+                                thread_id,
+                                message: m,
+                            },
+                        );
                         id
                     }
                 };
@@ -526,7 +559,14 @@ async fn codex_consumer(
                         emit_lead_delta(&app, thread_id, row, &c.1, false);
                     }
                 }
-                let _ = app.emit(EVENT, Push::Delta { thread_id, message_id: row, text });
+                let _ = app.emit(
+                    EVENT,
+                    Push::Delta {
+                        thread_id,
+                        message_id: row,
+                        text,
+                    },
+                );
             }
             ThreadMsg::Event(ChatEvent::Assistant { texts: _, tools }) => {
                 // Codex streams text via deltas; only non-text items arrive here,
@@ -537,7 +577,12 @@ async fn codex_consumer(
                 for (name, summary) in tools {
                     let _ = app.emit(
                         EVENT,
-                        Push::Activity { thread_id, session_id: sid, name, summary },
+                        Push::Activity {
+                            thread_id,
+                            session_id: sid,
+                            name,
+                            summary,
+                        },
                     );
                 }
             }
@@ -562,7 +607,11 @@ async fn codex_consumer(
                     .await;
                     let _ = app.emit(
                         EVENT,
-                        Push::Finalize { thread_id, message_id: id, status: status.into() },
+                        Push::Finalize {
+                            thread_id,
+                            message_id: id,
+                            status: status.into(),
+                        },
                     );
                     if status == "complete" {
                         emit_lead_out(&app, thread_id, id, &text);
@@ -605,7 +654,13 @@ async fn codex_consumer(
                     (i.thread_id, i.ask_dir.clone())
                 };
                 let (tool, summary) = if method.contains("commandExecution") {
-                    ("Bash", params["command"].as_str().unwrap_or("(command)").to_string())
+                    (
+                        "Bash",
+                        params["command"]
+                            .as_str()
+                            .unwrap_or("(command)")
+                            .to_string(),
+                    )
                 } else {
                     ("Edit", "apply file changes".to_string())
                 };
@@ -685,9 +740,7 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     if inner.tool == "codex" && codex_appserver_enabled() {
         let thread = inner.native_id.clone();
         drop(inner);
-        if let (Some(thread), Ok(client)) =
-            (thread, crate::codex_app_server::client().await)
-        {
+        if let (Some(thread), Ok(client)) = (thread, crate::codex_app_server::client().await) {
             if let Some(turn) = client.active_turn(&thread).await {
                 let _ = client.interrupt(&thread, &turn).await;
             }
@@ -929,6 +982,8 @@ fn spawn_reader(
                     slash_commands,
                 } => {
                     inner.native_id = Some(session_id.clone());
+                    let slash_commands =
+                        merge_init_slash_commands(&inner.slash_commands, slash_commands);
                     inner.slash_commands = slash_commands.clone();
                     if let Some(sid) = inner.session_id {
                         let _ = repo::set_session_native_id(&db, sid, &session_id).await;
@@ -1379,7 +1434,13 @@ fn emit_lead_out(app: &AppHandle, thread_id: i32, message_id: i32, text: &str) {
 
 /// streaming 增量帧。`accumulated` 是到当前为止的全文；`done` 标记最后一帧。
 /// 未注册 LeadDeltaHub（如 mock_app 测试）静默——不 panic。
-fn emit_lead_delta(app: &AppHandle, thread_id: i32, message_id: i32, accumulated: &str, done: bool) {
+fn emit_lead_delta(
+    app: &AppHandle,
+    thread_id: i32,
+    message_id: i32,
+    accumulated: &str,
+    done: bool,
+) {
     if let Some(hub) = app.try_state::<super::delta_hub::LeadDeltaHub>() {
         hub.emit(super::delta_hub::LeadDelta {
             thread_id,
@@ -1449,6 +1510,20 @@ mod tests {
     #[test]
     fn zero_caps_disable_each_check() {
         assert_eq!(turn_verdict(Some(1_000_000), 1_000_000, 0, 0, false), None);
+    }
+
+    #[test]
+    fn initialize_metadata_survives_later_bare_init_list() {
+        let rich = vec![crate::lead_chat::proto::SlashCmd {
+            name: "compact".into(),
+            description: Some("Summarize context".into()),
+            arg_hint: None,
+        }];
+        let bare = vec![crate::lead_chat::proto::SlashCmd::bare("compact")];
+
+        let merged = merge_init_slash_commands(&rich, bare);
+
+        assert_eq!(merged, rich);
     }
 
     #[test]

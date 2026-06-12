@@ -100,7 +100,11 @@ pub fn run() {
 
     #[cfg(debug_assertions)]
     {
-        builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+        builder = builder.plugin(
+            tauri_plugin_mcp_bridge::Builder::new()
+                .bind_address("127.0.0.1")
+                .build(),
+        );
     }
 
     builder
@@ -178,6 +182,10 @@ pub fn run() {
             commands::answer_permission,
             commands::set_dangerous_mode,
             commands::set_keep_awake,
+            commands::db_encryption_status,
+            commands::db_enable_encryption,
+            commands::db_disable_encryption,
+            commands::db_change_password,
             commands::set_guardrails,
             commands::session_for,
             commands::effective_config,
@@ -217,7 +225,6 @@ pub fn run() {
             commands::im_get_settings,
             commands::im_set_settings,
             commands::im_set_enabled,
-            commands::im_set_streaming,
             commands::im_set_remote_standby,
             commands::im_status,
             commands::im_bind_thread,

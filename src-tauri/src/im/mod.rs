@@ -18,6 +18,8 @@ pub const K_ENABLED: &str = "im.feishu.enabled";
 /// 远程待命：桥启用期间持有「防空闲休眠」断言（power.rs RemoteStandby）。
 /// 纯电源层标志——不影响桥连接本身。默认关。
 pub const K_REMOTE_STANDBY: &str = "im.remote_standby";
+/// 飞书 👀「看我看我」表情的 reaction key。
+const INBOUND_ACK_EMOJI: &str = "MeMeMe";
 
 #[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
@@ -178,7 +180,7 @@ pub trait Channel: Send + Sync {
     }
 
     // —— 流式卡片（Phase 2，飞书 CardKit）。默认 no-op：非流式通道 / 测试替身免实现。
-    //    `K_IM_STREAMING` 开关 + 飞书通道才会真正走下面的实现。 ——
+    //    飞书通道会真正走下面的实现。 ——
     /// 起一张流式卡：建卡 entity + 发给收件人，返回会话句柄（无能力则 None）。
     async fn stream_begin(
         &self,
@@ -212,7 +214,7 @@ pub trait Channel: Send + Sync {
     }
 }
 
-/// M2-6 桥运行时上下文：让 execute() 在入站 IssueMessage 路径里挂 👀，
+/// M2-6 桥运行时上下文：让 execute() 在入站可投递到 lead 的消息路径里挂 👀，
 /// 同时把 (im_message_id, reaction_id) 记到 `acks[thread_id]`——lead 首条
 /// 出站时 [`spawn`] 出站任务取走清空。`message_id`/`acks` 任一缺失即跳过
 /// reaction（测试路径 / 配置未注入 都安全）。
@@ -265,12 +267,14 @@ pub async fn execute(
                     if let Err(e) = consume_free_text(
                         app,
                         db,
+                        channel,
                         &open_id,
                         &chat_id,
                         &im_thread_ref,
                         None,
                         &text,
                         lang,
+                        ctx,
                     )
                     .await
                     {
@@ -383,8 +387,19 @@ pub async fn execute(
             // concierge thread，不把不同 IM 上下文混进全局单例。
             let _ = (&sender_open_id, &chat_id, &im_thread_ref, &reply_to, &text);
             if let Some(app) = app {
-                if let Err(e) =
-                    consume_free_text(app, db, &sender_open_id, &chat_id, &im_thread_ref, reply_to.as_deref(), &text, lang).await
+                if let Err(e) = consume_free_text(
+                    app,
+                    db,
+                    channel,
+                    &sender_open_id,
+                    &chat_id,
+                    &im_thread_ref,
+                    reply_to.as_deref(),
+                    &text,
+                    lang,
+                    ctx,
+                )
+                .await
                 {
                     eprintln!("[weft][im] concierge: {e}");
                 }
@@ -429,29 +444,7 @@ pub async fn execute(
                 }
                 return Ok(());
             };
-            // M2-6 回执：在投递 engine 之前先挂 👀——出站前批量 delete。
-            // ctx 没给 message_id / acks 则跳过；reaction add 失败不阻挡后续灌入。
-            if let (Some(ctx), true) = (
-                ctx,
-                ctx.map(|c| c.inbound_message_id.is_some()).unwrap_or(false),
-            ) {
-                if let (Some(mid), Some(acks)) =
-                    (ctx.inbound_message_id.as_deref(), ctx.acks.as_ref())
-                {
-                    // emoji_type 必须是飞书有效键："EYES" 不在目录里（reaction 静默失败的元凶之一）。
-                    // 用 "MeMeMe"（飞书 👀「看我看我」表情）——有效键，语义即「已看到，排队处理」。
-                    match channel.add_reaction(mid, "MeMeMe").await {
-                        Ok(rid) => {
-                            acks.lock()
-                                .await
-                                .entry(route.thread_id)
-                                .or_default()
-                                .push((mid.to_string(), rid));
-                        }
-                        Err(e) => eprintln!("[weft][im] add reaction: {e}"),
-                    }
-                }
-            }
+            record_inbound_reaction(ctx, channel, route.thread_id).await;
             let Some(app) = app else { return Ok(()) }; // 测试路径不进 engine
             if let Err(e) = feed_issue_message(app, db, route.thread_id, &text, lang).await {
                 eprintln!("[weft][im] issue lead send: {e}");
@@ -459,6 +452,41 @@ pub async fn execute(
         }
     }
     Ok(())
+}
+
+async fn record_inbound_reaction(ctx: Option<&ExecuteCtx>, channel: &dyn Channel, thread_id: i32) {
+    let Some(ctx) = ctx else { return };
+    let (Some(mid), Some(acks)) = (ctx.inbound_message_id.as_deref(), ctx.acks.as_ref()) else {
+        return;
+    };
+
+    match channel.add_reaction(mid, INBOUND_ACK_EMOJI).await {
+        Ok(rid) if !rid.is_empty() => {
+            acks.lock()
+                .await
+                .entry(thread_id)
+                .or_default()
+                .push((mid.to_string(), rid));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[weft][im] add reaction: {e}"),
+    }
+}
+
+async fn drain_inbound_reactions(
+    thread_id: i32,
+    ch: &dyn Channel,
+    acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
+) {
+    let pending: Vec<(String, String)> = {
+        let mut g = acks.lock().await;
+        g.remove(&thread_id).unwrap_or_default()
+    };
+    for (mid, rid) in pending {
+        if let Err(e) = ch.delete_reaction(&mid, &rid).await {
+            eprintln!("[weft][im] delete reaction: {e}");
+        }
+    }
 }
 
 // ───────────────────────── 桥运行时（Task 10）─────────────────────────
@@ -680,15 +708,6 @@ pub fn spawn(app: tauri::AppHandle) {
             });
         }
 
-        // Phase 2 流式开关：开了则 Concierge 回复改由下面的 LeadDelta 消费者流式
-        // 渲染。启动期读一次；改开关需重启桥（与其它 IM 设置一致）才生效。
-        let streaming_on = crate::store::repo::get_setting(&db, crate::store::repo::K_IM_STREAMING)
-            .await
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some("1");
-
         // —— 回流：lead engine assistant 文本 finalize → 反查 im_route → 飞书 reply ——
         // 没注册 LeadOutHub（单测可能这样跑）则跳过——桥也能正常处理入站。
         if let Some(hub) = app.try_state::<crate::lead_chat::out_hub::LeadOutHub>() {
@@ -703,7 +722,7 @@ pub fn spawn(app: tauri::AppHandle) {
                     }
                     match rx.recv().await {
                         Ok(out) => {
-                            consume_lead_out(out, &db2, ch.as_ref(), &acks2, streaming_on).await;
+                            consume_lead_out(out, &db2, ch.as_ref(), &acks2, true).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // engine 产文本太快 / 桥太慢——容量 64 已远超单轮 finalize
@@ -716,113 +735,108 @@ pub fn spawn(app: tauri::AppHandle) {
             });
         }
 
-        // —— Phase 2 流式：LeadDelta → Concierge 流式卡片 ——
-        // 仅 streaming_on 时挂起；只接管 feishu_concierge 路由（issue 话题仍走 LeadOut
-        // 整段 reply）。建卡失败 / 流式不可用时在 done 帧回落普通发送，保证不丢消息。
-        if streaming_on {
-            if let Some(hub) = app.try_state::<crate::lead_chat::delta_hub::LeadDeltaHub>() {
-                let mut rx = hub.subscribe();
-                let (db2, ch) = (db.clone(), channel.clone());
-                let app5 = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let bridge = app5.state::<ImBridge>();
-                    // 每条 assistant 消息一张流式卡，按 message_id 归并帧。
-                    let mut streams: HashMap<i32, feishu::streaming::StreamSession> = HashMap::new();
-                    loop {
-                        if !bridge.live(generation) {
-                            return;
+        // —— Phase 2 流式：LeadDelta → 飞书流式卡片 ——
+        // 常开：Concierge 与 issue 话题都优先用 CardKit 流式卡。建卡失败 /
+        // 流式不可用时在 done 帧回落普通发送，保证不丢消息。
+        if let Some(hub) = app.try_state::<crate::lead_chat::delta_hub::LeadDeltaHub>() {
+            let mut rx = hub.subscribe();
+            let (db2, ch) = (db.clone(), channel.clone());
+            let app5 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let bridge = app5.state::<ImBridge>();
+                // 每条 assistant 消息一张流式卡，按 message_id 归并帧。
+                let mut streams: HashMap<i32, feishu::streaming::StreamSession> = HashMap::new();
+                loop {
+                    if !bridge.live(generation) {
+                        return;
+                    }
+                    let d = match rx.recv().await {
+                        Ok(d) => d,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!("[weft][im] lead-delta lagged: {n} dropped");
+                            continue;
                         }
-                        let d = match rx.recv().await {
-                            Ok(d) => d,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                eprintln!("[weft][im] lead-delta lagged: {n} dropped");
-                                continue;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                        };
-                        // Concierge（主会话→出口 agent，新消息）和 issue 话题（→lead，
-                        // 回复挂话题）都流式；其它路由由 LeadOut 整段发。
-                        let route =
-                            match crate::store::repo::im_route_of_thread(&db2, d.thread_id).await {
-                                Ok(Some(r))
-                                    if r.channel == "feishu_concierge" || r.channel == "feishu" =>
-                                {
-                                    r
-                                }
-                                _ => continue,
-                            };
-                        let is_topic = route.channel == "feishu";
-                        // 话题里加「Lead：」前缀保持归属（与 issue_reply_text 一致）；DM 原样。
-                        let content = if is_topic {
-                            format!(
-                                "{}{}",
-                                if IM_LANG == "zh" { "Lead：" } else { "Lead: " },
-                                d.accumulated
-                            )
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    };
+                    // Concierge（主会话→出口 agent，新消息）和 issue 话题（→lead，
+                    // 回复挂话题）都流式；其它路由由 LeadOut 整段发。
+                    let route = match crate::store::repo::im_route_of_thread(&db2, d.thread_id)
+                        .await
+                    {
+                        Ok(Some(r)) if r.channel == "feishu_concierge" || r.channel == "feishu" => {
+                            r
+                        }
+                        _ => continue,
+                    };
+                    let is_topic = route.channel == "feishu";
+                    // 话题里加「Lead：」前缀保持归属（与 issue_reply_text 一致）；DM 原样。
+                    let content = if is_topic {
+                        format!(
+                            "{}{}",
+                            if IM_LANG == "zh" { "Lead：" } else { "Lead: " },
+                            d.accumulated
+                        )
+                    } else {
+                        d.accumulated.clone()
+                    };
+                    // 首帧建卡：空内容的中间帧先等真正内容；done 帧总处理。
+                    if !streams.contains_key(&d.message_id) {
+                        if d.accumulated.trim().is_empty() && !d.done {
+                            continue;
+                        }
+                        // 话题→回复式卡片挂到话题根；DM→新消息发给 open_id/chat_id。
+                        let begun = if is_topic {
+                            ch.stream_begin_reply(&route.im_thread_ref).await
+                        } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+                            ch.stream_begin("open_id", open_id).await
+                        } else if route.im_thread_ref.starts_with("chat:") {
+                            ch.stream_begin("chat_id", &route.chat_id).await
                         } else {
-                            d.accumulated.clone()
+                            continue;
                         };
-                        // 首帧建卡：空内容的中间帧先等真正内容；done 帧总处理。
-                        if !streams.contains_key(&d.message_id) {
-                            if d.accumulated.trim().is_empty() && !d.done {
-                                continue;
+                        match begun {
+                            Ok(Some(s)) => {
+                                streams.insert(d.message_id, s);
                             }
-                            // 话题→回复式卡片挂到话题根；DM→新消息发给 open_id/chat_id。
-                            let begun = if is_topic {
-                                ch.stream_begin_reply(&route.im_thread_ref).await
-                            } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
-                                ch.stream_begin("open_id", open_id).await
-                            } else if route.im_thread_ref.starts_with("chat:") {
-                                ch.stream_begin("chat_id", &route.chat_id).await
-                            } else {
-                                continue;
-                            };
-                            match begun {
-                                Ok(Some(s)) => {
-                                    streams.insert(d.message_id, s);
-                                }
-                                _ => {
-                                    // 流式不可用/建卡失败：done 时回落普通发送一次，不丢消息。
-                                    if d.done {
-                                        let sent = if is_topic {
-                                            let body =
-                                                outbound::issue_reply_text(IM_LANG, &d.accumulated);
-                                            ch.reply_text(&route.im_thread_ref, &body)
-                                                .await
-                                                .map(|_| ())
-                                        } else if let Some(open_id) =
-                                            route.im_thread_ref.strip_prefix("dm:")
-                                        {
-                                            ch.send_text(open_id, &d.accumulated).await.map(|_| ())
-                                        } else {
-                                            ch.send_chat_text(&route.chat_id, &d.accumulated)
-                                                .await
-                                                .map(|_| ())
-                                        };
-                                        if let Err(e) = sent {
-                                            eprintln!("[weft][im] stream fallback send: {e}");
-                                        }
+                            _ => {
+                                // 流式不可用/建卡失败：done 时回落普通发送一次，不丢消息。
+                                if d.done {
+                                    let sent = if is_topic {
+                                        let body =
+                                            outbound::issue_reply_text(IM_LANG, &d.accumulated);
+                                        ch.reply_text(&route.im_thread_ref, &body).await.map(|_| ())
+                                    } else if let Some(open_id) =
+                                        route.im_thread_ref.strip_prefix("dm:")
+                                    {
+                                        ch.send_text(open_id, &d.accumulated).await.map(|_| ())
+                                    } else {
+                                        ch.send_chat_text(&route.chat_id, &d.accumulated)
+                                            .await
+                                            .map(|_| ())
+                                    };
+                                    if let Err(e) = sent {
+                                        eprintln!("[weft][im] stream fallback send: {e}");
                                     }
-                                    continue;
                                 }
-                            }
-                        }
-                        if let Some(session) = streams.get_mut(&d.message_id) {
-                            let r = if d.done {
-                                ch.stream_end(session, &content).await
-                            } else {
-                                ch.stream_push(session, &content).await
-                            };
-                            if let Err(e) = r {
-                                eprintln!("[weft][im] stream push/end: {e}");
-                            }
-                            if d.done {
-                                streams.remove(&d.message_id);
+                                continue;
                             }
                         }
                     }
-                });
-            }
+                    if let Some(session) = streams.get_mut(&d.message_id) {
+                        let r = if d.done {
+                            ch.stream_end(session, &content).await
+                        } else {
+                            ch.stream_push(session, &content).await
+                        };
+                        if let Err(e) = r {
+                            eprintln!("[weft][im] stream push/end: {e}");
+                        }
+                        if d.done {
+                            streams.remove(&d.message_id);
+                        }
+                    }
+                }
+            });
         }
 
         // —— ws 长连接（断线指数退避重连） ——
@@ -1115,6 +1129,7 @@ pub async fn consume_lead_out(
         // streaming 开启时，Concierge 回复整段交给 LeadDelta 消费者流式发送
         // （stream 或失败回落），此处不再重复发一遍——见 spawn 的 delta 消费者。
         if streaming {
+            drain_inbound_reactions(out.thread_id, ch, acks).await;
             return;
         }
         let send = if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
@@ -1131,7 +1146,9 @@ pub async fn consume_lead_out(
         };
         if let Err(e) = send {
             eprintln!("[weft][im] concierge reply: {e}");
+            return;
         }
+        drain_inbound_reactions(out.thread_id, ch, acks).await;
         return;
     }
     // issue 话题：streaming 时 reply 由 LeadDelta 消费者发流式卡（stream 或回落），
@@ -1145,15 +1162,7 @@ pub async fn consume_lead_out(
         }
     }
     // 出站成功（或 streaming 接管）→ 清掉这个 thread 上挂的所有 👀。
-    let pending: Vec<(String, String)> = {
-        let mut g = acks.lock().await;
-        g.remove(&out.thread_id).unwrap_or_default()
-    };
-    for (mid, rid) in pending {
-        if let Err(e) = ch.delete_reaction(&mid, &rid).await {
-            eprintln!("[weft][im] delete reaction: {e}");
-        }
-    }
+    drain_inbound_reactions(out.thread_id, ch, acks).await;
 }
 
 async fn ensure_concierge_workspace(db: &crate::store::Db) -> anyhow::Result<i32> {
@@ -1216,14 +1225,17 @@ async fn ensure_im_concierge_thread(
 async fn consume_free_text(
     app: &tauri::AppHandle,
     db: &crate::store::Db,
+    channel: &dyn Channel,
     sender_open_id: &str,
     chat_id: &str,
     im_thread_ref: &str,
     reply_to: Option<&str>,
     text: &str,
     lang: &str,
+    ctx: Option<&ExecuteCtx>,
 ) -> anyhow::Result<()> {
     let thread_id = ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref).await?;
+    record_inbound_reaction(ctx, channel, thread_id).await;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
     let framed = match reply_to {
         Some(mid) => format!(

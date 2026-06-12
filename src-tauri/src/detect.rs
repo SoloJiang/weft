@@ -187,7 +187,9 @@ impl ToolDiagnostic {
     pub fn below_minimum(tool: &str, version: &str, min: &str) -> Self {
         Self {
             kind: DiagnosticKind::BelowMinimum,
-            message: format!("{tool} {version} is below the recommended {min}. Update recommended."),
+            message: format!(
+                "{tool} {version} is below the recommended {min}. Update recommended."
+            ),
         }
     }
 }

@@ -17,7 +17,6 @@ use open_lark::communication::im::v1::message::create::{CreateMessageBody, Creat
 use open_lark::communication::im::v1::message::models::ReceiveIdType;
 use open_lark::communication::im::v1::message::patch::PatchMessageCardRequest;
 use open_lark::communication::im::v1::message::reaction::create::CreateMessageReactionRequest;
-use open_lark::communication::im::v1::message::reaction::delete::DeleteMessageReactionRequest;
 use open_lark::communication::im::v1::message::reaction::models::{
     CreateMessageReactionBody, ReactionType,
 };
@@ -148,10 +147,8 @@ impl super::Channel for FeishuChannel {
         if reaction_id.is_empty() {
             return Ok(()); // add_reaction 没回 id：跳过 delete。
         }
-        DeleteMessageReactionRequest::new(self.config.clone())
-            .message_id(message_id)
-            .reaction_id(reaction_id)
-            .execute()
+        self.stream
+            .delete_message_reaction(message_id, reaction_id)
             .await
             .map_err(|e| anyhow::anyhow!("feishu delete_reaction: {e}"))?;
         Ok(())

@@ -129,7 +129,7 @@ pub fn spawn_periodic(app: tauri::AppHandle) {
         let ttl = env_secs("WEFT_GC_ORPHAN_TTL_SECS", 259_200); // 72h; 0 disables
         loop {
             if let Some(db) = app.try_state::<Db>() {
-                let db = Db(db.0.clone());
+                let db = Db(db.0.clone(), db.1);
                 tauri::async_runtime::spawn(async move {
                     let _ = sweep_orphan_worktrees(&db, ttl).await;
                 });

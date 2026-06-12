@@ -3,8 +3,8 @@
 use anyhow::Result;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
-use crate::store::Db;
 use crate::store::entities::backup_config;
+use crate::store::Db;
 
 const SINGLETON_ID: i32 = 1;
 const DEFAULT_INTERVAL_SECONDS: i64 = 3600;

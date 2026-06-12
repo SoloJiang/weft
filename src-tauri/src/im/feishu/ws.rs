@@ -57,9 +57,13 @@ pub fn inbound_from_raw(env: &serde_json::Value) -> Option<Inbound> {
             .as_str()?,
         m.get("chat_type")?.as_str()?,
         m.get("chat_id")?.as_str()?,
-        m.get("thread_id").and_then(|v| v.as_str()).map(String::from),
+        m.get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         m.get("message_id")?.as_str()?,
-        m.get("parent_id").and_then(|v| v.as_str()).map(String::from),
+        m.get("parent_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         m.get("message_type")?.as_str()?,
         m.get("content")?.as_str()?,
     )
@@ -264,6 +268,9 @@ mod tests {
     fn inbound_from_raw_drops_malformed_envelope() {
         // 缺 header / 缺 event / 缺字段都返回 None，不 panic。
         assert!(inbound_from_raw(&serde_json::json!({})).is_none());
-        assert!(inbound_from_raw(&serde_json::json!({"header": {"event_type": "im.message.receive_v1"}})).is_none());
+        assert!(inbound_from_raw(
+            &serde_json::json!({"header": {"event_type": "im.message.receive_v1"}})
+        )
+        .is_none());
     }
 }

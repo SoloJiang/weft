@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use tauri::State;
 
-use crate::backup::{BackupService, config, recovery_key};
+use crate::backup::{config, recovery_key, BackupService};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

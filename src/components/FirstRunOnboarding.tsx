@@ -8,8 +8,10 @@ import {
   Sparkles,
 } from "lucide-react";
 import { Button } from "./ui/Button";
+import { Select } from "./ui/Select";
 import { ToolIcon, toolFullName } from "./ToolIcon";
 import { useStore } from "../state/store";
+import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 
 const STORAGE_KEY = "weft-first-run-onboarding-v2-dismissed";
@@ -36,18 +38,20 @@ const EDGES = [
 ];
 
 export function FirstRunOnboarding() {
-  const { workspaces, createWorkspace } = useStore();
+  const { workspaces, refreshWorkspaces, selectWorkspace } = useStore();
   const { t } = useTranslation();
   const [ready, setReady] = useState(false);
   const [dismissed, setDismissed] = useState(() => localStorage.getItem(STORAGE_KEY) === "1");
   const [step, setStep] = useState(0);
-  const [workspaceName, setWorkspaceName] = useState("结算改版");
-  const [task, setTask] = useState(t("onboarding.demoTask"));
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [task, setTask] = useState("");
+  const [issueKind, setIssueKind] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const steps = t("onboarding.steps", { returnObjects: true }) as string[];
   const open = ready && workspaces.length === 0 && !dismissed;
   const last = step === steps.length - 1;
+  const canEnter = !!workspaceName.trim() && !!task.trim() && !!issueKind;
 
   useEffect(() => {
     const timer = window.setTimeout(() => setReady(true), 300);
@@ -60,12 +64,16 @@ export function FirstRunOnboarding() {
   }
 
   async function enter() {
-    if (busy) return;
+    if (busy || !canEnter) return;
     setBusy(true);
     setErr(null);
     try {
       const name = workspaceName.trim();
-      if (name) await createWorkspace(name);
+      const title = task.trim();
+      const ws = await api.createWorkspace(name);
+      await api.createThread(ws.id, title, issueKind);
+      await refreshWorkspaces();
+      await selectWorkspace(ws.id);
       dismiss();
     } catch (e) {
       setErr(String(e));
@@ -123,7 +131,15 @@ export function FirstRunOnboarding() {
 
       <main className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex min-h-full w-full max-w-[900px] items-center justify-center px-6 py-10">
-          <OnboardingStage step={step} task={task} setTask={setTask} workspaceName={workspaceName} setWorkspaceName={setWorkspaceName} />
+          <OnboardingStage
+            step={step}
+            task={task}
+            setTask={setTask}
+            issueKind={issueKind}
+            setIssueKind={setIssueKind}
+            workspaceName={workspaceName}
+            setWorkspaceName={setWorkspaceName}
+          />
         </div>
       </main>
 
@@ -138,7 +154,7 @@ export function FirstRunOnboarding() {
         {last ? (
           <button
             onClick={() => void enter()}
-            disabled={busy}
+            disabled={busy || !canEnter}
             className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] border border-accent bg-accent px-3 text-[13px] font-medium text-[oklch(0.18_0.02_40)] transition-[filter,opacity] hover:brightness-105 disabled:pointer-events-none disabled:opacity-45"
           >
             <ArrowRight size={14} />
@@ -161,12 +177,16 @@ function OnboardingStage({
   setWorkspaceName,
   task,
   setTask,
+  issueKind,
+  setIssueKind,
 }: {
   step: number;
   workspaceName: string;
   setWorkspaceName: (v: string) => void;
   task: string;
   setTask: (v: string) => void;
+  issueKind: string;
+  setIssueKind: (v: string) => void;
 }) {
   const { t } = useTranslation();
 
@@ -259,9 +279,27 @@ function OnboardingStage({
         <textarea
           value={task}
           onChange={(e) => setTask(e.currentTarget.value)}
+          placeholder={t("dialog.threadTitlePlaceholder")}
           rows={4}
           className="mt-5 w-full resize-none rounded-[var(--radius-md)] border border-border bg-bg px-3 py-2.5 text-[13px] leading-relaxed text-ink outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/25"
         />
+        <label className="mt-4 flex flex-col gap-2">
+          <span className="text-[10.5px] font-semibold uppercase tracking-wider text-ink-faint">
+            {t("dialog.threadType")}
+          </span>
+          <Select
+            value={issueKind}
+            onValueChange={setIssueKind}
+            ariaLabel={t("dialog.threadType")}
+            placeholder={t("dialog.threadTypePlaceholder")}
+            options={[
+              { value: "feature", label: t("kind.feature") },
+              { value: "bugfix", label: t("kind.bugfix") },
+              { value: "refactor", label: t("kind.refactor") },
+              { value: "spike", label: t("kind.spike") },
+            ]}
+          />
+        </label>
       </section>
     );
   }

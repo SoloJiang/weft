@@ -5,7 +5,7 @@
 //! `-c user.email=… -c user.name=…` so we don't read or mutate the user's
 //! global git identity.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::Command;
 

@@ -22,7 +22,11 @@ pub struct SlashCmd {
 impl SlashCmd {
     /// Name-only command (claude's init list, codex prompt stems): no metadata.
     pub fn bare(name: impl Into<String>) -> Self {
-        Self { name: name.into(), description: None, arg_hint: None }
+        Self {
+            name: name.into(),
+            description: None,
+            arg_hint: None,
+        }
     }
 }
 

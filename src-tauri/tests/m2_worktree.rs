@@ -2,8 +2,8 @@
 //! same repo across two threads doesn't collide.
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use weft_app_lib::materialize::{cleanup_worktrees, materialize_direction};
-use weft_app_lib::store::{repo, Db};
+use weft::materialize::{cleanup_worktrees, materialize_direction};
+use weft::store::{repo, Db};
 
 fn sh(dir: &Path, args: &[&str]) {
     let st = Command::new(args[0])
@@ -101,7 +101,7 @@ async fn m2_acceptance() {
     );
     assert_ne!(w3[0].branch, w1[0].branch, "branches must differ");
     // both worktrees coexist in repo-a
-    let listed = weft_app_lib::git::list_worktrees(&repo_a).unwrap();
+    let listed = weft::git::list_worktrees(&repo_a).unwrap();
     assert!(listed.iter().any(|(_, b)| b == &w1[0].branch));
     assert!(listed.iter().any(|(_, b)| b == &w3[0].branch));
 
@@ -120,7 +120,7 @@ async fn m2_acceptance() {
 
     // the deleted thread's namespaced branch must be gone from the canonical repo
     // (zero-accumulation), while the surviving thread's branch remains.
-    let listed_after = weft_app_lib::git::list_worktrees(&repo_a).unwrap();
+    let listed_after = weft::git::list_worktrees(&repo_a).unwrap();
     assert!(
         !listed_after.iter().any(|(_, b)| b == &w1[0].branch),
         "deleted thread's branch must be gone"
