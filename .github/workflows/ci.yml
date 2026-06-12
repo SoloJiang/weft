@@ -136,23 +136,35 @@ jobs:
           $libExe = $exes | Where-Object { (Split-Path -Leaf $_) -match '^weft-[0-9a-f]+\.exe$' } | Select-Object -First 1
           if (-not $libExe) { $libExe = $exes | Select-Object -First 1 }
           Write-Host "########## inspecting: $libExe ##########"
-          Write-Host "----- /dependents -----"
-          $dep = & $dumpbin /dependents $libExe
-          $dep | Write-Host
-          Write-Host "----- /imports -----"
-          & $dumpbin /imports $libExe
 
-          # Dump exports of the resolved runtime DLLs so the missing symbol can be
-          # diffed against the imports above by reading the log.
-          $suspects = 'vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll','ucrtbase.dll'
-          foreach ($s in $suspects) {
-            $loc = (Get-Command $s -ErrorAction SilentlyContinue).Source
-            if (-not $loc) { $loc = "$env:SystemRoot\System32\$s" }
-            if (Test-Path $loc) {
-              Write-Host "----- /exports $loc -----"
-              & $dumpbin /exports $loc | Select-Object -First 40
+          # Parse the exe's imports into { dll -> [funcs] }.
+          $imports = @{}
+          $cur = $null
+          foreach ($line in (& $dumpbin /imports $libExe)) {
+            if ($line -match '^\s{4}([A-Za-z0-9_.-]+\.dll)\s*$') {
+              $cur = $matches[1].ToLower(); if (-not $imports.ContainsKey($cur)) { $imports[$cur] = @() }; continue
+            }
+            if ($cur -and $line -match '^\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_@]*)\s*$') { $imports[$cur] += $matches[1] }
+          }
+
+          # For each real DLL (skip api-set contracts), resolve the file the loader
+          # would use and diff the exe's imported names against its export table.
+          # Any import missing from the export table IS the STATUS_ENTRYPOINT_NOT_FOUND.
+          foreach ($dll in ($imports.Keys | Sort-Object)) {
+            if ($dll -like 'api-ms-*') { Write-Host "[skip api-set] $dll ($($imports[$dll].Count))"; continue }
+            $path = (Get-Command $dll -ErrorAction SilentlyContinue).Source
+            if (-not $path) { $path = Join-Path "$env:SystemRoot\System32" $dll }
+            if (-not (Test-Path $path)) { Write-Host "########## MISSING DLL: $dll (not on system)"; continue }
+            $exports = New-Object System.Collections.Generic.HashSet[string]
+            foreach ($l in (& $dumpbin /exports $path)) {
+              if ($l -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{4,}\s+([A-Za-z_][A-Za-z0-9_@]*)') { [void]$exports.Add($matches[1]) }
+            }
+            $missing = $imports[$dll] | Where-Object { -not $exports.Contains($_) }
+            if ($missing) {
+              Write-Host "########## MISSING ENTRY POINTS in ${dll} -> ${path}:"
+              $missing | ForEach-Object { Write-Host "    $dll!$_" }
             } else {
-              Write-Host "----- $s NOT FOUND -----"
+              Write-Host "[ok] $dll ($($imports[$dll].Count) imports / $($exports.Count) exports) -> $path"
             }
           }
 
