@@ -278,6 +278,39 @@ pub struct LeadStateInfo {
     pub cwd: String,
 }
 
+/// 由「常驻子进程是否存活」与「当前 turn 是否在跑」决定 lead engine 对外报的 state。
+/// 纯函数，便于回归测试。
+///
+/// **busy 优先于 alive**：codex app-server 在共享连接上跑 turn，没有 per-turn 子进程，
+/// 故进行中也 alive=false。若先判 alive 会把正在跑的一轮误报成 "stopped"，切页重挂时
+/// loadLeadChat 便用它覆盖实时 "busy"，「处理中」占位随之消失。turn 结束/进程死时
+/// busy 都会被复位（见 engine.rs on_turn_end / 死亡清理），故 busy 优先是安全的。
+fn lead_state_label(alive: bool, busy: bool) -> &'static str {
+    if busy {
+        "busy"
+    } else if !alive {
+        "stopped"
+    } else {
+        "idle"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lead_state_label;
+
+    #[test]
+    fn busy_turn_reports_busy_even_without_resident_child() {
+        // codex app-server 在共享连接上跑 turn，没有 per-turn 子进程，故进行中
+        // alive=false。正在跑的一轮必须仍报 "busy"——否则切页重挂时 loadLeadChat
+        // 会用陈旧的 "stopped" 覆盖实时态，「处理中」占位消失。（回归）
+        assert_eq!(lead_state_label(false, true), "busy");
+        assert_eq!(lead_state_label(true, true), "busy");
+        assert_eq!(lead_state_label(true, false), "idle");
+        assert_eq!(lead_state_label(false, false), "stopped");
+    }
+}
+
 #[tauri::command]
 pub async fn lead_state(
     app: AppHandle,
@@ -308,14 +341,7 @@ pub async fn lead_state(
                 .map(|c| c.try_wait().ok().flatten().is_none())
                 .unwrap_or(false);
             Ok(LeadStateInfo {
-                state: if !alive {
-                    "stopped"
-                } else if i.turn.busy {
-                    "busy"
-                } else {
-                    "idle"
-                }
-                .into(),
+                state: lead_state_label(alive, i.turn.busy).into(),
                 queued: i.turn.queue.len(),
                 native_id: i.native_id.clone(),
                 slash_commands: i.slash_commands.clone(),
