@@ -56,7 +56,11 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
     if std::fs::write(&script, body).is_err() {
         return Injection { args: vec![] };
     }
-    let _ = std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+    }
     crate::git::git_exclude(cwd, ".weft-ask-hook.sh");
 
     match tool {
