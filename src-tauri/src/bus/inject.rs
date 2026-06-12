@@ -27,13 +27,10 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
     format!("{base}/ask/{thread}/{dir}?tool={tool}")
 }
 
-/// Install the Ask Bridge for a session: a PreToolUse hook that POSTs each tool
-/// action to weft's /ask endpoint and blocks on the returned allow/deny. Both
-/// claude and codex use the IDENTICAL hookSpecificOutput contract, so the hook
-/// script is shared; only the per-tool wiring differs (claude `--settings`,
-/// codex `-c hooks.PreToolUse`). Additive — stacks with the user's own hooks.
-/// Best-effort: empty args if files can't be written. (OpenCode bridges via its
-/// server `/event` channel, not a hook — handled elsewhere.)
+/// Install the Ask Bridge for a session. Claude gets a worktree-local
+/// PreToolUse settings file; Codex writes only a worktree route file consumed
+/// by Weft's stable global hook in `~/.codex/config.toml`; OpenCode bridges via
+/// its server `/event` plugin. Best-effort: empty args if files can't be written.
 pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
     if tool == "opencode" {
         return inject_opencode_ask_plugin(base, thread, dir, cwd);
@@ -42,6 +39,14 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
         return Injection { args: vec![] };
     }
     let url = ask_url(base, thread, dir, tool);
+    if tool == "codex" {
+        let route = cwd.join(".weft-codex-ask-url");
+        if std::fs::write(&route, &url).is_err() {
+            return Injection { args: vec![] };
+        }
+        crate::git::git_exclude(cwd, ".weft-codex-ask-url");
+        return Injection { args: vec![] };
+    }
     let script = cwd.join(".weft-ask-hook.sh");
     // Reads the PreToolUse JSON on stdin, asks weft, echoes weft's decision JSON
     // (empty on failure/timeout → the tool falls back to its own prompt).
@@ -282,16 +287,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_ask_hook_does_not_bypass_hook_trust() {
+    fn codex_ask_hook_writes_worktree_route_without_launch_bypass() {
         let dir = std::env::temp_dir().join(format!("weft-askh-x-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let inj = inject_ask_hook("http://127.0.0.1:9", 2, "30", "codex", &dir);
         assert!(
-            !inj.args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-hook-trust"),
-            "codex launch args must not trigger the hook-trust bypass warning"
+            inj.args.is_empty(),
+            "global trusted hook needs no launch args"
         );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".weft-codex-ask-url")).unwrap(),
+            "http://127.0.0.1:9/ask/2/30?tool=codex"
+        );
+        assert!(!dir.join(".weft-ask-hook.sh").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

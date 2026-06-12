@@ -148,6 +148,7 @@ impl AgentAdapter for CodexExecAdapter {
 
     fn prepare(&self, cwd: &Path) {
         crate::codex::ensure_codex_trusted(cwd);
+        crate::codex::ensure_codex_hook();
     }
 
     fn build_argv(&self, ctx: &AdapterContext) -> anyhow::Result<(String, Vec<String>)> {
