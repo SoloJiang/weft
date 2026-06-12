@@ -439,8 +439,8 @@ pub async fn execute(
                     (ctx.inbound_message_id.as_deref(), ctx.acks.as_ref())
                 {
                     // emoji_type 必须是飞书有效键："EYES" 不在目录里（reaction 静默失败的元凶之一）。
-                    // 用 "OK"（👌，确认收到）——有效且语义贴近「已收到，排队处理」。
-                    match channel.add_reaction(mid, "OK").await {
+                    // 用 "MeMeMe"（飞书 👀「看我看我」表情）——有效键，语义即「已看到，排队处理」。
+                    match channel.add_reaction(mid, "MeMeMe").await {
                         Ok(rid) => {
                             acks.lock()
                                 .await
