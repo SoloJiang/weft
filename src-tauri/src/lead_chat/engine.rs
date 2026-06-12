@@ -388,7 +388,13 @@ pub async fn send(
     };
     // codex (app-server): no resident stdin, no per-turn process — the shared
     // connection drives the turn after the lock drops. Gated; default stays exec.
-    let is_codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
+    //
+    // BUT the app-server path (spawn_codex_turn) injects neither extra_args (the
+    // per-thread MCP, e.g. weft_global) nor system_prompt — only exec does. So any
+    // thread that needs them (the Concierge: non-empty system_prompt + weft_global
+    // MCP) must take the exec path, or it answers with no Weft tools and no prompt.
+    let is_codex_appserver =
+        inner.tool == "codex" && codex_appserver_enabled() && inner.system_prompt.is_empty();
     let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
     if direct && !spawn_now && !is_codex_appserver {
         write_user(&mut inner, &out).await;

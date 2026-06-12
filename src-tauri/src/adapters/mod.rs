@@ -157,11 +157,20 @@ impl AgentAdapter for CodexExecAdapter {
         a.push("--json".into());
         a.push("--cd".into());
         a.push(ctx.cwd.to_string_lossy().into_owned());
+        let first_turn = ctx.native_id.is_none();
         if let Some(id) = ctx.native_id {
             a.push("resume".into());
             a.push(id.to_string());
         }
-        a.push(ctx.message.to_string());
+        // codex has no `--append-system-prompt`: on the first turn, prepend the
+        // system prompt (e.g. the Concierge prompt) to the message. Resume turns
+        // already carry it in the conversation history, so only the first.
+        let msg = if first_turn && !ctx.system_prompt.is_empty() {
+            format!("{}\n\n{}", ctx.system_prompt, ctx.message)
+        } else {
+            ctx.message.to_string()
+        };
+        a.push(msg);
         Ok(("codex".into(), a))
     }
 
