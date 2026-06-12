@@ -31,7 +31,7 @@ const ROLE_ICON: Record<string, ComponentType<LucideProps>> = {
   unknown: CircleDashed,
 };
 
-const NODE_W = 224;
+const NODE_W = 248;
 const NODE_H = 108;
 const COL_GAP = 82;
 const ROW_GAP = 18;
@@ -383,7 +383,7 @@ function RepoProfilePane({
   const Icon = ROLE_ICON[profile.role] ?? CircleDashed;
 
   return (
-    <aside className="flex w-[360px] shrink-0 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
+    <aside className="flex w-[320px] shrink-0 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
       <div className="border-b border-border px-4 py-3">
         <div className="flex min-h-10 items-center gap-2.5">
           <span className="grid h-8 w-8 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost">
@@ -478,7 +478,7 @@ function CollapsedProfileRail({ onOpen }: { onOpen: () => void }) {
 function EmptyProfilePane() {
   const { t } = useTranslation();
   return (
-    <aside className="flex w-[360px] shrink-0 flex-col items-center justify-center rounded-[var(--radius-lg)] border border-border bg-surface px-6 text-center">
+    <aside className="flex w-[320px] shrink-0 flex-col items-center justify-center rounded-[var(--radius-lg)] border border-border bg-surface px-5 text-center">
       <CircleDashed size={22} className="text-ink-faint" />
       <p className="mt-3 text-[13px] font-medium text-ink">{t("repomap.selectRepo")}</p>
       <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">
