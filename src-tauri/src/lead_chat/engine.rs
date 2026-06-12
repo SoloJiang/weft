@@ -15,6 +15,11 @@ use tokio::process::{Child, ChildStdin, Command};
 
 pub const EVENT: &str = "lead-chat";
 
+/// 流式节流间隔（ms）：每过这么久把当前累积文本落一次 DB 快照，并向 IM 桥发一帧
+/// LeadDelta（飞书 CardKit 流式卡据此逐帧更新）。桌面 UI 不受影响——它吃的是每个
+/// token 的原始 `Push::Delta`。150ms 是流式卡看着流畅的下限；再大就一顿一顿的。
+const STREAM_THROTTLE_MS: u128 = 150;
+
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -508,7 +513,7 @@ async fn codex_consumer(
                     }
                 };
                 if let Some(c) = &mut inner.current {
-                    if c.2.elapsed().as_millis() >= 500 {
+                    if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
                         c.2 = std::time::Instant::now();
                         let content = serde_json::json!({ "text": c.1 }).to_string();
                         let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
@@ -981,9 +986,9 @@ fn spawn_reader(
                             id
                         }
                     };
-                    // Throttle DB snapshots; the live UI rides the Delta events.
+                    // Throttle DB snapshots + IM streaming frames; the live UI rides raw Delta events.
                     if let Some(c) = &mut inner.current {
-                        if c.2.elapsed().as_millis() >= 500 {
+                        if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
                             c.2 = std::time::Instant::now();
                             let content = serde_json::json!({ "text": c.1 }).to_string();
                             let _ =
