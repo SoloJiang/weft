@@ -54,7 +54,12 @@ jobs:
             args: ''
           - platform: 'macos-latest'
             args: ''
-          - platform: 'windows-latest'
+          # Pinned to windows-2022 (not windows-latest): the windows-2025-vs2026
+          # image crashes the test binary at load with STATUS_ENTRYPOINT_NOT_FOUND
+          # (0xc0000139) even though every DLL the exe imports resolves cleanly —
+          # an image/SDK regression, not our code. Revisit when the 2025 image
+          # stabilizes.
+          - platform: 'windows-2022'
             args: ''
 
     runs-on: ${{ matrix.platform }}
@@ -108,65 +113,6 @@ jobs:
           # WinGet package dir to PATH — cleaner, and keeps the runtime DLL search
           # path uncluttered.
           "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Windows test-binary diagnostics
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        timeout-minutes: 30
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          # STATIC analysis only — never execute the crashing exe (that blocks on a
-          # modal "entry point not found" loader dialog) and never recurse the
-          # import tree. dumpbin /dependents + /imports + /exports of the suspect
-          # runtime DLLs is enough to pinpoint the missing entry point from the log.
-          $exes = cargo test --no-run --manifest-path src-tauri/Cargo.toml --message-format=json 2>$null |
-            ForEach-Object { try { $o = $_ | ConvertFrom-Json } catch { return }; if ($o.executable) { $o.executable } } |
-            Where-Object { $_ }
-          Write-Host "=== test executables ==="
-          $exes | ForEach-Object { Write-Host $_ }
-
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -property installationPath
-          $dumpbin = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1 -ExpandProperty FullName
-          Write-Host "dumpbin: $dumpbin"
-
-          # Inspect the lib unittest exe (weft-<hash>.exe) — the one that crashes.
-          $libExe = $exes | Where-Object { (Split-Path -Leaf $_) -match '^weft-[0-9a-f]+\.exe$' } | Select-Object -First 1
-          if (-not $libExe) { $libExe = $exes | Select-Object -First 1 }
-          Write-Host "########## inspecting: $libExe ##########"
-
-          # Parse the exe's imports into { dll -> [funcs] }.
-          $imports = @{}
-          $cur = $null
-          foreach ($line in (& $dumpbin /imports $libExe)) {
-            if ($line -match '^\s{4}([A-Za-z0-9_.-]+\.dll)\s*$') {
-              $cur = $matches[1].ToLower(); if (-not $imports.ContainsKey($cur)) { $imports[$cur] = @() }; continue
-            }
-            if ($cur -and $line -match '^\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_@]*)\s*$') { $imports[$cur] += $matches[1] }
-          }
-
-          # For each real DLL (skip api-set contracts), resolve the file the loader
-          # would use and diff the exe's imported names against its export table.
-          # Any import missing from the export table IS the STATUS_ENTRYPOINT_NOT_FOUND.
-          foreach ($dll in ($imports.Keys | Sort-Object)) {
-            if ($dll -like 'api-ms-*') { Write-Host "[skip api-set] $dll ($($imports[$dll].Count))"; continue }
-            $path = (Get-Command $dll -ErrorAction SilentlyContinue).Source
-            if (-not $path) { $path = Join-Path "$env:SystemRoot\System32" $dll }
-            if (-not (Test-Path $path)) { Write-Host "########## MISSING DLL: $dll (not on system)"; continue }
-            $exports = New-Object System.Collections.Generic.HashSet[string]
-            foreach ($l in (& $dumpbin /exports $path)) {
-              if ($l -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{4,}\s+([A-Za-z_][A-Za-z0-9_@]*)') { [void]$exports.Add($matches[1]) }
-            }
-            $missing = $imports[$dll] | Where-Object { -not $exports.Contains($_) }
-            if ($missing) {
-              Write-Host "########## MISSING ENTRY POINTS in ${dll} -> ${path}:"
-              $missing | ForEach-Object { Write-Host "    $dll!$_" }
-            } else {
-              Write-Host "[ok] $dll ($($imports[$dll].Count) imports / $($exports.Count) exports) -> $path"
-            }
-          }
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
