@@ -113,6 +113,67 @@ impl BackupService {
         let digest = hex::encode(h.finalize());
         self.home.join("backup").join(&digest[..8])
     }
+
+    /// Pull a backup snapshot down from `remote_url`, validate it against this
+    /// build's schema, and lay `weft.db` back into `<home>/weft.db`. Also
+    /// writes the key in `recovery_key_path` back into the Keychain so the
+    /// next `Db::open_default` can decrypt it.
+    ///
+    /// Safety: refuses to run when `<home>/weft.db` already exists — restore
+    /// is a destructive operation; the caller must move/delete the old db
+    /// deliberately. The caller is expected to prompt the user to restart
+    /// Weft after this succeeds.
+    pub async fn restore_from(
+        &self,
+        remote_url: &str,
+        recovery_key_path: &std::path::Path,
+    ) -> Result<()> {
+        let db_path = self.home.join("weft.db");
+        if db_path.exists() {
+            return Err(anyhow::anyhow!(
+                "refusing to restore: {} already exists; remove it first",
+                db_path.display()
+            ));
+        }
+
+        // Writes back to Keychain (or no-ops under the test env bypass).
+        let _imported = recovery_key::import_from(recovery_key_path)?;
+
+        let tmp = self.home.join("backup-restore-tmp");
+        if tmp.exists() {
+            std::fs::remove_dir_all(&tmp)?;
+        }
+        git_remote::clone_to(&tmp, remote_url)?;
+
+        let meta_path = tmp.join(".weft-backup-meta.json");
+        let meta_bytes = std::fs::read(&meta_path)
+            .map_err(|e| anyhow::anyhow!("read backup meta {}: {e}", meta_path.display()))?;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)?;
+        let backup_version = meta["schema_version"].as_u64().unwrap_or(0) as usize;
+        use sea_orm_migration::MigratorTrait;
+        let current_version = crate::store::migration::Migrator::migrations().len();
+        if backup_version > current_version {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(anyhow::anyhow!(
+                "backup schema {backup_version} is newer than this Weft ({current_version}); upgrade Weft first"
+            ));
+        }
+
+        let snap = tmp.join("weft.db");
+        if !snap.exists() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(anyhow::anyhow!(
+                "backup repo missing weft.db: {}",
+                snap.display()
+            ));
+        }
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&snap, &db_path)?;
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
+    }
 }
 
 fn unix_now() -> String {
