@@ -25,12 +25,14 @@ fn env_secs(key: &str, default: u64) -> u64 {
 }
 
 /// Canonicalize for robust path comparison (resolves macOS /var→/private/var
-/// symlinks). Falls back to the lossy string if canonicalize fails.
+/// symlinks). Falls back to the lossy string if canonicalize fails. Separators
+/// are normalized to `/` so the boundary checks in `is_under` work on Windows,
+/// where canonicalize yields `\\?\C:\…` backslash paths.
 fn canon_str(p: &Path) -> String {
     std::fs::canonicalize(p)
         .unwrap_or_else(|_| p.to_path_buf())
         .to_string_lossy()
-        .to_string()
+        .replace('\\', "/")
 }
 
 /// Dir mtime in unix secs, None if unreadable (→ "unknown age" = never swept).
