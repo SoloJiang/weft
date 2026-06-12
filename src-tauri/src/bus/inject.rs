@@ -88,19 +88,10 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
                 args: vec!["--settings".into(), settings.to_string_lossy().to_string()],
             }
         }
-        // Codex defines the same hook in config.toml. We pass it inline via `-c`
-        // and add --dangerously-bypass-hook-trust: that flag only waives
-        // SOURCE-trust for our own generated hook so it runs unattended — it does
-        // NOT skip approvals or the sandbox (the hook IS the approval surface).
-        "codex" => {
-            let hooks = format!(
-                "hooks.PreToolUse=[{{ matcher = \".*\", hooks = [{{ type = \"command\", command = \"bash {}\" }}] }}]",
-                script.to_string_lossy()
-            );
-            Injection {
-                args: vec!["--dangerously-bypass-hook-trust".into(), "-c".into(), hooks],
-            }
-        }
+        // Codex now warns loudly when --dangerously-bypass-hook-trust is used.
+        // Do not inject Weft's PreToolUse hook through that bypass path; Codex's
+        // own sandbox/approval mode remains authoritative for exec sessions.
+        "codex" => Injection { args: vec![] },
         _ => Injection { args: vec![] },
     }
 }
@@ -291,16 +282,16 @@ mod tests {
     }
 
     #[test]
-    fn codex_ask_hook_injects_pretooluse_via_config() {
+    fn codex_ask_hook_does_not_bypass_hook_trust() {
         let dir = std::env::temp_dir().join(format!("weft-askh-x-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let inj = inject_ask_hook("http://127.0.0.1:9", 2, "30", "codex", &dir);
-        assert_eq!(inj.args[0], "--dangerously-bypass-hook-trust");
-        assert_eq!(inj.args[1], "-c");
-        assert!(inj.args[2].starts_with("hooks.PreToolUse=["));
-        assert!(inj.args[2].contains(".weft-ask-hook.sh"));
-        let script = std::fs::read_to_string(dir.join(".weft-ask-hook.sh")).unwrap();
-        assert!(script.contains("/ask/2/30?tool=codex"));
+        assert!(
+            !inj.args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-hook-trust"),
+            "codex launch args must not trigger the hook-trust bypass warning"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

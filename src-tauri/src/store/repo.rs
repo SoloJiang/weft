@@ -616,6 +616,23 @@ pub async fn latest_session_for_direction(
         .await?)
 }
 
+pub async fn sessions_for_thread(db: &Db, thread_id: i32) -> Result<Vec<session::Model>> {
+    let direction_ids: Vec<i32> = direction::Entity::find()
+        .filter(direction::Column::ThreadId.eq(thread_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    if direction_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(session::Entity::find()
+        .filter(session::Column::DirectionId.is_in(direction_ids))
+        .all(&db.0)
+        .await?)
+}
+
 // ---- chat timeline (lead console + chat-mode workers) ----
 
 #[allow(clippy::too_many_arguments)]
@@ -649,6 +666,29 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
         let mut a: lead_message::ActiveModel = m.into();
         a.content = Set(content.to_string());
         a.status = Set(status.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// Close rows left `streaming` by a previous app process. Live turn state is
+/// memory-only; after restart these rows can no longer receive deltas, so show
+/// them as interrupted instead of a forever-typing assistant.
+pub async fn mark_incomplete_turns_interrupted(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<()> {
+    let mut q = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Status.eq("streaming"));
+    q = match session_id {
+        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
+        None => q.filter(lead_message::Column::SessionId.is_null()),
+    };
+    for m in q.all(&db.0).await? {
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set("interrupted".to_string());
         a.update(&db.0).await?;
     }
     Ok(())
@@ -850,6 +890,48 @@ mod tests {
         assert_eq!(next_turn_id(&db, 1).await.unwrap(), 2);
     }
 
+    #[tokio::test]
+    async fn stale_streaming_messages_mark_interrupted_on_reopen() {
+        let db = mem().await;
+        let streaming = insert_lead_message(
+            &db,
+            4,
+            Some(9),
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"partial"}"#,
+            "streaming",
+        )
+        .await
+        .unwrap();
+        let queued = insert_lead_message(
+            &db,
+            4,
+            Some(9),
+            2,
+            "user",
+            "text",
+            r#"{"text":"next"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
+
+        mark_incomplete_turns_interrupted(&db, 4, Some(9))
+            .await
+            .unwrap();
+
+        let all = list_lead_messages(&db, 4).await.unwrap();
+        assert_eq!(
+            all.iter().find(|m| m.id == streaming.id).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(
+            all.iter().find(|m| m.id == queued.id).unwrap().status,
+            "queued"
+        );
+    }
     #[tokio::test]
     async fn queued_flips_to_complete() {
         let db = mem().await;

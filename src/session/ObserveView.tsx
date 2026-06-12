@@ -5,14 +5,9 @@ import { useStore } from "../state/store";
 import { api } from "../lib/api";
 import type { ObserveRef, SessionStatus } from "../lib/types";
 import { Transcript } from "./Transcript";
-import { ChatTimeline } from "./ChatTimeline";
-import { ChatComposer } from "./ChatComposer";
-import { PermissionBar } from "./PermissionBar";
-import { appLink, resumeCommand } from "../lib/resume";
 import { DiffPanel } from "./DiffPanel";
 import { StatusChip } from "../components/ui/StatusChip";
 import { Button } from "../components/ui/Button";
-import { Tooltip } from "../components/ui/Tooltip";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 
@@ -22,15 +17,7 @@ export function ObserveView() {
     driveDirection,
     sessions,
     needs,
-    asks,
     answerAsk,
-    activeThreadId,
-    leadMessages,
-    workerTurn,
-    workerSlash,
-    discoverWorkerSlash,
-    workerActivity,
-    loadLeadChat,
     sendToDirection,
   } = useStore();
   const { t } = useTranslation();
@@ -70,11 +57,6 @@ export function ObserveView() {
     };
   }, [directionId, repoId]);
 
-  // Chat-mode sessions render the weft-owned timeline; keep it hydrated.
-  useEffect(() => {
-    if (activeThreadId != null) void loadLeadChat(activeThreadId);
-  }, [activeThreadId, loadLeadChat]);
-
   if (viewing == null) return null;
 
   const liveSession = Object.values(sessions).find(
@@ -82,21 +64,8 @@ export function ObserveView() {
   );
   const openAsks = needs.filter((n) => n.direction_id === directionId);
 
-  // A chat-engine worker (any vendor) shows its REAL conversation, not the
-  // jsonl projection: live chat session, or persisted chat rows after a
-  // restart (chat_send rebuilds the engine on demand).
-  const chatSessionId =
-    liveSession != null
-      ? liveSession.info.session_id
-      : ref?.session_id != null
-        ? ref.session_id
-        : null;
-  const chatMsgs =
-    chatSessionId != null && activeThreadId != null
-      ? (leadMessages[activeThreadId] ?? []).filter((m) => m.session_id === chatSessionId)
-      : [];
-  const chatMode = chatSessionId != null && (liveSession != null || chatMsgs.length > 0);
-
+  // Observe is read-only. Starting/continuing a worker opens the single
+  // conversation surface in SessionView; this page keeps transcript/diff only.
   // Label: attach (live) → continue (has native id) → start (never dispatched).
   const driveLabel = liveSession
     ? t("observe.attach")
@@ -123,9 +92,6 @@ export function ObserveView() {
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
-        {/* Chat takeover needs no PTY-era bar (status chip / Attach): the
-            conversation is the console; diff + inspect ride the composer row. */}
-        {!chatMode && (
         <header className="flex items-center justify-end gap-2 border-b border-border bg-surface px-3 py-2">
             {ref && (
               <span className="mr-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-[11px] font-medium text-ink-muted">
@@ -158,7 +124,6 @@ export function ObserveView() {
               />
             )}
         </header>
-        )}
 
         {driveError && (
           <div className="border-b border-border bg-[oklch(0.64_0.2_25/0.12)] px-3 py-1.5 text-[12px] text-danger">
@@ -174,64 +139,7 @@ export function ObserveView() {
           </div>
         )}
 
-        {chatMode && chatSessionId != null ? (
-          <>
-            <PermissionBar asks={asks.filter((a) => a.dir === String(directionId))} />
-            <ChatTimeline
-              messages={chatMsgs}
-              busy={(workerTurn[chatSessionId]?.state ?? "stopped") === "busy"}
-              activity={workerActivity[chatSessionId]}
-              onReviewProposal={() => {}}
-            />
-            <ChatComposer
-              slashCommands={workerSlash[chatSessionId] ?? []}
-              onNeedSlashCommands={() => discoverWorkerSlash(chatSessionId)}
-              busy={(workerTurn[chatSessionId]?.state ?? "stopped") === "busy"}
-              queued={workerTurn[chatSessionId]?.queued ?? 0}
-              placeholder={t("session.message")}
-              onSend={(v, images, files) =>
-                void api.chatSend(chatSessionId, v, images, files)
-              }
-              onStop={() => void api.chatInterrupt(chatSessionId)}
-              onTakeOver={async () => {
-                if (!ref?.native_id) return false;
-                await api.chatStop(chatSessionId);
-                await navigator.clipboard.writeText(
-                  resumeCommand(ref.tool, ref.worktree, ref.native_id),
-                );
-                return true;
-              }}
-              onOpenApp={
-                ref?.native_id && appLink(ref.tool, ref.native_id)
-                  ? () => void api.openUrl(appLink(ref.tool, ref.native_id!)!)
-                  : undefined
-              }
-              extraActions={
-                ref && (
-                  <>
-                    <Tooltip label={t("diff.tab")}>
-                      <button
-                        onClick={() => setShowDiff(true)}
-                        aria-label={t("diff.tab")}
-                        className="grid h-7 w-7 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-                      >
-                        <GitCompare size={13} />
-                      </button>
-                    </Tooltip>
-                    <Inspect
-                      path={ref.worktree}
-                      branch={ref.branch}
-                      nativeId={ref.native_id}
-                      tool={ref.tool}
-                      size={13}
-                      className="h-7 w-7 shrink-0"
-                    />
-                  </>
-                )
-              }
-            />
-          </>
-        ) : ref ? (
+        {ref ? (
           <Transcript cwd={ref.worktree} tool={ref.tool} running={!!liveSession} />
         ) : (
           <div className="grid flex-1 place-items-center text-[13px] text-ink-faint">

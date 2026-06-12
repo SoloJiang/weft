@@ -486,9 +486,36 @@ async fn wait_for_slash_commands(eng: &EngineRef) -> Vec<crate::lead_chat::proto
 
 #[tauri::command]
 pub async fn list_lead_messages(
+    app: AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
 ) -> Result<Vec<crate::store::entities::lead_message::Model>, String> {
+    let engines: Vec<EngineRef> = {
+        let state = app.state::<LeadChatState>();
+        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().cloned().collect()
+    };
+    let mut thread_busy = false;
+    for eng in engines {
+        let inner = eng.lock().await;
+        if inner.thread_id == thread_id && inner.turn.busy {
+            thread_busy = true;
+            break;
+        }
+    }
+    if !thread_busy {
+        repo::mark_incomplete_turns_interrupted(&db, thread_id, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let sessions = repo::sessions_for_thread(&db, thread_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        for session in sessions {
+            repo::mark_incomplete_turns_interrupted(&db, thread_id, Some(session.id))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
     repo::list_lead_messages(&db, thread_id)
         .await
         .map_err(|e| e.to_string())
