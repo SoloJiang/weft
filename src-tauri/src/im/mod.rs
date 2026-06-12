@@ -257,18 +257,8 @@ pub async fn execute(
                 return Ok(()); // 已有 owner：本次绑定静默放弃
             }
             crate::store::repo::set_setting(db, K_ALLOW, &open_id).await?;
-            if let Err(e) = channel
-                .send_text(
-                    &open_id,
-                    t(
-                        "绑定成功 ✓ 之后 Weft 的权限请求和 agent 提问会推送到这里，回复卡片消息即可作答。",
-                        "Bound ✓ Weft will push permission asks and agent questions here; reply to a card to answer.",
-                    ),
-                )
-                .await
-            {
-                eprintln!("[weft][im] bind confirm: {e}");
-            }
+            // 首条消息静默绑定后直接当成问题处理（不再单发「绑定成功」打断）：把本条
+            // 文本喂给 Concierge，用户第一句就能得到回答。绑定本身已落库，后续消息照常。
             if let Some(app) = app {
                 if !text.trim().is_empty() {
                     let im_thread_ref = format!("dm:{open_id}");
@@ -448,7 +438,9 @@ pub async fn execute(
                 if let (Some(mid), Some(acks)) =
                     (ctx.inbound_message_id.as_deref(), ctx.acks.as_ref())
                 {
-                    match channel.add_reaction(mid, "EYES").await {
+                    // emoji_type 必须是飞书有效键："EYES" 不在目录里（reaction 静默失败的元凶之一）。
+                    // 用 "OK"（👌，确认收到）——有效且语义贴近「已收到，排队处理」。
+                    match channel.add_reaction(mid, "OK").await {
                         Ok(rid) => {
                             acks.lock()
                                 .await

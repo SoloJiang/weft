@@ -515,7 +515,7 @@ export const en = {
     imAppSecretHint: "Stored locally in weft.db. Leave blank to keep the saved value. The bridge connects when enabled and both credentials exist.",
     imPermsLabel: "Required permissions",
     imPermsHint:
-      "Enable these scopes under Permissions on the Open Platform: im:message covers send / reply / card update / reactions; the two readonly scopes receive 1:1 and group messages over long connection. group_msg is a sensitive scope and needs review approval.",
+      "Enable these scopes under Permissions on the Open Platform: im:message covers send / reply / card update; reactions:write_only is for emoji reactions (👀); the two readonly scopes receive 1:1 and group messages over long connection. group_msg is a sensitive scope and needs review approval.",
     imPermsCopy: "Copy scopes",
     imPermsCopied: "Copied",
     imStreaming: "Streaming replies",

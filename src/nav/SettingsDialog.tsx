@@ -413,11 +413,12 @@ function AutomationSettings() {
 }
 
 // 飞书自建应用需开通的权限点，与 src-tauri/src/im/feishu 的实际调用一一对应：
-// im:message 一条覆盖 发消息(message.create)/回复(message.reply)/更新卡片
-// (message_card.patch)/表情回复(message_reaction)；两条 readonly 用于长连接
-// (im.message.receive_v1) 接收单聊与群聊消息。改后端调用面时同步这里。
+// im:message 覆盖 发消息(message.create)/回复(message.reply)/更新卡片(message_card.patch)；
+// 表情回复(message_reaction)实测需单独开 im:message.reactions:write_only（仅 im:message
+// 不够）；两条 readonly 用于长连接(im.message.receive_v1) 接收单聊与群聊消息。改后端调用面时同步这里。
 const FEISHU_SCOPES = [
   "im:message",
+  "im:message.reactions:write_only",
   "im:message.p2p_msg:readonly",
   "im:message.group_msg:readonly",
 ] as const;

@@ -500,7 +500,7 @@ export const zh = {
     imAppSecretHint: "仅存本机 weft.db。留空表示保持已保存的值。启用且双凭证齐全后桥会连接。",
     imPermsLabel: "所需权限",
     imPermsHint:
-      "在开放平台「权限管理」开通这些权限点：im:message 一条覆盖发消息/回复/更新卡片/表情回复，两条 readonly 用于长连接接收单聊与群聊消息。group_msg 属敏感权限，需提交审核。",
+      "在开放平台「权限管理」开通这些权限点：im:message 覆盖发消息/回复/更新卡片，reactions:write_only 用于表情回复（👀），两条 readonly 用于长连接接收单聊与群聊消息。group_msg 属敏感权限，需提交审核。",
     imPermsCopy: "复制权限点",
     imPermsCopied: "已复制",
     imStreaming: "流式回复",
