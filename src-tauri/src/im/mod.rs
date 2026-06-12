@@ -15,6 +15,9 @@ pub const K_ALLOW: &str = "im.feishu.allow_open_ids";
 /// 启用开关：用户可不删凭证地断开桥。键从未写过时默认「双凭证齐全即开」，
 /// 保住升级前「凭证齐全即跑」的老用户不被这次改动断连。
 pub const K_ENABLED: &str = "im.feishu.enabled";
+/// 远程待命：桥启用期间持有「防空闲休眠」断言（power.rs RemoteStandby）。
+/// 纯电源层标志——不影响桥连接本身。默认关。
+pub const K_REMOTE_STANDBY: &str = "im.remote_standby";
 
 #[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
@@ -23,6 +26,8 @@ pub struct ImSettings {
     pub allow_open_ids: Vec<String>,
     /// 用户是否启用了桥（独立于凭证是否齐全）。off = 保留凭证但断开。
     pub enabled: bool,
+    /// 远程待命（默认关）：桥启用期间保持系统唤醒。
+    pub remote_standby: bool,
 }
 
 impl std::fmt::Debug for ImSettings {
@@ -39,6 +44,7 @@ impl std::fmt::Debug for ImSettings {
             )
             .field("allow_open_ids", &self.allow_open_ids)
             .field("enabled", &self.enabled)
+            .field("remote_standby", &self.remote_standby)
             .finish()
     }
 }
@@ -73,11 +79,16 @@ impl ImSettings {
             Some(v) => v == "1" || v == "true",
             None => has_creds,
         };
+        let remote_standby = matches!(
+            get_setting(db, K_REMOTE_STANDBY).await?.as_deref(),
+            Some("1") | Some("true")
+        );
         Ok(Self {
             app_id,
             app_secret,
             allow_open_ids,
             enabled,
+            remote_standby,
         })
     }
 }
@@ -544,9 +555,13 @@ pub fn spawn(app: tauri::AppHandle) {
         // 旧代任务下次 live() 检查时退出）。
         if !(settings.enabled && settings.ready()) {
             bridge.set_status("disabled");
+            crate::power::set_standby(&app, false);
             return;
         }
         bridge.set_status("connecting");
+        // 远程待命跟随「已启用且凭证齐全」的意图——断线重连也需要机器醒着，
+        // 所以不依赖瞬时连接状态。
+        crate::power::set_standby(&app, settings.remote_standby);
 
         let channel: Arc<dyn Channel> =
             match feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret) {
@@ -554,6 +569,7 @@ pub fn spawn(app: tauri::AppHandle) {
                 Err(e) => {
                     eprintln!("[weft][im] feishu client build: {e}");
                     bridge.set_status("error");
+                    crate::power::set_standby(&app, false);
                     return;
                 }
             };
