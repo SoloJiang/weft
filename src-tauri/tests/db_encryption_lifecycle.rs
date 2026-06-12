@@ -9,7 +9,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn fresh_env(home: &std::path::Path) {
     std::env::set_var("WEFT_HOME", home);
-    std::env::remove_var("WEFT_TEST_DB_PASSWORD");
+    std::env::set_var("WEFT_TEST_DB_PASSWORD", "test-db-password");
 }
 
 fn header(p: &std::path::Path) -> [u8; 16] {
