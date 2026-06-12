@@ -434,6 +434,7 @@ function ImSettings() {
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  const [standby, setStandby] = useState(false);
   // The toggles default to `false`. Without this flag we'd render the
   // off-state for one tick before `api.imGetSettings()` resolves, producing
   // a visible "off → on" flash for users whose IM was already enabled.
@@ -467,6 +468,7 @@ function ImSettings() {
       setBound(s.bound);
       setEnabled(s.enabled);
       setStreaming(s.streaming);
+      setStandby(s.remote_standby);
       setLoaded(true);
     });
     void api.imStatus().then(setStatus);
@@ -496,6 +498,18 @@ function ImSettings() {
       void api.imStatus().then(setStatus);
     } catch (err) {
       setStreaming(prev);
+      throw err;
+    }
+  }
+
+  // 远程待命：纯电源层开关（不重启桥）。乐观翻转 + 失败回滚。
+  async function toggleStandby(on: boolean) {
+    const prev = standby;
+    setStandby(on);
+    try {
+      await api.imSetRemoteStandby(on);
+    } catch (err) {
+      setStandby(prev);
       throw err;
     }
   }
@@ -631,6 +645,21 @@ function ImSettings() {
                 on={streaming}
                 onChange={(v) => void toggleStreaming(v)}
                 label={t("settings.imStreaming")}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-medium text-ink">
+                  {t("settings.imStandby")}
+                </div>
+                <p className="mt-0.5 text-[11.5px] leading-relaxed text-ink-faint">
+                  {t("settings.imStandbyHint")}
+                </p>
+              </div>
+              <Toggle
+                on={standby}
+                onChange={(v) => void toggleStandby(v)}
+                label={t("settings.imStandby")}
               />
             </div>
             <div className="flex justify-end">

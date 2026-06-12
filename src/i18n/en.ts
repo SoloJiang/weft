@@ -521,6 +521,9 @@ export const en = {
     imStreaming: "Streaming replies",
     imStreamingHint:
       "Render replies as live typewriter cards (Feishu CardKit): the Concierge in DMs and the lead in issue topics. Off = whole reply sent at once. Toggling restarts the bridge.",
+    imStandby: "Remote standby",
+    imStandbyHint:
+      "Keep the system awake while the bridge is enabled, so Feishu commands can reach Weft anytime. Best on AC power; closing the lid still sleeps.",
     imBound: "Bound — message the bot once to re-bind another account",
     imUnbound: "Not bound — send the bot any message to bind your account",
     imConnect: "Save & connect",

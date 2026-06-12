@@ -506,6 +506,8 @@ export const zh = {
     imStreaming: "流式回复",
     imStreamingHint:
       "把回复渲染成飞书 CardKit 流式打字机卡片：私聊里的 Concierge 和 issue 话题里的 lead。关 = 整段一次性发。切换会重启桥。",
+    imStandby: "远程待命",
+    imStandbyHint: "桥启用期间保持系统唤醒，飞书指令随时可达。建议插电使用；合盖仍会休眠。",
     imBound: "已绑定——再次私聊 bot 可重新绑定其他账号",
     imUnbound: "未绑定——给 bot 发任意一句话即可绑定你的账号",
     imConnect: "保存并连接",

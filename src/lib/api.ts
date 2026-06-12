@@ -212,6 +212,7 @@ export const api = {
       bound: boolean;
       enabled: boolean;
       streaming: boolean;
+      remote_standby: boolean;
     }>("im_get_settings"),
   imSetSettings: (appId: string, appSecret: string) =>
     invoke<void>("im_set_settings", { appId, appSecret }),
@@ -219,6 +220,8 @@ export const api = {
     invoke<void>("im_set_enabled", { enabled }),
   imSetStreaming: (enabled: boolean) =>
     invoke<void>("im_set_streaming", { enabled }),
+  imSetRemoteStandby: (enabled: boolean) =>
+    invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),
   imBindThread: (threadId: number, chatId: string, imThreadRef: string, channel = "feishu") =>
     invoke<ImRoute>("im_bind_thread", { threadId, channel, chatId, imThreadRef }),
