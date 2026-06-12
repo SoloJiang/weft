@@ -157,11 +157,20 @@ impl AgentAdapter for CodexExecAdapter {
         a.push("--json".into());
         a.push("--cd".into());
         a.push(ctx.cwd.to_string_lossy().into_owned());
+        let first_turn = ctx.native_id.is_none();
         if let Some(id) = ctx.native_id {
             a.push("resume".into());
             a.push(id.to_string());
         }
-        a.push(ctx.message.to_string());
+        // codex has no `--append-system-prompt`: on the first turn, prepend the
+        // system prompt (e.g. the Concierge prompt) to the message. Resume turns
+        // already carry it in the conversation history, so only the first.
+        let msg = if first_turn && !ctx.system_prompt.is_empty() {
+            format!("{}\n\n{}", ctx.system_prompt, ctx.message)
+        } else {
+            ctx.message.to_string()
+        };
+        a.push(msg);
         Ok(("codex".into(), a))
     }
 
@@ -192,7 +201,9 @@ impl AgentAdapter for CodexAppServerAdapter {
     }
 
     fn build_argv(&self, _ctx: &AdapterContext) -> anyhow::Result<(String, Vec<String>)> {
-        anyhow::bail!("codex app-server is a connection adapter — drive it via codex_app_server::client()")
+        anyhow::bail!(
+            "codex app-server is a connection adapter — drive it via codex_app_server::client()"
+        )
     }
 
     fn parse_line(&self, _line: &str) -> ChatEvent {
@@ -305,7 +316,9 @@ mod tests {
     #[test]
     fn claude_argv_matches_engine_shape() {
         let cwd = PathBuf::from("/tmp");
-        let (prog, a) = ClaudeAdapter.build_argv(&ctx(&cwd, Some("sess-1"), "hi", &[])).unwrap();
+        let (prog, a) = ClaudeAdapter
+            .build_argv(&ctx(&cwd, Some("sess-1"), "hi", &[]))
+            .unwrap();
         assert_eq!(prog, "claude");
         assert!(a.contains(&"--include-partial-messages".to_string()));
         assert!(a.contains(&"--verbose".to_string()));
@@ -318,7 +331,9 @@ mod tests {
     #[test]
     fn codex_exec_argv_carries_message_and_resume() {
         let cwd = PathBuf::from("/repo");
-        let (prog, a) = CodexExecAdapter.build_argv(&ctx(&cwd, Some("t1"), "do it", &[])).unwrap();
+        let (prog, a) = CodexExecAdapter
+            .build_argv(&ctx(&cwd, Some("t1"), "do it", &[]))
+            .unwrap();
         assert_eq!(prog, "codex");
         assert_eq!(a[0], "exec");
         assert!(a.contains(&"--json".to_string()));
@@ -331,12 +346,16 @@ mod tests {
     fn opencode_argv_routes_known_slash_to_command() {
         let cwd = PathBuf::from("/repo");
         let cmds = vec![SlashCmd::bare("review")];
-        let (_p, a) = OpenCodeAdapter.build_argv(&ctx(&cwd, None, "/review fix it", &cmds)).unwrap();
+        let (_p, a) = OpenCodeAdapter
+            .build_argv(&ctx(&cwd, None, "/review fix it", &cmds))
+            .unwrap();
         let i = a.iter().position(|x| x == "--command").unwrap();
         assert_eq!(a[i + 1], "review");
         assert_eq!(a.last().unwrap(), "fix it");
         // unknown slash stays literal
-        let (_p, b) = OpenCodeAdapter.build_argv(&ctx(&cwd, None, "/nope hi", &cmds)).unwrap();
+        let (_p, b) = OpenCodeAdapter
+            .build_argv(&ctx(&cwd, None, "/nope hi", &cmds))
+            .unwrap();
         assert!(!b.contains(&"--command".to_string()));
         assert_eq!(b.last().unwrap(), "/nope hi");
     }

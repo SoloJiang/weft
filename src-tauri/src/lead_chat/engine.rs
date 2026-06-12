@@ -15,6 +15,11 @@ use tokio::process::{Child, ChildStdin, Command};
 
 pub const EVENT: &str = "lead-chat";
 
+/// 流式节流间隔（ms）：每过这么久把当前累积文本落一次 DB 快照，并向 IM 桥发一帧
+/// LeadDelta（飞书 CardKit 流式卡据此逐帧更新）。桌面 UI 不受影响——它吃的是每个
+/// token 的原始 `Push::Delta`。150ms 是流式卡看着流畅的下限；再大就一顿一顿的。
+const STREAM_THROTTLE_MS: u128 = 150;
+
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -221,6 +226,39 @@ fn build_args(inner: &EngineInner) -> Vec<String> {
     a
 }
 
+fn merge_init_slash_commands(
+    existing: &[super::proto::SlashCmd],
+    init: Vec<super::proto::SlashCmd>,
+) -> Vec<super::proto::SlashCmd> {
+    if init.is_empty() {
+        return existing.to_vec();
+    }
+    if existing.is_empty() {
+        return init;
+    }
+
+    let by_name: HashMap<&str, &super::proto::SlashCmd> =
+        existing.iter().map(|c| (c.name.as_str(), c)).collect();
+    init.into_iter()
+        .map(|mut incoming| {
+            if let Some(old) = by_name.get(incoming.name.as_str()) {
+                if incoming
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    incoming.description = old.description.clone();
+                }
+                if incoming.arg_hint.as_deref().unwrap_or_default().is_empty() {
+                    incoming.arg_hint = old.arg_hint.clone();
+                }
+            }
+            incoming
+        })
+        .collect()
+}
+
 /// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
 /// Per-turn dialects have no resident process — sending spawns one per turn.
 pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
@@ -383,7 +421,13 @@ pub async fn send(
     };
     // codex (app-server): no resident stdin, no per-turn process — the shared
     // connection drives the turn after the lock drops. Gated; default stays exec.
-    let is_codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
+    //
+    // BUT the app-server path (spawn_codex_turn) injects neither extra_args (the
+    // per-thread MCP, e.g. weft_global) nor system_prompt — only exec does. So any
+    // thread that needs them (the Concierge: non-empty system_prompt + weft_global
+    // MCP) must take the exec path, or it answers with no Weft tools and no prompt.
+    let is_codex_appserver =
+        inner.tool == "codex" && codex_appserver_enabled() && inner.system_prompt.is_empty();
     let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
     if direct && !spawn_now && !is_codex_appserver {
         write_user(&mut inner, &out).await;
@@ -435,7 +479,12 @@ async fn spawn_codex_turn(
     let client = crate::codex_app_server::client().await?;
     let (native, cwd, sid, thread_id_i) = {
         let i = eng.lock().await;
-        (i.native_id.clone(), i.cwd.to_string_lossy().into_owned(), i.session_id, i.thread_id)
+        (
+            i.native_id.clone(),
+            i.cwd.to_string_lossy().into_owned(),
+            i.session_id,
+            i.thread_id,
+        )
     };
     let had_native = native.is_some();
     let thread = match native {
@@ -458,8 +507,13 @@ async fn spawn_codex_turn(
             let _ = client.resume_thread(&thread).await;
         }
         let rx = client.subscribe(&thread).await;
-        let (a, d, e, c, th) =
-            (app.clone(), db.clone(), eng.clone(), client.clone(), thread.clone());
+        let (a, d, e, c, th) = (
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            client.clone(),
+            thread.clone(),
+        );
         tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
     }
     let turn = client.start_turn(&thread, &out.text).await?;
@@ -478,8 +532,8 @@ async fn codex_consumer(
     thread: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::codex_app_server::ThreadMsg>,
 ) {
-    use crate::codex_app_server::ThreadMsg;
     use super::proto::ChatEvent;
+    use crate::codex_app_server::ThreadMsg;
     while let Some(msg) = rx.recv().await {
         match msg {
             ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
@@ -494,7 +548,13 @@ async fn codex_consumer(
                     }
                     None => {
                         let Ok(m) = repo::insert_lead_message(
-                            &db, thread_id, sid, turn, "assistant", "text", r#"{"text":""}"#,
+                            &db,
+                            thread_id,
+                            sid,
+                            turn,
+                            "assistant",
+                            "text",
+                            r#"{"text":""}"#,
                             "streaming",
                         )
                         .await
@@ -503,18 +563,32 @@ async fn codex_consumer(
                         };
                         let id = m.id;
                         inner.current = Some((id, text.clone(), std::time::Instant::now()));
-                        let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Message {
+                                thread_id,
+                                message: m,
+                            },
+                        );
                         id
                     }
                 };
                 if let Some(c) = &mut inner.current {
-                    if c.2.elapsed().as_millis() >= 500 {
+                    if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
                         c.2 = std::time::Instant::now();
                         let content = serde_json::json!({ "text": c.1 }).to_string();
                         let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
+                        emit_lead_delta(&app, thread_id, row, &c.1, false);
                     }
                 }
-                let _ = app.emit(EVENT, Push::Delta { thread_id, message_id: row, text });
+                let _ = app.emit(
+                    EVENT,
+                    Push::Delta {
+                        thread_id,
+                        message_id: row,
+                        text,
+                    },
+                );
             }
             ThreadMsg::Event(ChatEvent::Assistant { texts: _, tools }) => {
                 // Codex streams text via deltas; only non-text items arrive here,
@@ -525,7 +599,12 @@ async fn codex_consumer(
                 for (name, summary) in tools {
                     let _ = app.emit(
                         EVENT,
-                        Push::Activity { thread_id, session_id: sid, name, summary },
+                        Push::Activity {
+                            thread_id,
+                            session_id: sid,
+                            name,
+                            summary,
+                        },
                     );
                 }
             }
@@ -550,11 +629,31 @@ async fn codex_consumer(
                     .await;
                     let _ = app.emit(
                         EVENT,
-                        Push::Finalize { thread_id, message_id: id, status: status.into() },
+                        Push::Finalize {
+                            thread_id,
+                            message_id: id,
+                            status: status.into(),
+                        },
                     );
                     if status == "complete" {
                         emit_lead_out(&app, thread_id, id, &text);
                     }
+                } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
+                    &db,
+                    thread_id,
+                    inner.session_id,
+                    inner.turn_id,
+                    status,
+                )
+                .await
+                {
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Message {
+                            thread_id,
+                            message: m,
+                        },
+                    );
                 }
                 let next = inner.turn.on_turn_end();
                 if let Some(n) = &next {
@@ -593,7 +692,13 @@ async fn codex_consumer(
                     (i.thread_id, i.ask_dir.clone())
                 };
                 let (tool, summary) = if method.contains("commandExecution") {
-                    ("Bash", params["command"].as_str().unwrap_or("(command)").to_string())
+                    (
+                        "Bash",
+                        params["command"]
+                            .as_str()
+                            .unwrap_or("(command)")
+                            .to_string(),
+                    )
                 } else {
                     ("Edit", "apply file changes".to_string())
                 };
@@ -673,9 +778,7 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     if inner.tool == "codex" && codex_appserver_enabled() {
         let thread = inner.native_id.clone();
         drop(inner);
-        if let (Some(thread), Ok(client)) =
-            (thread, crate::codex_app_server::client().await)
-        {
+        if let (Some(thread), Ok(client)) = (thread, crate::codex_app_server::client().await) {
             if let Some(turn) = client.active_turn(&thread).await {
                 let _ = client.interrupt(&thread, &turn).await;
             }
@@ -752,6 +855,32 @@ fn human_dur(secs: u64) -> String {
     } else {
         format!("{}s", secs)
     }
+}
+
+async fn insert_terminal_assistant_if_missing(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn_id: i32,
+    status: &str,
+) -> anyhow::Result<Option<crate::store::entities::lead_message::Model>> {
+    let text = match status {
+        "error" => "The agent turn ended with an error before producing output.",
+        "interrupted" => "The agent turn was interrupted before producing output.",
+        _ => return Ok(None),
+    };
+    let m = repo::insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        turn_id,
+        "assistant",
+        "text",
+        &serde_json::json!({ "text": text }).to_string(),
+        status,
+    )
+    .await?;
+    Ok(Some(m))
 }
 
 /// Decide whether the in-flight turn should be force-stopped (§7 跑飞护栏).
@@ -917,6 +1046,8 @@ fn spawn_reader(
                     slash_commands,
                 } => {
                     inner.native_id = Some(session_id.clone());
+                    let slash_commands =
+                        merge_init_slash_commands(&inner.slash_commands, slash_commands);
                     inner.slash_commands = slash_commands.clone();
                     if let Some(sid) = inner.session_id {
                         let _ = repo::set_session_native_id(&db, sid, &session_id).await;
@@ -934,6 +1065,7 @@ fn spawn_reader(
                     );
                 }
                 super::proto::ChatEvent::Commands { commands } => {
+                    let commands = merge_init_slash_commands(&inner.slash_commands, commands);
                     inner.slash_commands = commands.clone();
                     let _ = app.emit(
                         EVENT,
@@ -980,13 +1112,14 @@ fn spawn_reader(
                             id
                         }
                     };
-                    // Throttle DB snapshots; the live UI rides the Delta events.
+                    // Throttle DB snapshots + IM streaming frames; the live UI rides raw Delta events.
                     if let Some(c) = &mut inner.current {
-                        if c.2.elapsed().as_millis() >= 500 {
+                        if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
                             c.2 = std::time::Instant::now();
                             let content = serde_json::json!({ "text": c.1 }).to_string();
                             let _ =
                                 repo::update_lead_message(&db, row, &content, "streaming").await;
+                            emit_lead_delta(&app, thread_id, row, &c.1, false);
                         }
                     }
                     let _ = app.emit(
@@ -1196,6 +1329,22 @@ fn spawn_reader(
                         if status == "complete" {
                             emit_lead_out(&app, thread_id, id, &text);
                         }
+                    } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
+                        &db,
+                        thread_id,
+                        inner.session_id,
+                        inner.turn_id,
+                        status,
+                    )
+                    .await
+                    {
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Message {
+                                thread_id,
+                                message: m,
+                            },
+                        );
                     }
                     if let Some(next) = inner.turn.on_turn_end() {
                         inner.turn_id += 1;
@@ -1359,6 +1508,28 @@ fn emit_lead_out(app: &AppHandle, thread_id: i32, message_id: i32, text: &str) {
             text: t.to_string(),
         });
     }
+    // streaming 收尾：每个「段落完成」处同时发一帧 done（与 LeadOut 同源、同清洗后文本），
+    // IM 桥据 done 定稿流式卡片。中间帧由两处 500ms 节流点发（见 emit_lead_delta）。
+    emit_lead_delta(app, thread_id, message_id, t, true);
+}
+
+/// streaming 增量帧。`accumulated` 是到当前为止的全文；`done` 标记最后一帧。
+/// 未注册 LeadDeltaHub（如 mock_app 测试）静默——不 panic。
+fn emit_lead_delta(
+    app: &AppHandle,
+    thread_id: i32,
+    message_id: i32,
+    accumulated: &str,
+    done: bool,
+) {
+    if let Some(hub) = app.try_state::<super::delta_hub::LeadDeltaHub>() {
+        hub.emit(super::delta_hub::LeadDelta {
+            thread_id,
+            message_id,
+            accumulated: accumulated.to_string(),
+            done,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1420,6 +1591,68 @@ mod tests {
     #[test]
     fn zero_caps_disable_each_check() {
         assert_eq!(turn_verdict(Some(1_000_000), 1_000_000, 0, 0, false), None);
+    }
+
+    #[test]
+    fn initialize_metadata_survives_later_bare_init_list() {
+        let rich = vec![crate::lead_chat::proto::SlashCmd {
+            name: "compact".into(),
+            description: Some("Summarize context".into()),
+            arg_hint: None,
+        }];
+        let bare = vec![crate::lead_chat::proto::SlashCmd::bare("compact")];
+
+        let merged = merge_init_slash_commands(&rich, bare);
+
+        assert_eq!(merged, rich);
+    }
+
+    #[test]
+    fn initialize_merge_adds_new_dynamic_commands() {
+        let existing = vec![crate::lead_chat::proto::SlashCmd {
+            name: "compact".into(),
+            description: Some("Summarize context".into()),
+            arg_hint: None,
+        }];
+        let init = vec![
+            crate::lead_chat::proto::SlashCmd::bare("compact"),
+            crate::lead_chat::proto::SlashCmd {
+                name: "superpowers:requesting-code-review".into(),
+                description: Some("Review current work".into()),
+                arg_hint: None,
+            },
+        ];
+
+        let merged = merge_init_slash_commands(&existing, init);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], existing[0]);
+        assert_eq!(merged[1].name, "superpowers:requesting-code-review");
+    }
+
+    #[tokio::test]
+    async fn terminal_error_without_current_row_is_persisted() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        let m = insert_terminal_assistant_if_missing(&db, 7, None, 3, "error")
+            .await
+            .unwrap()
+            .expect("error turn should create an assistant row");
+
+        assert_eq!(m.thread_id, 7);
+        assert_eq!(m.turn_id, 3);
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.kind, "text");
+        assert_eq!(m.status, "error");
+        assert!(m.content.contains("ended with an error"));
+        let all = repo::list_lead_messages(&db, 7).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, m.id);
+
+        let complete = insert_terminal_assistant_if_missing(&db, 7, None, 4, "complete")
+            .await
+            .unwrap();
+        assert!(complete.is_none());
     }
 
     #[test]

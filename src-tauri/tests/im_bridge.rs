@@ -1,11 +1,11 @@
 //! IM 桥集成测试：FakeChannel + 真 registry + 内存 Db。不打真飞书。
 
 use std::sync::{Arc, Mutex};
-use weft_app_lib::ask::{Answer, AskRegistry, Decision};
-use weft_app_lib::bus::BusRegistry;
-use weft_app_lib::im::{self, inbound::Route, Channel};
-use weft_app_lib::store::repo;
-use weft_app_lib::store::Db;
+use weft::ask::{Answer, AskRegistry, Decision};
+use weft::bus::BusRegistry;
+use weft::im::{self, inbound::Route, Channel};
+use weft::store::repo;
+use weft::store::Db;
 
 #[derive(Default)]
 struct FakeChannel {
@@ -14,6 +14,11 @@ struct FakeChannel {
     replies: Arc<Mutex<Vec<(String, String)>>>, // (reply_to, body)
     reactions: Arc<Mutex<Vec<(String, String)>>>, // (message_id, emoji) — adds
     deletions: Arc<Mutex<Vec<(String, String)>>>, // (message_id, reaction_id) — deletes
+}
+
+struct SlowReactionChannel {
+    inner: FakeChannel,
+    delay: std::time::Duration,
 }
 
 #[async_trait::async_trait]
@@ -58,6 +63,32 @@ impl Channel for FakeChannel {
             .unwrap()
             .push((message_id.into(), reaction_id.into()));
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Channel for SlowReactionChannel {
+    async fn send_card(&self, open_id: &str, card: serde_json::Value) -> anyhow::Result<String> {
+        self.inner.send_card(open_id, card).await
+    }
+    async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()> {
+        self.inner.patch_card(message_id, card).await
+    }
+    async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()> {
+        self.inner.send_text(open_id, text).await
+    }
+    async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
+        self.inner.send_chat_text(chat_id, text).await
+    }
+    async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
+        self.inner.reply_text(reply_to, text).await
+    }
+    async fn add_reaction(&self, message_id: &str, emoji: &str) -> anyhow::Result<String> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.add_reaction(message_id, emoji).await
+    }
+    async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> anyhow::Result<()> {
+        self.inner.delete_reaction(message_id, reaction_id).await
     }
 }
 
@@ -111,7 +142,7 @@ async fn answer_human_route_lands_in_asker_inbox() {
 }
 
 #[tokio::test]
-async fn bind_route_appends_allowlist_and_confirms() {
+async fn bind_route_appends_allowlist_without_legacy_confirmation() {
     let db = mem_db().await;
     let (asks, bus, ch) = (
         AskRegistry::new(),
@@ -129,8 +160,7 @@ async fn bind_route_appends_allowlist_and_confirms() {
     let saved = repo::get_setting(&db, im::K_ALLOW).await.unwrap();
     assert_eq!(saved.as_deref(), Some("ou_me"));
     let texts = ch.texts.lock().unwrap();
-    assert_eq!(texts.len(), 1); // 绑定确认
-    assert_eq!(texts[0].0, "ou_me");
+    assert!(texts.is_empty()); // 首绑不再单发确认；有 app 时首句直接进 Concierge。
 }
 
 #[tokio::test]
@@ -353,6 +383,7 @@ async fn issue_message_route_unbound_thread_hints_without_creating_issue() {
     let ctx = im::ExecuteCtx {
         inbound_message_id: Some("om_in".into()),
         acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
+        reaction_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -391,6 +422,7 @@ async fn issue_message_with_ctx_adds_eyes_reaction() {
     let ctx = im::ExecuteCtx {
         inbound_message_id: Some("om_in_1".into()),
         acks: Some(acks.clone()),
+        reaction_tx: None,
     };
     let r = Route::IssueMessage {
         chat_id: "oc_g".into(),
@@ -403,9 +435,47 @@ async fn issue_message_with_ctx_adds_eyes_reaction() {
         .unwrap();
     let rxns = ch.reactions.lock().unwrap();
     assert_eq!(rxns.len(), 1);
-    assert_eq!(rxns[0], ("om_in_1".into(), "EYES".into()));
+    assert_eq!(rxns[0], ("om_in_1".into(), "MeMeMe".into()));
     let acks_g = acks.lock().await;
     assert_eq!(acks_g.get(&t.id).map(|v| v.len()), Some(1));
+}
+
+#[tokio::test]
+async fn issue_message_with_reaction_queue_does_not_wait_for_feishu_reaction_api() {
+    use std::collections::HashMap;
+    let db = mem_db().await;
+    let (asks, bus) = (AskRegistry::new(), BusRegistry::new());
+    let ch = SlowReactionChannel {
+        inner: FakeChannel::default(),
+        delay: std::time::Duration::from_millis(200),
+    };
+    let ws = repo::create_workspace(&db, "ws").await.unwrap();
+    let t = repo::create_thread(&db, ws.id, "issue-x", "feature", "claude")
+        .await
+        .unwrap();
+    repo::bind_im_route(&db, t.id, "feishu", "oc_g", "omt_42")
+        .await
+        .unwrap();
+    let (reaction_tx, _reaction_rx) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = im::ExecuteCtx {
+        inbound_message_id: Some("om_in_slow".into()),
+        acks: Some(std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()))),
+        reaction_tx: Some(reaction_tx),
+    };
+    let r = Route::IssueMessage {
+        chat_id: "oc_g".into(),
+        im_thread_ref: "omt_42".into(),
+        sender_open_id: "ou_x".into(),
+        text: "看下进展".into(),
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        im::execute(r, &db, &asks, &bus, &ch, "ou_x", "zh", None, Some(&ctx)),
+    )
+    .await;
+
+    assert!(result.is_ok(), "inbound execution waited for add_reaction");
 }
 
 #[tokio::test]
@@ -413,7 +483,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
     // 端到端 M2-4 + M2-6：bind im_route → 模拟入站累计两条 👀 →
     // consume_lead_out 一次回流 + 清空两条 reaction。
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
     let db = mem_db().await;
     let ch = FakeChannel::default();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
@@ -441,7 +511,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
         message_id: 7,
         text: "搞定了一半".into(),
     };
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
     // reply 一次，body 带 Lead 前缀
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
@@ -457,7 +527,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
 async fn consume_lead_out_unbound_thread_is_noop() {
     // thread 没绑 im_route → 桥不 reply、不动 reactions。
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
     let db = mem_db().await;
     let ch = FakeChannel::default();
     let acks = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -468,7 +538,7 @@ async fn consume_lead_out_unbound_thread_is_noop() {
         message_id: 1,
         text: "nope".into(),
     };
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
     assert!(ch.replies.lock().unwrap().is_empty());
     assert!(ch.deletions.lock().unwrap().is_empty());
 }
@@ -503,7 +573,7 @@ async fn ensure_issue_topic_creates_feishu_root_and_binds_issue() {
 #[tokio::test]
 async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
 
     let db = mem_db().await;
     let ch = FakeChannel::default();
@@ -523,24 +593,35 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
     let acks = std::sync::Arc::new(tokio::sync::Mutex::new(
         HashMap::<i32, Vec<(String, String)>>::new(),
     ));
+    {
+        let mut g = acks.lock().await;
+        g.entry(concierge.id)
+            .or_default()
+            .push(("om_in_dm".into(), "re_dm".into()));
+    }
     let out = LeadOut {
         thread_id: concierge.id,
         message_id: 1,
         text: "我查到了。".into(),
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
 
     let texts = ch.texts.lock().unwrap();
     assert_eq!(texts.len(), 1);
     assert_eq!(texts[0], ("ou_owner".into(), "我查到了。".into()));
     assert!(ch.replies.lock().unwrap().is_empty());
+    assert_eq!(
+        ch.deletions.lock().unwrap().as_slice(),
+        [("om_in_dm".into(), "re_dm".into())]
+    );
+    assert!(acks.lock().await.get(&concierge.id).is_none());
 }
 
 #[tokio::test]
 async fn consume_lead_out_concierge_replies_to_bound_group_route() {
     use std::collections::HashMap;
-    use weft_app_lib::lead_chat::out_hub::LeadOut;
+    use weft::lead_chat::out_hub::LeadOut;
 
     let db = mem_db().await;
     let ch = FakeChannel::default();
@@ -560,7 +641,7 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
         text: "收到，我看一下。".into(),
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
 
     assert!(ch.texts.lock().unwrap().is_empty());
     let chat_texts = ch.chat_texts.lock().unwrap();

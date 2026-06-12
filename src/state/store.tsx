@@ -71,6 +71,8 @@ interface Store {
   leadSlash: Record<number, SlashCmd[]>;
   /** Hydrate a thread's timeline from DB + make sure the engine runs. */
   loadLeadChat: (threadId: number) => Promise<void>;
+  /** Pull a lead's slash commands on demand. */
+  discoverLeadSlash: (threadId: number) => void;
   /** Send a human message to the lead (optimistic; engine queues when busy). */
   sendLeadChat: (
     threadId: number,
@@ -149,9 +151,14 @@ interface Store {
   /** Which workspace-home tab is active (Board · Repos). */
   homeTab: HomeTab;
   setHomeTab: (t: HomeTab) => void;
+  /** Switch to Settings, snapshotting the current view so closeSettings can restore it. */
+  openSettings: () => void;
+  /** Leave Settings and restore the view that was active when openSettings ran. */
+  closeSettings: () => void;
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
+  refreshReposAndMap: (workspaceId?: number) => Promise<void>;
   reprofileRepo: (repoId: number) => Promise<void>;
   editRepoProfile: (repoId: number, summary: string, role: string) => Promise<void>;
 
@@ -268,6 +275,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
+  // Snapshot of the view that was active when the user opened Settings, so
+  // the back arrow restores it instead of dropping them on the board.
+  const prevHomeRef = useRef<{
+    homeTab: HomeTab;
+    activeThreadId: number | null;
+    activeSessionId: number | null;
+    viewing: { directionId: number; repoId: number; diff?: boolean } | null;
+    showNeeds: boolean;
+  } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
   // Thread-bus drawer + proposal-review state.
@@ -511,6 +527,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setThreadTab("lead");
   }, []);
 
+  const openSettings = useCallback(() => {
+    // Snapshot first — once we flip homeTab + clear thread/session/viewing the
+    // info is gone and the back arrow can't restore it.
+    prevHomeRef.current = {
+      homeTab,
+      activeThreadId,
+      activeSessionId,
+      viewing,
+      showNeeds,
+    };
+    setActiveThreadId(null);
+    setActiveSessionId(null);
+    setViewing(null);
+    setShowNeeds(false);
+    setHomeTab("settings");
+  }, [homeTab, activeThreadId, activeSessionId, viewing, showNeeds]);
+
+  const closeSettings = useCallback(() => {
+    const prev = prevHomeRef.current;
+    prevHomeRef.current = null;
+    if (!prev) {
+      // First-launch / direct deep link into Settings — nothing to restore.
+      setHomeTab("board");
+      return;
+    }
+    setShowNeeds(prev.showNeeds);
+    setViewing(prev.viewing);
+    setActiveSessionId(prev.activeSessionId);
+    setActiveThreadId(prev.activeThreadId);
+    setHomeTab(prev.homeTab === "settings" ? "board" : prev.homeTab);
+  }, []);
+
   const createWorkspace = useCallback(
     async (name: string) => {
       const ws = await api.createWorkspace(name);
@@ -564,7 +612,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
-  const refreshAfterRepo = useCallback(async (ws: number) => {
+  const refreshReposAndMap = useCallback(async (workspaceId?: number) => {
+    const ws = workspaceId ?? activeWorkspaceId;
+    if (ws == null || ws !== activeWorkspaceId) return;
     setRepos(await api.listRepos(ws));
     // a freshly added repo is eagerly profiled server-side; pull the new map
     try {
@@ -574,33 +624,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       /* ignore */
     }
-  }, []);
+  }, [activeWorkspaceId]);
 
   const addRepo = useCallback(
     async (name: string, path: string) => {
       if (activeWorkspaceId == null) return;
       await api.addRepoRef(activeWorkspaceId, name, path);
-      await refreshAfterRepo(activeWorkspaceId);
+      await refreshReposAndMap(activeWorkspaceId);
     },
-    [activeWorkspaceId, refreshAfterRepo],
+    [activeWorkspaceId, refreshReposAndMap],
   );
 
   const cloneRepo = useCallback(
     async (url: string, dest: string, name: string) => {
       if (activeWorkspaceId == null) return;
       await api.cloneRepo(activeWorkspaceId, url, dest, name);
-      await refreshAfterRepo(activeWorkspaceId);
+      await refreshReposAndMap(activeWorkspaceId);
     },
-    [activeWorkspaceId, refreshAfterRepo],
+    [activeWorkspaceId, refreshReposAndMap],
   );
 
   const createRepo = useCallback(
     async (name: string, dest: string) => {
       if (activeWorkspaceId == null) return;
       await api.createRepo(activeWorkspaceId, name, dest);
-      await refreshAfterRepo(activeWorkspaceId);
+      await refreshReposAndMap(activeWorkspaceId);
     },
-    [activeWorkspaceId, refreshAfterRepo],
+    [activeWorkspaceId, refreshReposAndMap],
   );
 
   const createThread = useCallback(
@@ -903,14 +953,32 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  const discoverLeadSlash = useCallback((threadId: number) => {
+    void (async () => {
+      try {
+        await api.leadEnsure(threadId, currentLang());
+      } catch {
+        /* discovery can still try the non-resident fallback below */
+      }
+      try {
+        const cmds = await api.discoverSlash(threadId, null);
+        if (cmds.length > 0) {
+          setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
+        }
+      } catch {
+        /* slash discovery is best-effort */
+      }
+    })();
+  }, []);
+
   const loadLeadChat = useCallback(async (threadId: number) => {
     const msgs = await api.listLeadMessages(threadId);
     setLeadMessages((m) => ({
       ...m,
       [threadId]: msgs.filter((x) => x.kind !== "meta"),
     }));
-    // Fire the engine up so init delivers slash commands + the console is live.
-    void api.leadEnsure(threadId, currentLang()).catch(() => {});
+    // Fire the engine up and refresh slash commands, including workspace skills.
+    discoverLeadSlash(threadId);
     try {
       const st = await api.leadState(threadId);
       setLeadTurn((t) => ({
@@ -923,10 +991,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       /* engine state is cosmetic at load time */
     }
-  }, []);
+  }, [discoverLeadSlash]);
 
-  // Pull a worker's slash commands on demand: opencode runs live GET /command
-  // discovery, claude returns its cached initialize list, codex returns none.
+  // Pull a worker's slash commands on demand: opencode runs live GET /command,
+  // claude returns its initialize list, codex mirrors TUI built-ins plus skills.
   // Best-effort — an empty result leaves the existing palette untouched.
   const discoverWorkerSlash = useCallback((sessionId: number) => {
     void api
@@ -1424,6 +1492,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     leadTurn,
     leadSlash,
     loadLeadChat,
+    discoverLeadSlash,
     sendLeadChat,
     interruptLead,
     workerTurn,
@@ -1470,8 +1539,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     repoEdges,
     homeTab,
     setHomeTab,
+    openSettings,
+    closeSettings,
     openRepoMap,
     refreshRepoMap,
+    refreshReposAndMap,
     reprofileRepo,
     editRepoProfile,
     proposal,

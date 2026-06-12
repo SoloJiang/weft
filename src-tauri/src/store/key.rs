@@ -1,108 +1,63 @@
-//! SQLCipher 密钥管理：从 OS Keychain 取/生成 32B key + 16B salt。
+//! SQLCipher 密码管理：默认明文；启用加密时由用户在 Settings 里设置密码，
+//! 密码缓存在 OS Keychain，下次启动透明打开。
+//!
+//! 测试旁路：环境变量 `WEFT_TEST_DB_PASSWORD` 存在时直接用它作密码，完全绕开
+//! Keychain。集成测试搭配 `tempfile + WEFT_HOME + WEFT_TEST_DB_PASSWORD` 隔离环境。
 
 use anyhow::Result;
 
-const KEY_LEN: usize = 32;
-const SALT_LEN: usize = 16;
 const KEYCHAIN_SERVICE: &str = "weft";
-const KEYCHAIN_ACCOUNT: &str = "db-key-v1";
+const KEYCHAIN_ACCOUNT: &str = "db-password-v1";
+const ENV_BYPASS: &str = "WEFT_TEST_DB_PASSWORD";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SqlCipherKey {
-    key: [u8; KEY_LEN],
-    salt: [u8; SALT_LEN],
+/// 把用户密码序列化成 SQLCipher 的 `"x'<hex>'"` 字面量或带引号字符串字面量。
+/// 密码走 PBKDF2，传 PRAGMA key 时用 SQL 字符串就行。注意密码里的单引号要 doubled。
+pub fn pragma_literal(password: &str) -> String {
+    let escaped = password.replace('\'', "''");
+    format!("'{escaped}'")
 }
 
-impl SqlCipherKey {
-    pub fn random() -> Self {
-        use rand::RngCore;
-        let mut buf = [0u8; KEY_LEN + SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut buf);
-        let mut key = [0u8; KEY_LEN];
-        let mut salt = [0u8; SALT_LEN];
-        key.copy_from_slice(&buf[..KEY_LEN]);
-        salt.copy_from_slice(&buf[KEY_LEN..]);
-        Self { key, salt }
+/// 取 Keychain 里保存的密码；不存在返回 None。优先 env bypass 用于测试隔离。
+pub fn get_password() -> Result<Option<String>> {
+    if let Ok(pwd) = std::env::var(ENV_BYPASS) {
+        return Ok(Some(pwd));
     }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != KEY_LEN + SALT_LEN {
-            return Err(anyhow::anyhow!(
-                "sqlcipher key must be {} bytes, got {}",
-                KEY_LEN + SALT_LEN,
-                bytes.len()
-            ));
-        }
-        let mut key = [0u8; KEY_LEN];
-        let mut salt = [0u8; SALT_LEN];
-        key.copy_from_slice(&bytes[..KEY_LEN]);
-        salt.copy_from_slice(&bytes[KEY_LEN..]);
-        Ok(Self { key, salt })
-    }
-
-    pub fn to_bytes(&self) -> [u8; KEY_LEN + SALT_LEN] {
-        let mut out = [0u8; KEY_LEN + SALT_LEN];
-        out[..KEY_LEN].copy_from_slice(&self.key);
-        out[KEY_LEN..].copy_from_slice(&self.salt);
-        out
-    }
-}
-
-/// Format key + salt as the SQLCipher `"x'<64hex><32hex>'"` literal.
-/// The outer double quotes are REQUIRED: SQLCipher's `PRAGMA key` parser treats
-/// the value as a string and only then recognises the inner `x'...'` blob
-/// form. Sending the bare blob literal would yield "syntax error near x'...'".
-/// See https://www.zetetic.net/sqlcipher/sqlcipher-api/#example-3-raw-key-data-with-explicit-salt-without-key-derivation
-pub fn format_for_pragma(k: &SqlCipherKey) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(2 + 2 + 64 + 32 + 1);
-    s.push('"');
-    s.push_str("x'");
-    for b in k.key.iter().chain(k.salt.iter()) {
-        let _ = write!(s, "{:02x}", b);
-    }
-    s.push('\'');
-    s.push('"');
-    s
-}
-
-/// 从 OS Keychain 取密钥；不存在则随机生成并写回。
-///
-/// 测试旁路：环境变量 `WEFT_TEST_DB_KEY_B64` 存在时直接用它（base64 编码的 48 字节），
-/// 完全绕开 Keychain。集成测试用 `tempfile + WEFT_HOME + WEFT_TEST_DB_KEY_B64` 隔离环境。
-pub fn get_or_create() -> Result<SqlCipherKey> {
-    if let Ok(b64) = std::env::var("WEFT_TEST_DB_KEY_B64") {
-        return decode_b64_key(&b64);
-    }
-
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
         .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
-
     match entry.get_password() {
-        Ok(b64) => decode_b64_key(&b64),
-        Err(keyring::Error::NoEntry) => {
-            let k = SqlCipherKey::random();
-            let b64 = encode_b64_key(&k);
-            entry
-                .set_password(&b64)
-                .map_err(|e| anyhow::anyhow!("keyring write: {e}"))?;
-            Ok(k)
-        }
+        Ok(pwd) => Ok(Some(pwd)),
+        Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(anyhow::anyhow!("keyring read: {e}")),
     }
 }
 
-fn encode_b64_key(k: &SqlCipherKey) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(k.to_bytes())
+/// 写密码到 Keychain（覆盖已有）。env bypass 模式下只设 process env var。
+pub fn set_password(password: &str) -> Result<()> {
+    if std::env::var(ENV_BYPASS).is_ok() {
+        std::env::set_var(ENV_BYPASS, password);
+        return Ok(());
+    }
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
+    entry
+        .set_password(password)
+        .map_err(|e| anyhow::anyhow!("keyring write: {e}"))?;
+    Ok(())
 }
 
-fn decode_b64_key(s: &str) -> Result<SqlCipherKey> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(s.trim())
-        .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))?;
-    SqlCipherKey::from_bytes(&bytes)
+/// 删除 Keychain 里的密码条目；env bypass 模式下移除 env var。
+/// 不存在不算错误（关闭加密时调用，本来就可能没设）。
+pub fn delete_password() -> Result<()> {
+    if std::env::var(ENV_BYPASS).is_ok() {
+        std::env::remove_var(ENV_BYPASS);
+        return Ok(());
+    }
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("keyring delete: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -110,67 +65,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_produces_48_bytes() {
-        let k = SqlCipherKey::random();
-        assert_eq!(k.to_bytes().len(), 48);
+    fn pragma_literal_quotes_password() {
+        assert_eq!(pragma_literal("hello"), "'hello'");
     }
 
     #[test]
-    fn from_bytes_roundtrip() {
-        let raw = [0xABu8; 48];
-        let k = SqlCipherKey::from_bytes(&raw).unwrap();
-        assert_eq!(k.to_bytes(), raw);
+    fn pragma_literal_escapes_single_quote() {
+        assert_eq!(pragma_literal("it's"), "'it''s'");
     }
 
     #[test]
-    fn from_bytes_rejects_wrong_length() {
-        assert!(SqlCipherKey::from_bytes(&[0u8; 47]).is_err());
-        assert!(SqlCipherKey::from_bytes(&[0u8; 49]).is_err());
-    }
-
-    #[test]
-    fn format_for_pragma_is_x_hex_literal() {
-        let raw = {
-            let mut v = [0u8; 48];
-            for (i, b) in v.iter_mut().enumerate() {
-                *b = i as u8;
-            }
-            v
-        };
-        let k = SqlCipherKey::from_bytes(&raw).unwrap();
-        let s = format_for_pragma(&k);
-        // SQLCipher requires the blob literal to be wrapped in double quotes
-        // so its PRAGMA key parser accepts it as a string.
-        assert!(s.starts_with("\"x'"));
-        assert!(s.ends_with("'\""));
-        // 64 hex chars (key) + 32 hex chars (salt) + "x'' = 101
-        assert_eq!(s.len(), 101);
-        // first key byte 00 → "00"; second 01 → "01"
-        assert_eq!(&s[3..7], "0001");
-    }
-
-    #[test]
-    fn b64_roundtrip() {
-        let k = SqlCipherKey::random();
-        let s = encode_b64_key(&k);
-        let k2 = decode_b64_key(&s).unwrap();
-        assert_eq!(k.to_bytes(), k2.to_bytes());
-    }
-
-    #[test]
-    fn decode_rejects_garbage() {
-        assert!(decode_b64_key("not-valid-base64!!!").is_err());
-        assert!(decode_b64_key("aGVsbG8=").is_err());
-    }
-
-    #[test]
-    fn get_or_create_uses_env_bypass() {
-        use base64::Engine;
-        let raw = [0x7Fu8; 48];
-        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-        std::env::set_var("WEFT_TEST_DB_KEY_B64", &b64);
-        let k = get_or_create().unwrap();
-        std::env::remove_var("WEFT_TEST_DB_KEY_B64");
-        assert_eq!(k.to_bytes(), raw);
+    fn env_bypass_round_trips() {
+        let prev = std::env::var(ENV_BYPASS).ok();
+        std::env::set_var(ENV_BYPASS, "test-pw");
+        assert_eq!(get_password().unwrap().as_deref(), Some("test-pw"));
+        set_password("changed").unwrap();
+        assert_eq!(get_password().unwrap().as_deref(), Some("changed"));
+        delete_password().unwrap();
+        // After delete in env-bypass mode the env var is gone.
+        assert!(std::env::var(ENV_BYPASS).is_err());
+        if let Some(v) = prev {
+            std::env::set_var(ENV_BYPASS, v);
+        }
     }
 }

@@ -41,6 +41,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     leadSlash,
     leadActivity,
     loadLeadChat,
+    discoverLeadSlash,
     sendLeadChat,
     interruptLead,
     setReviewingProposal,
@@ -109,14 +110,12 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
         localSlash={localSlash}
         onLocalSlash={onLocalSlash}
         busy={turn.state === "busy"}
-        stopped={turn.state === "stopped"}
         queued={turn.queued}
-        stoppedHint={t("lead.slashHint")}
         onSend={(text, images, files) =>
           void sendLeadChat(activeThreadId, text, images, files)
         }
         onStop={() => void interruptLead(activeThreadId)}
-        onNeedSlashCommands={() => void loadLeadChat(activeThreadId)}
+        onNeedSlashCommands={() => discoverLeadSlash(activeThreadId)}
         onTakeOver={async () => {
           const st = await api.leadState(activeThreadId);
           if (!st.native_id) return false;

@@ -1,20 +1,17 @@
 //! Scheduler tests. Uses real local bare repos as the "remote" so the full
 //! run_now pipeline gets exercised on tick.
 
-use base64::Engine;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
-use weft_app_lib::backup::{BackupService, config, scheduler};
-use weft_app_lib::store::Db;
+use weft::backup::{BackupService, config, scheduler};
+use weft::store::Db;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn iso_env(home: &std::path::Path) {
     std::env::set_var("WEFT_HOME", home);
-    let raw = [0xBEu8; 48];
-    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-    std::env::set_var("WEFT_TEST_DB_KEY_B64", &b64);
+    std::env::remove_var("WEFT_TEST_DB_PASSWORD");
 }
 
 fn make_bare(parent: &std::path::Path) -> String {
@@ -40,7 +37,7 @@ async fn scheduler_fires_at_least_once_when_interval_short() {
 
     use sea_orm::{ActiveModelTrait, Set};
     let m = config::load(&db).await.unwrap();
-    let mut am: weft_app_lib::store::entities::backup_config::ActiveModel = m.into();
+    let mut am: weft::store::entities::backup_config::ActiveModel = m.into();
     am.enabled = Set(true);
     am.remote_url = Set(url);
     am.auto_backup_enabled = Set(true);
@@ -87,7 +84,7 @@ async fn idle_catchup_fires_immediately() {
 
     use sea_orm::{ActiveModelTrait, Set};
     let m = config::load(&db).await.unwrap();
-    let mut am: weft_app_lib::store::entities::backup_config::ActiveModel = m.into();
+    let mut am: weft::store::entities::backup_config::ActiveModel = m.into();
     am.enabled = Set(true);
     am.remote_url = Set(url);
     am.auto_backup_enabled = Set(true);

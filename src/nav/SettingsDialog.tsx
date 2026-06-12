@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   ArrowLeft,
   Bot,
   Boxes,
+  Check,
+  Copy,
   Database,
   FolderOpen,
   MessageSquare,
@@ -11,9 +14,11 @@ import {
   Palette,
   Search,
   Settings,
+  Shield,
   Sun,
 } from "lucide-react";
 import { Button } from "../components/ui/Button";
+import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
 import { Toggle } from "../components/ui/Toggle";
 import { SkillsSettings } from "../components/SkillsSettings";
@@ -61,7 +66,7 @@ const NAV_GROUPS: { labelKey: string; items: NavItem[] }[] = [
 
 export function SettingsScreen() {
   const { t } = useTranslation();
-  const { setHomeTab } = useStore();
+  const { closeSettings } = useStore();
   const [active, setActive] = useState<SettingsPage>("general");
   const [query, setQuery] = useState("");
 
@@ -82,7 +87,7 @@ export function SettingsScreen() {
         <div className="px-3 pb-3 pt-5">
           <button
             type="button"
-            onClick={() => setHomeTab("board")}
+            onClick={closeSettings}
             className="mb-4 flex items-center gap-2 rounded-[var(--radius-md)] px-2 py-1.5 text-[13px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
           >
             <ArrowLeft size={15} />
@@ -123,25 +128,28 @@ export function SettingsScreen() {
       <main className="min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-[760px] px-8 pb-16 pt-16">
           <h1 className="text-[22px] font-semibold tracking-[-0.01em] text-ink">{activeLabel}</h1>
-          <div className="mt-10">
-            {active === "general" ? (
-              <GeneralSettings />
-            ) : active === "appearance" ? (
-              <AppearanceSettings />
-            ) : active === "automation" ? (
-              <AutomationSettings />
-            ) : active === "im" ? (
-              <ImSettings />
-            ) : active === "backup" ? (
-              <BackupSettings />
-            ) : (
-              <SkillsSettings />
-            )}
-          </div>
+          <div className="mt-10">{renderSettingsPage(active)}</div>
         </div>
       </main>
     </section>
   );
+}
+
+function renderSettingsPage(active: SettingsPage) {
+  switch (active) {
+    case "general":
+      return <GeneralSettings />;
+    case "appearance":
+      return <AppearanceSettings />;
+    case "automation":
+      return <AutomationSettings />;
+    case "im":
+      return <ImSettings />;
+    case "backup":
+      return <BackupSettings />;
+    case "skills":
+      return <SkillsSettings />;
+  }
 }
 
 function SettingsNavButton({
@@ -202,6 +210,76 @@ function GeneralSettings() {
   useEffect(() => {
     setLangState(currentLang());
   }, []);
+
+  // Encryption state
+  const [encrypted, setEncrypted] = useState<boolean | null>(null);
+  const [encModal, setEncModal] = useState<"enable" | "disable" | "change" | null>(null);
+  const [encPassword, setEncPassword] = useState("");
+  const [encConfirm, setEncConfirm] = useState("");
+  const [encCurrentPassword, setEncCurrentPassword] = useState("");
+  const [encBusy, setEncBusy] = useState(false);
+  const [encError, setEncError] = useState("");
+
+  useEffect(() => {
+    void api.dbEncryptionStatus().then((s) => setEncrypted(s.encrypted));
+  }, []);
+
+  function resetEncForm() {
+    setEncPassword("");
+    setEncConfirm("");
+    setEncCurrentPassword("");
+    setEncError("");
+  }
+
+  function openEncModal(mode: "enable" | "disable" | "change") {
+    resetEncForm();
+    setEncModal(mode);
+  }
+
+  async function submitEncryption() {
+    setEncError("");
+    if (!encPassword.trim()) {
+      setEncError(t("settings.encryptionPasswordEmpty"));
+      return;
+    }
+    if (encModal === "enable" || encModal === "change") {
+      if (encPassword !== encConfirm) {
+        setEncError(t("settings.encryptionPasswordMismatch"));
+        return;
+      }
+    }
+    setEncBusy(true);
+    try {
+      if (encModal === "enable") {
+        await api.dbEnableEncryption(encPassword);
+      } else if (encModal === "disable") {
+        await api.dbDisableEncryption(encPassword);
+      } else if (encModal === "change") {
+        await api.dbChangePassword(encCurrentPassword, encPassword);
+      }
+      setEncModal(null);
+      await relaunch();
+    } catch (err) {
+      setEncError(t("settings.encryptionError", { error: String(err) }));
+    } finally {
+      setEncBusy(false);
+    }
+  }
+
+  function encryptionActionLabel(mode: typeof encModal) {
+    switch (mode) {
+      case "enable":
+        return t("settings.enableEncryption");
+      case "disable":
+        return t("settings.disableEncryption");
+      case "change":
+      default:
+        return t("settings.changePassword");
+    }
+  }
+
+  const encDialogTitle = encryptionActionLabel(encModal);
+  const encPrimaryLabel = encBusy ? "…" : encDialogTitle;
 
   async function pickDir() {
     const dir = await api.pickFolder(t("settings.projectsDir"));
@@ -294,15 +372,137 @@ function GeneralSettings() {
           </div>
         </div>
       </SettingsGroup>
+      <SettingsGroup title={t("settings.security")}>
+        <SettingRow label={t("settings.encryption")} hint={t("settings.encryptionHint")}>
+          <div className="flex items-center gap-2">
+            {encrypted === null ? (
+              <span className="text-[12px] text-ink-faint">…</span>
+            ) : (
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium",
+                  encrypted
+                    ? "border border-success/30 bg-success/15 text-success"
+                    : "border border-border bg-bg text-ink-faint",
+                )}
+              >
+                <Shield size={11} />
+                {encrypted ? t("settings.encryptionEnabled") : t("settings.encryptionDisabled")}
+              </span>
+            )}
+            {!encrypted && (
+              <Button variant="primary" onClick={() => openEncModal("enable")}>
+                {t("settings.enableEncryption")}
+              </Button>
+            )}
+            {encrypted && (
+              <Button variant="default" onClick={() => openEncModal("disable")}>
+                {t("settings.disableEncryption")}
+              </Button>
+            )}
+            {encrypted && (
+              <Button variant="default" onClick={() => openEncModal("change")}>
+                {t("settings.changePassword")}
+              </Button>
+            )}
+          </div>
+        </SettingRow>
+      </SettingsGroup>
+
+      {/* Encryption password modal */}
+      <Dialog
+        open={encModal !== null}
+        onOpenChange={(open) => {
+          if (!open) setEncModal(null);
+        }}
+      >
+        <DialogContent title={encDialogTitle}>
+          <div className="flex flex-col gap-4">
+            {encModal === "enable" && (
+              <p className="text-[12px] leading-relaxed text-danger">
+                {t("settings.encryptionEnableWarning")}
+              </p>
+            )}
+            {encModal === "disable" && (
+              <p className="text-[12px] leading-relaxed text-waiting">
+                {t("settings.encryptionDisableWarning")}
+              </p>
+            )}
+            {encModal === "change" && (
+              <div className="flex flex-col gap-2">
+                <label className="text-[12px] font-medium text-ink">
+                  {t("settings.encryptionCurrentPassword")}
+                </label>
+                <Input
+                  type="password"
+                  value={encCurrentPassword}
+                  onChange={(e) => setEncCurrentPassword(e.currentTarget.value)}
+                  className="h-8 bg-bg/80 font-mono text-[12px]"
+                />
+              </div>
+            )}
+            <div className="flex flex-col gap-2">
+              <label className="text-[12px] font-medium text-ink">
+                {encModal === "change"
+                  ? t("settings.encryptionNewPassword")
+                  : t("settings.encryptionCurrentPassword")}
+              </label>
+              <Input
+                type="password"
+                value={encPassword}
+                onChange={(e) => setEncPassword(e.currentTarget.value)}
+                className="h-8 bg-bg/80 font-mono text-[12px]"
+              />
+            </div>
+            {(encModal === "enable" || encModal === "change") && (
+              <div className="flex flex-col gap-2">
+                <label className="text-[12px] font-medium text-ink">
+                  {t("settings.encryptionConfirmPassword")}
+                </label>
+                <Input
+                  type="password"
+                  value={encConfirm}
+                  onChange={(e) => setEncConfirm(e.currentTarget.value)}
+                  className="h-8 bg-bg/80 font-mono text-[12px]"
+                />
+              </div>
+            )}
+            {encError && <p className="text-[12px] text-danger">{encError}</p>}
+            <div className="flex justify-end gap-2">
+              <Button variant="default" onClick={() => setEncModal(null)}>
+                {t("common.cancel")}
+              </Button>
+              <Button
+                variant="primary"
+                onClick={() => void submitEncryption()}
+                disabled={encBusy}
+              >
+                {encPrimaryLabel}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
 function ToolDiagnosticCard({ tool }: { tool: import("../lib/types").ToolStatus }) {
   const { t } = useTranslation();
-  const status = !tool.installed ? "error" : !tool.meets_min ? "warning" : "ok";
-  const color =
-    status === "ok" ? "text-success" : status === "warning" ? "text-waiting" : "text-danger";
+  let status: "error" | "warning" | "ok" = "ok";
+  if (!tool.installed) {
+    status = "error";
+  } else if (!tool.meets_min) {
+    status = "warning";
+  }
+
+  let color = "text-danger";
+  if (status === "ok") {
+    color = "text-success";
+  } else if (status === "warning") {
+    color = "text-waiting";
+  }
+
   return (
     <div className="rounded-[var(--radius-md)] border border-border bg-bg p-3">
       <div className="flex items-center justify-between gap-2">
@@ -379,6 +579,26 @@ function AutomationSettings() {
     setAutoReview,
   } = useStore();
   const [loopGuard, setLoopGuard] = useState(true);
+  const [remoteStandby, setRemoteStandby] = useState(false);
+  const [remoteStandbyLoaded, setRemoteStandbyLoaded] = useState(false);
+
+  useEffect(() => {
+    void api.imGetSettings().then((s) => {
+      setRemoteStandby(s.remote_standby);
+      setRemoteStandbyLoaded(true);
+    });
+  }, []);
+
+  async function toggleRemoteStandby(on: boolean) {
+    const prev = remoteStandby;
+    setRemoteStandby(on);
+    try {
+      await api.imSetRemoteStandby(on);
+    } catch (err) {
+      setRemoteStandby(prev);
+      throw err;
+    }
+  }
 
   return (
     <div className="flex flex-col gap-10">
@@ -391,6 +611,20 @@ function AutomationSettings() {
         </SettingRow>
         <SettingRow label={t("settings.keepAwakeTitle")} hint={t("settings.keepAwakeHint")}>
           <Toggle on={keepAwake} onChange={setKeepAwake} label={t("settings.keepAwakeTitle")} />
+        </SettingRow>
+        <SettingRow label={t("settings.remoteStandby")} hint={t("settings.remoteStandbyHint")}>
+          {remoteStandbyLoaded ? (
+            <Toggle
+              on={remoteStandby}
+              onChange={(v) => void toggleRemoteStandby(v)}
+              label={t("settings.remoteStandby")}
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
         </SettingRow>
       </SettingsGroup>
       <SettingsGroup title={t("settings.reviewGroup")}>
@@ -410,6 +644,17 @@ function AutomationSettings() {
   );
 }
 
+// 飞书自建应用需开通的权限点，与 src-tauri/src/im/feishu 的实际调用一一对应：
+// im:message 覆盖 发消息(message.create)/回复(message.reply)/更新卡片(message_card.patch)；
+// 表情回复(message_reaction)实测需单独开 im:message.reactions:write_only（仅 im:message
+// 不够）；两条 readonly 用于长连接(im.message.receive_v1) 接收单聊与群聊消息。改后端调用面时同步这里。
+const FEISHU_SCOPES = [
+  "im:message",
+  "im:message.reactions:write_only",
+  "im:message.p2p_msg:readonly",
+  "im:message.group_msg:readonly",
+] as const;
+
 function ImSettings() {
   const { t } = useTranslation();
   const [appId, setAppId] = useState("");
@@ -420,6 +665,31 @@ function ImSettings() {
   const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState("disabled");
   const [saving, setSaving] = useState(false);
+  const [copied, setCopied] = useState(false);
+  // The toggles default to `false`. Without this flag we'd render the
+  // off-state for one tick before `api.imGetSettings()` resolves, producing
+  // a visible "off → on" flash for users whose IM was already enabled.
+  const [loaded, setLoaded] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  // 一键复制需开通的权限点：换行分隔，方便逐条粘进开放平台「权限管理」搜索框。
+  async function copyPerms() {
+    try {
+      await navigator.clipboard.writeText(FEISHU_SCOPES.join("\n"));
+    } catch {
+      return; // 剪贴板不可用时静默——按钮不给假反馈。
+    }
+    setCopied(true);
+    if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => setCopied(false), 1500);
+  }
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -428,6 +698,7 @@ function ImSettings() {
       setHasSecret(s.has_secret);
       setBound(s.bound);
       setEnabled(s.enabled);
+      setLoaded(true);
     });
     void api.imStatus().then(setStatus);
     const id = setInterval(() => void api.imStatus().then(setStatus), 3000);
@@ -451,13 +722,18 @@ function ImSettings() {
   const dirty = appId.trim() !== savedAppId.trim() || secret.length > 0;
 
   async function reconnect() {
+    const prevStatus = status;
     setSaving(true);
+    setStatus("connecting");
     try {
       await api.imSetSettings(appId, secret);
       setSavedAppId(appId);
       if (secret.length > 0) setHasSecret(true);
       setSecret("");
       void api.imStatus().then(setStatus);
+    } catch (err) {
+      setStatus(prevStatus);
+      throw err;
     } finally {
       setSaving(false);
     }
@@ -466,27 +742,38 @@ function ImSettings() {
   const online = status.startsWith("online");
   const connecting = status.startsWith("connecting");
   const errored = status.startsWith("error");
-  const dot = online
-    ? "bg-success"
-    : connecting
-      ? "bg-waiting"
-      : errored
-        ? "bg-danger"
-        : "bg-ink-faint";
-  const statusTone = online
-    ? "border-success/30 bg-success/15 text-success"
-    : connecting
-      ? "border-waiting/30 bg-waiting/15 text-waiting"
-      : errored
-        ? "border-danger/30 bg-danger/15 text-danger"
-        : "border-border bg-bg text-ink-faint";
-  const statusText = online
-    ? t("settings.imOnline")
-    : connecting
-      ? t("settings.imConnecting")
-      : errored
-        ? t("settings.imError")
-        : t("settings.imOffline");
+  let dot = "bg-ink-faint";
+  let statusTone = "border-border bg-bg text-ink-faint";
+  let statusText = t("settings.imOffline");
+  if (online) {
+    dot = "bg-success";
+    statusTone = "border-success/30 bg-success/15 text-success";
+    statusText = t("settings.imOnline");
+  } else if (connecting) {
+    dot = "bg-waiting";
+    statusTone = "border-waiting/30 bg-waiting/15 text-waiting";
+    statusText = t("settings.imConnecting");
+  } else if (errored) {
+    dot = "bg-danger";
+    statusTone = "border-danger/30 bg-danger/15 text-danger";
+    statusText = t("settings.imError");
+  }
+
+  let helperText = " ";
+  if (loaded && enabled && bound) {
+    helperText = t("settings.imBound");
+  } else if (loaded && enabled) {
+    helperText = t("settings.imUnbound");
+  } else if (loaded) {
+    helperText = t("settings.imCollapsedHint");
+  }
+
+  let reconnectLabel = t("settings.imConnect");
+  if (saving) {
+    reconnectLabel = t("settings.imConnecting");
+  } else if (online) {
+    reconnectLabel = t("settings.imReconnect");
+  }
 
   return (
     <div className="flex flex-col gap-10">
@@ -510,15 +797,16 @@ function ImSettings() {
                 </span>
               )}
             </div>
-            <p className="mt-0.5 text-[12px] text-ink-faint">
-              {enabled
-                ? bound
-                  ? t("settings.imBound")
-                  : t("settings.imUnbound")
-                : t("settings.imCollapsedHint")}
-            </p>
+            <p className="mt-0.5 text-[12px] text-ink-faint">{helperText}</p>
           </div>
-          <Toggle on={enabled} onChange={(v) => void toggle(v)} label={t("settings.imProvider")} />
+          {loaded ? (
+            <Toggle on={enabled} onChange={(v) => void toggle(v)} label={t("settings.imProvider")} />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
         </div>
 
         {enabled && (
@@ -540,9 +828,25 @@ function ImSettings() {
                 className="h-8 w-full bg-bg/80 font-mono text-[12px]"
               />
             </ImField>
+            <ImField label={t("settings.imPermsLabel")} hint={t("settings.imPermsHint")}>
+              <div className="flex items-start gap-2">
+                <code className="flex-1 whitespace-pre rounded-[var(--radius-md)] border border-border bg-bg/80 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-ink-muted">
+                  {FEISHU_SCOPES.join("\n")}
+                </code>
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => void copyPerms()}
+                  className="shrink-0"
+                >
+                  {copied ? <Check size={13} /> : <Copy size={13} />}
+                  {copied ? t("settings.imPermsCopied") : t("settings.imPermsCopy")}
+                </Button>
+              </div>
+            </ImField>
             <div className="flex justify-end">
               <Button variant="primary" onClick={() => void reconnect()} disabled={saving || !dirty}>
-                {online ? t("settings.imReconnect") : t("settings.imConnect")}
+                {reconnectLabel}
               </Button>
             </div>
           </div>
@@ -588,36 +892,47 @@ function ImRoutes() {
     await refresh();
   }
 
+  let content: ReactNode;
+  if (loading && rows.length === 0) {
+    content = (
+      <span className="text-[12px] text-ink-faint">{t("settings.imRoutesLoading")}</span>
+    );
+  } else if (rows.length === 0) {
+    content = <span className="text-[12px] text-ink-faint">{t("settings.imRoutesEmpty")}</span>;
+  } else {
+    content = rows.map((r) => (
+      <div
+        key={r.thread_id}
+        className="flex items-center justify-between gap-3 rounded-md border border-border bg-bg/40 px-2.5 py-1.5"
+      >
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="font-mono text-[11px] text-ink">
+            #{r.thread_id} · {r.channel}
+          </span>
+          <span className="truncate font-mono text-[11px] text-ink-muted">
+            {r.chat_id} / {r.im_thread_ref}
+          </span>
+        </div>
+        <Button variant="default" onClick={() => void unbind(r.thread_id)}>
+          {t("settings.imRoutesUnbind")}
+        </Button>
+      </div>
+    ));
+  }
+
   return (
     <SettingsGroup title={t("settings.imRoutesGroup")}>
-      <SettingRow label={t("settings.imRoutesLabel")} hint={t("settings.imRoutesHint")}>
-        <div className="flex w-full flex-col gap-1.5">
-          {loading && rows.length === 0 ? (
-            <span className="text-[12px] text-ink-faint">{t("settings.imRoutesLoading")}</span>
-          ) : rows.length === 0 ? (
-            <span className="text-[12px] text-ink-faint">{t("settings.imRoutesEmpty")}</span>
-          ) : (
-            rows.map((r) => (
-              <div
-                key={r.thread_id}
-                className="flex items-center justify-between gap-2 rounded-md border border-border bg-bg/40 px-2.5 py-1.5"
-              >
-                <div className="min-w-0 flex flex-col">
-                  <span className="font-mono text-[11px] text-ink">
-                    #{r.thread_id} · {r.channel}
-                  </span>
-                  <span className="truncate font-mono text-[11px] text-ink-muted">
-                    {r.chat_id} / {r.im_thread_ref}
-                  </span>
-                </div>
-                <Button variant="default" onClick={() => void unbind(r.thread_id)}>
-                  {t("settings.imRoutesUnbind")}
-                </Button>
-              </div>
-            ))
-          )}
+      <div className="flex flex-col gap-2.5 px-3 py-3">
+        <div>
+          <div className="text-[12.5px] font-semibold text-ink">
+            {t("settings.imRoutesLabel")}
+          </div>
+          <p className="mt-1 max-w-[58ch] text-[12px] leading-relaxed text-ink-faint">
+            {t("settings.imRoutesHint")}
+          </p>
         </div>
-      </SettingRow>
+        <div className="flex flex-col gap-1.5">{content}</div>
+      </div>
     </SettingsGroup>
   );
 }

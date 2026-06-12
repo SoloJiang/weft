@@ -1,8 +1,8 @@
 //! Drives the bus HTTP MCP handler exactly like a CLI client would: initialize,
 //! tools/list, then two directions exchanging a message.
-use weft_app_lib::ask::AskRegistry;
-use weft_app_lib::bus::{server, BusRegistry};
-use weft_app_lib::store::Db;
+use weft::ask::AskRegistry;
+use weft::bus::{server, BusRegistry};
+use weft::store::Db;
 
 async fn rpc(base: &str, thread: i32, dir: &str, body: serde_json::Value) -> String {
     let url = format!("{base}/bus/{thread}/{dir}/mcp");

@@ -15,6 +15,7 @@ mod check;
 mod claude;
 mod codex;
 mod codex_app_server;
+mod codex_slash;
 pub mod commands;
 mod commands_backup;
 pub mod config;
@@ -56,6 +57,13 @@ pub fn run() {
     // Make GUI-launched spawns find nvm/fnm/native-installer CLIs (see detect.rs).
     detect::augment_path_from_login_shell();
 
+    // Pin the rustls CryptoProvider. Several of our transitive deps enable
+    // both `ring` and `aws-lc-rs`, which makes rustls 0.23 refuse to auto-pick
+    // and panic at the first TLS handshake ("Could not automatically determine
+    // the process-level CryptoProvider"). Install ring once here, ignoring the
+    // "already installed" error so re-entry (tests, restart) is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Open the DB synchronously before building the app.
     let db = tauri::async_runtime::block_on(async { store::Db::open_default().await })
         .unwrap_or_else(|e| fatal("open weft.db", e));
@@ -92,13 +100,18 @@ pub fn run() {
 
     #[cfg(debug_assertions)]
     {
-        builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+        builder = builder.plugin(
+            tauri_plugin_mcp_bridge::Builder::new()
+                .bind_address("127.0.0.1")
+                .build(),
+        );
     }
 
     builder
         .manage(db)
         .manage(lead_chat::engine::LeadChatState::default())
         .manage(lead_chat::out_hub::LeadOutHub::default())
+        .manage(lead_chat::delta_hub::LeadDeltaHub::default())
         .manage(commands::GuardrailState::default())
         .manage(power::PowerGuard::default())
         .manage(bus)
@@ -169,6 +182,10 @@ pub fn run() {
             commands::answer_permission,
             commands::set_dangerous_mode,
             commands::set_keep_awake,
+            commands::db_encryption_status,
+            commands::db_enable_encryption,
+            commands::db_disable_encryption,
+            commands::db_change_password,
             commands::set_guardrails,
             commands::session_for,
             commands::effective_config,
@@ -208,6 +225,7 @@ pub fn run() {
             commands::im_get_settings,
             commands::im_set_settings,
             commands::im_set_enabled,
+            commands::im_set_remote_standby,
             commands::im_status,
             commands::im_bind_thread,
             commands::im_unbind_thread,

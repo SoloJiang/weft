@@ -18,7 +18,7 @@ export interface RepoActionContext {
   /** When present, the result is posted back to the lead thread. */
   threadId?: number;
   /** Override the active workspace (e.g., when invoked from a card pinned
-   *  to a specific workspace). Falls back to store / ensureDefaultWorkspace. */
+   *  to a specific workspace). Falls back to the active workspace. */
   preferredWorkspaceId?: number | null;
 }
 
@@ -39,7 +39,7 @@ type Translate = (key: string, opts?: Record<string, unknown>) => string;
 
 export function useRepoActions() {
   const { t } = useTranslation();
-  const { activeWorkspaceId } = useStore();
+  const { activeWorkspaceId, refreshReposAndMap } = useStore();
   const [busy, setBusy] = useState<Record<string, boolean>>({});
 
   const setBusyFor = useCallback((id: string, v: boolean) => {
@@ -48,14 +48,10 @@ export function useRepoActions() {
 
   const resolveWorkspaceId = useCallback(
     async (ctx: RepoActionContext): Promise<number | null> => {
-      if (ctx.preferredWorkspaceId) return ctx.preferredWorkspaceId;
-      if (activeWorkspaceId) return activeWorkspaceId;
-      try {
-        return await api.ensureDefaultWorkspace();
-      } catch {
-        toast(t("repoActions.noWorkspaceToast"));
-        return null;
-      }
+      if (ctx.preferredWorkspaceId != null) return ctx.preferredWorkspaceId;
+      if (activeWorkspaceId != null) return activeWorkspaceId;
+      toast(t("repoActions.noWorkspaceToast"));
+      return null;
     },
     [activeWorkspaceId, t],
   );
@@ -90,6 +86,11 @@ export function useRepoActions() {
         const result = await dispatch(inv, wsId, t as Translate);
         if (result.status === "ok") {
           toast(t("repoActions.addedToast", { name: result.name }));
+          try {
+            await refreshReposAndMap(wsId);
+          } catch {
+            // The repo is already registered; a later workspace refresh will recover.
+          }
         } else if (result.status === "error") {
           toast(t("repoActions.failedToast", { message: result.message }));
         }
@@ -98,7 +99,7 @@ export function useRepoActions() {
         setBusyFor(inv.actionId, false);
       }
     },
-    [maybePost, resolveWorkspaceId, setBusyFor, t],
+    [maybePost, refreshReposAndMap, resolveWorkspaceId, setBusyFor, t],
   );
 
   return { run, busy };

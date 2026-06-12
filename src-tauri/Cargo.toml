@@ -1,12 +1,12 @@
 [package]
-name = "weft-app"
+name = "weft"
 version = "0.1.0"
 description = "weft — multi-repo / multi-tool session orchestrator"
 authors = ["weft"]
 edition = "2021"
 
 [lib]
-name = "weft_app_lib"
+name = "weft"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -31,20 +31,33 @@ futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 axum = "0.7"
 tower = "0.5"
-# opencode slash-command discovery hits http://127.0.0.1 only — no TLS needed.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# opencode slash-command discovery hits http://127.0.0.1（无需 TLS）；飞书 CardKit
+# 流式卡片走 HTTPS（open.feishu.cn），故启用 rustls-tls（rustls 已由 openlark 引入，
+# 此处仅复用，编译成本已付）。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
+roxmltree = "0.20"
 keepawake = "0.6"
-open-lark = { version = "0.14", default-features = false, features = ["im", "websocket"] }
+# Package renamed open-lark -> openlark (0.15+); lib import path stays `open_lark::*`.
+openlark = { version = "0.17", default-features = false, features = ["communication", "cardkit", "websocket"] }
 tauri-plugin-process = "2.3.1"
 # SQLCipher: replace SQLite with the encrypted variant statically. The feature
 # must be declared on the top-level manifest so it propagates via Cargo feature
 # unification to sqlx-sqlite's indirect dep on libsqlite3-sys.
 libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher-vendored-openssl"] }
-keyring = "3"
+# `keyring` ships with NO platform backend enabled by default — on macOS this
+# silently no-ops writes and returns NoEntry on reads, which makes the SQLCipher
+# key mint a fresh random key every launch and instantly orphans the previous
+# encrypted db. Enable `apple-native` (Security framework) here.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 rand = "0.8"
 sha1 = "0.10"
 hex = "0.4"
+# Pulled in solely to call `CryptoProvider::install_default` at boot. Several
+# of our transitive deps enable both `ring` and `aws-lc-rs`, which makes
+# rustls refuse to auto-pick and panics at the first TLS handshake. Pin the
+# choice once at startup (lib.rs `run()`).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

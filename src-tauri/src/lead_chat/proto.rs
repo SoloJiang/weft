@@ -22,7 +22,11 @@ pub struct SlashCmd {
 impl SlashCmd {
     /// Name-only command (claude's init list, codex prompt stems): no metadata.
     pub fn bare(name: impl Into<String>) -> Self {
-        Self { name: name.into(), description: None, arg_hint: None }
+        Self {
+            name: name.into(),
+            description: None,
+            arg_hint: None,
+        }
     }
 }
 
@@ -95,6 +99,9 @@ fn parse_codex(line: &str) -> ChatEvent {
                     tools: vec![],
                 },
                 Some("agent_message") => ChatEvent::Other,
+                Some("error") => ChatEvent::TextDelta {
+                    text: error_text_from_item(item),
+                },
                 Some(other) => {
                     // command_execution / file_change / mcp_tool_call / reasoning…
                     if other == "reasoning" {
@@ -140,6 +147,18 @@ fn parse_opencode(line: &str) -> ChatEvent {
         },
         _ => ChatEvent::Other,
     }
+}
+
+pub(crate) fn error_text_from_item(item: &Value) -> String {
+    let text = item["message"]
+        .as_str()
+        .or_else(|| item["text"].as_str())
+        .or_else(|| item["summary"].as_str())
+        .or_else(|| item["detail"].as_str())
+        .or_else(|| item["error"]["message"].as_str())
+        .or_else(|| item["error"].as_str())
+        .unwrap_or("Codex reported an error.");
+    text.trim().to_string()
 }
 
 pub fn parse_line(line: &str) -> ChatEvent {
@@ -341,6 +360,13 @@ mod tests {
             ChatEvent::Assistant { tools, .. } => {
                 assert_eq!(tools[0], ("command_execution".into(), "npm test".into()))
             }
+            e => panic!("{e:?}"),
+        }
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.started","item":{"type":"error","message":"unknown slash command"}}"#,
+        ) {
+            ChatEvent::TextDelta { text } => assert_eq!(text, "unknown slash command"),
             e => panic!("{e:?}"),
         }
         assert!(matches!(

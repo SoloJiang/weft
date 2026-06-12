@@ -34,6 +34,7 @@ export function WorkspaceNav() {
     needsByWorkspace,
     homeTab,
     setHomeTab,
+    openSettings,
     activeThreadId,
     showNeeds,
     openNeeds,
@@ -193,10 +194,7 @@ export function WorkspaceNav() {
 
       <footer className="border-t border-border p-2">
         <button
-          onClick={() => {
-            backToWorkspace();
-            setHomeTab("settings");
-          }}
+          onClick={openSettings}
           className={cn(
             "flex w-full items-center gap-2 rounded-[var(--radius-md)] px-2 py-1.5 text-[13px] transition-colors hover:bg-brand-ghost hover:text-ink",
             onHome && homeTab === "settings" ? "bg-brand-ghost text-ink" : "text-ink-muted",

@@ -2,7 +2,7 @@
 //! local `git init --bare` repo as the "remote".
 
 use std::process::Command;
-use weft_app_lib::backup::git_remote;
+use weft::backup::git_remote;
 
 fn make_bare_remote(parent: &std::path::Path) -> std::path::PathBuf {
     let bare = parent.join("remote.git");
@@ -71,5 +71,7 @@ fn ensure_clone_rebuilds_when_origin_changes() {
         .output()
         .unwrap();
     let url = String::from_utf8(out.stdout).unwrap();
-    assert!(url.trim().ends_with("b/remote.git"));
+    // Normalize separators: on Windows git echoes back the file:// path with
+    // backslashes (…\b\remote.git).
+    assert!(url.trim().replace('\\', "/").ends_with("b/remote.git"));
 }

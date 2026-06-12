@@ -210,10 +210,13 @@ pub async fn call_global(
             let kind = args
                 .get("kind")
                 .and_then(|v| v.as_str())
-                .unwrap_or("feature")
+                .unwrap_or("")
                 .to_string();
             if title.trim().is_empty() {
                 return text_result("error: title required".into());
+            }
+            if kind.trim().is_empty() {
+                return text_result("error: kind required".into());
             }
             match create_issue(db, ws, &title, &kind).await {
                 Ok(v) => json_result(v),
@@ -331,7 +334,7 @@ async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::R
     if !settings.ready() {
         anyhow::bail!("Feishu app credentials are not configured");
     }
-    let ch = crate::im::feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret);
+    let ch = crate::im::feishu::FeishuChannel::new(&settings.app_id, &settings.app_secret)?;
     crate::im::ensure_issue_topic(db, &ch, thread_id, chat_id, None, "zh").await?;
     let after = repo::im_route_of_thread(db, thread_id)
         .await?
@@ -401,10 +404,10 @@ pub fn global_specs() -> Value {
         },
         {
             "name": "create_issue",
-            "description": "File a new issue in a workspace. kind ∈ feature|bugfix|refactor|spike (defaults to feature).",
+            "description": "File a new issue in a workspace. kind is required and must be chosen explicitly: feature|bugfix|refactor|spike.",
             "inputSchema": { "type": "object",
                 "properties": { "workspace_id": i(), "title": s(), "kind": s() },
-                "required": ["workspace_id", "title"] }
+                "required": ["workspace_id", "title", "kind"] }
         }
     ])
 }
@@ -569,6 +572,25 @@ mod tests {
         let ts = repo::list_threads(&db, w.id).await.unwrap();
         assert_eq!(ts.len(), 1);
         assert_eq!(ts[0].title, "new feature");
+    }
+
+    #[tokio::test]
+    async fn create_issue_requires_kind() {
+        let db = mem_db().await;
+        let asks = AskRegistry::new();
+        let bus = BusRegistry::new();
+        let w = repo::create_workspace(&db, "ws").await.unwrap();
+        let v = call_global(
+            &db,
+            &asks,
+            &bus,
+            "create_issue",
+            &json!({ "workspace_id": w.id, "title": "new feature" }),
+        )
+        .await;
+        let s = v["content"][0]["text"].as_str().unwrap();
+        assert!(s.contains("kind required"));
+        assert!(repo::list_threads(&db, w.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]

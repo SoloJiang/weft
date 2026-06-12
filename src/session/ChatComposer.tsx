@@ -44,9 +44,7 @@ export function ChatComposer({
   localSlash,
   onLocalSlash,
   busy,
-  stopped,
   queued,
-  stoppedHint,
   onSend,
   onStop,
   onTakeOver,
@@ -62,10 +60,7 @@ export function ChatComposer({
   localSlash?: { name: string; label: string }[];
   onLocalSlash?: (name: string) => void;
   busy: boolean;
-  stopped: boolean;
   queued: number;
-  /** Footer hint while the engine is stopped (sending resumes it). */
-  stoppedHint: string;
   onSend: (text: string, images: ImageAttachment[], files: string[]) => void;
   onStop: () => void;
   /** Stop the engine + copy the terminal resume command; false = unavailable. */
@@ -86,6 +81,7 @@ export function ChatComposer({
   const [slashIdx, setSlashIdx] = useState(0);
   const [copied, setCopied] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const slashActiveRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     const el = ref.current;
@@ -135,8 +131,17 @@ export function ChatComposer({
     ].slice(0, 16);
   }, [slashQuery, slashCommands, localSlash]);
   const paletteOpen = slashMatches.length > 0;
+  const activeSlashIdx = slashMatches.length
+    ? Math.min(slashIdx, slashMatches.length - 1)
+    : 0;
 
   useEffect(() => setSlashIdx(0), [slashQuery]);
+
+  useEffect(() => {
+    if (paletteOpen) {
+      slashActiveRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [activeSlashIdx, paletteOpen]);
 
   // Typing "/" before the engine reported its command list: ask for a refresh
   // (once per palette attempt) so the palette appears as soon as data exists.
@@ -224,11 +229,12 @@ export function ChatComposer({
               return (
                 <button
                   key={`${item.source}:${item.name}`}
+                  ref={i === activeSlashIdx ? slashActiveRef : undefined}
                   onMouseEnter={() => setSlashIdx(i)}
                   onClick={() => complete(item)}
                   className={cn(
                     "flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-[12.5px]",
-                    i === slashIdx ? "bg-brand-ghost text-ink" : "text-ink-muted",
+                    i === activeSlashIdx ? "bg-brand-ghost text-ink" : "text-ink-muted",
                     divider,
                   )}
                 >
@@ -312,7 +318,7 @@ export function ChatComposer({
               }
               if (e.key === "Tab") {
                 e.preventDefault();
-                complete(slashMatches[slashIdx]);
+                complete(slashMatches[activeSlashIdx]);
                 return;
               }
               if (e.key === "Enter") {
@@ -328,7 +334,7 @@ export function ChatComposer({
                 if (exact && exact.source === "cli") {
                   send();
                 } else {
-                  complete(exact ?? slashMatches[slashIdx]);
+                  complete(exact ?? slashMatches[activeSlashIdx]);
                 }
                 return;
               }
@@ -357,7 +363,7 @@ export function ChatComposer({
             </button>
           </Tooltip>
           <span className="hidden truncate text-[11px] text-ink-faint sm:block">
-            {stopped ? stoppedHint : busy ? t("lead.busyHint") : t("lead.slashHint")}
+            {t("lead.slashHint")}
           </span>
           <span className="ml-auto" />
           {queued > 0 && (

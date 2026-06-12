@@ -22,7 +22,7 @@ pub mod scheduler;
 pub mod snapshot;
 
 // Shared env-mutation lock for in-process backup tests. Every submodule that
-// pokes `WEFT_HOME` / `WEFT_TEST_DB_KEY_B64` must take this same mutex, or
+// pokes `WEFT_HOME` / `WEFT_TEST_DB_PASSWORD` must take this same mutex, or
 // parallel tests will trample each other mid-`open_default`.
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -116,8 +116,8 @@ impl BackupService {
 
     /// Pull a backup snapshot down from `remote_url`, validate it against this
     /// build's schema, and lay `weft.db` back into `<home>/weft.db`. Also
-    /// writes the key in `recovery_key_path` back into the Keychain so the
-    /// next `Db::open_default` can decrypt it.
+    /// writes the password from `recovery_key_path` back into the Keychain so
+    /// the next `Db::open_default` can decrypt it.
     ///
     /// Safety: refuses to run when `<home>/weft.db` already exists — restore
     /// is a destructive operation; the caller must move/delete the old db
@@ -136,8 +136,10 @@ impl BackupService {
             ));
         }
 
-        // Writes back to Keychain (or no-ops under the test env bypass).
-        let _imported = recovery_key::import_from(recovery_key_path)?;
+        // Parse the recovery file first so a malformed file fails before we
+        // touch the network. We write it to the Keychain only after the
+        // snapshot is in place (so a half-restore doesn't leave a stale pwd).
+        let recovered_password = recovery_key::import_from(recovery_key_path)?;
 
         let tmp = self.home.join("backup-restore-tmp");
         if tmp.exists() {
@@ -172,6 +174,7 @@ impl BackupService {
         }
         std::fs::copy(&snap, &db_path)?;
         let _ = std::fs::remove_dir_all(&tmp);
+        crate::store::key::set_password(&recovered_password)?;
         Ok(())
     }
 }
@@ -186,13 +189,11 @@ fn unix_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
 
     fn iso_env(home: &std::path::Path) {
         std::env::set_var("WEFT_HOME", home);
-        let raw = [0xA1u8; 48];
-        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-        std::env::set_var("WEFT_TEST_DB_KEY_B64", &b64);
+        // Default tests run against a plaintext DB now; no password env needed.
+        std::env::remove_var("WEFT_TEST_DB_PASSWORD");
     }
 
     #[tokio::test]

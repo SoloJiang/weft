@@ -12,11 +12,13 @@ export function Select({
   onValueChange,
   options,
   ariaLabel,
+  placeholder,
 }: {
   value: string;
   onValueChange: (v: string) => void;
   options: Option[];
   ariaLabel?: string;
+  placeholder?: string;
 }) {
   return (
     <RS.Root value={value} onValueChange={onValueChange}>
@@ -30,7 +32,7 @@ export function Select({
           "data-[placeholder]:text-ink-faint",
         )}
       >
-        <RS.Value />
+        <RS.Value placeholder={placeholder} />
         <RS.Icon>
           <ChevronDown size={14} className="text-ink-faint" />
         </RS.Icon>

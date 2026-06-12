@@ -331,16 +331,25 @@ export function CreateThreadDialog({ open, onOpenChange }: DProps) {
   const { createThread } = useStore();
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
-  const [kind, setKind] = useState("feature");
+  const [kind, setKind] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setTitle("");
+      setKind("");
+      setBusy(false);
+      setErr(null);
+    }
+  }, [open]);
+
   async function submit() {
-    if (!title.trim() || busy) return;
+    if (!title.trim() || !kind || busy) return;
     setBusy(true);
     setErr(null);
     try {
       await createThread(title.trim(), kind);
-      setTitle("");
       onOpenChange(false);
     } catch (e) {
       setErr(String(e));
@@ -374,6 +383,7 @@ export function CreateThreadDialog({ open, onOpenChange }: DProps) {
               value={kind}
               onValueChange={setKind}
               ariaLabel={t("dialog.threadType")}
+              placeholder={t("dialog.threadTypePlaceholder")}
               options={[
                 { value: "feature", label: t("kind.feature") },
                 { value: "bugfix", label: t("kind.bugfix") },
@@ -387,7 +397,7 @@ export function CreateThreadDialog({ open, onOpenChange }: DProps) {
             <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
               {t("common.cancel")}
             </Button>
-            <Button type="submit" variant="primary" disabled={!title.trim() || busy}>
+            <Button type="submit" variant="primary" disabled={!title.trim() || !kind || busy}>
               {busy ? t("dialog.creating") : t("dialog.createThread")}
             </Button>
           </div>

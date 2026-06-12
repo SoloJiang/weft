@@ -1,18 +1,21 @@
 //! Restore round-trip: back the db up, lose the local file, restore from
-//! the remote, prove the data is back.
+//! the remote, prove the data is back. Plaintext path; encrypted lifecycle
+//! is in `db_encryption_lifecycle.rs`.
 
-use base64::Engine;
 use std::process::Command;
 use std::sync::Mutex;
-use weft_app_lib::backup::{BackupService, config, recovery_key};
-use weft_app_lib::store::Db;
+use weft::backup::{BackupService, config, recovery_key};
+use weft::store::Db;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn iso_env_with(home: &std::path::Path, key: [u8; 48]) {
+fn iso_env(home: &std::path::Path) {
     std::env::set_var("WEFT_HOME", home);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(key);
-    std::env::set_var("WEFT_TEST_DB_KEY_B64", &b64);
+    // The recovery-key file currently always carries a password (for the
+    // encrypted-restore case). For the plaintext round-trip we still need
+    // *some* password env in place so `recovery_key::export_to` has a value
+    // to write; the restored DB is plaintext and ignores it.
+    std::env::set_var("WEFT_TEST_DB_PASSWORD", "round-trip-pwd");
 }
 
 fn make_bare(parent: &std::path::Path) -> String {
@@ -28,12 +31,25 @@ fn make_bare(parent: &std::path::Path) -> String {
     format!("file://{}", bare.to_string_lossy())
 }
 
+/// Delete a file, retrying briefly. On Windows a file with any live handle
+/// can't be removed, and a just-closed SQLite pool can linger a few ms; on
+/// Unix the first attempt succeeds (open files unlink freely).
+async fn remove_file_eventually(p: &std::path::Path) {
+    for _ in 0..100 {
+        if std::fs::remove_file(p).is_ok() || !p.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    std::fs::remove_file(p).unwrap();
+}
+
 #[tokio::test]
 async fn backup_then_restore_roundtrip() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().to_path_buf();
-    iso_env_with(&home, [0xEDu8; 48]);
+    iso_env(&home);
 
     let url = make_bare(tmp.path());
 
@@ -61,22 +77,21 @@ async fn backup_then_restore_roundtrip() {
         let r = svc.run_now().await.unwrap();
         assert!(matches!(
             r,
-            weft_app_lib::backup::RunOutcome::Success { .. }
+            weft::backup::RunOutcome::Success { .. }
         ));
+        // Windows can't delete a file that still has open handles; close the
+        // SQLite pool so weft.db is released before it's removed below.
+        drop(svc);
+        db.0.close().await;
     }
 
     let rk_path = tmp.path().join("rk.json");
     recovery_key::export_to(&rk_path).unwrap();
 
-    // Simulate "new machine": wipe the local db file so restore_from accepts
-    // the operation.
-    std::fs::remove_file(home.join("weft.db")).unwrap();
-    // Also remove WAL/journal sidecars if SQLCipher left any.
+    remove_file_eventually(&home.join("weft.db")).await;
     let _ = std::fs::remove_file(home.join("weft.db-wal"));
     let _ = std::fs::remove_file(home.join("weft.db-shm"));
 
-    // restore_from only touches files + Keychain; the Db handle it holds is
-    // unused, so a throwaway in-memory db is fine.
     let svc = {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         BackupService::new(db, home.clone())
@@ -96,13 +111,15 @@ async fn backup_then_restore_roundtrip() {
         .expect("row exists");
     let name: String = row.try_get("", "name").unwrap();
     assert_eq!(name, "restore-me");
+
+    std::env::remove_var("WEFT_TEST_DB_PASSWORD");
 }
 
 #[tokio::test]
 async fn restore_refuses_when_db_exists() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    iso_env_with(tmp.path(), [0x12u8; 48]);
+    iso_env(tmp.path());
     let db = Db::open_default().await.unwrap();
     let svc = BackupService::new(db, tmp.path().to_path_buf());
     let rk = tmp.path().join("rk.json");
@@ -116,4 +133,5 @@ async fn restore_refuses_when_db_exists() {
         err.to_string().contains("already exists"),
         "got: {err:#}"
     );
+    std::env::remove_var("WEFT_TEST_DB_PASSWORD");
 }

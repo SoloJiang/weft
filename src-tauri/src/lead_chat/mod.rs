@@ -4,6 +4,7 @@
 //! Spec: docs/superpowers/specs/2026-06-10-lead-chat-engine-design.md
 
 pub mod commands;
+pub mod delta_hub;
 pub mod engine;
 pub mod out_hub;
 pub mod proto;

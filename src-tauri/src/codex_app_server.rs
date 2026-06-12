@@ -34,7 +34,10 @@ use crate::lead_chat::proto::ChatEvent;
 /// Encode a client→server request line (newline-terminated). `params` is sent
 /// verbatim; all our requests carry params.
 pub fn encode_request(id: i64, method: &str, params: Value) -> String {
-    format!("{}\n", json!({ "id": id, "method": method, "params": params }))
+    format!(
+        "{}\n",
+        json!({ "id": id, "method": method, "params": params })
+    )
 }
 
 /// Encode a client→server notification (no id), e.g. the `initialized` handshake.
@@ -97,7 +100,11 @@ pub enum Incoming {
     /// Server→client notification (streaming events, hook/skills updates).
     Notification { method: String, params: Value },
     /// Server→client request (approvals) — must be answered, echoing `id`.
-    ServerRequest { id: Value, method: String, params: Value },
+    ServerRequest {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     /// Unparseable / unrecognised — ignored.
     Other,
 }
@@ -111,7 +118,11 @@ pub fn classify(line: &str) -> Incoming {
     if let Some(method) = v.get("method").and_then(|m| m.as_str()).map(String::from) {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
         return match v.get("id") {
-            Some(id) => Incoming::ServerRequest { id: id.clone(), method, params },
+            Some(id) => Incoming::ServerRequest {
+                id: id.clone(),
+                method,
+                params,
+            },
             None => Incoming::Notification { method, params },
         };
     }
@@ -119,13 +130,20 @@ pub fn classify(line: &str) -> Incoming {
         return Incoming::Other;
     };
     if let Some(result) = v.get("result") {
-        return Incoming::Response { id, result: result.clone() };
+        return Incoming::Response {
+            id,
+            result: result.clone(),
+        };
     }
     if let Some(err) = v.get("error") {
         return Incoming::Error {
             id,
             code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
-            message: err.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+            message: err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string(),
         };
     }
     Incoming::Other
@@ -156,10 +174,14 @@ pub fn is_approval_request(method: &str) -> bool {
 /// 4). Mirrors how the exec dialect renders agent text + tool pills.
 pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> {
     match method {
-        "item/agentMessage/delta" => params["delta"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| ChatEvent::TextDelta { text: s.to_string() }),
+        "item/agentMessage/delta" => {
+            params["delta"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| ChatEvent::TextDelta {
+                    text: s.to_string(),
+                })
+        }
         "item/started" => {
             // Non-text items surface as activity pills as soon as they start;
             // agentMessage waits for its deltas / completion.
@@ -167,6 +189,9 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             match item["type"].as_str() {
                 Some("agentMessage") | None => None,
                 Some("reasoning") => None,
+                Some("error") => Some(ChatEvent::TextDelta {
+                    text: crate::lead_chat::proto::error_text_from_item(item),
+                }),
                 Some(kind) => Some(ChatEvent::Assistant {
                     texts: vec![],
                     tools: vec![(kind.to_string(), item_summary(kind, item))],
@@ -216,7 +241,11 @@ pub enum ThreadMsg {
     /// An approval ask the session must answer via [`Client::reply_approval`]
     /// (echoing `id`), else the turn hangs. `decision` ∈ accept | acceptForSession
     /// | decline | cancel.
-    Approval { id: Value, method: String, params: Value },
+    Approval {
+        id: Value,
+        method: String,
+        params: Value,
+    },
 }
 
 struct Inner {
@@ -265,8 +294,14 @@ impl Client {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
         *g = Some(Inner {
             stdin,
             next_id: 1,
@@ -281,8 +316,11 @@ impl Client {
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
 
         // Handshake: initialize (await), then the `initialized` notification.
-        self.request("initialize", initialize_params("weft", env!("CARGO_PKG_VERSION")))
-            .await?;
+        self.request(
+            "initialize",
+            initialize_params("weft", env!("CARGO_PKG_VERSION")),
+        )
+        .await?;
         self.notify("initialized", None).await?;
         Ok(())
     }
@@ -306,7 +344,8 @@ impl Client {
                 Incoming::ServerRequest { id, method, params } => {
                     if is_approval_request(&method) {
                         if let Some(tid) = params["threadId"].as_str().map(String::from) {
-                            self.route(&tid, ThreadMsg::Approval { id, method, params }).await;
+                            self.route(&tid, ThreadMsg::Approval { id, method, params })
+                                .await;
                         }
                     }
                 }
@@ -345,7 +384,10 @@ impl Client {
             inner.next_id += 1;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
-            inner.stdin.write_all(encode_request(id, method, params).as_bytes()).await?;
+            inner
+                .stdin
+                .write_all(encode_request(id, method, params).as_bytes())
+                .await?;
             inner.stdin.flush().await?;
             (id, rx)
         };
@@ -365,8 +407,13 @@ impl Client {
     /// Fire-and-forget notification (no reply expected).
     pub async fn notify(&self, method: &str, params: Option<Value>) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
-        let inner = g.as_mut().ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
-        inner.stdin.write_all(encode_notification(method, params).as_bytes()).await?;
+        let inner = g
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
+        inner
+            .stdin
+            .write_all(encode_notification(method, params).as_bytes())
+            .await?;
         inner.stdin.flush().await?;
         Ok(())
     }
@@ -393,34 +440,52 @@ impl Client {
     /// Record the in-flight turn id for a thread (for a later interrupt).
     pub async fn set_active_turn(&self, thread_id: &str, turn_id: &str) {
         if let Some(inner) = self.0.lock().await.as_mut() {
-            inner.active_turn.insert(thread_id.to_string(), turn_id.to_string());
+            inner
+                .active_turn
+                .insert(thread_id.to_string(), turn_id.to_string());
         }
     }
 
     /// The in-flight turn id for a thread, if any.
     pub async fn active_turn(&self, thread_id: &str) -> Option<String> {
-        self.0.lock().await.as_ref()?.active_turn.get(thread_id).cloned()
+        self.0
+            .lock()
+            .await
+            .as_ref()?
+            .active_turn
+            .get(thread_id)
+            .cloned()
     }
 
     // ── typed drive-loop helpers ──
     pub async fn start_thread(&self, cwd: &str) -> anyhow::Result<String> {
-        let r = self.request("thread/start", thread_start_params(cwd)).await?;
+        let r = self
+            .request("thread/start", thread_start_params(cwd))
+            .await?;
         thread_id_of(&r).ok_or_else(|| anyhow::anyhow!("thread/start: no thread.id"))
     }
     pub async fn resume_thread(&self, thread_id: &str) -> anyhow::Result<()> {
-        self.request("thread/resume", thread_resume_params(thread_id)).await.map(|_| ())
+        self.request("thread/resume", thread_resume_params(thread_id))
+            .await
+            .map(|_| ())
     }
     pub async fn start_turn(&self, thread_id: &str, text: &str) -> anyhow::Result<String> {
-        let r = self.request("turn/start", turn_start_params(thread_id, text)).await?;
+        let r = self
+            .request("turn/start", turn_start_params(thread_id, text))
+            .await?;
         turn_id_of(&r).ok_or_else(|| anyhow::anyhow!("turn/start: no turn.id"))
     }
     pub async fn interrupt(&self, thread_id: &str, turn_id: &str) -> anyhow::Result<()> {
-        self.request("turn/interrupt", turn_interrupt_params(thread_id, turn_id)).await.map(|_| ())
+        self.request("turn/interrupt", turn_interrupt_params(thread_id, turn_id))
+            .await
+            .map(|_| ())
     }
     /// Answer an approval request. `decision` ∈ accept | acceptForSession | decline | cancel.
     pub async fn reply_approval(&self, id: &Value, decision: &str) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
-        let inner = g.as_mut().ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
+        let inner = g
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
         let line = encode_response(id, json!({ "decision": decision }));
         inner.stdin.write_all(line.as_bytes()).await?;
         inner.stdin.flush().await?;
@@ -467,18 +532,27 @@ mod tests {
     fn classify_distinguishes_message_kinds() {
         assert_eq!(
             classify(r#"{"id":7,"result":{"turn":{"id":"turn_9"}}}"#),
-            Incoming::Response { id: 7, result: json!({"turn":{"id":"turn_9"}}) }
+            Incoming::Response {
+                id: 7,
+                result: json!({"turn":{"id":"turn_9"}})
+            }
         );
         assert!(matches!(
             classify(r#"{"id":7,"error":{"code":-32600,"message":"bad"}}"#),
-            Incoming::Error { id: 7, code: -32600, .. }
+            Incoming::Error {
+                id: 7,
+                code: -32600,
+                ..
+            }
         ));
         assert!(matches!(
             classify(r#"{"method":"turn/completed","params":{"turn":{"status":"completed"}}}"#),
             Incoming::Notification { .. }
         ));
         // server request: has BOTH method and id → must be answered.
-        match classify(r#"{"id":"a1","method":"item/commandExecution/requestApproval","params":{}}"#) {
+        match classify(
+            r#"{"id":"a1","method":"item/commandExecution/requestApproval","params":{}}"#,
+        ) {
             Incoming::ServerRequest { id, method, .. } => {
                 assert_eq!(id, json!("a1"));
                 assert!(is_approval_request(&method));
@@ -506,6 +580,13 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
+        ) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "unknown slash command"),
+            e => panic!("{e:?}"),
+        }
         // agentMessage text already streamed via deltas — item/completed is a
         // no-op to avoid double-rendering (verified against live 0.137.0).
         assert!(notification_to_event(
@@ -522,14 +603,22 @@ mod tests {
             Some(ChatEvent::TurnEnd { is_error: true })
         ));
         // reasoning + lifecycle markers are ignored
-        assert!(notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none());
+        assert!(
+            notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none()
+        );
         assert!(notification_to_event("turn/started", &json!({"threadId":"t"})).is_none());
     }
 
     #[test]
     fn extracts_ids_from_responses() {
-        assert_eq!(thread_id_of(&json!({"thread":{"id":"th_1"}})).as_deref(), Some("th_1"));
-        assert_eq!(turn_id_of(&json!({"turn":{"id":"tn_1"}})).as_deref(), Some("tn_1"));
+        assert_eq!(
+            thread_id_of(&json!({"thread":{"id":"th_1"}})).as_deref(),
+            Some("th_1")
+        );
+        assert_eq!(
+            turn_id_of(&json!({"turn":{"id":"tn_1"}})).as_deref(),
+            Some("tn_1")
+        );
         assert_eq!(thread_id_of(&json!({})), None);
     }
 }

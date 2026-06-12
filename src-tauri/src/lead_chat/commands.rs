@@ -9,6 +9,20 @@ fn lead_key(thread_id: i32) -> i64 {
     -(thread_id as i64)
 }
 
+fn ensure_lead_cwd(thread_id: i32) -> anyhow::Result<std::path::PathBuf> {
+    let cwd = crate::paths::weft_home()?
+        .join("leads")
+        .join(thread_id.to_string());
+    std::fs::create_dir_all(&cwd)?;
+    // git-init so claude's session store (keyed by cwd) behaves like any other
+    // cwd; harmless if it already exists.
+    let _ = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&cwd)
+        .status();
+    Ok(cwd)
+}
+
 /// What a (re)dispatched worker session looks like to the frontend.
 #[derive(serde::Serialize, Clone)]
 pub struct SessionInfo {
@@ -78,7 +92,7 @@ pub fn concierge_prompt(lang: &str) -> String {
 - answer_question(thread_id, ask_id, text) —— 转达用户对 agent 提问的回答。\n\
 - message_lead(thread_id, text) —— 把用户的话喂给某个 issue 的 lead。\n\
 - ensure_issue_topic(thread_id, chat_id) —— 当用户语义明确要为某个已有 issue 创建/打开/继续飞书 topic 时调用；普通聊天不要调用。\n\
-- create_issue(workspace_id, title, kind) —— 新建 issue；kind 默认 feature。\n\
+- create_issue(workspace_id, title, kind) —— 新建 issue；kind 必须显式传入 feature / bugfix / refactor / spike 之一。\n\
 \n\
 不要做的事：\n\
 - 不要替用户决定需要桌面确认的事（scope 拍板、批准 write trigger、合并保护分支）——把状态报清楚，请用户去桌面处理。\n\
@@ -100,7 +114,7 @@ Tools:\n\
 - answer_question(thread_id, ask_id, text) — relay the user's answer to an agent's open question.\n\
 - message_lead(thread_id, text) — deliver the user's message into a specific issue's lead.\n\
 - ensure_issue_topic(thread_id, chat_id) — call only when the user semantically asks to create/open/continue a Feishu topic for an existing issue; do not call for ordinary chat.\n\
-- create_issue(workspace_id, title, kind) — file a new issue (kind defaults to feature).\n\
+- create_issue(workspace_id, title, kind) — file a new issue; kind must be explicitly set to feature, bugfix, refactor, or spike.\n\
 \n\
 Do not:\n\
 - Decide things that require the desktop (scope approval, write-trigger approve/deny, merge-protected branches) — report the state and ask the user to go to the desktop.\n\
@@ -135,16 +149,7 @@ pub async fn lead_engine(
     let t = repo::get_thread(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
-    let cwd = crate::paths::weft_home()?
-        .join("leads")
-        .join(thread_id.to_string());
-    std::fs::create_dir_all(&cwd)?;
-    // git-init so claude's session store (keyed by cwd) behaves like any other
-    // cwd; harmless if it already exists.
-    let _ = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&cwd)
-        .status();
+    let cwd = ensure_lead_cwd(thread_id)?;
     let base = app.state::<crate::BusBase>().0.clone();
     let is_concierge = t.kind == "concierge";
     let inj = if is_concierge {
@@ -278,6 +283,39 @@ pub struct LeadStateInfo {
     pub cwd: String,
 }
 
+/// 由「常驻子进程是否存活」与「当前 turn 是否在跑」决定 lead engine 对外报的 state。
+/// 纯函数，便于回归测试。
+///
+/// **busy 优先于 alive**：codex app-server 在共享连接上跑 turn，没有 per-turn 子进程，
+/// 故进行中也 alive=false。若先判 alive 会把正在跑的一轮误报成 "stopped"，切页重挂时
+/// loadLeadChat 便用它覆盖实时 "busy"，「处理中」占位随之消失。turn 结束/进程死时
+/// busy 都会被复位（见 engine.rs on_turn_end / 死亡清理），故 busy 优先是安全的。
+fn lead_state_label(alive: bool, busy: bool) -> &'static str {
+    if busy {
+        "busy"
+    } else if !alive {
+        "stopped"
+    } else {
+        "idle"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lead_state_label;
+
+    #[test]
+    fn busy_turn_reports_busy_even_without_resident_child() {
+        // codex app-server 在共享连接上跑 turn，没有 per-turn 子进程，故进行中
+        // alive=false。正在跑的一轮必须仍报 "busy"——否则切页重挂时 loadLeadChat
+        // 会用陈旧的 "stopped" 覆盖实时态，「处理中」占位消失。（回归）
+        assert_eq!(lead_state_label(false, true), "busy");
+        assert_eq!(lead_state_label(true, true), "busy");
+        assert_eq!(lead_state_label(true, false), "idle");
+        assert_eq!(lead_state_label(false, false), "stopped");
+    }
+}
+
 #[tauri::command]
 pub async fn lead_state(
     app: AppHandle,
@@ -308,14 +346,7 @@ pub async fn lead_state(
                 .map(|c| c.try_wait().ok().flatten().is_none())
                 .unwrap_or(false);
             Ok(LeadStateInfo {
-                state: if !alive {
-                    "stopped"
-                } else if i.turn.busy {
-                    "busy"
-                } else {
-                    "idle"
-                }
-                .into(),
+                state: lead_state_label(alive, i.turn.busy).into(),
                 queued: i.turn.queue.len(),
                 native_id: i.native_id.clone(),
                 slash_commands: i.slash_commands.clone(),
@@ -326,10 +357,12 @@ pub async fn lead_state(
 }
 
 /// Discover the slash commands a session's CLI actually supports — never
-/// hardcoded. claude: the live `initialize` list the engine already holds;
-/// opencode: GET /command off a lazily-started `opencode serve`, keyed by the
-/// session's project cwd; codex: none (headless `exec` has no slash surface).
-/// `session_id` selects a worker; `thread_id` selects the (claude) lead.
+/// hardcoded for tools whose CLI exposes the list. claude: the live
+/// `initialize` list the engine already holds; opencode: GET /command off a
+/// lazily-started `opencode serve`, keyed by the session's project cwd; codex:
+/// the TUI's built-in enum mirrored locally (codex's app-server has no slash
+/// surface, see `codex_slash`) merged with dynamic skills from `skills/list`.
+/// `session_id` selects a worker; `thread_id` selects the lead.
 #[tauri::command]
 pub async fn discover_slash(
     app: AppHandle,
@@ -339,25 +372,124 @@ pub async fn discover_slash(
 ) -> Result<Vec<crate::lead_chat::proto::SlashCmd>, String> {
     let state = app.state::<LeadChatState>();
     if let Some(sid) = session_id {
-        let Some(sess) = repo::get_session(&db, sid).await.map_err(|e| e.to_string())? else {
+        let Some(sess) = repo::get_session(&db, sid)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
             return Ok(vec![]);
         };
         return Ok(match sess.tool.as_str() {
-            "opencode" => crate::opencode::discover_commands(&sess.cwd).await,
-            "claude" => match state.get(sid as i64) {
-                Some(eng) => eng.lock().await.slash_commands.clone(),
-                None => vec![],
-            },
-            _ => vec![], // codex: no headless slash commands
+            "opencode" => merge_local_skill_commands(
+                crate::opencode::discover_commands(&sess.cwd).await,
+                std::path::Path::new(&sess.cwd),
+            ),
+            "claude" => {
+                let eng = match state.get(sid as i64) {
+                    Some(eng) => eng,
+                    None => worker_engine(&app, &db, sid)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                };
+                engine::ensure_running(&app, &db, &eng)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                merge_local_skill_commands(
+                    wait_for_slash_commands(&eng).await,
+                    std::path::Path::new(&sess.cwd),
+                )
+            }
+            "codex" => {
+                crate::codex_slash::discover_commands_for_cwd(std::path::Path::new(&sess.cwd)).await
+            }
+            _ => vec![],
         });
     }
-    // Lead console (always claude): the engine's live initialize list.
+    // Lead console: claude carries its own initialize list on the engine;
+    // codex and opencode use the same fallback discovery as workers so the
+    // composer still gets a palette before the lead process has emitted init.
     if let Some(tid) = thread_id {
         if let Some(eng) = state.get(lead_key(tid)) {
-            return Ok(eng.lock().await.slash_commands.clone());
+            let (live, tool, cwd) = {
+                let inner = eng.lock().await;
+                (
+                    inner.slash_commands.clone(),
+                    inner.tool.clone(),
+                    inner.cwd.clone(),
+                )
+            };
+            let discovered = match tool.as_str() {
+                "claude" if live.is_empty() => {
+                    engine::ensure_running(&app, &db, &eng)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    merge_local_skill_commands(wait_for_slash_commands(&eng).await, &cwd)
+                }
+                "claude" => merge_local_skill_commands(live, &cwd),
+                "opencode" => {
+                    let cmds = crate::opencode::discover_commands(&cwd.to_string_lossy()).await;
+                    let cmds = if cmds.is_empty() { live } else { cmds };
+                    merge_local_skill_commands(cmds, &cwd)
+                }
+                "codex" => {
+                    let cmds = crate::codex_slash::discover_commands_for_cwd(&cwd).await;
+                    if cmds.is_empty() {
+                        live
+                    } else {
+                        cmds
+                    }
+                }
+                _ => live,
+            };
+            if !discovered.is_empty() {
+                eng.lock().await.slash_commands = discovered.clone();
+            }
+            return Ok(discovered);
+        } else if let Ok(Some(t)) = repo::get_thread(&db, tid).await {
+            // Lead engine not spawned yet — composer still wants a palette.
+            return Ok(match t.lead_tool.as_str() {
+                "opencode" => {
+                    let cwd = ensure_lead_cwd(tid).map_err(|e| e.to_string())?;
+                    crate::skills::inject_for(&db, t.workspace_id, &cwd).await;
+                    merge_local_skill_commands(
+                        crate::opencode::discover_commands(&cwd.to_string_lossy()).await,
+                        &cwd,
+                    )
+                }
+                "codex" => {
+                    let cwd = ensure_lead_cwd(tid).map_err(|e| e.to_string())?;
+                    crate::skills::inject_for(&db, t.workspace_id, &cwd).await;
+                    crate::codex_slash::discover_commands_for_cwd(&cwd).await
+                }
+                _ => vec![],
+            });
         }
     }
     Ok(vec![])
+}
+
+fn merge_local_skill_commands(
+    mut commands: Vec<crate::lead_chat::proto::SlashCmd>,
+    cwd: &std::path::Path,
+) -> Vec<crate::lead_chat::proto::SlashCmd> {
+    let mut seen: std::collections::HashSet<String> =
+        commands.iter().map(|c| c.name.clone()).collect();
+    for c in crate::codex_slash::local_skill_commands_for_cwd(cwd) {
+        if seen.insert(c.name.clone()) {
+            commands.push(c);
+        }
+    }
+    commands
+}
+
+async fn wait_for_slash_commands(eng: &EngineRef) -> Vec<crate::lead_chat::proto::SlashCmd> {
+    for _ in 0..20 {
+        let cmds = eng.lock().await.slash_commands.clone();
+        if !cmds.is_empty() {
+            return cmds;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    vec![]
 }
 
 #[tauri::command]

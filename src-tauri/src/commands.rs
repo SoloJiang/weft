@@ -31,16 +31,15 @@ pub async fn list_workspaces(db: State<'_, Db>) -> R<Vec<entities::workspace::Mo
     repo::list_workspaces(&db).await.map_err(e)
 }
 
-/// Return the id of the most-recently created workspace, creating a "Default"
-/// workspace first if the DB has none. Used by first-run onboarding so the UI
-/// always has a workspace id to attach a repo/thread to. Kept as a free
-/// function so integration tests can drive it without a Tauri runtime.
+/// Return the id of the most-recently created workspace. This never creates a
+/// synthetic "Default" workspace; callers that need one must ask the user for
+/// an explicit name. Kept as a free function so integration tests can drive it
+/// without a Tauri runtime.
 pub async fn ensure_default_workspace_inner(db: &Db) -> R<i32> {
     if let Some(w) = repo::latest_workspace(db).await.map_err(e)? {
         return Ok(w.id);
     }
-    let created = repo::create_workspace(db, "Default").await.map_err(e)?;
-    Ok(created.id)
+    Err("workspace required".into())
 }
 
 #[tauri::command]
@@ -902,6 +901,8 @@ pub struct ImSettingsView {
     pub has_secret: bool,
     pub bound: bool,
     pub enabled: bool,
+    /// 远程待命（im.remote_standby）：桥启用期间保持系统唤醒。
+    pub remote_standby: bool,
 }
 
 #[tauri::command]
@@ -912,6 +913,7 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
         has_secret: !s.app_secret.is_empty(),
         bound: !s.allow_open_ids.is_empty(),
         enabled: s.enabled,
+        remote_standby: s.remote_standby,
     })
 }
 
@@ -944,6 +946,26 @@ pub async fn im_set_enabled(app: tauri::AppHandle, db: State<'_, Db>, enabled: b
         .await
         .map_err(e)?;
     crate::im::spawn(app);
+    Ok(())
+}
+
+/// 远程待命：桥启用期间持有「防空闲休眠」断言，保证飞书指令随时可达。
+/// 纯电源层开关——不重启桥、不断 WS；写库后立即收敛 PowerGuard。
+#[tauri::command]
+pub async fn im_set_remote_standby(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    enabled: bool,
+) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::im::K_REMOTE_STANDBY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)?;
+    let s = crate::im::ImSettings::load(&db).await.map_err(e)?;
+    crate::power::set_standby(&app, enabled && s.enabled && s.ready());
     Ok(())
 }
 
@@ -1013,4 +1035,59 @@ pub async fn im_route_for_thread(db: State<'_, Db>, thread_id: i32) -> R<Option<
 pub async fn im_list_routes(db: State<'_, Db>) -> R<Vec<ImRouteView>> {
     let rows = repo::list_im_routes(&db).await.map_err(e)?;
     Ok(rows.into_iter().map(route_view).collect())
+}
+
+// --- Encryption ---
+
+#[derive(serde::Serialize)]
+pub struct DbEncryptionStatus {
+    pub encrypted: bool,
+}
+
+#[tauri::command]
+pub fn db_encryption_status(db: State<'_, Db>) -> R<DbEncryptionStatus> {
+    Ok(DbEncryptionStatus {
+        encrypted: db.encrypted(),
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct DbEncryptionMutationResult {
+    pub restart_required: bool,
+}
+
+#[tauri::command]
+pub async fn db_enable_encryption(password: String) -> R<DbEncryptionMutationResult> {
+    let path = crate::paths::db_path().map_err(e)?;
+    crate::store::encryption::enable(&path, &password)
+        .await
+        .map_err(e)?;
+    Ok(DbEncryptionMutationResult {
+        restart_required: true,
+    })
+}
+
+#[tauri::command]
+pub async fn db_disable_encryption(password: String) -> R<DbEncryptionMutationResult> {
+    let path = crate::paths::db_path().map_err(e)?;
+    crate::store::encryption::disable(&path, &password)
+        .await
+        .map_err(e)?;
+    Ok(DbEncryptionMutationResult {
+        restart_required: true,
+    })
+}
+
+#[tauri::command]
+pub async fn db_change_password(
+    old_password: String,
+    new_password: String,
+) -> R<DbEncryptionMutationResult> {
+    let path = crate::paths::db_path().map_err(e)?;
+    crate::store::encryption::change_password(&path, &old_password, &new_password)
+        .await
+        .map_err(e)?;
+    Ok(DbEncryptionMutationResult {
+        restart_required: true,
+    })
 }

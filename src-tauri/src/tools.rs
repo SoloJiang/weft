@@ -70,7 +70,11 @@ fn probe(tool: &str) -> ToolStatus {
         .unwrap_or(true);
     if installed && !meets_min {
         if let Some(v) = &version {
-            diagnostics.push(Diag::below_minimum(tool, v, &crate::detect::min_version_str(tool)));
+            diagnostics.push(Diag::below_minimum(
+                tool,
+                v,
+                &crate::detect::min_version_str(tool),
+            ));
         }
     }
     ToolStatus {

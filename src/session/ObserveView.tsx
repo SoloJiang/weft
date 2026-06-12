@@ -187,9 +187,7 @@ export function ObserveView() {
               slashCommands={workerSlash[chatSessionId] ?? []}
               onNeedSlashCommands={() => discoverWorkerSlash(chatSessionId)}
               busy={(workerTurn[chatSessionId]?.state ?? "stopped") === "busy"}
-              stopped={(workerTurn[chatSessionId]?.state ?? "stopped") === "stopped"}
               queued={workerTurn[chatSessionId]?.queued ?? 0}
-              stoppedHint={t("session.chatStopped")}
               placeholder={t("session.message")}
               onSend={(v, images, files) =>
                 void api.chatSend(chatSessionId, v, images, files)
