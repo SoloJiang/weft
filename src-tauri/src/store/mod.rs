@@ -13,19 +13,38 @@ use sea_orm_migration::MigratorTrait;
 pub struct Db(pub DatabaseConnection);
 
 impl Db {
-    /// Connect to a sqlite URL (e.g. "sqlite://<path>?mode=rwc" or
-    /// "sqlite::memory:") and run migrations.
+    /// Connect to any sqlite URL (e.g. "sqlite://<path>?mode=rwc" or
+    /// "sqlite::memory:") without attaching a SQLCipher key. Kept for the
+    /// in-memory tests and any caller that wants a plain sqlite handle.
     pub async fn connect(url: &str) -> Result<Self, sea_orm::DbErr> {
         let conn = Database::connect(url).await?;
         Migrator::up(&conn, None).await?;
         Ok(Db(conn))
     }
 
-    /// Connect to the on-disk weft db (~/.weft/weft.db).
+    /// Open `~/.weft/weft.db` as an encrypted SQLCipher database. The key is
+    /// taken from (or minted into) the OS Keychain. Any pre-existing plaintext
+    /// db is renamed aside — we do not migrate its data.
     pub async fn open_default() -> anyhow::Result<Self> {
         let path = crate::paths::db_path()?;
+        crate::store::legacy::archive_if_plaintext(&path)?;
+
+        let key = crate::store::key::get_or_create()?;
         let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
-        Ok(Self::connect(&url).await?)
+
+        let mut opt = sea_orm::ConnectOptions::new(url);
+        opt.sqlcipher_key(crate::store::key::format_for_pragma(&key));
+
+        let conn = sea_orm::Database::connect(opt).await?;
+
+        // SQLCipher-recommended pragmas; must run after the key is registered
+        // (otherwise the connection is still locked and these statements fail).
+        use sea_orm::ConnectionTrait;
+        conn.execute_unprepared("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .await?;
+
+        Migrator::up(&conn, None).await?;
+        Ok(Db(conn))
     }
 }
 
