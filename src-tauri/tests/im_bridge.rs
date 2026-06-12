@@ -441,7 +441,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
         message_id: 7,
         text: "搞定了一半".into(),
     };
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
     // reply 一次，body 带 Lead 前缀
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
@@ -468,7 +468,7 @@ async fn consume_lead_out_unbound_thread_is_noop() {
         message_id: 1,
         text: "nope".into(),
     };
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
     assert!(ch.replies.lock().unwrap().is_empty());
     assert!(ch.deletions.lock().unwrap().is_empty());
 }
@@ -529,7 +529,7 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
         text: "我查到了。".into(),
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
 
     let texts = ch.texts.lock().unwrap();
     assert_eq!(texts.len(), 1);
@@ -560,7 +560,7 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
         text: "收到，我看一下。".into(),
     };
 
-    im::consume_lead_out(out, &db, &ch, &acks).await;
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
 
     assert!(ch.texts.lock().unwrap().is_empty());
     let chat_texts = ch.chat_texts.lock().unwrap();

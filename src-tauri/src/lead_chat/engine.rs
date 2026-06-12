@@ -512,6 +512,7 @@ async fn codex_consumer(
                         c.2 = std::time::Instant::now();
                         let content = serde_json::json!({ "text": c.1 }).to_string();
                         let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
+                        emit_lead_delta(&app, thread_id, row, &c.1, false);
                     }
                 }
                 let _ = app.emit(EVENT, Push::Delta { thread_id, message_id: row, text });
@@ -987,6 +988,7 @@ fn spawn_reader(
                             let content = serde_json::json!({ "text": c.1 }).to_string();
                             let _ =
                                 repo::update_lead_message(&db, row, &content, "streaming").await;
+                            emit_lead_delta(&app, thread_id, row, &c.1, false);
                         }
                     }
                     let _ = app.emit(
@@ -1357,6 +1359,22 @@ fn emit_lead_out(app: &AppHandle, thread_id: i32, message_id: i32, text: &str) {
             thread_id,
             message_id,
             text: t.to_string(),
+        });
+    }
+    // streaming 收尾：每个「段落完成」处同时发一帧 done（与 LeadOut 同源、同清洗后文本），
+    // IM 桥据 done 定稿流式卡片。中间帧由两处 500ms 节流点发（见 emit_lead_delta）。
+    emit_lead_delta(app, thread_id, message_id, t, true);
+}
+
+/// streaming 增量帧。`accumulated` 是到当前为止的全文；`done` 标记最后一帧。
+/// 未注册 LeadDeltaHub（如 mock_app 测试）静默——不 panic。
+fn emit_lead_delta(app: &AppHandle, thread_id: i32, message_id: i32, accumulated: &str, done: bool) {
+    if let Some(hub) = app.try_state::<super::delta_hub::LeadDeltaHub>() {
+        hub.emit(super::delta_hub::LeadDelta {
+            thread_id,
+            message_id,
+            accumulated: accumulated.to_string(),
+            done,
         });
     }
 }

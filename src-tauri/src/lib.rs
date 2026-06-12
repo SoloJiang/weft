@@ -91,6 +91,7 @@ pub fn run() {
         .manage(db)
         .manage(lead_chat::engine::LeadChatState::default())
         .manage(lead_chat::out_hub::LeadOutHub::default())
+        .manage(lead_chat::delta_hub::LeadDeltaHub::default())
         .manage(commands::GuardrailState::default())
         .manage(power::PowerGuard::default())
         .manage(bus)

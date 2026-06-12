@@ -10,6 +10,7 @@
 //! 调用风格也从 `client.im.v1.message.create(req, None)` 改为「请求构建器 + `.execute*(body)`」。
 //! `app_type` 默认即 `SelfBuild`（openlark_core `AppType` 的 `#[default]`），故无需显式设置。
 
+pub mod streaming;
 pub mod ws;
 
 use open_lark::communication::im::v1::message::create::{CreateMessageBody, CreateMessageRequest};
@@ -28,6 +29,8 @@ pub struct FeishuChannel {
     // ——区别于长连接用的 `open_lark::Config`（openlark_client）。缓存一份可克隆的
     // CoreConfig 而非整个 Client：token 缓存挂在内部，clone 共享同一缓存。
     config: CoreConfig,
+    // 流式卡片走 raw REST（typed SDK 的 content body 缺 sequence），独立 token 缓存。
+    stream: streaming::StreamClient,
 }
 
 impl FeishuChannel {
@@ -42,6 +45,7 @@ impl FeishuChannel {
             .map_err(|e| anyhow::anyhow!("feishu client build: {e}"))?;
         Ok(Self {
             config: client.config().clone(),
+            stream: streaming::StreamClient::new(app_id, app_secret),
         })
     }
 
@@ -150,6 +154,60 @@ impl super::Channel for FeishuChannel {
             .execute()
             .await
             .map_err(|e| anyhow::anyhow!("feishu delete_reaction: {e}"))?;
+        Ok(())
+    }
+
+    async fn stream_begin(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+    ) -> anyhow::Result<Option<streaming::StreamSession>> {
+        let card_id = self.stream.create_streaming_card().await?;
+        let message_id = self
+            .stream
+            .send_entity_card(receive_id_type, receive_id, &card_id)
+            .await?;
+        Ok(Some(streaming::StreamSession::new(
+            card_id,
+            streaming::ELEMENT_ID.to_string(),
+            message_id,
+        )))
+    }
+
+    async fn stream_push(
+        &self,
+        session: &mut streaming::StreamSession,
+        accumulated: &str,
+    ) -> anyhow::Result<()> {
+        // 内容没变就不发——省一次卡片更新配额。
+        if !session.should_send(accumulated) {
+            return Ok(());
+        }
+        let seq = session.next_seq();
+        self.stream
+            .put_content(&session.card_id, &session.element_id, accumulated, seq)
+            .await?;
+        session.mark_sent(accumulated);
+        Ok(())
+    }
+
+    async fn stream_end(
+        &self,
+        session: &mut streaming::StreamSession,
+        final_text: &str,
+    ) -> anyhow::Result<()> {
+        // 最后一帧强制发权威全文（绕过去重），再关 streaming_mode。
+        let seq = session.next_seq();
+        self.stream
+            .put_content(&session.card_id, &session.element_id, final_text, seq)
+            .await?;
+        session.mark_sent(final_text);
+        // 关流式模式失败不致命：卡片内容已是终态，只是少了「停掉输入指示」这步。
+        // settings 也吃同一序号空间里的下一个 sequence。
+        let fin_seq = session.next_seq();
+        if let Err(e) = self.stream.finalize(&session.card_id, fin_seq).await {
+            eprintln!("[weft][im] stream finalize: {e}");
+        }
         Ok(())
     }
 }

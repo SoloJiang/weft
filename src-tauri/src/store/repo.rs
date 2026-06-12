@@ -195,6 +195,10 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
 /// Workspace container used by per-IM-conversation Concierge threads.
 pub const K_CONCIERGE_WORKSPACE: &str = "concierge.workspace_id";
 
+/// Phase 2 流式卡片开关（"1" = 开）。默认关：开了才把 Concierge 回复以飞书
+/// CardKit streaming 卡片逐字渲染；issue 话题仍走整段 reply。
+pub const K_IM_STREAMING: &str = "im.streaming";
+
 pub async fn add_repo_ref(
     db: &Db,
     workspace_id: i32,

@@ -31,8 +31,10 @@ futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 axum = "0.7"
 tower = "0.5"
-# opencode slash-command discovery hits http://127.0.0.1 only — no TLS needed.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# opencode slash-command discovery hits http://127.0.0.1（无需 TLS）；飞书 CardKit
+# 流式卡片走 HTTPS（open.feishu.cn），故启用 rustls-tls（rustls 已由 openlark 引入，
+# 此处仅复用，编译成本已付）。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
 keepawake = "0.6"
 # Package renamed open-lark -> openlark (0.15+); lib import path stays `open_lark::*`.
