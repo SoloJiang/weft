@@ -514,6 +514,11 @@ export const en = {
       "Create a self-built app on Feishu Open Platform; subscribe im.message.receive_v1 over long connection.",
     imAppSecret: "App Secret",
     imAppSecretHint: "Stored locally in weft.db. Leave blank to keep the saved value. The bridge connects when enabled and both credentials exist.",
+    imPermsLabel: "Required permissions",
+    imPermsHint:
+      "Enable these scopes under Permissions on the Open Platform: im:message covers send / reply / card update / reactions; the two readonly scopes receive 1:1 and group messages over long connection. group_msg is a sensitive scope and needs review approval.",
+    imPermsCopy: "Copy scopes",
+    imPermsCopied: "Copied",
     imBound: "Bound — message the bot once to re-bind another account",
     imUnbound: "Not bound — send the bot any message to bind your account",
     imConnect: "Save & connect",

@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   ArrowLeft,
   Bot,
   Boxes,
+  Check,
+  Copy,
   FolderOpen,
   MessageSquare,
   Moon,
@@ -405,6 +407,16 @@ function AutomationSettings() {
   );
 }
 
+// 飞书自建应用需开通的权限点，与 src-tauri/src/im/feishu 的实际调用一一对应：
+// im:message 一条覆盖 发消息(message.create)/回复(message.reply)/更新卡片
+// (message_card.patch)/表情回复(message_reaction)；两条 readonly 用于长连接
+// (im.message.receive_v1) 接收单聊与群聊消息。改后端调用面时同步这里。
+const FEISHU_SCOPES = [
+  "im:message",
+  "im:message.p2p_msg:readonly",
+  "im:message.group_msg:readonly",
+] as const;
+
 function ImSettings() {
   const { t } = useTranslation();
   const [appId, setAppId] = useState("");
@@ -415,6 +427,27 @@ function ImSettings() {
   const [enabled, setEnabled] = useState(false);
   const [status, setStatus] = useState("disabled");
   const [saving, setSaving] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  // 一键复制需开通的权限点：换行分隔，方便逐条粘进开放平台「权限管理」搜索框。
+  async function copyPerms() {
+    try {
+      await navigator.clipboard.writeText(FEISHU_SCOPES.join("\n"));
+    } catch {
+      return; // 剪贴板不可用时静默——按钮不给假反馈。
+    }
+    setCopied(true);
+    if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => setCopied(false), 1500);
+  }
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -534,6 +567,22 @@ function ImSettings() {
                 onChange={(e) => setSecret(e.currentTarget.value)}
                 className="h-8 w-full bg-bg/80 font-mono text-[12px]"
               />
+            </ImField>
+            <ImField label={t("settings.imPermsLabel")} hint={t("settings.imPermsHint")}>
+              <div className="flex items-start gap-2">
+                <code className="flex-1 whitespace-pre rounded-[var(--radius-md)] border border-border bg-bg/80 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-ink-muted">
+                  {FEISHU_SCOPES.join("\n")}
+                </code>
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => void copyPerms()}
+                  className="shrink-0"
+                >
+                  {copied ? <Check size={13} /> : <Copy size={13} />}
+                  {copied ? t("settings.imPermsCopied") : t("settings.imPermsCopy")}
+                </Button>
+              </div>
             </ImField>
             <div className="flex justify-end">
               <Button variant="primary" onClick={() => void reconnect()} disabled={saving || !dirty}>

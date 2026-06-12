@@ -499,6 +499,11 @@ export const zh = {
     imAppIdHint: "在飞书开放平台创建自建应用；事件订阅选长连接并订阅 im.message.receive_v1。",
     imAppSecret: "App Secret",
     imAppSecretHint: "仅存本机 weft.db。留空表示保持已保存的值。启用且双凭证齐全后桥会连接。",
+    imPermsLabel: "所需权限",
+    imPermsHint:
+      "在开放平台「权限管理」开通这些权限点：im:message 一条覆盖发消息/回复/更新卡片/表情回复，两条 readonly 用于长连接接收单聊与群聊消息。group_msg 属敏感权限，需提交审核。",
+    imPermsCopy: "复制权限点",
+    imPermsCopied: "已复制",
     imBound: "已绑定——再次私聊 bot 可重新绑定其他账号",
     imUnbound: "未绑定——给 bot 发任意一句话即可绑定你的账号",
     imConnect: "保存并连接",
