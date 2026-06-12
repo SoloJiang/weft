@@ -103,21 +103,59 @@ jobs:
             $protocPath = $installed.FullName
           }
           & $protocPath --version
-          # Supply protoc to prost-build via $PROTOC instead of prepending the
-          # WinGet package dir to PATH. That dir ships its own DLLs (abseil, etc.)
-          # which would otherwise land on the runtime DLL search path and can
-          # shadow the C-runtime / crypto DLLs the test exe loads, crashing it at
-          # startup with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139).
+          # Supply protoc to prost-build via $PROTOC rather than prepending the
+          # WinGet package dir to PATH — cleaner, and keeps the runtime DLL search
+          # path uncluttered.
           "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Windows protoc package contents (diagnostic)
+      - name: Windows test-binary diagnostics
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: pwsh
         run: |
-          $dir = Split-Path -Parent $env:PROTOC
-          Write-Host "protoc dir: $dir"
-          Get-ChildItem -Path $dir -Filter *.dll -ErrorAction SilentlyContinue | Select-Object Name, Length
+          $ErrorActionPreference = 'Continue'
+          # Build the test binaries (no run) and capture their paths from cargo's
+          # JSON output so we can inspect the exact exe that crashes at load.
+          $exes = cargo test --no-run --manifest-path src-tauri/Cargo.toml --message-format=json 2>$null |
+            ForEach-Object { try { $o = $_ | ConvertFrom-Json } catch { return }; if ($o.executable) { $o.executable } } |
+            Where-Object { $_ }
+          Write-Host "=== test executables ==="
+          $exes | ForEach-Object { Write-Host $_ }
+
+          # Locate dumpbin from the installed MSVC toolset.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = $null
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -property installationPath
+            $dumpbin = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1 -ExpandProperty FullName
+          }
+          Write-Host "dumpbin: $dumpbin"
+
+          # lucasg Dependencies CLI explicitly flags missing import entry points.
+          $depDir = "$env:RUNNER_TEMP\deptool"
+          $depCli = $null
+          try {
+            Invoke-WebRequest -Uri "https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release.zip" -OutFile "$env:RUNNER_TEMP\deps.zip"
+            Expand-Archive -Path "$env:RUNNER_TEMP\deps.zip" -DestinationPath $depDir -Force
+            $depCli = Join-Path $depDir 'Dependencies.exe'
+          } catch { Write-Host "Dependencies download failed: $_" }
+
+          foreach ($exe in $exes) {
+            Write-Host "########## $exe ##########"
+            if ($dumpbin) {
+              Write-Host "----- dumpbin /dependents -----"
+              & $dumpbin /dependents $exe
+            }
+            if ($depCli -and (Test-Path $depCli)) {
+              Write-Host "----- Dependencies -chain (missing entry points) -----"
+              & $depCli -depth 2 -chain $exe 2>&1 |
+                Select-String -Pattern "Missing|NOT_FOUND|not found|\[-\]|0xc0000139|entrypoint|ordinal"
+            }
+            Write-Host "----- direct run -----"
+            & $exe --list 2>&1 | Out-String | Write-Host
+            Write-Host "exit code: $LASTEXITCODE"
+          }
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
