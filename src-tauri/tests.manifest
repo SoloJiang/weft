@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Manifest embedded into `cargo test` binaries on Windows (see build.rs).
+
+  The app binary gets its manifest from tauri-build, but cargo's test
+  harness binaries do not. `rfd` (native dialogs) statically imports
+  comctl32!TaskDialogIndirect, which exists only in Common-Controls v6
+  (WinSxS); without this dependency the loader binds comctl32 to System32's
+  v5.82, that export is missing, and the test exe dies at load with
+  STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139). Declaring the v6 assembly here
+  makes the loader resolve the v6 comctl32 instead.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>
