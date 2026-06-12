@@ -352,10 +352,12 @@ pub async fn lead_state(
 }
 
 /// Discover the slash commands a session's CLI actually supports — never
-/// hardcoded. claude: the live `initialize` list the engine already holds;
-/// opencode: GET /command off a lazily-started `opencode serve`, keyed by the
-/// session's project cwd; codex: none (headless `exec` has no slash surface).
-/// `session_id` selects a worker; `thread_id` selects the (claude) lead.
+/// hardcoded for tools whose CLI exposes the list. claude: the live
+/// `initialize` list the engine already holds; opencode: GET /command off a
+/// lazily-started `opencode serve`, keyed by the session's project cwd; codex:
+/// the TUI's built-in enum mirrored locally (codex's app-server has no slash
+/// surface, see `codex_slash`) merged with dynamic skills from `skills/list`.
+/// `session_id` selects a worker; `thread_id` selects the lead (claude or codex).
 #[tauri::command]
 pub async fn discover_slash(
     app: AppHandle,
@@ -374,13 +376,29 @@ pub async fn discover_slash(
                 Some(eng) => eng.lock().await.slash_commands.clone(),
                 None => vec![],
             },
-            _ => vec![], // codex: no headless slash commands
+            "codex" => crate::codex_slash::discover_commands().await,
+            _ => vec![],
         });
     }
-    // Lead console (always claude): the engine's live initialize list.
+    // Lead console: claude carries its own initialize list on the engine;
+    // codex (and anything else without a CLI-side list) falls back to the
+    // mirrored built-ins so the user still gets a palette.
     if let Some(tid) = thread_id {
         if let Some(eng) = state.get(lead_key(tid)) {
-            return Ok(eng.lock().await.slash_commands.clone());
+            let inner = eng.lock().await;
+            let live = inner.slash_commands.clone();
+            if !live.is_empty() {
+                return Ok(live);
+            }
+            if inner.tool == "codex" {
+                drop(inner);
+                return Ok(crate::codex_slash::discover_commands().await);
+            }
+        } else if let Ok(Some(t)) = repo::get_thread(&db, tid).await {
+            // Lead engine not spawned yet — composer still wants a palette.
+            if t.lead_tool == "codex" {
+                return Ok(crate::codex_slash::discover_commands().await);
+            }
         }
     }
     Ok(vec![])

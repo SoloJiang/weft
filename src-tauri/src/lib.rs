@@ -15,6 +15,7 @@ mod check;
 mod claude;
 mod codex;
 mod codex_app_server;
+mod codex_slash;
 pub mod commands;
 mod commands_backup;
 pub mod config;
