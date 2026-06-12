@@ -537,10 +537,10 @@ async fn consume_lead_out_replies_and_drains_acks() {
         text: "搞定了一半".into(),
     };
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
-    // reply 一次，body 带 Lead 前缀
+    // reply 一次：目标是最新入站 message_id，不是持久 topic id；body 带 Lead 前缀
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].0, "omt_99");
+    assert_eq!(replies[0].0, "om_b");
     assert!(replies[0].1.starts_with("Lead："));
     // 两条 👀 一次性被 delete
     let dels = ch.deletions.lock().unwrap();
