@@ -93,26 +93,18 @@ jobs:
           brew install protobuf
           protoc --version
 
+      # winget (used previously) ships only with windows-latest/Server 2025, not
+      # windows-2022, so install protoc via the dedicated action — it works on
+      # every image and adds protoc (with its include dir) to PATH for prost-build.
       - name: Install Windows dependencies
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          winget install -e --id Google.Protobuf --accept-package-agreements --accept-source-agreements
-          $protoc = Get-Command protoc -ErrorAction SilentlyContinue
-          if ($protoc) {
-            $protocPath = $protoc.Source
-          } else {
-            $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter protoc.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $installed) {
-              throw "protoc.exe not found after winget install"
-            }
-            $protocPath = $installed.FullName
-          }
-          & $protocPath --version
-          # Supply protoc to prost-build via $PROTOC rather than prepending the
-          # WinGet package dir to PATH — cleaner, and keeps the runtime DLL search
-          # path uncluttered.
-          "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify protoc (Windows)
+        if: runner.os == 'Windows'
+        run: protoc --version
 
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
