@@ -787,7 +787,21 @@ pub async fn im_route_of_thread(db: &Db, thread_id: i32) -> Result<Option<im_rou
         .await?)
 }
 
-/// Reverse lookup: which issue is this IM thread bound to?
+/// Broad lookup by channel + chat. Used by Concierge because its latest reply
+/// target changes per inbound message while the chat-level conversation stays one.
+pub async fn im_route_of_channel_chat(
+    db: &Db,
+    channel: &str,
+    chat_id: &str,
+) -> Result<Option<im_route::Model>> {
+    Ok(im_route::Entity::find()
+        .filter(im_route::Column::Channel.eq(channel))
+        .filter(im_route::Column::ChatId.eq(chat_id))
+        .one(&db.0)
+        .await?)
+}
+
+/// Reverse lookup: which issue is this IM thread/topic bound to?
 pub async fn im_route_of_thread_ref(
     db: &Db,
     channel: &str,

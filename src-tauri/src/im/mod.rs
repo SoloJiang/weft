@@ -56,12 +56,12 @@ pub fn format_im_user_message(
         "provider": caps.provider_id,
         "conversation": {
             "chat_id": chat_id,
-            "thread_ref": im_thread_ref,
+            "topic_ref": im_thread_ref,
             "reply_to": reply_to,
             "sender_id": sender_open_id,
         },
         "capabilities": {
-            "issue_thread": {
+            "issue_topic": {
                 "supported": caps.issue_thread_supported,
                 "default_on_create_issue": caps.default_create_thread_for_new_issue,
                 "can_create_from_current_conversation": caps.can_create_thread_from_current_conversation,
@@ -74,6 +74,27 @@ pub fn format_im_user_message(
         "<weft:im_context>{ctx}</weft:im_context>\n\n<weft:user_message>{}</weft:user_message>",
         text.trim()
     )
+}
+
+fn reply_target_ref(im_ref: &str) -> Option<&str> {
+    im_ref
+        .strip_prefix("reply:")
+        .or_else(|| im_ref.split_once(";reply:").map(|(_, reply)| reply))
+        .filter(|s| !s.is_empty())
+}
+
+fn dm_open_id_ref(im_ref: &str) -> Option<&str> {
+    im_ref
+        .strip_prefix("dm:")
+        .map(|rest| rest.split_once(';').map(|(id, _)| id).unwrap_or(rest))
+        .filter(|s| !s.is_empty())
+}
+
+fn chat_ref(im_ref: &str) -> Option<&str> {
+    im_ref
+        .strip_prefix("chat:")
+        .map(|rest| rest.split_once(';').map(|(id, _)| id).unwrap_or(rest))
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1160,7 +1181,6 @@ pub async fn ensure_issue_topic(
                 eprintln!("[weft][im] ensure-topic existing hint: {e}");
             }
         }
-        // route 保持不变：后续 lead 输出仍会进入已有 topic。
         let _ = route;
         return Ok(());
     }
@@ -1218,13 +1238,22 @@ async fn send_delta_fallback(
     ch: &dyn Channel,
     text: &str,
 ) -> anyhow::Result<()> {
-    if is_topic {
+    if let Some(reply_to) = reply_target_ref(&route.im_thread_ref) {
+        let body = if is_topic {
+            outbound::issue_reply_text(IM_LANG, text)
+        } else {
+            text.to_string()
+        };
+        ch.reply_text(reply_to, &body).await.map(|_| ())
+    } else if is_topic {
         let body = outbound::issue_reply_text(IM_LANG, text);
         ch.reply_text(&route.im_thread_ref, &body).await.map(|_| ())
-    } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+    } else if let Some(open_id) = dm_open_id_ref(&route.im_thread_ref) {
         ch.send_text(open_id, text).await.map(|_| ())
-    } else {
+    } else if chat_ref(&route.im_thread_ref).is_some() {
         ch.send_chat_text(&route.chat_id, text).await.map(|_| ())
+    } else {
+        anyhow::bail!("unknown im_thread_ref {}", route.im_thread_ref)
     }
 }
 
@@ -1257,14 +1286,11 @@ async fn consume_lead_delta_frame(
     streams: &mut HashMap<i32, feishu::streaming::StreamSession>,
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
 ) {
-    // Concierge（主会话→出口 agent，新消息）和 issue 话题（→lead，回复挂话题）
-    // 都流式；其它路由由 LeadOut 整段发。
     let route = match crate::store::repo::im_route_of_thread(db, d.thread_id).await {
         Ok(Some(r)) if r.channel == "feishu_concierge" || r.channel == "feishu" => r,
         _ => return,
     };
     let is_topic = route.channel == "feishu";
-    // 话题里加「Lead：」前缀保持归属（与 issue_reply_text 一致）；DM 原样。
     let content = if is_topic {
         format!(
             "{}{}",
@@ -1275,17 +1301,17 @@ async fn consume_lead_delta_frame(
         d.accumulated.clone()
     };
 
-    // 首帧建卡：空内容的中间帧先等真正内容；done 帧总处理。
     if !streams.contains_key(&d.message_id) {
         if d.accumulated.trim().is_empty() && !d.done {
             return;
         }
-        // 话题→回复式卡片挂到话题根；DM→新消息发给 open_id/chat_id。
-        let begun = if is_topic {
+        let begun = if let Some(reply_to) = reply_target_ref(&route.im_thread_ref) {
+            ch.stream_begin_reply(reply_to).await
+        } else if is_topic {
             ch.stream_begin_reply(&route.im_thread_ref).await
-        } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+        } else if let Some(open_id) = dm_open_id_ref(&route.im_thread_ref) {
             ch.stream_begin("open_id", open_id).await
-        } else if route.im_thread_ref.starts_with("chat:") {
+        } else if chat_ref(&route.im_thread_ref).is_some() {
             ch.stream_begin("chat_id", &route.chat_id).await
         } else {
             return;
@@ -1358,8 +1384,6 @@ pub async fn consume_lead_out(
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
     streaming: bool,
 ) {
-    // 反查 im_route：普通 issue 通过绑定话题回飞书；Concierge 通过
-    // feishu_concierge route 回到发起它的 IM 会话。
     let route = match crate::store::repo::im_route_of_thread(db, out.thread_id).await {
         Ok(Some(r)) => r,
         Ok(None) => return,
@@ -1369,15 +1393,14 @@ pub async fn consume_lead_out(
         }
     };
     if route.channel == "feishu_concierge" {
-        // streaming 开启时，Concierge 回复整段交给 LeadDelta 消费者流式发送
-        // （stream 或失败回落），此处不再重复发一遍，也不提前清回执——见
-        // consume_lead_delta_frame 的 done 帧处理。
         if streaming {
             return;
         }
-        let send = if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+        let send = if let Some(reply_to) = reply_target_ref(&route.im_thread_ref) {
+            ch.reply_text(reply_to, &out.text).await.map(|_| ())
+        } else if let Some(open_id) = dm_open_id_ref(&route.im_thread_ref) {
             ch.send_text(open_id, &out.text).await.map(|_| ())
-        } else if route.im_thread_ref.starts_with("chat:") {
+        } else if chat_ref(&route.im_thread_ref).is_some() {
             ch.send_chat_text(&route.chat_id, &out.text)
                 .await
                 .map(|_| ())
@@ -1394,14 +1417,11 @@ pub async fn consume_lead_out(
         drain_inbound_reactions(out.thread_id, ch, acks).await;
         return;
     }
-    // issue 话题：streaming 时 reply 由 LeadDelta 消费者发流式卡（stream 或回落），
-    // 这里跳过一次性 reply；成功后的 👀 清理由 done 帧处理。否则照旧整段 reply。
     if !streaming {
         let body = outbound::issue_reply_text(IM_LANG, &out.text);
-        // im_thread_ref 即话题根 message_id：飞书 reply API 会把回复挂同一话题。
         if let Err(e) = ch.reply_text(&route.im_thread_ref, &body).await {
             eprintln!("[weft][im] reply lead text: {e}");
-            return; // reply 失败就不 clear 回执——下一条 lead 还会带它走。
+            return;
         }
         drain_inbound_reactions(out.thread_id, ch, acks).await;
     }
@@ -1420,7 +1440,6 @@ async fn ensure_concierge_workspace(db: &crate::store::Db) -> anyhow::Result<i32
             return Ok(id);
         }
     }
-
     let ws = crate::store::repo::create_workspace(db, "Concierge").await?;
     crate::store::repo::set_setting(
         db,
@@ -1437,10 +1456,14 @@ async fn ensure_im_concierge_thread(
     chat_id: &str,
     im_thread_ref: &str,
 ) -> anyhow::Result<i32> {
-    if let Some(route) =
+    let existing =
         crate::store::repo::im_route_of_thread_ref(db, "feishu_concierge", chat_id, im_thread_ref)
             .await?
-    {
+            .or(
+                crate::store::repo::im_route_of_channel_chat(db, "feishu_concierge", chat_id)
+                    .await?,
+            );
+    if let Some(route) = existing {
         if crate::store::repo::get_thread(db, route.thread_id)
             .await?
             .is_some()
@@ -1477,6 +1500,11 @@ async fn consume_free_text(
     ctx: Option<&ExecuteCtx>,
 ) -> anyhow::Result<()> {
     let thread_id = ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref).await?;
+    if let Some(reply_to) = reply_to {
+        let out_ref = format!("{im_thread_ref};reply:{reply_to}");
+        crate::store::repo::bind_im_route(db, thread_id, "feishu_concierge", chat_id, &out_ref)
+            .await?;
+    }
     record_inbound_reaction(ctx, channel, thread_id).await;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
     let framed = format_im_user_message(
@@ -1615,8 +1643,11 @@ mod tests {
 
         assert!(frame.contains("<weft:im_context>"));
         assert!(frame.contains("\"provider\":\"feishu\""));
-        assert!(frame.contains("\"issue_thread\""));
+        assert!(frame.contains("\"issue_topic\""));
+        assert!(frame.contains("\"topic_ref\""));
         assert!(frame.contains("\"default_on_create_issue\":true"));
+        assert!(!frame.contains("thread_ref"));
+        assert!(!frame.contains("issue_thread"));
         assert!(frame.contains("<weft:user_message>创建一个 issue</weft:user_message>"));
         assert!(!frame.contains("feishu_chat_id="));
     }

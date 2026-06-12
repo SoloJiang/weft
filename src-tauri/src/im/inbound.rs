@@ -241,7 +241,7 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
                 sender_open_id: sender_open_id.clone(),
                 chat_id: chat_id.clone(),
                 im_thread_ref: format!("dm:{sender_open_id}"),
-                reply_to: None,
+                reply_to: Some(message_id.clone()),
                 text: text.clone(),
             }
         }
@@ -352,7 +352,7 @@ mod tests {
                 sender_open_id: "ou_me".into(),
                 chat_id: "oc_dm".into(),
                 im_thread_ref: "dm:ou_me".into(),
-                reply_to: None,
+                reply_to: Some("om_in".into()),
                 text: "允许".into(),
             }
         );
@@ -367,7 +367,7 @@ mod tests {
                 sender_open_id: "ou_me".into(),
                 chat_id: "oc_dm".into(),
                 im_thread_ref: "dm:ou_me".into(),
-                reply_to: None,
+                reply_to: Some("om_in".into()),
                 text: "今天进展如何".into(),
             }
         );

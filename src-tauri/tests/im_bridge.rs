@@ -675,3 +675,41 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
     assert_eq!(chat_texts.len(), 1);
     assert_eq!(chat_texts[0], ("oc_g".into(), "收到，我看一下。".into()));
 }
+
+#[tokio::test]
+async fn consume_lead_out_concierge_replies_to_latest_group_message() {
+    use std::collections::HashMap;
+    use weft::lead_chat::out_hub::LeadOut;
+
+    let db = mem_db().await;
+    let ch = FakeChannel::default();
+    let ws = repo::create_workspace(&db, "Concierge").await.unwrap();
+    let concierge = repo::create_thread(&db, ws.id, "飞书群聊 · oc_g", "concierge", "claude")
+        .await
+        .unwrap();
+    repo::bind_im_route(
+        &db,
+        concierge.id,
+        "feishu_concierge",
+        "oc_g",
+        "chat:oc_g;reply:om_latest",
+    )
+    .await
+    .unwrap();
+    let acks = std::sync::Arc::new(tokio::sync::Mutex::new(
+        HashMap::<i32, Vec<(String, String)>>::new(),
+    ));
+    let out = LeadOut {
+        thread_id: concierge.id,
+        message_id: 1,
+        text: "收到，我看一下。".into(),
+    };
+
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+
+    assert!(ch.texts.lock().unwrap().is_empty());
+    assert!(ch.chat_texts.lock().unwrap().is_empty());
+    let replies = ch.replies.lock().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0], ("om_latest".into(), "收到，我看一下。".into()));
+}
