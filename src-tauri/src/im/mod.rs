@@ -176,6 +176,13 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<Option<feishu::streaming::StreamSession>> {
         Ok(None)
     }
+    /// 起一张流式卡，作为对 `reply_to`（话题根 message_id）的回复（issue 话题用）。
+    async fn stream_begin_reply(
+        &self,
+        _reply_to: &str,
+    ) -> anyhow::Result<Option<feishu::streaming::StreamSession>> {
+        Ok(None)
+    }
     /// 追加累积全文到流式卡（内部去重 + 递增 sequence）。
     async fn stream_push(
         &self,
@@ -725,36 +732,64 @@ pub fn spawn(app: tauri::AppHandle) {
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                         };
-                        // 只流 Concierge 路由；其它由 LeadOut 整段发。
+                        // Concierge（主会话→出口 agent，新消息）和 issue 话题（→lead，
+                        // 回复挂话题）都流式；其它路由由 LeadOut 整段发。
                         let route =
                             match crate::store::repo::im_route_of_thread(&db2, d.thread_id).await {
-                                Ok(Some(r)) if r.channel == "feishu_concierge" => r,
+                                Ok(Some(r))
+                                    if r.channel == "feishu_concierge" || r.channel == "feishu" =>
+                                {
+                                    r
+                                }
                                 _ => continue,
                             };
-                        let (rid_type, rid) =
-                            if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
-                                ("open_id", open_id.to_string())
-                            } else if route.im_thread_ref.starts_with("chat:") {
-                                ("chat_id", route.chat_id.clone())
-                            } else {
-                                continue;
-                            };
+                        let is_topic = route.channel == "feishu";
+                        // 话题里加「Lead：」前缀保持归属（与 issue_reply_text 一致）；DM 原样。
+                        let content = if is_topic {
+                            format!(
+                                "{}{}",
+                                if IM_LANG == "zh" { "Lead：" } else { "Lead: " },
+                                d.accumulated
+                            )
+                        } else {
+                            d.accumulated.clone()
+                        };
                         // 首帧建卡：空内容的中间帧先等真正内容；done 帧总处理。
                         if !streams.contains_key(&d.message_id) {
                             if d.accumulated.trim().is_empty() && !d.done {
                                 continue;
                             }
-                            match ch.stream_begin(rid_type, &rid).await {
+                            // 话题→回复式卡片挂到话题根；DM→新消息发给 open_id/chat_id。
+                            let begun = if is_topic {
+                                ch.stream_begin_reply(&route.im_thread_ref).await
+                            } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
+                                ch.stream_begin("open_id", open_id).await
+                            } else if route.im_thread_ref.starts_with("chat:") {
+                                ch.stream_begin("chat_id", &route.chat_id).await
+                            } else {
+                                continue;
+                            };
+                            match begun {
                                 Ok(Some(s)) => {
                                     streams.insert(d.message_id, s);
                                 }
                                 _ => {
                                     // 流式不可用/建卡失败：done 时回落普通发送一次，不丢消息。
                                     if d.done {
-                                        let sent = if rid_type == "open_id" {
-                                            ch.send_text(&rid, &d.accumulated).await.map(|_| ())
+                                        let sent = if is_topic {
+                                            let body =
+                                                outbound::issue_reply_text(IM_LANG, &d.accumulated);
+                                            ch.reply_text(&route.im_thread_ref, &body)
+                                                .await
+                                                .map(|_| ())
+                                        } else if let Some(open_id) =
+                                            route.im_thread_ref.strip_prefix("dm:")
+                                        {
+                                            ch.send_text(open_id, &d.accumulated).await.map(|_| ())
                                         } else {
-                                            ch.send_chat_text(&rid, &d.accumulated).await.map(|_| ())
+                                            ch.send_chat_text(&route.chat_id, &d.accumulated)
+                                                .await
+                                                .map(|_| ())
                                         };
                                         if let Err(e) = sent {
                                             eprintln!("[weft][im] stream fallback send: {e}");
@@ -766,9 +801,9 @@ pub fn spawn(app: tauri::AppHandle) {
                         }
                         if let Some(session) = streams.get_mut(&d.message_id) {
                             let r = if d.done {
-                                ch.stream_end(session, &d.accumulated).await
+                                ch.stream_end(session, &content).await
                             } else {
-                                ch.stream_push(session, &d.accumulated).await
+                                ch.stream_push(session, &content).await
                             };
                             if let Err(e) = r {
                                 eprintln!("[weft][im] stream push/end: {e}");
@@ -1091,13 +1126,17 @@ pub async fn consume_lead_out(
         }
         return;
     }
-    let body = outbound::issue_reply_text(IM_LANG, &out.text);
-    // im_thread_ref 即话题根 message_id：飞书 reply API 会把回复挂同一话题。
-    if let Err(e) = ch.reply_text(&route.im_thread_ref, &body).await {
-        eprintln!("[weft][im] reply lead text: {e}");
-        return; // reply 失败就不 clear 回执——下一条 lead 还会带它走。
+    // issue 话题：streaming 时 reply 由 LeadDelta 消费者发流式卡（stream 或回落），
+    // 这里跳过一次性 reply，只负责清 👀（acks 在本函数手里）；否则照旧整段 reply。
+    if !streaming {
+        let body = outbound::issue_reply_text(IM_LANG, &out.text);
+        // im_thread_ref 即话题根 message_id：飞书 reply API 会把回复挂同一话题。
+        if let Err(e) = ch.reply_text(&route.im_thread_ref, &body).await {
+            eprintln!("[weft][im] reply lead text: {e}");
+            return; // reply 失败就不 clear 回执——下一条 lead 还会带它走。
+        }
     }
-    // 出站成功 → 清掉这个 thread 上挂的所有 👀。
+    // 出站成功（或 streaming 接管）→ 清掉这个 thread 上挂的所有 👀。
     let pending: Vec<(String, String)> = {
         let mut g = acks.lock().await;
         g.remove(&out.thread_id).unwrap_or_default()

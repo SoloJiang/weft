@@ -174,6 +174,19 @@ impl super::Channel for FeishuChannel {
         )))
     }
 
+    async fn stream_begin_reply(
+        &self,
+        reply_to: &str,
+    ) -> anyhow::Result<Option<streaming::StreamSession>> {
+        let card_id = self.stream.create_streaming_card().await?;
+        let message_id = self.stream.reply_entity_card(reply_to, &card_id).await?;
+        Ok(Some(streaming::StreamSession::new(
+            card_id,
+            streaming::ELEMENT_ID.to_string(),
+            message_id,
+        )))
+    }
+
     async fn stream_push(
         &self,
         session: &mut streaming::StreamSession,

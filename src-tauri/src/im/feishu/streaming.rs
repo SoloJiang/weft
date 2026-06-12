@@ -17,6 +17,19 @@ use tokio::sync::Mutex;
 const BASE: &str = "https://open.feishu.cn";
 /// 流式卡里那个 markdown 文本组件的固定 id（create 与 put_content 共享）。
 pub const ELEMENT_ID: &str = "md_streaming";
+/// 卡片体上限 30KB；CJK 取 9000 字符 ≈ 27KB。超限前先截断。
+const MAX_STREAM_CHARS: usize = 9000;
+
+/// 按字符截断（CJK 安全：字节切片落在多字节字符中间会 panic，生产路径 deny panic）。
+fn clamp(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push_str("…(truncated)");
+        out
+    }
+}
 
 /// 一张流式卡的运行态：id 三元组 + 严格递增的 sequence + 去重缓存。
 /// 桥侧按 thread_id 持有一份；`next_seq`/`should_send`/`mark_sent` 是纯逻辑（单测覆盖）。
@@ -178,6 +191,32 @@ impl StreamClient {
             .ok_or_else(|| anyhow::anyhow!("feishu send_entity_card: no message_id"))
     }
 
+    /// 把卡 entity 作为**回复**挂到 `reply_to`（话题根 message_id）下，返回新消息 id。
+    /// 用于 issue 话题：lead 的流式卡挂在话题里，与一次性 reply_text 同一线程语义。
+    pub async fn reply_entity_card(
+        &self,
+        reply_to: &str,
+        card_id: &str,
+    ) -> anyhow::Result<String> {
+        let content = serde_json::json!({"type": "card", "data": {"card_id": card_id}}).to_string();
+        let token = self.token().await?;
+        let resp: serde_json::Value = self
+            .http
+            .post(format!("{BASE}/open-apis/im/v1/messages/{reply_to}/reply"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"msg_type": "interactive", "content": content}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Self::check(&resp, "reply_entity_card")?;
+        resp.get("data")
+            .and_then(|d| d.get("message_id"))
+            .and_then(|m| m.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("feishu reply_entity_card: no message_id"))
+    }
+
     /// 流式追加文本：PUT content + 必需的递增 sequence。content 为 markdown 全文。
     pub async fn put_content(
         &self,
@@ -186,6 +225,7 @@ impl StreamClient {
         content: &str,
         sequence: u64,
     ) -> anyhow::Result<()> {
+        let body_content = clamp(content, MAX_STREAM_CHARS);
         let token = self.token().await?;
         let resp: serde_json::Value = self
             .http
@@ -193,7 +233,7 @@ impl StreamClient {
                 "{BASE}/open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}/content"
             ))
             .bearer_auth(&token)
-            .json(&serde_json::json!({"content": content, "sequence": sequence}))
+            .json(&serde_json::json!({"content": body_content, "sequence": sequence}))
             .send()
             .await?
             .json()
