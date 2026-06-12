@@ -434,6 +434,10 @@ function ImSettings() {
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  // The toggles default to `false`. Without this flag we'd render the
+  // off-state for one tick before `api.imGetSettings()` resolves, producing
+  // a visible "off → on" flash for users whose IM was already enabled.
+  const [loaded, setLoaded] = useState(false);
   const copiedTimer = useRef<number | null>(null);
 
   useEffect(
@@ -463,6 +467,7 @@ function ImSettings() {
       setBound(s.bound);
       setEnabled(s.enabled);
       setStreaming(s.streaming);
+      setLoaded(true);
     });
     void api.imStatus().then(setStatus);
     const id = setInterval(() => void api.imStatus().then(setStatus), 3000);
@@ -559,14 +564,23 @@ function ImSettings() {
               )}
             </div>
             <p className="mt-0.5 text-[12px] text-ink-faint">
-              {enabled
-                ? bound
-                  ? t("settings.imBound")
-                  : t("settings.imUnbound")
-                : t("settings.imCollapsedHint")}
+              {!loaded
+                ? " "
+                : enabled
+                  ? bound
+                    ? t("settings.imBound")
+                    : t("settings.imUnbound")
+                  : t("settings.imCollapsedHint")}
             </p>
           </div>
-          <Toggle on={enabled} onChange={(v) => void toggle(v)} label={t("settings.imProvider")} />
+          {loaded ? (
+            <Toggle on={enabled} onChange={(v) => void toggle(v)} label={t("settings.imProvider")} />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
         </div>
 
         {enabled && (
