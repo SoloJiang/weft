@@ -90,9 +90,21 @@ pub async fn add_skill_source(
     git_url: &str,
     git_ref: Option<&str>,
 ) -> Result<skill_source::Model> {
+    let ref_norm = git_ref.unwrap_or("").to_string();
+    // Idempotent: same (url, ref) reuses the existing row so repeat clicks /
+    // re-imports don't pile up duplicate clones under ~/.weft/skills/sources/.
+    // A *different* ref on the same URL is still a distinct source.
+    if let Some(existing) = skill_source::Entity::find()
+        .filter(skill_source::Column::GitUrl.eq(git_url))
+        .filter(skill_source::Column::GitRef.eq(&ref_norm))
+        .one(&db.0)
+        .await?
+    {
+        return Ok(existing);
+    }
     let m = skill_source::ActiveModel {
         git_url: Set(git_url.to_string()),
-        git_ref: Set(git_ref.unwrap_or("").to_string()),
+        git_ref: Set(ref_norm),
         last_synced: Set(String::new()),
         last_status: Set("never".to_string()),
         ..Default::default()
@@ -1151,5 +1163,22 @@ mod tests {
         remove_skill_source(&db, s.id).await.unwrap();
         assert!(list_skill_sources(&db).await.unwrap().is_empty());
         assert!(list_skill_enable(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_skill_source_is_idempotent_on_same_url_ref() {
+        let db = mem().await;
+        let url = "https://example.com/skills.git";
+        let a = add_skill_source(&db, url, None).await.unwrap();
+        let b = add_skill_source(&db, url, None).await.unwrap();
+        let c = add_skill_source(&db, url, Some("")).await.unwrap();
+        assert_eq!(a.id, b.id, "same url+empty ref must reuse row");
+        assert_eq!(a.id, c.id, "None and Some(\"\") must collapse");
+        assert_eq!(list_skill_sources(&db).await.unwrap().len(), 1);
+
+        // Different ref on same URL is a distinct source.
+        let d = add_skill_source(&db, url, Some("main")).await.unwrap();
+        assert_ne!(a.id, d.id);
+        assert_eq!(list_skill_sources(&db).await.unwrap().len(), 2);
     }
 }
