@@ -56,6 +56,13 @@ pub fn run() {
     // Make GUI-launched spawns find nvm/fnm/native-installer CLIs (see detect.rs).
     detect::augment_path_from_login_shell();
 
+    // Pin the rustls CryptoProvider. Several of our transitive deps enable
+    // both `ring` and `aws-lc-rs`, which makes rustls 0.23 refuse to auto-pick
+    // and panic at the first TLS handshake ("Could not automatically determine
+    // the process-level CryptoProvider"). Install ring once here, ignoring the
+    // "already installed" error so re-entry (tests, restart) is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Open the DB synchronously before building the app.
     let db = tauri::async_runtime::block_on(async { store::Db::open_default().await })
         .unwrap_or_else(|e| fatal("open weft.db", e));
