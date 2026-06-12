@@ -216,9 +216,19 @@ pub trait Channel: Send + Sync {
     async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()>;
     /// 发纯文本到用户（p2p）。
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()>;
-    /// 发纯文本到群聊，返回根 message_id；用作 issue topic 的锚点。
+    /// 发纯文本到群聊，返回根 message_id；非话题群 fallback 会用它。
     async fn send_chat_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<String> {
         anyhow::bail!("send_chat_text unsupported by this channel")
+    }
+    /// 在群聊内创建 provider-native issue topic，返回 provider topic id（Feishu: `omt_*`）。
+    async fn create_chat_topic(
+        &self,
+        _chat_id: &str,
+        seed_message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        let _ = text;
+        self.reply_text(seed_message_id, "").await
     }
     /// 回复一条已存在的消息（M2-4：lead 回流飞书话题）。reply_to 必须是话题
     /// 根消息或话题内任意一条消息——飞书 `reply` API 自动把回复挂到同一话题。
@@ -1155,16 +1165,30 @@ pub async fn ensure_issue_topic(
         return Ok(());
     }
 
-    let root = ch
-        .send_chat_text(
+    let seed_message_id = match reply_to {
+        Some(mid) => mid.to_string(),
+        None => {
+            ch.send_chat_text(
+                chat_id,
+                &format!(
+                    "Weft issue #{} · {}\n这个飞书话题已绑定到 Weft issue。",
+                    thread.id, thread.title
+                ),
+            )
+            .await?
+        }
+    };
+    let topic_id = ch
+        .create_chat_topic(
             chat_id,
+            &seed_message_id,
             &format!(
                 "Weft issue #{} · {}\n这个飞书话题已绑定到 Weft issue。",
                 thread.id, thread.title
             ),
         )
         .await?;
-    crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &root).await?;
+    crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
     if let Some(reply_to) = reply_to {
         if let Err(e) = ch
             .reply_text(
@@ -1704,6 +1728,86 @@ mod tests {
             .unwrap();
         assert_eq!(thread.kind, "concierge");
         assert_eq!(thread.lead_tool, expected);
+    }
+
+    #[derive(Default)]
+    struct TopicChannel {
+        created_topics: std::sync::Mutex<Vec<(String, String)>>,
+        replies: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for TopicChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("om_card".into())
+        }
+
+        async fn patch_card(
+            &self,
+            _message_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
+            self.created_topics
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string()));
+            Ok("om_plain_message".into())
+        }
+
+        async fn create_chat_topic(
+            &self,
+            chat_id: &str,
+            seed_message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<String> {
+            self.created_topics
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), format!("{seed_message_id}:{text}")));
+            Ok("omt_created_topic".into())
+        }
+
+        async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((reply_to.to_string(), text.to_string()));
+            Ok("om_reply".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_issue_topic_binds_feishu_thread_id_not_plain_message_id() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        let ch = TopicChannel::default();
+
+        ensure_issue_topic(&db, &ch, issue.id, "oc_chat", Some("om_request"), "zh")
+            .await
+            .unwrap();
+
+        let route = crate::store::repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.im_thread_ref, "omt_created_topic");
     }
 
     #[derive(Default)]

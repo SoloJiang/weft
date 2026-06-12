@@ -75,6 +75,13 @@ pub async fn handle_global(
         .into_response()
 }
 
+fn issue_id_arg(args: &Value) -> Option<i32> {
+    args.get("issue_id")
+        .or_else(|| args.get("thread_id"))
+        .and_then(|v| v.as_i64())
+        .map(|x| x as i32)
+}
+
 /// Per-tool dispatch. Errors short-return via text_result so MCP clients see a
 /// friendly message instead of a transport failure (mirrors `call_planner`).
 pub async fn call_global(
@@ -100,12 +107,8 @@ pub async fn call_global(
             }
         }
         "issue_status" => {
-            let Some(tid) = args
-                .get("thread_id")
-                .and_then(|v| v.as_i64())
-                .map(|x| x as i32)
-            else {
-                return text_result("error: thread_id required".into());
+            let Some(tid) = issue_id_arg(args) else {
+                return text_result("error: issue_id required".into());
             };
             match issue_status(db, asks, tid).await {
                 Ok(v) => json_result(v),
@@ -133,32 +136,24 @@ pub async fn call_global(
             }
         }
         "answer_question" => {
-            let Some(tid) = args
-                .get("thread_id")
-                .and_then(|v| v.as_i64())
-                .map(|x| x as i32)
-            else {
-                return text_result("error: thread_id required".into());
+            let Some(tid) = issue_id_arg(args) else {
+                return text_result("error: issue_id required".into());
             };
             let Some(ask_id) = args.get("ask_id").and_then(|v| v.as_u64()) else {
                 return text_result("error: ask_id required".into());
             };
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if bus.answer_ask(tid, ask_id, text) {
-                text_result(format!("answered ask #{ask_id} on thread {tid}"))
+                text_result(format!("answered ask #{ask_id} on issue {tid}"))
             } else {
                 text_result(format!(
-                    "ask #{ask_id} on thread {tid} was already answered or no longer exists"
+                    "ask #{ask_id} on issue {tid} was already answered or no longer exists"
                 ))
             }
         }
         "message_lead" => {
-            let Some(tid) = args
-                .get("thread_id")
-                .and_then(|v| v.as_i64())
-                .map(|x| x as i32)
-            else {
-                return text_result("error: thread_id required".into());
+            let Some(tid) = issue_id_arg(args) else {
+                return text_result("error: issue_id required".into());
             };
             let text = args
                 .get("text")
@@ -169,7 +164,7 @@ pub async fn call_global(
                 return text_result("error: text required".into());
             }
             match message_lead(db, tid, &text).await {
-                Ok(()) => text_result(format!("delivered to lead of thread {tid}")),
+                Ok(()) => text_result(format!("delivered to lead of issue {tid}")),
                 Err(e) => text_result(format!("error: {e}")),
             }
         }
@@ -203,12 +198,8 @@ pub async fn call_global(
             }
         }
         "ensure_issue_im_thread" => {
-            let Some(tid) = args
-                .get("thread_id")
-                .and_then(|v| v.as_i64())
-                .map(|x| x as i32)
-            else {
-                return text_result("error: thread_id required".into());
+            let Some(tid) = issue_id_arg(args) else {
+                return text_result("error: issue_id required".into());
             };
             match ensure_issue_im_thread(db, tid, args).await {
                 Ok(v) => json_result(v),
@@ -216,12 +207,8 @@ pub async fn call_global(
             }
         }
         "ensure_issue_topic" => {
-            let Some(tid) = args
-                .get("thread_id")
-                .and_then(|v| v.as_i64())
-                .map(|x| x as i32)
-            else {
-                return text_result("error: thread_id required".into());
+            let Some(tid) = issue_id_arg(args) else {
+                return text_result("error: issue_id required".into());
             };
             let chat_id = args
                 .get("chat_id")
@@ -271,32 +258,48 @@ pub async fn call_global(
 
 // ───────────────────── tool implementations ─────────────────────
 
+async fn internal_concierge_workspace_id(db: &Db) -> anyhow::Result<Option<i32>> {
+    Ok(repo::get_setting(db, repo::K_CONCIERGE_WORKSPACE)
+        .await?
+        .and_then(|s| s.parse::<i32>().ok()))
+}
+
 async fn list_workspaces(db: &Db) -> anyhow::Result<Value> {
+    let hidden = internal_concierge_workspace_id(db).await?;
     let mut out = Vec::new();
     for w in repo::list_workspaces(db).await? {
+        if Some(w.id) == hidden {
+            continue;
+        }
         let count = repo::list_threads(db, w.id)
             .await
-            .map(|v| v.len())
+            .map(|v| v.into_iter().filter(|t| t.kind != "concierge").count())
             .unwrap_or(0);
-        out.push(json!({ "id": w.id, "name": w.name, "thread_count": count }));
+        out.push(json!({ "id": w.id, "name": w.name, "issue_count": count }));
     }
     Ok(Value::Array(out))
 }
 
 async fn list_issues(db: &Db, ws: Option<i32>) -> anyhow::Result<Value> {
+    let hidden = internal_concierge_workspace_id(db).await?;
     let workspaces = match ws {
-        Some(id) => vec![id],
+        Some(id) if Some(id) != hidden => vec![id],
+        Some(_) => Vec::new(),
         None => repo::list_workspaces(db)
             .await?
             .into_iter()
+            .filter(|w| Some(w.id) != hidden)
             .map(|w| w.id)
             .collect(),
     };
     let mut out = Vec::new();
     for w in workspaces {
         for t in repo::list_threads(db, w).await? {
+            if t.kind == "concierge" {
+                continue;
+            }
             out.push(json!({
-                "id": t.id,
+                "issue_id": t.id,
                 "workspace_id": t.workspace_id,
                 "title": t.title,
                 "kind": t.kind,
@@ -312,7 +315,7 @@ async fn issue_status(db: &Db, asks: &AskRegistry, tid: i32) -> anyhow::Result<V
         .ok_or_else(|| anyhow::anyhow!("thread {tid} not found"))?;
     let open_asks = asks.open_in(tid).len();
     Ok(json!({
-        "thread_id": t.id,
+        "issue_id": t.id,
         "title": t.title,
         "kind": t.kind,
         "open_asks_count": open_asks,
@@ -336,8 +339,8 @@ async fn pending_needs_you(db: &Db, asks: &AskRegistry) -> anyhow::Result<Value>
         .map(|a| {
             json!({
                 "ask_id": a.id,
-                "thread_id": a.thread,
-                "thread_title": a.thread_title,
+                "issue_id": a.thread,
+                "issue_title": a.thread_title,
                 "direction": a.dir_name,
                 "tool": a.tool,
                 "summary": a.summary,
@@ -386,7 +389,7 @@ async fn create_issue_from_im(
     args: &Value,
 ) -> anyhow::Result<Value> {
     let issue = create_issue(db, ws, title, kind).await?;
-    let thread_id = issue["id"].as_i64().unwrap_or_default() as i32;
+    let thread_id = issue["issue_id"].as_i64().unwrap_or_default() as i32;
     let provider = im_provider(args);
     let supported = im_issue_thread_supported(args);
     let mut im = json!({
@@ -427,7 +430,7 @@ async fn create_issue_from_im(
 async fn ensure_issue_im_thread(db: &Db, thread_id: i32, args: &Value) -> anyhow::Result<Value> {
     let issue = repo::get_thread(db, thread_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("issue {thread_id} not found"))?;
     let provider = im_provider(args);
     let supported = im_issue_thread_supported(args);
     let initial_message = args
@@ -471,7 +474,7 @@ async fn ensure_issue_im_thread(db: &Db, thread_id: i32, args: &Value) -> anyhow
     };
     Ok(json!({
         "issue": {
-            "id": issue.id,
+            "issue_id": issue.id,
             "workspace_id": issue.workspace_id,
             "title": issue.title,
             "kind": issue.kind
@@ -485,7 +488,7 @@ async fn create_issue(db: &Db, ws: i32, title: &str, kind: &str) -> anyhow::Resu
     let tool = crate::tools::default_tool(db).await;
     let t = repo::create_thread(db, ws, title, kind, &tool).await?;
     Ok(json!({
-        "id": t.id,
+        "issue_id": t.id,
         "workspace_id": t.workspace_id,
         "title": t.title,
         "kind": t.kind,
@@ -504,7 +507,7 @@ async fn ensure_issue_topic(db: &Db, thread_id: i32, chat_id: &str) -> anyhow::R
         .await?
         .ok_or_else(|| anyhow::anyhow!("topic route was not created"))?;
     Ok(json!({
-        "thread_id": after.thread_id,
+        "issue_id": after.thread_id,
         "chat_id": after.chat_id,
         "im_thread_ref": after.im_thread_ref,
         "created": before.is_none(),
@@ -520,7 +523,7 @@ pub fn global_specs() -> Value {
     json!([
         {
             "name": "list_workspaces",
-            "description": "List every workspace (id, name, thread_count). Call before answering any question that mentions \"workspaces\" or \"issues\".",
+            "description": "List every user workspace (id, name, issue_count). Internal IM Concierge storage is hidden. Call before answering any question that mentions \"workspaces\" or \"issues\".",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -531,11 +534,11 @@ pub fn global_specs() -> Value {
         {
             "name": "issue_status",
             "description": "Read one issue's title, kind, and how many open permission asks it has.",
-            "inputSchema": { "type": "object", "properties": { "thread_id": i() }, "required": ["thread_id"] }
+            "inputSchema": { "type": "object", "properties": { "issue_id": i() }, "required": ["issue_id"] }
         },
         {
             "name": "pending_needs_you",
-            "description": "Every open permission Ask across all workspaces — id, thread, asking direction, tool, summary, ts. Use this when the human asks \"what's waiting on me\".",
+            "description": "Every open permission Ask across all workspaces — id, issue, asking direction, tool, summary, ts. Use this when the human asks \"what's waiting on me\".",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -549,15 +552,15 @@ pub fn global_specs() -> Value {
             "name": "answer_question",
             "description": "Reply to an agent's open question (ask_human). The text is delivered into that direction's bus inbox.",
             "inputSchema": { "type": "object",
-                "properties": { "thread_id": i(), "ask_id": u(), "text": s() },
-                "required": ["thread_id", "ask_id", "text"] }
+                "properties": { "issue_id": i(), "ask_id": u(), "text": s() },
+                "required": ["issue_id", "ask_id", "text"] }
         },
         {
             "name": "message_lead",
-            "description": "Send a message into a thread's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM.",
+            "description": "Send a message into an issue's lead engine, as if the human typed it in the desktop. Use when the human wants to nudge a specific issue's lead from IM.",
             "inputSchema": { "type": "object",
-                "properties": { "thread_id": i(), "text": s() },
-                "required": ["thread_id", "text"] }
+                "properties": { "issue_id": i(), "text": s() },
+                "required": ["issue_id", "text"] }
         },
         {
             "name": "create_issue_from_im",
@@ -570,15 +573,15 @@ pub fn global_specs() -> Value {
             "name": "ensure_issue_im_thread",
             "description": "Ensure an existing issue has a provider-native IM thread/topic and guide the user there. Use when the user wants to open, enter, intervene in, or continue an issue from IM. initial_message is optional and should be set only when the user gave concrete text to relay to the lead.",
             "inputSchema": { "type": "object",
-                "properties": { "thread_id": i(), "im_context": { "type": "object" }, "initial_message": s() },
-                "required": ["thread_id", "im_context"] }
+                "properties": { "issue_id": i(), "im_context": { "type": "object" }, "initial_message": s() },
+                "required": ["issue_id", "im_context"] }
         },
         {
             "name": "ensure_issue_topic",
             "description": "Ensure an existing issue has a Feishu topic in chat_id. Use only when the user semantically asks to create/open/continue an issue-specific Feishu topic; do not call for ordinary chat.",
             "inputSchema": { "type": "object",
-                "properties": { "thread_id": i(), "chat_id": s() },
-                "required": ["thread_id", "chat_id"] }
+                "properties": { "issue_id": i(), "chat_id": s() },
+                "required": ["issue_id", "chat_id"] }
         },
         {
             "name": "create_issue",
@@ -615,7 +618,7 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed[0]["name"], "alpha");
-        assert_eq!(parsed[0]["thread_count"], 2);
+        assert_eq!(parsed[0]["issue_count"], 2);
     }
 
     #[tokio::test]
@@ -659,8 +662,8 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed[0]["ask_id"], id);
-        assert_eq!(parsed[0]["thread_id"], t.id);
-        assert_eq!(parsed[0]["thread_title"], "登录修复");
+        assert_eq!(parsed[0]["issue_id"], t.id);
+        assert_eq!(parsed[0]["issue_title"], "登录修复");
         assert_eq!(parsed[0]["summary"], "Run: npm test");
     }
 
@@ -739,6 +742,41 @@ mod tests {
             .collect();
         assert!(names.contains(&"create_issue_from_im".to_string()));
         assert!(names.contains(&"ensure_issue_im_thread".to_string()));
+    }
+
+    #[test]
+    fn global_specs_expose_issue_id_not_thread_id() {
+        let specs = global_specs();
+        let text = specs.to_string();
+        assert!(text.contains("issue_id"));
+        assert!(!text.contains("thread_id"));
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_hides_internal_concierge_workspace() {
+        let db = mem_db().await;
+        let visible = repo::create_workspace(&db, "Product").await.unwrap();
+        let hidden = repo::create_workspace(&db, "Concierge").await.unwrap();
+        repo::set_setting(&db, repo::K_CONCIERGE_WORKSPACE, &hidden.id.to_string())
+            .await
+            .unwrap();
+
+        let parsed: Value = serde_json::from_str(
+            call_global(
+                &db,
+                &AskRegistry::new(),
+                &BusRegistry::new(),
+                "list_workspaces",
+                &json!({}),
+            )
+            .await["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["id"], visible.id);
     }
 
     #[tokio::test]

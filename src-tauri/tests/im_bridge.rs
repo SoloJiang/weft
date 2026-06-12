@@ -11,6 +11,7 @@ use weft::store::Db;
 struct FakeChannel {
     texts: Arc<Mutex<Vec<(String, String)>>>, // (open_id, text)
     chat_texts: Arc<Mutex<Vec<(String, String)>>>, // (chat_id, text)
+    topics: Arc<Mutex<Vec<(String, String, String)>>>, // (chat_id, seed_message_id, text)
     replies: Arc<Mutex<Vec<(String, String)>>>, // (reply_to, body)
     reactions: Arc<Mutex<Vec<(String, String)>>>, // (message_id, emoji) — adds
     deletions: Arc<Mutex<Vec<(String, String)>>>, // (message_id, reaction_id) — deletes
@@ -43,6 +44,19 @@ impl Channel for FakeChannel {
             .push((chat_id.into(), text.into()));
         Ok(format!("om_chat_{}", self.chat_texts.lock().unwrap().len()))
     }
+    async fn create_chat_topic(
+        &self,
+        chat_id: &str,
+        seed_message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        self.topics
+            .lock()
+            .unwrap()
+            .push((chat_id.into(), seed_message_id.into(), text.into()));
+        Ok(format!("omt_topic_{}", self.topics.lock().unwrap().len()))
+    }
+
     async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
         self.replies
             .lock()
@@ -80,6 +94,17 @@ impl Channel for SlowReactionChannel {
     async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
         self.inner.send_chat_text(chat_id, text).await
     }
+    async fn create_chat_topic(
+        &self,
+        chat_id: &str,
+        seed_message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        self.inner
+            .create_chat_topic(chat_id, seed_message_id, text)
+            .await
+    }
+
     async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
         self.inner.reply_text(reply_to, text).await
     }
@@ -559,11 +584,13 @@ async fn ensure_issue_topic_creates_feishu_root_and_binds_issue() {
     let route = repo::im_route_of_thread(&db, t.id).await.unwrap().unwrap();
     assert_eq!(route.channel, "feishu");
     assert_eq!(route.chat_id, "oc_g");
-    assert_eq!(route.im_thread_ref, "om_chat_1");
-    let chat_texts = ch.chat_texts.lock().unwrap();
-    assert_eq!(chat_texts.len(), 1);
-    assert_eq!(chat_texts[0].0, "oc_g");
-    assert!(chat_texts[0].1.contains("Weft issue"));
+    assert_eq!(route.im_thread_ref, "omt_topic_1");
+    assert!(ch.chat_texts.lock().unwrap().is_empty());
+    let topics = ch.topics.lock().unwrap();
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].0, "oc_g");
+    assert_eq!(topics[0].1, "om_cmd");
+    assert!(topics[0].2.contains("Weft issue"));
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].0, "om_cmd");

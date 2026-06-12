@@ -28,7 +28,15 @@ pub async fn rename_workspace(
 
 #[tauri::command]
 pub async fn list_workspaces(db: State<'_, Db>) -> R<Vec<entities::workspace::Model>> {
-    repo::list_workspaces(&db).await.map_err(e)
+    let hidden = repo::get_setting(&db, repo::K_CONCIERGE_WORKSPACE)
+        .await
+        .map_err(e)?
+        .and_then(|s| s.parse::<i32>().ok());
+    let workspaces = repo::list_workspaces(&db).await.map_err(e)?;
+    Ok(workspaces
+        .into_iter()
+        .filter(|w| Some(w.id) != hidden)
+        .collect())
 }
 
 /// Return the id of the most-recently created workspace. This never creates a
