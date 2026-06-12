@@ -8,6 +8,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Harden cargo's network layer against transient crates.io download flakes.
+# `cargo` intermittently fails registry downloads with
+# `curl failed: [16] Error in the HTTP2 framing layer`; disabling HTTP/2
+# multiplexing forces HTTP/1.1 and avoids that framing error, and a higher
+# retry count rides out brief blips.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   lint-and-frontend:
     runs-on: ubuntu-latest
