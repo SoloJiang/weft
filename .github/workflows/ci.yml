@@ -107,4 +107,25 @@ jobs:
         run: protoc --version
 
       - name: Run Rust tests
+        if: runner.os != 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # On Windows the cargo test-harness binaries get no application manifest
+      # (tauri-build only manifests the app bin), so rfd's static import of the
+      # Common-Controls-v6-only comctl32!TaskDialogIndirect can't resolve and the
+      # exe dies at load with STATUS_ENTRYPOINT_NOT_FOUND. Build the test binaries
+      # first, drop an external <exe>.manifest beside each (the loader honors it
+      # for exes with no embedded manifest, redirecting comctl32 to v6), then run.
+      - name: Run Rust tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide" /v PreferExternalManifest /t REG_DWORD /d 1 /f | Out-Null
+          $exes = cargo test --no-run --manifest-path src-tauri/Cargo.toml --message-format=json |
+            ForEach-Object { try { $o = $_ | ConvertFrom-Json } catch { return }; if ($o.executable) { $o.executable } } |
+            Where-Object { $_ }
+          foreach ($exe in $exes) {
+            Copy-Item -Path src-tauri/tests.manifest -Destination "$exe.manifest" -Force
+            Write-Host "external manifest -> $exe.manifest"
+          }
+          cargo test --manifest-path src-tauri/Cargo.toml
