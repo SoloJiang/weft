@@ -6,7 +6,6 @@ import {
   LayoutGrid,
   MessagesSquare,
   Moon,
-  PanelLeftClose,
   PanelLeftOpen,
   Sun,
   X,
@@ -126,15 +125,17 @@ export function AppTopBar() {
         </motion.div>
       )}
       <header className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border bg-bg px-3">
-        <button
-          type="button"
-          onClick={() => setNavCollapsed(!navCollapsed)}
-          aria-label={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
-          title={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-        >
-          {navCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-        </button>
+        {navCollapsed && (
+          <button
+            type="button"
+            onClick={() => setNavCollapsed(false)}
+            aria-label={t("nav.expandSidebar")}
+            title={t("nav.expandSidebar")}
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+          >
+            <PanelLeftOpen size={16} />
+          </button>
+        )}
 
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
         {navCollapsed && (
