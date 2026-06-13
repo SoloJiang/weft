@@ -17,28 +17,28 @@ Codex、OpenCode 跨多个仓库推进，把需求从意图一路带向实现、
 
 ## 30 秒看懂
 
-Weft 不是终端网格，也不是云端 agent runner。它是需求与原生 coding agents、
-仓库、分支、检查和发布路径之间的本地编排层。
+Weft 不是终端网格，也不是云端 agent runner。它是在你的需求、原生 coding agents、
+仓库、分支、检查和发布流程之间做协调的本地编排层。
 
-北极星链路：
+最终目标链路：
 
 ```text
-需求 → 仓库地图 → 有边界的 agent 通道 → 仓库原生分支 → 实现 → PR / 合并 / 上线
+需求 → 仓库地图 → 有边界的 agent 工作通道 → 仓库原生分支 → 实现 → PR / 合并 / 上线
 ```
 
-### 1. 跨仓库 scope 拆解
+### 1. 跨仓库范围拆解
 
 你描述 feature、bugfix、refactor 或 spike。Lead agent 根据 workspace 的 repo map
 判断哪些仓库需要写、每条写入通道为什么存在、应该由哪个 worker 执行。读取仓库是自由的；
-只有写入会被声明、确认、物化和追踪。
+只有写入会被声明、确认、创建工作目录并持续追踪。
 
-### 2. Respect user origin
+### 2. 尊重用户自己的工具习惯
 
 Weft 驱动你已经在用的原生工具：Claude Code、Codex、OpenCode。它不替代这些工具的
 登录态、hooks、审批、sandbox、skills 或 session 身份。权限请求会镜像到 Weft，
 但不会被绕过；需要原生体验时，也可以一键回到自己的终端接管。
 
-### 3. Respect repo origin
+### 3. 尊重仓库自己的协作习惯
 
 Weft 不把内部命名规则强加给你的仓库。新的工作目录创建在目标仓库内：
 
