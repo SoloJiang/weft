@@ -158,6 +158,14 @@ async fn latest_pending_ack_message(
         .map(|(message_id, _)| message_id.clone())
 }
 
+/// Setting key for the replyable seed message id of an issue topic. Stored at
+/// bind time as a member `om_*` message of the topic; used as the last-resort
+/// reply target when neither the frame's origin_tag nor a pending ack is present
+/// (replying to an `om_*` message succeeds where the `omt_*` topic id would not).
+fn issue_topic_seed_key(thread_id: i32) -> String {
+    format!("im.issue_topic_seed.{thread_id}")
+}
+
 #[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
     pub app_id: String,
@@ -1216,8 +1224,19 @@ async fn feed_issue_message(
         text,
         &feishu_provider_capabilities(),
     );
-    // Topic threading uses pending-ack reactions, not origin_tag.
-    crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new(), None).await
+    // Each issue-topic turn carries its originating message id via origin_tag so the
+    // response threads under that exact message; the pending ack is used only for
+    // draining 👀 reactions.
+    crate::lead_chat::engine::send(
+        app,
+        db,
+        &eng,
+        &framed,
+        Vec::new(),
+        Vec::new(),
+        reply_to.map(|s| s.to_string()),
+    )
+    .await
 }
 
 pub async fn ensure_issue_topic(
@@ -1284,6 +1303,9 @@ pub async fn ensure_issue_topic(
         .create_chat_topic(chat_id, &seed_message_id, &lead_intro)
         .await?;
     crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
+    // Persist a replyable seed message id (an `om_*` member of the topic) for the
+    // no-ack / no-origin_tag fallback (Finding C).
+    crate::store::repo::set_setting(db, &issue_topic_seed_key(thread.id), &seed_message_id).await?;
     if let Some(reply_to) = reply_to {
         if let Err(e) = ch
             .reply_text(
@@ -1372,10 +1394,21 @@ async fn consume_lead_delta_frame(
     } else {
         d.accumulated.clone()
     };
-    // Topic (issue) threading uses the pending inbound ack; concierge uses the
-    // frame's own origin_tag so each response threads under its originating message.
+    // Issue-topic reply target prefers the frame's own origin_tag (the originating
+    // message id), then the latest pending inbound ack, then the stored seed message
+    // id; concierge uses the frame's own origin_tag. Reaction draining still uses the
+    // ack map regardless — only the reply TARGET follows this chain.
     let reply_to = if is_topic {
-        latest_pending_ack_message(d.thread_id, acks).await
+        match d.origin_tag.clone() {
+            Some(t) => Some(t),
+            None => match latest_pending_ack_message(d.thread_id, acks).await {
+                Some(a) => Some(a),
+                None => crate::store::repo::get_setting(db, &issue_topic_seed_key(d.thread_id))
+                    .await
+                    .ok()
+                    .flatten(),
+            },
+        }
     } else {
         d.origin_tag.clone()
     };
@@ -1470,10 +1503,21 @@ pub async fn consume_lead_out(
     if streaming && route.channel == "feishu_concierge" {
         return;
     }
-    // feishu (issue topic) threads under the pending inbound ack; concierge threads
-    // under the frame's own origin_tag (the originating message id).
+    // feishu (issue topic) reply target prefers the frame's own origin_tag (the
+    // originating message id), then the latest pending inbound ack, then the stored
+    // seed message id; concierge uses the frame's own origin_tag. Reaction draining
+    // still uses the ack map regardless — only the reply TARGET follows this chain.
     let reply_to = if route.channel == "feishu" {
-        latest_pending_ack_message(out.thread_id, acks).await
+        match out.origin_tag.clone() {
+            Some(t) => Some(t),
+            None => match latest_pending_ack_message(out.thread_id, acks).await {
+                Some(a) => Some(a),
+                None => crate::store::repo::get_setting(db, &issue_topic_seed_key(out.thread_id))
+                    .await
+                    .ok()
+                    .flatten(),
+            },
+        }
     } else {
         out.origin_tag.clone()
     };
@@ -2243,6 +2287,121 @@ mod tests {
         assert_eq!(
             ch.replies.lock().unwrap().as_slice(),
             [("provider-topic-id".into(), "Lead：我查到了。".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_topic_reply_threads_under_origin_tag() {
+        // Finding D: each issue-topic turn threads under its OWN originating message
+        // (carried via the frame's origin_tag), NOT under the thread-wide latest ack.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        // No acks recorded for this thread — the per-turn origin_tag must win.
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        // Turn A: originating message m1.
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 101,
+                accumulated: "答复一".into(),
+                done: true,
+                origin_tag: Some("m1".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+        // Turn B: originating message m2.
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 102,
+                accumulated: "答复二".into(),
+                done: true,
+                origin_tag: Some("m2".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Each issue-topic response threads under its OWN originating message.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["m1".to_string(), "m2".to_string()]
+        );
+        // Issue-topic content is "Lead：" prefixed (is_topic=true).
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [
+                ("m1".into(), "Lead：答复一".into()),
+                ("m2".into(), "Lead：答复二".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_topic_falls_back_to_seed_when_no_ack() {
+        // Finding C: with no origin_tag and no pending ack, the issue-topic reply
+        // falls back to the stored replyable seed message id (an `om_*` message),
+        // NOT the `omt_*` topic id — replying to the topic id would hit
+        // /messages/{id}/reply with a thread id and fail.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, &issue_topic_seed_key(issue.id), "om_seed")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        // No acks recorded for this thread.
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "我查到了。".into(),
+                done: true,
+                origin_tag: None,
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Falls back to the stored seed message id, not the topic id.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["om_seed".to_string()]
         );
     }
 
