@@ -59,7 +59,6 @@ interface Store {
 
   activeThreadId: number | null;
   sessions: Record<number, OpenSession>;
-  activeSessionId: number | null;
   messages: BusMsg[];
   postHuman: (to: string | null, text: string) => Promise<void>;
 
@@ -176,7 +175,6 @@ interface Store {
   refreshWorkspaces: () => Promise<void>;
   selectThread: (threadId: number) => Promise<void>;
   loadThreadChildren: (threadId: number) => Promise<void>;
-  backToBoard: () => void;
   /** Leave the active thread for the workspace portfolio board. */
   backToWorkspace: () => void;
 
@@ -218,8 +216,6 @@ interface Store {
   /** Review-agent rung: on-demand pre-PR self-review verdict + in-flight set. */
   /** Run the global review skill inside the direction's own session. */
   requestSkillReview: (directionId: number) => Promise<void>;
-  /** Deliver a message to a (direction, repo)'s worker, waking it if needed. */
-  sendToDirection: (directionId: number, repoId: number, text: string) => Promise<void>;
   /** The configured review skill ("" = auto-detect superpowers'). */
   reviewSkill: string;
   setReviewSkill: (s: string) => void;
@@ -267,7 +263,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const dispatchingRef = useRef<Set<number>>(new Set());
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
-  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [viewing, setViewing] = useState<{
     directionId: number;
     repoId: number;
@@ -287,7 +282,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const prevHomeRef = useRef<{
     homeTab: HomeTab;
     activeThreadId: number | null;
-    activeSessionId: number | null;
     viewing: { directionId: number; repoId: number; diff?: boolean } | null;
     showNeeds: boolean;
   } | null>(null);
@@ -483,7 +477,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setDirections({});
     setWorktrees({});
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setViewing(null);
     setShowNeeds(false);
     setHomeTab("board");
@@ -509,7 +502,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const selectThread = useCallback(
     async (threadId: number) => {
       setActiveThreadId(threadId);
-      setActiveSessionId(null);
       setViewing(null);
       setShowNeeds(false);
       setHomeTab("board");
@@ -526,8 +518,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [loadThreadChildren],
   );
 
-  const backToBoard = useCallback(() => setActiveSessionId(null), []);
-
   const refreshOverview = useCallback(async () => {
     if (activeWorkspaceId == null) {
       setOverview([]);
@@ -542,7 +532,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const backToWorkspace = useCallback(() => {
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setViewing(null);
     setShowNeeds(false);
     setHomeTab("board");
@@ -550,21 +539,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const openSettings = useCallback(() => {
-    // Snapshot first — once we flip homeTab + clear thread/session/viewing the
+    // Snapshot first — once we flip homeTab + clear thread/viewing the
     // info is gone and the back arrow can't restore it.
     prevHomeRef.current = {
       homeTab,
       activeThreadId,
-      activeSessionId,
       viewing,
       showNeeds,
     };
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setViewing(null);
     setShowNeeds(false);
     setHomeTab("settings");
-  }, [homeTab, activeThreadId, activeSessionId, viewing, showNeeds]);
+  }, [homeTab, activeThreadId, viewing, showNeeds]);
 
   const closeSettings = useCallback(() => {
     const prev = prevHomeRef.current;
@@ -576,7 +563,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     setShowNeeds(prev.showNeeds);
     setViewing(prev.viewing);
-    setActiveSessionId(prev.activeSessionId);
     setActiveThreadId(prev.activeThreadId);
     setHomeTab(prev.homeTab === "settings" ? "board" : prev.homeTab);
   }, []);
@@ -706,6 +692,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // --format json). Escape hatches per tool: codex app deep link, terminal
   // takeover command for all three.
 
+  // Single entry to a worker's conversation surface. All "open/focus a worker"
+  // paths route here → `viewing` → WorkerConversation (no separate activeSessionId).
+  const openWorker = useCallback((directionId: number, repoId: number) => {
+    setViewing({ directionId, repoId });
+    setShowNeeds(false);
+    setHomeTab("board");
+  }, []);
+
   // Spawn (or focus) a worker for a (direction, repo) slot. focus=true opens it
   // full-screen (a click); focus=false dispatches it in the background.
   const spawnWorker = useCallback(
@@ -714,11 +708,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         (s) => s.directionId === directionId && s.repoId === repoId,
       );
       if (existing) {
-        if (focus) {
-          setActiveSessionId(existing.info.session_id);
-          setShowNeeds(false);
-          setHomeTab("board");
-        }
+        if (focus) openWorker(directionId, repoId);
         return;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
@@ -734,19 +724,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           nativeId: info.native_id,
         },
       }));
-      if (focus) {
-        setActiveSessionId(info.session_id);
-        setShowNeeds(false);
-        setHomeTab("board");
-      }
+      if (focus) openWorker(directionId, repoId);
     },
-    [activeThreadId],
+    [activeThreadId, openWorker],
   );
 
   const viewDirection = useCallback(
     (directionId: number, repoId: number, opts?: { diff?: boolean }) => {
       setViewing({ directionId, repoId, diff: opts?.diff });
-      setActiveSessionId(null);
       setShowNeeds(false);
       setHomeTab("board");
     },
@@ -767,11 +752,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           s.status !== "exited",
       );
       if (existing) {
-        if (focus) {
-          setActiveSessionId(existing.info.session_id);
-          setShowNeeds(false);
-          setHomeTab("board");
-        }
+        if (focus) openWorker(directionId, repoId);
         return;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
@@ -794,13 +775,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           },
         };
       });
-      if (focus) {
-        setActiveSessionId(info.session_id);
-        setShowNeeds(false);
-        setHomeTab("board");
-      }
+      if (focus) openWorker(directionId, repoId);
     },
-    [activeThreadId],
+    [activeThreadId, openWorker],
   );
 
   // Lazy attach + send: the worker surface is always input-able. Sending into a
@@ -1109,26 +1086,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     );
   }, [reviewSkill, leadSlash, workerSlash]);
 
-  // Deliver a composed message to a (direction, repo)'s worker — waking it
-  // first when nothing is live (the engine resumes). The delivery half of diff
-  // annotations and skill reviews.
-  const sendToDirection = useCallback(
-    async (directionId: number, repoId: number, text: string) => {
-      let sess = Object.values(sessionsRef.current).find(
-        (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
-      );
-      if (!sess) {
-        await driveDirection(directionId, repoId, false);
-        sess = Object.values(sessionsRef.current).find(
-          (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
-        );
-      }
-      if (!sess) return;
-      await api.chatSend(sess.info.session_id, text);
-    },
-    [driveDirection],
-  );
-
   const requestSkillReview = useCallback(
     async (directionId: number) => {
       const writes = await api.listWorktrees(directionId).catch(() => []);
@@ -1172,7 +1129,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [directionsByThread, autoReview, requestSkillReview]);
 
-  const focusSession = useCallback((id: number) => setActiveSessionId(id), []);
+  const focusSession = useCallback((id: number) => {
+    const s = sessionsRef.current[id];
+    if (s) openWorker(s.directionId, s.repoId);
+  }, [openWorker]);
 
   const postHuman = useCallback(
     async (to: string | null, text: string) => {
@@ -1209,7 +1169,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeWorkspaceId]);
 
   const openNeeds = useCallback(() => {
-    setActiveSessionId(null);
     setViewing(null);
     setHomeTab("board");
     setShowNeeds(true);
@@ -1232,7 +1191,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const openRepoMap = useCallback(() => {
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setShowNeeds(false);
     setHomeTab("repos");
     void refreshRepoMap();
@@ -1352,12 +1310,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       );
       if (live) {
         setActiveThreadId(item.thread_id);
-        setActiveSessionId(live.info.session_id);
+        openWorker(live.directionId, live.repoId);
         return;
       }
       await selectThread(item.thread_id);
     },
-    [sessions, selectThread],
+    [sessions, selectThread, openWorker],
   );
 
   useEffect(() => {
@@ -1534,7 +1492,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     worktreesByDirection,
     activeThreadId,
     sessions,
-    activeSessionId,
     messages,
     postHuman,
     leadMessages,
@@ -1605,7 +1562,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshWorkspaces,
     selectThread,
     loadThreadChildren,
-    backToBoard,
     backToWorkspace,
     createWorkspace,
     renameWorkspace,
@@ -1628,7 +1584,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     checkingDirections,
     verifyDirection,
     requestSkillReview,
-    sendToDirection,
     reviewSkill,
     setReviewSkill,
     autoReview,
