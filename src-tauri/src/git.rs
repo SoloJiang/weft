@@ -338,7 +338,26 @@ pub fn choose_branch_name(repo: &Path, semantic: &str, title: &str, reserved: &[
 fn choose_branch_name_from_refs(semantic: &str, title: &str, refs: &[String]) -> String {
     let slug = crate::slug::slugify(title);
     let prefix = branch_prefix_for_semantic(semantic, refs);
-    unique_branch(&format!("{prefix}/{slug}"), refs)
+    // A ref named exactly `prefix` (e.g. a branch literally `feature`) blocks the
+    // whole `prefix/…` namespace — git stores refs as files, so `refs/heads/feature`
+    // and `refs/heads/feature/x` can't coexist (a D/F conflict). Join with `-`
+    // instead so the branch is actually creatable.
+    let prefix_is_leaf = refs.iter().any(|r| {
+        let r = r.strip_prefix("origin/").unwrap_or(r);
+        r == prefix
+    });
+    let sep = if prefix_is_leaf { '-' } else { '/' };
+    unique_branch(&format!("{prefix}{sep}{slug}"), refs)
+}
+
+/// A ref that would collide with `name` if both were created. Beyond an exact
+/// match, git's file-backed refs forbid a leaf and a directory at the same path,
+/// so `feature` conflicts with `feature/x` and vice versa (a "D/F conflict").
+fn df_conflict(name: &str, refs: &[String]) -> bool {
+    refs.iter().any(|r| {
+        let r = r.strip_prefix("origin/").unwrap_or(r);
+        r == name || r.starts_with(&format!("{name}/")) || name.starts_with(&format!("{r}/"))
+    })
 }
 
 fn branch_prefix_for_semantic(semantic: &str, refs: &[String]) -> &'static str {
@@ -380,17 +399,13 @@ fn count_prefix(refs: &[String], prefix: &str) -> usize {
 }
 
 fn unique_branch(base: &str, refs: &[String]) -> String {
-    let exists = |name: &str| {
-        refs.iter()
-            .any(|r| r == name || r.strip_prefix("origin/") == Some(name))
-    };
-    if !exists(base) {
+    if !df_conflict(base, refs) {
         return base.to_string();
     }
     let mut n = 2;
     loop {
         let candidate = format!("{base}-{n}");
-        if !exists(&candidate) {
+        if !df_conflict(&candidate, refs) {
             return candidate;
         }
         n += 1;
@@ -572,5 +587,29 @@ mod tests {
         let second = choose_branch_name_from_refs("feature", "Add Login", &with_reserved);
         assert_ne!(second, first);
         assert_eq!(second, "feature/add-login-2");
+    }
+
+    #[test]
+    fn leaf_prefix_ref_falls_back_to_hyphen_separator() {
+        // A repo with a branch literally named `feature` blocks the `feature/`
+        // namespace (git D/F conflict), so the branch must not sit below it.
+        let refs = vec!["main".to_string(), "feature".to_string()];
+        let name = choose_branch_name_from_refs("feature", "Add Login", &refs);
+        assert_eq!(name, "feature-add-login");
+        assert!(!name.starts_with("feature/"));
+    }
+
+    #[test]
+    fn branch_avoids_df_conflict_with_existing_nested_ref() {
+        // `feat/login` exists as a directory ref → a new `feat/login` leaf can't be
+        // created; the dedup must bump past it.
+        let refs = vec!["feat/login/sub".to_string()];
+        let name = choose_branch_name_from_refs("fix", "login", &refs);
+        // prefix resolves to `fix` (no feat/fix refs counted), base `fix/login`, free.
+        assert_eq!(name, "fix/login");
+        // but a direct collision under an existing dir ref bumps:
+        let refs2 = vec!["fix/login/old".to_string()];
+        let n2 = choose_branch_name_from_refs("fix", "login", &refs2);
+        assert_eq!(n2, "fix/login-2");
     }
 }
