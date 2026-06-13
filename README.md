@@ -33,6 +33,15 @@ database backup.
 **North star:** one requirement in; Weft drives your own Claude Code, Codex, and
 OpenCode through PR, merge, and release.
 
+## When you don't need Weft
+
+If you mostly work in **one repository** and already have a coding-agent workflow
+you're happy with — a single Claude Code or Codex session, your own branches, your
+own review habit — you probably don't need Weft. It earns its place the moment one
+session stops being enough: work that spans **several repositories**, multiple
+agents that have to stay coordinated under one issue, or long runs you want to keep
+steering from your phone after you've left the desk.
+
 ## Why Weft is different
 
 ### 1. Orchestrate delivery across repos
