@@ -7,26 +7,29 @@ product
 ## Users
 
 Developers who deliver features and fixes that span several repositories and
-want coding agents (Claude Code, Codex, OpenCode) to carry the work from intent
-to reviewable multi-repo diffs and, next, pull requests, not just chat. They think in tasks ("add a discount code to
-checkout", "fix #4821"), not in worktrees or sessions. Their context: a focused
-desktop session beside an IDE, several work lines in flight at once, wanting to
-*supervise* delivery, not babysit terminals. They step in when something is
-genuinely stuck, not to push every step forward.
+want coding agents (Claude Code, Codex, OpenCode) to carry a requirement from
+intent through implementation, PR, merge, and release — not just chat or a local
+diff. They think in product tasks ("add a discount code to checkout", "fix
+#4821"), not in worktrees or sessions. Their context: a focused desktop session
+beside an IDE, several work lines in flight at once, wanting to *supervise*
+delivery, not babysit terminals. They step in when something is genuinely
+stuck, not to push every step forward.
 
 ## Product Purpose
 
-weft is a local-first, no-server **delivery hub** where coding agents drive
-multi-repo work from a **Task toward shipped code**. The north star is
-**automation**: you state a task; weft plans it, decides which repos to touch,
-spawns the agents, coordinates them, verifies the result, and drives it out the
-door. You supervise and handle exceptions — you are not a required checkpoint in
-the loop.
+weft is a local-first, no-server **multi-repo delivery orchestrator**. You give
+it a requirement; it coordinates your own Claude Code, Codex, and OpenCode
+across repositories to carry the work from intent toward implementation, merge,
+and release. The north star is **automation**: weft plans, decides which repos
+to touch, spawns the agents, coordinates them, verifies the result, and drives
+it through the repo's own delivery path. You supervise and handle exceptions —
+you are not a required checkpoint in the loop.
 
 Delivery is **phased**: current code reaches reviewable local worktree diffs
 with pre-PR checks; the next product boundary is clean pull requests. The north
-star is to carry it the rest of the way — **merge, then deploy across environments
-(staging → production)** — so the unit of *done* is shipped code, not an open PR.
+star continues through **merge, then release/deploy across environments
+(staging → production)** by orchestrating the repo's existing harnesses, not
+replacing them. The unit of *done* is shipped code, not an open PR.
 
 The shape of the work:
 
@@ -41,16 +44,18 @@ The shape of the work:
    unmanaged: an agent may read any repo freely, so only the write set is
    scoped, materialized, and confirmed. No other tool turns one task into
    "which repos, and who does what" across a fleet.
-3. **Deliver, automatically** — each write-repo gets an isolated git worktree;
-   the lead spawns a **worker** per direction (heterogeneous tools allowed),
-   hands each a structured **brief** (scope + interface-contract + acceptance),
-   and drives them to convergence over a per-thread **bus**. Workers' output is
-   gated by **executable verification** (lint / type / test / contract /
-   configured in-worker review skill), not by a human nod. Green currently means
-   a reviewable worktree diff with pre-PR evidence; the next boundary is opening
-   or updating a PR, and the roadmap flows on through **merge and
-   environment-aware deploy (staging → production)**; red retries within bounds,
-   then escalates.
+3. **Deliver, automatically** — each write-repo gets a repo-native git
+   worktree under that repo's `.worktrees/weft/<branch>` path; branch names
+   follow the target repo's observed style (`feat/*` vs `feature/*`, `fix/*`
+   vs `bugfix/*`). The lead spawns a **worker** per direction (heterogeneous
+   tools allowed), hands each a structured **brief** (scope +
+   interface-contract + acceptance), and drives them to convergence over a
+   per-thread **bus**. Workers' output is gated by **executable verification**
+   (lint / type / test / contract / configured in-worker review skill), not by
+   a human nod. Green currently means a reviewable worktree diff with pre-PR
+   evidence; the roadmap continues through PR creation/update, **merge**, and
+   environment-aware **release/deploy**; red retries within bounds, then
+   escalates.
 
 **Home is a conversation, not a terminal grid.** The primary surface is the
 **lead** (your main chat + control tower): read-only across the repos, it plans,
@@ -68,13 +73,14 @@ deploy). Everything else runs; "what's waiting on me" is the rare exception,
 surfaced at the top of every view.
 
 **Delivery is phased — now reviewable diff, next Task → PR, the goal Task →
-shipped.** Current code reaches local worktree diffs with light pre-PR
-verification. The next boundary is a PR per repo: weft drives the native CLIs
-(it doesn't bypass hooks), so opening a PR naturally triggers the repo's own
-checks. The north star reaches past the PR — weft **drives merge, then deploy
-across environments (staging → production)** — by *orchestrating the repo's
-existing pipelines*, never re-implementing CI/CD. The unit of *done* becomes
-shipped code; irreversible steps stay gated by the configurable boundary above.
+merged and released.** Current code reaches local worktree diffs with light
+pre-PR verification. The next boundary is a PR per repo: weft drives the native
+CLIs (it doesn't bypass hooks), so opening a PR naturally triggers the repo's
+own checks. The north star reaches past the PR — weft **drives merge, then
+release/deploy across environments (staging → production)** — by orchestrating
+the repo's existing pipelines, never re-implementing CI/CD. The unit of *done*
+becomes shipped code; irreversible steps stay gated by the configurable
+boundary above.
 
 It is explicitly **not** a terminal emulator, and not a "watch the agents go"
 dashboard. It is the workspace-and-automation fabric the agents deliver inside.
@@ -102,10 +108,10 @@ designed, system-following + toggleable).
 
 ## Design Principles
 
-1. **Automation is the north star.** The default path is autonomous: task in,
-   shipped code out. Every surface is built for *supervising* that flow, not for
-   driving it step by step. If a screen assumes the human pushes each step forward, it
-   fights the product.
+1. **Automation is the north star.** The default path is autonomous:
+   requirement in, merged-and-released code out. Every surface is built for
+   *supervising* that flow, not for driving it step by step. If a screen assumes
+   the human pushes each step forward, it fights the product.
 2. **The human handles exceptions, not the line.** weft adds no gate of its own.
    Surface the rare blocker (a tool's permission prompt, a true agent
    escalation, a hard conflict) loudly; let routine flow pass silently. Never
@@ -132,10 +138,11 @@ designed, system-following + toggleable).
    Surface and observation are decoupled — a session can run in weft, in its
    own app, or taken over in your terminal, observed the same way throughout.
 8. **Hide the mechanism, present the decisions.** worktrees / headless agent
-   processes / MCP bus / add-dir / sidecar are plumbing — they recede into Inspect. What the user owns
-   stays first-class: the task, scope, branch / PR / diff, tool choice, brief,
-   effective skills. Every abstraction ships with a real escape hatch (true
-   path / open terminal) and a readable failure.
+   processes / MCP bus / add-dir / sidecar are plumbing — they recede into
+   Inspect. What the user owns stays first-class: the requirement, scope,
+   repo-native branch / PR / merge / release, tool choice, brief, effective
+   skills. Every abstraction ships with a real escape hatch (true path / open
+   terminal) and a readable failure.
 9. **Calm under parallelism.** Many threads and directions at once must read as
    composed, not busy. Density without noise; motion only when something
    actually changed; the eye always finds the one thing that needs it.
