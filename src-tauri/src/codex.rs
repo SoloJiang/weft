@@ -75,6 +75,20 @@ fn ensure_codex_trusted_in(cfg: &Path, root: &str) {
     write_atomic(cfg, next.as_bytes());
 }
 
+/// The `bash <helper>` command Weft writes into Codex's `hooks.PreToolUse`, with
+/// backslashes and quotes escaped for TOML (Windows paths). Centralized so tests
+/// assert against the exact string production writes, staying correct on any
+/// path separator.
+fn codex_hook_command(helper: &Path) -> String {
+    format!(
+        "bash {}",
+        helper
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
+}
+
 fn ensure_codex_hook_in(cfg: &Path, helper: &Path) {
     let Ok(text) = std::fs::read_to_string(cfg) else {
         return; // Codex not set up — don't fabricate a config.
@@ -111,13 +125,7 @@ done
         let _ = std::fs::set_permissions(helper, std::fs::Permissions::from_mode(0o755));
     }
 
-    let command = format!(
-        "bash {}",
-        helper
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-    );
+    let command = codex_hook_command(helper);
     // Weft's PreToolUse array element (no top-level key).
     let entry = format!(
         "{{ matcher = \".*\", hooks = [{{ type = \"command\", command = \"{command}\", timeout = 3650 }}] }}"
@@ -345,7 +353,7 @@ mod tests {
         let after = std::fs::read_to_string(&cfg).unwrap();
         // user's own hook is preserved, Weft's hook is spliced in alongside it
         assert!(after.contains("/usr/local/bin/my-audit"));
-        assert!(after.contains(&format!("bash {}", helper.to_string_lossy())));
+        assert!(after.contains(&codex_hook_command(&helper)));
         // exactly one top-level hooks.PreToolUse assignment (no TOML dup key)
         let assigns = after
             .lines()
@@ -366,7 +374,7 @@ mod tests {
         assert_eq!(after, after2);
         assert_eq!(
             after2
-                .matches(&format!("bash {}", helper.to_string_lossy()))
+                .matches(&codex_hook_command(&helper))
                 .count(),
             1
         );
@@ -386,7 +394,7 @@ mod tests {
         assert!(after.contains("# mine"));
         assert!(after.contains("# BEGIN WEFT MANAGED CODEX HOOK"));
         assert!(after.contains("hooks.PreToolUse"));
-        assert!(after.contains(&format!("bash {}", helper.to_string_lossy())));
+        assert!(after.contains(&codex_hook_command(&helper)));
         assert!(std::fs::read_to_string(&helper)
             .unwrap()
             .contains(".weft-codex-ask-url"));
