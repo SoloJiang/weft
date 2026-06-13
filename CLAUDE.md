@@ -33,6 +33,8 @@ Backend logic is covered with Rust unit tests next to modules and integration te
 
 History uses short conventional prefixes such as `feat(plan): ...`, `fix(store): ...`, `polish(needs): ...`, and `chore: ...`. Keep commits scoped and descriptive.
 
+Respect `.gitignore` strictly. Never `git add` ignored or out-of-scope paths, and prefer staging explicit files over `git add -A`/`git add .`. Review `git status` / `git diff --cached` before every commit and confirm each staged path belongs to this change. Internal planning and spec artifacts (e.g. anything under `docs/`, which is ignored) must never be committed; if you find such a path already tracked, untrack it with `git rm --cached` rather than leaving it in the repo.
+
 PRs should include a concise summary, verification commands and results, linked issue/task when applicable, and screenshots or short recordings for visible UI changes.
 
 When opening a PR, prefer the GitHub app/connector and fall back to `gh pr create`. Confirm the working tree is clean or contains only this PR's scope before pushing, and never bypass hooks with `--no-verify` (fix the real failure instead). After creating a PR, record and report: PR URL, PR number, base branch, head branch, head commit, and verification results — the head commit is the last-seen baseline for review monitoring.
