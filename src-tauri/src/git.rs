@@ -324,8 +324,15 @@ fn all_branch_refs(repo: &Path) -> Vec<String> {
     .unwrap_or_default()
 }
 
-pub fn choose_branch_name(repo: &Path, semantic: &str, title: &str) -> String {
-    choose_branch_name_from_refs(semantic, title, &all_branch_refs(repo))
+/// `reserved` carries branch names already chosen for this repo but not yet present
+/// as git refs — e.g. sibling directions whose worktree hasn't materialized yet.
+/// Including them stops two directions on the same issue/repo from reserving the
+/// identical branch (and thus the same `.worktrees/weft/<branch>` path) before the
+/// first branch exists in git.
+pub fn choose_branch_name(repo: &Path, semantic: &str, title: &str, reserved: &[String]) -> String {
+    let mut refs = all_branch_refs(repo);
+    refs.extend(reserved.iter().cloned());
+    choose_branch_name_from_refs(semantic, title, &refs)
 }
 
 fn choose_branch_name_from_refs(semantic: &str, title: &str, refs: &[String]) -> String {
@@ -551,5 +558,19 @@ mod tests {
             choose_branch_name_from_refs("bugfix", "Crash On Logout", &long),
             "bugfix/crash-on-logout"
         );
+    }
+
+    #[test]
+    fn reserved_branches_dedup_before_git_has_them() {
+        // Two directions for the same issue/repo derive the same branch from the
+        // same title with no git refs yet; the second must avoid the first's
+        // reserved branch (choose_branch_name merges `reserved` into these refs).
+        let no_refs: Vec<String> = vec![];
+        let first = choose_branch_name_from_refs("feature", "Add Login", &no_refs);
+        assert_eq!(first, "feature/add-login");
+        let with_reserved = vec![first.clone()];
+        let second = choose_branch_name_from_refs("feature", "Add Login", &with_reserved);
+        assert_ne!(second, first);
+        assert_eq!(second, "feature/add-login-2");
     }
 }

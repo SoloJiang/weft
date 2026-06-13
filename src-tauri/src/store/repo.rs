@@ -412,10 +412,23 @@ pub async fn create_direction(
     } else {
         &t.title
     };
+    // Branches/worktrees are keyed per repo, so dedup against branches ALREADY
+    // reserved by other directions on this repo — not just git refs. Otherwise two
+    // directions created before the first worktree materializes derive the same
+    // branch from the same title and collide on `.worktrees/weft/<branch>`.
+    let reserved: Vec<String> = direction::Entity::find()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|d| d.branch)
+        .filter(|b| !b.is_empty())
+        .collect();
     let branch = crate::git::choose_branch_name(
         std::path::Path::new(&repo_ref.local_git_path),
         &t.kind,
         branch_title,
+        &reserved,
     );
     let dir = direction::ActiveModel {
         thread_id: Set(thread_id),
