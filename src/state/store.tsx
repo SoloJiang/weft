@@ -789,6 +789,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeThreadId, openWorker],
   );
 
+  // Adopt a backend-initiated worker session (boot revive, or one still alive
+  // after a frontend reload) into the session map — with its OWN thread id, since
+  // a revived worker can belong to any thread, not the active one. Like
+  // driveDirection but never navigates. Gives it a status dot + the auto-verify
+  // loop instead of running invisibly. chatOpenWorker is an idempotent re-attach.
+  const adoptWorker = useCallback(
+    async (directionId: number, repoId: number, threadId: number) => {
+      const existing = Object.values(sessionsRef.current).find(
+        (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
+      );
+      if (existing) return;
+      const info = await api.chatOpenWorker(directionId, repoId, currentLang());
+      setSessions((m) =>
+        m[info.session_id]
+          ? m
+          : {
+              ...m,
+              [info.session_id]: {
+                info,
+                status: "running",
+                directionId,
+                repoId,
+                threadId,
+                nativeId: info.native_id,
+              },
+            },
+      );
+    },
+    [],
+  );
+
   // Lazy attach + send: the worker surface is always input-able. Sending into a
   // worker with no live engine transparently resumes/dispatches it (focus=false,
   // so we stay on the same surface — no navigation), then delivers the message.
@@ -987,6 +1018,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       void un.then((f) => f());
     };
   }, []);
+
+  // Adopt backend-initiated worker sessions: pull the live ones on mount (covers
+  // workers revived before this listener registered), and adopt any revived after
+  // (the `worker-revived` event). Both route through the idempotent adoptWorker.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const slots = await api.listLiveWorkerSlots();
+        for (const s of slots) void adoptWorker(s.direction_id, s.repo_id, s.thread_id);
+      } catch {
+        /* best-effort hydration */
+      }
+    })();
+    const un = listen<{ direction_id: number; repo_id: number; thread_id: number }>(
+      "worker-revived",
+      (e) => void adoptWorker(e.payload.direction_id, e.payload.repo_id, e.payload.thread_id),
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [adoptWorker]);
 
   const discoverLeadSlash = useCallback((threadId: number) => {
     void (async () => {

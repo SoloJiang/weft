@@ -562,6 +562,46 @@ pub async fn list_lead_messages(
         .map_err(|e| e.to_string())
 }
 
+/// A live worker engine's (direction, repo) slot. The frontend hydrates its
+/// session map from these on mount so backend-revived workers (boot recovery,
+/// or workers still alive after a frontend reload) get status dots + auto-verify
+/// instead of running invisibly.
+#[derive(serde::Serialize)]
+pub struct LiveWorkerSlot {
+    pub direction_id: i32,
+    pub repo_id: i32,
+    pub thread_id: i32,
+}
+
+#[tauri::command]
+pub async fn list_live_worker_slots(
+    app: AppHandle,
+    db: State<'_, Db>,
+) -> Result<Vec<LiveWorkerSlot>, String> {
+    let engines: Vec<EngineRef> = {
+        let state = app.state::<LeadChatState>();
+        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().cloned().collect()
+    };
+    let mut out = Vec::new();
+    for eng in engines {
+        let sid = { eng.lock().await.session_id };
+        if let Some(sid) = sid {
+            if let Ok(Some(s)) = repo::get_session(&db, sid).await {
+                let Ok(Some(dir)) = repo::get_direction(&db, s.direction_id).await else {
+                    continue;
+                };
+                out.push(LiveWorkerSlot {
+                    direction_id: s.direction_id,
+                    repo_id: s.repo_id,
+                    thread_id: dir.thread_id,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ───────────────────── chat-mode workers ─────────────────────
 //
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
