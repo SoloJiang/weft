@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::sync::Semaphore;
 
 use crate::lead_chat::commands::{chat_open_worker_impl, lead_engine, lead_key};
@@ -132,17 +132,6 @@ async fn try_revive_worker(app: &AppHandle, db: &Db, w: WorkerTarget) -> anyhow:
     // different repo if a direction ever has multiple worktree rows, opening the
     // wrong session and leaving the interrupted one unrecovered.
     chat_open_worker_impl(app, db, w.direction_id, w.repo_id, "en").await?;
-    // This is a backend-initiated session the frontend never drove, so it isn't in
-    // the UI's session map (no status dot, no auto-verify on completion). Tell the
-    // frontend to adopt it; it routes through driveDirection, which is idempotent.
-    let _ = app.emit(
-        "worker-revived",
-        serde_json::json!({
-            "direction_id": w.direction_id,
-            "repo_id": w.repo_id,
-            "thread_id": w.thread_id,
-        }),
-    );
     if has_open_ask(app, &w.direction_id.to_string(), w.thread_id) {
         return Ok(());
     }

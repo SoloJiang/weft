@@ -119,10 +119,6 @@ export const api = {
     invoke<LeadStateInfo>("lead_state", { threadId }),
   listLeadMessages: (threadId: number) =>
     invoke<LeadMessage[]>("list_lead_messages", { threadId }),
-  listLiveWorkerSlots: () =>
-    invoke<{ direction_id: number; repo_id: number; thread_id: number }[]>(
-      "list_live_worker_slots",
-    ),
   /** Live slash-command discovery for a worker (sessionId) or the lead
    *  (threadId) — claude's initialize list, opencode's GET /command,
    *  codex's mirrored TUI built-ins plus dynamic skills. */
