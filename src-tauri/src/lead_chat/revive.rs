@@ -132,10 +132,10 @@ async fn try_revive_worker(app: &AppHandle, db: &Db, w: WorkerTarget) -> anyhow:
     // different repo if a direction ever has multiple worktree rows, opening the
     // wrong session and leaving the interrupted one unrecovered.
     chat_open_worker_impl(app, db, w.direction_id, w.repo_id, "en").await?;
-    if has_open_ask(app, &w.direction_id.to_string()) {
+    if has_open_ask(app, &w.direction_id.to_string(), w.thread_id) {
         return Ok(());
     }
-    nudge_if_idle(app, db, w.session_id as i64).await;
+    nudge_if_idle(app, db, w.session_id as i64).await?;
     Ok(())
 }
 
@@ -153,37 +153,45 @@ async fn try_revive_lead(app: &AppHandle, db: &Db, thread_id: i32) -> anyhow::Re
     repo::mark_incomplete_turns_interrupted(db, thread_id, None).await?;
     let eng = lead_engine(app, db, thread_id, "en").await?;
     engine::ensure_running(app, db, &eng).await?;
-    if has_open_ask(app, "lead") {
+    if has_open_ask(app, "lead", thread_id) {
         return Ok(());
     }
-    nudge_eng_if_idle(app, db, &eng).await;
+    nudge_eng_if_idle(app, db, &eng).await?;
     Ok(())
 }
 
 /// Mirror of the watchdog's gate (engine.rs): an ask owned by this direction
 /// (workers key by direction id; the lead's asks carry an empty dir) means the
 /// turn is legitimately blocked on a human — don't nudge it forward.
-fn has_open_ask(app: &AppHandle, dir: &str) -> bool {
+fn has_open_ask(app: &AppHandle, dir: &str, thread_id: i32) -> bool {
     app.try_state::<crate::ask::AskRegistry>()
         .map(|a| {
-            a.open()
-                .iter()
-                .any(|k| k.dir == dir || (dir == "lead" && k.dir.is_empty()))
+            a.open().iter().any(|k| {
+                // Worker asks carry the direction id (globally unique). Lead asks
+                // use an empty dir, so scope them to this thread or one lead's ask
+                // would suppress the continue nudge for every other lead.
+                k.dir == dir || (dir == "lead" && k.dir.is_empty() && k.thread == thread_id)
+            })
         })
         .unwrap_or(false)
 }
 
-async fn nudge_if_idle(app: &AppHandle, db: &Db, key: i64) {
+async fn nudge_if_idle(app: &AppHandle, db: &Db, key: i64) -> anyhow::Result<()> {
     if let Some(eng) = app.state::<LeadChatState>().get(key) {
-        nudge_eng_if_idle(app, db, &eng).await;
+        nudge_eng_if_idle(app, db, &eng).await?;
     }
+    Ok(())
 }
 
-async fn nudge_eng_if_idle(app: &AppHandle, db: &Db, eng: &EngineRef) {
+async fn nudge_eng_if_idle(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
     let busy = { eng.lock().await.turn.busy };
     if !busy {
-        let _ = engine::nudge(app, db, eng, REVIVE_PROMPT).await;
+        // Propagate failure (e.g. the CLI/app-server can't start at boot) so the
+        // caller's report_failure surfaces it in Needs-you instead of marking the
+        // session silently revived while its interrupted work stays stuck.
+        engine::nudge(app, db, eng, REVIVE_PROMPT).await?;
     }
+    Ok(())
 }
 
 fn report_failure(app: &AppHandle, thread_id: i32, dir: &str, e: &anyhow::Error) {
