@@ -197,7 +197,11 @@ interface Store {
 
   viewing: { directionId: number; repoId: number; diff?: boolean } | null;
   viewDirection: (directionId: number, repoId: number, opts?: { diff?: boolean }) => void;
-  driveDirection: (directionId: number, repoId: number, focus: boolean) => Promise<void>;
+  driveDirection: (
+    directionId: number,
+    repoId: number,
+    focus: boolean,
+  ) => Promise<number | null>;
   sendToWorker: (
     directionId: number,
     repoId: number,
@@ -744,7 +748,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // the backend to resume the same native conversation (or fresh-dispatch only
   // when no native id was ever captured). Never re-seeds a live/finished task.
   const driveDirection = useCallback(
-    async (directionId: number, repoId: number, focus: boolean) => {
+    async (
+      directionId: number,
+      repoId: number,
+      focus: boolean,
+    ): Promise<number | null> => {
       const existing = Object.values(sessionsRef.current).find(
         (s) =>
           s.directionId === directionId &&
@@ -753,7 +761,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       );
       if (existing) {
         if (focus) openWorker(directionId, repoId);
-        return;
+        return existing.info.session_id;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
       autoCheckedRef.current.delete(directionId);
@@ -776,6 +784,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         };
       });
       if (focus) openWorker(directionId, repoId);
+      return info.session_id;
     },
     [activeThreadId, openWorker],
   );
@@ -792,17 +801,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       images?: ImageAttachment[],
       files?: string[],
     ) => {
-      let live = Object.values(sessionsRef.current).find(
+      const live = Object.values(sessionsRef.current).find(
         (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
       );
-      if (!live) {
-        await driveDirection(directionId, repoId, false);
-        live = Object.values(sessionsRef.current).find(
-          (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
-        );
-      }
-      if (!live) return;
-      await api.chatSend(live.info.session_id, text, images, files);
+      // driveDirection returns the (possibly freshly-resumed) session id directly.
+      // sessionsRef won't reflect a new session until React re-renders, so re-scanning
+      // it here would drop the first message to an idle/recovered worker (the send
+      // would no-op after ChatComposer already cleared the input).
+      const sessionId =
+        live?.info.session_id ?? (await driveDirection(directionId, repoId, false));
+      if (sessionId == null) return;
+      await api.chatSend(sessionId, text, images, files);
     },
     [driveDirection],
   );
