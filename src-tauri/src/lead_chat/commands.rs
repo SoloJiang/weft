@@ -5,7 +5,7 @@ use super::engine::{self, EngineRef, LeadChatState};
 use crate::store::{repo, Db};
 use tauri::{AppHandle, Manager, State};
 
-fn lead_key(thread_id: i32) -> i64 {
+pub(crate) fn lead_key(thread_id: i32) -> i64 {
     -(thread_id as i64)
 }
 
@@ -592,7 +592,7 @@ pub async fn chat_open_worker(
     .map_err(|e| e.to_string())
 }
 
-async fn chat_open_worker_impl(
+pub(crate) async fn chat_open_worker_impl(
     app: &AppHandle,
     db: &Db,
     direction_id: i32,
