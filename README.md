@@ -64,6 +64,14 @@ exist, repo-owned skills can win by name, and Weft shows the effective skills
 and rules before a session runs. The same model is the path for workspace rules:
 shared defaults, selective opt-in, repo rules last.
 
+### 5. Keep long runs reachable and recoverable
+
+Agent delivery is long-running desktop work, so Weft treats reliability as part
+of the product. It can prevent idle sleep while sessions run, keep the machine
+awake for remote IM commands when the bridge is enabled, and back up the local
+SQLite state as encrypted snapshots to a private Git remote with a separate
+Recovery Key.
+
 ## What it feels like
 
 <p align="center">
@@ -147,6 +155,8 @@ messages cannot bind ownership, and DB errors fail closed.
 - Ask Bridge for tool permission requests: Allow, Always, Full, and Deny.
 - Skill source manager with git-backed sync, personal skill preservation, and global/workspace enablement.
 - Effective config preview for the skills and rules that apply to each repo, including their layer and overrides.
+- Keep-awake and remote-standby controls for long-running sessions and IM command reachability.
+- Encrypted local database backups to a private Git remote, with schedule, on-exit backup, restore, and Recovery Key export.
 - Sidecar observation for Claude jsonl, Codex rollout jsonl, and OpenCode SQLite.
 - Diff and pre-PR check surfaces from materialized worktrees.
 - Rename and cascade-delete for workspaces, issues, and sub-tasks.
