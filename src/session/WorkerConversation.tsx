@@ -3,11 +3,10 @@ import { useTranslation } from "react-i18next";
 import { GitCompare } from "lucide-react";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
-import type { ObserveRef, SessionStatus } from "../lib/types";
+import type { ObserveRef } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
 import { ChatComposer } from "./ChatComposer";
 import { DiffPanel } from "./DiffPanel";
-import { StatusChip } from "../components/ui/StatusChip";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { appLink, resumeCommand } from "../lib/resume";
@@ -96,8 +95,6 @@ export function WorkerConversation() {
   const sid = live?.info.session_id ?? ref?.session_id ?? null;
   const turn = sid != null ? workerTurn[sid] : undefined;
   const busy = (turn?.state ?? "stopped") === "busy";
-  const status: SessionStatus =
-    (live?.status as SessionStatus) ?? (ref?.status === "running" ? "running" : "idle");
   const msgs =
     threadId != null && sid != null
       ? (leadMessages[threadId] ?? []).filter((m) => m.session_id === sid)
@@ -126,7 +123,6 @@ export function WorkerConversation() {
           >
             <GitCompare size={13} />
           </button>
-          <StatusChip status={status} />
           {ref && (
             <Inspect
               path={ref.worktree}
