@@ -1,11 +1,11 @@
 //! Background GC: reclaim leaked worktrees — ones git still has registered but
 //! Weft's DB no longer tracks (crash / partial-cleanup residue). Safety-first:
-//! only ever touches paths UNDER worktree_home that are NOT DB-tracked and are
-//! older than a TTL. Never the canonical repo, never user dirs, never a tracked
-//! worktree. done-direction / artifact cleanup is intentionally out of scope.
+//! only ever touches paths under each repo's `.worktrees/weft` root that are NOT
+//! DB-tracked and are older than a TTL. Never the canonical repo, never arbitrary
+//! user dirs, never a tracked worktree. Done-direction cleanup is separate.
 
+use crate::git;
 use crate::store::{repo, Db};
-use crate::{git, paths};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,8 +50,8 @@ fn is_under(path_canon: &str, home_canon: &str) -> bool {
     path_canon == home_canon || path_canon.starts_with(&format!("{home_canon}/"))
 }
 
-/// PURE safety decision. Sweep iff under worktree_home AND not DB-tracked AND old
-/// enough. Unknown mtime → keep. Safety-critical predicate.
+/// PURE safety decision. Sweep iff under the repo's `.worktrees/weft` root,
+/// not DB-tracked, and old enough. Unknown mtime → keep. Safety-critical predicate.
 fn should_sweep(
     path_canon: &str,
     home_canon: &str,
@@ -100,7 +100,6 @@ pub async fn sweep_orphan_worktrees(db: &Db, ttl_secs: u64) -> anyhow::Result<us
     if ttl_secs == 0 {
         return Ok(0);
     }
-    let home_canon = canon_str(&paths::worktree_home()?);
     let tracked: HashSet<String> = repo::list_worktrees(db, None)
         .await?
         .into_iter()
@@ -110,13 +109,10 @@ pub async fn sweep_orphan_worktrees(db: &Db, ttl_secs: u64) -> anyhow::Result<us
     let mut removed = 0;
     for ws in repo::list_workspaces(db).await? {
         for r in repo::list_repos(db, ws.id).await? {
-            removed += sweep_repo(
-                Path::new(&r.local_git_path),
-                &home_canon,
-                &tracked,
-                ttl_secs,
-                now,
-            );
+            let repo_path = Path::new(&r.local_git_path);
+            let root = crate::materialize::worktree_root(repo_path);
+            let root_canon = canon_str(&root);
+            removed += sweep_repo(repo_path, &root_canon, &tracked, ttl_secs, now);
         }
     }
     Ok(removed)
@@ -148,10 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn sweeps_untracked_old_under_home() {
+    fn sweeps_untracked_old_under_repo_weft_root() {
         assert!(should_sweep(
-            "/h/worktrees/ws/t/d/repo",
-            "/h/worktrees",
+            "/repo/.worktrees/weft/feat/x",
+            "/repo/.worktrees/weft",
             &set(&[]),
             100,
             1000,
@@ -160,10 +156,10 @@ mod tests {
     }
     #[test]
     fn never_sweeps_tracked() {
-        let t = set(&["/h/worktrees/ws/t/d/repo"]);
+        let t = set(&["/repo/.worktrees/weft/feat/x"]);
         assert!(!should_sweep(
-            "/h/worktrees/ws/t/d/repo",
-            "/h/worktrees",
+            "/repo/.worktrees/weft/feat/x",
+            "/repo/.worktrees/weft",
             &t,
             100,
             10_000,
@@ -173,16 +169,16 @@ mod tests {
     #[test]
     fn never_sweeps_outside_home() {
         assert!(!should_sweep(
-            "/h/some-real-repo",
-            "/h/worktrees",
+            "/repo",
+            "/repo/.worktrees/weft",
             &set(&[]),
             100,
             10_000,
             Some(0)
         ));
         assert!(!should_sweep(
-            "/h/worktrees-evil/x",
-            "/h/worktrees",
+            "/repo/.worktrees/weft-evil/x",
+            "/repo/.worktrees/weft",
             &set(&[]),
             100,
             10_000,
@@ -192,8 +188,8 @@ mod tests {
     #[test]
     fn never_sweeps_too_new() {
         assert!(!should_sweep(
-            "/h/worktrees/x",
-            "/h/worktrees",
+            "/repo/.worktrees/weft/x",
+            "/repo/.worktrees/weft",
             &set(&[]),
             100,
             1000,
@@ -203,8 +199,8 @@ mod tests {
     #[test]
     fn unknown_mtime_is_kept() {
         assert!(!should_sweep(
-            "/h/worktrees/x",
-            "/h/worktrees",
+            "/repo/.worktrees/weft/x",
+            "/repo/.worktrees/weft",
             &set(&[]),
             100,
             10_000,
@@ -213,23 +209,26 @@ mod tests {
     }
     #[test]
     fn is_under_equality_and_boundary() {
-        assert!(is_under("/h/worktrees", "/h/worktrees"));
-        assert!(is_under("/h/worktrees/a", "/h/worktrees"));
-        assert!(!is_under("/h/worktrees-evil/x", "/h/worktrees"));
+        assert!(is_under("/repo/.worktrees/weft", "/repo/.worktrees/weft"));
+        assert!(is_under("/repo/.worktrees/weft/a", "/repo/.worktrees/weft"));
+        assert!(!is_under(
+            "/repo/.worktrees/weft-evil/x",
+            "/repo/.worktrees/weft"
+        ));
     }
     #[test]
     fn sweep_repo_removes_orphan_keeps_tracked() {
         let base = std::env::temp_dir().join(format!("weft-gc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
-        let home = base.join("worktrees");
-        std::fs::create_dir_all(&home).unwrap();
         git::init_repo(&repo).unwrap();
+        let home = crate::materialize::worktree_root(&repo);
+        std::fs::create_dir_all(&home).unwrap();
         let br = git::current_branch(&repo).unwrap();
-        let tracked_wt = home.join("keep");
-        let orphan_wt = home.join("drop");
-        git::add_worktree(&repo, "ws/keep", &tracked_wt, &br).unwrap();
-        git::add_worktree(&repo, "ws/drop", &orphan_wt, &br).unwrap();
+        let tracked_wt = home.join("feat").join("keep");
+        let orphan_wt = home.join("feat").join("drop");
+        git::add_worktree(&repo, "feat/keep", &tracked_wt, &br).unwrap();
+        git::add_worktree(&repo, "feat/drop", &orphan_wt, &br).unwrap();
         let home_canon = canon_str(&home);
         let tracked = set(&[&canon_str(&tracked_wt)]);
         let n = sweep_repo(&repo, &home_canon, &tracked, 0, now_secs());

@@ -1,6 +1,6 @@
-//! Minimal git worktree helpers for M1. Branch names are namespaced with the
-//! thread dimension (`ws/<workspace>/<thread>/<direction>`) so the same branch
-//! is never checked out in two worktrees at once.
+//! Minimal git worktree helpers. Branch names follow the target repo's observed
+//! style (`feat/*` vs `feature/*`, `fix/*` vs `bugfix/*`) and worktrees are
+//! materialized under that repo's `.worktrees/weft/` root.
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -304,6 +304,90 @@ pub fn list_registered_worktrees(repo: &Path) -> Vec<PathBuf> {
     }
 }
 
+fn all_branch_refs(repo: &Path) -> Vec<String> {
+    git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .map(|out| {
+        out.lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.ends_with("/HEAD"))
+            .map(ToString::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+pub fn choose_branch_name(repo: &Path, semantic: &str, title: &str) -> String {
+    choose_branch_name_from_refs(semantic, title, &all_branch_refs(repo))
+}
+
+fn choose_branch_name_from_refs(semantic: &str, title: &str, refs: &[String]) -> String {
+    let slug = crate::slug::slugify(title);
+    let prefix = branch_prefix_for_semantic(semantic, refs);
+    unique_branch(&format!("{prefix}/{slug}"), refs)
+}
+
+fn branch_prefix_for_semantic(semantic: &str, refs: &[String]) -> &'static str {
+    let short = count_prefix(refs, "feat") + count_prefix(refs, "fix");
+    let long = count_prefix(refs, "feature") + count_prefix(refs, "bugfix");
+    match semantic {
+        "fix" => {
+            if count_prefix(refs, "bugfix") > count_prefix(refs, "fix") {
+                "bugfix"
+            } else {
+                "fix"
+            }
+        }
+        "docs" => "docs",
+        "test" => "test",
+        "refactor" => "refactor",
+        "chore" => "chore",
+        "polish" => "polish",
+        _ => {
+            if short > long {
+                "feat"
+            } else {
+                "feature"
+            }
+        }
+    }
+}
+
+fn count_prefix(refs: &[String], prefix: &str) -> usize {
+    refs.iter()
+        .filter(|r| {
+            let r = r.strip_prefix("origin/").unwrap_or(r);
+            r.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('-'))
+        })
+        .count()
+}
+
+fn unique_branch(base: &str, refs: &[String]) -> String {
+    let exists = |name: &str| {
+        refs.iter()
+            .any(|r| r == name || r.strip_prefix("origin/") == Some(name))
+    };
+    if !exists(base) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !exists(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Current branch name of a repo (e.g. "main").
 pub fn current_branch(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
@@ -380,7 +464,7 @@ mod tests {
         assert_ne!(base_commit, other_commit);
 
         let wt = tmp("base-wt");
-        add_worktree(&repo, "ws/x/t/d", &wt, &base).unwrap();
+        add_worktree(&repo, "feat/base-test", &wt, &base).unwrap();
         let wt_head = git(&wt, &["rev-parse", "HEAD"]).unwrap();
         assert_eq!(
             wt_head, base_commit,
@@ -398,7 +482,7 @@ mod tests {
         let repo = tmp("bogus");
         init_repo(&repo).unwrap();
         let wt = tmp("bogus-wt");
-        add_worktree(&repo, "ws/x/t/d2", &wt, "no-such-branch-xyz").unwrap();
+        add_worktree(&repo, "feat/bogus-base", &wt, "no-such-branch-xyz").unwrap();
         assert!(wt.join(".git").exists());
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
@@ -414,5 +498,36 @@ mod tests {
         let fb = resolve_base_ref(&repo, "nope-xyz");
         assert!(git(&repo, &["rev-parse", "--verify", &fb]).is_ok());
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn branch_name_follows_repo_short_prefix_style() {
+        let existing = vec![
+            "main".to_string(),
+            "origin/feat/search".to_string(),
+            "origin/feat/payments".to_string(),
+            "fix/login".to_string(),
+        ];
+        assert_eq!(
+            choose_branch_name_from_refs("feature", "Add Checkout Promo", &existing),
+            "feat/add-checkout-promo"
+        );
+    }
+
+    #[test]
+    fn branch_name_follows_repo_long_prefix_style_and_dedups() {
+        let existing = vec![
+            "feature/add-checkout-promo".to_string(),
+            "feature/add-checkout-promo-2".to_string(),
+            "bugfix/login".to_string(),
+        ];
+        assert_eq!(
+            choose_branch_name_from_refs("feature", "Add Checkout Promo", &existing),
+            "feature/add-checkout-promo-3"
+        );
+        assert_eq!(
+            choose_branch_name_from_refs("fix", "Login Timeout", &existing),
+            "bugfix/login-timeout"
+        );
     }
 }

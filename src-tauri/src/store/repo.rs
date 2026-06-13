@@ -391,7 +391,7 @@ pub async fn create_direction(
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-    let ws = workspace::Entity::find_by_id(t.workspace_id)
+    let _ws = workspace::Entity::find_by_id(t.workspace_id)
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("workspace missing"))?;
@@ -402,8 +402,21 @@ pub async fn create_direction(
         .into_iter()
         .map(|d| d.slug)
         .collect();
+    let repo_ref = repo_ref::Entity::find_by_id(repo_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
     let slug = unique_slug(name, &existing);
-    let branch = format!("ws/{}/{}/{}", ws.slug, t.slug, slug);
+    let branch_title = if t.title.trim().is_empty() {
+        name
+    } else {
+        &t.title
+    };
+    let branch = crate::git::choose_branch_name(
+        std::path::Path::new(&repo_ref.local_git_path),
+        &t.kind,
+        branch_title,
+    );
     let dir = direction::ActiveModel {
         thread_id: Set(thread_id),
         name: Set(name.to_string()),
@@ -1029,7 +1042,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(dir.branch, "ws/demo-ws/add-login/main");
+        assert_eq!(dir.branch, "feature/add-login");
         assert_eq!(dir.repo_id, repo.id);
         assert_eq!(dir.reason, "build the feature");
 
@@ -1047,7 +1060,7 @@ mod tests {
             vec![(
                 repo.id,
                 "/tmp/wt".to_string(),
-                "ws/demo-ws/add-login/main".to_string()
+                "feature/add-login".to_string()
             )]
         );
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
@@ -1110,7 +1123,7 @@ mod tests {
             name: Set("main".to_string()),
             slug: Set("main".to_string()),
             tool: Set("claude".to_string()),
-            branch: Set("ws/demo-ws/add-login/main".to_string()),
+            branch: Set("feature/add-login".to_string()),
             status: Set("queued".to_string()),
             repo_id: Set(0),
             reason: Set(String::new()),
@@ -1191,7 +1204,7 @@ mod tests {
         let d2 = rename_direction(&db, d.id, "api work").await.unwrap();
         assert_eq!(d2.name, "api work");
         assert_eq!(d2.slug, "main");
-        assert_eq!(d2.branch, "ws/demo-ws/add-login/main");
+        assert_eq!(d2.branch, "feature/add-login");
     }
 
     #[tokio::test]
