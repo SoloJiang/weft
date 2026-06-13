@@ -5,7 +5,7 @@ import { ThreadBoard } from "./board/ThreadBoard";
 import { WorkspaceHome } from "./board/WorkspaceHome";
 import { NeedsYouView } from "./board/NeedsYouView";
 import { SessionView } from "./session/SessionView";
-import { ObserveView } from "./session/ObserveView";
+import { WorkerConversation } from "./session/WorkerConversation";
 import { DangerToast } from "./components/DangerToast";
 import { Toasts } from "./components/Toast";
 import { CommandPalette } from "./components/CommandPalette";
@@ -21,8 +21,8 @@ function Main() {
   // Needs-you is the workspace-wide exception queue — it takes precedence over
   // whatever thread/board is open underneath, so it's reachable from anywhere.
   if (showNeeds) return <NeedsYouView />;
+  if (viewing != null) return <WorkerConversation />;
   if (activeSessionId != null) return <SessionView />;
-  if (viewing != null) return <ObserveView />;
   if (activeThreadId != null) return <ThreadBoard />;
   return <WorkspaceHome />;
 }
