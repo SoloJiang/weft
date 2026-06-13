@@ -54,10 +54,16 @@ jobs:
             args: ''
           - platform: 'macos-latest'
             args: ''
-          - platform: 'windows-latest'
+          # Pinned to windows-2022 (not windows-latest): the windows-2025-vs2026
+          # image crashes the test binary at load with STATUS_ENTRYPOINT_NOT_FOUND
+          # (0xc0000139) even though every DLL the exe imports resolves cleanly —
+          # an image/SDK regression, not our code. Revisit when the 2025 image
+          # stabilizes.
+          - platform: 'windows-2022'
             args: ''
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
 
@@ -87,75 +93,39 @@ jobs:
           brew install protobuf
           protoc --version
 
+      # winget (used previously) ships only with windows-latest/Server 2025, not
+      # windows-2022, so install protoc via the dedicated action — it works on
+      # every image and adds protoc (with its include dir) to PATH for prost-build.
       - name: Install Windows dependencies
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          winget install -e --id Google.Protobuf --accept-package-agreements --accept-source-agreements
-          $protoc = Get-Command protoc -ErrorAction SilentlyContinue
-          if ($protoc) {
-            $protocPath = $protoc.Source
-          } else {
-            $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter protoc.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $installed) {
-              throw "protoc.exe not found after winget install"
-            }
-            $protocPath = $installed.FullName
-          }
-          & $protocPath --version
-          # Supply protoc to prost-build via $PROTOC rather than prepending the
-          # WinGet package dir to PATH — cleaner, and keeps the runtime DLL search
-          # path uncluttered.
-          "PROTOC=$protocPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Windows test-binary diagnostics
+      - name: Verify protoc (Windows)
         if: runner.os == 'Windows'
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          # Build the test binaries (no run) and capture their paths from cargo's
-          # JSON output so we can inspect the exact exe that crashes at load.
-          $exes = cargo test --no-run --manifest-path src-tauri/Cargo.toml --message-format=json 2>$null |
-            ForEach-Object { try { $o = $_ | ConvertFrom-Json } catch { return }; if ($o.executable) { $o.executable } } |
-            Where-Object { $_ }
-          Write-Host "=== test executables ==="
-          $exes | ForEach-Object { Write-Host $_ }
-
-          # Locate dumpbin from the installed MSVC toolset.
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $dumpbin = $null
-          if (Test-Path $vswhere) {
-            $vsPath = & $vswhere -latest -property installationPath
-            $dumpbin = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1 -ExpandProperty FullName
-          }
-          Write-Host "dumpbin: $dumpbin"
-
-          # lucasg Dependencies CLI explicitly flags missing import entry points.
-          $depDir = "$env:RUNNER_TEMP\deptool"
-          $depCli = $null
-          try {
-            Invoke-WebRequest -Uri "https://github.com/lucasg/Dependencies/releases/download/v1.11.1/Dependencies_x64_Release.zip" -OutFile "$env:RUNNER_TEMP\deps.zip"
-            Expand-Archive -Path "$env:RUNNER_TEMP\deps.zip" -DestinationPath $depDir -Force
-            $depCli = Join-Path $depDir 'Dependencies.exe'
-          } catch { Write-Host "Dependencies download failed: $_" }
-
-          foreach ($exe in $exes) {
-            Write-Host "########## $exe ##########"
-            if ($dumpbin) {
-              Write-Host "----- dumpbin /dependents -----"
-              & $dumpbin /dependents $exe
-            }
-            if ($depCli -and (Test-Path $depCli)) {
-              Write-Host "----- Dependencies -chain (missing entry points) -----"
-              & $depCli -depth 2 -chain $exe 2>&1 |
-                Select-String -Pattern "Missing|NOT_FOUND|not found|\[-\]|0xc0000139|entrypoint|ordinal"
-            }
-            Write-Host "----- direct run -----"
-            & $exe --list 2>&1 | Out-String | Write-Host
-            Write-Host "exit code: $LASTEXITCODE"
-          }
+        run: protoc --version
 
       - name: Run Rust tests
+        if: runner.os != 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # On Windows the cargo test-harness binaries get no application manifest
+      # (tauri-build only manifests the app bin), so rfd's static import of the
+      # Common-Controls-v6-only comctl32!TaskDialogIndirect can't resolve and the
+      # exe dies at load with STATUS_ENTRYPOINT_NOT_FOUND. Build the test binaries
+      # first, drop an external <exe>.manifest beside each (the loader honors it
+      # for exes with no embedded manifest, redirecting comctl32 to v6), then run.
+      - name: Run Rust tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\SideBySide" /v PreferExternalManifest /t REG_DWORD /d 1 /f | Out-Null
+          $exes = cargo test --no-run --manifest-path src-tauri/Cargo.toml --message-format=json |
+            ForEach-Object { try { $o = $_ | ConvertFrom-Json } catch { return }; if ($o.executable) { $o.executable } } |
+            Where-Object { $_ }
+          foreach ($exe in $exes) {
+            Copy-Item -Path src-tauri/tests.manifest -Destination "$exe.manifest" -Force
+            Write-Host "external manifest -> $exe.manifest"
+          }
+          cargo test --manifest-path src-tauri/Cargo.toml

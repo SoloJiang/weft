@@ -71,5 +71,7 @@ fn ensure_clone_rebuilds_when_origin_changes() {
         .output()
         .unwrap();
     let url = String::from_utf8(out.stdout).unwrap();
-    assert!(url.trim().ends_with("b/remote.git"));
+    // Normalize separators: on Windows git echoes back the file:// path with
+    // backslashes (…\b\remote.git).
+    assert!(url.trim().replace('\\', "/").ends_with("b/remote.git"));
 }
