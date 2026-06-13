@@ -112,7 +112,7 @@ enum LeadOutboundTarget<'a> {
 
 fn lead_outbound_target<'a>(
     route: &'a crate::store::entities::im_route::Model,
-    topic_reply_to: Option<&'a str>,
+    reply_to: Option<&'a str>,
 ) -> Option<LeadOutboundTarget<'a>> {
     match route.channel.as_str() {
         // Prefer threading under the user's latest inbound message (the pending
@@ -122,11 +122,15 @@ fn lead_outbound_target<'a>(
         // from the desktop/global tool, or the best-effort ack reaction is delayed
         // or fails (pre-8f7f8c3 behavior delivered to route.im_thread_ref directly).
         "feishu" => Some(LeadOutboundTarget::Reply {
-            message_id: topic_reply_to.unwrap_or(route.im_thread_ref.as_str()),
+            message_id: reply_to.unwrap_or(route.im_thread_ref.as_str()),
             issue_style: true,
         }),
+        // Concierge: prefer the per-turn reply hint (the originating message id,
+        // carried via the frame's origin_tag) so two rapid messages each thread
+        // under their OWN message; fall back to a reply ref baked into the stable
+        // im_thread_ref, then DM, then chat.
         "feishu_concierge" => {
-            if let Some(message_id) = reply_target_ref(&route.im_thread_ref) {
+            if let Some(message_id) = reply_to.or_else(|| reply_target_ref(&route.im_thread_ref)) {
                 Some(LeadOutboundTarget::Reply {
                     message_id,
                     issue_style: false,
@@ -1212,7 +1216,8 @@ async fn feed_issue_message(
         text,
         &feishu_provider_capabilities(),
     );
-    crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new()).await
+    // Topic threading uses pending-ack reactions, not origin_tag.
+    crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new(), None).await
 }
 
 pub async fn ensure_issue_topic(
@@ -1367,12 +1372,14 @@ async fn consume_lead_delta_frame(
     } else {
         d.accumulated.clone()
     };
-    let topic_reply_to = if is_topic {
+    // Topic (issue) threading uses the pending inbound ack; concierge uses the
+    // frame's own origin_tag so each response threads under its originating message.
+    let reply_to = if is_topic {
         latest_pending_ack_message(d.thread_id, acks).await
     } else {
-        None
+        d.origin_tag.clone()
     };
-    let Some(target) = lead_outbound_target(&route, topic_reply_to.as_deref()) else {
+    let Some(target) = lead_outbound_target(&route, reply_to.as_deref()) else {
         return;
     };
 
@@ -1463,12 +1470,14 @@ pub async fn consume_lead_out(
     if streaming && route.channel == "feishu_concierge" {
         return;
     }
-    let topic_reply_to = if route.channel == "feishu" {
+    // feishu (issue topic) threads under the pending inbound ack; concierge threads
+    // under the frame's own origin_tag (the originating message id).
+    let reply_to = if route.channel == "feishu" {
         latest_pending_ack_message(out.thread_id, acks).await
     } else {
-        None
+        out.origin_tag.clone()
     };
-    let Some(target) = lead_outbound_target(&route, topic_reply_to.as_deref()) else {
+    let Some(target) = lead_outbound_target(&route, reply_to.as_deref()) else {
         eprintln!(
             "[weft][im] lead-out missing delivery target for route {}",
             route.id
@@ -1557,11 +1566,10 @@ async fn consume_free_text(
     ctx: Option<&ExecuteCtx>,
 ) -> anyhow::Result<()> {
     let thread_id = ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref).await?;
-    if let Some(reply_to) = reply_to {
-        let out_ref = format!("{im_thread_ref};reply:{reply_to}");
-        crate::store::repo::bind_im_route(db, thread_id, "feishu_concierge", chat_id, &out_ref)
-            .await?;
-    }
+    // The route's im_thread_ref stays the STABLE conversation ref (dm:/chat:) set
+    // by ensure_im_concierge_thread. The per-message reply target rides the turn as
+    // origin_tag — two rapid free-text messages each thread under their OWN message
+    // instead of both binding the shared route to the latest reply ref.
     record_inbound_reaction(ctx, channel, thread_id).await;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
     let framed = format_im_user_message(
@@ -1572,7 +1580,16 @@ async fn consume_free_text(
         text,
         &feishu_provider_capabilities(),
     );
-    crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new()).await
+    crate::lead_chat::engine::send(
+        app,
+        db,
+        &eng,
+        &framed,
+        Vec::new(),
+        Vec::new(),
+        reply_to.map(|s| s.to_string()),
+    )
+    .await
 }
 
 /// M3-4: 桥上线后向 owner 私聊推一次「待办摘要」。整段 best-effort：任一
@@ -2013,6 +2030,7 @@ mod tests {
                 message_id: 11,
                 accumulated: "我查到了。".into(),
                 done: true,
+                origin_tag: None,
             },
             &db,
             &ch,
@@ -2118,6 +2136,7 @@ mod tests {
                 message_id: 12,
                 accumulated: "我查到了。".into(),
                 done: true,
+                origin_tag: None,
             },
             &db,
             &ch,
@@ -2169,6 +2188,7 @@ mod tests {
                 message_id: 12,
                 accumulated: "我查到了。".into(),
                 done: true,
+                origin_tag: None,
             },
             &db,
             &ch,
@@ -2211,6 +2231,7 @@ mod tests {
                 thread_id: issue.id,
                 message_id: 7,
                 text: "我查到了。".into(),
+                origin_tag: None,
             },
             &db,
             &ch,
@@ -2225,6 +2246,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn concierge_reply_threads_under_originating_message_via_origin_tag() {
+        // Finding 2 regression: two rapid free-text messages in one chat must each
+        // get their reply threaded under their OWN originating message. The per-turn
+        // target now rides the FRAME's origin_tag (not a shared im_route write), so a
+        // later message can't steal the earlier reply's target. The route's
+        // im_thread_ref stays the stable conversation ref ("dm:ou_owner").
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::create_workspace(&db, "Concierge")
+            .await
+            .unwrap();
+        let thread_id = ensure_im_concierge_thread(&db, "ou_owner", "oc_dm", "dm:ou_owner")
+            .await
+            .unwrap();
+        // Route is bound to the stable conversation ref — no ;reply: suffix.
+        let route = crate::store::repo::im_route_of_thread(&db, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.im_thread_ref, "dm:ou_owner");
+
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        // Frame A: response to message m1.
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id,
+                message_id: 101,
+                accumulated: "答复一".into(),
+                done: true,
+                origin_tag: Some("m1".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+        // Frame B: response to message m2 (the LATER inbound message).
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id,
+                message_id: 102,
+                accumulated: "答复二".into(),
+                done: true,
+                origin_tag: Some("m2".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Each response threads under its OWN originating message — NOT both under
+        // the latest. Before this change, both resolved to the shared route ref.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["m1".to_string(), "m2".to_string()]
+        );
+        // Concierge stream has no "Lead：" prefix (is_topic=false): the fallback body
+        // is the raw accumulated text, replied to the matching originating message.
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [
+                ("m1".into(), "答复一".into()),
+                ("m2".into(), "答复二".into())
+            ]
+        );
+    }
+
     #[test]
     fn coalesces_streaming_delta_frames_to_latest_per_message() {
         let frames = coalesce_delta_frames(
@@ -2233,6 +2329,7 @@ mod tests {
                 message_id: 10,
                 accumulated: "h".into(),
                 done: false,
+                origin_tag: None,
             },
             vec![
                 crate::lead_chat::delta_hub::LeadDelta {
@@ -2240,18 +2337,21 @@ mod tests {
                     message_id: 10,
                     accumulated: "he".into(),
                     done: false,
+                    origin_tag: None,
                 },
                 crate::lead_chat::delta_hub::LeadDelta {
                     thread_id: 2,
                     message_id: 20,
                     accumulated: "x".into(),
                     done: false,
+                    origin_tag: None,
                 },
                 crate::lead_chat::delta_hub::LeadDelta {
                     thread_id: 1,
                     message_id: 10,
                     accumulated: "hello".into(),
                     done: true,
+                    origin_tag: None,
                 },
             ],
         );

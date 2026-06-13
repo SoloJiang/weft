@@ -20,6 +20,10 @@ pub struct LeadDelta {
     pub accumulated: String,
     /// 该消息的最后一帧（finalize）。
     pub done: bool,
+    /// 不透明的「这一轮回复对应哪条入站消息」标记（per-turn 透传，非 IM 调用恒为
+    /// None）。IM 桥据此把流式回复 thread 到正确的原始消息下——即便回复跨越了 engine
+    /// 的轮次队列。engine 不解析它，只原样从 turn 携带到帧上。
+    pub origin_tag: Option<String>,
 }
 
 /// Tauri-managed 单例。
@@ -60,6 +64,7 @@ mod tests {
             message_id: 1,
             accumulated: "he".into(),
             done: false,
+            origin_tag: None,
         });
         let got = rx.recv().await.unwrap();
         assert_eq!(got.thread_id, 7);
@@ -76,6 +81,7 @@ mod tests {
             message_id: 1,
             accumulated: "x".into(),
             done: true,
+            origin_tag: None,
         }); // 不应 panic
     }
 }

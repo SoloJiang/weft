@@ -535,6 +535,7 @@ async fn consume_lead_out_replies_and_drains_acks() {
         thread_id: t.id,
         message_id: 7,
         text: "搞定了一半".into(),
+        origin_tag: None,
     };
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
     // reply 一次：目标是最新入站 message_id，不是持久 topic id；body 带 Lead 前缀
@@ -562,6 +563,7 @@ async fn consume_lead_out_unbound_thread_is_noop() {
         thread_id: 999,
         message_id: 1,
         text: "nope".into(),
+        origin_tag: None,
     };
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
     assert!(ch.replies.lock().unwrap().is_empty());
@@ -630,6 +632,7 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
         thread_id: concierge.id,
         message_id: 1,
         text: "我查到了。".into(),
+        origin_tag: None,
     };
 
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
@@ -666,6 +669,7 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
         thread_id: concierge.id,
         message_id: 1,
         text: "收到，我看一下。".into(),
+        origin_tag: None,
     };
 
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
@@ -703,6 +707,7 @@ async fn consume_lead_out_concierge_replies_to_latest_group_message() {
         thread_id: concierge.id,
         message_id: 1,
         text: "收到，我看一下。".into(),
+        origin_tag: None,
     };
 
     im::consume_lead_out(out, &db, &ch, &acks, false).await;

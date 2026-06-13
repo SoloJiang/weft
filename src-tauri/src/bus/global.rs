@@ -359,7 +359,7 @@ async fn message_lead(db: &Db, thread_id: i32, text: &str) -> anyhow::Result<()>
         .get()
         .ok_or_else(|| anyhow::anyhow!("app handle not initialized"))?;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, "zh").await?;
-    crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new()).await
+    crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new(), None).await
 }
 
 fn im_provider(args: &Value) -> &str {

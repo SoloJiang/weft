@@ -164,6 +164,7 @@ pub async fn lead_engine(
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        current_origin_tag: None,
     };
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(lead_key(thread_id), eng))
@@ -205,6 +206,7 @@ pub async fn lead_send(
         &text,
         to_pairs(images),
         files.unwrap_or_default(),
+        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -621,6 +623,7 @@ async fn chat_open_worker_impl(
                 interrupting: false,
                 generation: 0,
                 pending_skill_refresh: false,
+                current_origin_tag: None,
             };
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
             state.get_or_insert(key, e)
@@ -636,7 +639,7 @@ async fn chat_open_worker_impl(
             .unwrap_or_default();
         if !brief.trim().is_empty() {
             brief.push_str(lang_directive(lang));
-            engine::send(app, db, &eng, &brief, vec![], vec![]).await?;
+            engine::send(app, db, &eng, &brief, vec![], vec![], None).await?;
         }
     }
     // Dispatch enters the mandate's first phase: plan+impl workers start by
@@ -717,6 +720,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        current_origin_tag: None,
     };
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(session_id as i64, e))
@@ -741,6 +745,7 @@ pub async fn chat_send(
         &text,
         to_pairs(images),
         files.unwrap_or_default(),
+        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -832,10 +837,14 @@ pub async fn post_lead_tool_result(
                 text,
                 images: vec![],
                 tracked: false,
+                origin_tag: None,
             };
             if inner.turn.try_begin_send() {
                 inner.turn_id += 1;
                 inner.clock.begin_turn();
+                // Card-click plumbing starts a turn directly (not via send): keep the
+                // invariant so a prior concierge tag can't leak onto this turn.
+                inner.current_origin_tag = None;
                 engine::write_user(&mut inner, &out).await;
             } else {
                 inner.turn.queue.push_back(out);
