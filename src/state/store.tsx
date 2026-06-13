@@ -200,6 +200,13 @@ interface Store {
   viewing: { directionId: number; repoId: number; diff?: boolean } | null;
   viewDirection: (directionId: number, repoId: number, opts?: { diff?: boolean }) => void;
   driveDirection: (directionId: number, repoId: number, focus: boolean) => Promise<void>;
+  sendToWorker: (
+    directionId: number,
+    repoId: number,
+    text: string,
+    images?: ImageAttachment[],
+    files?: string[],
+  ) => Promise<void>;
   reviveDirection: (directionId: number) => Promise<void>;
   closeObserve: () => void;
   /** Set a task's lifecycle status (human override). */
@@ -794,6 +801,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
     },
     [activeThreadId],
+  );
+
+  // Lazy attach + send: the worker surface is always input-able. Sending into a
+  // worker with no live engine transparently resumes/dispatches it (focus=false,
+  // so we stay on the same surface — no navigation), then delivers the message.
+  // resume reuses the prior session row, so session_id is stable (no flicker).
+  const sendToWorker = useCallback(
+    async (
+      directionId: number,
+      repoId: number,
+      text: string,
+      images?: ImageAttachment[],
+      files?: string[],
+    ) => {
+      let live = Object.values(sessionsRef.current).find(
+        (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
+      );
+      if (!live) {
+        await driveDirection(directionId, repoId, false);
+        live = Object.values(sessionsRef.current).find(
+          (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
+        );
+      }
+      if (!live) return;
+      await api.chatSend(live.info.session_id, text, images, files);
+    },
+    [driveDirection],
   );
 
   // Automation-first (§4 principle 7): once a task is materialized, dispatch its
@@ -1586,6 +1620,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     viewing,
     viewDirection,
     driveDirection,
+    sendToWorker,
     reviveDirection,
     closeObserve,
     setTaskStatus,
