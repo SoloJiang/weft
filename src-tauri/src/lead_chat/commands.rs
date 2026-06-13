@@ -565,7 +565,8 @@ pub async fn list_lead_messages(
 // ───────────────────── chat-mode workers ─────────────────────
 //
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
-// timeline in the SessionView, with per-tool wire dialects (engine::per_turn).
+// timeline in the worker conversation surface, with per-tool wire dialects
+// (engine::per_turn).
 // Each session remains takeover-able in the user's own terminal via its
 // native id.
 

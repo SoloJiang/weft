@@ -87,7 +87,7 @@ export interface SessionInfo {
   native_id: string | null;
 }
 
-/** Read-only snapshot backing the observe surface (mirrors Rust ObserveRef). */
+/** Session ref backing the worker conversation surface (mirrors Rust ObserveRef). */
 export interface ObserveRef {
   worktree: string;
   branch: string;
