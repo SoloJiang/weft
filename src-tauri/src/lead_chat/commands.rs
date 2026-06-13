@@ -300,6 +300,25 @@ mod tests {
     }
 
     #[test]
+    fn stale_cleanup_skips_only_busy_sessions() {
+        use std::collections::HashSet;
+        // Session 1 busy; lead (None) + session 2 idle → clean lead and [2], not 1.
+        let busy: HashSet<Option<i32>> = [Some(1)].into_iter().collect();
+        let (clean_lead, sessions) = super::stale_cleanup_targets(&busy, &[1, 2]);
+        assert!(clean_lead);
+        assert_eq!(sessions, vec![2]);
+        // Lead (None) busy → don't clean the lead group; idle sessions still cleaned.
+        let busy2: HashSet<Option<i32>> = [None].into_iter().collect();
+        let (clean_lead2, sessions2) = super::stale_cleanup_targets(&busy2, &[1, 2]);
+        assert!(!clean_lead2);
+        assert_eq!(sessions2, vec![1, 2]);
+        // Nothing busy → clean every group.
+        let (cl3, s3) = super::stale_cleanup_targets(&HashSet::new(), &[1, 2]);
+        assert!(cl3);
+        assert_eq!(s3, vec![1, 2]);
+    }
+
+    #[test]
     fn concierge_prompt_is_provider_aware_not_feishu_scripted() {
         let prompt = super::concierge_prompt("zh");
         assert!(prompt.contains("IM provider"));
@@ -486,6 +505,25 @@ async fn wait_for_slash_commands(eng: &EngineRef) -> Vec<crate::lead_chat::proto
     vec![]
 }
 
+/// A streaming row is only legitimately live while ITS OWN engine is busy, so the
+/// `None` (lead, sessionless) group and each `Some(session)` group is cleanable
+/// unless that exact engine is busy. Returns (clean the lead group?, the session
+/// ids to clean). Gating per `(thread, session)` instead of one issue-wide busy
+/// flag stops a busy session from leaving another idle session's stale row stuck
+/// in `streaming` (a forever-"typing" assistant) until the next all-idle reload.
+fn stale_cleanup_targets(
+    busy: &std::collections::HashSet<Option<i32>>,
+    sessions: &[i32],
+) -> (bool, Vec<i32>) {
+    let clean_lead = !busy.contains(&None);
+    let clean_sessions = sessions
+        .iter()
+        .copied()
+        .filter(|s| !busy.contains(&Some(*s)))
+        .collect();
+    (clean_lead, clean_sessions)
+}
+
 #[tauri::command]
 pub async fn list_lead_messages(
     app: AppHandle,
@@ -497,26 +535,27 @@ pub async fn list_lead_messages(
         let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
         guard.values().cloned().collect()
     };
-    let mut thread_busy = false;
+    let mut busy: std::collections::HashSet<Option<i32>> = std::collections::HashSet::new();
     for eng in engines {
         let inner = eng.lock().await;
         if inner.thread_id == thread_id && inner.turn.busy {
-            thread_busy = true;
-            break;
+            busy.insert(inner.session_id);
         }
     }
-    if !thread_busy {
+    let sessions = repo::sessions_for_thread(&db, thread_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let session_ids: Vec<i32> = sessions.iter().map(|s| s.id).collect();
+    let (clean_lead, clean_sessions) = stale_cleanup_targets(&busy, &session_ids);
+    if clean_lead {
         repo::mark_incomplete_turns_interrupted(&db, thread_id, None)
             .await
             .map_err(|e| e.to_string())?;
-        let sessions = repo::sessions_for_thread(&db, thread_id)
+    }
+    for sid in clean_sessions {
+        repo::mark_incomplete_turns_interrupted(&db, thread_id, Some(sid))
             .await
             .map_err(|e| e.to_string())?;
-        for session in sessions {
-            repo::mark_incomplete_turns_interrupted(&db, thread_id, Some(session.id))
-                .await
-                .map_err(|e| e.to_string())?;
-        }
     }
     repo::list_lead_messages(&db, thread_id)
         .await
