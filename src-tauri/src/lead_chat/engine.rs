@@ -869,6 +869,10 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
         // Plumbing nudge starts a turn directly (not via send): keep the invariant.
         inner.current_origin_tag = None;
         crate::power::on_turn_began(app);
+        // A nudge is a turn-start too (e.g. a coordinator bus-wake on an idle
+        // engine): persist `running` like send, so a crash mid-nudge-turn is
+        // revivable instead of reading a stale `idle`.
+        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
         if per_turn(&inner.tool) {
             drop(inner);
             spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
