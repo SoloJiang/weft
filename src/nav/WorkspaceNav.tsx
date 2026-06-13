@@ -10,6 +10,7 @@ import {
   HelpCircle,
   LayoutGrid,
   Pencil,
+  PanelLeftClose,
   Plus,
   Search,
   Settings,
@@ -41,6 +42,7 @@ export function WorkspaceNav() {
     needs,
     asks,
     writeTriggers,
+    setNavCollapsed,
   } = useStore();
   // Live workspace-wide pending count for the Needs-you focal entry.
   const needsCount = needs.length + asks.length + writeTriggers.length;
@@ -65,14 +67,25 @@ export function WorkspaceNav() {
   return (
     <nav className="flex h-full w-72 shrink-0 flex-col border-r border-border bg-surface">
       <div className="flex flex-col gap-2 px-3 pb-2.5 pt-3">
-        <button
-          onClick={backToWorkspace}
-          title={t("nav.home")}
-          className="flex w-fit select-none items-center gap-1.5 rounded-[var(--radius-sm)] px-1 py-0.5 transition-colors hover:bg-brand-ghost"
-        >
-          <img src="/weft-mark.svg" alt="" className="h-[18px] w-[18px]" draggable={false} />
-          <span className="text-[15px] font-semibold tracking-[-0.01em] text-ink">weft</span>
-        </button>
+        <div className="flex items-center justify-between gap-2">
+          <button
+            onClick={backToWorkspace}
+            title={t("nav.home")}
+            className="flex min-w-0 select-none items-center gap-1.5 rounded-[var(--radius-sm)] px-1 py-0.5 transition-colors hover:bg-brand-ghost"
+          >
+            <img src="/weft-mark.svg" alt="" className="h-[18px] w-[18px]" draggable={false} />
+            <span className="truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">weft</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setNavCollapsed(true)}
+            aria-label={t("nav.collapseSidebar")}
+            title={t("nav.collapseSidebar")}
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+          >
+            <PanelLeftClose size={16} />
+          </button>
+        </div>
         <div className="rounded-[var(--radius-md)] border border-border bg-bg/55 p-1">
           <WorkspacePicker
             workspaces={workspaces}

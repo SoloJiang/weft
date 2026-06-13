@@ -28,7 +28,15 @@ pub async fn rename_workspace(
 
 #[tauri::command]
 pub async fn list_workspaces(db: State<'_, Db>) -> R<Vec<entities::workspace::Model>> {
-    repo::list_workspaces(&db).await.map_err(e)
+    let hidden = repo::get_setting(&db, repo::K_CONCIERGE_WORKSPACE)
+        .await
+        .map_err(e)?
+        .and_then(|s| s.parse::<i32>().ok());
+    let workspaces = repo::list_workspaces(&db).await.map_err(e)?;
+    Ok(workspaces
+        .into_iter()
+        .filter(|w| Some(w.id) != hidden)
+        .collect())
 }
 
 /// Return the id of the most-recently created workspace. This never creates a
@@ -78,6 +86,14 @@ pub async fn add_repo_ref(
     local_git_path: String,
 ) -> R<entities::repo_ref::Model> {
     register_repo(&db, workspace_id, &name, &local_git_path).await
+}
+
+/// Cheap pre-check used by first-run onboarding to validate every picked folder
+/// *before* a workspace is created — so a non-git folder can't leave an orphan
+/// workspace behind. Mirrors the guard inside `register_repo`.
+#[tauri::command]
+pub fn check_git_repo(path: String) -> bool {
+    crate::git::is_git_repo(std::path::Path::new(&path))
 }
 
 /// Clone a remote git URL into `<dest>/<name>`, then register it.

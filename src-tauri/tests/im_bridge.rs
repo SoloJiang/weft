@@ -11,6 +11,7 @@ use weft::store::Db;
 struct FakeChannel {
     texts: Arc<Mutex<Vec<(String, String)>>>, // (open_id, text)
     chat_texts: Arc<Mutex<Vec<(String, String)>>>, // (chat_id, text)
+    topics: Arc<Mutex<Vec<(String, String, String)>>>, // (chat_id, seed_message_id, text)
     replies: Arc<Mutex<Vec<(String, String)>>>, // (reply_to, body)
     reactions: Arc<Mutex<Vec<(String, String)>>>, // (message_id, emoji) — adds
     deletions: Arc<Mutex<Vec<(String, String)>>>, // (message_id, reaction_id) — deletes
@@ -43,6 +44,19 @@ impl Channel for FakeChannel {
             .push((chat_id.into(), text.into()));
         Ok(format!("om_chat_{}", self.chat_texts.lock().unwrap().len()))
     }
+    async fn create_chat_topic(
+        &self,
+        chat_id: &str,
+        seed_message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        self.topics
+            .lock()
+            .unwrap()
+            .push((chat_id.into(), seed_message_id.into(), text.into()));
+        Ok(format!("omt_topic_{}", self.topics.lock().unwrap().len()))
+    }
+
     async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
         self.replies
             .lock()
@@ -80,6 +94,17 @@ impl Channel for SlowReactionChannel {
     async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
         self.inner.send_chat_text(chat_id, text).await
     }
+    async fn create_chat_topic(
+        &self,
+        chat_id: &str,
+        seed_message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        self.inner
+            .create_chat_topic(chat_id, seed_message_id, text)
+            .await
+    }
+
     async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
         self.inner.reply_text(reply_to, text).await
     }
@@ -335,6 +360,7 @@ async fn bind_issue_thread_route_persists_im_route_and_confirms() {
         thread_id: t.id,
         chat_id: "oc_g".into(),
         im_thread_ref: "omt_42".into(),
+        seed_message_id: "om_bind".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_me", "zh", None, None)
         .await
@@ -360,6 +386,7 @@ async fn bind_issue_thread_missing_issue_is_polite_noop() {
         thread_id: 999,
         chat_id: "oc_g".into(),
         im_thread_ref: "omt_42".into(),
+        seed_message_id: "om_bind".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_me", "zh", None, None)
         .await
@@ -510,12 +537,13 @@ async fn consume_lead_out_replies_and_drains_acks() {
         thread_id: t.id,
         message_id: 7,
         text: "搞定了一半".into(),
+        origin_tag: None,
     };
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
-    // reply 一次，body 带 Lead 前缀
+    // reply 一次：目标是最新入站 message_id，不是持久 topic id；body 带 Lead 前缀
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].0, "omt_99");
+    assert_eq!(replies[0].0, "om_b");
     assert!(replies[0].1.starts_with("Lead："));
     // 两条 👀 一次性被 delete
     let dels = ch.deletions.lock().unwrap();
@@ -537,6 +565,7 @@ async fn consume_lead_out_unbound_thread_is_noop() {
         thread_id: 999,
         message_id: 1,
         text: "nope".into(),
+        origin_tag: None,
     };
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
     assert!(ch.replies.lock().unwrap().is_empty());
@@ -559,11 +588,13 @@ async fn ensure_issue_topic_creates_feishu_root_and_binds_issue() {
     let route = repo::im_route_of_thread(&db, t.id).await.unwrap().unwrap();
     assert_eq!(route.channel, "feishu");
     assert_eq!(route.chat_id, "oc_g");
-    assert_eq!(route.im_thread_ref, "om_chat_1");
-    let chat_texts = ch.chat_texts.lock().unwrap();
-    assert_eq!(chat_texts.len(), 1);
-    assert_eq!(chat_texts[0].0, "oc_g");
-    assert!(chat_texts[0].1.contains("Weft issue"));
+    assert_eq!(route.im_thread_ref, "omt_topic_1");
+    assert!(ch.chat_texts.lock().unwrap().is_empty());
+    let topics = ch.topics.lock().unwrap();
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].0, "oc_g");
+    assert_eq!(topics[0].1, "om_cmd");
+    assert!(topics[0].2.contains("Weft issue"));
     let replies = ch.replies.lock().unwrap();
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].0, "om_cmd");
@@ -603,6 +634,7 @@ async fn consume_lead_out_concierge_replies_to_bound_dm_route() {
         thread_id: concierge.id,
         message_id: 1,
         text: "我查到了。".into(),
+        origin_tag: None,
     };
 
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
@@ -639,6 +671,7 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
         thread_id: concierge.id,
         message_id: 1,
         text: "收到，我看一下。".into(),
+        origin_tag: None,
     };
 
     im::consume_lead_out(out, &db, &ch, &acks, false).await;
@@ -647,4 +680,43 @@ async fn consume_lead_out_concierge_replies_to_bound_group_route() {
     let chat_texts = ch.chat_texts.lock().unwrap();
     assert_eq!(chat_texts.len(), 1);
     assert_eq!(chat_texts[0], ("oc_g".into(), "收到，我看一下。".into()));
+}
+
+#[tokio::test]
+async fn consume_lead_out_concierge_replies_to_latest_group_message() {
+    use std::collections::HashMap;
+    use weft::lead_chat::out_hub::LeadOut;
+
+    let db = mem_db().await;
+    let ch = FakeChannel::default();
+    let ws = repo::create_workspace(&db, "Concierge").await.unwrap();
+    let concierge = repo::create_thread(&db, ws.id, "飞书群聊 · oc_g", "concierge", "claude")
+        .await
+        .unwrap();
+    repo::bind_im_route(
+        &db,
+        concierge.id,
+        "feishu_concierge",
+        "oc_g",
+        "chat:oc_g;reply:om_latest",
+    )
+    .await
+    .unwrap();
+    let acks = std::sync::Arc::new(tokio::sync::Mutex::new(
+        HashMap::<i32, Vec<(String, String)>>::new(),
+    ));
+    let out = LeadOut {
+        thread_id: concierge.id,
+        message_id: 1,
+        text: "收到，我看一下。".into(),
+        origin_tag: None,
+    };
+
+    im::consume_lead_out(out, &db, &ch, &acks, false).await;
+
+    assert!(ch.texts.lock().unwrap().is_empty());
+    assert!(ch.chat_texts.lock().unwrap().is_empty());
+    let replies = ch.replies.lock().unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0], ("om_latest".into(), "收到，我看一下。".into()));
 }

@@ -48,6 +48,8 @@ export const api = {
     invoke<RepoRef[]>("list_repos", { workspaceId }),
   addRepoRef: (workspaceId: number, name: string, localGitPath: string) =>
     invoke<RepoRef>("add_repo_ref", { workspaceId, name, localGitPath }),
+  checkGitRepo: (path: string) =>
+    invoke<boolean>("check_git_repo", { path }),
   cloneRepo: (workspaceId: number, url: string, dest: string, name: string) =>
     invoke<RepoRef>("clone_repo", { workspaceId, url, dest, name }),
   createRepo: (workspaceId: number, name: string, dest: string) =>

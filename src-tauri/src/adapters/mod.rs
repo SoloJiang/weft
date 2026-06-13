@@ -148,6 +148,7 @@ impl AgentAdapter for CodexExecAdapter {
 
     fn prepare(&self, cwd: &Path) {
         crate::codex::ensure_codex_trusted(cwd);
+        crate::codex::ensure_codex_hook();
     }
 
     fn build_argv(&self, ctx: &AdapterContext) -> anyhow::Result<(String, Vec<String>)> {
@@ -272,11 +273,18 @@ impl AgentAdapter for OpenCodeAdapter {
 
 // ───────────────────────────── resolver ─────────────────────────────
 
-/// codex prefers the app-server transport unless `WEFT_CODEX_EXEC` forces exec.
-/// (Single source of truth shared with `engine::codex_appserver_enabled` once the
-/// cutover lands.)
+/// Codex app-server is opt-in because its initialized handshake can initialize
+/// ChatGPT Apps (`/backend-api/wham/apps`) and fail on network/auth state before
+/// a normal Weft turn starts. Exec is the safe default.
+pub(crate) fn codex_prefers_appserver_from_env(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 pub(crate) fn codex_prefers_appserver() -> bool {
-    !std::env::var("WEFT_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0")
+    codex_prefers_appserver_from_env(std::env::var("WEFT_CODEX_APPSERVER").ok().as_deref())
 }
 
 /// The PROCESS adapter for a tool identity, used by the engine's spawn/parse/
@@ -358,6 +366,18 @@ mod tests {
             .unwrap();
         assert!(!b.contains(&"--command".to_string()));
         assert_eq!(b.last().unwrap(), "/nope hi");
+    }
+
+    #[test]
+    fn codex_appserver_is_opt_in() {
+        assert!(!codex_prefers_appserver_from_env(None));
+        assert!(!codex_prefers_appserver_from_env(Some("")));
+        assert!(!codex_prefers_appserver_from_env(Some("0")));
+        assert!(!codex_prefers_appserver_from_env(Some("false")));
+        assert!(codex_prefers_appserver_from_env(Some("1")));
+        assert!(codex_prefers_appserver_from_env(Some("true")));
+        assert!(codex_prefers_appserver_from_env(Some("YES")));
+        assert!(codex_prefers_appserver_from_env(Some(" on ")));
     }
 
     #[test]

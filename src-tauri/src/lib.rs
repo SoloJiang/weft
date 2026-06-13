@@ -52,6 +52,17 @@ fn fatal(context: &str, err: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+fn mcp_bridge_enabled_from_env(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn mcp_bridge_enabled() -> bool {
+    mcp_bridge_enabled_from_env(std::env::var("WEFT_MCP_BRIDGE").ok().as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Make GUI-launched spawns find nvm/fnm/native-installer CLIs (see detect.rs).
@@ -99,7 +110,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build());
 
     #[cfg(debug_assertions)]
-    {
+    if mcp_bridge_enabled() {
         builder = builder.plugin(
             tauri_plugin_mcp_bridge::Builder::new()
                 .bind_address("127.0.0.1")
@@ -149,6 +160,7 @@ pub fn run() {
             commands::list_workspaces,
             commands::ensure_default_workspace,
             commands::add_repo_ref,
+            commands::check_git_repo,
             commands::clone_repo,
             commands::create_repo,
             commands::create_thread,
@@ -240,4 +252,21 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| fatal("running tauri application", e));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcp_bridge_enabled_from_env;
+
+    #[test]
+    fn mcp_bridge_is_opt_in() {
+        assert!(!mcp_bridge_enabled_from_env(None));
+        assert!(!mcp_bridge_enabled_from_env(Some("")));
+        assert!(!mcp_bridge_enabled_from_env(Some("0")));
+        assert!(!mcp_bridge_enabled_from_env(Some("false")));
+        assert!(mcp_bridge_enabled_from_env(Some("1")));
+        assert!(mcp_bridge_enabled_from_env(Some("true")));
+        assert!(mcp_bridge_enabled_from_env(Some("YES")));
+        assert!(mcp_bridge_enabled_from_env(Some(" on ")));
+    }
 }

@@ -43,6 +43,10 @@ pub enum Route {
         thread_id: i32,
         chat_id: String,
         im_thread_ref: String,
+        /// The `/bind` message id (a member of this topic) — recorded as a
+        /// replyable seed so desktop-driven / no-ack lead replies have a valid
+        /// `om_*` target instead of the non-replyable `omt_*` topic id.
+        seed_message_id: String,
     },
     /// 已绑定 owner 在飞书群普通消息里发送 `/topic <thread_id>`，为已有
     /// Weft issue 创建或复用一个飞书 topic。
@@ -165,6 +169,7 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
                                         thread_id,
                                         chat_id: chat_id.clone(),
                                         im_thread_ref: tref.clone(),
+                                        seed_message_id: message_id.clone(),
                                     };
                                 }
                             }
@@ -241,7 +246,7 @@ pub fn route(inb: &Inbound, allow: &[String], cards: &CardIndex) -> Route {
                 sender_open_id: sender_open_id.clone(),
                 chat_id: chat_id.clone(),
                 im_thread_ref: format!("dm:{sender_open_id}"),
-                reply_to: None,
+                reply_to: Some(message_id.clone()),
                 text: text.clone(),
             }
         }
@@ -352,7 +357,7 @@ mod tests {
                 sender_open_id: "ou_me".into(),
                 chat_id: "oc_dm".into(),
                 im_thread_ref: "dm:ou_me".into(),
-                reply_to: None,
+                reply_to: Some("om_in".into()),
                 text: "允许".into(),
             }
         );
@@ -367,7 +372,7 @@ mod tests {
                 sender_open_id: "ou_me".into(),
                 chat_id: "oc_dm".into(),
                 im_thread_ref: "dm:ou_me".into(),
-                reply_to: None,
+                reply_to: Some("om_in".into()),
                 text: "今天进展如何".into(),
             }
         );
@@ -432,6 +437,7 @@ mod tests {
                 thread_id: 7,
                 chat_id: "oc_g".into(),
                 im_thread_ref: "omt_42".into(),
+                seed_message_id: "om".into(),
             }
         );
 
