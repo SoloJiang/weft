@@ -22,55 +22,46 @@ Weft is not a terminal grid and not a hosted agent runner. It is the local
 orchestration layer between a product requirement and the native coding agents,
 repositories, branches, checks, and release paths you already use.
 
-The north-star loop:
-
 ```text
 Requirement → repo map → scoped agent lanes → repo-native branches → implementation → PR / merge / release
 ```
 
-### 1. Cross-repo scope decomposition
+**Today:** local multi-repo planning, repo-native worktrees, native-agent
+sessions, reviewable diffs, pre-PR checks, IM asks, keep-awake, and encrypted
+database backup.
 
-You describe a feature, bugfix, refactor, or spike. The lead agent uses the
-workspace repo map to decide which repositories need writes, why each write lane
-exists, and which worker should take it. Reads stay free; only writes are scoped,
-approved, materialized, and tracked.
+**North star:** one requirement in; Weft drives your own Claude Code, Codex, and
+OpenCode through PR, merge, and release.
 
-### 2. Respect user origin
+## Why Weft is different
 
-Weft drives the native tools you already use: Claude Code, Codex, and OpenCode.
-It does not replace their auth, hooks, approvals, sandbox rules, skills, or
-session identity. Permission asks are mirrored into Weft; they are not bypassed.
-Terminal takeover remains one step away when you want the original CLI surface.
+### 1. Orchestrate delivery across repos
 
-### 3. Respect repo origin
+You describe a feature, bugfix, refactor, or spike. The lead agent reads the
+workspace repo map and proposes scoped write lanes: which repository needs
+writes, why that lane exists, and which worker should take it. Reads stay free;
+only writes are approved, materialized, tracked, and reviewed.
 
-Weft does not impose an internal branch scheme on your repository. New work is
-materialized under the target repo:
+### 2. Respect your origins
 
-```text
-<repo>/.worktrees/weft/<branch-name>
-```
+Weft works with the tools and repositories you already trust.
 
-Branch names follow that repo's observed style: `feat/*` vs `feature/*`,
-`fix/*` vs `bugfix/*`, with numeric suffixes only when needed. Weft keeps its
-own routing in local state; your git history keeps looking like your git
-history.
+- **User origin:** Weft drives your native Claude Code, Codex, and OpenCode. It
+  keeps their auth, hooks, approvals, sandbox rules, skills, and session identity.
+- **Repo origin:** worktrees live under the target repo:
+  `<repo>/.worktrees/weft/<branch-name>`. Branch names follow that repo's style:
+  `feat/*` vs `feature/*`, `fix/*` vs `bugfix/*`.
+- **Team origin:** teams can import git-hosted skill sources, enable each skill
+  globally or per workspace, and still let personal or repo-owned skills win.
+  Effective skills and rules are visible before a session runs.
 
-### 4. Bring team playbooks, keep personal taste
+### 3. Stay local, reachable, and recoverable
 
-Teams can import git-hosted skill sources, sync them locally, and enable each
-skill globally or only for a workspace. Your personal native-CLI skills still
-exist, repo-owned skills can win by name, and Weft shows the effective skills
-and rules before a session runs. The same model is the path for workspace rules:
-shared defaults, selective opt-in, repo rules last.
-
-### 5. Keep long runs reachable and recoverable
-
-Agent delivery is long-running desktop work, so Weft treats reliability as part
-of the product. It can prevent idle sleep while sessions run, keep the machine
-awake for remote IM commands when the bridge is enabled, and back up the local
-SQLite state as encrypted snapshots to a private Git remote with a separate
-Recovery Key.
+Weft treats long-running desktop automation as a product problem, not an
+afterthought. It can prevent idle sleep while sessions run, keep the machine
+awake for remote IM commands when the bridge is enabled, mirror asks to
+Feishu/Lark, and back up the local SQLite state as encrypted snapshots to a
+private Git remote with a separate Recovery Key.
 
 ## What it feels like
 
@@ -87,42 +78,7 @@ Recovery Key.
 
 The human handles exceptions, not the assembly line.
 
-## Product model
-
-- **Workspace**: a logical set of repo references, profiles, rules, and tools.
-- **Issue**: one user-facing work line for a feature, bugfix, refactor, or spike.
-- **Sub-task**: one scoped worker lane with one write repository today.
-- **Session**: one native agent run attached to a worktree.
-
-Internally the store still uses `thread` for Issues and `direction` for
-Sub-tasks. User-facing docs and UI use **Issue** and **Sub-task**.
-
-## Product surfaces
-
-| Workspace board | Issue board |
-|---|---|
-| <img src="assets/screenshots/board-workspace.png" alt="Workspace board" /> | <img src="assets/screenshots/board-issue.png" alt="Issue board" /> |
-
-| Lead conversation | Repository map |
-|---|---|
-| <img src="assets/screenshots/lead.png" alt="Lead conversation" /> | <img src="assets/screenshots/repo-graph.png" alt="Repository dependency map" /> |
-
-## Architecture
-
-<p align="center">
-  <img src="assets/diagrams/arch-en.svg" alt="Weft local-first architecture" width="940" />
-</p>
-
-The Rust backend owns the local SQLite store, git worktree lifecycle, headless
-agent processes, Ask Bridge, local MCP bus, IM bridge, skill sources, and sidecar
-observation. The React frontend renders the workspace board, issue board, lead
-conversation, worker sessions, observe/diff views, settings, and Needs-you queue.
-
-<p align="center">
-  <img src="assets/diagrams/model-en.svg" alt="Workspace, issue, sub-task, session model" width="860" />
-</p>
-
-## IM remote control
+## Operate from chat when you are away
 
 <p align="center">
   <img src="assets/diagrams/im-en.svg" alt="IM remote control: Feishu cards mirror permission asks and agent questions" width="940" />
@@ -142,6 +98,32 @@ The bridge currently covers:
 
 Binding is conservative: the first private-chat sender can become owner, group
 messages cannot bind ownership, and DB errors fail closed.
+
+## Product surfaces
+
+| Workspace board | Issue board |
+|---|---|
+| <img src="assets/screenshots/board-workspace.png" alt="Workspace board" /> | <img src="assets/screenshots/board-issue.png" alt="Issue board" /> |
+
+| Repository map | Lead conversation |
+|---|---|
+| <img src="assets/screenshots/repo-graph.png" alt="Repository dependency map" /> | <img src="assets/screenshots/lead.png" alt="Lead conversation" /> |
+
+## Architecture
+
+<p align="center">
+  <img src="assets/diagrams/arch-en.svg" alt="Weft local-first architecture" width="940" />
+</p>
+
+The Rust backend owns the local SQLite store, git worktree lifecycle, headless
+agent processes, Ask Bridge, local MCP bus, IM bridge, skill sources, power
+guards, encrypted backup, and sidecar observation. The React frontend renders
+the workspace board, issue board, lead conversation, worker sessions,
+observe/diff views, settings, and Needs-you queue.
+
+<p align="center">
+  <img src="assets/diagrams/model-en.svg" alt="Workspace, issue, sub-task, session model" width="860" />
+</p>
 
 ## Current capabilities
 

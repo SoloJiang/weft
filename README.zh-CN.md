@@ -20,50 +20,37 @@ Codex、OpenCode 跨多个仓库推进，把需求从意图一路带向实现、
 Weft 不是终端网格，也不是云端 agent runner。它是在你的需求、原生 coding agents、
 仓库、分支、检查和发布流程之间做协调的本地编排层。
 
-最终目标链路：
-
 ```text
 需求 → 仓库地图 → 有边界的 agent 工作通道 → 仓库原生分支 → 实现 → PR / 合并 / 上线
 ```
 
-### 1. 跨仓库范围拆解
+**当前能力：** 本地多仓规划、仓库原生 worktree、原生 agent 会话、可 review 的 diff、
+pre-PR checks、IM 问答、运行中防休眠、加密数据库备份。
 
-你描述 feature、bugfix、refactor 或 spike。Lead agent 根据 workspace 的 repo map
-判断哪些仓库需要写、每条写入通道为什么存在、应该由哪个 worker 执行。读取仓库是自由的；
-只有写入会被声明、确认、创建工作目录并持续追踪。
+**最终目标：** 你给一个需求，Weft 指挥你自己的 Claude Code、Codex、OpenCode 一路做到
+PR、合并和上线。
 
-### 2. 尊重用户自己的工具习惯
+## Weft 的不同之处
 
-Weft 驱动你已经在用的原生工具：Claude Code、Codex、OpenCode。它不替代这些工具的
-登录态、hooks、审批、sandbox、skills 或 session 身份。权限请求会镜像到 Weft，
-但不会被绕过；需要原生体验时，也可以一键回到自己的终端接管。
+### 1. 编排跨仓库交付
 
-### 3. 尊重仓库自己的协作习惯
+你描述 feature、bugfix、refactor 或 spike。Lead agent 读取 workspace 的 repo map，
+提出有边界的写入通道：哪个仓库需要写、为什么要写、由哪个 worker 执行。读取仓库是自由的；
+只有写入会被确认、创建工作目录、追踪和 review。
 
-Weft 不把内部命名规则强加给你的仓库。新的工作目录创建在目标仓库内：
+### 2. 尊重你的原有习惯
 
-```text
-<repo>/.worktrees/weft/<branch-name>
-```
+Weft 和你已经信任的工具、仓库一起工作。
 
-分支名会根据该仓库已有风格推断：`feat/*` 还是 `feature/*`，`fix/*` 还是 `bugfix/*`；
-只有冲突时才追加数字后缀。Weft 的路由和状态留在本地数据库里，你的 git 历史继续保持
-它原本的样子。
+- **尊重用户工具：** Weft 驱动你自己的 Claude Code、Codex、OpenCode，保留它们的登录态、hooks、审批、sandbox、skills 和 session 身份。
+- **尊重仓库习惯：** worktree 创建在目标仓库内：`<repo>/.worktrees/weft/<branch-name>`。分支名跟随该仓库已有风格，例如 `feat/*` vs `feature/*`、`fix/*` vs `bugfix/*`。
+- **尊重团队经验：** 团队可以导入 Git 托管的 Skill 源，按全局或 workspace 选择性启用；个人或仓库自带的同名 Skill 仍可优先。会话开始前可以查看每个仓库最终生效的 Skills 和 Rules。
 
-### 4. 导入团队经验，保留个人习惯
+### 3. 本地运行，远程可达，数据可恢复
 
-团队可以导入 Git 托管的 Skill 源，同步到本地后，再按「所有 Workspace」或「当前
-Workspace」选择性启用。你自己熟悉的原生 CLI Skills 仍然保留；如果仓库里有同名
-Skill，仓库自己的版本优先。Weft 也会展示每个仓库最终生效的 Skills 和 Rules，让你
-在会话开始前知道「哪些能力会被带进去、来自哪一层」。未来工作区规则包（workspace
-rule packs）也应沿用同一套模型：团队给默认值，用户按需启用，仓库自己的规则最后说了算。
-
-### 5. 长任务不断线，数据可恢复
-
-Agent 交付经常是长时间运行的桌面工作，所以 Weft 把可靠性也当成产品能力。它可以在
-session 运行时阻止系统空闲休眠；开启 IM 桥时，也可以保持远程待命，让飞书指令随时
-到达。Weft 还支持把本地 SQLite 状态库加密备份到私有 Git 远端，并单独导出 Recovery
-Key，方便换机或故障后恢复。
+Agent 交付经常是长时间运行的桌面工作。Weft 可以在 session 运行时阻止系统空闲休眠；
+开启 IM 桥时保持远程待命，让飞书指令随时到达；也可以把本地 SQLite 状态库加密备份到
+私有 Git 远端，并单独导出 Recovery Key，方便换机或故障后恢复。
 
 ## 实际工作流
 
@@ -80,44 +67,13 @@ Key，方便换机或故障后恢复。
 
 人处理异常，不推动流水线。
 
-## 产品模型
-
-- **Workspace**：一组逻辑仓库，以及仓库画像、规则和工具配置。
-- **Issue**：一条面向用户的工作线，可以是 feature、bugfix、refactor 或 spike。
-- **子任务（Sub-task）**：一个具体 worker 通道，目前绑定一个写入仓库。
-- **Session**：一个原生 agent 会话，绑定到某个 worktree。
-
-内部存储仍用 `thread` 表示 Issue 层，用 `direction` 表示子任务层。面向用户的文档和 UI 统一称为 **Issue** 与 **子任务**。
-
-## 产品界面
-
-| Workspace 看板 | Issue 看板 |
-|---|---|
-| <img src="assets/screenshots/board-workspace.png" alt="Workspace 看板" /> | <img src="assets/screenshots/board-issue.png" alt="Issue 看板" /> |
-
-| Lead 对话 | 仓库地图 |
-|---|---|
-| <img src="assets/screenshots/lead.png" alt="Lead 对话" /> | <img src="assets/screenshots/repo-graph.png" alt="仓库依赖图" /> |
-
-## 架构
-
-<p align="center">
-  <img src="assets/diagrams/arch-zh.svg" alt="Weft 本地优先架构" width="940" />
-</p>
-
-Rust 后端负责本地 SQLite 状态库、git worktree 生命周期、headless agent 进程、Ask Bridge、本地 MCP bus、IM 桥、skill source 和 sidecar 观测。React 前端负责 Workspace 看板、Issue 看板、Lead 对话、worker session、Observe/Diff、Settings 和 Needs-you 队列。
-
-<p align="center">
-  <img src="assets/diagrams/model-zh.svg" alt="Workspace、Issue、子任务、Session 模型" width="860" />
-</p>
-
-## IM 远程指挥
+## 人不在电脑前，也能继续指挥
 
 <p align="center">
   <img src="assets/diagrams/im-zh.svg" alt="IM 远程指挥：飞书卡片镜像权限请求和 agent 提问" width="940" />
 </p>
 
-worker 产生的权限请求和 agent 提问可以镜像到飞书/Lark 交互卡片。移动端回复卡片，会解析到桌面端使用的同一个处理函数；不论在哪一侧回答，两边都会 patch 到同一个终态。
+Worker 产生的权限请求和 agent 提问可以镜像到飞书/Lark 交互卡片。移动端回复卡片，会解析到桌面端使用的同一个处理函数；不论在哪一侧回答，两边都会 patch 到同一个终态。
 
 当前桥接覆盖：
 
@@ -128,6 +84,28 @@ worker 产生的权限请求和 agent 提问可以镜像到飞书/Lark 交互卡
 - 每次恢复在线时，对待处理 Needs-you 做一次摘要同步。
 
 绑定策略保持保守：首位私聊发送者可以成为 owner，群消息不能触发绑定，DB 错误 fail-closed。
+
+## 产品界面
+
+| Workspace 看板 | Issue 看板 |
+|---|---|
+| <img src="assets/screenshots/board-workspace.png" alt="Workspace 看板" /> | <img src="assets/screenshots/board-issue.png" alt="Issue 看板" /> |
+
+| 仓库地图 | Lead 对话 |
+|---|---|
+| <img src="assets/screenshots/repo-graph.png" alt="仓库依赖图" /> | <img src="assets/screenshots/lead.png" alt="Lead 对话" /> |
+
+## 架构
+
+<p align="center">
+  <img src="assets/diagrams/arch-zh.svg" alt="Weft 本地优先架构" width="940" />
+</p>
+
+Rust 后端负责本地 SQLite 状态库、git worktree 生命周期、headless agent 进程、Ask Bridge、本地 MCP bus、IM 桥、Skill 源、电源管理、加密备份和 sidecar 观测。React 前端负责 Workspace 看板、Issue 看板、Lead 对话、worker session、Observe/Diff、Settings 和 Needs-you 队列。
+
+<p align="center">
+  <img src="assets/diagrams/model-zh.svg" alt="Workspace、Issue、子任务、Session 模型" width="860" />
+</p>
 
 ## 当前能力
 
