@@ -624,6 +624,27 @@ pub async fn set_session_status(db: &Db, session_id: i32, status: &str) -> Resul
     Ok(())
 }
 
+/// One-time upgrade reconcile: before honest activity status existed, `status`
+/// was a write-once high-water-mark (`running` on attach, never reset to idle),
+/// so every legacy worker row reads `running`/`starting` regardless of whether
+/// its turn finished. Reset those to `idle` so the boot revive sweep doesn't
+/// resume+nudge every old idle/review worker on the first launch after upgrade.
+/// Run by migration M0017; from then on the engine writes status honestly.
+/// Generic over the connection so the migration (`SchemaManagerConnection`) and
+/// tests (`DatabaseConnection`) share one implementation.
+pub async fn reset_stale_running_sessions<C: sea_orm::ConnectionTrait>(conn: &C) -> Result<()> {
+    for s in session::Entity::find()
+        .filter(session::Column::Status.is_in(["running", "starting"]))
+        .all(conn)
+        .await?
+    {
+        let mut a: session::ActiveModel = s.into();
+        a.status = Set("idle".to_string());
+        a.update(conn).await?;
+    }
+    Ok(())
+}
+
 pub async fn get_session(db: &Db, session_id: i32) -> Result<Option<session::Model>> {
     Ok(session::Entity::find_by_id(session_id).one(&db.0).await?)
 }
@@ -719,9 +740,13 @@ pub async fn mark_incomplete_turns_interrupted(
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Result<()> {
+    // A crash leaves both a half-streamed assistant row and any user message the
+    // user queued behind it (the in-memory FIFO is gone, so a `queued` row has no
+    // live processor and would otherwise show as pending forever). Close both as
+    // interrupted; full queued-message replay is the backend-queue feature (later).
     let mut q = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(lead_message::Column::Status.eq("streaming"));
+        .filter(lead_message::Column::Status.is_in(["streaming", "queued"]));
     q = match session_id {
         Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
         None => q.filter(lead_message::Column::SessionId.is_null()),
@@ -1018,10 +1043,31 @@ mod tests {
             all.iter().find(|m| m.id == streaming.id).unwrap().status,
             "interrupted"
         );
+        // A queued user message orphaned by the crash (no live FIFO to deliver it)
+        // is closed as interrupted too, so it doesn't show as pending forever.
         assert_eq!(
             all.iter().find(|m| m.id == queued.id).unwrap().status,
-            "queued"
+            "interrupted"
         );
+    }
+
+    #[tokio::test]
+    async fn reset_stale_running_sessions_idles_legacy_rows() {
+        let db = mem().await;
+        // Pre-fix rows: status was a write-once high-water-mark, so an idle worker
+        // reads "running" (or "starting" before it ever attached).
+        let running = create_session(&db, 1, 1, "codex", "/tmp/a").await.unwrap();
+        set_session_status(&db, running.id, "running").await.unwrap();
+        let starting = create_session(&db, 2, 1, "codex", "/tmp/b").await.unwrap();
+        set_session_status(&db, starting.id, "starting").await.unwrap();
+        let idle = create_session(&db, 3, 1, "codex", "/tmp/c").await.unwrap();
+        set_session_status(&db, idle.id, "idle").await.unwrap();
+
+        reset_stale_running_sessions(&db.0).await.unwrap();
+
+        assert_eq!(get_session(&db, running.id).await.unwrap().unwrap().status, "idle");
+        assert_eq!(get_session(&db, starting.id).await.unwrap().unwrap().status, "idle");
+        assert_eq!(get_session(&db, idle.id).await.unwrap().unwrap().status, "idle");
     }
     #[tokio::test]
     async fn queued_flips_to_complete() {
