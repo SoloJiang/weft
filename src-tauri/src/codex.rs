@@ -20,27 +20,31 @@
 use std::path::{Path, PathBuf};
 
 pub fn ensure_codex_trusted(cwd: &Path) {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = codex_home() else {
         return;
     };
     let Some(root) = repo_root(cwd) else {
         return;
     };
-    ensure_codex_trusted_in(
-        &PathBuf::from(&home).join(".codex").join("config.toml"),
-        &root,
-    );
+    ensure_codex_trusted_in(&home.join(".codex").join("config.toml"), &root);
 }
 
 pub fn ensure_codex_hook() {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = codex_home() else {
         return;
     };
-    let home = PathBuf::from(home);
     ensure_codex_hook_in(
         &home.join(".codex").join("config.toml"),
         &home.join(".weft").join("weft-codex-hook.sh"),
     );
+}
+
+/// The user's home directory, where Codex keeps `~/.codex/config.toml`. Resolved
+/// platform-awarely: on a Windows GUI launch `HOME` is unset (the profile lives at
+/// `%USERPROFILE%`), so a bare `env::var("HOME")` would skip hook install there.
+/// `dirs::home_dir()` already consults the right per-platform source.
+fn codex_home() -> Option<PathBuf> {
+    dirs::home_dir()
 }
 
 /// The git repository root Codex trusts (a worktree → its main repo root).
@@ -77,13 +81,72 @@ fn ensure_codex_trusted_in(cfg: &Path, root: &str) {
     write_atomic(cfg, next.as_bytes());
 }
 
-/// The raw `bash <helper>` command Weft writes into Codex's `hooks.PreToolUse`.
-/// Returned UNescaped: `toml_edit` owns TOML string escaping when it serializes
-/// this value, so escaping here too would double-escape backslashes on Windows
-/// paths (`C:\x` → `C:\\\\x`). Centralized so production and tests share one
-/// source for the command string, staying correct on any path separator.
+/// The `bash <helper>` command Weft writes into Codex's `hooks.PreToolUse`. The
+/// helper path is SHELL-quoted (single quotes, with embedded `'` escaped as
+/// `'\''`) because this string is handed to a shell to run: an unquoted path with
+/// a space or metacharacter (e.g. `C:\Users\Jane Doe\…`) would be word-split and
+/// the Ask Bridge would never start. This quoting is for the shell only — the
+/// TOML-string escaping of the whole command value is still `toml_edit`'s job, so
+/// nothing is pre-escaped for TOML here (that would double-escape backslashes on
+/// Windows paths). Centralized so production and the dedup check share one source.
 fn codex_hook_command(helper: &Path) -> String {
-    format!("bash {}", helper.to_string_lossy())
+    format!(
+        "bash '{}'",
+        helper.to_string_lossy().replace('\'', "'\\''")
+    )
+}
+
+/// True if a PreToolUse entry's nested `hooks` already names `command`. The entry
+/// is table-like (an inline table from a value-array, or a `[[..]]` table), and
+/// its `hooks` may itself be a value-array of inline tables (`hooks = [{..}]`) or
+/// an array-of-tables (`[[hooks.PreToolUse.hooks]]`) — both are scanned. Compares
+/// the PARSED (unescaped) command so it stays correct on Windows paths.
+fn entry_has_command(entry: &dyn toml_edit::TableLike, command: &str) -> bool {
+    let Some(hooks) = entry.get("hooks") else {
+        return false;
+    };
+    // Value-array form: hooks = [{ type = "command", command = ".." }, ..]
+    if let Some(arr) = hooks.as_array() {
+        if arr.iter().any(|v| {
+            v.as_inline_table()
+                .and_then(|t| t.get("command"))
+                .and_then(|c| c.as_str())
+                == Some(command)
+        }) {
+            return true;
+        }
+    }
+    // Array-of-tables form: [[hooks.PreToolUse.hooks]] type=".." command=".."
+    if let Some(aot) = hooks.as_array_of_tables() {
+        if aot
+            .iter()
+            .any(|t| t.get("command").and_then(|c| c.as_str()) == Some(command))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The single inner command hook `{ type = "command", command = "<command>",
+/// timeout = 3650 }`, built from toml_edit values so escaping is correct.
+fn weft_inner_command_hook(command: &str) -> toml_edit::InlineTable {
+    let mut inner = toml_edit::InlineTable::new();
+    inner.insert("type", toml_edit::Value::from("command"));
+    inner.insert("command", toml_edit::Value::from(command));
+    inner.insert("timeout", toml_edit::Value::from(3650));
+    inner
+}
+
+/// Weft's full PreToolUse entry as an inline table, for the value-array forms:
+/// `{ matcher = ".*", hooks = [{ type = "command", command = "<command>", timeout = 3650 }] }`.
+fn weft_entry_inline(command: &str) -> toml_edit::InlineTable {
+    let mut hooks_arr = toml_edit::Array::new();
+    hooks_arr.push(toml_edit::Value::InlineTable(weft_inner_command_hook(command)));
+    let mut entry = toml_edit::InlineTable::new();
+    entry.insert("matcher", toml_edit::Value::from(".*"));
+    entry.insert("hooks", toml_edit::Value::Array(hooks_arr));
+    entry
 }
 
 fn ensure_codex_hook_in(cfg: &Path, helper: &Path) {
@@ -155,11 +218,13 @@ done
         return;
     };
 
-    // Resolve / create the `hooks.PreToolUse` array. `doc["hooks"]` covers both the
-    // dotted form (`hooks.PreToolUse = [..]`, stored as an implicit table) and the
-    // table form (`[hooks]` then `PreToolUse = [..]`); `as_table_like_mut` also
-    // covers an inline `hooks = { .. }`. We index via accessors (not `doc[..]`,
-    // which panics on a missing key) since production paths must not panic.
+    // Resolve / create the `hooks.PreToolUse` collection. Indexing `hooks` covers
+    // the dotted form (`hooks.PreToolUse = [..]`, stored as an implicit table), the
+    // table form (`[hooks]` then `PreToolUse = [..]`), and an inline `hooks = {..}`
+    // — all via `as_table_like_mut`. The value itself can be a value-array of inline
+    // tables OR the documented `[[hooks.PreToolUse]]` array-of-tables; we handle
+    // both, appending Weft's entry so the Ask Bridge runs alongside user hooks.
+    // All accessors are non-panicking (no `doc[..]`, which expects/panics).
     let root = doc.as_table_mut();
     let hooks_item = root
         .entry("hooks")
@@ -168,63 +233,53 @@ done
         return; // `hooks` exists but isn't a table/inline-table — leave it be.
     };
 
-    let array = match hooks.get_mut("PreToolUse") {
-        Some(item) => match item.as_array_mut() {
-            Some(arr) => arr, // dotted or table form: edit the existing array in place
-            None => return,   // present but not an array — don't corrupt it.
-        },
+    match hooks.get_mut("PreToolUse") {
+        // Array-of-tables form: `[[hooks.PreToolUse]]`. Dedup over the existing
+        // `[[..]]` entries, then append a new table whose `hooks` is a value-array
+        // of one inline command hook (valid inside an array-of-tables entry).
+        Some(item) if item.is_array_of_tables() => {
+            let Some(aot) = item.as_array_of_tables_mut() else {
+                return;
+            };
+            if aot.iter().any(|t| entry_has_command(t, &command)) {
+                return;
+            }
+            let mut hooks_arr = toml_edit::Array::new();
+            hooks_arr.push(toml_edit::Value::InlineTable(weft_inner_command_hook(&command)));
+            let mut entry = toml_edit::Table::new();
+            entry.insert("matcher", toml_edit::value(".*"));
+            entry.insert(
+                "hooks",
+                toml_edit::Item::Value(toml_edit::Value::Array(hooks_arr)),
+            );
+            aot.push(entry);
+        }
+        // Value-array form (dotted or table inline array). Dedup over elements, then
+        // append Weft's entry as an inline table.
+        Some(item) => {
+            let Some(array) = item.as_array_mut() else {
+                return; // present but neither array nor array-of-tables — don't corrupt it.
+            };
+            if array
+                .iter()
+                .filter_map(|el| el.as_inline_table())
+                .any(|t| entry_has_command(t, &command))
+            {
+                return;
+            }
+            array.push(toml_edit::Value::InlineTable(weft_entry_inline(&command)));
+        }
+        // Absent: create a value-array holding Weft's entry, INSIDE the hooks table
+        // (never a conflicting top-level dotted `hooks.PreToolUse` key).
         None => {
-            // `[hooks]` table (or inline) with no PreToolUse: add the array INTO it,
-            // never a conflicting top-level dotted `hooks.PreToolUse` key.
+            let mut array = toml_edit::Array::new();
+            array.push(toml_edit::Value::InlineTable(weft_entry_inline(&command)));
             hooks.insert(
                 "PreToolUse",
-                toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())),
+                toml_edit::Item::Value(toml_edit::Value::Array(array)),
             );
-            let Some(item) = hooks.get_mut("PreToolUse") else {
-                return;
-            };
-            let Some(arr) = item.as_array_mut() else {
-                return;
-            };
-            arr
         }
-    };
-
-    // Idempotence: if any element already carries `command` in a nested
-    // `hooks[].command`, do nothing. Compare the PARSED (unescaped) value against
-    // the raw command so the check is correct on Windows paths too — comparing
-    // serialized text would mismatch toml_edit's backslash escaping.
-    let already_present = array.iter().any(|el| {
-        el.as_inline_table()
-            .and_then(|t| t.get("hooks"))
-            .and_then(|h| h.as_array())
-            .map(|inner| {
-                inner.iter().any(|ih| {
-                    ih.as_inline_table()
-                        .and_then(|t| t.get("command"))
-                        .and_then(|c| c.as_str())
-                        == Some(command.as_str())
-                })
-            })
-            .unwrap_or(false)
-    });
-    if already_present {
-        return;
     }
-
-    // Append Weft's entry, equivalent to:
-    //   { matcher = ".*", hooks = [{ type = "command", command = "<command>", timeout = 3650 }] }
-    // Built from toml_edit values so it serializes with correct escaping.
-    let mut inner = toml_edit::InlineTable::new();
-    inner.insert("type", toml_edit::Value::from("command"));
-    inner.insert("command", toml_edit::Value::from(command));
-    inner.insert("timeout", toml_edit::Value::from(3650));
-    let mut hooks_arr = toml_edit::Array::new();
-    hooks_arr.push(toml_edit::Value::InlineTable(inner));
-    let mut entry = toml_edit::InlineTable::new();
-    entry.insert("matcher", toml_edit::Value::from(".*"));
-    entry.insert("hooks", toml_edit::Value::Array(hooks_arr));
-    array.push(toml_edit::Value::InlineTable(entry));
 
     // Untouched formatting/comments are preserved by toml_edit. Only write when the
     // serialized document actually differs from the file we read.
@@ -534,6 +589,77 @@ mod tests {
             helper_text.contains("hostport") && helper_text.contains("${rest%%/*}"),
             "the host-parsing guard must be present:\n{helper_text}"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn splices_into_array_of_tables_hooks() {
+        // The documented `[[hooks.PreToolUse]]` array-of-tables layout: Weft's entry
+        // must be appended (a new `[[hooks.PreToolUse]]` table), not skipped.
+        let base = fresh_dir("aot-splice");
+        let cfg = base.join("config.toml");
+        let helper = base.join("weft-codex-hook.sh");
+        let before = "[[hooks.PreToolUse]]\nmatcher = \"shell\"\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"/usr/local/bin/my-audit\"\n";
+        std::fs::write(&cfg, before).unwrap();
+
+        ensure_codex_hook_in(&cfg, &helper);
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&after).is_ok(),
+            "array-of-tables config must stay valid TOML:\n{after}"
+        );
+        assert_ne!(after, before, "array-of-tables PreToolUse must be edited, not skipped");
+        // User entry preserved, Weft's command appended into the SAME logical array.
+        assert!(after.contains("/usr/local/bin/my-audit"), "user hook preserved:\n{after}");
+        assert!(
+            after.contains(&codex_hook_command(&helper)),
+            "weft command must be appended to the array-of-tables:\n{after}"
+        );
+        assert_eq!(pretooluse_len(&after), 2, "user entry + weft entry:\n{after}");
+
+        // Idempotent: a second run does not append again.
+        ensure_codex_hook_in(&cfg, &helper);
+        let after2 = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(after, after2);
+        assert_eq!(after2.matches(&codex_hook_command(&helper)).count(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn quotes_helper_path_with_spaces() {
+        // A helper path with a space must be single-quoted in the shell command so
+        // `bash` receives one argument, and the whole config must stay valid TOML.
+        let base = fresh_dir("spaced-path");
+        let spaced = base.join("Jane Doe").join(".weft");
+        std::fs::create_dir_all(&spaced).unwrap();
+        let cfg = base.join("config.toml");
+        let helper = spaced.join("weft-codex-hook.sh");
+        assert!(helper.to_string_lossy().contains(' ')); // precondition: path has a space
+        std::fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
+
+        ensure_codex_hook_in(&cfg, &helper);
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&after).is_ok(),
+            "config with a spaced helper path must stay valid TOML:\n{after}"
+        );
+        // The command embeds the single-quoted path: bash '<path with space>'.
+        let command = codex_hook_command(&helper);
+        assert!(command.starts_with("bash '") && command.ends_with('\''));
+        assert!(command.contains(&format!("'{}'", helper.to_string_lossy())));
+        // And it round-trips out of the config as that exact quoted string.
+        let v: toml::Value = toml::from_str(&after).unwrap();
+        let got = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(got, command, "stored command must equal the quoted command:\n{after}");
+
+        // An embedded single quote is escaped as '\'' (no panic, still valid TOML).
+        let tricky = base.join("a'b").join("weft-codex-hook.sh");
+        let tricky_cmd = codex_hook_command(&tricky);
+        assert!(tricky_cmd.contains("'\\''"), "embedded quote must be escaped: {tricky_cmd}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
