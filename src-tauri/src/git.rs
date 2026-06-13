@@ -338,7 +338,9 @@ fn branch_prefix_for_semantic(semantic: &str, refs: &[String]) -> &'static str {
     let short = count_prefix(refs, "feat") + count_prefix(refs, "fix");
     let long = count_prefix(refs, "feature") + count_prefix(refs, "bugfix");
     match semantic {
-        "fix" => {
+        // UI/IM issues store the kind as `bugfix`; conventional commits use `fix`.
+        // Both are fix-style work and must follow the repo's fix branch convention.
+        "fix" | "bugfix" => {
             if count_prefix(refs, "bugfix") > count_prefix(refs, "fix") {
                 "bugfix"
             } else {
@@ -528,6 +530,26 @@ mod tests {
         assert_eq!(
             choose_branch_name_from_refs("fix", "Login Timeout", &existing),
             "bugfix/login-timeout"
+        );
+    }
+
+    #[test]
+    fn bugfix_issue_kind_uses_fix_branch_style() {
+        // UI/IM issues store kind = "bugfix"; it must follow the repo's fix-style
+        // branch convention, not fall through to the feature/feat path.
+        let short = vec![
+            "main".to_string(),
+            "fix/login".to_string(),
+            "feat/search".to_string(),
+        ];
+        assert_eq!(
+            choose_branch_name_from_refs("bugfix", "Crash On Logout", &short),
+            "fix/crash-on-logout"
+        );
+        let long = vec!["bugfix/login".to_string(), "feature/search".to_string()];
+        assert_eq!(
+            choose_branch_name_from_refs("bugfix", "Crash On Logout", &long),
+            "bugfix/crash-on-logout"
         );
     }
 }
