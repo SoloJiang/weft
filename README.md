@@ -1,12 +1,11 @@
 <div align="center">
   <img src="public/weft-logo.svg" alt="Weft" width="220" />
 
-### Local-first delivery hub for coding agents
+### Repo-native delivery control room for coding agents
 
-Give Weft a feature, bugfix, or refactor. A lead agent turns it into scoped
-worker lanes, Weft materializes each approved lane as an isolated `git worktree`,
-and Claude Code, Codex, or OpenCode drive the work until there is a diff you can
-review.
+Give Weft a task. A lead agent reads your repo map, proposes the write lanes,
+and Weft turns each approved lane into a repo-native worktree where Claude Code,
+Codex, or OpenCode can drive toward a reviewable diff.
 
 <sub>Tauri v2 · React 19 · Rust · SQLite · native coding-agent CLIs</sub>
 
@@ -17,41 +16,72 @@ review.
   <img src="assets/readme/weft-overview.png" alt="Weft overview: repositories feed a lead workspace, scoped workers produce checked review diffs" width="940" />
 </p>
 
-## Why Weft
+## The 30-second version
 
-Coding agents are strongest when they get tight scope, real repository context,
-and a clear handoff back to a human. Weft keeps that loop local:
+Weft is not a terminal grid and not a hosted agent runner. It is a local-first
+delivery layer for people who already trust their own repos, their own CLIs, and
+their own git conventions.
 
-- Your source stays on your machine.
-- Workers run through the native CLIs you already use and authenticate.
-- Every worker gets an explicit write repository and its own worktree.
-- The product UI shows the plan, live sessions, permission asks, diffs, and
-  pre-PR checks without embedding a terminal as the main experience.
+The big move:
 
-The core product model is small:
+```text
+Task → repo map → scoped write lanes → repo-native worktrees → native agents → reviewable diffs
+```
 
-- **Workspace**: a logical set of repositories, profiles, rules, and tools.
-- **Issue**: one user-facing work line for a feature, bugfix, refactor, or spike.
-- **Sub-task**: one scoped worker lane, currently with one write repository.
-- **Session**: one native agent run attached to a worktree.
+### 1. Cross-repo scope decomposition
 
-Internally the store still uses `thread` for Issues and `direction` for
-Sub-tasks. User-facing docs and UI use **Issue** and **Sub-task**.
+You describe a feature, bugfix, refactor, or spike. The lead agent uses the
+workspace repo map to decide which repositories need writes, why each write lane
+exists, and which worker should take it. Reads stay free; only writes are scoped,
+approved, materialized, and tracked.
 
-## Workflow
+### 2. Respect user origin
+
+Weft drives the native tools you already use: Claude Code, Codex, and OpenCode.
+It does not replace their auth, hooks, approvals, sandbox rules, skills, or
+session identity. Permission asks are mirrored into Weft; they are not bypassed.
+Terminal takeover remains one step away when you want the original CLI surface.
+
+### 3. Respect repo origin
+
+Weft does not impose an internal branch scheme on your repository. New work is
+materialized under the target repo:
+
+```text
+<repo>/.worktrees/weft/<branch-name>
+```
+
+Branch names follow that repo's observed style: `feat/*` vs `feature/*`,
+`fix/*` vs `bugfix/*`, with numeric suffixes only when needed. Weft keeps its
+own routing in local state; your git history keeps looking like your git
+history.
+
+## What it feels like
 
 <p align="center">
   <img src="assets/diagrams/flow-en.svg" alt="Task to scoped sub-tasks to verified worktree diffs" width="940" />
 </p>
 
-1. Add, clone, or create repositories in a workspace.
-2. Start an issue and discuss the goal with the lead agent.
-3. The lead proposes sub-tasks with write scope, tool choice, reason, and mandate.
-4. You approve the write declarations that should become worktrees.
-5. Workers run in headless Claude/Codex/OpenCode sessions and stream into Weft.
-6. You observe progress, answer asks, inspect diffs, and run checks before PR.
+1. Add existing repositories to a workspace.
+2. Start an issue and describe the goal to the lead agent.
+3. Review the proposed write lanes: repository, reason, tool, and mandate.
+4. Approve the lanes that should become worktrees.
+5. Workers run headless native CLI sessions and stream back into Weft.
+6. You answer real blockers, inspect diffs, and run checks before PR.
 
-## Product Surfaces
+The human handles exceptions, not the assembly line.
+
+## Product model
+
+- **Workspace**: a logical set of repo references, profiles, rules, and tools.
+- **Issue**: one user-facing work line for a feature, bugfix, refactor, or spike.
+- **Sub-task**: one scoped worker lane with one write repository today.
+- **Session**: one native agent run attached to a worktree.
+
+Internally the store still uses `thread` for Issues and `direction` for
+Sub-tasks. User-facing docs and UI use **Issue** and **Sub-task**.
+
+## Product surfaces
 
 | Workspace board | Issue board |
 |---|---|
@@ -76,7 +106,7 @@ conversation, worker sessions, observe/diff views, settings, and Needs-you queue
   <img src="assets/diagrams/model-en.svg" alt="Workspace, issue, sub-task, session model" width="860" />
 </p>
 
-## IM Remote Control
+## IM remote control
 
 <p align="center">
   <img src="assets/diagrams/im-en.svg" alt="IM remote control: Feishu cards mirror permission asks and agent questions" width="940" />
@@ -89,7 +119,7 @@ desktop UI would resolve, and both surfaces patch to the same final state.
 The bridge currently covers:
 
 - Permission asks and agent questions.
-- Issue-to-Feishu thread routes for lead messages; bind a topic by sending
+- Issue-to-Feishu topic routes for lead messages; bind a topic by sending
   `/bind <issue-id>` from that Feishu topic.
 - Concierge-style direct chat backed by the `weft_global` MCP tools.
 - Online resync summaries for pending Needs-you items.
@@ -97,9 +127,11 @@ The bridge currently covers:
 Binding is conservative: the first private-chat sender can become owner, group
 messages cannot bind ownership, and DB errors fail closed.
 
-## Current Capabilities
+## Current capabilities
 
 - Workspace repo add/clone/create flows with deterministic repo profiles.
+- Repo map powered scope proposals: the lead explains which repo each lane writes and why.
+- Repo-native worktrees and branch names that follow each target repo's style.
 - Claude lead sessions with planner MCP and write-scope review.
 - Lead action cards for adding, cloning, or creating repos from the conversation.
 - Worker sessions for Claude Code, Codex, and OpenCode.
