@@ -1201,6 +1201,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const openRepoMap = useCallback(() => {
     setActiveThreadId(null);
     setShowNeeds(false);
+    setViewing(null); // else Main renders WorkerConversation over the repo tab
     setHomeTab("repos");
     void refreshRepoMap();
   }, [refreshRepoMap]);
