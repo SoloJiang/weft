@@ -368,9 +368,12 @@ fn im_provider(args: &Value) -> &str {
         .unwrap_or("")
 }
 
-fn im_issue_topic_supported(args: &Value) -> bool {
-    args.pointer("/im_context/capabilities/issue_topic/supported")
-        .or_else(|| args.pointer("/im_context/capabilities/issue_thread/supported"))
+/// Whether a topic can be created from the CURRENT conversation — not merely
+/// whether the provider supports topics in general. Feishu DMs report
+/// `supported: true` but `can_create_from_current_conversation: false`, so gating
+/// on this avoids attempting a topic (with the DM chat id) where none can exist.
+fn im_can_create_topic_here(args: &Value) -> bool {
+    args.pointer("/im_context/capabilities/issue_topic/can_create_from_current_conversation")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
@@ -392,7 +395,7 @@ async fn create_issue_from_im(
     let issue = create_issue(db, ws, title, kind).await?;
     let thread_id = issue["issue_id"].as_i64().unwrap_or_default() as i32;
     let provider = im_provider(args);
-    let supported = im_issue_topic_supported(args);
+    let can_create = im_can_create_topic_here(args);
     let mut im = json!({
         "provider": provider,
         "topic_exists": false,
@@ -400,7 +403,7 @@ async fn create_issue_from_im(
         "topic_ref": null,
         "open_hint": "provider does not support issue topic in this conversation"
     });
-    if provider == "feishu" && supported {
+    if provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
             match ensure_issue_topic(db, thread_id, chat_id).await {
                 Ok(v) => {
@@ -432,7 +435,7 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
         .await?
         .ok_or_else(|| anyhow::anyhow!("issue {thread_id} not found"))?;
     let provider = im_provider(args);
-    let supported = im_issue_topic_supported(args);
+    let can_create = im_can_create_topic_here(args);
     let initial_message = args
         .get("initial_message")
         .and_then(|v| v.as_str())
@@ -454,7 +457,7 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
             "chat_id": route.chat_id,
             "open_hint": "已有 issue topic，请进入那里继续讨论"
         });
-    } else if provider == "feishu" && supported {
+    } else if provider == "feishu" && can_create {
         if let Some(chat_id) = im_chat_id(args) {
             let v = ensure_issue_topic(db, thread_id, chat_id).await?;
             im = json!({
@@ -467,7 +470,13 @@ async fn ensure_issue_im_topic(db: &Db, thread_id: i32, args: &Value) -> anyhow:
             });
         }
     }
-    let delivered = if !initial_message.is_empty() {
+    // Only relay the initial message once a topic actually exists — otherwise the
+    // lead's reply has no IM route back to the user, yet we'd report it delivered.
+    let has_topic = im
+        .get("topic_exists")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let delivered = if has_topic && !initial_message.is_empty() {
         message_lead(db, thread_id, initial_message).await.is_ok()
     } else {
         false
