@@ -1,11 +1,11 @@
 <div align="center">
   <img src="public/weft-logo.svg" alt="Weft" width="220" />
 
-### Repo-native delivery control room for coding agents
+### Local multi-repo delivery orchestration for your coding agents
 
-Give Weft a task. A lead agent reads your repo map, proposes the write lanes,
-and Weft turns each approved lane into a repo-native worktree where Claude Code,
-Codex, or OpenCode can drive toward a reviewable diff.
+Weft is a local multi-repo delivery orchestrator. Give it a requirement, and it
+coordinates your own Claude Code, Codex, and OpenCode across repositories to
+carry the work from intent toward implementation, merge, and release.
 
 <sub>Tauri v2 · React 19 · Rust · SQLite · native coding-agent CLIs</sub>
 
@@ -18,14 +18,14 @@ Codex, or OpenCode can drive toward a reviewable diff.
 
 ## The 30-second version
 
-Weft is not a terminal grid and not a hosted agent runner. It is a local-first
-delivery layer for people who already trust their own repos, their own CLIs, and
-their own git conventions.
+Weft is not a terminal grid and not a hosted agent runner. It is the local
+orchestration layer between a product requirement and the native coding agents,
+repositories, branches, checks, and release paths you already use.
 
-The big move:
+The north-star loop:
 
 ```text
-Task → repo map → scoped write lanes → repo-native worktrees → native agents → reviewable diffs
+Requirement → repo map → scoped agent lanes → repo-native branches → implementation → PR / merge / release
 ```
 
 ### 1. Cross-repo scope decomposition

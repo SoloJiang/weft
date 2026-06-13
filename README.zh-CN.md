@@ -1,11 +1,10 @@
 <div align="center">
   <img src="public/weft-logo.svg" alt="Weft" width="220" />
 
-### 尊重用户与仓库原生习惯的 Coding Agent 交付控制台
+### 本地多仓交付编排器，指挥你自己的 Coding Agents
 
-把一个任务交给 Weft。Lead agent 读取你的仓库地图，提出需要写哪些仓库、为什么要写、
-该由哪个 worker 执行；你确认后，Weft 在目标仓库内创建原生风格的 worktree，
-再驱动 Claude Code、Codex 或 OpenCode 推进到可 review 的 diff。
+Weft 是一个本地的多仓交付编排器。你给它一个需求，它指挥你自己的 Claude Code、
+Codex、OpenCode 跨多个仓库推进，把需求从意图一路带向实现、合并和上线。
 
 <sub>Tauri v2 · React 19 · Rust · SQLite · native coding-agent CLIs</sub>
 
@@ -18,13 +17,13 @@
 
 ## 30 秒看懂
 
-Weft 不是终端网格，也不是云端 agent runner。它是一个本地优先的交付层，服务于那些
-已经有自己的仓库、自己的 CLI、自己的 git 习惯的开发者。
+Weft 不是终端网格，也不是云端 agent runner。它是需求与原生 coding agents、
+仓库、分支、检查和发布路径之间的本地编排层。
 
-核心链路：
+北极星链路：
 
 ```text
-任务 → 仓库地图 → 有边界的写入通道 → 仓库原生 worktree → 原生 agent → 可 review 的 diff
+需求 → 仓库地图 → 有边界的 agent 通道 → 仓库原生分支 → 实现 → PR / 合并 / 上线
 ```
 
 ### 1. 跨仓库 scope 拆解
