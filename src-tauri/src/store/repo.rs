@@ -552,15 +552,6 @@ pub async fn worktree_for(
         .await?)
 }
 
-/// The materialized worktree for a direction (any repo) — boot revive routes
-/// from an orphaned `running` session to the repo it must reopen against.
-pub async fn worktree_for_direction(db: &Db, direction_id: i32) -> Result<Option<worktree::Model>> {
-    Ok(worktree::Entity::find()
-        .filter(worktree::Column::DirectionId.eq(direction_id))
-        .one(&db.0)
-        .await?)
-}
-
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
 pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, String, String)>> {

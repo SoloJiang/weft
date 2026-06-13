@@ -19,6 +19,7 @@ const MAX_CONCURRENT: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkerTarget {
     direction_id: i32,
+    repo_id: i32,
     thread_id: i32,
     session_id: i32,
 }
@@ -63,6 +64,7 @@ async fn collect_targets(
                 }
                 workers.push(WorkerTarget {
                     direction_id: dir.id,
+                    repo_id: sess.repo_id,
                     thread_id: th.id,
                     session_id: sess.id,
                 });
@@ -125,10 +127,11 @@ async fn revive_worker(app: &AppHandle, w: WorkerTarget) {
 
 async fn try_revive_worker(app: &AppHandle, db: &Db, w: WorkerTarget) -> anyhow::Result<()> {
     repo::mark_incomplete_turns_interrupted(db, w.thread_id, Some(w.session_id)).await?;
-    let wt = repo::worktree_for_direction(db, w.direction_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no worktree for direction {}", w.direction_id))?;
-    chat_open_worker_impl(app, db, w.direction_id, wt.repo_id, "en").await?;
+    // Re-open the EXACT repo the selected running session belongs to (the session
+    // row carries `repo_id`). Resolving via the direction's worktree could pick a
+    // different repo if a direction ever has multiple worktree rows, opening the
+    // wrong session and leaving the interrupted one unrecovered.
+    chat_open_worker_impl(app, db, w.direction_id, w.repo_id, "en").await?;
     if has_open_ask(app, &w.direction_id.to_string()) {
         return Ok(());
     }
@@ -268,6 +271,7 @@ mod tests {
             workers,
             vec![WorkerTarget {
                 direction_id: dir,
+                repo_id,
                 thread_id: th,
                 session_id: sess,
             }]
