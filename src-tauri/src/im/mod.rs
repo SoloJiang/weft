@@ -32,12 +32,16 @@ pub struct ImProviderCapabilities {
     pub terminology_en: &'static str,
 }
 
-pub fn feishu_provider_capabilities() -> ImProviderCapabilities {
+/// `can_create_topic_here` reflects the CURRENT conversation: Feishu issue topics
+/// can only be created from a group chat, not a DM. The provider supports topics in
+/// general (`issue_thread_supported`), but the "create" flags must be false in a DM
+/// so the lead/global tool doesn't advertise or attempt a topic there.
+pub fn feishu_provider_capabilities(can_create_topic_here: bool) -> ImProviderCapabilities {
     ImProviderCapabilities {
         provider_id: "feishu",
         issue_thread_supported: true,
-        default_create_thread_for_new_issue: true,
-        can_create_thread_from_current_conversation: true,
+        default_create_thread_for_new_issue: can_create_topic_here,
+        can_create_thread_from_current_conversation: can_create_topic_here,
         can_reply_to_message: true,
         terminology_zh: "飞书 topic",
         terminology_en: "Feishu topic",
@@ -449,6 +453,7 @@ pub async fn execute(
             thread_id,
             chat_id,
             im_thread_ref,
+            seed_message_id,
         } => {
             let thread = crate::store::repo::get_thread(db, thread_id).await?;
             let Some(thread) = thread else {
@@ -464,6 +469,11 @@ pub async fn execute(
                 return Ok(());
             };
             crate::store::repo::bind_im_route(db, thread_id, "feishu", &chat_id, &im_thread_ref)
+                .await?;
+            // Record the /bind message as the topic's replyable seed (a member of
+            // this topic), so a later desktop-driven / no-ack lead reply has a valid
+            // om_ target rather than the non-replyable omt_ topic id.
+            crate::store::repo::set_setting(db, &issue_topic_seed_key(thread_id), &seed_message_id)
                 .await?;
             if let Err(e) = channel
                 .send_text(
@@ -1222,7 +1232,7 @@ async fn feed_issue_message(
         im_thread_ref,
         reply_to,
         text,
-        &feishu_provider_capabilities(),
+        &feishu_provider_capabilities(true),
     );
     // Each issue-topic turn carries its originating message id via origin_tag so the
     // response threads under that exact message; the pending ack is used only for
@@ -1616,13 +1626,16 @@ async fn consume_free_text(
     // instead of both binding the shared route to the latest reply ref.
     record_inbound_reaction(ctx, channel, thread_id).await;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
+    // Feishu topics can only be created from a group chat, never a DM — don't
+    // advertise topic creation to the lead/global tool on a DM Concierge turn.
+    let can_create_topic = !im_thread_ref.starts_with("dm:");
     let framed = format_im_user_message(
         sender_open_id,
         chat_id,
         im_thread_ref,
         reply_to,
         text,
-        &feishu_provider_capabilities(),
+        &feishu_provider_capabilities(can_create_topic),
     );
     crate::lead_chat::engine::send(
         app,
@@ -1756,7 +1769,7 @@ mod tests {
             "chat:oc_chat",
             Some("om_msg"),
             "创建一个 issue",
-            &super::feishu_provider_capabilities(),
+            &super::feishu_provider_capabilities(true),
         );
 
         assert!(frame.contains("<weft:im_context>"));
@@ -1768,6 +1781,23 @@ mod tests {
         assert!(!frame.contains("issue_thread"));
         assert!(frame.contains("<weft:user_message>创建一个 issue</weft:user_message>"));
         assert!(!frame.contains("feishu_chat_id="));
+
+        // DM Concierge: topic creation must NOT be advertised — only group chats
+        // can host a Feishu topic. The provider still supports topics in general.
+        let dm = super::feishu_provider_capabilities(false);
+        assert!(!dm.default_create_thread_for_new_issue);
+        assert!(!dm.can_create_thread_from_current_conversation);
+        assert!(dm.issue_thread_supported);
+        let dm_frame = super::format_im_user_message(
+            "ou_sender",
+            "oc_dm",
+            "dm:ou_sender",
+            None,
+            "创建一个 issue",
+            &dm,
+        );
+        assert!(dm_frame.contains("\"default_on_create_issue\":false"));
+        assert!(dm_frame.contains("\"can_create_from_current_conversation\":false"));
     }
 
     #[test]

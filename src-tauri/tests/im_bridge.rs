@@ -360,6 +360,7 @@ async fn bind_issue_thread_route_persists_im_route_and_confirms() {
         thread_id: t.id,
         chat_id: "oc_g".into(),
         im_thread_ref: "omt_42".into(),
+        seed_message_id: "om_bind".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_me", "zh", None, None)
         .await
@@ -385,6 +386,7 @@ async fn bind_issue_thread_missing_issue_is_polite_noop() {
         thread_id: 999,
         chat_id: "oc_g".into(),
         im_thread_ref: "omt_42".into(),
+        seed_message_id: "om_bind".into(),
     };
     im::execute(r, &db, &asks, &bus, &ch, "ou_me", "zh", None, None)
         .await
