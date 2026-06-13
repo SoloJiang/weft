@@ -9,8 +9,11 @@
 //! Codex also requires hook-source trust. We do NOT pass
 //! `--dangerously-bypass-hook-trust`; instead we install one stable
 //! Weft-managed global hook in an existing Codex config and route only Weft
-//! worktrees through it via a local `.weft-codex-ask-url` file. User configs are
-//! preserved, and no config is fabricated if Codex was never set up.
+//! worktrees through it via a local `.weft-codex-ask-url` file. If the user
+//! already declares their own `hooks.PreToolUse`, Weft splices its entry into
+//! that array (Codex runs matchers in sequence) instead of skipping — so the
+//! Ask Bridge stays active alongside user hooks. No config is fabricated if
+//! Codex was never set up.
 
 use std::path::{Path, PathBuf};
 
@@ -115,18 +118,114 @@ done
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
     );
-    let block = format!(
-        "# BEGIN WEFT MANAGED CODEX HOOK\n\
-hooks.PreToolUse=[{{ matcher = \".*\", hooks = [{{ type = \"command\", command = \"{command}\", timeout = 3650 }}] }}]\n\
-# END WEFT MANAGED CODEX HOOK\n"
+    // Weft's PreToolUse array element (no top-level key).
+    let entry = format!(
+        "{{ matcher = \".*\", hooks = [{{ type = \"command\", command = \"{command}\", timeout = 3650 }}] }}"
     );
-    if has_user_pretooluse_hook(&text) {
-        return;
-    }
-    let next = replace_managed_block(&text, &block);
+    let next = if has_user_pretooluse_hook(&text) {
+        // The user already declares hooks.PreToolUse. Codex runs PreToolUse
+        // matchers in sequence, so Weft coexists by splicing its element into the
+        // user's existing array — emitting a second top-level hooks.PreToolUse
+        // would be a TOML duplicate-key error and break Codex. If the array can't
+        // be located safely, leave the user config untouched.
+        match splice_pretooluse_entry(&text, &entry, &command) {
+            Some(spliced) => spliced,
+            None => return,
+        }
+    } else {
+        let block = format!(
+            "# BEGIN WEFT MANAGED CODEX HOOK\n\
+hooks.PreToolUse=[{entry}]\n\
+# END WEFT MANAGED CODEX HOOK\n"
+        );
+        replace_managed_block(&text, &block)
+    };
     if next != text {
         write_atomic(cfg, next.as_bytes());
     }
+}
+
+/// Splice Weft's PreToolUse `entry` into the user's existing
+/// `hooks.PreToolUse = [ ... ]` array (inline or multiline). Returns the edited
+/// text, or `None` if no such dotted-array assignment is found (e.g. an
+/// array-of-tables form we won't risk rewriting). Idempotent: if `command` is
+/// already present anywhere, returns the text unchanged.
+fn splice_pretooluse_entry(text: &str, entry: &str, command: &str) -> Option<String> {
+    if text.contains(command) {
+        return Some(text.to_string()); // already wired in
+    }
+    const NEEDLE: &str = "hooks.PreToolUse";
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(NEEDLE) {
+        let idx = from + rel;
+        let line_start = text[..idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
+        if text[line_start..idx].trim_start().starts_with('#') {
+            from = idx + NEEDLE.len();
+            continue; // commented-out assignment
+        }
+        let after = &text[idx + NEEDLE.len()..];
+        if let Some(eq_rel) = after.find('=') {
+            let after_eq = &after[eq_rel + 1..];
+            if let Some(br_rel) = after_eq.find('[') {
+                if after_eq[..br_rel].trim().is_empty() {
+                    let open = idx + NEEDLE.len() + eq_rel + 1 + br_rel;
+                    if let Some(close) = matching_bracket(text, open) {
+                        let inner = text[open + 1..close].trim();
+                        let insertion = if inner.is_empty() {
+                            entry.to_string()
+                        } else {
+                            format!(", {entry}")
+                        };
+                        let mut out = String::with_capacity(text.len() + insertion.len());
+                        out.push_str(&text[..close]);
+                        out.push_str(&insertion);
+                        out.push_str(&text[close..]);
+                        return Some(out);
+                    }
+                }
+            }
+        }
+        from = idx + NEEDLE.len();
+    }
+    None
+}
+
+/// Index of the `]` matching the `[` at `open`, honoring nesting and strings.
+fn matching_bracket(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(open) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = open;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            match c {
+                b'\\' => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_str = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn replace_managed_block(text: &str, block: &str) -> String {
@@ -231,20 +330,46 @@ mod tests {
     }
 
     #[test]
-    fn skips_global_hook_when_user_pretooluse_exists() {
+    fn appends_managed_hook_alongside_user_pretooluse() {
         let base =
             std::env::temp_dir().join(format!("weft-codex-user-hook-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let cfg = base.join("config.toml");
         let helper = base.join("weft-codex-hook.sh");
-        let before = "hooks.PreToolUse=[{ matcher = \"shell\", hooks = [] }]\n";
+        let before = "hooks.PreToolUse=[{ matcher = \"shell\", hooks = [{ type = \"command\", command = \"/usr/local/bin/my-audit\" }] }]\n";
         std::fs::write(&cfg, before).unwrap();
 
         ensure_codex_hook_in(&cfg, &helper);
 
-        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
-        assert!(!std::fs::read_to_string(&helper).unwrap().is_empty());
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        // user's own hook is preserved, Weft's hook is spliced in alongside it
+        assert!(after.contains("/usr/local/bin/my-audit"));
+        assert!(after.contains(&format!("bash {}", helper.to_string_lossy())));
+        // exactly one top-level hooks.PreToolUse assignment (no TOML dup key)
+        let assigns = after
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with('#') && t.contains("hooks.PreToolUse")
+            })
+            .count();
+        assert_eq!(assigns, 1);
+        // helper script written and routed through the per-worktree ask url
+        assert!(std::fs::read_to_string(&helper)
+            .unwrap()
+            .contains(".weft-codex-ask-url"));
+
+        // idempotent: a second run does not duplicate Weft's entry
+        ensure_codex_hook_in(&cfg, &helper);
+        let after2 = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(after, after2);
+        assert_eq!(
+            after2
+                .matches(&format!("bash {}", helper.to_string_lossy()))
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
     #[test]
