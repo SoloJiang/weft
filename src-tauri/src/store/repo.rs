@@ -610,6 +610,20 @@ pub async fn set_session_native_id(db: &Db, session_id: i32, native_id: &str) ->
     Ok(())
 }
 
+/// Set a worker session's activity status directly. Unlike
+/// `set_session_native_id` (which forces `running` as a side effect of
+/// capturing the id), this writes whatever caller-chosen value — e.g.
+/// flipping a live session to `idle` once its turn drains, or a boot sweep
+/// marking a crash-interrupted row. No-op if the row is gone.
+pub async fn set_session_status(db: &Db, session_id: i32, status: &str) -> Result<()> {
+    if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
+        let mut a: session::ActiveModel = s.into();
+        a.status = Set(status.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 pub async fn get_session(db: &Db, session_id: i32) -> Result<Option<session::Model>> {
     Ok(session::Entity::find_by_id(session_id).one(&db.0).await?)
 }
@@ -776,7 +790,54 @@ pub async fn lead_native_id(db: &Db, thread_id: i32) -> Result<Option<String>> {
 }
 
 pub async fn set_lead_native_id(db: &Db, thread_id: i32, native_id: &str) -> Result<()> {
-    let content = serde_json::json!({ "native_id": native_id }).to_string();
+    let existing = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&db.0)
+        .await?;
+    match existing {
+        // Merge, don't replace: the meta row may already carry a `status` field
+        // (set first by `set_lead_status`); blowing the whole object away would
+        // clobber it. Read → set one key → write back.
+        Some(m) => {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
+            v["native_id"] = serde_json::json!(native_id);
+            let mut a: lead_message::ActiveModel = m.into();
+            a.content = Set(v.to_string());
+            a.update(&db.0).await?;
+        }
+        None => {
+            let content = serde_json::json!({ "native_id": native_id }).to_string();
+            insert_lead_message(
+                db, thread_id, None, 0, "system", "meta", &content, "complete",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The lead's persisted activity status, co-located with `native_id` in the
+/// single role=system kind=meta row. None until first written.
+pub async fn lead_status(db: &Db, thread_id: i32) -> Result<Option<String>> {
+    Ok(lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&db.0)
+        .await?
+        .and_then(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .ok()?
+                .get("status")?
+                .as_str()
+                .map(String::from)
+        }))
+}
+
+/// Upsert the per-thread lead `meta` row's `status` field, preserving any other
+/// fields it already holds (notably `native_id`).
+pub async fn set_lead_status(db: &Db, thread_id: i32, status: &str) -> Result<()> {
     let existing = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
         .filter(lead_message::Column::Kind.eq("meta"))
@@ -784,11 +845,15 @@ pub async fn set_lead_native_id(db: &Db, thread_id: i32, native_id: &str) -> Res
         .await?;
     match existing {
         Some(m) => {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
+            v["status"] = serde_json::json!(status);
             let mut a: lead_message::ActiveModel = m.into();
-            a.content = Set(content);
+            a.content = Set(v.to_string());
             a.update(&db.0).await?;
         }
         None => {
+            let content = serde_json::json!({ "status": status }).to_string();
             insert_lead_message(
                 db, thread_id, None, 0, "system", "meta", &content, "complete",
             )
@@ -990,6 +1055,33 @@ mod tests {
         );
         // meta row stays single + out of turn numbering
         assert_eq!(list_lead_messages(&db, 3).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_status_round_trips() {
+        let db = mem().await;
+        let s = create_session(&db, 1, 1, "codex", "/tmp/wt").await.unwrap();
+        set_session_status(&db, s.id, "idle").await.unwrap();
+        assert_eq!(get_session(&db, s.id).await.unwrap().unwrap().status, "idle");
+        set_session_status(&db, s.id, "running").await.unwrap();
+        assert_eq!(
+            get_session(&db, s.id).await.unwrap().unwrap().status,
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_status_round_trips_and_preserves_native_id() {
+        let db = mem().await;
+        set_lead_native_id(&db, 7, "nat-xyz").await.unwrap();
+        set_lead_status(&db, 7, "running").await.unwrap();
+        assert_eq!(lead_status(&db, 7).await.unwrap().as_deref(), Some("running"));
+        assert_eq!(lead_native_id(&db, 7).await.unwrap().as_deref(), Some("nat-xyz"));
+        // opposite write order must also coexist (status first, native id second)
+        set_lead_status(&db, 8, "idle").await.unwrap();
+        set_lead_native_id(&db, 8, "nat-8").await.unwrap();
+        assert_eq!(lead_status(&db, 8).await.unwrap().as_deref(), Some("idle"));
+        assert_eq!(lead_native_id(&db, 8).await.unwrap().as_deref(), Some("nat-8"));
     }
 
     #[tokio::test]
