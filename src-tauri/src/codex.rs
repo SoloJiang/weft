@@ -9,11 +9,13 @@
 //! Codex also requires hook-source trust. We do NOT pass
 //! `--dangerously-bypass-hook-trust`; instead we install one stable
 //! Weft-managed global hook in an existing Codex config and route only Weft
-//! worktrees through it via a local `.weft-codex-ask-url` file. If the user
-//! already declares their own `hooks.PreToolUse`, Weft splices its entry into
-//! that array (Codex runs matchers in sequence) instead of skipping — so the
-//! Ask Bridge stays active alongside user hooks. No config is fabricated if
-//! Codex was never set up.
+//! worktrees through it via a local `.weft-codex-ask-url` file. The config edit
+//! is structural (via `toml_edit`): Weft appends its entry into the existing
+//! `hooks.PreToolUse` array — resolving the dotted (`hooks.PreToolUse = [..]`)
+//! and table (`[hooks]` + `PreToolUse = [..]`) forms to the same logical path —
+//! or creates that array if absent. Codex runs matchers in sequence, so the Ask
+//! Bridge stays active alongside any user hooks. A config that can't be parsed
+//! is never overwritten, and no config is fabricated if Codex was never set up.
 
 use std::path::{Path, PathBuf};
 
@@ -75,18 +77,13 @@ fn ensure_codex_trusted_in(cfg: &Path, root: &str) {
     write_atomic(cfg, next.as_bytes());
 }
 
-/// The `bash <helper>` command Weft writes into Codex's `hooks.PreToolUse`, with
-/// backslashes and quotes escaped for TOML (Windows paths). Centralized so tests
-/// assert against the exact string production writes, staying correct on any
-/// path separator.
+/// The raw `bash <helper>` command Weft writes into Codex's `hooks.PreToolUse`.
+/// Returned UNescaped: `toml_edit` owns TOML string escaping when it serializes
+/// this value, so escaping here too would double-escape backslashes on Windows
+/// paths (`C:\x` → `C:\\\\x`). Centralized so production and tests share one
+/// source for the command string, staying correct on any path separator.
 fn codex_hook_command(helper: &Path) -> String {
-    format!(
-        "bash {}",
-        helper
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-    )
+    format!("bash {}", helper.to_string_lossy())
 }
 
 fn ensure_codex_hook_in(cfg: &Path, helper: &Path) {
@@ -104,16 +101,25 @@ while :; do
   route="$dir/.weft-codex-ask-url"
   if [ -f "$route" ]; then
     url="$(cat "$route" 2>/dev/null)"
-    # SECURITY: only post to Weft's local ask endpoint (always http://127.0.0.1:<port>).
-    # A repo could plant a .weft-codex-ask-url pointing off-box; refusing non-loopback
-    # URLs stops tool-approval payloads from being exfiltrated and stops a remote from
-    # driving the approval verdict. Non-loopback (or empty) → exit without posting.
+    # SECURITY: a repo can plant a .weft-codex-ask-url, so only Weft's local endpoint
+    # (always http://127.0.0.1:<port>) is trusted. PARSE the real host — strip scheme,
+    # path, and any userinfo — rather than glob-matching the raw string: a glob on
+    # "http://127.0.0.1:*" is defeated by http://127.0.0.1:80@attacker.example, whose
+    # actual host is attacker.example. Non-http or non-loopback → exit without posting.
     case "$url" in
-      http://127.0.0.1:*|http://127.0.0.1/*|http://localhost:*|http://localhost/*)
-        resp="$(curl -s -m 3600 -X POST "$url" -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)"
-        [ -n "$resp" ] && printf '%s' "$resp"
-        ;;
+      http://*) ;;
+      *) exit 0 ;;
     esac
+    rest="${url#http://}"
+    authority="${rest%%/*}"      # drop path/query
+    hostport="${authority##*@}"  # drop userinfo (user:pass@)
+    host="${hostport%%:*}"       # drop :port
+    case "$host" in
+      127.0.0.1|localhost) ;;
+      *) exit 0 ;;
+    esac
+    resp="$(curl -s -m 3600 -X POST "$url" -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)"
+    [ -n "$resp" ] && printf '%s' "$resp"
     exit 0
   fi
   [ "$dir" = "/" ] && exit 0
@@ -132,197 +138,100 @@ done
     }
 
     let command = codex_hook_command(helper);
-    // Weft's PreToolUse array element (no top-level key).
-    let entry = format!(
-        "{{ matcher = \".*\", hooks = [{{ type = \"command\", command = \"{command}\", timeout = 3650 }}] }}"
-    );
-    let next = if has_user_pretooluse_hook(&text) {
-        // The user already declares hooks.PreToolUse. Codex runs PreToolUse
-        // matchers in sequence, so Weft coexists by splicing its element into the
-        // user's existing array — emitting a second top-level hooks.PreToolUse
-        // would be a TOML duplicate-key error and break Codex. If the array can't
-        // be located safely, leave the user config untouched.
-        //
-        // Drop any prior Weft-managed block FIRST: if the user added their own
-        // hook after Weft installed the standalone block, keeping both would be the
-        // very duplicate key we're avoiding, and the splice's command-already-present
-        // check would otherwise short-circuit on the stale managed block.
-        let base = if text.contains("# BEGIN WEFT MANAGED CODEX HOOK") {
-            remove_managed_block(&text)
-        } else {
-            text.clone()
-        };
-        match splice_pretooluse_entry(&base, &entry, &command) {
-            Some(spliced) => spliced,
-            None => return,
-        }
+
+    // Migrate any legacy standalone Weft-managed block out of `text` FIRST, then
+    // edit structurally. Codex runs `hooks.PreToolUse` matchers in sequence, so
+    // Weft coexists with a user's own entries by appending into the SAME array —
+    // a second top-level `hooks.PreToolUse` would be a TOML duplicate-key error.
+    let base = if text.contains("# BEGIN WEFT MANAGED CODEX HOOK") {
+        remove_managed_block(&text)
     } else {
-        let block = format!(
-            "# BEGIN WEFT MANAGED CODEX HOOK\n\
-hooks.PreToolUse=[{entry}]\n\
-# END WEFT MANAGED CODEX HOOK\n"
-        );
-        replace_managed_block(&text, &block)
+        text.clone()
     };
+
+    // Never overwrite a config we can't parse: a manual save mid-edit, or a form
+    // toml_edit rejects, must be left exactly as the user left it.
+    let Ok(mut doc) = base.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+
+    // Resolve / create the `hooks.PreToolUse` array. `doc["hooks"]` covers both the
+    // dotted form (`hooks.PreToolUse = [..]`, stored as an implicit table) and the
+    // table form (`[hooks]` then `PreToolUse = [..]`); `as_table_like_mut` also
+    // covers an inline `hooks = { .. }`. We index via accessors (not `doc[..]`,
+    // which panics on a missing key) since production paths must not panic.
+    let root = doc.as_table_mut();
+    let hooks_item = root
+        .entry("hooks")
+        .or_insert_with(toml_edit::table); // a `[hooks]` table if absent
+    let Some(hooks) = hooks_item.as_table_like_mut() else {
+        return; // `hooks` exists but isn't a table/inline-table — leave it be.
+    };
+
+    let array = match hooks.get_mut("PreToolUse") {
+        Some(item) => match item.as_array_mut() {
+            Some(arr) => arr, // dotted or table form: edit the existing array in place
+            None => return,   // present but not an array — don't corrupt it.
+        },
+        None => {
+            // `[hooks]` table (or inline) with no PreToolUse: add the array INTO it,
+            // never a conflicting top-level dotted `hooks.PreToolUse` key.
+            hooks.insert(
+                "PreToolUse",
+                toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())),
+            );
+            let Some(item) = hooks.get_mut("PreToolUse") else {
+                return;
+            };
+            let Some(arr) = item.as_array_mut() else {
+                return;
+            };
+            arr
+        }
+    };
+
+    // Idempotence: if any element already carries `command` in a nested
+    // `hooks[].command`, do nothing. Compare the PARSED (unescaped) value against
+    // the raw command so the check is correct on Windows paths too — comparing
+    // serialized text would mismatch toml_edit's backslash escaping.
+    let already_present = array.iter().any(|el| {
+        el.as_inline_table()
+            .and_then(|t| t.get("hooks"))
+            .and_then(|h| h.as_array())
+            .map(|inner| {
+                inner.iter().any(|ih| {
+                    ih.as_inline_table()
+                        .and_then(|t| t.get("command"))
+                        .and_then(|c| c.as_str())
+                        == Some(command.as_str())
+                })
+            })
+            .unwrap_or(false)
+    });
+    if already_present {
+        return;
+    }
+
+    // Append Weft's entry, equivalent to:
+    //   { matcher = ".*", hooks = [{ type = "command", command = "<command>", timeout = 3650 }] }
+    // Built from toml_edit values so it serializes with correct escaping.
+    let mut inner = toml_edit::InlineTable::new();
+    inner.insert("type", toml_edit::Value::from("command"));
+    inner.insert("command", toml_edit::Value::from(command));
+    inner.insert("timeout", toml_edit::Value::from(3650));
+    let mut hooks_arr = toml_edit::Array::new();
+    hooks_arr.push(toml_edit::Value::InlineTable(inner));
+    let mut entry = toml_edit::InlineTable::new();
+    entry.insert("matcher", toml_edit::Value::from(".*"));
+    entry.insert("hooks", toml_edit::Value::Array(hooks_arr));
+    array.push(toml_edit::Value::InlineTable(entry));
+
+    // Untouched formatting/comments are preserved by toml_edit. Only write when the
+    // serialized document actually differs from the file we read.
+    let next = doc.to_string();
     if next != text {
         write_atomic(cfg, next.as_bytes());
     }
-}
-
-/// Splice Weft's PreToolUse `entry` into the user's existing
-/// `hooks.PreToolUse = [ ... ]` array (inline or multiline). Returns the edited
-/// text, or `None` if no such dotted-array assignment is found (e.g. an
-/// array-of-tables form we won't risk rewriting). Idempotent: if `command` is
-/// already present anywhere, returns the text unchanged.
-fn splice_pretooluse_entry(text: &str, entry: &str, command: &str) -> Option<String> {
-    if text.contains(command) {
-        return Some(text.to_string()); // already wired in
-    }
-    const NEEDLE: &str = "hooks.PreToolUse";
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(NEEDLE) {
-        let idx = from + rel;
-        let line_start = text[..idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
-        if text[line_start..idx].trim_start().starts_with('#') {
-            from = idx + NEEDLE.len();
-            continue; // commented-out assignment
-        }
-        let after = &text[idx + NEEDLE.len()..];
-        if let Some(eq_rel) = after.find('=') {
-            let after_eq = &after[eq_rel + 1..];
-            if let Some(br_rel) = after_eq.find('[') {
-                if after_eq[..br_rel].trim().is_empty() {
-                    let open = idx + NEEDLE.len() + eq_rel + 1 + br_rel;
-                    if let Some(close) = matching_bracket(text, open) {
-                        let inner = text[open + 1..close].trim();
-                        // An empty array, or one that already ends with a trailing
-                        // comma (`[ {..}, ]`), needs no leading comma — adding one
-                        // would produce a double comma and corrupt the TOML.
-                        let insertion = if inner.is_empty() || inner.ends_with(',') {
-                            entry.to_string()
-                        } else {
-                            format!(", {entry}")
-                        };
-                        let mut out = String::with_capacity(text.len() + insertion.len());
-                        out.push_str(&text[..close]);
-                        out.push_str(&insertion);
-                        out.push_str(&text[close..]);
-                        return Some(out);
-                    }
-                }
-            }
-        }
-        from = idx + NEEDLE.len();
-    }
-    None
-}
-
-/// Index of the `]` matching the `[` at `open`, honoring nesting and strings.
-fn matching_bracket(text: &str, open: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if bytes.get(open) != Some(&b'[') {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut i = open;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            match c {
-                b'\\' => {
-                    i += 2;
-                    continue;
-                }
-                b'"' => in_str = false,
-                _ => {}
-            }
-        } else {
-            match c {
-                b'"' => in_str = true,
-                b'[' => depth += 1,
-                b']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn replace_managed_block(text: &str, block: &str) -> String {
-    const BEGIN: &str = "# BEGIN WEFT MANAGED CODEX HOOK";
-    const END: &str = "# END WEFT MANAGED CODEX HOOK";
-    let mut out = String::with_capacity(text.len() + block.len() + 2);
-    let mut lines = text.lines();
-    let mut done = false; // managed block written (replaced in place or inserted)
-    while let Some(line) = lines.next() {
-        if line.trim() == BEGIN {
-            // Replace the existing managed block in place.
-            for inner in lines.by_ref() {
-                if inner.trim() == END {
-                    break;
-                }
-            }
-            if !out.ends_with('\n') && !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(block);
-            done = true;
-            continue;
-        }
-        // No managed block yet and we've reached the first TOML table header
-        // (`[table]` / `[[array]]`): insert the block BEFORE it so hooks.PreToolUse
-        // stays a TOP-LEVEL key. A key written after a `[projects."..."]` table
-        // (which ensure_codex_trusted appends) would belong to that table instead,
-        // silently disabling the Ask Bridge.
-        if !done && line.trim_start().starts_with('[') {
-            if !out.ends_with('\n') && !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(block);
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            done = true;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !done {
-        if !out.ends_with('\n') && !out.is_empty() {
-            out.push('\n');
-        }
-        out.push('\n');
-        out.push_str(block);
-    }
-    out
-}
-
-fn has_user_pretooluse_hook(text: &str) -> bool {
-    let stripped = remove_managed_block(text);
-    // Dotted form (`hooks.PreToolUse = [..]`) — lenient string scan, works even on
-    // configs the TOML parser would reject.
-    if stripped.lines().any(|line| {
-        let trimmed = line.trim_start();
-        !trimmed.starts_with('#') && trimmed.contains("hooks.PreToolUse")
-    }) {
-        return true;
-    }
-    // Table form (`[hooks]` then `PreToolUse = [..]`) — detected via a TOML parse so
-    // we DON'T insert a conflicting top-level `hooks.PreToolUse` dotted key before an
-    // existing `[hooks]` table (which would redefine `hooks` and corrupt the config).
-    // The line-based splice only edits the dotted form, so a table-form config is
-    // left untouched here rather than corrupted.
-    toml::from_str::<toml::Value>(&stripped)
-        .ok()
-        .and_then(|v| v.get("hooks").and_then(|h| h.get("PreToolUse")).cloned())
-        .is_some()
 }
 
 fn remove_managed_block(text: &str) -> String {
@@ -385,108 +294,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn appends_managed_hook_alongside_user_pretooluse() {
-        let base =
-            std::env::temp_dir().join(format!("weft-codex-user-hook-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        let cfg = base.join("config.toml");
-        let helper = base.join("weft-codex-hook.sh");
-        let before = "hooks.PreToolUse=[{ matcher = \"shell\", hooks = [{ type = \"command\", command = \"/usr/local/bin/my-audit\" }] }]\n";
-        std::fs::write(&cfg, before).unwrap();
-
-        ensure_codex_hook_in(&cfg, &helper);
-
-        let after = std::fs::read_to_string(&cfg).unwrap();
-        // user's own hook is preserved, Weft's hook is spliced in alongside it
-        assert!(after.contains("/usr/local/bin/my-audit"));
-        assert!(after.contains(&codex_hook_command(&helper)));
-        // exactly one top-level hooks.PreToolUse assignment (no TOML dup key)
-        let assigns = after
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with('#') && t.contains("hooks.PreToolUse")
+    /// Count the logical `hooks.PreToolUse` array elements via a TOML parse —
+    /// separator-agnostic across dotted and table forms (a string scan can't see
+    /// either reliably).
+    fn pretooluse_len(after: &str) -> usize {
+        toml::from_str::<toml::Value>(after)
+            .ok()
+            .and_then(|v| {
+                v.get("hooks")
+                    .and_then(|h| h.get("PreToolUse"))
+                    .and_then(|p| p.as_array())
+                    .map(|a| a.len())
             })
-            .count();
-        assert_eq!(assigns, 1);
-        // helper script written and routed through the per-worktree ask url
-        assert!(std::fs::read_to_string(&helper)
-            .unwrap()
-            .contains(".weft-codex-ask-url"));
-
-        // idempotent: a second run does not duplicate Weft's entry
-        ensure_codex_hook_in(&cfg, &helper);
-        let after2 = std::fs::read_to_string(&cfg).unwrap();
-        assert_eq!(after, after2);
-        assert_eq!(
-            after2
-                .matches(&codex_hook_command(&helper))
-                .count(),
-            1
-        );
-        let _ = std::fs::remove_dir_all(&base);
+            .unwrap_or(0)
     }
-    #[test]
-    fn installs_managed_global_hook_without_clobbering_config() {
-        let base = std::env::temp_dir().join(format!("weft-codex-hook-{}", std::process::id()));
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("weft-codex-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn no_existing_hooks() {
+        let base = fresh_dir("no-hooks");
         let cfg = base.join("config.toml");
         let helper = base.join("weft-codex-hook.sh");
         std::fs::write(&cfg, "# mine\nmodel = \"gpt-5\"\n").unwrap();
 
         ensure_codex_hook_in(&cfg, &helper);
-        let after = std::fs::read_to_string(&cfg).unwrap();
-        assert!(after.contains("# mine"));
-        assert!(after.contains("# BEGIN WEFT MANAGED CODEX HOOK"));
-        assert!(after.contains("hooks.PreToolUse"));
-        assert!(after.contains(&codex_hook_command(&helper)));
-        let helper_text = std::fs::read_to_string(&helper).unwrap();
-        assert!(helper_text.contains(".weft-codex-ask-url"));
-        assert!(helper_text.contains("127.0.0.1")); // loopback-only guard (anti-exfil)
 
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&after).is_ok(),
+            "config must stay valid TOML:\n{after}"
+        );
+        let v: toml::Value = toml::from_str(&after).unwrap();
+        assert!(
+            v.get("hooks")
+                .and_then(|h| h.get("PreToolUse"))
+                .and_then(|p| p.as_array())
+                .is_some(),
+            "hooks.PreToolUse must exist as an array:\n{after}"
+        );
+        assert!(after.contains("# mine")); // existing content preserved
+        assert!(after.contains(&codex_hook_command(&helper)));
+
+        // Idempotent: a second run leaves the file byte-identical.
         ensure_codex_hook_in(&cfg, &helper);
         assert_eq!(after, std::fs::read_to_string(&cfg).unwrap());
         let _ = std::fs::remove_dir_all(&base);
     }
+
     #[test]
-    fn splices_into_trailing_comma_array_without_corrupting_toml() {
-        let base =
-            std::env::temp_dir().join(format!("weft-codex-trailcomma-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+    fn preserves_user_dotted_hook() {
+        let base = fresh_dir("user-dotted");
         let cfg = base.join("config.toml");
         let helper = base.join("weft-codex-hook.sh");
-        // Formatted multiline array WITH a trailing comma after the last element.
-        let before = "hooks.PreToolUse = [\n  { matcher = \"shell\", hooks = [{ type = \"command\", command = \"/usr/local/bin/my-audit\" }] },\n]\n";
-        std::fs::write(&cfg, before).unwrap();
-
-        ensure_codex_hook_in(&cfg, &helper);
-
-        let after = std::fs::read_to_string(&cfg).unwrap();
-        // Must remain valid TOML — no `, ,` double comma corrupting the array.
-        assert!(
-            toml::from_str::<toml::Value>(&after).is_ok(),
-            "spliced config must stay valid TOML:\n{after}"
-        );
-        assert!(!after.replace(' ', "").contains(",,"));
-        assert!(after.contains("/usr/local/bin/my-audit")); // user hook preserved
-        assert!(after.contains(&codex_hook_command(&helper))); // weft hook spliced in
-        let _ = std::fs::remove_dir_all(&base);
-    }
-    #[test]
-    fn installs_top_level_hook_before_projects_table() {
-        let base =
-            std::env::temp_dir().join(format!("weft-codex-toplevel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        let cfg = base.join("config.toml");
-        let helper = base.join("weft-codex-hook.sh");
-        // Config whose tail is a [projects."..."] table, exactly as
-        // ensure_codex_trusted appends. The managed hook must NOT land inside it.
-        let before = "# mine\nmodel = \"gpt-5\"\n\n[projects.\"/repo\"]\ntrust_level = \"trusted\"\n";
+        let before = "hooks.PreToolUse=[{ matcher = \"shell\", hooks = [{ type = \"command\", command = \"/usr/local/bin/my-audit\" }] }]\n";
         std::fs::write(&cfg, before).unwrap();
 
         ensure_codex_hook_in(&cfg, &helper);
@@ -496,32 +362,140 @@ mod tests {
             toml::from_str::<toml::Value>(&after).is_ok(),
             "config must stay valid TOML:\n{after}"
         );
-        // hooks.PreToolUse must be a TOP-LEVEL key, not captured by the table.
-        let v: toml::Value = toml::from_str(&after).unwrap();
-        assert!(
-            v.get("hooks").and_then(|h| h.get("PreToolUse")).is_some(),
-            "hooks.PreToolUse must be top-level:\n{after}"
-        );
-        // ...and physically precede the table header in the file.
-        let hook_pos = after.find("hooks.PreToolUse").unwrap();
-        let table_pos = after.find("[projects.").unwrap();
-        assert!(
-            hook_pos < table_pos,
-            "managed hook must precede the table:\n{after}"
-        );
-        assert!(after.contains("[projects.\"/repo\"]")); // trust table intact
-        assert!(after.contains("trust_level = \"trusted\""));
+        // Both the user's hook and Weft's are present.
+        assert!(after.contains("/usr/local/bin/my-audit"));
+        assert!(after.contains(&codex_hook_command(&helper)));
+        // Exactly one logical hooks.PreToolUse, now holding both entries.
+        assert_eq!(pretooluse_len(&after), 2, "one array, both entries:\n{after}");
+        // Helper routed through the per-worktree ask url.
+        assert!(std::fs::read_to_string(&helper)
+            .unwrap()
+            .contains(".weft-codex-ask-url"));
+
+        // Idempotent: a second run does not duplicate Weft's entry.
+        ensure_codex_hook_in(&cfg, &helper);
+        let after2 = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(after, after2);
+        assert_eq!(after2.matches(&codex_hook_command(&helper)).count(), 1);
         let _ = std::fs::remove_dir_all(&base);
     }
+
     #[test]
-    fn migrates_managed_block_into_user_array_without_duplicate_key() {
-        let base = std::env::temp_dir().join(format!("weft-codex-migrate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+    fn splices_into_table_form_hooks() {
+        // Finding 157: a `[hooks]` table whose PreToolUse array must ALSO receive
+        // Weft's entry, not be left unchanged.
+        let base = fresh_dir("table-splice");
         let cfg = base.join("config.toml");
         let helper = base.join("weft-codex-hook.sh");
-        // Weft previously installed its standalone managed block, and the user
-        // LATER added their own hooks.PreToolUse — keeping both is a duplicate key.
+        let before = "[hooks]\nPreToolUse = [{ matcher = \"shell\", hooks = [] }]\n";
+        std::fs::write(&cfg, before).unwrap();
+
+        ensure_codex_hook_in(&cfg, &helper);
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&after).is_ok(),
+            "table-form config must stay valid TOML:\n{after}"
+        );
+        assert_ne!(after, before, "table-form PreToolUse must be edited, not skipped");
+        assert!(
+            after.contains(&codex_hook_command(&helper)),
+            "weft command must be spliced into the table-form array:\n{after}"
+        );
+        assert_eq!(pretooluse_len(&after), 2, "user entry + weft entry:\n{after}");
+
+        // Idempotent.
+        ensure_codex_hook_in(&cfg, &helper);
+        assert_eq!(after, std::fs::read_to_string(&cfg).unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn adds_pretooluse_into_existing_hooks_table() {
+        // Finding 288: a `[hooks]` table with a DIFFERENT hook kind (no PreToolUse).
+        // PreToolUse must be added INSIDE that table, not as a conflicting top-level
+        // dotted key (which would be a duplicate-key TOML error against `[hooks]`).
+        let base = fresh_dir("hooks-table-add");
+        let cfg = base.join("config.toml");
+        let helper = base.join("weft-codex-hook.sh");
+        let before = "[hooks]\nUserPromptSubmit = [{ matcher = \".*\", hooks = [] }]\n";
+        std::fs::write(&cfg, before).unwrap();
+
+        ensure_codex_hook_in(&cfg, &helper);
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&after).is_ok(),
+            "config must stay valid TOML (no dup key):\n{after}"
+        );
+        let v: toml::Value = toml::from_str(&after).unwrap();
+        let hooks = v.get("hooks").expect("hooks table present");
+        // PreToolUse landed inside the [hooks] table...
+        assert!(
+            hooks.get("PreToolUse").and_then(|p| p.as_array()).is_some(),
+            "PreToolUse must be inside the [hooks] table:\n{after}"
+        );
+        // ...alongside the preserved UserPromptSubmit entry.
+        assert!(
+            hooks.get("UserPromptSubmit").is_some(),
+            "UserPromptSubmit must be preserved:\n{after}"
+        );
+        assert!(after.contains(&codex_hook_command(&helper)));
+        assert_eq!(pretooluse_len(&after), 1, "exactly Weft's entry:\n{after}");
+
+        // Idempotent.
+        ensure_codex_hook_in(&cfg, &helper);
+        assert_eq!(after, std::fs::read_to_string(&cfg).unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn top_level_when_projects_table_present() {
+        // A trailing [projects."..."] table (exactly what ensure_codex_trusted
+        // appends) must not capture Weft's hook: a proper [hooks] table header keeps
+        // it top-level regardless of ordering.
+        let base = fresh_dir("toplevel");
+        let cfg = base.join("config.toml");
+        let helper = base.join("weft-codex-hook.sh");
+        let before = "model = \"gpt-5\"\n\n[projects.\"/repo\"]\ntrust_level = \"trusted\"\n";
+        std::fs::write(&cfg, before).unwrap();
+
+        ensure_codex_hook_in(&cfg, &helper);
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&after).is_ok(),
+            "config must stay valid TOML:\n{after}"
+        );
+        let v: toml::Value = toml::from_str(&after).unwrap();
+        // hooks.PreToolUse resolvable at TOP level, not nested under projects.
+        assert!(
+            v.get("hooks")
+                .and_then(|h| h.get("PreToolUse"))
+                .and_then(|p| p.as_array())
+                .is_some(),
+            "hooks.PreToolUse must be top-level:\n{after}"
+        );
+        // The projects table is intact.
+        assert!(
+            v.get("projects")
+                .and_then(|p| p.get("/repo"))
+                .and_then(|r| r.get("trust_level"))
+                .is_some(),
+            "[projects.\"/repo\"] must be intact:\n{after}"
+        );
+        assert!(after.contains(&codex_hook_command(&helper)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrates_legacy_managed_block() {
+        // Legacy standalone managed block PLUS a user hooks.PreToolUse the user
+        // added later: keeping both would be a duplicate key. The migration strips
+        // the block and folds Weft's CURRENT command into the user's array.
+        let base = fresh_dir("migrate-legacy");
+        let cfg = base.join("config.toml");
+        let helper = base.join("weft-codex-hook.sh");
         let managed = "# BEGIN WEFT MANAGED CODEX HOOK\nhooks.PreToolUse=[{ matcher = \".*\", hooks = [{ type = \"command\", command = \"bash /old/weft-codex-hook.sh\", timeout = 3650 }] }]\n# END WEFT MANAGED CODEX HOOK\n";
         let user = "hooks.PreToolUse=[{ matcher = \"shell\", hooks = [{ type = \"command\", command = \"/usr/local/bin/my-audit\" }] }]\n";
         std::fs::write(&cfg, format!("{managed}{user}")).unwrap();
@@ -533,43 +507,36 @@ mod tests {
             toml::from_str::<toml::Value>(&after).is_ok(),
             "must stay valid TOML (no duplicate key):\n{after}"
         );
-        assert!(!after.contains("# BEGIN WEFT MANAGED CODEX HOOK")); // stale block dropped
-        let assigns = after
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with('#') && t.contains("hooks.PreToolUse")
-            })
-            .count();
-        assert_eq!(assigns, 1, "exactly one hooks.PreToolUse:\n{after}");
-        assert!(after.contains("/usr/local/bin/my-audit")); // user hook preserved
-        assert!(after.contains(&codex_hook_command(&helper))); // weft hook migrated into the array
+        assert!(!after.contains("# BEGIN WEFT MANAGED CODEX HOOK")); // markers gone
+        assert!(!after.contains("# END WEFT MANAGED CODEX HOOK"));
+        assert!(!after.contains("/old/weft-codex-hook.sh")); // stale command dropped
+        // Exactly one logical array, holding the user hook + the CURRENT weft command.
+        assert_eq!(pretooluse_len(&after), 2, "one array, both entries:\n{after}");
+        assert!(after.contains("/usr/local/bin/my-audit"));
+        assert!(after.contains(&codex_hook_command(&helper)));
         let _ = std::fs::remove_dir_all(&base);
     }
+
     #[test]
-    fn leaves_table_form_hooks_uncorrupted() {
-        let base =
-            std::env::temp_dir().join(format!("weft-codex-tableform-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+    fn helper_has_loopback_host_guard() {
+        // The P1 host-validation guard in the helper script must not be silently
+        // dropped by a refactor of the config-editing path.
+        let base = fresh_dir("helper-guard");
         let cfg = base.join("config.toml");
         let helper = base.join("weft-codex-hook.sh");
-        // Table-form hooks: a [hooks] table with a PreToolUse key (valid Codex layout).
-        let before = "model = \"gpt-5\"\n\n[hooks]\nPreToolUse = [{ matcher = \"shell\", hooks = [] }]\n";
-        std::fs::write(&cfg, before).unwrap();
+        std::fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
 
         ensure_codex_hook_in(&cfg, &helper);
 
-        let after = std::fs::read_to_string(&cfg).unwrap();
-        // Detected as a user hook (table form) and left untouched — NOT corrupted by
-        // a conflicting top-level dotted key inserted before the [hooks] table.
+        let helper_text = std::fs::read_to_string(&helper).unwrap();
+        assert!(helper_text.contains("127.0.0.1")); // loopback-only allow
         assert!(
-            toml::from_str::<toml::Value>(&after).is_ok(),
-            "table-form config must stay valid TOML:\n{after}"
+            helper_text.contains("hostport") && helper_text.contains("${rest%%/*}"),
+            "the host-parsing guard must be present:\n{helper_text}"
         );
-        assert_eq!(after, before);
         let _ = std::fs::remove_dir_all(&base);
     }
+
     #[test]
     fn noop_when_no_config() {
         let base = std::env::temp_dir().join(format!("weft-codex-none-{}", std::process::id()));
