@@ -56,6 +56,14 @@ Branch names follow that repo's observed style: `feat/*` vs `feature/*`,
 own routing in local state; your git history keeps looking like your git
 history.
 
+### 4. Bring team playbooks, keep personal taste
+
+Teams can import git-hosted skill sources, sync them locally, and enable each
+skill globally or only for a workspace. Your personal native-CLI skills still
+exist, repo-owned skills can win by name, and Weft shows the effective skills
+and rules before a session runs. The same model is the path for workspace rules:
+shared defaults, selective opt-in, repo rules last.
+
 ## What it feels like
 
 <p align="center">
@@ -137,15 +145,16 @@ messages cannot bind ownership, and DB errors fail closed.
 - Worker sessions for Claude Code, Codex, and OpenCode.
 - Weft-owned chat timeline with queueing, interrupt, resume, slash commands, and attachments.
 - Ask Bridge for tool permission requests: Allow, Always, Full, and Deny.
-- Skill source manager with git-backed sync and global/workspace enablement.
+- Skill source manager with git-backed sync, personal skill preservation, and global/workspace enablement.
+- Effective config preview for the skills and rules that apply to each repo, including their layer and overrides.
 - Sidecar observation for Claude jsonl, Codex rollout jsonl, and OpenCode SQLite.
 - Diff and pre-PR check surfaces from materialized worktrees.
 - Rename and cascade-delete for workspaces, issues, and sub-tasks.
 - English and Chinese UI.
 
 Not yet productized: automatic PR creation, protected-branch merge orchestration,
-CI/CD observation, deployment orchestration, team marketplace sync, and the
-long-running semantic Curator.
+CI/CD observation, deployment orchestration, workspace rule packs, team
+marketplace sync, and the long-running semantic Curator.
 
 ## Development
 

@@ -50,6 +50,14 @@ Weft 不把内部命名规则强加给你的仓库。新的工作目录创建在
 只有冲突时才追加数字后缀。Weft 的路由和状态留在本地数据库里，你的 git 历史继续保持
 它原本的样子。
 
+### 4. 导入团队经验，保留个人习惯
+
+团队可以导入 Git 托管的 Skill 源，同步到本地后，再按「所有 Workspace」或「当前
+Workspace」选择性启用。你自己熟悉的原生 CLI Skills 仍然保留；如果仓库里有同名
+Skill，仓库自己的版本优先。Weft 也会展示每个仓库最终生效的 Skills 和 Rules，让你
+在会话开始前知道「哪些能力会被带进去、来自哪一层」。未来工作区规则包（workspace
+rule packs）也应沿用同一套模型：团队给默认值，用户按需启用，仓库自己的规则最后说了算。
+
 ## 实际工作流
 
 <p align="center">
@@ -124,13 +132,14 @@ worker 产生的权限请求和 agent 提问可以镜像到飞书/Lark 交互卡
 - Claude Code、Codex、OpenCode worker 会话。
 - Weft 自有 chat timeline，支持排队、打断、resume、slash commands 和附件。
 - Ask Bridge 统一展示工具权限请求，支持 Allow、Always、Full、Deny。
-- Skill 仓库源：git-backed 同步，支持全局/按 workspace 启用。
+- Skill 源管理：支持导入团队公共 Skill 仓库，保留个人已熟悉的本地 Skills，并按全局或 workspace 选择性启用。
+- 有效配置预览：展示每个仓库实际生效的 Skills 和 Rules，以及来源层级和覆盖关系。
 - sidecar 观测 Claude jsonl、Codex rollout jsonl 和 OpenCode SQLite。
 - 从物化 worktree 展示 diff 和 pre-PR checks。
 - Workspace、Issue、子任务重命名和级联删除。
 - 中英双语 UI。
 
-尚未产品化：自动创建 PR、受保护分支合并编排、CI/CD 观测、部署编排、团队 marketplace 同步、长期语义 Curator。
+尚未产品化：自动创建 PR、受保护分支合并编排、CI/CD 观测、部署编排、工作区规则包（workspace rule packs）、团队 marketplace 同步、长期语义 Curator。
 
 ## 本地开发
 
