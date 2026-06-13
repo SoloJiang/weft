@@ -1014,10 +1014,15 @@ pub async fn stop_quiet(eng: &EngineRef) {
     inner.clock = TurnClock::default();
 }
 
-/// Stop the engine outright (e.g. before a terminal takeover).
+/// Stop the engine outright (e.g. before a terminal takeover or by the runaway
+/// guard). Persists idle so a stopped/taken-over session can't be falsely
+/// revived into a COMPETING headless process on the next boot (see L204).
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     stop_quiet(eng).await;
     let inner = eng.lock().await;
+    if let Some(db) = app.try_state::<Db>() {
+        persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
+    }
     let _ = app.emit(
         EVENT,
         Push::Turn {
@@ -1538,6 +1543,10 @@ fn spawn_reader(
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
+            // The turn is unconditionally reset to idle here; persist that so a
+            // resident-process death (incl. interrupt→kill) doesn't leave the row
+            // stuck "running" and falsely revive an engine on the next boot.
+            persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
             let _ = app.emit(
                 EVENT,
                 Push::Turn {
