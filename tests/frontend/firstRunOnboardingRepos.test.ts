@@ -15,6 +15,16 @@ test("derives repo names from local paths", () => {
   assert.equal(basename("/"), "");
 });
 
+test("derives repo names from Windows backslash paths", () => {
+  assert.equal(basename("C:\\work\\api"), "api");
+  assert.equal(basename("C:\\work\\api\\"), "api"); // trailing separator
+  assert.equal(repoSubmitName({ id: "C:\\work\\api", name: "  ", path: "C:\\work\\api" }), "api");
+  // a trailing backslash is the same repo (dedup)
+  const seeded = addPendingRepo([], "C:\\work\\api");
+  const dup = addPendingRepo(seeded.repos, "C:\\work\\api\\");
+  assert.equal(dup.added, false);
+});
+
 test("adds a picked repo once with a derived name", () => {
   const result = addPendingRepo([], "/Users/me/code/weft/");
   assert.equal(result.added, true);

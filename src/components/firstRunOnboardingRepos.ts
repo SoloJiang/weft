@@ -4,10 +4,13 @@ export type PendingRepo = {
   path: string;
 };
 
+// Handle both POSIX (`/`) and Windows (`\`) separators: the native folder picker
+// returns backslash paths on Windows, where splitting on `/` alone would keep the
+// whole path as the repo name and miss trailing-separator duplicates.
 export const basename = (p: string) =>
-  p.trim().replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? "";
+  p.trim().replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() ?? "";
 
-const normalizePath = (p: string) => p.trim().replace(/\/+$/, "");
+const normalizePath = (p: string) => p.trim().replace(/[\\/]+$/, "");
 
 export function addPendingRepo(
   current: PendingRepo[],
