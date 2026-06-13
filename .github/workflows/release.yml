@@ -122,3 +122,13 @@ jobs:
         run: gh release upload ${{ github.ref_name }} latest.json --repo ${{ github.repository }} --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload macOS "damaged" fix helper
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          chmod +x scripts/weft-macos-fix.command
+          zip -j weft-macos-fix.command.zip scripts/weft-macos-fix.command
+          gh release upload "$TAG" weft-macos-fix.command.zip --repo "$REPO" --clobber
