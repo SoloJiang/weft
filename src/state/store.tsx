@@ -368,25 +368,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void api.setKeepAwake(localStorage.getItem("weft-keep-awake") !== "0");
   }, []);
-  // Auto-check for app updates on launch (silent; only surface when found).
+  // Auto-check for app updates on launch and hourly thereafter (silent; only
+  // surface when found, and don't re-nag a version the user already dismissed).
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body: string } | null>(null);
+  const dismissedUpdateRef = useRef<string | null>(null);
   useEffect(() => {
-    void (async () => {
+    let cancelled = false;
+    const run = async () => {
       try {
         const { checkUpdate } = await import("../lib/updater");
         const info = await checkUpdate();
-        if (info) setUpdateAvailable(info);
+        if (cancelled || !info) return;
+        if (info.version === dismissedUpdateRef.current) return; // already dismissed this one
+        setUpdateAvailable((prev) => (prev?.version === info.version ? prev : info));
       } catch {
         /* updater unavailable in dev or offline */
       }
-    })();
+    };
+    void run();
+    const UPDATE_POLL_MS = 60 * 60 * 1000; // re-check hourly for long-running sessions
+    const id = setInterval(() => void run(), UPDATE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
   const installUpdate = useCallback(async () => {
     const { installUpdate: doInstall } = await import("../lib/updater");
     await doInstall();
   }, []);
   const dismissUpdate = useCallback(() => {
-    setUpdateAvailable(null);
+    setUpdateAvailable((cur) => {
+      if (cur) dismissedUpdateRef.current = cur.version; // suppress re-nag until a newer version
+      return null;
+    });
   }, []);
   const [dangerousMode, setDangerousModeState] = useState(
     () => localStorage.getItem("weft-dangerous") === "1",
