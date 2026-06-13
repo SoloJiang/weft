@@ -80,6 +80,22 @@ pub fn format_brief(d: &BriefData) -> String {
     s
 }
 
+/// Render the seed message as a normal user request first, then attach the
+/// structured Weft brief as context. Codex Desktop indexes exec-created threads
+/// more reliably when the first turn looks like a user task instead of starting
+/// with an internal `# Brief:` heading.
+pub fn format_seed_message(d: &BriefData) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "Please deliver this worker task: {}\n\n",
+        d.direction
+    ));
+    s.push_str(&format!("User requirement ({}): {}\n\n", d.kind, d.task));
+    s.push_str("## Brief context\n");
+    s.push_str(&format_brief(d));
+    s
+}
+
 /// Gather a direction's brief from the DB + the curator's dependency graph.
 pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
     use sea_orm::EntityTrait;
@@ -152,7 +168,7 @@ pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
         .map(|n| n.repo_name.clone())
         .collect();
 
-    Ok(format_brief(&BriefData {
+    Ok(format_seed_message(&BriefData {
         task: thread.title,
         kind: thread.kind,
         direction: dir.name,
@@ -211,6 +227,13 @@ mod tests {
         assert!(s.contains("Delivery contract"));
     }
 
+    #[test]
+    fn seed_message_starts_with_user_task_before_brief_context() {
+        let s = format_seed_message(&data());
+        assert!(s.starts_with("Please deliver this worker task: Backend endpoint\n\n"));
+        assert!(s.contains("User requirement (feature): Add a discount code\n"));
+        assert!(s.contains("## Brief context\n# Brief: Backend endpoint"));
+    }
     #[test]
     fn plan_impl_brief_carries_delivery_contract() {
         let s = format_brief(&data());

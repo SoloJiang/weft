@@ -628,8 +628,8 @@ async fn chat_open_worker_impl(
     };
     engine::ensure_running(app, db, &eng).await?;
 
-    // A fresh conversation gets its brief as the opening message (the brief is
-    // a message, not a system prompt).
+    // A fresh conversation starts with a user-shaped task request, followed by
+    // the structured Weft brief as context.
     if !resumed {
         let mut brief = crate::brief::assemble(db, direction_id)
             .await
