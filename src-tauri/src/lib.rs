@@ -160,6 +160,7 @@ pub fn run() {
             commands::list_workspaces,
             commands::ensure_default_workspace,
             commands::add_repo_ref,
+            commands::check_git_repo,
             commands::clone_repo,
             commands::create_repo,
             commands::create_thread,

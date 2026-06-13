@@ -100,6 +100,7 @@ export const en = {
     repoEmpty: "Add one or more existing git repositories. You can also skip this and add repositories later.",
     addLocalRepo: "Add local repository",
     repoDuplicate: "That repository is already in the list.",
+    repoInvalid: "These folders are not git repositories: {{paths}}",
     repoNameLabel: "Repository name",
     repoPathLabel: "Repository path",
     removeRepo: "Remove",

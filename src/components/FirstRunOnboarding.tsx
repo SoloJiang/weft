@@ -17,9 +17,9 @@ import {
   addPendingRepo,
   removePendingRepo,
   renamePendingRepo,
-  repoSubmitName,
   type PendingRepo,
 } from "./firstRunOnboardingRepos";
+import { submitOnboarding, InvalidReposError } from "./firstRunOnboardingSubmit";
 
 const STORAGE_KEY = "weft-first-run-onboarding-v2-dismissed";
 
@@ -69,18 +69,21 @@ export function FirstRunOnboarding() {
     setBusy(true);
     setErr(null);
     try {
-      const name = workspaceName.trim();
-      const title = task.trim();
-      const ws = await api.createWorkspace(name);
-      for (const repo of repos) {
-        await api.addRepoRef(ws.id, repoSubmitName(repo), repo.path);
-      }
-      await api.createThread(ws.id, title, issueKind);
+      const ws = await submitOnboarding(api, {
+        name: workspaceName.trim(),
+        title: task.trim(),
+        issueKind,
+        repos,
+      });
       await refreshWorkspaces();
       await selectWorkspace(ws.id);
       dismiss();
     } catch (e) {
-      setErr(String(e));
+      if (e instanceof InvalidReposError) {
+        setErr(t("onboarding.repoInvalid", { paths: e.invalidRepos.join(", ") }));
+      } else {
+        setErr(String(e));
+      }
     } finally {
       setBusy(false);
     }

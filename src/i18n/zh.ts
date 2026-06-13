@@ -99,6 +99,7 @@ export const zh = {
     repoEmpty: "添加一个或多个已有本地 Git 仓库。也可以跳过，稍后再添加。",
     addLocalRepo: "添加本地仓库",
     repoDuplicate: "这个仓库已经在列表里。",
+    repoInvalid: "这些文件夹不是 Git 仓库：{{paths}}",
     repoNameLabel: "仓库名称",
     repoPathLabel: "仓库路径",
     removeRepo: "移除",

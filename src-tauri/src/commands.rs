@@ -88,6 +88,14 @@ pub async fn add_repo_ref(
     register_repo(&db, workspace_id, &name, &local_git_path).await
 }
 
+/// Cheap pre-check used by first-run onboarding to validate every picked folder
+/// *before* a workspace is created — so a non-git folder can't leave an orphan
+/// workspace behind. Mirrors the guard inside `register_repo`.
+#[tauri::command]
+pub fn check_git_repo(path: String) -> bool {
+    crate::git::is_git_repo(std::path::Path::new(&path))
+}
+
 /// Clone a remote git URL into `<dest>/<name>`, then register it.
 #[tauri::command]
 pub async fn clone_repo(
