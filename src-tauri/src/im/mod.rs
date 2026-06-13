@@ -115,8 +115,14 @@ fn lead_outbound_target<'a>(
     topic_reply_to: Option<&'a str>,
 ) -> Option<LeadOutboundTarget<'a>> {
     match route.channel.as_str() {
-        "feishu" => topic_reply_to.map(|message_id| LeadOutboundTarget::Reply {
-            message_id,
+        // Prefer threading under the user's latest inbound message (the pending
+        // ack); fall back to the bound topic id so a bound issue topic always has
+        // a delivery target. Without the fallback, lead replies are silently
+        // dropped whenever no inbound ack was recorded — e.g. the lead is driven
+        // from the desktop/global tool, or the best-effort ack reaction is delayed
+        // or fails (pre-8f7f8c3 behavior delivered to route.im_thread_ref directly).
+        "feishu" => Some(LeadOutboundTarget::Reply {
+            message_id: topic_reply_to.unwrap_or(route.im_thread_ref.as_str()),
             issue_style: true,
         }),
         "feishu_concierge" => {
@@ -2133,6 +2139,92 @@ mod tests {
             [("provider-message-id".into(), "reaction-id".into())]
         );
     }
+
+    #[tokio::test]
+    async fn topic_stream_falls_back_to_bound_topic_when_no_ack() {
+        // Regression: a bound Feishu issue topic must stay deliverable even when
+        // no inbound ack was recorded (lead driven from the desktop/global tool,
+        // or the best-effort reaction delayed/failed) — previously the streamed
+        // reply was silently dropped because lead_outbound_target returned None.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        // No acks recorded for this thread.
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "我查到了。".into(),
+                done: true,
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Threaded under the bound topic id, not dropped.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["provider-topic-id".to_string()]
+        );
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [("provider-topic-id".into(), "Lead：我查到了。".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_lead_out_falls_back_to_bound_topic_when_no_ack() {
+        // Same regression on the non-streaming delivery path.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        consume_lead_out(
+            crate::lead_chat::out_hub::LeadOut {
+                thread_id: issue.id,
+                message_id: 7,
+                text: "我查到了。".into(),
+            },
+            &db,
+            &ch,
+            &acks,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [("provider-topic-id".into(), "Lead：我查到了。".into())]
+        );
+    }
+
     #[test]
     fn coalesces_streaming_delta_frames_to_latest_per_message() {
         let frames = coalesce_delta_frames(
