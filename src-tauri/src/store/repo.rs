@@ -604,7 +604,11 @@ pub async fn set_session_native_id(db: &Db, session_id: i32, native_id: &str) ->
     if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
         let mut a: session::ActiveModel = s.into();
         a.native_session_id = Set(Some(native_id.to_string()));
-        a.status = Set("running".to_string());
+        // Capturing the native id does NOT mean a turn is running. The readers
+        // call this on every attach (including an idle re-attach for command
+        // discovery), so writing "running" here would make the boot revive sweep
+        // treat an idle resume as interrupted work. Status is owned by the turn
+        // boundaries (persist_activity); a real turn is already "running" by now.
         a.update(&db.0).await?;
     }
     Ok(())

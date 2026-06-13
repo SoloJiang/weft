@@ -112,7 +112,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
         busy={turn.state === "busy"}
         queued={turn.queued}
         onSend={(text, images, files) =>
-          void sendLeadChat(activeThreadId, text, images, files)
+          sendLeadChat(activeThreadId, text, images, files)
         }
         onStop={() => void interruptLead(activeThreadId)}
         onNeedSlashCommands={() => discoverLeadSlash(activeThreadId)}

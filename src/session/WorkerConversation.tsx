@@ -155,7 +155,7 @@ export function WorkerConversation() {
             busy={busy}
             queued={turn?.queued ?? 0}
             placeholder={loadError ?? t("session.message")}
-            onSend={(v, images, fs) => void sendToWorker(directionId, repoId, v, images, fs)}
+            onSend={(v, images, fs) => sendToWorker(directionId, repoId, v, images, fs)}
             onStop={() => sid != null && void api.chatInterrupt(sid)}
             onTakeOver={async () => {
               if (!ref || !nativeId || sid == null) return false;

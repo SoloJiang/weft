@@ -244,11 +244,12 @@ mod tests {
         let s = repo::create_session(db, direction_id, repo_id, "codex", "/tmp/wt")
             .await
             .unwrap();
-        // set_session_native_id forces status=running as a side effect of capturing
-        // the id — exactly the live-turn state we crash out of.
+        // A live, mid-turn session: native id captured + status running (the
+        // honest turn-start state we crash out of).
         repo::set_session_native_id(db, s.id, "nat-123")
             .await
             .unwrap();
+        repo::set_session_status(db, s.id, "running").await.unwrap();
         s.id
     }
 

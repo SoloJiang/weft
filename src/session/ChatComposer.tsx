@@ -61,7 +61,11 @@ export function ChatComposer({
   onLocalSlash?: (name: string) => void;
   busy: boolean;
   queued: number;
-  onSend: (text: string, images: ImageAttachment[], files: string[]) => void;
+  onSend: (
+    text: string,
+    images: ImageAttachment[],
+    files: string[],
+  ) => void | Promise<unknown>;
   onStop: () => void;
   /** Stop the engine + copy the terminal resume command; false = unavailable. */
   onTakeOver?: () => Promise<boolean>;
@@ -160,10 +164,20 @@ export function ChatComposer({
   const send = () => {
     const v = text.trim();
     if (!v && images.length === 0 && files.length === 0) return;
-    onSend(v, images.map(({ media_type, data }) => ({ media_type, data })), files);
+    const imgs = images.map(({ media_type, data }) => ({ media_type, data }));
+    const prevText = text;
+    const prevImages = images;
+    const prevFiles = files;
     setText("");
     setImages([]);
     setFiles([]);
+    // Restore the draft if the send fails: a lazy resume can throw (missing
+    // worktree / unavailable CLI), and we already cleared the input.
+    Promise.resolve(onSend(v, imgs, prevFiles)).catch(() => {
+      setText(prevText);
+      setImages(prevImages);
+      setFiles(prevFiles);
+    });
   };
 
   const complete = (item: SlashItem) => {
