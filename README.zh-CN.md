@@ -3,10 +3,10 @@
 
 ### 本地多仓交付编排器，指挥你自己的 Coding Agents
 
-Weft 是一个本地的多仓交付编排器。你给它一个需求，它指挥你自己的 Claude Code、
+Weft 是一个本地多仓交付编排器。你给它一个需求，它会指挥你自己的 Claude Code、
 Codex、OpenCode 跨多个仓库推进，把需求从意图一路带向实现、合并和上线。
 
-<sub>Tauri v2 · React 19 · Rust · SQLite · native coding-agent CLIs</sub>
+<sub>Tauri v2 · React 19 · Rust · SQLite · Native Coding-Agent CLIs</sub>
 
 [English](README.md)
 </div>
@@ -60,7 +60,7 @@ Weft 不把内部命名规则强加给你的仓库。新的工作目录创建在
 2. 新建 Issue，并和 Lead agent 讨论目标。
 3. 查看 Lead 提出的写入通道：仓库、原因、工具和执行授权。
 4. 确认哪些通道可以创建 worktree。
-5. worker 以 headless 原生 CLI 会话运行，并流式进入 Weft。
+5. Worker 以 headless 原生 CLI 会话运行，并流式进入 Weft。
 6. 你只处理真正的阻塞、查看 diff，并在 PR 前运行检查。
 
 人处理异常，不推动流水线。
