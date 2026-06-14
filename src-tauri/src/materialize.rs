@@ -26,6 +26,13 @@ pub fn worktree_root(repo_path: &Path) -> PathBuf {
 /// orphaned by — the installed release app's `weft` worktrees in the same repo
 /// (the two profiles run separate DBs that can't see each other's worktree rows).
 /// Release keeps `weft` so existing checkouts are unaffected.
+///
+/// This isolates worktree *directories*. Branch *names* are repo-global, and
+/// `choose_branch_name` dedupes against the repo's real git refs (shared by both
+/// profiles), so once one profile's branch ref exists the other avoids it. Known
+/// limitation: if both profiles reserve the same branch name before either
+/// materializes its ref, the second `git worktree add` fails loudly (recoverable
+/// by renaming) — the cross-DB form of the single-DB race `reserved` already guards.
 fn worktree_dirname(debug_build: bool) -> &'static str {
     if debug_build {
         "weft-dev"
