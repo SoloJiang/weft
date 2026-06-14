@@ -75,9 +75,20 @@ function setPrefGlobal(pref: ThemePref) {
 }
 
 // Follow live OS appearance changes while in system mode (registered once).
-darkQuery()?.addEventListener("change", () => {
+// Guard the listener API: older WebKit/WebKitGTK WebViews (Tauri's Linux
+// runtime) expose only the legacy MediaQueryList.addListener, so an unguarded
+// addEventListener would throw at import and blank the app for those users.
+const systemQuery = darkQuery();
+const onSystemChange = () => {
   if (state.pref === "system") commit("system");
-});
+};
+if (systemQuery) {
+  if (typeof systemQuery.addEventListener === "function") {
+    systemQuery.addEventListener("change", onSystemChange);
+  } else if (typeof systemQuery.addListener === "function") {
+    systemQuery.addListener(onSystemChange);
+  }
+}
 
 function subscribe(cb: () => void): () => void {
   listeners.add(cb);
