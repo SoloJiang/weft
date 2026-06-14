@@ -245,6 +245,9 @@ function AskBox({
             e.preventDefault();
             send();
           } else if (e.key === "Escape") {
+            // Cancel just this annotation — don't let Escape bubble to
+            // DiffPanel's window listener, which would close the whole panel.
+            e.stopPropagation();
             onClose();
           }
         }}
@@ -306,17 +309,20 @@ function parsePatch(patch: string): Record<string, DiffLine[]> {
       const m = line.match(/ b\/(.+)$/);
       cur = m ? m[1] : line;
     } else if (
-      line.startsWith("index ") ||
-      line.startsWith("--- ") ||
-      line.startsWith("+++ ") ||
-      line.startsWith("new file") ||
-      line.startsWith("deleted file") ||
-      line.startsWith("old mode") ||
-      line.startsWith("new mode") ||
-      line.startsWith("similarity ") ||
-      line.startsWith("rename ")
+      !inHunk &&
+      (line.startsWith("index ") ||
+        line.startsWith("--- ") ||
+        line.startsWith("+++ ") ||
+        line.startsWith("new file") ||
+        line.startsWith("deleted file") ||
+        line.startsWith("old mode") ||
+        line.startsWith("new mode") ||
+        line.startsWith("similarity ") ||
+        line.startsWith("rename "))
     ) {
-      // header noise — the section header already names the file
+      // file-level metadata, which only appears before the first hunk — drop it;
+      // the section header already names the file. Inside a hunk, lines like
+      // "+++ x" / "--- x" are real added/removed content, not headers.
     } else if (cur) {
       if (line.startsWith("@@")) {
         // hunk header resets the counters: @@ -oldStart,_ +newStart,_ @@
