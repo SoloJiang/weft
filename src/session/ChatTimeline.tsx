@@ -82,9 +82,14 @@ export function ChatTimeline({
     // just short of the bottom.
     const v = virtuosoRef.current;
     v?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: "auto" });
-    const raf = requestAnimationFrame(() =>
-      v?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: "auto" }),
-    );
+    // Re-check atBottom inside the frame: the user may have scrolled up between
+    // this commit and the next frame (atBottomStateChange flips the ref), and a
+    // deferred scroll must never yank them back down.
+    const raf = requestAnimationFrame(() => {
+      if (atBottomRef.current) {
+        v?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: "auto" });
+      }
+    });
     return () => cancelAnimationFrame(raf);
   }, [visible.length, lastTextLen, busy, activity]);
 
