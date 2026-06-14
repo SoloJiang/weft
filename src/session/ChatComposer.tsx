@@ -412,25 +412,29 @@ export function ChatComposer({
               </button>
             </Tooltip>
           )}
-          {/* One morphing button: Stop while a turn is in flight, Send when idle.
-              Enter (onKeyDown) always sends — so you can still queue a new message
-              while busy even though the button shows Stop. */}
-          {busy ? (
-            <Button size="sm" variant="ghost" onClick={onStop}>
-              <Square size={12} />
-              {t("lead.stop")}
-            </Button>
-          ) : (
+          {/* Send stays clickable while busy (click = queue the message); Stop is a
+              separate, small icon-only key shown only while a turn is in flight.
+              Enter also sends/queues. */}
+          {busy && (
             <Button
               size="sm"
-              variant="primary"
-              disabled={!text.trim() && images.length === 0 && files.length === 0}
-              onClick={send}
+              variant="ghost"
+              onClick={onStop}
+              aria-label={t("lead.stop")}
+              title={t("lead.stop")}
             >
-              <Send size={13} />
-              {t("lead.send")}
+              <Square size={12} />
             </Button>
           )}
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={!text.trim() && images.length === 0 && files.length === 0}
+            onClick={send}
+          >
+            <Send size={13} />
+            {t("lead.send")}
+          </Button>
         </div>
       </div>
     </div>
