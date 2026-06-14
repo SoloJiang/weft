@@ -8,7 +8,21 @@ use anyhow::Result;
 
 const KEYCHAIN_SERVICE: &str = "weft";
 const KEYCHAIN_ACCOUNT: &str = "db-password-v1";
+/// Debug builds (`tauri dev`, `~/.weft-dev`) key the DB password under a separate
+/// account so enabling/changing/disabling encryption while iterating never
+/// overwrites or deletes the installed release app's `~/.weft` credential.
+/// Release keeps `db-password-v1` so existing encrypted installs need no re-entry.
+const KEYCHAIN_ACCOUNT_DEV: &str = "db-password-v1-dev";
 const ENV_BYPASS: &str = "WEFT_TEST_DB_PASSWORD";
+
+/// The Keychain account for the active build profile (see [`KEYCHAIN_ACCOUNT_DEV`]).
+fn keychain_account(debug_build: bool) -> &'static str {
+    if debug_build {
+        KEYCHAIN_ACCOUNT_DEV
+    } else {
+        KEYCHAIN_ACCOUNT
+    }
+}
 
 /// 把用户密码序列化成 SQLCipher 的 `"x'<hex>'"` 字面量或带引号字符串字面量。
 /// 密码走 PBKDF2，传 PRAGMA key 时用 SQL 字符串就行。注意密码里的单引号要 doubled。
@@ -22,7 +36,7 @@ pub fn get_password() -> Result<Option<String>> {
     if let Ok(pwd) = std::env::var(ENV_BYPASS) {
         return Ok(Some(pwd));
     }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, keychain_account(cfg!(debug_assertions)))
         .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
     match entry.get_password() {
         Ok(pwd) => Ok(Some(pwd)),
@@ -37,7 +51,7 @@ pub fn set_password(password: &str) -> Result<()> {
         std::env::set_var(ENV_BYPASS, password);
         return Ok(());
     }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, keychain_account(cfg!(debug_assertions)))
         .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
     entry
         .set_password(password)
@@ -52,7 +66,7 @@ pub fn delete_password() -> Result<()> {
         std::env::remove_var(ENV_BYPASS);
         return Ok(());
     }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, keychain_account(cfg!(debug_assertions)))
         .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -87,5 +101,14 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var(ENV_BYPASS, v);
         }
+    }
+
+    #[test]
+    fn keychain_account_isolates_dev_from_prod() {
+        // Dev builds must not share the release app's DB-password credential, or
+        // toggling dev encryption would clobber it; release keeps the original
+        // account so existing encrypted installs need no re-entry.
+        assert_eq!(keychain_account(true), "db-password-v1-dev");
+        assert_eq!(keychain_account(false), "db-password-v1");
     }
 }

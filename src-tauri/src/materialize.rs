@@ -8,15 +8,30 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// The deterministic worktree path for a direction branch inside its target repo:
-/// `<repo>/.worktrees/weft/<branch>`. The branch suffix keeps the path user-visible
-/// and aligned with the repo's own naming style while `.worktrees/weft` keeps Weft
-/// checkouts separate from manually-created worktrees.
+/// `<repo>/.worktrees/<weft|weft-dev>/<branch>`. The branch suffix keeps the path
+/// user-visible and aligned with the repo's own naming style while `.worktrees/weft`
+/// keeps Weft checkouts separate from manually-created worktrees.
 pub fn worktree_path(repo_path: &Path, branch: &str) -> PathBuf {
     worktree_root(repo_path).join(branch)
 }
 
 pub fn worktree_root(repo_path: &Path) -> PathBuf {
-    repo_path.join(".worktrees").join("weft")
+    repo_path
+        .join(".worktrees")
+        .join(worktree_dirname(cfg!(debug_assertions)))
+}
+
+/// The `.worktrees/<this>` subdir for the active build profile. Debug builds
+/// (`tauri dev`) use `weft-dev` so dev checkouts never collide with — or get
+/// orphaned by — the installed release app's `weft` worktrees in the same repo
+/// (the two profiles run separate DBs that can't see each other's worktree rows).
+/// Release keeps `weft` so existing checkouts are unaffected.
+fn worktree_dirname(debug_build: bool) -> &'static str {
+    if debug_build {
+        "weft-dev"
+    } else {
+        "weft"
+    }
 }
 
 /// Create the one worktree for `direction_id`'s bound repo at
@@ -116,6 +131,19 @@ mod tests {
     #[test]
     fn worktree_path_is_repo_local_and_branch_shaped() {
         let p = worktree_path(Path::new("/repo"), "feat/add-login");
-        assert_eq!(p, Path::new("/repo/.worktrees/weft/feat/add-login"));
+        // Profile-aware: `.worktrees/weft-dev` in debug/test runs, `.worktrees/weft`
+        // in release.
+        let expected = Path::new("/repo/.worktrees")
+            .join(worktree_dirname(cfg!(debug_assertions)))
+            .join("feat/add-login");
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn worktree_dirname_isolates_dev_from_prod() {
+        // Dev checkouts get their own repo-local subdir so they never collide with
+        // or orphan the installed app's worktrees; release keeps `weft`.
+        assert_eq!(worktree_dirname(true), "weft-dev");
+        assert_eq!(worktree_dirname(false), "weft");
     }
 }
