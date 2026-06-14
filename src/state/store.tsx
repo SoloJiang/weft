@@ -1013,7 +1013,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [leadMeta, setLeadMeta] = useState<Record<number, SessionMeta>>({});
   const [workerMeta, setWorkerMeta] = useState<Record<number, SessionMeta>>({});
   const hydrateWorkerMeta = useCallback((sessionId: number, snap: ObserveRef) => {
-    setWorkerMeta((m) => ({ ...m, [sessionId]: metaFromSnapshot(snap) }));
+    // First-paint only: the snapshot carries no per-server tools (claude's tool
+    // catalog arrives via the `init` event), so never overwrite richer live meta
+    // — the 2s session_for poll would otherwise wipe the MCP tool lists.
+    setWorkerMeta((m) => (m[sessionId] ? m : { ...m, [sessionId]: metaFromSnapshot(snap) }));
   }, []);
   const mergeWorkerMeta = useCallback((sessionId: number, snap: SessionMetaSnapshot) => {
     setWorkerMeta((m) => ({ ...m, [sessionId]: mergeSnapshot(m[sessionId], snap) }));
@@ -1193,7 +1196,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (st.slash_commands.length > 0) {
         setLeadSlash((s) => ({ ...s, [threadId]: st.slash_commands }));
       }
-      setLeadMeta((m) => ({ ...m, [threadId]: metaFromSnapshot(st) }));
+      // First-paint only (same reason as hydrateWorkerMeta): don't let a
+      // tool-less snapshot clobber the init event's MCP tool catalog on remount.
+      setLeadMeta((m) => (m[threadId] ? m : { ...m, [threadId]: metaFromSnapshot(st) }));
     } catch {
       /* engine state is cosmetic at load time */
     }
