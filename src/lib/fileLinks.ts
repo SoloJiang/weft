@@ -110,9 +110,14 @@ export type Seg = { type: "text" | "path"; value: string };
 // no inter-word spaces, so these are treated as token DELIMITERS (split on them),
 // not just peeled — otherwise `lib/x.rs，然后` stays one token and never matches.
 const CJK_PUNCT = "（）【】「」『』〔〕〈〉《》〖〗。，、；：！？…—～·｜“”‘’";
+// CJK ideographs (kana, CJK Ext-A, CJK Unified, compat, Hangul). Chinese has no
+// inter-word spaces, so an ideograph run is a hard boundary too — this isolates
+// an ASCII path embedded with no delimiter, e.g. `修改src/App.tsx文件`. (An
+// all-CJK-named path won't be detected, but it's left as text, not mangled.)
+const CJK_IDEO = "\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uac00-\\ud7af";
 const LIST_SEP = ",;"; // ASCII list separators between adjacent path refs (a.ts,b.ts)
-const DELIM = new RegExp(`(\\s+|[${LIST_SEP}${CJK_PUNCT}]+)`);
-const IS_DELIM = new RegExp(`^(?:\\s|[${LIST_SEP}${CJK_PUNCT}])`);
+const DELIM = new RegExp(`(\\s+|[${LIST_SEP}${CJK_IDEO}${CJK_PUNCT}]+)`);
+const IS_DELIM = new RegExp(`^(?:\\s|[${LIST_SEP}${CJK_IDEO}${CJK_PUNCT}])`);
 // ASCII punctuation that hugs a path is peeled back into the text run.
 const LEAD_PUNCT = /^[([{<'"`]+/;
 const TAIL_PUNCT = /[)\]}>'"`.,;:!?]+$/;
