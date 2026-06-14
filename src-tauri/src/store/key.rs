@@ -39,6 +39,42 @@ fn keychain_account_for(home: &Path, release_home: Option<&Path>) -> String {
     }
 }
 
+/// A keyring handle for `account` under the weft service.
+fn entry(account: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(|e| anyhow::anyhow!("keyring entry: {e}"))
+}
+
+/// Read `account`'s stored password, mapping "no entry" to `None`.
+fn read_account(account: &str) -> Result<Option<String>> {
+    match entry(account)?.get_password() {
+        Ok(pwd) => Ok(Some(pwd)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("keyring read: {e}")),
+    }
+}
+
+/// Decide what `get_password` returns from the scoped-account lookup and (for a
+/// non-bare active account) the legacy bare lookup, plus whether the chosen
+/// password must be migrated (copied) into the scoped account. Before per-home
+/// scoping, every home — including a relocated `WEFT_HOME` — stored its password
+/// under the bare account, so a scoped home with no entry yet adopts the legacy
+/// credential and copies it forward (a later release-side change can't desync it).
+fn resolve_lookup(
+    scoped: Option<String>,
+    account_is_bare: bool,
+    legacy_bare: Option<String>,
+) -> Option<(String, bool)> {
+    if let Some(pwd) = scoped {
+        return Some((pwd, false));
+    }
+    if !account_is_bare {
+        if let Some(legacy) = legacy_bare {
+            return Some((legacy, true));
+        }
+    }
+    None
+}
+
 /// 把用户密码序列化成 SQLCipher 的 `"x'<hex>'"` 字面量或带引号字符串字面量。
 /// 密码走 PBKDF2，传 PRAGMA key 时用 SQL 字符串就行。注意密码里的单引号要 doubled。
 pub fn pragma_literal(password: &str) -> String {
@@ -47,17 +83,31 @@ pub fn pragma_literal(password: &str) -> String {
 }
 
 /// 取 Keychain 里保存的密码；不存在返回 None。优先 env bypass 用于测试隔离。
+/// 对非默认 home（dev 的 `~/.weft-dev` 或重定位的 `WEFT_HOME`），若自己的账户尚无
+/// 条目，则沿用并迁移历史 bare 账户里的凭据，避免老的加密 relocated home 打不开。
 pub fn get_password() -> Result<Option<String>> {
     if let Ok(pwd) = std::env::var(ENV_BYPASS) {
         return Ok(Some(pwd));
     }
-    let home = active_home()?;
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&home))
-        .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
-    match entry.get_password() {
-        Ok(pwd) => Ok(Some(pwd)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("keyring read: {e}")),
+    let account = keychain_account(&active_home()?);
+    let account_is_bare = account == KEYCHAIN_ACCOUNT;
+    let scoped = read_account(&account)?;
+    // Only consult the legacy bare account when this home has no entry of its own.
+    let legacy_bare = if account_is_bare || scoped.is_some() {
+        None
+    } else {
+        read_account(KEYCHAIN_ACCOUNT)?
+    };
+    match resolve_lookup(scoped, account_is_bare, legacy_bare) {
+        Some((pwd, migrate)) => {
+            if migrate {
+                entry(&account)?
+                    .set_password(&pwd)
+                    .map_err(|e| anyhow::anyhow!("keyring migrate: {e}"))?;
+            }
+            Ok(Some(pwd))
+        }
+        None => Ok(None),
     }
 }
 
@@ -67,10 +117,8 @@ pub fn set_password(password: &str) -> Result<()> {
         std::env::set_var(ENV_BYPASS, password);
         return Ok(());
     }
-    let home = active_home()?;
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&home))
-        .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
-    entry
+    let account = keychain_account(&active_home()?);
+    entry(&account)?
         .set_password(password)
         .map_err(|e| anyhow::anyhow!("keyring write: {e}"))?;
     Ok(())
@@ -83,10 +131,8 @@ pub fn delete_password() -> Result<()> {
         std::env::remove_var(ENV_BYPASS);
         return Ok(());
     }
-    let home = active_home()?;
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&home))
-        .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
-    match entry.delete_credential() {
+    let account = keychain_account(&active_home()?);
+    match entry(&account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow::anyhow!("keyring delete: {e}")),
     }
@@ -143,5 +189,34 @@ mod tests {
             keychain_account_for(Path::new("/custom/home"), release),
             "db-password-v1::/custom/home"
         );
+    }
+
+    #[test]
+    fn scoped_password_wins_without_migration() {
+        // When the home's own account already has a password, use it as-is — never
+        // touch the legacy bare account.
+        assert_eq!(
+            resolve_lookup(Some("p".into()), false, Some("legacy".into())),
+            Some(("p".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn scoped_home_adopts_and_migrates_legacy_bare() {
+        // A relocated/dev home with no entry yet adopts the legacy bare credential
+        // and flags it for migration into its own account.
+        assert_eq!(
+            resolve_lookup(None, false, Some("legacy".into())),
+            Some(("legacy".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn bare_account_never_self_falls_back() {
+        // The canonical release home IS the bare account, so it must not fall back
+        // to itself; and with nothing stored anywhere the result is None (surfacing
+        // the explicit "no password" error rather than a wrong credential).
+        assert_eq!(resolve_lookup(None, true, Some("legacy".into())), None);
+        assert_eq!(resolve_lookup(None, false, None), None);
     }
 }
