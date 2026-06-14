@@ -369,12 +369,12 @@ fn opencode_data_dirs() -> Vec<PathBuf> {
     dirs_out
 }
 
-/// 解析 opencode 当前活跃的 DB 文件路径。硬编码 `opencode.db` 会在 prod/stable 渠道上读不到
-/// (那里是 `opencode-prod.db` / `opencode-stable.db`),也会在 Windows 上读不到(库在
-/// `%APPDATA%`)。故扫描所有候选数据目录里的 `opencode*.db`,取 **mtime 最新**的那个
-/// (= 正在写的活跃库),跨平台 + 跨渠道。
-fn opencode_db_path() -> Option<PathBuf> {
-    let mut best: Option<(SystemTime, PathBuf)> = None;
+/// 所有候选 opencode DB 路径,按 mtime **新→旧**排序(活跃库优先)。覆盖渠道变体
+/// (`opencode.db` / `opencode-prod.db` / `opencode-stable.db`)与跨平台数据目录。
+/// **不返回单个"全局最新"** —— 那个库可能属于别的渠道、不含目标 session;调用方应逐个
+/// 尝试直到找到拥有该 session 的库(见 [`opencode_session_usage`] / [`read_opencode`])。
+fn opencode_db_candidates() -> Vec<PathBuf> {
+    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
     for dir in opencode_data_dirs() {
         let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
@@ -388,16 +388,11 @@ fn opencode_db_path() -> Option<PathBuf> {
             let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            let newer = match &best {
-                Some((t, _)) => mtime > *t,
-                None => true,
-            };
-            if newer {
-                best = Some((mtime, entry.path()));
-            }
+            found.push((mtime, entry.path()));
         }
     }
-    best.map(|(_, p)| p)
+    found.sort_by(|a, b| b.0.cmp(&a.0)); // 新→旧
+    found.into_iter().map(|(_, p)| p).collect()
 }
 
 /// 会话信息面板(M2):opencode 会话的「当前上下文」usage + model,按 session id(= 我们的
@@ -406,7 +401,19 @@ fn opencode_db_path() -> Option<PathBuf> {
 /// model 取 message 行的 `providerID`/`modelID`(不用 `session.model` 列——当前 opencode 对
 /// 最新会话该列常为空,model 身份只在 message 行可靠)。ro 连接,不扰动 live(WAL)db。
 pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<String>)> {
-    let db = opencode_db_path()?;
+    // 多渠道库并存时逐个尝试,返回**拥有该 session** 的库给出的结果——光取"全局最新库"
+    // 可能落在别的渠道、查不到该 session(见 opencode_db_candidates)。
+    for db in opencode_db_candidates() {
+        if let Some(found) = usage_from_db(&db, native_id).await {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// 单个 DB 里查该 session 最近一条 assistant 消息的 usage + model;该库不含此 session
+/// (查不到行)→ `None`,调用方接着试下一个候选库。
+async fn usage_from_db(db: &Path, native_id: &str) -> Option<(u64, Option<String>)> {
     let url = format!("sqlite://{}?mode=ro", db.to_string_lossy());
     let mut opt = ConnectOptions::new(url);
     opt.max_connections(1).sqlx_logging(false);
@@ -426,25 +433,28 @@ pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<Stri
         ))
         .await
         .ok()?;
-    let (ctx, model) = match rows.first() {
-        Some(r) => {
-            let ti: i64 = r.try_get("", "ti").unwrap_or(0);
-            let tcr: i64 = r.try_get("", "tcr").unwrap_or(0);
-            let model = crate::session_meta::opencode_model_json(
-                r.try_get::<String>("", "pid").ok(),
-                r.try_get::<String>("", "mid").ok(),
-            );
-            ((ti.max(0) as u64) + (tcr.max(0) as u64), model)
-        }
-        None => (0, None),
-    };
-    Some((ctx, model))
+    let r = rows.first()?; // 该库无此 session 的 assistant 行 → None,试下一个候选库
+    let ti: i64 = r.try_get("", "ti").unwrap_or(0);
+    let tcr: i64 = r.try_get("", "tcr").unwrap_or(0);
+    let model = crate::session_meta::opencode_model_json(
+        r.try_get::<String>("", "pid").ok(),
+        r.try_get::<String>("", "mid").ok(),
+    );
+    Some(((ti.max(0) as u64) + (tcr.max(0) as u64), model))
 }
 
 async fn read_opencode(cwd: &Path) -> Option<Vec<NormEvent>> {
+    // 逐个候选库尝试,返回**含该 cwd 会话**的那个库的事件(光取全局最新库可能落空)。
+    for db in opencode_db_candidates() {
+        if let Some(events) = read_opencode_from(&db, cwd).await {
+            return Some(events);
+        }
+    }
+    None
+}
+
+async fn read_opencode_from(db: &Path, cwd: &Path) -> Option<Vec<NormEvent>> {
     use std::collections::HashMap;
-    // 渠道无关地挑活跃库(opencode.db / opencode-prod.db / opencode-stable.db…)。
-    let db = opencode_db_path()?;
     let raw = cwd.to_string_lossy().to_string();
     let canon = std::fs::canonicalize(cwd)
         .ok()
