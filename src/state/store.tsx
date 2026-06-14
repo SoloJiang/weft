@@ -16,6 +16,7 @@ import type {
   ImageAttachment,
   LeadChatPush,
   LeadMessage,
+  LiveWorkerSlot,
   NeedItem,
   PermissionAsk,
   Proposal,
@@ -788,6 +789,58 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [activeThreadId, openWorker],
   );
+
+  // Adopt a backend-initiated worker (boot revive, or one still alive after a
+  // frontend reload/HMR) into the session map. Idempotent and keyed on the
+  // session id. Unlike driveDirection it NEVER calls chatOpenWorker — the engine
+  // is already live in the backend, so there is nothing to start; calling it
+  // would respawn a stopped worker. Uses the slot's OWN thread id (a revived
+  // worker can belong to any thread, not activeThreadId). The unconditional
+  // setWorkerTurn in the lead-chat listener already seeds turn state, so a
+  // busy→idle transition fires the auto-verify effect once the session exists.
+  const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
+    const sid = slot.info.session_id;
+    if (sessionsRef.current[sid]) return;
+    setSessions((m) =>
+      m[sid]
+        ? m
+        : {
+            ...m,
+            [sid]: {
+              info: slot.info,
+              status: slot.busy ? "running" : "idle",
+              directionId: slot.direction_id,
+              repoId: slot.repo_id,
+              threadId: slot.thread_id,
+              nativeId: slot.info.native_id,
+            },
+          },
+    );
+  }, []);
+
+  // Pull the backend's live worker engines and adopt any the frontend doesn't
+  // know about. Called on mount (backstop for workers live before the listener
+  // registered) and when a turn push references an unknown busy session. The
+  // in-flight guard collapses concurrent triggers into one pull.
+  const hydratingRef = useRef(false);
+  const hydrateLiveWorkers = useCallback(async () => {
+    if (hydratingRef.current) return;
+    hydratingRef.current = true;
+    try {
+      const slots = await api.listLiveWorkerSlots();
+      for (const slot of slots) adoptWorker(slot);
+    } catch {
+      /* best-effort hydration */
+    } finally {
+      hydratingRef.current = false;
+    }
+  }, [adoptWorker]);
+
+  // Mount backstop: adopt workers already live before the listener registered —
+  // boot-revived before mount, or still alive after a frontend reload/HMR.
+  useEffect(() => {
+    void hydrateLiveWorkers();
+  }, [hydrateLiveWorkers]);
 
   // Lazy attach + send: the worker surface is always input-able. Sending into a
   // worker with no live engine transparently resumes/dispatches it (focus=false,
