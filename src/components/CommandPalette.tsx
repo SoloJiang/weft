@@ -53,7 +53,7 @@ export function CommandPalette() {
     setNavCollapsed,
     activeWorkspaceId,
   } = useStore();
-  const { toggle: toggleTheme } = useTheme();
+  const { cycle: cycleTheme } = useTheme();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
@@ -160,7 +160,7 @@ export function CommandPalette() {
         group: t("palette.action"),
         label: t("palette.theme"),
         icon: <SunMoon size={14} />,
-        run: () => toggleTheme(),
+        run: () => cycleTheme(),
       },
       {
         key: "act-settings",
@@ -184,7 +184,7 @@ export function CommandPalette() {
     navCollapsed,
     setNavCollapsed,
     activeWorkspaceId,
-    toggleTheme,
+    cycleTheme,
     t,
   ]);
 

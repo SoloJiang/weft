@@ -7,15 +7,16 @@
     <title>weft</title>
     <script>
       // Apply the theme before first paint to avoid a flash of the wrong theme.
+      // Explicit "dark"/"light" pin; "system" or no saved value follow the OS.
       (function () {
         try {
           var k = localStorage.getItem("weft-theme");
           var t =
             k === "dark" || k === "light"
               ? k
-              : matchMedia("(prefers-color-scheme: light)").matches
-                ? "light"
-                : "dark";
+              : matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
           document.documentElement.dataset.theme = t;
         } catch (e) {
           document.documentElement.dataset.theme = "dark";

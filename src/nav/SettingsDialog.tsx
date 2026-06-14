@@ -10,6 +10,7 @@ import {
   Database,
   FolderOpen,
   MessageSquare,
+  Monitor,
   Moon,
   Palette,
   Search,
@@ -34,7 +35,7 @@ import {
   type NotifyPermission,
 } from "../lib/notifications";
 import { useStore } from "../state/store";
-import { useTheme } from "../state/theme";
+import { useTheme, type ThemePref } from "../state/theme";
 
 type SettingsPage = "general" | "appearance" | "automation" | "skills" | "im" | "backup";
 
@@ -528,7 +529,7 @@ function ToolDiagnosticCard({ tool }: { tool: import("../lib/types").ToolStatus 
 
 function AppearanceSettings() {
   const { t } = useTranslation();
-  const { theme, toggle } = useTheme();
+  const { pref, setPref } = useTheme();
   const [lang, setLangState] = useState<Lang>(currentLang());
 
   useEffect(() => {
@@ -539,13 +540,12 @@ function AppearanceSettings() {
     <SettingsGroup title={t("settings.interface")}>
       <SettingRow label={t("settings.theme")}>
         <Segmented
-          value={theme}
-          onChange={(v) => {
-            if (v !== theme) toggle();
-          }}
+          value={pref}
+          onChange={(v) => setPref(v as ThemePref)}
           options={[
-            { value: "dark", label: t("settings.dark"), icon: <Moon size={13} /> },
+            { value: "system", label: t("settings.system"), icon: <Monitor size={13} /> },
             { value: "light", label: t("settings.light"), icon: <Sun size={13} /> },
+            { value: "dark", label: t("settings.dark"), icon: <Moon size={13} /> },
           ]}
         />
       </SettingRow>
