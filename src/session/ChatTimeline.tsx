@@ -9,6 +9,7 @@ import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock
 import type { useRepoActions } from "./useRepoActions";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
+type EmptyStateMode = "default" | "lead-task" | "lead-repo-guide";
 
 /**
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
@@ -32,6 +33,7 @@ export function ChatTimeline({
   workspaceId,
   promptText,
   cwd,
+  emptyState = "default",
 }: {
   messages: LeadMessage[];
   busy: boolean;
@@ -46,6 +48,8 @@ export function ChatTimeline({
   promptText?: (title: string, placeholder?: string) => Promise<string | null>;
   /** Session working dir — resolves relative file paths agents mention. */
   cwd?: string;
+  /** Lead hosts opt into task/repo guidance; workers keep the default empty state. */
+  emptyState?: EmptyStateMode;
 }) {
   const { t } = useTranslation();
   const endRef = useRef<HTMLDivElement>(null);
@@ -72,11 +76,14 @@ export function ChatTimeline({
 
   if (visible.length === 0 && !busy) {
     return (
-      <div className="flex flex-1 items-center justify-center px-6 text-center">
-        <p className="text-[12px] leading-relaxed text-ink-faint">
-          {t("lead.transcriptEmpty")}
-        </p>
-      </div>
+      <EmptyLeadState
+        mode={emptyState}
+        runAction={runAction}
+        actionsBusy={actionsBusy}
+        threadId={threadId ?? null}
+        workspaceId={workspaceId ?? null}
+        promptText={promptText}
+      />
     );
   }
 
@@ -110,6 +117,85 @@ export function ChatTimeline({
         )}
       </div>
       <div ref={endRef} />
+    </div>
+  );
+}
+
+function EmptyLeadState({
+  mode,
+  runAction,
+  actionsBusy,
+  threadId,
+  workspaceId,
+  promptText,
+}: {
+  mode: EmptyStateMode;
+  runAction?: RunAction;
+  actionsBusy?: Record<string, boolean>;
+  threadId: number | null;
+  workspaceId: number | null;
+  promptText?: (title: string, placeholder?: string) => Promise<string | null>;
+}) {
+  const { t } = useTranslation();
+
+  if (mode === "lead-repo-guide" && runAction && promptText) {
+    const actions: ActionCardAction[] = [
+      { id: "empty-add-repo", kind: "add", label: t("actionCard.addRepoLabel") },
+      { id: "empty-new-repo", kind: "new", label: t("actionCard.newRepoLabel") },
+      { id: "empty-clone-repo", kind: "clone", label: t("actionCard.cloneRepoLabel") },
+    ];
+    const steps = [
+      t("lead.repoGuideStepChoose"),
+      t("lead.repoGuideStepMap"),
+      t("lead.repoGuideStepReturn"),
+    ];
+
+    return (
+      <div className="flex flex-1 items-center justify-center px-4 py-6">
+        <div className="w-full max-w-[620px]">
+          <ActionCardBlock
+            title={t("lead.repoGuideTitle")}
+            body={t("lead.repoGuideBody")}
+            steps={steps}
+            actions={actions}
+            readOnly={false}
+            busy={actionsBusy ?? {}}
+            onAction={(action) =>
+              void runAction({
+                actionId: action.id,
+                kind: action.kind,
+                ctx: {
+                  threadId: threadId ?? undefined,
+                  preferredWorkspaceId: workspaceId,
+                },
+                promptText,
+              })
+            }
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (mode === "lead-task") {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-center">
+        <div className="max-w-[420px]">
+          <span className="mx-auto grid h-8 w-8 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
+            <Sparkles size={15} />
+          </span>
+          <p className="mt-3 text-[13px] font-medium text-ink">{t("lead.taskEmptyTitle")}</p>
+          <p className="mt-1.5 text-[12px] leading-relaxed text-ink-faint">
+            {t("lead.taskEmptyBody")}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-1 items-center justify-center px-6 text-center">
+      <p className="text-[12px] leading-relaxed text-ink-faint">{t("lead.transcriptEmpty")}</p>
     </div>
   );
 }
@@ -204,7 +290,10 @@ function TimelineRow({
     // runtime-checked sentinel payload from the lead — schema enforced by
     // src-tauri/src/lead_chat/sentinels.rs before the row is persisted.
     const actions = Array.isArray(parsed.actions)
-      ? (parsed.actions as ActionCardAction[])
+      ? parsed.actions.filter(isActionCardAction)
+      : [];
+    const steps = Array.isArray(parsed.steps)
+      ? parsed.steps.filter((step): step is string => typeof step === "string")
       : [];
     // Worker hosts (no runAction wired) and historical rows fall back to
     // read-only — buttons render disabled so the card stays in context but
@@ -227,6 +316,7 @@ function TimelineRow({
       <ActionCardBlock
         title={title}
         body={body}
+        steps={steps.length > 0 ? steps : undefined}
         actions={actions}
         readOnly={readOnly}
         busy={actionsBusy ?? {}}
@@ -324,19 +414,29 @@ function TimelineRow({
               <QueuedChip />
             </span>
           )}
+          {m.status === "error" && (
+            <p className="self-end text-[11px] text-danger">{t("lead.errored")}</p>
+          )}
         </div>
       </div>
     );
   }
 
   // assistant / system text
+  const terminal = typeof c.terminal === "string" ? c.terminal : "";
+  const assistantText =
+    terminal === "error_before_output"
+      ? t("lead.terminalErrorBeforeOutput")
+      : terminal === "interrupted_before_output"
+        ? t("lead.terminalInterruptedBeforeOutput")
+        : String(c.text ?? "");
   return (
     <div className="flex items-start gap-2.5">
       <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
         <Sparkles size={14} />
       </span>
       <div className="min-w-0 flex-1 rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-        <Markdown text={String(c.text ?? "")} cwd={cwd} />
+        {assistantText && <Markdown text={assistantText} cwd={cwd} />}
         {m.status === "streaming" && (
           <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
         )}
@@ -348,6 +448,16 @@ function TimelineRow({
         )}
       </div>
     </div>
+  );
+}
+
+function isActionCardAction(value: unknown): value is ActionCardAction {
+  if (!value || typeof value !== "object") return false;
+  const action = value as Record<string, unknown>;
+  return (
+    typeof action.id === "string" &&
+    typeof action.label === "string" &&
+    (action.kind === "add" || action.kind === "new" || action.kind === "clone")
   );
 }
 

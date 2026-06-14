@@ -40,6 +40,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     leadTurn,
     leadSlash,
     leadActivity,
+    repos,
     loadLeadChat,
     discoverLeadSlash,
     sendLeadChat,
@@ -125,6 +126,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
         workspaceId={activeWorkspaceId}
         promptText={promptText}
         cwd={leadCwd}
+        emptyState={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
       />
       <ChatComposer
         slashCommands={leadSlash[activeThreadId] ?? []}

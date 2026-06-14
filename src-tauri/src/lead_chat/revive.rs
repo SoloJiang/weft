@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Semaphore;
 
 use crate::lead_chat::commands::{chat_open_worker_impl, lead_engine, lead_key};
@@ -93,6 +93,7 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
         workers.len(),
         leads.len()
     );
+    let revived_workers = workers.len();
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
     for tid in leads {
@@ -111,6 +112,12 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
     }
     for h in handles {
         let _ = h.await;
+    }
+    // A worker revived AFTER the frontend store mounted isn't caught by its
+    // mount-time pull, and a nudge-driven turn emits no busy push the listener
+    // could react to. Tell the frontend to re-pull live workers. Payload-less.
+    if revived_workers > 0 {
+        let _ = app.emit("worker-revived", ());
     }
     Ok(())
 }
