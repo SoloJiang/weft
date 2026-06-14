@@ -192,13 +192,14 @@ function AskBox({
 
   const quoted = line?.text != null && line.text.trim() !== "" ? line.text : null;
   // Which line this comment targets: the new-side number if the line exists in
-  // the new file, else the old-side number, else the whole file.
-  const target =
+  // the new file, else the old-side number, else null (whole file).
+  const at =
     line?.rno != null
-      ? t("diff.askLineRef", { side: "R", n: line.rno })
+      ? { side: "R", n: line.rno }
       : line?.lno != null
-        ? t("diff.askLineRef", { side: "L", n: line.lno })
-        : t("diff.askFileRef");
+        ? { side: "L", n: line.lno }
+        : null;
+  const target = at ? t("diff.askLineRef", at) : t("diff.askFileRef");
 
   const grow = (el: HTMLTextAreaElement) => {
     el.style.height = "auto";
@@ -208,8 +209,13 @@ function AskBox({
   const send = () => {
     const v = q.trim();
     if (!v) return;
+    // Carry the exact line target into the message so the worker applies the
+    // request to the right line even when the quoted text repeats (dup/blank).
+    const header = at
+      ? t("diff.askContextLine", { path, ...at })
+      : t("diff.askContext", { path });
     const quote = quoted != null ? `\n> ${quoted}` : "";
-    onSend(`${t("diff.askContext", { path })}${quote}\n\n${v}`);
+    onSend(`${header}${quote}\n\n${v}`);
   };
 
   return (

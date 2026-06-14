@@ -308,6 +308,7 @@ export const en = {
     askCancel: "Cancel",
     askSubmit: "Send",
     askContext: "About this change in `{{path}}`:",
+    askContextLine: "About this change in `{{path}}` (line {{side}}{{n}}):",
   },
   observe: {
     answerPlaceholder: "Type a reply, press Enter",

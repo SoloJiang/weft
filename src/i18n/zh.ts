@@ -298,6 +298,7 @@ export const zh = {
     askCancel: "取消",
     askSubmit: "发送",
     askContext: "关于 `{{path}}` 这处改动：",
+    askContextLine: "关于 `{{path}}`（第 {{side}}{{n}} 行）这处改动：",
   },
   observe: {
     answerPlaceholder: "输入回复，回车发送",
