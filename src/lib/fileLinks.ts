@@ -99,14 +99,23 @@ export function isPathLike(token: string): boolean {
 
 export type Seg = { type: "text" | "path"; value: string };
 
+// CJK full-width brackets / quotes / stops common in Chinese prose. Chinese has
+// no inter-word spaces, so these are treated as token DELIMITERS (split on them),
+// not just peeled — otherwise `lib/x.rs，然后` stays one token and never matches.
+const CJK_PUNCT = "（）【】「」『』〔〕〈〉《》〖〗。，、；：！？…—～·｜“”‘’";
+const DELIM = new RegExp(`(\\s+|[${CJK_PUNCT}]+)`);
+const IS_DELIM = new RegExp(`^(?:\\s|[${CJK_PUNCT}])`);
+// ASCII punctuation that hugs a path is peeled back into the text run.
 const LEAD_PUNCT = /^[([{<'"`]+/;
 const TAIL_PUNCT = /[)\]}>'"`.,;:!?]+$/;
 
 // Cheap gate before the heavier isPathLike: a separator, a dot (extensions or
-// dotfiles), or the two dotless manifest names. Lets ordinary prose words bail
-// out without a regex match.
+// dotfiles), or a dotless manifest name (optionally with a `:line` suffix).
+// Lets ordinary prose words bail out without a regex match.
 function couldBePath(core: string): boolean {
-  return /[/\\.]/.test(core) || core === "Dockerfile" || core === "Makefile";
+  if (/[/\\.]/.test(core)) return true;
+  const head = core.replace(/:\d+(?::\d+)?$/, ""); // drop :line for the dotless check
+  return head === "Dockerfile" || head === "Makefile";
 }
 
 function pushText(segs: Seg[], v: string): void {
@@ -116,17 +125,17 @@ function pushText(segs: Seg[], v: string): void {
 }
 
 /**
- * Split prose into text/path segments (re-joining to the original string). Works
- * token-by-token so bare names (`Cargo.toml`) are caught alongside separator
- * paths (`src/foo.ts`, `src\foo.ts`); surrounding punctuation is peeled back
- * into the text run.
+ * Split prose into text/path segments (re-joining to the original string). Splits
+ * on whitespace AND CJK punctuation so bare names (`Cargo.toml`) and separator
+ * paths (`src/foo.ts`, `src\foo.ts`) are caught even when hugged by Chinese
+ * punctuation (`（src/App.tsx）`, `lib/x.rs，然后`); ASCII punctuation is peeled.
  */
 export function splitTextForPaths(text: string): Seg[] {
   const segs: Seg[] = [];
-  for (const part of text.split(/(\s+)/)) {
+  for (const part of text.split(DELIM)) {
     if (!part) continue;
-    if (/^\s/.test(part)) {
-      pushText(segs, part);
+    if (IS_DELIM.test(part)) {
+      pushText(segs, part); // whitespace / CJK-punctuation run → text
       continue;
     }
     const lead = part.match(LEAD_PUNCT)?.[0] ?? "";

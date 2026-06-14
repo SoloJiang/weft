@@ -2,8 +2,8 @@
 //! file references inside chat: the product hides plumbing (worktree paths,
 //! branches) but ALWAYS offers a real way out — open the working copy in a
 //! terminal/file manager, or open a file the agent mentioned with the OS default
-//! app. Opening + revealing go through `tauri-plugin-opener`, so they work on
-//! macOS/Windows/Linux. (`open_terminal` is still macOS-only — a later adapt pass.)
+//! app. Opening files/URLs + revealing go through `tauri-plugin-opener`, so they
+//! work on macOS/Windows/Linux. (`open_terminal` is still macOS-only — later pass.)
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,19 +32,12 @@ pub fn open_terminal(path: String) -> Result<(), String> {
     }
 }
 
-/// Open a URL or app deep link with the OS handler (e.g. `codex://threads/<id>`
-/// to jump to a session in the Codex app). Best-effort.
+/// Open a URL or app deep link with the OS handler — `https://…`, app schemes
+/// like `ms-settings:…`/`vscode-insiders://…`, or `codex://threads/<id>` to jump
+/// to a session in the Codex app. Cross-platform via the opener plugin.
 #[tauri::command]
 pub fn open_url(url: String) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg(&url).status().map_err(err)?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("opening a url is only supported on macOS for now".into())
-    }
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(err)
 }
 
 /// Open a file the agent referenced in chat with the OS default app. `path` may
