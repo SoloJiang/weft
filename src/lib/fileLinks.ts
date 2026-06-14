@@ -16,20 +16,25 @@ import i18n from "../i18n";
 
 export type HrefKind = { kind: "web"; url: string } | { kind: "file"; token: string };
 
-const SCHEME_SLASH = /^[a-z][a-z0-9+.-]*:\/\//i; // http://, https://, codex://, vscode://
-const MAILTO_TEL = /^(mailto|tel):/i;
+const SCHEME = /^[a-z][a-z0-9+.-]*:/i; // http:, mailto:, ms-settings:, vscode-insiders:, …
+const LINE_SUFFIX = /^[^:]*:\d+(?::\d+)?$/; // path:line[:col] (head has no colon)
 const WIN_DRIVE = /^[a-zA-Z]:[\\/]/;
 
 /**
- * Classify a markdown link's href. Explicit links are lenient: anything that
- * isn't clearly a web/app URL or in-page anchor is treated as a local file (the
- * agent deliberately linked it).
+ * Classify a markdown link's href. Any real URI scheme (http://, mailto:,
+ * ms-settings:, codex://, vscode-insiders://, …) opens as a web/app link via the
+ * opener; everything else — absolute/relative paths, `path:line`, drive paths —
+ * is treated as a local file the agent deliberately linked.
  */
 export function classifyHref(href: string): HrefKind {
   const h = href.trim();
   if (/^file:\/\//i.test(h)) return { kind: "file", token: h };
   if (h.startsWith("#")) return { kind: "web", url: h }; // in-page anchor — leave alone
-  if (SCHEME_SLASH.test(h) || MAILTO_TEL.test(h)) return { kind: "web", url: h };
+  // A scheme prefix means a URI, UNLESS it's actually a Windows drive (`C:\`)
+  // or a `path:line` suffix (`Cargo.toml:42`).
+  if (SCHEME.test(h) && !WIN_DRIVE.test(h) && !LINE_SUFFIX.test(h)) {
+    return { kind: "web", url: h };
+  }
   return { kind: "file", token: h };
 }
 
@@ -50,6 +55,7 @@ export function parsePathToken(token: string): { path: string; line?: number; co
   } catch {
     /* malformed %-escape — leave as-is */
   }
+  t = t.replace(/^\/([A-Za-z]:[\\/])/, "$1"); // /C:/repo → C:/repo (mirror backend)
   const m = t.match(/^(.*?):(\d+)(?::(\d+))?$/);
   // `m[1].length > 1` keeps a lone Windows drive letter (e.g. "C:5") intact.
   if (m && m[1].length > 1) {
