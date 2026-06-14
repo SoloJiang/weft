@@ -36,11 +36,13 @@ pub fn worktree_root(repo_path: &Path) -> PathBuf {
 /// materializes its ref, the second `git worktree add` fails loudly (recoverable
 /// by renaming) — the cross-DB form of the single-DB race `reserved` already guards.
 fn worktree_dirname(home: Option<&Path>) -> String {
-    worktree_dirname_for(
-        home,
-        crate::paths::default_home(false).as_deref(),
-        crate::paths::default_home(true).as_deref(),
-    )
+    // Canonicalize so the same physical home via a symlink or `..` resolves to one
+    // root — an aliased release home must not get a second `weft-<hash>` root that
+    // gc::sweep_orphan_worktrees would treat as a foreign home's.
+    let home = home.map(crate::paths::canonical);
+    let release = crate::paths::default_home(false).map(|p| crate::paths::canonical(&p));
+    let dev = crate::paths::default_home(true).map(|p| crate::paths::canonical(&p));
+    worktree_dirname_for(home.as_deref(), release.as_deref(), dev.as_deref())
 }
 
 fn worktree_dirname_for(

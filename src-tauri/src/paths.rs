@@ -1,7 +1,7 @@
 //! Canonical weft home + derived paths. Everything persistent lives under
 //! ~/.weft so worktree cwds stay stable across restarts (resume depends on it).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// weft home. Honors the WEFT_HOME env override (used for test isolation and to
 /// let users relocate weft's data); otherwise `~/<home_dir_name>` — `.weft-dev`
@@ -38,6 +38,15 @@ fn home_dir_name(debug_build: bool) -> &'static str {
 /// against these.
 pub fn default_home(debug_build: bool) -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(home_dir_name(debug_build)))
+}
+
+/// Best-effort canonicalization: resolves symlinks and `..` so two paths naming
+/// the same physical directory compare equal. Falls back to the input unchanged
+/// if it can't be canonicalized (e.g. the path doesn't exist yet). Used to key
+/// per-home identity (keychain account, worktree root) so an aliased home isn't
+/// mistaken for a different data set.
+pub fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// ~/.weft/weft.db
@@ -86,6 +95,18 @@ mod tests {
         assert!(db_path().unwrap().ends_with("weft.db"));
         assert!(worktree_home().unwrap().ends_with("worktrees"));
         assert!(skills_home().unwrap().ends_with("skills/sources"));
+    }
+
+    #[test]
+    fn canonical_collapses_dotdot() {
+        // The same physical dir reached via `..` must canonicalize equal, so home
+        // identity (keychain account / worktree root) is alias-stable.
+        let tmp = std::env::temp_dir().join(format!("weft-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        let aliased = tmp.join("sub").join(".."); // <tmp>/sub/.. == <tmp>
+        assert_eq!(canonical(&aliased), canonical(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

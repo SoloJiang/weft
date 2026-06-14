@@ -28,7 +28,14 @@ fn active_home() -> Result<PathBuf> {
 /// or an encrypted home gets read under the wrong account and fails to unlock. The
 /// canonical release home keeps the bare account for backward compatibility.
 fn keychain_account(home: &Path) -> String {
-    keychain_account_for(home, default_release_home().as_deref())
+    // Canonicalize so the same physical home reached via a symlink or `..` keys to
+    // the same account. Otherwise an aliased release home is misread as relocated:
+    // encryption mutations would write the scoped `db-password-v1::<home>` entry
+    // while rekeying the real DB, and a normal launch (bare account) could no
+    // longer decrypt it.
+    let home = crate::paths::canonical(home);
+    let release = default_release_home().map(|p| crate::paths::canonical(&p));
+    keychain_account_for(&home, release.as_deref())
 }
 
 fn keychain_account_for(home: &Path, release_home: Option<&Path>) -> String {
