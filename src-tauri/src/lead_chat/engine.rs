@@ -1227,27 +1227,14 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
 }
 
 /// Coordinator bus wake: drive the agent to read its inbox, coalescing wakes.
-/// While the engine is busy, this sets a single `bus_read_pending` flag instead
-/// of queuing one read per wake — the engine synthesizes exactly one inbox-read
-/// turn the moment its queue drains (immediate at turn-end, no fixed delay). An
-/// idle engine reads now; a stopped/taken-over engine is left untouched.
+/// Idle → read now; busy → reserve the wake's FIFO position (`request_bus_read`)
+/// so one inbox-read fires at that spot when the queue drains, never behind a
+/// later send; stopped/taken-over → left untouched. The whole decision runs
+/// under a single engine lock (in `send_hidden_inner`), so a racing user send
+/// can't slip the read out of order.
 pub async fn nudge_bus_read(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
     ensure_running(app, db, eng).await?;
-    {
-        let mut inner = eng.lock().await;
-        if inner.stopped {
-            return Ok(()); // taken over in the user's terminal — don't drive it
-        }
-        if inner.turn.busy {
-            // Coalesce into the running turn; read once when it drains.
-            inner.turn.request_bus_read();
-            return Ok(());
-        }
-    }
-    // Idle: read now. (A benign race where the engine turns busy between the
-    // drop above and the re-lock below just queues one read, drained the same
-    // way at turn-end.)
-    send_hidden_existing(app, db, eng, BUS_WAKE_PROMPT.to_string()).await
+    send_hidden_inner(app, db, eng, BUS_WAKE_PROMPT.to_string(), true).await
 }
 
 /// Deliver invisible plumbing to an existing engine. Unlike [`nudge`], this
@@ -1259,6 +1246,20 @@ pub async fn send_hidden_existing(
     db: &Db,
     eng: &EngineRef,
     text: String,
+) -> anyhow::Result<()> {
+    send_hidden_inner(app, db, eng, text, false).await
+}
+
+/// Shared body of [`send_hidden_existing`] and [`nudge_bus_read`]. The single
+/// lock makes the busy/idle decision atomic. When `bus_read`, a busy engine
+/// reserves the wake's FIFO position (coalescing) instead of tail-queuing, and a
+/// stopped/not-accepting engine is skipped rather than erroring.
+async fn send_hidden_inner(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    text: String,
+    bus_read: bool,
 ) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
     let out = Outgoing {
@@ -1275,10 +1276,20 @@ pub async fn send_hidden_existing(
         inner.stopped,
     ) {
         HiddenDelivery::Noop => {
+            if bus_read {
+                return Ok(()); // a bus wake is best-effort; don't error
+            }
             anyhow::bail!("lead engine is not accepting hidden input");
         }
         HiddenDelivery::Queue => {
-            queue_hidden_delivery(app, &mut inner, out);
+            if bus_read {
+                // Busy: reserve the wake's FIFO position (coalescing further
+                // wakes into one read) instead of tail-queuing, so a later send
+                // can't be answered before the inbox read. Atomic under the lock.
+                inner.turn.request_bus_read();
+            } else {
+                queue_hidden_delivery(app, &mut inner, out);
+            }
             Ok(())
         }
         HiddenDelivery::WriteResident => {
