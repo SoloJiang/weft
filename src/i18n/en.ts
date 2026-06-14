@@ -303,6 +303,16 @@ export const en = {
     askPlaceholder: "Ask the worker about this change… (Enter sends; wakes it)",
     askContext: "About this change in `{{path}}`:",
   },
+  sessionInfo: {
+    title: "Session",
+    used: "{{pct}}% used",
+    pending: "Available after first message",
+    noSkills: "No skills enabled",
+    servers_one: "{{count}} server",
+    servers_other: "{{count}} servers",
+    tools_one: "{{count}} tool",
+    tools_other: "{{count}} tools",
+  },
   observe: {
     answerPlaceholder: "Type a reply, press Enter",
   },

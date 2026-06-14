@@ -293,6 +293,14 @@ export const zh = {
     askPlaceholder: "问 worker 这处改动…（Enter 发送，自动唤醒）",
     askContext: "关于 `{{path}}` 这处改动：",
   },
+  sessionInfo: {
+    title: "会话信息",
+    used: "已用 {{pct}}%",
+    pending: "首条消息后可见",
+    noSkills: "未启用 skill",
+    servers_other: "{{count}} 个 server",
+    tools_other: "{{count}} 个 tool",
+  },
   observe: {
     answerPlaceholder: "输入回复，回车发送",
   },

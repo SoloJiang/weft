@@ -97,7 +97,7 @@ export function SessionInfoPanel({
           <div className="flex items-center">
             <span className="text-[11px] text-ink-faint">MCP</span>
             <span className="ml-auto text-[11px] text-ink-faint">
-              {t("sessionInfo.servers", { n: meta?.mcpServers.length ?? 0 })}
+              {t("sessionInfo.servers", { count: meta?.mcpServers.length ?? 0 })}
             </span>
           </div>
           {meta && meta.mcpServers.length > 0 ? (
@@ -132,7 +132,7 @@ function McpRow({ name, status, tools }: { name: string; status: string; tools: 
         <span className="min-w-0 flex-1 truncate text-[12.5px] text-ink">{name}</span>
         {hasTools && (
           <span className="shrink-0 text-[10.5px] text-ink-faint">
-            {t("sessionInfo.tools", { n: tools.length })}
+            {t("sessionInfo.tools", { count: tools.length })}
           </span>
         )}
         {hasTools &&
