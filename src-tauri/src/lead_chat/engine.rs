@@ -63,6 +63,11 @@ pub enum Push {
         session_id: Option<i32>,
         native_id: String,
         slash_commands: Vec<super::proto::SlashCmd>,
+        /// claude `system/init` 才有(随首条消息到达);其余 init 推空。
+        mcp_servers: Vec<super::proto::McpServer>,
+        tools: Vec<String>,
+        model: Option<String>,
+        window: Option<u64>,
     },
     /// The tool call currently executing — transient: rendered while it runs,
     /// replaced by the next one, cleared by the Turn event. Never persisted.
@@ -71,6 +76,14 @@ pub enum Push {
         session_id: Option<i32>,
         name: String,
         summary: String,
+    },
+    /// 每个 turn 结束推一次当前上下文占用;window 跟随最近一次 init 的 model。
+    Usage {
+        thread_id: i32,
+        session_id: Option<i32>,
+        context_tokens: u64,
+        window: Option<u64>,
+        model: Option<String>,
     },
 }
 
@@ -191,6 +204,13 @@ pub struct EngineInner {
     /// Set on idle when skills changed; the next send silently restarts the
     /// resident process so it picks up newly-injected skills. UI never sees it.
     pub pending_skill_refresh: bool,
+    /// 会话信息面板的最近快照,供 lead_state / session_for 重挂回填(claude:init
+    /// 解析出 mcp/model/window,turn 结束更新 context_tokens)。
+    pub last_context_tokens: Option<u64>,
+    pub last_model: Option<String>,
+    pub last_window: Option<u64>,
+    pub last_mcp_servers: Vec<super::proto::McpServer>,
+    pub last_tools: Vec<String>,
     /// Opaque tag of the turn whose output is currently being emitted. Set at
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
@@ -635,9 +655,22 @@ async fn codex_consumer(
                     );
                 }
             }
-            ThreadMsg::Event(ChatEvent::TurnEnd { is_error }) => {
+            ThreadMsg::Event(ChatEvent::TurnEnd { is_error, context_tokens }) => {
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
+                if let Some(ct) = context_tokens {
+                    inner.last_context_tokens = Some(ct);
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Usage {
+                            thread_id,
+                            session_id: inner.session_id,
+                            context_tokens: ct,
+                            window: inner.last_window,
+                            model: inner.last_model.clone(),
+                        },
+                    );
+                }
                 let status = if inner.interrupting {
                     "interrupted"
                 } else if is_error {
@@ -1073,6 +1106,10 @@ fn spawn_reader(
                             session_id: inner.session_id,
                             native_id: native,
                             slash_commands: inner.slash_commands.clone(),
+                            mcp_servers: inner.last_mcp_servers.clone(),
+                            tools: inner.last_tools.clone(),
+                            model: inner.last_model.clone(),
+                            window: inner.last_window,
                         },
                     );
                 }
@@ -1087,11 +1124,19 @@ fn spawn_reader(
                 super::proto::ChatEvent::Init {
                     session_id,
                     slash_commands,
+                    mcp_servers,
+                    tools,
+                    model,
                 } => {
                     inner.native_id = Some(session_id.clone());
                     let slash_commands =
                         merge_init_slash_commands(&inner.slash_commands, slash_commands);
                     inner.slash_commands = slash_commands.clone();
+                    let window = model.as_deref().and_then(super::window::context_window);
+                    inner.last_mcp_servers = mcp_servers.clone();
+                    inner.last_tools = tools.clone();
+                    inner.last_model = model.clone();
+                    inner.last_window = window;
                     if let Some(sid) = inner.session_id {
                         let _ = repo::set_session_native_id(&db, sid, &session_id).await;
                     } else {
@@ -1104,6 +1149,10 @@ fn spawn_reader(
                             session_id: inner.session_id,
                             native_id: session_id,
                             slash_commands,
+                            mcp_servers,
+                            tools,
+                            model,
+                            window,
                         },
                     );
                 }
@@ -1117,6 +1166,10 @@ fn spawn_reader(
                             session_id: inner.session_id,
                             native_id: inner.native_id.clone().unwrap_or_default(),
                             slash_commands: commands,
+                            mcp_servers: inner.last_mcp_servers.clone(),
+                            tools: inner.last_tools.clone(),
+                            model: inner.last_model.clone(),
+                            window: inner.last_window,
                         },
                     );
                 }
@@ -1359,7 +1412,20 @@ fn spawn_reader(
                         );
                     }
                 }
-                super::proto::ChatEvent::TurnEnd { is_error } => {
+                super::proto::ChatEvent::TurnEnd { is_error, context_tokens } => {
+                    if let Some(ct) = context_tokens {
+                        inner.last_context_tokens = Some(ct);
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Usage {
+                                thread_id,
+                                session_id: inner.session_id,
+                                context_tokens: ct,
+                                window: inner.last_window,
+                                model: inner.last_model.clone(),
+                            },
+                        );
+                    }
                     let status = if inner.interrupting {
                         "interrupted"
                     } else if is_error {
@@ -1784,6 +1850,11 @@ mod tests {
             interrupting: false,
             generation: 0,
             pending_skill_refresh: false,
+            last_context_tokens: None,
+            last_model: None,
+            last_window: None,
+            last_mcp_servers: vec![],
+            last_tools: vec![],
             current_origin_tag: None,
         };
         let fresh = build_args(&inner);

@@ -30,11 +30,22 @@ impl SlashCmd {
     }
 }
 
+/// 一个 MCP server 的连接态,来自 claude `system/init.mcp_servers`。
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct McpServer {
+    pub name: String,
+    pub status: String, // connected | pending | failed | …(原样透传)
+}
+
 #[derive(Debug)]
 pub enum ChatEvent {
     Init {
         session_id: String,
         slash_commands: Vec<SlashCmd>,
+        /// claude `system/init` 才有;codex/opencode 走 Commands/带外路径,留空。
+        mcp_servers: Vec<McpServer>,
+        tools: Vec<String>,
+        model: Option<String>,
     },
     TextDelta {
         text: String,
@@ -47,6 +58,8 @@ pub enum ChatEvent {
     },
     TurnEnd {
         is_error: bool,
+        /// 当前上下文 token(input + cache_read + cache_creation);拿不到为 None。
+        context_tokens: Option<u64>,
     },
     /// Response to our `initialize` control_request: the CLI's slash commands.
     /// Sent right after spawn — the `init` system message only arrives with the
@@ -119,8 +132,14 @@ fn parse_codex(line: &str) -> ChatEvent {
                 None => ChatEvent::Other,
             }
         }
-        Some("turn.completed") => ChatEvent::TurnEnd { is_error: false },
-        Some("turn.failed") | Some("error") => ChatEvent::TurnEnd { is_error: true },
+        Some("turn.completed") => ChatEvent::TurnEnd {
+            is_error: false,
+            context_tokens: None, // codex usage 解析留给后续里程碑
+        },
+        Some("turn.failed") | Some("error") => ChatEvent::TurnEnd {
+            is_error: true,
+            context_tokens: None,
+        },
         _ => ChatEvent::Other,
     }
 }
@@ -176,6 +195,24 @@ pub fn parse_line(line: &str) -> ChatEvent {
                         .collect()
                 })
                 .unwrap_or_default(),
+            mcp_servers: v["mcp_servers"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| {
+                            Some(McpServer {
+                                name: s["name"].as_str()?.to_string(),
+                                status: s["status"].as_str().unwrap_or("unknown").to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            tools: v["tools"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            model: v["model"].as_str().map(String::from),
         },
         Some("stream_event") => {
             let d = &v["event"]["delta"];
@@ -214,6 +251,7 @@ pub fn parse_line(line: &str) -> ChatEvent {
         }
         Some("result") => ChatEvent::TurnEnd {
             is_error: v["subtype"] != "success",
+            context_tokens: claude_context_tokens(&v["usage"]),
         },
         Some("control_response") => {
             let r = &v["response"];
@@ -241,6 +279,16 @@ pub fn parse_line(line: &str) -> ChatEvent {
         }
         _ => ChatEvent::Other,
     }
+}
+
+/// claude `result.usage` → 当前上下文占用(本回合送入的 prompt 体量)。
+/// 取 input + cache_read + cache_creation;usage 缺失/非对象返回 None。
+fn claude_context_tokens(usage: &Value) -> Option<u64> {
+    if !usage.is_object() {
+        return None;
+    }
+    let g = |k: &str| usage[k].as_u64().unwrap_or(0);
+    Some(g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens"))
 }
 
 /// First string-ish field of a tool input, truncated — just enough for a
@@ -278,6 +326,7 @@ mod tests {
             ChatEvent::Init {
                 session_id,
                 slash_commands,
+                ..
             } => {
                 assert_eq!(session_id, "abc-123");
                 assert_eq!(
@@ -287,6 +336,52 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn parses_init_mcp_tools_model() {
+        // 真实形状取自本机 `claude -p --output-format stream-json` 实测。
+        let l = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-4-8[1m]","slash_commands":["compact"],"tools":["Bash","mcp__codegraph__codegraph_search"],"mcp_servers":[{"name":"codegraph","status":"connected"},{"name":"tauri","status":"pending"}]}"#;
+        match parse_line(l) {
+            ChatEvent::Init {
+                mcp_servers,
+                tools,
+                model,
+                ..
+            } => {
+                assert_eq!(model.as_deref(), Some("claude-opus-4-8[1m]"));
+                assert_eq!(tools, vec!["Bash", "mcp__codegraph__codegraph_search"]);
+                assert_eq!(
+                    mcp_servers,
+                    vec![
+                        McpServer { name: "codegraph".into(), status: "connected".into() },
+                        McpServer { name: "tauri".into(), status: "pending".into() },
+                    ]
+                );
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_result_usage_context_tokens() {
+        let l = r#"{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":8684,"cache_creation_input_tokens":22127,"cache_read_input_tokens":0,"output_tokens":4}}"#;
+        match parse_line(l) {
+            ChatEvent::TurnEnd { is_error, context_tokens } => {
+                assert!(!is_error);
+                assert_eq!(context_tokens, Some(8684 + 22127));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn result_without_usage_has_none_tokens() {
+        let l = r#"{"type":"result","subtype":"success","is_error":false}"#;
+        assert!(matches!(
+            parse_line(l),
+            ChatEvent::TurnEnd { context_tokens: None, .. }
+        ));
     }
 
     #[test]
@@ -371,7 +466,7 @@ mod tests {
         }
         assert!(matches!(
             parse_line_for("codex", r#"{"type":"turn.completed","usage":{}}"#),
-            ChatEvent::TurnEnd { is_error: false }
+            ChatEvent::TurnEnd { is_error: false, .. }
         ));
     }
 
@@ -420,11 +515,11 @@ mod tests {
     fn parses_result_and_garbage() {
         assert!(matches!(
             parse_line(r#"{"type":"result","subtype":"success","is_error":false}"#),
-            ChatEvent::TurnEnd { is_error: false }
+            ChatEvent::TurnEnd { is_error: false, .. }
         ));
         assert!(matches!(
             parse_line(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#),
-            ChatEvent::TurnEnd { is_error: true }
+            ChatEvent::TurnEnd { is_error: true, .. }
         ));
         assert!(matches!(parse_line("not json"), ChatEvent::Other));
         assert!(matches!(

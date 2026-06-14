@@ -164,6 +164,11 @@ pub async fn lead_engine(
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        last_context_tokens: None,
+        last_model: None,
+        last_window: None,
+        last_mcp_servers: vec![],
+        last_tools: vec![],
         current_origin_tag: None,
     };
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
@@ -663,6 +668,11 @@ pub(crate) async fn chat_open_worker_impl(
                 interrupting: false,
                 generation: 0,
                 pending_skill_refresh: false,
+                last_context_tokens: None,
+                last_model: None,
+                last_window: None,
+                last_mcp_servers: vec![],
+                last_tools: vec![],
                 current_origin_tag: None,
             };
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
@@ -760,6 +770,11 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        last_context_tokens: None,
+        last_model: None,
+        last_window: None,
+        last_mcp_servers: vec![],
+        last_tools: vec![],
         current_origin_tag: None,
     };
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
