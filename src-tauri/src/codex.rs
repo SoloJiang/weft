@@ -33,10 +33,19 @@ pub fn ensure_codex_hook() {
     let Some(home) = codex_home() else {
         return;
     };
-    ensure_codex_hook_in(
-        &home.join(".codex").join("config.toml"),
-        &home.join(".weft").join("weft-codex-hook.sh"),
-    );
+    let Some(hook) = codex_hook_path() else {
+        return;
+    };
+    ensure_codex_hook_in(&home.join(".codex").join("config.toml"), &hook);
+}
+
+/// Weft's Codex PreToolUse hook script, kept under the active weft home so a dev
+/// build (`.weft-dev`) and the installed app (`.weft`) own separate copies rather
+/// than overwriting one shared path referenced from `~/.codex/config.toml`.
+fn codex_hook_path() -> Option<PathBuf> {
+    crate::paths::weft_home()
+        .ok()
+        .map(|home| home.join("weft-codex-hook.sh"))
 }
 
 /// The user's home directory, where Codex keeps `~/.codex/config.toml`. Resolved
@@ -369,6 +378,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    #[test]
+    fn codex_hook_path_lives_under_weft_home() {
+        // The hook script must live under the active weft home, so `tauri dev`
+        // (`.weft-dev`) and the installed app (`.weft`) never share one script.
+        let _g = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_dir("hook-home");
+        std::env::set_var("WEFT_HOME", &home);
+        let p = codex_hook_path().expect("hook path under weft home");
+        std::env::remove_var("WEFT_HOME");
+        assert_eq!(p, home.join("weft-codex-hook.sh"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
