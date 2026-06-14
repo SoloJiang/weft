@@ -8,6 +8,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "react-i18next";
 
 import { toast } from "../components/Toast";
+import { currentLang } from "../i18n";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
 import type { RepoRef } from "../lib/types";
@@ -66,9 +67,9 @@ export function useRepoActions() {
         ...payload,
       };
       try {
-        await api.postLeadToolResult(inv.ctx.threadId, full);
-      } catch {
-        // best-effort回灌; UI already toasted the user-visible outcome.
+        await api.postLeadToolResult(inv.ctx.threadId, full, currentLang());
+      } catch (e) {
+        console.warn("[weft] lead repo-action feedback delivery failed", e);
       }
     },
     [],

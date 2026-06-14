@@ -213,6 +213,8 @@ pub fn run() {
             lead_chat::commands::lead_stop,
             lead_chat::commands::lead_state,
             lead_chat::commands::list_lead_messages,
+            lead_chat::commands::list_live_worker_slots,
+            lead_chat::commands::auto_verify_check,
             lead_chat::commands::discover_slash,
             lead_chat::commands::post_lead_tool_result,
             lead_chat::commands::chat_open_worker,

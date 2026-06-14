@@ -133,6 +133,269 @@ pub fn per_turn(tool: &str) -> bool {
     crate::adapters::adapter_for(tool).is_some_and(|a| a.per_turn())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HiddenDelivery {
+    Noop,
+    Queue,
+    SpawnTurn,
+    WriteResident,
+}
+
+fn hidden_delivery(tool: &str, busy: bool, has_stdin: bool, stopped: bool) -> HiddenDelivery {
+    if stopped {
+        HiddenDelivery::Noop
+    } else if busy {
+        HiddenDelivery::Queue
+    } else if per_turn(tool) {
+        HiddenDelivery::SpawnTurn
+    } else if has_stdin {
+        HiddenDelivery::WriteResident
+    } else {
+        HiddenDelivery::Noop
+    }
+}
+
+fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
+    let _ = inner.turn.try_begin_send();
+    inner.turn_id += 1;
+    inner.clock.begin_turn();
+    // Plumbing starts a turn directly (not via send): keep the invariant.
+    inner.current_origin_tag = None;
+    inner.turn_id
+}
+
+fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> bool {
+    if inner.turn_id != turn_id || !inner.turn.busy {
+        return false;
+    }
+    inner.turn.busy = false;
+    inner.turn.queue.clear();
+    inner.clock.started = None;
+    inner.current_origin_tag = None;
+    inner.child = None;
+    inner.stdin = None;
+    inner.current = None;
+    inner.interrupting = false;
+    true
+}
+
+fn emit_finalize(app: &AppHandle, thread_id: i32, message_id: i32, status: &str) {
+    let _ = app.emit(
+        EVENT,
+        Push::Finalize {
+            thread_id,
+            message_id,
+            status: status.into(),
+        },
+    );
+}
+
+async fn mark_queued_delivered(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    out: &Outgoing,
+) {
+    if !out.tracked {
+        return;
+    }
+    match repo::complete_queued(db, thread_id, session_id).await {
+        Ok(Some(m)) => emit_finalize(app, thread_id, m.id, "complete"),
+        Ok(None) => {}
+        Err(e) => eprintln!("[weft] queued message complete failed: {e}"),
+    }
+}
+
+async fn mark_queued_status(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    status: &str,
+) {
+    match repo::set_queued_status(db, thread_id, session_id, status).await {
+        Ok(rows) => {
+            for m in rows {
+                emit_finalize(app, thread_id, m.id, status);
+            }
+        }
+        Err(e) => eprintln!("[weft] queued message {status} finalize failed: {e}"),
+    }
+}
+
+async fn mark_queued_failed(app: &AppHandle, db: &Db, thread_id: i32, session_id: Option<i32>) {
+    mark_queued_status(app, db, thread_id, session_id, "error").await;
+}
+
+fn emit_turn_state(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    busy: bool,
+    queued: usize,
+) {
+    let _ = app.emit(
+        EVENT,
+        Push::Turn {
+            thread_id,
+            session_id,
+            state: if busy { "busy" } else { "idle" }.into(),
+            queued,
+        },
+    );
+}
+
+async fn begin_hidden_turn(app: &AppHandle, db: &Db, inner: &mut EngineInner) -> i32 {
+    let turn_id = mark_hidden_turn_started(inner);
+    crate::power::on_turn_began(app);
+    // Hidden delivery is a turn-start too, so persist `running`; otherwise a
+    // crash mid-action can leave stale `idle` state and skip boot revive.
+    persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+    emit_turn_state(
+        app,
+        inner.thread_id,
+        inner.session_id,
+        inner.turn.busy,
+        inner.turn.queue.len(),
+    );
+    turn_id
+}
+
+fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing) {
+    inner.turn.queue.push_back(out);
+    emit_turn_state(
+        app,
+        inner.thread_id,
+        inner.session_id,
+        inner.turn.busy,
+        inner.turn.queue.len(),
+    );
+}
+
+async fn rollback_failed_turn(app: &AppHandle, db: &Db, eng: &EngineRef, turn_id: i32) {
+    let mut inner = eng.lock().await;
+    if !reset_failed_hidden_turn(&mut inner, turn_id) {
+        return;
+    }
+    let thread_id = inner.thread_id;
+    let session_id = inner.session_id;
+    persist_activity(db, session_id, thread_id, "idle").await;
+    emit_turn_state(app, thread_id, session_id, false, 0);
+    drop(inner);
+    mark_queued_failed(app, db, thread_id, session_id).await;
+}
+
+async fn rollback_failed_visible_turn(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    turn_id: i32,
+    message_id: i32,
+    content: &str,
+) {
+    let thread_id = { eng.lock().await.thread_id };
+    let _ = repo::update_lead_message(db, message_id, content, "error").await;
+    emit_finalize(app, thread_id, message_id, "error");
+    rollback_failed_turn(app, db, eng, turn_id).await;
+}
+
+async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fallback_status: &str) {
+    let mut inner = eng.lock().await;
+    if !inner.turn.busy && inner.current.is_none() && inner.turn.queue.is_empty() {
+        return;
+    }
+    let thread_id = inner.thread_id;
+    let session_id = inner.session_id;
+    let had_busy_turn = inner.turn.busy;
+    let turn_id = inner.turn_id;
+    let status = if inner.interrupting {
+        "interrupted"
+    } else {
+        fallback_status
+    };
+    let current = inner.current.take().map(|(id, text, _)| (id, text));
+    inner.interrupting = false;
+    inner.child = None;
+    inner.stdin = None;
+    inner.turn = TurnState::default();
+    inner.clock = TurnClock::default();
+    inner.current_origin_tag = None;
+    inner.stopped = true;
+    persist_activity(db, session_id, thread_id, "stopped").await;
+    let _ = app.emit(
+        EVENT,
+        Push::Turn {
+            thread_id,
+            session_id,
+            state: "stopped".into(),
+            queued: 0,
+        },
+    );
+    drop(inner);
+    if let Ok(Some(row)) = persist_disconnected_turn_row(
+        db,
+        thread_id,
+        session_id,
+        turn_id,
+        status,
+        had_busy_turn,
+        current,
+    )
+    .await
+    {
+        match row {
+            DisconnectedTurnRow::Finalized { message_id } => {
+                emit_finalize(app, thread_id, message_id, status);
+            }
+            DisconnectedTurnRow::Inserted(message) => {
+                let _ = app.emit(
+                    EVENT,
+                    Push::Message {
+                        thread_id,
+                        message,
+                    },
+                );
+            }
+        }
+    }
+    mark_queued_status(app, db, thread_id, session_id, status).await;
+}
+
+enum DisconnectedTurnRow {
+    Finalized { message_id: i32 },
+    Inserted(crate::store::entities::lead_message::Model),
+}
+
+async fn persist_disconnected_turn_row(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn_id: i32,
+    status: &str,
+    had_busy_turn: bool,
+    current: Option<(i32, String)>,
+) -> anyhow::Result<Option<DisconnectedTurnRow>> {
+    if let Some((id, text)) = current {
+        let _ = repo::update_lead_message(
+            db,
+            id,
+            &serde_json::json!({ "text": text }).to_string(),
+            status,
+        )
+        .await;
+        return Ok(Some(DisconnectedTurnRow::Finalized { message_id: id }));
+    }
+    if had_busy_turn {
+        if let Some(message) =
+            insert_terminal_assistant_if_missing(db, thread_id, session_id, turn_id, status).await?
+        {
+            return Ok(Some(DisconnectedTurnRow::Inserted(message)));
+        }
+    }
+    Ok(None)
+}
+
 /// Watchdog clocks for the in-flight turn (§7 跑飞护栏). An idle engine burns
 /// nothing, so only busy turns are clocked.
 pub struct TurnClock {
@@ -202,6 +465,9 @@ pub struct EngineInner {
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
     pub current_origin_tag: Option<String>,
+    /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
+    /// engines; explicit sends/ensure clear this and restart as needed.
+    pub stopped: bool,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -291,6 +557,9 @@ fn merge_init_slash_commands(
 /// Per-turn dialects have no resident process — sending spawns one per turn.
 pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
+    if inner.stopped {
+        return Ok(());
+    }
     if per_turn(&inner.tool) {
         return Ok(());
     }
@@ -339,22 +608,34 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     Ok(())
 }
 
-pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) {
-    if let Some(stdin) = inner.stdin.as_mut() {
-        let mut content = vec![serde_json::json!({ "type": "text", "text": out.text })];
-        for (media_type, data) in &out.images {
-            content.push(serde_json::json!({
-                "type": "image",
-                "source": { "type": "base64", "media_type": media_type, "data": data }
-            }));
-        }
-        let msg = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": content }
-        });
-        let _ = stdin.write_all(format!("{msg}\n").as_bytes()).await;
-        let _ = stdin.flush().await;
+pub async fn ensure_running_for_send(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+) -> anyhow::Result<()> {
+    eng.lock().await.stopped = false;
+    ensure_running(app, db, eng).await
+}
+
+pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
+    let stdin = inner
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("resident stdin is unavailable"))?;
+    let mut content = vec![serde_json::json!({ "type": "text", "text": out.text })];
+    for (media_type, data) in &out.images {
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data }
+        }));
     }
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content }
+    });
+    stdin.write_all(format!("{msg}\n").as_bytes()).await?;
+    stdin.flush().await?;
+    Ok(())
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
@@ -374,10 +655,10 @@ pub async fn send(
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
     let pending = { eng.lock().await.pending_skill_refresh };
     if pending {
-        stop_quiet(eng).await;
+        let _ = stop_quiet(eng).await;
         eng.lock().await.pending_skill_refresh = false;
     }
-    ensure_running(app, db, eng).await?;
+    ensure_running_for_send(app, db, eng).await?;
     let mut inner = eng.lock().await;
     let thread_id = inner.thread_id;
     let sid = inner.session_id;
@@ -464,7 +745,11 @@ pub async fn send(
         inner.tool == "codex" && codex_appserver_enabled() && inner.system_prompt.is_empty();
     let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
     if direct && !spawn_now && !is_codex_appserver {
-        write_user(&mut inner, &out).await;
+        if let Err(e) = write_user(&mut inner, &out).await {
+            drop(inner);
+            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+            return Err(e);
+        }
     } else if !direct {
         inner.turn.queue.push_back(out.clone());
     }
@@ -479,13 +764,19 @@ pub async fn send(
     );
     drop(inner);
     if spawn_now {
-        spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
+        if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
+            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+            return Err(e);
+        }
     } else if direct && is_codex_appserver {
         // Fall back to exec if the app-server can't be reached (old codex, crash):
         // the thread id is shared with exec's rollout store, so resume is seamless.
         if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
             eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
-            spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
+            if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
+                rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -645,6 +936,7 @@ async fn codex_consumer(
             ThreadMsg::Event(ChatEvent::TurnEnd { is_error }) => {
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
+                let session_id = inner.session_id;
                 let status = if inner.interrupting {
                     "interrupted"
                 } else if is_error {
@@ -693,14 +985,20 @@ async fn codex_consumer(
                 // Next turn's tag becomes the in-flight tag (None when going idle),
                 // so the dequeued turn's output frames carry its own origin_tag.
                 inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
-                if let Some(n) = &next {
+                let next_turn_id = if next.is_some() {
                     inner.turn_id += 1;
-                    if n.tracked {
-                        let _ = repo::complete_queued(&db, thread_id, &n.text).await;
-                    }
-                }
+                    Some(inner.turn_id)
+                } else {
+                    None
+                };
                 let still_busy = inner.turn.busy;
-                persist_activity(&db, inner.session_id, thread_id, if still_busy { "running" } else { "idle" }).await;
+                persist_activity(
+                    &db,
+                    inner.session_id,
+                    thread_id,
+                    if still_busy { "running" } else { "idle" },
+                )
+                .await;
                 inner.clock.on_turn_end(still_busy);
                 let _ = app.emit(
                     EVENT,
@@ -713,10 +1011,16 @@ async fn codex_consumer(
                 );
                 drop(inner);
                 // Flush: start the next queued message as a fresh turn on this thread.
-                if let Some(n) = next {
+                if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
                     match client.start_turn(&thread, &n.text).await {
-                        Ok(t) => client.set_active_turn(&thread, &t).await,
-                        Err(e) => eprintln!("[weft][codex] flush next turn: {e}"),
+                        Ok(t) => {
+                            mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
+                            client.set_active_turn(&thread, &t).await;
+                        }
+                        Err(e) => {
+                            eprintln!("[weft][codex] flush next turn: {e}");
+                            rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                        }
                     }
                 }
             }
@@ -758,6 +1062,7 @@ async fn codex_consumer(
             }
         }
     }
+    cleanup_disconnected_turn(&app, &db, &eng, "error").await;
 }
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
@@ -863,33 +1168,59 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
 /// queue it (processed after the current turn, same as the TUI's queue).
 pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> anyhow::Result<()> {
     ensure_running(app, db, eng).await?;
+    send_hidden_existing(app, db, eng, text.to_string()).await
+}
+
+/// Deliver invisible plumbing to an existing engine. Unlike [`nudge`], this
+/// intentionally does not start a missing/stopped resident process; action-card
+/// callbacks should not resurrect a lead the user stopped. Per-turn engines
+/// have no resident stdin, so an idle existing engine still needs a fresh turn.
+pub async fn send_hidden_existing(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    text: String,
+) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
     let out = Outgoing {
-        text: text.to_string(),
+        text,
         images: vec![],
         tracked: false,
         origin_tag: None,
     };
-    if inner.turn.try_begin_send() {
-        inner.turn_id += 1;
-        inner.clock.begin_turn();
-        // Plumbing nudge starts a turn directly (not via send): keep the invariant.
-        inner.current_origin_tag = None;
-        crate::power::on_turn_began(app);
-        // A nudge is a turn-start too (e.g. a coordinator bus-wake on an idle
-        // engine): persist `running` like send, so a crash mid-nudge-turn is
-        // revivable instead of reading a stale `idle`.
-        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
-        if per_turn(&inner.tool) {
-            drop(inner);
-            spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
-        } else {
-            write_user(&mut inner, &out).await;
+
+    match hidden_delivery(
+        &inner.tool,
+        inner.turn.busy,
+        inner.stdin.is_some(),
+        inner.stopped,
+    ) {
+        HiddenDelivery::Noop => {
+            anyhow::bail!("lead engine is not accepting hidden input");
         }
-    } else {
-        inner.turn.queue.push_back(out);
+        HiddenDelivery::Queue => {
+            queue_hidden_delivery(app, &mut inner, out);
+            Ok(())
+        }
+        HiddenDelivery::WriteResident => {
+            let turn_id = begin_hidden_turn(app, db, &mut inner).await;
+            if let Err(e) = write_user(&mut inner, &out).await {
+                drop(inner);
+                rollback_failed_turn(app, db, eng, turn_id).await;
+                return Err(e);
+            }
+            Ok(())
+        }
+        HiddenDelivery::SpawnTurn => {
+            let turn_id = begin_hidden_turn(app, db, &mut inner).await;
+            drop(inner);
+            if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
+                rollback_failed_turn(app, db, eng, turn_id).await;
+                return Err(e);
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 fn human_dur(secs: u64) -> String {
@@ -909,9 +1240,9 @@ async fn insert_terminal_assistant_if_missing(
     turn_id: i32,
     status: &str,
 ) -> anyhow::Result<Option<crate::store::entities::lead_message::Model>> {
-    let text = match status {
-        "error" => "The agent turn ended with an error before producing output.",
-        "interrupted" => "The agent turn was interrupted before producing output.",
+    let terminal = match status {
+        "error" => "error_before_output",
+        "interrupted" => "interrupted_before_output",
         _ => return Ok(None),
     };
     let m = repo::insert_lead_message(
@@ -921,7 +1252,7 @@ async fn insert_terminal_assistant_if_missing(
         turn_id,
         "assistant",
         "text",
-        &serde_json::json!({ "text": text }).to_string(),
+        &serde_json::json!({ "terminal": terminal }).to_string(),
         status,
     )
     .await?;
@@ -1012,17 +1343,19 @@ pub fn spawn_watchdog(app: AppHandle) {
 /// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
-pub async fn stop_quiet(eng: &EngineRef) {
+pub async fn stop_quiet(eng: &EngineRef) -> (i32, Option<i32>, Option<(i32, String)>) {
     let mut inner = eng.lock().await;
+    let target = (inner.thread_id, inner.session_id);
+    let current = inner.current.take().map(|(id, text, _)| (id, text));
     inner.generation += 1; // orphan the reader so EOF handling is ours
     if let Some(c) = inner.child.as_mut() {
         let _ = c.kill().await;
     }
     inner.child = None;
     inner.stdin = None;
-    inner.current = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    (target.0, target.1, current)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -1032,16 +1365,29 @@ pub async fn stop_quiet(eng: &EngineRef) {
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    stop_quiet(eng).await;
-    let inner = eng.lock().await;
+    let (thread_id, session_id, current) = stop_quiet(eng).await;
+    let mut inner = eng.lock().await;
+    inner.stopped = true;
+    drop(inner);
     if let Some(db) = app.try_state::<Db>() {
-        persist_activity(&db, inner.session_id, inner.thread_id, STATUS_STOPPED).await;
+        persist_activity(&db, session_id, thread_id, STATUS_STOPPED).await;
+        if let Some((id, text)) = current {
+            let _ = repo::update_lead_message(
+                &db,
+                id,
+                &serde_json::json!({ "text": text }).to_string(),
+                "interrupted",
+            )
+            .await;
+            emit_finalize(app, thread_id, id, "interrupted");
+        }
+        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
     }
     let _ = app.emit(
         EVENT,
         Push::Turn {
-            thread_id: inner.thread_id,
-            session_id: inner.session_id,
+            thread_id,
+            session_id,
             state: "stopped".into(),
             queued: 0,
         },
@@ -1349,7 +1695,7 @@ fn spawn_reader(
                                             tracked: false,
                                             origin_tag: None,
                                         };
-                                        write_user(&mut inner, &out).await;
+                                        queue_hidden_delivery(&app, &mut inner, out);
                                     }
                                 }
                             }
@@ -1395,7 +1741,13 @@ fn spawn_reader(
                             },
                         );
                         if status == "complete" {
-                            emit_lead_out(&app, thread_id, id, &text, inner.current_origin_tag.clone());
+                            emit_lead_out(
+                                &app,
+                                thread_id,
+                                id,
+                                &text,
+                                inner.current_origin_tag.clone(),
+                            );
                         }
                     } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
                         &db,
@@ -1420,20 +1772,41 @@ fn spawn_reader(
                     inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
                     if let Some(next) = next {
                         inner.turn_id += 1;
-                        if next.tracked {
-                            let _ = repo::complete_queued(&db, thread_id, &next.text).await;
-                        }
+                        let next_turn_id = inner.turn_id;
+                        let session_id = inner.session_id;
                         if per_turn(&inner.tool) {
                             let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                             tauri::async_runtime::spawn(async move {
-                                let _ = spawn_turn(a, d, e, next).await;
+                                if let Err(err) =
+                                    spawn_turn(a.clone(), d.clone(), e.clone(), next.clone()).await
+                                {
+                                    eprintln!("[weft] queued per-turn delivery failed: {err}");
+                                    rollback_failed_turn(&a, &d, &e, next_turn_id).await;
+                                } else {
+                                    mark_queued_delivered(&a, &d, thread_id, session_id, &next)
+                                        .await;
+                                }
                             });
                         } else {
-                            write_user(&mut inner, &next).await;
+                            if let Err(e) = write_user(&mut inner, &next).await {
+                                eprintln!("[weft] queued resident delivery failed: {e}");
+                                drop(inner);
+                                rollback_failed_turn(&app, &db, &eng, next_turn_id).await;
+                                return;
+                            } else {
+                                mark_queued_delivered(&app, &db, thread_id, session_id, &next)
+                                    .await;
+                            }
                         }
                     }
                     let still_busy = inner.turn.busy;
-                    persist_activity(&db, inner.session_id, thread_id, if still_busy { "running" } else { "idle" }).await;
+                    persist_activity(
+                        &db,
+                        inner.session_id,
+                        thread_id,
+                        if still_busy { "running" } else { "idle" },
+                    )
+                    .await;
                     inner.clock.on_turn_end(still_busy);
                     let state = if still_busy { "busy" } else { "idle" };
                     let _ = app.emit(
@@ -1496,7 +1869,13 @@ fn spawn_reader(
                 );
                 // 仅 complete 才回流 IM——interrupted/error 的半截不应上桥。
                 if status == "complete" {
-                    emit_lead_out(&app, inner.thread_id, id, &text, inner.current_origin_tag.clone());
+                    emit_lead_out(
+                        &app,
+                        inner.thread_id,
+                        id,
+                        &text,
+                        inner.current_origin_tag.clone(),
+                    );
                 }
             }
             inner.child = None;
@@ -1505,16 +1884,29 @@ fn spawn_reader(
             inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
             if let Some(next) = next {
                 inner.turn_id += 1;
-                if next.tracked {
-                    let _ = repo::complete_queued(&db, inner.thread_id, &next.text).await;
-                }
+                let next_turn_id = inner.turn_id;
+                let thread_id = inner.thread_id;
+                let session_id = inner.session_id;
                 let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                 tauri::async_runtime::spawn(async move {
-                    let _ = spawn_turn(a, d, e, next).await;
+                    if let Err(err) =
+                        spawn_turn(a.clone(), d.clone(), e.clone(), next.clone()).await
+                    {
+                        eprintln!("[weft] queued per-turn delivery failed: {err}");
+                        rollback_failed_turn(&a, &d, &e, next_turn_id).await;
+                    } else {
+                        mark_queued_delivered(&a, &d, thread_id, session_id, &next).await;
+                    }
                 });
             }
             let still_busy = inner.turn.busy;
-            persist_activity(&db, inner.session_id, inner.thread_id, if still_busy { "running" } else { "idle" }).await;
+            persist_activity(
+                &db,
+                inner.session_id,
+                inner.thread_id,
+                if still_busy { "running" } else { "idle" },
+            )
+            .await;
             inner.clock.on_turn_end(still_busy);
             let state = if still_busy { "busy" } else { "idle" };
             let _ = app.emit(
@@ -1535,6 +1927,9 @@ fn spawn_reader(
             } else {
                 "error"
             };
+            let queued_status = status;
+            let thread_id = inner.thread_id;
+            let session_id = inner.session_id;
             inner.interrupting = false;
             if let Some((id, text, _)) = inner.current.take() {
                 let _ = repo::update_lead_message(
@@ -1560,16 +1955,18 @@ fn spawn_reader(
             // The turn is unconditionally reset to idle here; persist that so a
             // resident-process death (incl. interrupt→kill) doesn't leave the row
             // stuck "running" and falsely revive an engine on the next boot.
-            persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
+            persist_activity(&db, session_id, thread_id, "idle").await;
             let _ = app.emit(
                 EVENT,
                 Push::Turn {
-                    thread_id: inner.thread_id,
-                    session_id: inner.session_id,
+                    thread_id,
+                    session_id,
                     state: "stopped".into(),
                     queued: 0,
                 },
             );
+            drop(inner);
+            mark_queued_status(&app, &db, thread_id, session_id, queued_status).await;
         }
     });
 }
@@ -1735,7 +2132,8 @@ mod tests {
         assert_eq!(m.role, "assistant");
         assert_eq!(m.kind, "text");
         assert_eq!(m.status, "error");
-        assert!(m.content.contains("ended with an error"));
+        let content: serde_json::Value = serde_json::from_str(&m.content).unwrap();
+        assert_eq!(content["terminal"], "error_before_output");
         let all = repo::list_lead_messages(&db, 7).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, m.id);
@@ -1744,6 +2142,27 @@ mod tests {
             .await
             .unwrap();
         assert!(complete.is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnected_busy_turn_without_current_row_persists_terminal_error() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+
+        let row = persist_disconnected_turn_row(&db, 7, None, 3, "error", true, None)
+            .await
+            .unwrap();
+
+        let all = repo::list_lead_messages(&db, 7).await.unwrap();
+        assert_eq!(all.len(), 1);
+        match row {
+            Some(DisconnectedTurnRow::Inserted(m)) => assert_eq!(m.id, all[0].id),
+            _ => panic!("busy disconnected turn without current should insert terminal row"),
+        }
+        assert_eq!(all[0].turn_id, 3);
+        assert_eq!(all[0].role, "assistant");
+        assert_eq!(all[0].status, "error");
+        let content: serde_json::Value = serde_json::from_str(&all[0].content).unwrap();
+        assert_eq!(content["terminal"], "error_before_output");
     }
 
     #[test]
@@ -1759,6 +2178,128 @@ mod tests {
         assert!(per_turn("codex"));
         assert!(per_turn("opencode"));
         assert!(!per_turn("mystery"));
+    }
+
+    fn test_inner(tool: &str) -> EngineInner {
+        EngineInner {
+            thread_id: 1,
+            tool: tool.into(),
+            session_id: None,
+            cwd: "/tmp".into(),
+            extra_args: vec![],
+            system_prompt: String::new(),
+            native_id: None,
+            slash_commands: vec![],
+            turn: TurnState::default(),
+            turn_id: 0,
+            ask_dir: "lead".into(),
+            clock: TurnClock::default(),
+            child: None,
+            stdin: None,
+            current: None,
+            interrupting: false,
+            generation: 0,
+            pending_skill_refresh: false,
+            current_origin_tag: None,
+            stopped: false,
+        }
+    }
+
+    #[test]
+    fn mark_hidden_turn_started_sets_busy_and_clears_origin_tag() {
+        let mut inner = test_inner("claude");
+        inner.current_origin_tag = Some("im-reply-target".into());
+
+        let turn_id = mark_hidden_turn_started(&mut inner);
+
+        assert!(inner.turn.busy);
+        assert_eq!(turn_id, 1);
+        assert_eq!(inner.turn_id, 1);
+        assert!(inner.clock.started.is_some());
+        assert!(inner.current_origin_tag.is_none());
+    }
+
+    #[test]
+    fn reset_failed_hidden_turn_clears_busy_state_for_same_turn() {
+        let mut inner = test_inner("claude");
+        inner.current_origin_tag = Some("stale".into());
+        inner.turn.queue.push_back(Outgoing {
+            text: "queued user".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+        });
+        let turn_id = mark_hidden_turn_started(&mut inner);
+
+        assert!(reset_failed_hidden_turn(&mut inner, turn_id));
+
+        assert!(!inner.turn.busy);
+        assert!(inner.turn.queue.is_empty());
+        assert!(inner.clock.started.is_none());
+        assert!(inner.current_origin_tag.is_none());
+        assert!(inner.current.is_none());
+        assert!(!inner.interrupting);
+    }
+
+    #[test]
+    fn reset_failed_hidden_turn_ignores_later_turn() {
+        let mut inner = test_inner("claude");
+        let old_turn = mark_hidden_turn_started(&mut inner);
+        inner.turn_id += 1;
+
+        assert!(!reset_failed_hidden_turn(&mut inner, old_turn));
+        assert!(inner.turn.busy);
+    }
+
+    #[tokio::test]
+    async fn write_user_reports_missing_stdin() {
+        let mut inner = test_inner("claude");
+        let out = Outgoing {
+            text: "hello".into(),
+            images: vec![],
+            tracked: false,
+            origin_tag: None,
+        };
+
+        let err = write_user(&mut inner, &out).await.unwrap_err();
+
+        assert!(err.to_string().contains("resident stdin is unavailable"));
+    }
+
+    #[test]
+    fn hidden_delivery_spawns_for_per_turn_tools_without_stdin() {
+        assert_eq!(
+            hidden_delivery("codex", false, false, false),
+            HiddenDelivery::SpawnTurn
+        );
+        assert_eq!(
+            hidden_delivery("opencode", false, false, false),
+            HiddenDelivery::SpawnTurn
+        );
+    }
+
+    #[test]
+    fn hidden_delivery_keeps_resident_and_queue_semantics() {
+        assert_eq!(
+            hidden_delivery("claude", false, true, false),
+            HiddenDelivery::WriteResident
+        );
+        assert_eq!(
+            hidden_delivery("claude", false, false, false),
+            HiddenDelivery::Noop
+        );
+        assert_eq!(
+            hidden_delivery("codex", true, false, false),
+            HiddenDelivery::Queue
+        );
+    }
+
+    #[test]
+    fn hidden_delivery_rejects_stopped_per_turn_engines() {
+        assert_eq!(
+            hidden_delivery("codex", false, false, true),
+            HiddenDelivery::Noop
+        );
     }
 
     #[test]
@@ -1795,6 +2336,7 @@ mod tests {
             generation: 0,
             pending_skill_refresh: false,
             current_origin_tag: None,
+            stopped: false,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));

@@ -46,13 +46,19 @@ impl Db {
         let want_encrypted = detect_encrypted(&path)?;
 
         if want_encrypted {
-            let pwd = crate::store::key::get_password()?.ok_or_else(|| {
+            let (pwd, from_legacy) = crate::store::key::open_password()?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "weft.db is encrypted but no password is stored in the keychain. \
                      Set the password from Settings → General → Security, then restart Weft."
                 )
             })?;
-            open_encrypted(&path, &pwd).await
+            // Open (which validates the key) BEFORE adopting a legacy credential, so
+            // a wrong legacy password never overwrites this home's scoped account.
+            let db = open_encrypted(&path, &pwd).await?;
+            if from_legacy {
+                crate::store::key::adopt_scoped_password(&pwd)?;
+            }
+            Ok(db)
         } else {
             open_plaintext(&path).await
         }

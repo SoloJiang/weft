@@ -321,6 +321,7 @@ function OnboardingStage({
         <textarea
           value={task}
           onChange={(e) => setTask(e.currentTarget.value)}
+          placeholder={t("dialog.threadTitlePlaceholder")}
           rows={4}
           className="mt-5 w-full resize-none rounded-[var(--radius-md)] border border-border bg-bg px-3 py-2.5 text-[13px] leading-relaxed text-ink outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/25"
         />
