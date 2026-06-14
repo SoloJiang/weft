@@ -78,8 +78,8 @@ export function isPathLike(token: string): boolean {
   if (!path || /\s/.test(path)) return false;
   if (/^(\/|\\|~[\\/]?|\.\.?[\\/])/.test(path)) return true; // /abs \abs ~ ~/ ~\ ./ .\ ../ ..\
   if (WIN_DRIVE.test(path)) return true;
-  if (/[/\\]/.test(path) && EXT_RE.test(path)) return true; // a/b/foo.ts or a\b\foo.ts
-  if (MANIFEST_RE.test(path)) return true; // Cargo.toml, package.json, Makefile
+  if (EXT_RE.test(path)) return true; // foo.ts, a/b/foo.ts, a\b\foo.ts (known extension)
+  if (MANIFEST_RE.test(path)) return true; // Dockerfile, Makefile, .gitignore
   return false;
 }
 

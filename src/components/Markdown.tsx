@@ -5,12 +5,19 @@ import { api } from "../lib/api";
 import { classifyHref, filePathsRehype, isPathLike } from "../lib/fileLinks";
 import { FilePathRef } from "./FilePathRef";
 
-// react-markdown's default sanitizer blanks any non-web protocol, which would
-// strip `file://` links before we can route them. Keep local file paths intact
-// (we never navigate to them — clicks go through the OS opener) and defer to the
-// default sanitizer for everything else (web links stay XSS-safe).
-const fileAwareUrlTransform: NonNullable<Options["urlTransform"]> = (url, key) =>
-  key === "href" && classifyHref(url).kind === "file" ? url : defaultUrlTransform(url);
+// Script-y schemes are never handed to the DOM href or the OS opener.
+const UNSAFE_HREF = /^\s*(?:javascript|data|vbscript):/i;
+
+// react-markdown's default sanitizer blanks any non-web scheme, which would
+// strip both local file paths and legitimate app deep links (ms-settings:,
+// vscode-insiders://, codex://) before our `a` renderer can route them. We never
+// navigate to an href — clicks are preventDefault'd and sent to the OS opener /
+// file resolver — so for links we preserve everything except the script-y
+// denylist. Image `src` still uses the strict default sanitizer.
+const fileAwareUrlTransform: NonNullable<Options["urlTransform"]> = (url, key) => {
+  if (key !== "href") return defaultUrlTransform(url);
+  return UNSAFE_HREF.test(url) ? "" : url;
+};
 
 /**
  * Renders agent output as markdown — headings, lists, code, tables, links —
