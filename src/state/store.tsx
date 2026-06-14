@@ -877,20 +877,29 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [adoptWorker]);
 
-  // Mount backstop: adopt workers already live before the listener registered —
-  // boot-revived before mount, or still alive after a frontend reload/HMR.
+  // Adopt backend-headless workers the frontend never drove (boot revive, or
+  // alive after a reload/HMR). Register the `worker-revived` listener BEFORE the
+  // mount pull: `listen` is async, so doing the pull first would leave a gap where
+  // a boot sweep that emits the event between the pull's snapshot and the
+  // subscription is lost with no later trigger. Awaiting `listen` first closes
+  // that gap — the mount pull then runs with the listener live (anything revived
+  // during it re-pulls via the pending guard), and later revives (whose
+  // nudge-driven turns emit no busy push to react to) are caught by the event.
   useEffect(() => {
-    void hydrateLiveWorkers();
-  }, [hydrateLiveWorkers]);
-
-  // Boot revives that land after this component mounted miss the mount backstop
-  // above, and a nudge-driven revive turn emits no busy push to react to — so the
-  // backend emits `worker-revived` when its boot sweep recovers worker(s); re-pull
-  // and adopt them then.
-  useEffect(() => {
-    const un = listen("worker-revived", () => void hydrateLiveWorkers());
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
+      un = await listen("worker-revived", () => void hydrateLiveWorkers());
+      if (cancelled) {
+        un();
+        un = undefined;
+        return;
+      }
+      void hydrateLiveWorkers();
+    })();
     return () => {
-      void un.then((f) => f());
+      cancelled = true;
+      un?.();
     };
   }, [hydrateLiveWorkers]);
 
