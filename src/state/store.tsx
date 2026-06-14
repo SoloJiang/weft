@@ -842,6 +842,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void hydrateLiveWorkers();
   }, [hydrateLiveWorkers]);
 
+  // Live ref: the lead-chat listener effect has empty deps (registers once), so
+  // it reads the current hydrate fn through a ref instead of re-subscribing.
+  const hydrateLiveWorkersRef = useRef(hydrateLiveWorkers);
+  hydrateLiveWorkersRef.current = hydrateLiveWorkers;
+
   // Lazy attach + send: the worker surface is always input-able. Sending into a
   // worker with no live engine transparently resumes/dispatches it (focus=false,
   // so we stay on the same surface — no navigation), then delivers the message.
@@ -998,6 +1003,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 }
               : m,
           );
+          // A worker we don't know about turned busy: it's a backend-headless
+          // engine (boot revive that landed after mount, or a runtime headless
+          // spawn). Pull the live set so it gets a session entry → status dot +
+          // auto-verify. Stopped/idle engines are not busy, so they're never
+          // pulled (and adoptWorker never restarts anything).
+          if (p.state === "busy" && !sessionsRef.current[sid]) {
+            void hydrateLiveWorkersRef.current();
+          }
         } else {
           setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
