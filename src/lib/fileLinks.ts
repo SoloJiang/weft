@@ -28,7 +28,8 @@ const WIN_DRIVE = /^[a-zA-Z]:[\\/]/;
  */
 export function classifyHref(href: string): HrefKind {
   const h = href.trim();
-  if (/^file:\/\//i.test(h)) return { kind: "file", token: h };
+  // Any `file:` URI (file://host/p, file:///p, or the minimal file:/p) is a file ref.
+  if (/^file:/i.test(h)) return { kind: "file", token: h };
   if (h.startsWith("#")) return { kind: "web", url: h }; // in-page anchor
   // Protocol-relative URL — give the opener a concrete scheme (no page to inherit one from).
   if (h.startsWith("//")) return { kind: "web", url: `https:${h}` };
@@ -58,7 +59,7 @@ export function parsePathToken(
   if (isUrl) {
     // URL token: strip scheme + localhost authority + fragment, percent-decode,
     // normalize the drive form. Literal tokens keep '#'/'%' as filename chars.
-    const scheme = t.match(/^file:\/\//i);
+    const scheme = t.match(/^file:(?:\/\/)?/i); // file://, file:///, or minimal file:/
     if (scheme) t = t.slice(scheme[0].length).replace(/^localhost(?=\/)/i, "");
     const frag = t.search(/[#?]/);
     if (frag !== -1) t = t.slice(0, frag);
@@ -85,10 +86,15 @@ const MANIFEST =
 const EXT_RE = new RegExp(`\\.(?:${CODE_EXT})$`, "i");
 const MANIFEST_RE = new RegExp(`(?:^|[/\\\\])(?:${MANIFEST})$`);
 
-/** Conservative test: is this token a local file path worth wiring up? */
-export function isPathLike(token: string): boolean {
+/**
+ * Conservative test: is this token a local file path worth wiring up?
+ * `allowSpaces` is for inline-code tokens, where the whole span is the path
+ * (e.g. `My Dir/App.tsx`); prose keeps the no-space rule so words aren't joined.
+ */
+export function isPathLike(token: string, allowSpaces = false): boolean {
   const { path } = parsePathToken(token);
-  if (!path || /\s/.test(path)) return false;
+  if (!path) return false;
+  if (!allowSpaces && /\s/.test(path)) return false;
   if (/^(\/|\\|~[\\/]?|\.\.?[\\/])/.test(path)) return true; // /abs \abs ~ ~/ ~\ ./ .\ ../ ..\
   if (WIN_DRIVE.test(path)) return true;
   if (EXT_RE.test(path)) return true; // foo.ts, a/b/foo.ts, a\b\foo.ts (known extension)
@@ -104,8 +110,9 @@ export type Seg = { type: "text" | "path"; value: string };
 // no inter-word spaces, so these are treated as token DELIMITERS (split on them),
 // not just peeled — otherwise `lib/x.rs，然后` stays one token and never matches.
 const CJK_PUNCT = "（）【】「」『』〔〕〈〉《》〖〗。，、；：！？…—～·｜“”‘’";
-const DELIM = new RegExp(`(\\s+|[${CJK_PUNCT}]+)`);
-const IS_DELIM = new RegExp(`^(?:\\s|[${CJK_PUNCT}])`);
+const LIST_SEP = ",;"; // ASCII list separators between adjacent path refs (a.ts,b.ts)
+const DELIM = new RegExp(`(\\s+|[${LIST_SEP}${CJK_PUNCT}]+)`);
+const IS_DELIM = new RegExp(`^(?:\\s|[${LIST_SEP}${CJK_PUNCT}])`);
 // ASCII punctuation that hugs a path is peeled back into the text run.
 const LEAD_PUNCT = /^[([{<'"`]+/;
 const TAIL_PUNCT = /[)\]}>'"`.,;:!?]+$/;

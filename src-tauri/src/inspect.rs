@@ -158,15 +158,18 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Strip a `file://` scheme and an optional `localhost` authority, leaving the
-/// path body. `file:///p` → `/p`; `file://localhost/p` → `/p`. The scheme match
-/// is case-insensitive (`FILE://` == `file://`, per URI rules). Non-URI tokens
-/// (and a relative `localhost/…` dir) are returned untouched.
+/// Strip a `file:` scheme, an optional `//` authority marker, and an optional
+/// `localhost` host, leaving the path body. Handles all RFC 8089 forms:
+/// `file:///p` → `/p`, `file://localhost/p` → `/p`, and the minimal `file:/p`
+/// → `/p`. The scheme + host match case-insensitively. Non-URI tokens (and a
+/// relative `localhost/…` dir) are returned untouched.
 fn strip_file_scheme(token: &str) -> &str {
-    let rest = match token.get(..7) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("file://") => &token[7..],
+    let after_scheme = match token.get(..5) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("file:") => &token[5..],
         _ => return token,
     };
+    // Optional `//` authority marker (present in file:// / file:///, absent in file:/).
+    let rest = after_scheme.strip_prefix("//").unwrap_or(after_scheme);
     // The host authority is case-insensitive: strip a `localhost` host (any case)
     // when it's followed by the absolute path, e.g. `file://LOCALHOST/Users/…`.
     match rest.get(..9) {
@@ -346,6 +349,8 @@ mod tests {
     #[test]
     fn strips_file_scheme_and_localhost_authority() {
         assert_eq!(strip_file_scheme("file:///Users/me/x"), "/Users/me/x");
+        assert_eq!(strip_file_scheme("file:/tmp/App.tsx"), "/tmp/App.tsx"); // minimal RFC 8089 form
+        assert_eq!(strip_file_scheme("FILE:/tmp/x"), "/tmp/x"); // minimal + case-insensitive
         assert_eq!(strip_file_scheme("file://localhost/Users/me/x"), "/Users/me/x");
         assert_eq!(strip_file_scheme("file://localhost/C:/repo"), "/C:/repo");
         assert_eq!(strip_file_scheme("FILE:///tmp/x"), "/tmp/x"); // scheme is case-insensitive
