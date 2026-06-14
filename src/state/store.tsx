@@ -10,6 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { currentLang } from "../i18n";
+import { metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
   Direction,
@@ -25,7 +26,9 @@ import type {
   RepoRef,
   ResolvedProposal,
   ThreadOverview,
+  ObserveRef,
   SessionInfo,
+  SessionMeta,
   SessionStatus,
   SlashCmd,
   Thread,
@@ -88,6 +91,11 @@ interface Store {
   /** The tool call running right now (transient): lead by thread, worker by session. */
   leadActivity: Record<number, { name: string; summary: string } | null>;
   workerActivity: Record<number, { name: string; summary: string } | null>;
+  /** 会话信息面板的每会话快照:lead 按 thread_id、worker 按 session_id。 */
+  leadMeta: Record<number, SessionMeta>;
+  workerMeta: Record<number, SessionMeta>;
+  /** worker 重挂时由 session_for 回包回填 meta(首条消息前不空白)。 */
+  hydrateWorkerMeta: (sessionId: number, snap: ObserveRef) => void;
   /** The thread-bus drawer (demoted from a permanent rail). */
   showBus: boolean;
   setShowBus: (open: boolean) => void;
@@ -882,6 +890,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [workerActivity, setWorkerActivity] = useState<
     Record<number, { name: string; summary: string } | null>
   >({});
+  const [leadMeta, setLeadMeta] = useState<Record<number, SessionMeta>>({});
+  const [workerMeta, setWorkerMeta] = useState<Record<number, SessionMeta>>({});
+  const hydrateWorkerMeta = useCallback((sessionId: number, snap: ObserveRef) => {
+    setWorkerMeta((m) => ({ ...m, [sessionId]: metaFromSnapshot(snap) }));
+  }, []);
   // Skills dirty latch: bump on any skills mutation; idle sessions/leads compare
   // against their last-refreshed stamp to flag one engine refresh per episode.
   const [skillsDirtyAt, setSkillsDirtyAt] = useState(0);
@@ -956,6 +969,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (p.session_id != null) {
           const sid = p.session_id;
           setWorkerSlash((s) => ({ ...s, [sid]: p.slash_commands }));
+          setWorkerMeta((m) => ({ ...m, [sid]: metaFromInit(m[sid], p) }));
           // The early initialize-derived push has no native id yet — keep the old one.
           if (p.native_id) {
             setSessions((m) =>
@@ -964,6 +978,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
         } else {
           setLeadSlash((s) => ({ ...s, [p.thread_id]: p.slash_commands }));
+          setLeadMeta((m) => ({ ...m, [p.thread_id]: metaFromInit(m[p.thread_id], p) }));
         }
         // An init implies a live engine: a stale "stopped" flips to idle (a
         // turn event will overwrite the moment anything actually runs).
@@ -980,6 +995,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               ? { ...t, [p.thread_id]: { state: "idle", queued: 0 } }
               : t,
           );
+        }
+      } else if (p.type === "usage") {
+        if (p.session_id != null) {
+          const sid = p.session_id;
+          setWorkerMeta((m) => ({ ...m, [sid]: metaFromUsage(m[sid], p) }));
+        } else {
+          setLeadMeta((m) => ({ ...m, [p.thread_id]: metaFromUsage(m[p.thread_id], p) }));
         }
       }
     });
@@ -1023,6 +1045,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (st.slash_commands.length > 0) {
         setLeadSlash((s) => ({ ...s, [threadId]: st.slash_commands }));
       }
+      setLeadMeta((m) => ({ ...m, [threadId]: metaFromSnapshot(st) }));
     } catch {
       /* engine state is cosmetic at load time */
     }
@@ -1516,6 +1539,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     discoverWorkerSlash,
     leadActivity,
     workerActivity,
+    leadMeta,
+    workerMeta,
+    hydrateWorkerMeta,
     showBus,
     setShowBus,
     navCollapsed,
