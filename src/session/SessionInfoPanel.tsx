@@ -63,7 +63,7 @@ export function SessionInfoPanel({
               </span>
             )}
           </div>
-          {ct != null ? (
+          {ct != null && (
             <>
               <div className="mt-1.5 flex items-baseline gap-1.5">
                 <span className="text-[18px] font-medium text-ink">{ct.toLocaleString()}</span>
@@ -74,14 +74,17 @@ export function SessionInfoPanel({
                   <div className="h-full bg-brand" style={{ width: `${pct}%` }} />
                 </div>
               )}
-              {meta?.model && (
-                <div className="mt-1.5 truncate font-mono text-[10.5px] text-ink-faint">
-                  {meta.model}
-                  {win ? ` · ${Math.round(win / 1000)}k` : ""}
-                </div>
-              )}
             </>
-          ) : (
+          )}
+          {/* model·window 独立于 token usage 渲染:codex 的 token 走首条消息后的 usage
+              事件,但 model/window 由 session_meta 立即提供。 */}
+          {meta?.model && (
+            <div className="mt-1.5 truncate font-mono text-[10.5px] text-ink-faint">
+              {meta.model}
+              {win ? ` · ${Math.round(win / 1000)}k` : ""}
+            </div>
+          )}
+          {ct == null && !meta?.model && (
             <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
           )}
         </section>
