@@ -1,21 +1,52 @@
 //! Canonical weft home + derived paths. Everything persistent lives under
 //! ~/.weft so worktree cwds stay stable across restarts (resume depends on it).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// weft home. Honors the WEFT_HOME env override (used for test isolation and to
-/// let users relocate weft's data); otherwise ~/.weft. Created if missing.
+/// let users relocate weft's data); otherwise `~/<home_dir_name>` — `.weft-dev`
+/// in dev builds, `.weft` in release (see [`home_dir_name`]). Created if missing.
 pub fn weft_home() -> std::io::Result<PathBuf> {
     let dir = match std::env::var("WEFT_HOME") {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
         _ => {
             let home = dirs::home_dir()
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir"))?;
-            home.join(".weft")
+            home.join(home_dir_name(cfg!(debug_assertions)))
         }
     };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Base directory name for weft's data under $HOME. Debug builds (`tauri dev`,
+/// `cargo test`) isolate to `.weft-dev` so local iteration never reads or writes
+/// the installed app's real `.weft` data; release builds (`tauri build`) use
+/// `.weft`. The WEFT_HOME override bypasses this entirely, regardless of profile.
+fn home_dir_name(debug_build: bool) -> &'static str {
+    if debug_build {
+        ".weft-dev"
+    } else {
+        ".weft"
+    }
+}
+
+/// The default (non-`WEFT_HOME`) data home for a build profile: `~/.weft` for
+/// release, `~/.weft-dev` for debug. `None` if the home dir can't be resolved.
+/// Callers that must distinguish the canonical homes from a relocated `WEFT_HOME`
+/// (e.g. credential / worktree namespacing) compare the resolved [`weft_home`]
+/// against these.
+pub fn default_home(debug_build: bool) -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(home_dir_name(debug_build)))
+}
+
+/// Best-effort canonicalization: resolves symlinks and `..` so two paths naming
+/// the same physical directory compare equal. Falls back to the input unchanged
+/// if it can't be canonicalized (e.g. the path doesn't exist yet). Used to key
+/// per-home identity (keychain account, worktree root) so an aliased home isn't
+/// mistaken for a different data set.
+pub fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// ~/.weft/weft.db
@@ -58,9 +89,32 @@ mod tests {
         // may not have cleared yet on its own thread) can't leak in here.
         std::env::remove_var("WEFT_HOME");
         let home = weft_home().unwrap();
-        assert!(home.ends_with(".weft"));
+        // Default home follows the build profile (`.weft-dev` in debug/test runs,
+        // `.weft` in release), so assert against the active-profile name.
+        assert!(home.ends_with(home_dir_name(cfg!(debug_assertions))));
         assert!(db_path().unwrap().ends_with("weft.db"));
         assert!(worktree_home().unwrap().ends_with("worktrees"));
         assert!(skills_home().unwrap().ends_with("skills/sources"));
+    }
+
+    #[test]
+    fn canonical_collapses_dotdot() {
+        // The same physical dir reached via `..` must canonicalize equal, so home
+        // identity (keychain account / worktree root) is alias-stable.
+        let tmp = std::env::temp_dir().join(format!("weft-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        let aliased = tmp.join("sub").join(".."); // <tmp>/sub/.. == <tmp>
+        assert_eq!(canonical(&aliased), canonical(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn home_dir_name_isolates_dev_from_prod() {
+        // Dev builds get their own home so local iteration never touches the
+        // installed app's data; release keeps `.weft` so existing users on the
+        // installed app need no migration.
+        assert_eq!(home_dir_name(true), ".weft-dev");
+        assert_eq!(home_dir_name(false), ".weft");
     }
 }

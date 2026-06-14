@@ -33,6 +33,11 @@ pub fn ensure_codex_hook() {
     let Some(home) = codex_home() else {
         return;
     };
+    // One stable hook path across build profiles: `~/.codex/config.toml` is the
+    // user's single global Codex config (shared by dev and release), and
+    // `ensure_codex_hook_in` dedupes by exact command string. A profile-specific
+    // path would append a second matching entry and double every permission ask,
+    // so the hook script is intentionally NOT isolated per profile.
     ensure_codex_hook_in(
         &home.join(".codex").join("config.toml"),
         &home.join(".weft").join("weft-codex-hook.sh"),

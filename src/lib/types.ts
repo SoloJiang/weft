@@ -87,6 +87,18 @@ export interface SessionInfo {
   native_id: string | null;
 }
 
+/** A live worker engine the backend is running, mirrored into the frontend
+ *  session map so boot-revived / reload-survived workers get a status dot +
+ *  auto-verify. Mirrors Rust `LiveWorkerSlot`. */
+export interface LiveWorkerSlot {
+  info: SessionInfo;
+  direction_id: number;
+  repo_id: number;
+  thread_id: number;
+  busy: boolean;
+  queued: number;
+}
+
 /** Session ref backing the worker conversation surface (mirrors Rust ObserveRef). */
 export interface ObserveRef {
   worktree: string;

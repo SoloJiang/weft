@@ -28,7 +28,7 @@ export function DiffView({
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [touched, setTouched] = useState(false);
   /** The annotation being composed: a file, optionally pinned to one line. */
-  const [ask, setAsk] = useState<{ path: string; line?: string } | null>(null);
+  const [ask, setAsk] = useState<{ path: string; line?: DiffLine } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   // Pressing outside the diff closes an open AskBox. Scoped to the whole surface
   // (not the box) so clicking another line just retargets it, keeping the draft.
@@ -78,19 +78,19 @@ export function DiffView({
   const totalRemoved = files.reduce((s, f) => s + f.removed, 0);
 
   return (
-    <div ref={rootRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+    <div ref={rootRef} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
       <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-bg/95 px-4 py-2.5 text-[11px] text-ink-faint backdrop-blur">
         <span>{t("diff.filesChanged", { count: files.length })}</span>
         <span className="text-running">+{totalAdded}</span>
         <span className="text-danger">−{totalRemoved}</span>
       </div>
 
-      <div className="flex flex-col">
+      <div className="flex min-w-0 flex-col">
         {files.map((f) => {
           const body = bodyByPath[f.path];
           const expanded = isOpen(f.path);
           return (
-            <div key={f.path} className="border-b border-border/60">
+            <div key={f.path} className="min-w-0 border-b border-border/60">
               <div className="group flex w-full items-center gap-2 px-3 py-2 transition-colors hover:bg-surface">
                 <button
                   onClick={() => toggle(f.path)}
@@ -134,20 +134,22 @@ export function DiffView({
               {expanded &&
                 (body && body.length > 0 ? (
                   <pre className="overflow-x-auto px-3 pb-3 font-mono text-[11.5px] leading-relaxed">
-                    {body.map((line, i) => (
-                      <div
-                        key={i}
-                        onClick={onAsk ? () => setAsk({ path: f.path, line }) : undefined}
-                        title={onAsk ? t("diff.askLine") : undefined}
-                        className={cn(
-                          "whitespace-pre",
-                          lineClass(line),
-                          onAsk && "cursor-pointer hover:bg-brand-ghost/60",
-                        )}
-                      >
-                        {line || " "}
-                      </div>
-                    ))}
+                    <div className="w-max min-w-full">
+                      {body.map((line, i) => (
+                        <div
+                          key={i}
+                          onClick={onAsk ? () => setAsk({ path: f.path, line }) : undefined}
+                          title={onAsk ? t("diff.askLine") : undefined}
+                          className={cn(
+                            "whitespace-pre",
+                            lineClass(line.text),
+                            onAsk && "cursor-pointer hover:bg-brand-ghost/60",
+                          )}
+                        >
+                          {line.text || " "}
+                        </div>
+                      ))}
+                    </div>
                   </pre>
                 ) : (
                   <p className="px-3 pb-3 pl-8 text-[11px] text-ink-faint">
@@ -162,7 +164,16 @@ export function DiffView({
   );
 }
 
-/** The in-place annotation composer: quoted context + a one-line question. */
+/** True on macOS — picks the right modifier glyph for the send shortcut. */
+const isMac =
+  typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+
+/**
+ * The in-place annotation composer: a review-comment block anchored to a file
+ * or a single diff line. Header names the target (real new/old line number when
+ * known), a multi-line field collects the change request, ⌘/Ctrl+↵ sends it to
+ * the worker (Enter inserts a newline; Esc cancels).
+ */
 function AskBox({
   path,
   line,
@@ -170,59 +181,121 @@ function AskBox({
   onClose,
 }: {
   path: string;
-  line?: string;
+  line?: DiffLine;
   onSend: (text: string) => void;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
   const [q, setQ] = useState("");
-  const ref = useRef<HTMLInputElement>(null);
+  const ref = useRef<HTMLTextAreaElement>(null);
   useEffect(() => ref.current?.focus(), []);
+
+  const quoted = line?.text != null && line.text.trim() !== "" ? line.text : null;
+  // Which line this comment targets: the new-side number if the line exists in
+  // the new file, else the old-side number, else null (whole file).
+  const at =
+    line?.rno != null
+      ? { side: "R", n: line.rno }
+      : line?.lno != null
+        ? { side: "L", n: line.lno }
+        : null;
+  const target = at ? t("diff.askLineRef", at) : t("diff.askFileRef");
+
+  const grow = (el: HTMLTextAreaElement) => {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  };
 
   const send = () => {
     const v = q.trim();
     if (!v) return;
-    const quote = line != null && line.trim() !== "" ? `\n> ${line}` : "";
-    onSend(`${t("diff.askContext", { path })}${quote}\n\n${v}`);
+    // Carry the exact line target into the message so the worker applies the
+    // request to the right line even when the quoted text repeats (dup/blank).
+    const header = at
+      ? t("diff.askContextLine", { path, ...at })
+      : t("diff.askContext", { path });
+    const quote = quoted != null ? `\n> ${quoted}` : "";
+    onSend(`${header}${quote}\n\n${v}`);
   };
 
   return (
-    <div className="mx-3 mb-2 rounded-[var(--radius-md)] border border-brand/30 bg-brand-ghost/40 p-2">
-      {line != null && line.trim() !== "" && (
-        <div className="mb-1.5 truncate border-l-2 border-brand/50 pl-2 font-mono text-[11px] text-ink-muted">
-          {line}
+    <div className="mx-3 mb-2 rounded-[var(--radius-md)] border border-border bg-raised p-2.5">
+      <div className="mb-2 flex items-center gap-1.5">
+        <MessageSquarePlus size={13} className="shrink-0 text-brand" />
+        <span className="text-[12px] font-semibold text-ink">{t("diff.askTitle")}</span>
+        <span className="ml-auto truncate pl-2 font-mono text-[11px] text-ink-faint">
+          {target}
+        </span>
+      </div>
+      {quoted != null && (
+        <div className="mb-2 truncate border-l-2 border-brand/50 pl-2 font-mono text-[11px] text-ink-muted">
+          {quoted}
         </div>
       )}
-      <div className="flex items-center gap-1.5">
-        <input
-          ref={ref}
-          value={q}
-          onChange={(e) => setQ(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") send();
-            if (e.key === "Escape") onClose();
-          }}
-          placeholder={t("diff.askPlaceholder")}
-          className="h-7 min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-bg px-2 text-[12px] text-ink outline-none focus:border-brand/60"
-        />
+      <textarea
+        ref={ref}
+        value={q}
+        rows={2}
+        onChange={(e) => {
+          setQ(e.currentTarget.value);
+          grow(e.currentTarget);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            e.preventDefault();
+            send();
+          } else if (e.key === "Escape") {
+            // Cancel just this annotation — don't let Escape bubble to
+            // DiffPanel's window listener, which would close the whole panel.
+            e.stopPropagation();
+            onClose();
+          }
+        }}
+        placeholder={t("diff.askPlaceholder")}
+        className="w-full resize-none rounded-[var(--radius-sm)] border border-border bg-bg px-2 py-1.5 text-[12px] leading-relaxed text-ink outline-none focus:border-brand/60"
+      />
+      <div className="mt-2 flex items-center gap-2">
+        <span className="mr-auto text-[11px] text-ink-faint">
+          {t("diff.askHint", { key: isMac ? "⌘↵" : "Ctrl+↵" })}
+        </span>
+        <button
+          onClick={onClose}
+          className="rounded-[var(--radius-sm)] px-2.5 py-1 text-[12px] text-ink-muted transition-colors hover:bg-surface hover:text-ink"
+        >
+          {t("diff.askCancel")}
+        </button>
         <button
           onClick={send}
           disabled={!q.trim()}
-          aria-label={t("lead.send")}
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] bg-brand text-brand-ink transition-opacity disabled:opacity-40"
+          className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] bg-brand px-3 py-1 text-[12px] font-medium text-brand-ink transition-opacity disabled:opacity-40"
         >
           <Send size={12} />
+          {t("diff.askSubmit")}
         </button>
       </div>
     </div>
   );
 }
 
-/** Split a unified patch into per-file bodies, dropping git header noise. */
-function parsePatch(patch: string): Record<string, string[]> {
-  const out: Record<string, string[]> = {};
+/** One line of a unified-diff body, tagged with its old/new file line numbers. */
+type DiffLine = {
+  /** Raw patch line: "+added", "-removed", " context", or an "@@ … @@" header. */
+  text: string;
+  /** Old-file (left) line number — set for context and removed (`-`) lines. */
+  lno?: number;
+  /** New-file (right) line number — set for context and added (`+`) lines. */
+  rno?: number;
+};
+
+/** Split a unified patch into per-file bodies, dropping git header noise and
+ *  numbering each line by its position in the old and new files. */
+function parsePatch(patch: string): Record<string, DiffLine[]> {
+  const out: Record<string, DiffLine[]> = {};
   let cur: string | null = null;
-  let buf: string[] = [];
+  let buf: DiffLine[] = [];
+  let oldNo = 0;
+  let newNo = 0;
+  let inHunk = false;
   const flush = () => {
     if (cur) out[cur] = buf;
   };
@@ -230,22 +303,54 @@ function parsePatch(patch: string): Record<string, string[]> {
     if (line.startsWith("diff --git")) {
       flush();
       buf = [];
+      oldNo = 0;
+      newNo = 0;
+      inHunk = false;
       const m = line.match(/ b\/(.+)$/);
       cur = m ? m[1] : line;
     } else if (
-      line.startsWith("index ") ||
-      line.startsWith("--- ") ||
-      line.startsWith("+++ ") ||
-      line.startsWith("new file") ||
-      line.startsWith("deleted file") ||
-      line.startsWith("old mode") ||
-      line.startsWith("new mode") ||
-      line.startsWith("similarity ") ||
-      line.startsWith("rename ")
+      !inHunk &&
+      (line.startsWith("index ") ||
+        line.startsWith("--- ") ||
+        line.startsWith("+++ ") ||
+        line.startsWith("new file") ||
+        line.startsWith("deleted file") ||
+        line.startsWith("old mode") ||
+        line.startsWith("new mode") ||
+        line.startsWith("similarity ") ||
+        line.startsWith("rename "))
     ) {
-      // header noise — the section header already names the file
+      // file-level metadata, which only appears before the first hunk — drop it;
+      // the section header already names the file. Inside a hunk, lines like
+      // "+++ x" / "--- x" are real added/removed content, not headers.
     } else if (cur) {
-      buf.push(line);
+      if (line.startsWith("@@")) {
+        // hunk header resets the counters: @@ -oldStart,_ +newStart,_ @@
+        const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (m) {
+          oldNo = Number(m[1]);
+          newNo = Number(m[2]);
+          inHunk = true;
+        }
+        buf.push({ text: line });
+      } else if (!inHunk) {
+        // pre-hunk metadata (e.g. "Binary files … differ") — owns no line number
+        buf.push({ text: line });
+      } else if (line.startsWith("+")) {
+        buf.push({ text: line, rno: newNo });
+        newNo++;
+      } else if (line.startsWith("-")) {
+        buf.push({ text: line, lno: oldNo });
+        oldNo++;
+      } else if (line === "" || line.startsWith("\\")) {
+        // blank tail line / "\ No newline at end of file" — owns no line number
+        buf.push({ text: line });
+      } else {
+        // context line — advances both files
+        buf.push({ text: line, lno: oldNo, rno: newNo });
+        oldNo++;
+        newNo++;
+      }
     }
   }
   flush();
