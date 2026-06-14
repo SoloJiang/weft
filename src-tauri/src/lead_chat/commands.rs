@@ -627,6 +627,39 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
     out
 }
 
+/// Live worker engines the frontend should mirror into its session map. Snapshots
+/// `LeadChatState` worker entries (positive keys = session ids; negative keys are
+/// leads), then `build_worker_slots` keeps only the running ones. Read-only: it
+/// never starts or attaches an engine, so it cannot restart a stopped worker.
+#[tauri::command]
+pub async fn list_live_worker_slots(
+    app: AppHandle,
+    db: State<'_, Db>,
+) -> Result<Vec<LiveWorkerSlot>, String> {
+    // Clone the worker EngineRefs out under the std mutex, then release it before
+    // awaiting any tokio engine lock (never hold the std guard across .await).
+    let engines: Vec<EngineRef> = {
+        let state = app.state::<LeadChatState>();
+        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .filter(|(k, _)| **k > 0)
+            .map(|(_, e)| e.clone())
+            .collect()
+    };
+    let mut snaps = Vec::new();
+    for eng in engines {
+        let (session_id, thread_id, busy, queued) = {
+            let inner = eng.lock().await;
+            (inner.session_id, inner.thread_id, inner.turn.busy, inner.turn.queue.len())
+        };
+        if let Some(sid) = session_id {
+            snaps.push(WorkerSnapshot { session_id: sid, thread_id, busy, queued });
+        }
+    }
+    Ok(build_worker_slots(&db, snaps).await)
+}
+
 // ───────────────────── chat-mode workers ─────────────────────
 //
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
