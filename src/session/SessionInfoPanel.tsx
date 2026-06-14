@@ -56,7 +56,7 @@ export function SessionInfoPanel({
         {/* Context */}
         <section className="border-b border-border px-4 py-3">
           <div className="flex items-center">
-            <span className="text-[11px] text-ink-faint">Context</span>
+            <span className="text-[11px] text-ink-faint">{t("sessionInfo.context")}</span>
             {pct != null && (
               <span className="ml-auto text-[11px] text-ink-muted">
                 {t("sessionInfo.used", { pct })}
@@ -67,7 +67,7 @@ export function SessionInfoPanel({
             <>
               <div className="mt-1.5 flex items-baseline gap-1.5">
                 <span className="text-[18px] font-medium text-ink">{ct.toLocaleString()}</span>
-                <span className="text-[11px] text-ink-faint">tokens</span>
+                <span className="text-[11px] text-ink-faint">{t("sessionInfo.tokens")}</span>
               </div>
               {pct != null && (
                 <div className="mt-2 h-1 overflow-hidden rounded-full bg-surface">
@@ -89,7 +89,7 @@ export function SessionInfoPanel({
         {/* Skills */}
         <section className="border-b border-border px-4 py-3">
           <div className="flex items-center">
-            <span className="text-[11px] text-ink-faint">Skills</span>
+            <span className="text-[11px] text-ink-faint">{t("sessionInfo.skills")}</span>
             <span className="ml-auto text-[11px] text-ink-faint">{skills.length}</span>
           </div>
           {skills.length > 0 ? (
@@ -112,7 +112,7 @@ export function SessionInfoPanel({
         {/* MCP */}
         <section className="px-4 py-3">
           <div className="flex items-center">
-            <span className="text-[11px] text-ink-faint">MCP</span>
+            <span className="text-[11px] text-ink-faint">{t("sessionInfo.mcp")}</span>
             <span className="ml-auto text-[11px] text-ink-faint">
               {t("sessionInfo.servers", { count: meta?.mcpServers.length ?? 0 })}
             </span>
