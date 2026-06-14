@@ -1,14 +1,25 @@
-//! Consumes bus Wake events and drives the target's live session to read its
-//! inbox. Rate-limited per (thread, direction). A busy engine queues the nudge
-//! for after the current turn rather than fragile idle detection — this is the
-//! honest "push" half of bus + coordinator = near-realtime.
+//! Consumes bus Wake events and drives the target's session to read its inbox.
+//! A busy engine queues the nudge for after the current turn rather than fragile
+//! idle detection — this is the honest "push" half of bus + coordinator =
+//! near-realtime.
 //!
 //! Three wake targets: the human (`"you"` → refresh the Needs-you UI), the
 //! thread lead (`"lead"` → drive the lead engine), and a worker (a numeric
 //! direction id → drive that worker's engine, lazily attaching it if idle).
+//!
+//! Per (thread, dir) the delivery is debounced: a leading-edge nudge fires
+//! immediately and any wake arriving inside the window is COALESCED into a
+//! single trailing nudge, never dropped (one `bus_inbox` call drains the whole
+//! inbox, so one trailing nudge suffices for any number of coalesced posts).
+//!
+//! Single-writer safety: a session the human has taken over in their terminal is
+//! persisted `STATUS_STOPPED`; a wake never spawns a competing headless process
+//! for it. A cleanly-idle session is still driven (its message goes through).
 
 use crate::bus::{Wake, HUMAN, LEAD};
-use std::collections::HashMap;
+use crate::lead_chat::engine::STATUS_STOPPED;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -37,47 +48,103 @@ fn classify(dir: &str) -> Option<Route> {
     }
 }
 
+/// Leading+trailing debounce state, keyed by `"{thread}/{dir}"`.
+#[derive(Default)]
+struct Debounce {
+    last: HashMap<String, Instant>,
+    pending: HashSet<String>,
+}
+
 /// Run the coordinator loop on a dedicated OS thread (the mpsc Receiver is
 /// blocking).
 pub fn run(app: AppHandle, rx: Receiver<Wake>) {
     std::thread::spawn(move || {
-        let mut last: HashMap<String, Instant> = HashMap::new();
+        let dq: Arc<Mutex<Debounce>> = Arc::new(Mutex::new(Debounce::default()));
         while let Ok(w) = rx.recv() {
             let Some(route) = classify(&w.dir) else {
                 continue;
             };
             // A wake addressed to the human means an agent asked a question:
             // nudge the UI to refresh its Needs-you surface, don't touch an
-            // engine. Not rate-limited — it's a cheap UI event.
+            // engine. Not debounced — it's a cheap UI event.
             if route == Route::Human {
                 let _ = app.emit("needs-you://changed", w.thread);
                 continue;
             }
-            // Rate-limit per (thread, dir): a burst of posts to the same target
-            // shouldn't spam the agent, since one wake drains the whole inbox.
             // The lead's dir ("lead") repeats across threads, so the thread must
             // be part of the key.
             let key = format!("{}/{}", w.thread, w.dir);
-            let now = Instant::now();
-            if let Some(t) = last.get(&key) {
-                if now.duration_since(*t) < RATE_LIMIT {
-                    continue; // rate-limited: don't spam the agent
+            // Leading-edge fire; a wake inside the window is remembered and
+            // delivered once on the trailing edge instead of being dropped.
+            let fire = {
+                let mut g = dq.lock().unwrap_or_else(|e| e.into_inner());
+                match g.last.get(&key) {
+                    Some(t) if t.elapsed() < RATE_LIMIT => {
+                        g.pending.insert(key.clone());
+                        false
+                    }
+                    _ => {
+                        g.last.insert(key.clone(), Instant::now());
+                        true
+                    }
                 }
+            };
+            if !fire {
+                continue;
             }
-            last.insert(key, now);
             let app2 = app.clone();
+            let dq2 = dq.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = deliver(&app2, w.thread, route).await {
-                    eprintln!("[weft][coordinator] wake {route:?}@{} failed: {e}", w.thread);
+                loop {
+                    if let Err(e) = deliver(&app2, w.thread, route).await {
+                        eprintln!("[weft][coordinator] wake {route:?}@{} failed: {e}", w.thread);
+                    }
+                    tokio::time::sleep(RATE_LIMIT).await;
+                    // Trailing edge: deliver once more if a wake coalesced during
+                    // the window; otherwise release the key so the next wake fires
+                    // immediately.
+                    let again = {
+                        let mut g = dq2.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.pending.remove(&key) {
+                            g.last.insert(key.clone(), Instant::now());
+                            true
+                        } else {
+                            g.last.remove(&key);
+                            false
+                        }
+                    };
+                    if !again {
+                        break;
+                    }
                 }
             });
         }
     });
 }
 
+/// True iff `key`'s engine is resident AND its child process is alive — i.e.
+/// weft already owns the single-writer slot, so a nudge reuses it instead of
+/// spawning. A taken-over session is resident-but-dead-child (or not resident),
+/// so this is false for it.
+async fn live_resident(app: &AppHandle, key: i64) -> bool {
+    let Some(eng) = app
+        .state::<crate::lead_chat::engine::LeadChatState>()
+        .get(key)
+    else {
+        return false;
+    };
+    let mut inner = eng.lock().await;
+    inner
+        .child
+        .as_mut()
+        .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+}
+
 /// Deliver an invisible bus-wake nudge to the routed engine. A busy engine
 /// queues it for after the current turn; an idle/not-yet-resident worker is
-/// lazily attached so it can still be driven (mirrors the boot revive path).
+/// lazily attached so a bus post still drives it. A session taken over in the
+/// user's terminal (`STATUS_STOPPED`, not currently live under weft) is skipped
+/// so we never spawn a competing headless process.
 async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<()> {
     let Some(db) = app.try_state::<crate::store::Db>() else {
         return Ok(());
@@ -87,9 +154,15 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
         // Handled inline in run(); never reaches deliver().
         Route::Human => Ok(()),
         Route::Lead => {
-            // Get-or-create the lead engine for this thread, then nudge it to read
-            // its inbox. nudge() spawns/resumes the process via ensure_running and
-            // starts a turn if idle, or queues behind the current one.
+            let key = crate::lead_chat::commands::lead_key(thread);
+            let taken_over = crate::store::repo::lead_status(&db, thread).await?.as_deref()
+                == Some(STATUS_STOPPED);
+            if taken_over && !live_resident(app, key).await {
+                return Ok(());
+            }
+            // Get-or-create the lead engine, then nudge it to read its inbox.
+            // nudge() spawns/resumes the process via ensure_running and starts a
+            // turn if idle, or queues behind the current one.
             let eng = crate::lead_chat::commands::lead_engine(app, &db, thread, "en").await?;
             crate::lead_chat::engine::nudge(app, &db, &eng, WAKE_PROMPT).await
         }
@@ -97,11 +170,15 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
             let Some(s) = crate::store::repo::latest_session_for_direction(&db, dir).await? else {
                 return Ok(());
             };
-            let eng = match app
-                .state::<crate::lead_chat::engine::LeadChatState>()
-                .get(s.id as i64)
-            {
-                Some(e) => Some(e),
+            let live = live_resident(app, s.id as i64).await;
+            // Taken over in the user's terminal: never spawn a competing process.
+            // A live resident process means weft re-owns it, so drive on.
+            if !live && s.status == STATUS_STOPPED {
+                return Ok(());
+            }
+            let state = app.state::<crate::lead_chat::engine::LeadChatState>();
+            let eng = match state.get(s.id as i64) {
+                Some(e) => e,
                 None => {
                     // Not resident: lazily open the worker so an idle/closed
                     // worker can still be driven by a bus post. Never resurrect a
@@ -111,21 +188,19 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
                         .map(|d| d.status == "done")
                         .unwrap_or(true);
                     if done {
-                        None
-                    } else {
-                        let info = crate::lead_chat::commands::chat_open_worker_impl(
-                            app, &db, dir, s.repo_id, "en",
-                        )
-                        .await?;
-                        app.state::<crate::lead_chat::engine::LeadChatState>()
-                            .get(info.session_id as i64)
+                        return Ok(());
+                    }
+                    let info = crate::lead_chat::commands::chat_open_worker_impl(
+                        app, &db, dir, s.repo_id, "en",
+                    )
+                    .await?;
+                    match state.get(info.session_id as i64) {
+                        Some(e) => e,
+                        None => return Ok(()),
                     }
                 }
             };
-            if let Some(eng) = eng {
-                crate::lead_chat::engine::nudge(app, &db, &eng, WAKE_PROMPT).await?;
-            }
-            Ok(())
+            crate::lead_chat::engine::nudge(app, &db, &eng, WAKE_PROMPT).await
         }
     }
 }
@@ -149,5 +224,33 @@ mod tests {
         assert_eq!(classify(""), None);
         assert_eq!(classify("leader"), None);
         assert_eq!(classify("worker-3"), None);
+    }
+
+    // The debounce coalesces a wake arriving inside the window into a single
+    // trailing fire (never dropped) and releases the key when idle so the next
+    // wake fires immediately. This exercises that state machine without a runtime.
+    #[test]
+    fn debounce_coalesces_then_releases() {
+        let mut dq = Debounce::default();
+        let key = "7/lead".to_string();
+
+        // First wake: leading-edge fire.
+        let fire1 = matches!(dq.last.get(&key), Some(t) if t.elapsed() < RATE_LIMIT);
+        assert!(!fire1, "no prior timestamp → should fire");
+        dq.last.insert(key.clone(), Instant::now());
+
+        // Second wake inside the window: coalesced (remembered), not a new fire.
+        let within = matches!(dq.last.get(&key), Some(t) if t.elapsed() < RATE_LIMIT);
+        assert!(within, "still inside the window");
+        dq.pending.insert(key.clone());
+
+        // Trailing edge sees the pending wake → fires once more, keeps the key.
+        assert!(dq.pending.remove(&key), "trailing fire consumes the pending wake");
+        dq.last.insert(key.clone(), Instant::now());
+
+        // Next trailing edge: nothing pending → release the key.
+        assert!(!dq.pending.remove(&key));
+        dq.last.remove(&key);
+        assert!(dq.last.get(&key).is_none(), "key released when idle");
     }
 }

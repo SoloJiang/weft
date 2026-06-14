@@ -15,6 +15,13 @@ use tokio::process::{Child, ChildStdin, Command};
 
 pub const EVENT: &str = "lead-chat";
 
+/// Persisted activity status for a session/lead deliberately stopped by the
+/// human (terminal takeover) or the runaway guard. Distinct from "idle" (a turn
+/// ended cleanly) so single-writer-sensitive paths — boot revive AND coordinator
+/// bus-wake delivery — can refuse to spawn a COMPETING headless process for a
+/// session the human may be driving in their own terminal.
+pub const STATUS_STOPPED: &str = "stopped";
+
 /// Persist the turn-activity status for whichever surface this engine drives:
 /// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
 async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, status: &str) {
@@ -1019,13 +1026,16 @@ pub async fn stop_quiet(eng: &EngineRef) {
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
-/// guard). Persists idle so a stopped/taken-over session can't be falsely
-/// revived into a COMPETING headless process on the next boot (see L204).
+/// guard). Persists `STATUS_STOPPED` so a stopped/taken-over session can't be
+/// falsely revived into a COMPETING headless process — neither by the boot
+/// revive sweep (which only resumes "running") nor by a coordinator bus wake
+/// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
+/// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     stop_quiet(eng).await;
     let inner = eng.lock().await;
     if let Some(db) = app.try_state::<Db>() {
-        persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
+        persist_activity(&db, inner.session_id, inner.thread_id, STATUS_STOPPED).await;
     }
     let _ = app.emit(
         EVENT,

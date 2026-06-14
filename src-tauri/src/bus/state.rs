@@ -173,12 +173,20 @@ impl BusRegistry {
         let targets: Vec<String> = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            let targets: Vec<String> = bus
+            let mut targets: Vec<String> = bus
                 .members
                 .iter()
                 .filter(|d| d.as_str() != from)
                 .cloned()
                 .collect();
+            // The lead joins the bus only when its process connects, so an idle
+            // or not-yet-opened lead is not in `members` and would silently miss
+            // thread-wide messages. Always route a broadcast to the lead's inbox
+            // (and wake it) so it sees the message when next driven — issue-thread
+            // broadcasts are the only callers, so this never targets a phantom.
+            if from != LEAD && !targets.iter().any(|d| d == LEAD) {
+                targets.push(LEAD.to_string());
+            }
             bus.log.push(m.clone());
             for d in &targets {
                 bus.inboxes.entry(d.clone()).or_default().push(m.clone());
@@ -331,6 +339,26 @@ mod tests {
         assert_eq!(r.inbox(1, "10").len(), 0);
         assert_eq!(r.inbox(1, "20").len(), 1);
         assert_eq!(r.inbox(1, "30").len(), 1);
+    }
+
+    #[test]
+    fn broadcast_reaches_lead_even_when_not_joined() {
+        // The lead joins the bus only when its process connects; a worker's
+        // broadcast must still land in the lead's inbox (and wake it) so an idle
+        // lead never silently misses a thread-wide message.
+        let r = BusRegistry::new();
+        r.join(1, "10");
+        r.broadcast(1, "10", "contract changed", "message");
+        assert_eq!(r.inbox(1, LEAD).len(), 1, "idle lead receives the broadcast");
+    }
+
+    #[test]
+    fn broadcast_from_lead_does_not_self_target() {
+        let r = BusRegistry::new();
+        r.join(1, "10");
+        r.broadcast(1, LEAD, "heads up", "message");
+        assert_eq!(r.inbox(1, LEAD).len(), 0, "lead never broadcasts to itself");
+        assert_eq!(r.inbox(1, "10").len(), 1);
     }
 
     #[test]
