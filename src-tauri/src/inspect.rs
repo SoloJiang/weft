@@ -52,16 +52,16 @@ pub fn open_url(url: String) -> Result<(), String> {
 /// `file://` URI, and may carry a trailing `:line[:col]` (stripped — the default
 /// app can't seek). Errors `"not_found"` so the UI can show a quiet toast.
 #[tauri::command]
-pub fn open_path(path: String, cwd: Option<String>) -> Result<(), String> {
-    let abs = resolve_chat_path(&path, cwd.as_deref()).map_err(map_resolve_err)?;
+pub fn open_path(path: String, cwd: Option<String>, is_url: bool) -> Result<(), String> {
+    let abs = resolve_chat_path(&path, cwd.as_deref(), is_url).map_err(map_resolve_err)?;
     tauri_plugin_opener::open_path(&abs, None::<&str>).map_err(err)
 }
 
 /// Reveal a file the agent referenced in chat — resolves the token (relative to
 /// `cwd`) like `open_path`, then selects it in the OS file manager.
 #[tauri::command]
-pub fn reveal_path_in(path: String, cwd: Option<String>) -> Result<(), String> {
-    let abs = resolve_chat_path(&path, cwd.as_deref()).map_err(map_resolve_err)?;
+pub fn reveal_path_in(path: String, cwd: Option<String>, is_url: bool) -> Result<(), String> {
+    let abs = resolve_chat_path(&path, cwd.as_deref(), is_url).map_err(map_resolve_err)?;
     tauri_plugin_opener::reveal_item_in_dir(&abs).map_err(err)
 }
 
@@ -94,21 +94,20 @@ fn map_resolve_err(e: ResolveErr) -> String {
 }
 
 /// Turn a raw path token from chat into an absolute, existing path.
-fn resolve_chat_path(token: &str, cwd: Option<&str>) -> Result<PathBuf, ResolveErr> {
+fn resolve_chat_path(token: &str, cwd: Option<&str>, is_url: bool) -> Result<PathBuf, ResolveErr> {
     let trimmed = token.trim();
-    // Strip the `file://` scheme + optional `localhost` authority, then any URL
-    // fragment/query (`#L42`, `#usage`, `?v=`) — like `:line`, the opener can't
-    // use it.
-    let body = strip_fragment(strip_file_scheme(trimmed));
-    // Markdown link hrefs (and `file://` URIs) are percent-encoded — a space is
-    // `%20` — so decode every token. Bare/inline literal paths rarely contain a
-    // literal `%XX`, so this is safe in practice.
-    let decoded = percent_decode(body);
-    // `file:///C:/…` leaves `/C:/…` after the scheme strip; drop the leading
-    // slash before a Windows drive letter so the path exists on disk. No-op for
-    // POSIX paths.
-    let normalized = strip_leading_drive_slash(decoded);
-    let bare = strip_line_suffix(&normalized);
+    // URL tokens (markdown link hrefs) carry URI syntax: a `file://` scheme +
+    // optional `localhost` authority, a `#fragment`/`?query`, percent-encoding,
+    // and the `/C:/…` drive form. Bare prose / inline-code tokens are LITERAL
+    // filesystem paths, where `#` and `%` are valid filename characters — so URI
+    // normalization runs ONLY for URL tokens.
+    let decoded: String = if is_url {
+        let body = strip_fragment(strip_file_scheme(trimmed));
+        strip_leading_drive_slash(percent_decode(body))
+    } else {
+        trimmed.to_string()
+    };
+    let bare = strip_line_suffix(&decoded);
     let expanded = expand_tilde(bare);
 
     let abs = if expanded.is_absolute() {
@@ -280,7 +279,7 @@ mod tests {
     #[test]
     fn resolves_absolute_existing() {
         let abs = manifest().join("Cargo.toml");
-        let got = resolve_chat_path(abs.to_str().unwrap(), None).unwrap();
+        let got = resolve_chat_path(abs.to_str().unwrap(), None, true).unwrap();
         assert!(got.ends_with("Cargo.toml"));
         assert!(got.is_absolute());
     }
@@ -288,7 +287,7 @@ mod tests {
     #[test]
     fn resolves_relative_against_cwd() {
         let cwd = manifest();
-        let got = resolve_chat_path("Cargo.toml", cwd.to_str()).unwrap();
+        let got = resolve_chat_path("Cargo.toml", cwd.to_str(), false).unwrap();
         assert!(got.ends_with("Cargo.toml"));
     }
 
@@ -296,7 +295,7 @@ mod tests {
     fn strips_file_scheme_and_line_then_resolves() {
         let abs = manifest().join("Cargo.toml");
         let token = format!("file://{}:10", abs.to_str().unwrap());
-        let got = resolve_chat_path(&token, None).unwrap();
+        let got = resolve_chat_path(&token, None, true).unwrap();
         assert!(got.ends_with("Cargo.toml"));
     }
 
@@ -314,17 +313,29 @@ mod tests {
         let dir = manifest();
         // Encode the leading 'C' of Cargo.toml as %43 to exercise URI decoding.
         let token = format!("file://{}/%43argo.toml", dir.to_str().unwrap());
-        let got = resolve_chat_path(&token, None).unwrap();
+        let got = resolve_chat_path(&token, None, true).unwrap();
         assert!(got.ends_with("Cargo.toml"));
     }
 
     #[test]
-    fn decodes_percent_escapes_in_bare_token() {
-        // A non-`file://` link href is still URL-encoded — must decode too.
+    fn decodes_percent_escapes_in_url_token() {
+        // A non-`file://` link href is still URL-encoded — must decode when is_url.
         let dir = manifest();
         let token = format!("{}/%43argo.toml", dir.to_str().unwrap());
-        let got = resolve_chat_path(&token, None).unwrap();
+        let got = resolve_chat_path(&token, None, true).unwrap();
         assert!(got.ends_with("Cargo.toml"));
+    }
+
+    #[test]
+    fn literal_paths_keep_hash_but_urls_strip_fragment() {
+        // A real file whose name contains '#': literal tokens must keep it; URL
+        // tokens treat '#' as a fragment. (No cross-test env mutation — temp file.)
+        let p = std::env::temp_dir().join("weft_test_a#b.txt");
+        std::fs::write(&p, b"x").unwrap();
+        let token = p.to_str().unwrap();
+        assert!(resolve_chat_path(token, None, false).is_ok()); // literal → found
+        assert_eq!(resolve_chat_path(token, None, true), Err(ResolveErr::NotFound)); // url → '#' fragment
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
@@ -360,13 +371,13 @@ mod tests {
 
     #[test]
     fn missing_path_is_not_found() {
-        let got = resolve_chat_path("definitely/not/here.xyz", manifest().to_str());
+        let got = resolve_chat_path("definitely/not/here.xyz", manifest().to_str(), false);
         assert_eq!(got, Err(ResolveErr::NotFound));
     }
 
     #[test]
     fn relative_without_cwd_errors() {
-        let got = resolve_chat_path("src/foo.ts", None);
+        let got = resolve_chat_path("src/foo.ts", None, false);
         assert_eq!(got, Err(ResolveErr::RelativeWithoutCwd));
     }
 }

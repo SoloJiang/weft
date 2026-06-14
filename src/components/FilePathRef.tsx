@@ -12,12 +12,15 @@ export function FilePathRef({
   token,
   cwd,
   code,
+  isUrl,
   children,
 }: {
   token: string;
   cwd?: string;
   /** Render with the inline-code chip styling (for `` `path` `` spans). */
   code?: boolean;
+  /** Token came from a markdown link href (URI semantics) vs a literal path. */
+  isUrl?: boolean;
   children: ReactNode;
 }) {
   return (
@@ -31,12 +34,12 @@ export function FilePathRef({
         if (!(e.metaKey || e.ctrlKey)) return;
         e.preventDefault();
         e.stopPropagation();
-        void openFileRef(token, cwd);
+        void openFileRef(token, cwd, isUrl);
       }}
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        openFileMenu({ x: e.clientX, y: e.clientY, token, cwd });
+        openFileMenu({ x: e.clientX, y: e.clientY, token, cwd, isUrl });
       }}
     >
       {children}

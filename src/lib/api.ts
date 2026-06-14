@@ -190,9 +190,12 @@ export const api = {
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   // Open / reveal a file the agent referenced in chat. `cwd` resolves relative
-  // paths against the session's working copy. Reject with "not_found" if missing.
-  openPath: (path: string, cwd?: string) => invoke<void>("open_path", { path, cwd }),
-  revealPathIn: (path: string, cwd?: string) => invoke<void>("reveal_path_in", { path, cwd }),
+  // paths against the session's working copy; `isUrl` marks a link href (URI
+  // syntax) vs a literal inline/prose path. Reject with "not_found" if missing.
+  openPath: (path: string, cwd?: string, isUrl = false) =>
+    invoke<void>("open_path", { path, cwd, isUrl }),
+  revealPathIn: (path: string, cwd?: string, isUrl = false) =>
+    invoke<void>("reveal_path_in", { path, cwd, isUrl }),
 
   // Which coding-agent CLIs are installed locally (for Settings).
   detectTools: () => invoke<ToolStatus[]>("detect_tools"),

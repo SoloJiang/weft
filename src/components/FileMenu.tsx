@@ -62,7 +62,7 @@ export function FileMenu() {
           label={t("fileLink.openWith")}
           onClick={() => {
             closeFileMenu();
-            void openFileRef(m.token, m.cwd);
+            void openFileRef(m.token, m.cwd, m.isUrl);
           }}
         />
         <MenuItem
@@ -70,7 +70,7 @@ export function FileMenu() {
           label={t("fileLink.openFolder")}
           onClick={() => {
             closeFileMenu();
-            void revealFileRef(m.token, m.cwd);
+            void revealFileRef(m.token, m.cwd, m.isUrl);
           }}
         />
         <MenuItem
@@ -78,7 +78,7 @@ export function FileMenu() {
           label={t("fileLink.copyPath")}
           onClick={() => {
             closeFileMenu();
-            copyFilePath(m.token);
+            copyFilePath(m.token, m.isUrl);
           }}
         />
       </div>

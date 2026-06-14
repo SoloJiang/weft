@@ -17,22 +17,26 @@ import i18n from "../i18n";
 export type HrefKind = { kind: "web"; url: string } | { kind: "file"; token: string };
 
 const SCHEME = /^[a-z][a-z0-9+.-]*:/i; // http:, mailto:, ms-settings:, vscode-insiders:, …
-const LINE_SUFFIX = /^[^:]*:\d+(?::\d+)?$/; // path:line[:col] (head has no colon)
+const LINE_SUFFIX_HEAD = /^([^:]*):\d+(?::\d+)?$/; // path:line[:col] → captures head
 const WIN_DRIVE = /^[a-zA-Z]:[\\/]/;
 
 /**
- * Classify a markdown link's href. Any real URI scheme (http://, mailto:,
- * ms-settings:, codex://, vscode-insiders://, …) opens as a web/app link via the
- * opener; everything else — absolute/relative paths, `path:line`, drive paths —
- * is treated as a local file the agent deliberately linked.
+ * Classify a markdown link's href. Any real URI scheme (http://, mailto:, tel:,
+ * ms-settings:, codex://, vscode-insiders://, …) and protocol-relative URLs open
+ * as web/app links via the opener; everything else — absolute/relative paths,
+ * `path:line`, drive paths — is treated as a local file the agent linked.
  */
 export function classifyHref(href: string): HrefKind {
   const h = href.trim();
   if (/^file:\/\//i.test(h)) return { kind: "file", token: h };
-  if (h.startsWith("#")) return { kind: "web", url: h }; // in-page anchor — leave alone
-  // A scheme prefix means a URI, UNLESS it's actually a Windows drive (`C:\`)
-  // or a `path:line` suffix (`Cargo.toml:42`).
-  if (SCHEME.test(h) && !WIN_DRIVE.test(h) && !LINE_SUFFIX.test(h)) {
+  if (h.startsWith("#")) return { kind: "web", url: h }; // in-page anchor
+  if (h.startsWith("//")) return { kind: "web", url: h }; // protocol-relative URL
+  if (SCHEME.test(h) && !WIN_DRIVE.test(h)) {
+    // A scheme prefix is a URI UNLESS it's a `path:line` ref whose head is itself
+    // path-like (Cargo.toml:42) — distinguishes files from scheme:opaque links
+    // (tel:155…, ms-settings:…).
+    const m = h.match(LINE_SUFFIX_HEAD);
+    if (m && isPathLike(m[1])) return { kind: "file", token: h };
     return { kind: "web", url: h };
   }
   return { kind: "file", token: h };
@@ -40,22 +44,30 @@ export function classifyHref(href: string): HrefKind {
 
 /**
  * Normalize a token to a usable filesystem path (for copy + detection),
- * mirroring the backend resolver: strip the `file://` scheme + optional
- * `localhost` authority (case-insensitive), drop a URL fragment/query,
- * percent-decode, then split off a trailing `:line[:col]` editor suffix.
+ * mirroring the backend resolver. For `isUrl` tokens (link hrefs) it strips the
+ * `file://` scheme + optional `localhost` authority, drops a URL fragment/query,
+ * percent-decodes, and normalizes the drive form; literal tokens (inline/prose)
+ * keep `#`/`%` verbatim. Always splits off a trailing `:line[:col]` suffix.
  */
-export function parsePathToken(token: string): { path: string; line?: number; col?: number } {
+export function parsePathToken(
+  token: string,
+  isUrl = false,
+): { path: string; line?: number; col?: number } {
   let t = token.trim();
-  const scheme = t.match(/^file:\/\//i);
-  if (scheme) t = t.slice(scheme[0].length).replace(/^localhost(?=\/)/i, "");
-  const frag = t.search(/[#?]/);
-  if (frag !== -1) t = t.slice(0, frag);
-  try {
-    t = decodeURIComponent(t);
-  } catch {
-    /* malformed %-escape — leave as-is */
+  if (isUrl) {
+    // URL token: strip scheme + localhost authority + fragment, percent-decode,
+    // normalize the drive form. Literal tokens keep '#'/'%' as filename chars.
+    const scheme = t.match(/^file:\/\//i);
+    if (scheme) t = t.slice(scheme[0].length).replace(/^localhost(?=\/)/i, "");
+    const frag = t.search(/[#?]/);
+    if (frag !== -1) t = t.slice(0, frag);
+    try {
+      t = decodeURIComponent(t);
+    } catch {
+      /* malformed %-escape — leave as-is */
+    }
+    t = t.replace(/^\/([A-Za-z]:[\\/])/, "$1"); // /C:/repo → C:/repo (mirror backend)
   }
-  t = t.replace(/^\/([A-Za-z]:[\\/])/, "$1"); // /C:/repo → C:/repo (mirror backend)
   const m = t.match(/^(.*?):(\d+)(?::(\d+))?$/);
   // `m[1].length > 1` keeps a lone Windows drive letter (e.g. "C:5") intact.
   if (m && m[1].length > 1) {
@@ -189,33 +201,42 @@ function failToast(e: unknown): void {
   toast(i18n.t(code.includes("not_found") ? "fileLink.notFound" : "fileLink.openFailed"));
 }
 
+// `isUrl` marks a token that came from a markdown link href (URI semantics);
+// false means a literal path from inline code or prose ('#'/'%' are verbatim).
+
 /** Open a file reference with the OS default app. */
-export async function openFileRef(token: string, cwd?: string): Promise<void> {
+export async function openFileRef(token: string, cwd?: string, isUrl = false): Promise<void> {
   try {
-    await api.openPath(token, cwd);
+    await api.openPath(token, cwd, isUrl);
   } catch (e) {
     failToast(e);
   }
 }
 
 /** Reveal a file reference's containing folder (selecting the item). */
-export async function revealFileRef(token: string, cwd?: string): Promise<void> {
+export async function revealFileRef(token: string, cwd?: string, isUrl = false): Promise<void> {
   try {
-    await api.revealPathIn(token, cwd);
+    await api.revealPathIn(token, cwd, isUrl);
   } catch (e) {
     failToast(e);
   }
 }
 
-/** Copy a file reference's bare path (scheme + line suffix stripped). */
-export function copyFilePath(token: string): void {
-  void navigator.clipboard?.writeText(parsePathToken(token).path);
+/** Copy a file reference's bare path (scheme/fragment/line suffix stripped for URLs). */
+export function copyFilePath(token: string, isUrl = false): void {
+  void navigator.clipboard?.writeText(parsePathToken(token, isUrl).path);
   toast(i18n.t("resume.copied"));
 }
 
 // ---- right-click menu store (mirrors components/Toast.tsx) ------------------
 
-export type FileMenuState = { x: number; y: number; token: string; cwd?: string };
+export type FileMenuState = {
+  x: number;
+  y: number;
+  token: string;
+  cwd?: string;
+  isUrl?: boolean;
+};
 
 let menuState: FileMenuState | null = null;
 const menuListeners = new Set<() => void>();

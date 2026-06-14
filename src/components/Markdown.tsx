@@ -39,7 +39,7 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
             const c = classifyHref(href);
             if (c.kind === "file") {
               return (
-                <FilePathRef token={c.token} cwd={cwd}>
+                <FilePathRef token={c.token} cwd={cwd} isUrl>
                   {children}
                 </FilePathRef>
               );
