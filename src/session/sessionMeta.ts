@@ -34,7 +34,9 @@ export function groupMcpTools(
     }));
 }
 
-/** init push → SessionMeta(init 不带 usage,保留旧 contextTokens)。 */
+/** init push → SessionMeta(init 不带 usage,保留旧 contextTokens)。
+ *  codex/opencode 的 init push 不带 mcp_servers(只有 claude 的 `system/init` 带)——
+ *  这种空 init 不能覆盖 session_meta 已填的 server,故空时保留 prev.mcpServers。 */
 export function metaFromInit(
   prev: SessionMeta | undefined,
   p: {
@@ -44,11 +46,12 @@ export function metaFromInit(
     window: number | null;
   },
 ): SessionMeta {
+  const grouped = groupMcpTools(p.mcp_servers, p.tools);
   return {
     contextTokens: prev?.contextTokens,
     window: p.window ?? prev?.window ?? undefined,
     model: p.model ?? prev?.model ?? undefined,
-    mcpServers: groupMcpTools(p.mcp_servers, p.tools),
+    mcpServers: grouped.length > 0 ? grouped : (prev?.mcpServers ?? []),
   };
 }
 
