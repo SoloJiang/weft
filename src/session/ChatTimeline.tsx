@@ -410,12 +410,14 @@ function safeParseObj(content: string): Record<string, unknown> {
 
 // Read-only history replay: only the most recent assistant row is interactive.
 // Older action_cards stay rendered for context but their buttons are disabled.
-// Tool rows are also role:"assistant" but are not conversational turns, so skip
-// them — a tool call after an action card must not make that card read-only.
+// Tool rows are role:"assistant" too: skip only those from m's OWN turn (a card
+// and the tools it kicked off share a turn) so they don't read-only the card —
+// but a LATER turn's tool rows are genuine newer activity and must disqualify it.
 function isLastAssistant(m: LeadMessage, all: LeadMessage[]): boolean {
   for (let i = all.length - 1; i >= 0; i--) {
-    if (all[i].kind === "tool") continue;
-    if (all[i].role === "assistant") return all[i].id === m.id;
+    const row = all[i];
+    if (row.kind === "tool" && row.turn_id === m.turn_id) continue;
+    if (row.role === "assistant") return row.id === m.id;
   }
   return false;
 }
