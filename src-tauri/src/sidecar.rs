@@ -346,8 +346,8 @@ fn parse_opencode_part(role: &str, data: &serde_json::Value, out: &mut Vec<NormE
 /// 之和),会随轮次无界增长、超出 window,不是当前上下文。model 仍取 `session.model`
 /// (稳定的 {id,providerID} JSON)。ro 连接,不扰动 live(WAL)db。
 pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<String>)> {
-    let home = std::env::var("HOME").ok()?;
-    let db = PathBuf::from(home).join(".local/share/opencode/opencode.db");
+    // dirs::home_dir() is platform-aware (HOME is often unset on Windows GUI launches).
+    let db = dirs::home_dir()?.join(".local/share/opencode/opencode.db");
     if !db.exists() {
         return None;
     }

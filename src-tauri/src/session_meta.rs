@@ -119,9 +119,8 @@ pub fn parse_opencode_mcp(v: &serde_json::Value) -> Vec<McpServer> {
 // ───────────────────────── 带外取数(I/O) ─────────────────────────
 
 fn codex_home() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".codex"))
-        .unwrap_or_default()
+    // dirs::home_dir() is platform-aware (HOME is often unset on Windows GUI launches).
+    dirs::home_dir().map(|h| h.join(".codex")).unwrap_or_default()
 }
 
 /// codex:`codex mcp list --json`(servers)+ config.toml(model)+ models_cache(window)。
