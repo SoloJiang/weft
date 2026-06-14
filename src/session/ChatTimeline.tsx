@@ -31,6 +31,7 @@ export function ChatTimeline({
   threadId,
   workspaceId,
   promptText,
+  cwd,
 }: {
   messages: LeadMessage[];
   busy: boolean;
@@ -43,6 +44,8 @@ export function ChatTimeline({
   threadId?: number | null;
   workspaceId?: number | null;
   promptText?: (title: string, placeholder?: string) => Promise<string | null>;
+  /** Session working dir — resolves relative file paths agents mention. */
+  cwd?: string;
 }) {
   const { t } = useTranslation();
   const endRef = useRef<HTMLDivElement>(null);
@@ -95,6 +98,7 @@ export function ChatTimeline({
             threadId={threadId ?? null}
             workspaceId={workspaceId ?? null}
             promptText={promptText}
+            cwd={cwd}
           />
         ))}
         {busy && activity && <ActivityLine name={activity.name} summary={activity.summary} />}
@@ -178,6 +182,7 @@ function TimelineRow({
   threadId,
   workspaceId,
   promptText,
+  cwd,
 }: {
   m: LeadMessage;
   all: LeadMessage[];
@@ -187,6 +192,7 @@ function TimelineRow({
   threadId: number | null;
   workspaceId: number | null;
   promptText?: (title: string, placeholder?: string) => Promise<string | null>;
+  cwd?: string;
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
@@ -330,7 +336,7 @@ function TimelineRow({
         <Sparkles size={14} />
       </span>
       <div className="min-w-0 flex-1 rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-        <Markdown text={String(c.text ?? "")} />
+        <Markdown text={String(c.text ?? "")} cwd={cwd} />
         {m.status === "streaming" && (
           <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
         )}

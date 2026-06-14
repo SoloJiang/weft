@@ -224,6 +224,7 @@ pub fn run() {
             inspect::open_terminal,
             inspect::reveal_path,
             inspect::open_url,
+            inspect::open_path,
             tools::detect_tools,
             commands::get_default_tool,
             commands::set_default_tool,

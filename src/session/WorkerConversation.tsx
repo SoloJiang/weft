@@ -148,6 +148,7 @@ export function WorkerConversation() {
             busy={busy}
             activity={sid != null ? workerActivity[sid] : undefined}
             onReviewProposal={() => {}}
+            cwd={ref?.worktree}
           />
           <ChatComposer
             slashCommands={(sid != null ? workerSlash[sid] : undefined) ?? []}

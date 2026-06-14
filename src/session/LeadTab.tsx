@@ -50,6 +50,8 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
   const [promptState, setPromptState] = useState<PromptState | null>(null);
+  // The lead's working dir — resolves relative file paths it mentions in chat.
+  const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
 
   const promptText = (title: string, placeholder?: string) =>
     new Promise<string | null>((resolve) =>
@@ -66,6 +68,20 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   useEffect(() => {
     if (activeThreadId != null) void loadLeadChat(activeThreadId);
   }, [activeThreadId, loadLeadChat]);
+
+  useEffect(() => {
+    if (activeThreadId == null) return;
+    let alive = true;
+    void api
+      .leadState(activeThreadId)
+      .then((st) => {
+        if (alive) setLeadCwd(st.cwd);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [activeThreadId]);
 
   if (activeThreadId == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
@@ -104,6 +120,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
         threadId={activeThreadId}
         workspaceId={activeWorkspaceId}
         promptText={promptText}
+        cwd={leadCwd}
       />
       <ChatComposer
         slashCommands={leadSlash[activeThreadId] ?? []}
