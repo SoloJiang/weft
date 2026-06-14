@@ -40,6 +40,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   const {
     activeThreadId,
     activeWorkspaceId,
+    threads,
     leadMessages,
     leadTurn,
     leadSlash,
@@ -103,6 +104,8 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[activeThreadId] ?? []).filter((m) => m.session_id == null);
   const turn = leadTurn[activeThreadId] ?? { state: "stopped" as const, queued: 0 };
+  // The lead engine runs the thread's lead_tool (not always claude).
+  const leadTool = threads.find((th) => th.id === activeThreadId)?.lead_tool ?? "claude";
 
   // 重载会话:重拉 skills + 标记静默 re-spawn(claude 下条消息拾取新 MCP/skill)。
   const onReload = () => {
@@ -129,8 +132,8 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
         <header className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2">
           <span className="mr-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-[11px] font-medium text-ink-muted">
-            <ToolIcon tool="claude" size={12} />
-            {toolFullName("claude")}
+            <ToolIcon tool={leadTool} size={12} />
+            {toolFullName(leadTool)}
           </span>
           <button
             onClick={() => setRail((r) => (r === "info" ? "none" : "info"))}
@@ -179,7 +182,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
             if (!st.native_id) return false;
             await api.leadStop(activeThreadId);
             await navigator.clipboard.writeText(
-              resumeCommand("claude", st.cwd, st.native_id),
+              resumeCommand(leadTool, st.cwd, st.native_id),
             );
             return true;
           }}

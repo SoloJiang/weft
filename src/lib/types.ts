@@ -35,6 +35,8 @@ export interface Thread {
   title: string;
   slug: string;
   kind: string;
+  /** The CLI the lead engine runs (claude | codex | opencode). */
+  lead_tool: string;
   created_at: string;
 }
 
