@@ -50,7 +50,8 @@ When the write boundary is clear enough for workers to start, call propose_direc
 (name, the ONE repo each writes, reason, mandate). Only list repos each direction must WRITE; reads are free. \
 Pick mandate per direction as a planning-depth hint: plan+impl for directions that need worker planning, impl-only for small or fully specified directions. \
 Prefer independent directions that can proceed in parallel; put shared contract owners first only when they block others. \
-The human reviews and confirms in weft; you can re-propose after more discussion.";
+The human reviews and confirms in weft; you can re-propose after more discussion. \
+After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), and reply with bus_post to a worker's direction id — a direct bus_post reliably reaches that worker even if it is currently idle. bus_broadcast only reaches participants already active on the bus, so to be sure a specific worker sees something, bus_post it directly rather than relying on a broadcast. Reading the bus is your job; do not assume silence means nothing happened.";
 
 /// Sentinel usage directives appended to the lead prompt. Each subsequent task
 /// (Task 3-5) keeps growing this block, so it lives as its own const for easy
@@ -130,15 +131,23 @@ pub async fn lead_engine(
     let cwd = ensure_lead_cwd(thread_id)?;
     let base = app.state::<crate::BusBase>().0.clone();
     let is_concierge = t.kind == "concierge";
-    let inj = if is_concierge {
-        crate::bus::inject::inject_global(&base, &t.lead_tool, &cwd)
-    } else {
-        crate::bus::inject::inject_planner(&base, thread_id, &t.lead_tool, &cwd)
-    };
     let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "lead", &t.lead_tool, &cwd);
     crate::skills::inject_for(db, t.workspace_id, &cwd).await;
     let mut extra = ask.args;
-    extra.extend(inj.args);
+    if is_concierge {
+        // Concierge is the IM-scoped global helper, not a thread participant: it
+        // gets weft_global, never the per-thread bus.
+        extra.extend(crate::bus::inject::inject_global(&base, &t.lead_tool, &cwd).args);
+    } else {
+        // A per-issue lead gets the planner (read-only scope planning) AND the
+        // thread bus under the LEAD identity, so workers can message it and it
+        // can reply/broadcast. Joining the bus also lets a worker's post drive a
+        // lead turn (see coordinator::run).
+        extra.extend(crate::bus::inject::inject_planner(&base, thread_id, &t.lead_tool, &cwd).args);
+        extra.extend(
+            crate::bus::inject::inject(&base, thread_id, crate::bus::LEAD, &t.lead_tool, &cwd).args,
+        );
+    }
     let system_prompt = if is_concierge {
         concierge_prompt(lang)
     } else {
@@ -184,6 +193,7 @@ pub async fn lead_engine(
         last_mcp_servers: vec![],
         last_tools: vec![],
         current_origin_tag: None,
+        tool_rows: std::collections::HashMap::new(),
         stopped,
     };
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
@@ -858,6 +868,7 @@ pub(crate) async fn chat_open_worker_impl(
                 last_mcp_servers: vec![],
                 last_tools: vec![],
                 current_origin_tag: None,
+                tool_rows: std::collections::HashMap::new(),
                 stopped: sess.status == "stopped",
             };
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
@@ -961,6 +972,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         last_mcp_servers: vec![],
         last_tools: vec![],
         current_origin_tag: None,
+        tool_rows: std::collections::HashMap::new(),
         stopped: sess.status == "stopped",
     };
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));

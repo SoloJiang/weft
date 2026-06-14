@@ -1,6 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, FileText, Sparkles } from "lucide-react";
+import { ArrowRight, ChevronRight, FileText, Sparkles } from "lucide-react";
 import type { LeadMessage } from "../lib/types";
 import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
@@ -49,27 +50,31 @@ export function ChatTimeline({
   emptyState?: EmptyStateMode;
 }) {
   const { t } = useTranslation();
-  const endRef = useRef<HTMLDivElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
-  const lastTextLen = messages
-    .filter((m) => m.kind === "text")
+
+  // Tool calls (claude/opencode) render inline as expandable `kind:"tool"` rows;
+  // only `meta` bookkeeping rows are hidden. (Codex tools still arrive as the
+  // transient activity bar below the list.)
+  const visible = messages.filter((m) => m.kind !== "meta");
+
+  // Virtuoso's followOutput only fires on item-COUNT changes, so it misses
+  // intra-message streaming growth (text appended to the existing last row).
+  // Follow the bottom ourselves on every growth signal, but only while the user
+  // is parked at the bottom. atBottomThreshold (set on Virtuoso below) restores
+  // the old ~80px tolerance, so a reader a few px short of the exact bottom still
+  // auto-follows while one who scrolled up to read history is left alone.
+  // scrollToIndex is measurement-aware — it renders and measures the target row
+  // before scrolling — so there is no scrollTo(MAX)/rAF drift to correct, and
+  // because the activity bar lives OUTSIDE the scroller the last row is the
+  // unambiguous bottom.
+  const growthLen = visible
+    .filter((m) => m.kind === "text" || m.kind === "tool")
     .reduce((n, m) => n + m.content.length, 0);
-
-  // Stick to the bottom while the user is already there (streaming included);
-  // never yank them down when they've scrolled up to read history.
   useEffect(() => {
-    if (atBottomRef.current) endRef.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, lastTextLen, busy, activity]);
-
-  const onScroll = () => {
-    const el = scrollRef.current;
-    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  };
-
-  // Tool rows (legacy imports / older builds) are hidden: tool calls render
-  // only while running, via the activity line below.
-  const visible = messages.filter((m) => m.kind !== "meta" && m.kind !== "tool");
+    if (!atBottomRef.current || visible.length === 0) return;
+    virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+  }, [visible.length, growthLen, busy, activity]);
 
   if (visible.length === 0 && !busy) {
     return (
@@ -85,36 +90,73 @@ export function ChatTimeline({
   }
 
   return (
-    <div
-      ref={scrollRef}
-      onScroll={onScroll}
-      className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-4 py-4"
-    >
-      <div className="mx-auto flex w-full max-w-[820px] flex-col gap-2.5">
-        {visible.map((m) => (
-          <TimelineRow
-            key={m.id}
-            m={m}
-            all={visible}
-            onReviewProposal={onReviewProposal}
-            runAction={runAction}
-            actionsBusy={actionsBusy}
-            threadId={threadId ?? null}
-            workspaceId={workspaceId ?? null}
-            promptText={promptText}
-          />
-        ))}
-        {busy && activity && <ActivityLine name={activity.name} summary={activity.summary} />}
-        {busy && !activity && (
-          <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
-            {t("lead.working")}
+    <div className="flex min-h-0 flex-1 flex-col">
+      <Virtuoso<LeadMessage>
+        ref={virtuosoRef}
+        className="min-h-0 flex-1"
+        data={visible}
+        computeItemKey={(_index, m) => m.id}
+        // Open at the BOTTOM of the last message (align "end"), so a final
+        // message taller than the viewport opens at its latest line, not its top.
+        // Omitted while empty (busy-only turn): index 0 is out of range for
+        // data=[] and would misinitialize Virtuoso.
+        initialTopMostItemIndex={
+          visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
+        }
+        // Restore the old 80px "close enough to the bottom" tolerance: a reader a
+        // few px up (e.g. a trackpad nudge) still counts as at-bottom and keeps
+        // auto-following. Virtuoso's default is only a few px.
+        atBottomThreshold={80}
+        atBottomStateChange={(atBottom) => {
+          atBottomRef.current = atBottom;
+        }}
+        increaseViewportBy={{ top: 600, bottom: 600 }}
+        components={{ Header, Footer }}
+        itemContent={(_index, m) => (
+          <div className="mx-auto w-full max-w-[820px] px-4 pb-2.5">
+            <TimelineRow
+              m={m}
+              all={visible}
+              onReviewProposal={onReviewProposal}
+              runAction={runAction}
+              actionsBusy={actionsBusy}
+              threadId={threadId ?? null}
+              workspaceId={workspaceId ?? null}
+              promptText={promptText}
+            />
           </div>
         )}
-      </div>
-      <div ref={endRef} />
+      />
+      {/* The in-flight tool / working indicator sits OUTSIDE the virtualized
+          scroller as a fixed bottom bar. Keeping it out of the list makes the
+          last message the unambiguous list bottom (so the follow-scroll target
+          is exact) and keeps the indicator visible even while the user scrolls
+          back through history. */}
+      {busy && (
+        <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
+          {activity ? (
+            <ActivityLine name={activity.name} summary={activity.summary} />
+          ) : (
+            <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
+              {t("lead.working")}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+/** Top breathing room — mirrors the old scroll container's py-4 top padding. */
+function Header() {
+  return <div className="h-4" />;
+}
+
+/** Bottom breathing room inside the scroller; the activity bar now renders
+ *  outside the virtualized list (see ChatTimeline). */
+function Footer() {
+  return <div className="h-4" />;
 }
 
 function EmptyLeadState({
@@ -224,6 +266,126 @@ function ActivityLine({ name, summary }: { name: string; summary: string }) {
   );
 }
 
+/**
+ * A persisted tool call (claude/opencode): a compact collapsed line — icon +
+ * tool label + target + a status dot — that expands to show the full input and
+ * the tool's output. `status` mirrors the row: "streaming" = running,
+ * "complete"/"error" = finished.
+ */
+function ToolRow({ m }: { m: LeadMessage }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const c = parse(m.content);
+  const name = typeof c.name === "string" ? c.name : "tool";
+  const summary = typeof c.summary === "string" ? c.summary : "";
+  const output = typeof c.output === "string" ? c.output : "";
+  const inputText = formatToolValue(c.input);
+  const running = m.status === "streaming";
+  const isError = c.is_error === true || m.status === "error";
+  const Icon = toolIcon(name);
+  const labelKey = toolLabelKey(name);
+  const label = labelKey === "session.toolCalling" ? cleanToolName(name) : t(labelKey);
+  const { target } = compactToolTarget(name, summary);
+  const hasDetail = inputText.length > 0 || output.length > 0;
+
+  return (
+    <div className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface/60">
+      <button
+        type="button"
+        disabled={!hasDetail}
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
+          hasDetail && "hover:bg-surface",
+        )}
+      >
+        <span
+          className={cn(
+            "h-1.5 w-1.5 shrink-0 rounded-full",
+            running ? "animate-pulse bg-running" : isError ? "bg-danger" : "bg-ink-faint",
+          )}
+        />
+        <Icon size={14} className="shrink-0 text-ink-faint" />
+        <span className="shrink-0 font-medium text-ink-muted">{label}</span>
+        {(target || summary) && (
+          <span className="min-w-0 truncate font-mono text-brand">{target || summary}</span>
+        )}
+        {hasDetail && (
+          <ChevronRight
+            size={13}
+            className={cn(
+              "ml-auto shrink-0 text-ink-faint transition-transform",
+              open && "rotate-90",
+            )}
+          />
+        )}
+      </button>
+      {open && hasDetail && (
+        <div className="space-y-2 border-t border-border px-2.5 py-2">
+          {inputText && <ToolBlock label={t("tool.input")} body={inputText} />}
+          {output && (
+            <ToolBlock label={t("tool.output")} body={output} tone={isError ? "error" : "default"} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A labeled monospace block inside an expanded tool row, with show-more past a
+ *  line budget so a huge stdout/diff doesn't blow up the timeline. */
+function ToolBlock({
+  label,
+  body,
+  tone = "default",
+}: {
+  label: string;
+  body: string;
+  tone?: "default" | "error";
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const lines = body.split("\n");
+  const LIMIT = 20;
+  const long = lines.length > LIMIT;
+  const shown = expanded || !long ? body : lines.slice(0, LIMIT).join("\n");
+  return (
+    <div>
+      <p className="mb-1 text-[10.5px] font-medium uppercase tracking-wide text-ink-faint">
+        {label}
+      </p>
+      <pre
+        className={cn(
+          "max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-bg px-2 py-1.5 font-mono text-[11.5px] leading-relaxed",
+          tone === "error" ? "text-danger" : "text-ink-muted",
+        )}
+      >
+        {shown}
+      </pre>
+      {long && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1 text-[11px] text-brand hover:underline"
+        >
+          {expanded ? t("tool.showLess") : t("tool.showMore", { n: lines.length - LIMIT })}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Render a tool input for display: strings verbatim, objects pretty-printed. */
+function formatToolValue(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
 function parse(content: string): Record<string, unknown> {
   try {
     return JSON.parse(content) as Record<string, unknown>;
@@ -248,9 +410,14 @@ function safeParseObj(content: string): Record<string, unknown> {
 
 // Read-only history replay: only the most recent assistant row is interactive.
 // Older action_cards stay rendered for context but their buttons are disabled.
+// Tool rows are role:"assistant" too: skip only those from m's OWN turn (a card
+// and the tools it kicked off share a turn) so they don't read-only the card —
+// but a LATER turn's tool rows are genuine newer activity and must disqualify it.
 function isLastAssistant(m: LeadMessage, all: LeadMessage[]): boolean {
   for (let i = all.length - 1; i >= 0; i--) {
-    if (all[i].role === "assistant") return all[i].id === m.id;
+    const row = all[i];
+    if (row.kind === "tool" && row.turn_id === m.turn_id) continue;
+    if (row.role === "assistant") return row.id === m.id;
   }
   return false;
 }
@@ -276,6 +443,10 @@ function TimelineRow({
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
+
+  if (m.kind === "tool") {
+    return <ToolRow m={m} />;
+  }
 
   if (m.kind === "action_card") {
     const parsed = safeParseObj(m.content);

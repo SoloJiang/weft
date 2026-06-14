@@ -37,6 +37,45 @@ pub struct McpServer {
     pub status: String, // connected | pending | failed | …(原样透传)
 }
 
+/// A tool invocation captured from the stream. Carries enough to render an
+/// expandable row — the full `input` plus a compact `summary` for the collapsed
+/// line. `output` is set only when the dialect delivers the result inline
+/// (opencode's completed `tool_use`); claude sends results separately as
+/// `ToolResults`, and codex builds pill-only calls (empty `id`, no `input`).
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+    pub summary: String,
+    pub output: Option<String>,
+    pub is_error: bool,
+}
+
+impl ToolCall {
+    /// Pill-only call (codex exec items): name + compact summary, no id/io — the
+    /// engine renders these as a transient activity pill, not a persisted row.
+    pub(crate) fn pill(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            id: String::new(),
+            name: name.into(),
+            input: Value::Null,
+            summary: summary.into(),
+            output: None,
+            is_error: false,
+        }
+    }
+}
+
+/// One tool result block (claude `user` message), correlated to its `Assistant`
+/// tool call by `id` (= the call's `tool_use_id`).
+#[derive(Debug, Clone)]
+pub struct ToolResultItem {
+    pub id: String,
+    pub output: String,
+    pub is_error: bool,
+}
+
 #[derive(Debug)]
 pub enum ChatEvent {
     Init {
@@ -50,11 +89,17 @@ pub enum ChatEvent {
     TextDelta {
         text: String,
     },
-    /// One complete assistant message event: its text blocks + (tool name,
-    /// compact summary) pairs. The CLI emits one per finished content block.
+    /// One complete assistant message event: its text blocks plus any tool calls
+    /// it started. Codex builds pill-only calls (transient activity); claude and
+    /// opencode build full calls persisted as expandable tool rows.
     Assistant {
         texts: Vec<String>,
-        tools: Vec<(String, String)>,
+        tools: Vec<ToolCall>,
+    },
+    /// Tool results delivered out-of-band (claude `user` message), each
+    /// correlated to its `Assistant` tool call by id.
+    ToolResults {
+        items: Vec<ToolResultItem>,
     },
     TurnEnd {
         is_error: bool,
@@ -126,7 +171,10 @@ fn parse_codex(line: &str) -> ChatEvent {
                         .unwrap_or_default();
                     ChatEvent::Assistant {
                         texts: vec![],
-                        tools: vec![(other.to_string(), summary.chars().take(120).collect())],
+                        tools: vec![ToolCall::pill(
+                            other,
+                            summary.chars().take(120).collect::<String>(),
+                        )],
                     }
                 }
                 None => ChatEvent::Other,
@@ -158,15 +206,72 @@ fn parse_opencode(line: &str) -> ChatEvent {
                 .unwrap_or_default(),
             tools: vec![],
         },
-        Some("tool_use") => ChatEvent::Assistant {
-            texts: vec![],
-            tools: vec![(
-                part["tool"].as_str().unwrap_or("tool").to_string(),
-                compact_input(&part["state"]["input"]),
-            )],
-        },
+        Some("tool_use") => {
+            let state = &part["state"];
+            let status = state["status"].as_str().unwrap_or("");
+            // opencode re-emits this part as the tool progresses and gives no
+            // stable per-call id to dedupe running→completed frames, so surface a
+            // single row only once it has finished, where input AND output are
+            // both present.
+            if status != "completed" && status != "error" {
+                return ChatEvent::Other;
+            }
+            let input = state["input"].clone();
+            let summary = compact_input(&input);
+            ChatEvent::Assistant {
+                texts: vec![],
+                tools: vec![ToolCall {
+                    id: String::new(),
+                    name: part["tool"].as_str().unwrap_or("tool").to_string(),
+                    input: cap_input(input),
+                    summary,
+                    output: Some(opencode_output(state)),
+                    is_error: status == "error",
+                }],
+            }
+        }
         _ => ChatEvent::Other,
     }
+}
+
+/// Best-effort result text from an opencode completed tool `state`. The field
+/// name varies by tool; try the common ones and fall back to empty (the row
+/// still shows the input).
+fn opencode_output(state: &Value) -> String {
+    let text = ["output", "result", "stdout", "metadata"]
+        .iter()
+        .find_map(|k| state[k].as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    cap_output(text)
+}
+
+/// Cap tool output so a pathological stdout / large file read can't bloat the
+/// persisted row, its push payload, or the React store. The collapsed row shows
+/// only a summary anyway, and the expanded view already paginates.
+fn cap_output(s: String) -> String {
+    const MAX: usize = 16_000;
+    if s.chars().count() <= MAX {
+        return s;
+    }
+    let mut out: String = s.chars().take(MAX).collect();
+    out.push_str("\n… (truncated)");
+    out
+}
+
+/// Cap a tool input the same way: a huge payload (e.g. a claude `Write`/`Edit`
+/// carrying full file contents) is replaced by a truncated string so it can't
+/// bloat the persisted row, its push, or the store. Small inputs pass through
+/// unchanged so the UI still renders the structured object.
+fn cap_input(input: Value) -> Value {
+    const MAX: usize = 16_000;
+    let s = input.to_string();
+    if s.chars().count() <= MAX {
+        return input;
+    }
+    let mut capped: String = s.chars().take(MAX).collect();
+    capped.push_str("… (truncated)");
+    Value::String(capped)
 }
 
 pub(crate) fn error_text_from_item(item: &Value) -> String {
@@ -241,14 +346,45 @@ pub fn parse_line(line: &str) -> ChatEvent {
                             }
                         }
                     }
-                    Some("tool_use") => tools.push((
-                        b["name"].as_str().unwrap_or("tool").to_string(),
-                        compact_input(&b["input"]),
-                    )),
+                    Some("tool_use") => {
+                        let input = b["input"].clone();
+                        let summary = compact_input(&input);
+                        tools.push(ToolCall {
+                            id: b["id"].as_str().unwrap_or_default().to_string(),
+                            name: b["name"].as_str().unwrap_or("tool").to_string(),
+                            input: cap_input(input),
+                            summary,
+                            output: None,
+                            is_error: false,
+                        });
+                    }
                     _ => {}
                 }
             }
             ChatEvent::Assistant { texts, tools }
+        }
+        // Tool results come back as a `user` turn whose content is one or more
+        // `tool_result` blocks, each tied to its call by `tool_use_id`.
+        Some("user") => {
+            let mut items = vec![];
+            for b in v["message"]["content"]
+                .as_array()
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+            {
+                if b["type"] == "tool_result" {
+                    items.push(ToolResultItem {
+                        id: b["tool_use_id"].as_str().unwrap_or_default().to_string(),
+                        output: tool_result_text(&b["content"]),
+                        is_error: b["is_error"].as_bool().unwrap_or(false),
+                    });
+                }
+            }
+            if items.is_empty() {
+                ChatEvent::Other
+            } else {
+                ChatEvent::ToolResults { items }
+            }
         }
         Some("result") => ChatEvent::TurnEnd {
             is_error: v["subtype"] != "success",
@@ -314,6 +450,22 @@ fn compact_input(input: &Value) -> String {
         other => other.to_string(),
     });
     s.chars().take(120).collect()
+}
+
+/// Flatten a claude `tool_result` block's `content` to text. It is either a
+/// plain string or an array of content blocks (we keep the text blocks).
+fn tool_result_text(content: &Value) -> String {
+    let text = if let Some(s) = content.as_str() {
+        s.to_string()
+    } else if let Some(arr) = content.as_array() {
+        arr.iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    cap_output(text)
 }
 
 #[cfg(test)]
@@ -404,8 +556,8 @@ mod tests {
         let l = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__weft_planner__get_task","input":{}}]}}"#;
         match parse_line(l) {
             ChatEvent::Assistant { tools, .. } => {
-                assert_eq!(tools[0].0, "mcp__weft_planner__get_task");
-                assert_eq!(tools[0].1, "");
+                assert_eq!(tools[0].name, "mcp__weft_planner__get_task");
+                assert_eq!(tools[0].summary, "");
             }
             e => panic!("{e:?}"),
         }
@@ -413,12 +565,75 @@ mod tests {
 
     #[test]
     fn parses_assistant_blocks() {
-        let l = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"},{"type":"tool_use","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
+        let l = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
         match parse_line(l) {
             ChatEvent::Assistant { texts, tools } => {
                 assert_eq!(texts, vec!["done"]);
-                assert_eq!(tools[0].0, "Read");
-                assert!(tools[0].1.contains("b.rs"));
+                assert_eq!(tools[0].id, "toolu_1");
+                assert_eq!(tools[0].name, "Read");
+                assert!(tools[0].summary.contains("b.rs"));
+                // full input is kept for the expandable row, not just the summary
+                assert_eq!(tools[0].input["file_path"], "/a/b.rs");
+                assert!(tools[0].output.is_none());
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_claude_tool_result() {
+        // string content
+        let l = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"hello\nworld","is_error":false}]}}"#;
+        match parse_line(l) {
+            ChatEvent::ToolResults { items } => {
+                assert_eq!(items[0].id, "toolu_1");
+                assert_eq!(items[0].output, "hello\nworld");
+                assert!(!items[0].is_error);
+            }
+            e => panic!("{e:?}"),
+        }
+        // array-of-blocks content + error flag
+        let l2 = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"boom"}],"is_error":true}]}}"#;
+        match parse_line(l2) {
+            ChatEvent::ToolResults { items } => {
+                assert_eq!(items[0].id, "toolu_2");
+                assert_eq!(items[0].output, "boom");
+                assert!(items[0].is_error);
+            }
+            e => panic!("{e:?}"),
+        }
+        // a plain user text turn (no tool_result) is not a ToolResults event
+        let l3 = r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}"#;
+        assert!(matches!(parse_line(l3), ChatEvent::Other));
+    }
+
+    #[test]
+    fn caps_huge_tool_output() {
+        let big = "x".repeat(20_000);
+        let line = format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t","content":"{big}"}}]}}}}"#
+        );
+        match parse_line(&line) {
+            ChatEvent::ToolResults { items } => {
+                assert!(items[0].output.chars().count() < 20_000);
+                assert!(items[0].output.ends_with("(truncated)"));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn caps_huge_tool_input() {
+        let big = "x".repeat(20_000);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t","name":"Write","input":{{"content":"{big}"}}}}]}}}}"#
+        );
+        match parse_line(&line) {
+            ChatEvent::Assistant { tools, .. } => {
+                // a huge object input collapses to a single truncated string
+                let s = tools[0].input.as_str().expect("capped input is a string");
+                assert!(s.chars().count() < 20_000);
+                assert!(s.ends_with("(truncated)"));
             }
             e => panic!("{e:?}"),
         }
@@ -454,7 +669,11 @@ mod tests {
             r#"{"type":"item.started","item":{"type":"command_execution","command":"npm test"}}"#,
         ) {
             ChatEvent::Assistant { tools, .. } => {
-                assert_eq!(tools[0], ("command_execution".into(), "npm test".into()))
+                assert_eq!(tools[0].name, "command_execution");
+                assert_eq!(tools[0].summary, "npm test");
+                // codex stays a transient pill: no correlation id, no persisted io
+                assert!(tools[0].id.is_empty());
+                assert!(tools[0].output.is_none());
             }
             e => panic!("{e:?}"),
         }
@@ -493,13 +712,25 @@ mod tests {
         }
         match parse_line_for(
             "opencode",
-            r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"echo hi"}}}}"#,
+            r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"echo hi"},"output":"hi\n"}}}"#,
         ) {
             ChatEvent::Assistant { tools, .. } => {
-                assert_eq!(tools[0], ("bash".into(), "echo hi".into()))
+                assert_eq!(tools[0].name, "bash");
+                assert_eq!(tools[0].summary, "echo hi");
+                assert_eq!(tools[0].input["command"], "echo hi");
+                assert_eq!(tools[0].output.as_deref(), Some("hi\n"));
             }
             e => panic!("{e:?}"),
         }
+        // running frames carry no result yet and have no stable id to dedupe, so
+        // they are skipped — only the completed row lands.
+        assert!(matches!(
+            parse_line_for(
+                "opencode",
+                r#"{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"status":"running","input":{"command":"echo hi"}}}}"#,
+            ),
+            ChatEvent::Other
+        ));
         assert!(matches!(
             parse_line_for("opencode", r#"{"type":"step_start","part":{}}"#),
             ChatEvent::Other

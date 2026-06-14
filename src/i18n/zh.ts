@@ -272,6 +272,12 @@ export const zh = {
     denyWriteTitle: "拒绝这次改动;通知 lead",
     runWith: "执行工具",
   },
+  tool: {
+    input: "输入",
+    output: "输出",
+    showMore: "展开剩余 {{n}} 行",
+    showLess: "收起",
+  },
   session: {
     back: "返回看板",
     lead: "Lead",
@@ -434,6 +440,7 @@ export const zh = {
     appearance: "外观",
     interface: "界面",
     theme: "主题",
+    system: "跟随系统",
     light: "亮色",
     dark: "暗色",
     language: "语言",
