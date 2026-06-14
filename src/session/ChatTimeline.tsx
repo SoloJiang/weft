@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, FileText, Sparkles } from "lucide-react";
@@ -56,10 +56,28 @@ export function ChatTimeline({
   emptyState?: EmptyStateMode;
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const atBottomRef = useRef(true);
 
   // Tool rows (legacy imports / older builds) are hidden: tool calls render
   // only while running, via the activity line in the footer.
   const visible = messages.filter((m) => m.kind !== "meta" && m.kind !== "tool");
+
+  // Virtuoso's followOutput only reacts to item-COUNT changes, but streaming
+  // appends text to the existing last row and the activity indicator lives in
+  // the footer — neither changes the count. Drive bottom-follow on those growth
+  // signals ourselves, but only while the user is parked at the bottom
+  // (atBottomRef), so scrolling up to read history is never yanked back down.
+  const lastTextLen = visible
+    .filter((m) => m.kind === "text")
+    .reduce((n, m) => n + m.content.length, 0);
+  useEffect(() => {
+    if (!atBottomRef.current || visible.length === 0) return;
+    virtuosoRef.current?.scrollToIndex({
+      index: visible.length - 1,
+      align: "end",
+      behavior: "auto",
+    });
+  }, [visible.length, lastTextLen, busy, activity]);
 
   if (visible.length === 0 && !busy) {
     return (
@@ -81,11 +99,16 @@ export function ChatTimeline({
         style={{ height: "100%" }}
         data={visible}
         computeItemKey={(_index, m) => m.id}
-        // Open pinned to the latest message instead of scrolling up from the top.
-        initialTopMostItemIndex={Math.max(0, visible.length - 1)}
-        // Stick to bottom during streaming ONLY when the user is already there;
-        // returning false when scrolled up preserves "don't yank them down".
+        // Open at the BOTTOM of the last message (align "end"), so a final
+        // message taller than the viewport opens at its latest line, not its top.
+        initialTopMostItemIndex={{ index: Math.max(0, visible.length - 1), align: "end" }}
+        // Smoothly follow newly appended message rows (count changes) while the
+        // user is at the bottom; intra-message streaming growth is handled by the
+        // effect above. Returning false when scrolled up preserves "don't yank".
         followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
+        atBottomStateChange={(atBottom) => {
+          atBottomRef.current = atBottom;
+        }}
         increaseViewportBy={{ top: 600, bottom: 600 }}
         context={{ busy, activity: activity ?? null }}
         components={{ Header, Footer }}
