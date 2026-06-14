@@ -397,6 +397,13 @@ export const zh = {
     branchLabel: "分支",
     sessionLabel: "会话",
   },
+  fileLink: {
+    openWith: "用默认应用打开",
+    openFolder: "打开所在文件夹",
+    copyPath: "复制路径",
+    notFound: "打不开 —— 文件不存在",
+    openFailed: "打不开这个文件",
+  },
   dialog: {
     newWorkspaceTitle: "新建工作区",
     workspaceName: "名称",

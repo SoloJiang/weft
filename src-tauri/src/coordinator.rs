@@ -1,16 +1,16 @@
 //! Consumes bus Wake events and drives the target's session to read its inbox.
-//! A busy engine queues the nudge for after the current turn rather than fragile
-//! idle detection — this is the honest "push" half of bus + coordinator =
-//! near-realtime.
+//! This is the honest "push" half of bus + coordinator = near-realtime.
 //!
 //! Three wake targets: the human (`"you"` → refresh the Needs-you UI), the
 //! thread lead (`"lead"` → drive the lead engine), and a worker (a numeric
 //! direction id → drive that worker's engine, lazily attaching it if idle).
 //!
-//! Per (thread, dir) the delivery is debounced: a leading-edge nudge fires
-//! immediately and any wake arriving inside the window is COALESCED into a
-//! single trailing nudge, never dropped (one `bus_inbox` call drains the whole
-//! inbox, so one trailing nudge suffices for any number of coalesced posts).
+//! Coalescing is busy-aware, not time-based: per (thread, dir) at most one
+//! `deliver` runs at a time, and a wake arriving while one is in flight is
+//! re-delivered the instant it finishes (no fixed delay). The engine itself
+//! collapses wakes that land mid-turn into a SINGLE inbox-read fired exactly at
+//! turn-end (`TurnState::request_bus_read`), so a busy agent reads new messages
+//! the moment it frees up — never on a timer, never one redundant turn per post.
 //!
 //! Single-writer safety: a session the human has taken over in their terminal is
 //! persisted `STATUS_STOPPED`; a wake never spawns a competing headless process
@@ -18,15 +18,10 @@
 
 use crate::bus::{Wake, HUMAN, LEAD};
 use crate::lead_chat::engine::STATUS_STOPPED;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
-
-const WAKE_PROMPT: &str =
-    "You have new messages on the thread bus. Call the bus_inbox tool to read them.";
-const RATE_LIMIT: Duration = Duration::from_secs(8);
 
 /// Where a wake's direction routes. The bus identity is either the human, the
 /// thread lead, or a worker (its direction id). Anything else is ignored.
@@ -48,25 +43,52 @@ fn classify(dir: &str) -> Option<Route> {
     }
 }
 
-/// Leading+trailing debounce state, keyed by `"{thread}/{dir}"`.
+/// Per-key (`"{thread}/{dir}"`) serialization. At most one delivery runs per key
+/// at a time so concurrent wakes can't race the lazy-attach; a wake that lands
+/// while one is in flight is remembered and re-delivered the instant it ends.
 #[derive(Default)]
-struct Debounce {
-    last: HashMap<String, Instant>,
-    pending: HashSet<String>,
+struct Inflight {
+    running: HashSet<String>,
+    dirty: HashSet<String>,
+}
+
+impl Inflight {
+    /// Register a wake. Returns true if the caller should start a delivery loop;
+    /// false means one is already running and this wake was coalesced into it.
+    fn begin(&mut self, key: &str) -> bool {
+        if self.running.contains(key) {
+            self.dirty.insert(key.to_string());
+            false
+        } else {
+            self.running.insert(key.to_string());
+            true
+        }
+    }
+
+    /// After one delivery completes. Returns true if a wake coalesced during it
+    /// (re-deliver now); false releases the key so the next wake starts fresh.
+    fn next(&mut self, key: &str) -> bool {
+        if self.dirty.remove(key) {
+            true
+        } else {
+            self.running.remove(key);
+            false
+        }
+    }
 }
 
 /// Run the coordinator loop on a dedicated OS thread (the mpsc Receiver is
 /// blocking).
 pub fn run(app: AppHandle, rx: Receiver<Wake>) {
     std::thread::spawn(move || {
-        let dq: Arc<Mutex<Debounce>> = Arc::new(Mutex::new(Debounce::default()));
+        let inflight: Arc<Mutex<Inflight>> = Arc::new(Mutex::new(Inflight::default()));
         while let Ok(w) = rx.recv() {
             let Some(route) = classify(&w.dir) else {
                 continue;
             };
             // A wake addressed to the human means an agent asked a question:
             // nudge the UI to refresh its Needs-you surface, don't touch an
-            // engine. Not debounced — it's a cheap UI event.
+            // engine.
             if route == Route::Human {
                 let _ = app.emit("needs-you://changed", w.thread);
                 continue;
@@ -74,44 +96,23 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
             // The lead's dir ("lead") repeats across threads, so the thread must
             // be part of the key.
             let key = format!("{}/{}", w.thread, w.dir);
-            // Leading-edge fire; a wake inside the window is remembered and
-            // delivered once on the trailing edge instead of being dropped.
-            let fire = {
-                let mut g = dq.lock().unwrap_or_else(|e| e.into_inner());
-                match g.last.get(&key) {
-                    Some(t) if t.elapsed() < RATE_LIMIT => {
-                        g.pending.insert(key.clone());
-                        false
-                    }
-                    _ => {
-                        g.last.insert(key.clone(), Instant::now());
-                        true
-                    }
-                }
+            let start = {
+                let mut g = inflight.lock().unwrap_or_else(|e| e.into_inner());
+                g.begin(&key)
             };
-            if !fire {
+            if !start {
                 continue;
             }
             let app2 = app.clone();
-            let dq2 = dq.clone();
+            let inflight2 = inflight.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     if let Err(e) = deliver(&app2, w.thread, route).await {
                         eprintln!("[weft][coordinator] wake {route:?}@{} failed: {e}", w.thread);
                     }
-                    tokio::time::sleep(RATE_LIMIT).await;
-                    // Trailing edge: deliver once more if a wake coalesced during
-                    // the window; otherwise release the key so the next wake fires
-                    // immediately.
                     let again = {
-                        let mut g = dq2.lock().unwrap_or_else(|e| e.into_inner());
-                        if g.pending.remove(&key) {
-                            g.last.insert(key.clone(), Instant::now());
-                            true
-                        } else {
-                            g.last.remove(&key);
-                            false
-                        }
+                        let mut g = inflight2.lock().unwrap_or_else(|e| e.into_inner());
+                        g.next(&key)
                     };
                     if !again {
                         break;
@@ -140,11 +141,11 @@ async fn live_resident(app: &AppHandle, key: i64) -> bool {
         .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
 }
 
-/// Deliver an invisible bus-wake nudge to the routed engine. A busy engine
-/// queues it for after the current turn; an idle/not-yet-resident worker is
-/// lazily attached so a bus post still drives it. A session taken over in the
-/// user's terminal (`STATUS_STOPPED`, not currently live under weft) is skipped
-/// so we never spawn a competing headless process.
+/// Deliver a bus-wake to the routed engine via `nudge_bus_read`, which coalesces
+/// wakes that land mid-turn into one inbox-read at turn-end. An idle/not-yet-
+/// resident worker is lazily attached so a bus post still drives it. A session
+/// taken over in the user's terminal (`STATUS_STOPPED`, not currently live under
+/// weft) is skipped so we never spawn a competing headless process.
 async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<()> {
     let Some(db) = app.try_state::<crate::store::Db>() else {
         return Ok(());
@@ -160,11 +161,9 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
             if taken_over && !live_resident(app, key).await {
                 return Ok(());
             }
-            // Get-or-create the lead engine, then nudge it to read its inbox.
-            // nudge() spawns/resumes the process via ensure_running and starts a
-            // turn if idle, or queues behind the current one.
+            // Get-or-create the lead engine, then drive it to read its inbox.
             let eng = crate::lead_chat::commands::lead_engine(app, &db, thread, "en").await?;
-            crate::lead_chat::engine::nudge(app, &db, &eng, WAKE_PROMPT).await
+            crate::lead_chat::engine::nudge_bus_read(app, &db, &eng).await
         }
         Route::Worker(dir) => {
             // Direction ids are global, but a wake belongs to the thread it was
@@ -206,7 +205,7 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
                     }
                 }
             };
-            crate::lead_chat::engine::nudge(app, &db, &eng, WAKE_PROMPT).await
+            crate::lead_chat::engine::nudge_bus_read(app, &db, &eng).await
         }
     }
 }
@@ -232,31 +231,17 @@ mod tests {
         assert_eq!(classify("worker-3"), None);
     }
 
-    // The debounce coalesces a wake arriving inside the window into a single
-    // trailing fire (never dropped) and releases the key when idle so the next
-    // wake fires immediately. This exercises that state machine without a runtime.
+    // One delivery per key at a time; a wake arriving mid-delivery is coalesced
+    // and re-delivered immediately when it ends, then the key releases.
     #[test]
-    fn debounce_coalesces_then_releases() {
-        let mut dq = Debounce::default();
-        let key = "7/lead".to_string();
-
-        // First wake: leading-edge fire.
-        let fire1 = matches!(dq.last.get(&key), Some(t) if t.elapsed() < RATE_LIMIT);
-        assert!(!fire1, "no prior timestamp → should fire");
-        dq.last.insert(key.clone(), Instant::now());
-
-        // Second wake inside the window: coalesced (remembered), not a new fire.
-        let within = matches!(dq.last.get(&key), Some(t) if t.elapsed() < RATE_LIMIT);
-        assert!(within, "still inside the window");
-        dq.pending.insert(key.clone());
-
-        // Trailing edge sees the pending wake → fires once more, keeps the key.
-        assert!(dq.pending.remove(&key), "trailing fire consumes the pending wake");
-        dq.last.insert(key.clone(), Instant::now());
-
-        // Next trailing edge: nothing pending → release the key.
-        assert!(!dq.pending.remove(&key));
-        dq.last.remove(&key);
-        assert!(dq.last.get(&key).is_none(), "key released when idle");
+    fn inflight_serializes_and_coalesces() {
+        let mut f = Inflight::default();
+        let k = "7/lead";
+        assert!(f.begin(k)); // first wake → start a loop
+        assert!(!f.begin(k)); // wake during the loop → coalesced, no new loop
+        assert!(!f.begin(k)); // another → still coalesced
+        assert!(f.next(k)); // loop end sees the coalesced wake → re-deliver
+        assert!(!f.next(k)); // nothing pending → release the key
+        assert!(f.begin(k)); // a later wake starts a fresh loop
     }
 }

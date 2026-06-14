@@ -22,6 +22,12 @@ pub const EVENT: &str = "lead-chat";
 /// session the human may be driving in their own terminal.
 pub const STATUS_STOPPED: &str = "stopped";
 
+/// The invisible prompt a bus wake delivers: tell the agent to drain its inbox.
+/// One `bus_inbox` call reads every unread message, so a single read covers any
+/// number of coalesced wakes (see `TurnState::request_bus_read`).
+pub const BUS_WAKE_PROMPT: &str =
+    "You have new messages on the thread bus. Call the bus_inbox tool to read them.";
+
 /// Persist the turn-activity status for whichever surface this engine drives:
 /// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
 async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, status: &str) {
@@ -126,6 +132,15 @@ pub struct Outgoing {
 pub struct TurnState {
     pub busy: bool,
     pub queue: VecDeque<Outgoing>,
+    /// A bus wake landed while this engine was busy. Rather than queue one "read
+    /// your inbox" turn per wake, we remember the wake's FIFO position — the
+    /// number of messages already queued when it arrived — and synthesize a
+    /// SINGLE inbox-read there. Messages queued BEFORE the wake drain first, then
+    /// the read, then anything queued after (so a later user send can't jump
+    /// ahead of an earlier bus message). One `bus_inbox` reads everything, so any
+    /// number of wakes during a turn coalesce into this one read (`is_none`
+    /// guard keeps the earliest position). No timer, never interleaved mid-turn.
+    pub bus_read_pos: Option<usize>,
 }
 
 impl TurnState {
@@ -138,14 +153,54 @@ impl TurnState {
         true
     }
 
-    /// Turn finished: pop the next queued message (stays busy) or go idle.
-    pub fn on_turn_end(&mut self) -> Option<Outgoing> {
-        match self.queue.pop_front() {
-            Some(next) => Some(next),
-            None => {
-                self.busy = false;
-                None
+    /// A bus wake arrived. Returns true if the caller should start a read turn
+    /// right now (engine idle); false means it was coalesced into the running
+    /// turn and will be read at its FIFO position once the queue drains there
+    /// (see `on_turn_end`). The `is_none` guard keeps the earliest wake's
+    /// position so a later wake can't push the read behind newer messages.
+    pub fn request_bus_read(&mut self) -> bool {
+        if self.busy {
+            if self.bus_read_pos.is_none() {
+                self.bus_read_pos = Some(self.queue.len());
             }
+            false
+        } else {
+            self.busy = true;
+            true
+        }
+    }
+
+    /// Turn finished: deliver the next thing in FIFO order. Messages queued
+    /// before a coalesced bus wake drain first; when the wake's position is
+    /// reached, synthesize one invisible inbox-read turn; then the rest; finally
+    /// go idle.
+    pub fn on_turn_end(&mut self) -> Option<Outgoing> {
+        match self.bus_read_pos {
+            // The wake sits at the front: read the inbox now (stays busy).
+            Some(0) => {
+                self.bus_read_pos = None;
+                Some(Outgoing {
+                    text: BUS_WAKE_PROMPT.to_string(),
+                    images: vec![],
+                    tracked: false,
+                    origin_tag: None,
+                })
+            }
+            // A message queued before the wake goes first; the wake slides up one.
+            Some(n) => {
+                let next = self.queue.pop_front();
+                self.bus_read_pos = Some(n.saturating_sub(1));
+                // Defensive: if the queue emptied early, read at turn-end anyway
+                // rather than stranding the pending wake.
+                next.or_else(|| self.on_turn_end())
+            }
+            None => match self.queue.pop_front() {
+                Some(next) => Some(next),
+                None => {
+                    self.busy = false;
+                    None
+                }
+            },
         }
     }
 }
@@ -621,27 +676,32 @@ fn merge_init_slash_commands(
         .collect()
 }
 
-/// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
-/// Per-turn dialects have no resident process — sending spawns one per turn.
-pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
-    let mut inner = eng.lock().await;
+/// Spawn the resident process if it isn't alive, under the CALLER's already-held
+/// lock. Returns the new child's stdout + generation when a process was spawned
+/// (the caller must `spawn_reader` after it drops the lock), or `None` when no
+/// spawn was needed (stopped, per-turn, or already alive). Keeping the spawn
+/// under one continuous lock lets a caller reserve a turn slot atomically with
+/// ensuring the process — no window for a racing send to slip a turn in.
+async fn ensure_running_locked(
+    inner: &mut EngineInner,
+) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64)>> {
     if inner.stopped {
-        return Ok(());
+        return Ok(None);
     }
     if per_turn(&inner.tool) {
-        return Ok(());
+        return Ok(None);
     }
     if inner.tool != "claude" {
         anyhow::bail!("unknown lead tool {}", inner.tool);
     }
     if let Some(c) = inner.child.as_mut() {
         if c.try_wait().ok().flatten().is_none() {
-            return Ok(()); // alive
+            return Ok(None); // alive
         }
     }
     crate::claude::ensure_trusted(&inner.cwd);
     let mut child = Command::new("claude")
-        .args(build_args(&inner))
+        .args(build_args(inner))
         .current_dir(&inner.cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -670,9 +730,18 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     inner.clock = TurnClock::default();
     inner.current = None;
     inner.interrupting = false;
-    let generation = inner.generation;
+    Ok(Some((stdout, inner.generation)))
+}
+
+/// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
+/// Per-turn dialects have no resident process — sending spawns one per turn.
+pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
+    let mut inner = eng.lock().await;
+    let reader = ensure_running_locked(&mut inner).await?;
     drop(inner);
-    spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+    if let Some((stdout, generation)) = reader {
+        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+    }
     Ok(())
 }
 
@@ -808,10 +877,13 @@ pub async fn send(
     // codex (app-server): no resident stdin, no per-turn process — the shared
     // connection drives the turn after the lock drops. Gated; default stays exec.
     //
-    // BUT the app-server path (spawn_codex_turn) injects neither extra_args (the
-    // per-thread MCP, e.g. weft_global) nor system_prompt — only exec does. So any
-    // thread that needs them (the Concierge: non-empty system_prompt + weft_global
-    // MCP) must take the exec path, or it answers with no Weft tools and no prompt.
+    // system_prompt is now prepended to a new thread's first turn (codex has no
+    // thread/start prompt field — mirrors the exec adapter). The remaining gap is
+    // MCP: codex app-server MCP is APP-SCOPED (config.toml + config/mcpServer/
+    // reload), so today's per-thread bus URLs (weft_bus / weft_global) can't be
+    // carried by one global app-server without restructuring the bus to a single
+    // thread-routing endpoint. The gate keeps system_prompt.is_empty() and the
+    // path stays behind the off-by-default env flag until that's settled.
     let is_codex_appserver =
         inner.tool == "codex" && codex_appserver_enabled() && inner.system_prompt.is_empty();
     let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
@@ -871,13 +943,14 @@ async fn spawn_codex_turn(
     out: Outgoing,
 ) -> anyhow::Result<()> {
     let client = crate::codex_app_server::client().await?;
-    let (native, cwd, sid, thread_id_i) = {
+    let (native, cwd, sid, thread_id_i, system_prompt) = {
         let i = eng.lock().await;
         (
             i.native_id.clone(),
             i.cwd.to_string_lossy().into_owned(),
             i.session_id,
             i.thread_id,
+            i.system_prompt.clone(),
         )
     };
     let had_native = native.is_some();
@@ -910,9 +983,25 @@ async fn spawn_codex_turn(
         );
         tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
     }
-    let turn = client.start_turn(&thread, &out.text).await?;
+    // codex has no thread/start system-prompt field, so (like the exec adapter)
+    // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
+    // thread already carries it in conversation history.
+    let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
+    let turn = client.start_turn(&thread, &first_text).await?;
     client.set_active_turn(&thread, &turn).await;
     Ok(())
+}
+
+/// codex has no thread/start system-prompt field, so — exactly like the exec
+/// adapter (`CodexExecAdapter::build_argv`) — the engine's `system_prompt` is
+/// prepended to the FIRST turn of a brand-new thread. A resumed thread already
+/// carries it in history, so it's added only when `!had_native`.
+fn codex_first_turn_text(system_prompt: &str, message: &str, had_native: bool) -> String {
+    if !had_native && !system_prompt.is_empty() {
+        format!("{system_prompt}\n\n{message}")
+    } else {
+        message.to_string()
+    }
 }
 
 /// One long-lived task per codex session: consume the thread's app-server
@@ -1255,6 +1344,17 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
     send_hidden_existing(app, db, eng, text.to_string()).await
 }
 
+/// Coordinator bus wake: drive the agent to read its inbox, coalescing wakes.
+/// Idle → read now; busy → reserve the wake's FIFO position (`request_bus_read`)
+/// so one inbox-read fires at that spot when the queue drains, never behind a
+/// later send; stopped/taken-over → left untouched. Ensuring the process and
+/// reserving the slot happen under ONE continuous lock (`ensure = true`), so a
+/// racing user send can't slip a turn in ahead of the read — even when the
+/// resident process has to be spawned first.
+pub async fn nudge_bus_read(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
+    send_hidden_inner(app, db, eng, BUS_WAKE_PROMPT.to_string(), true, true).await
+}
+
 /// Deliver invisible plumbing to an existing engine. Unlike [`nudge`], this
 /// intentionally does not start a missing/stopped resident process; action-card
 /// callbacks should not resurrect a lead the user stopped. Per-turn engines
@@ -1265,7 +1365,32 @@ pub async fn send_hidden_existing(
     eng: &EngineRef,
     text: String,
 ) -> anyhow::Result<()> {
+    send_hidden_inner(app, db, eng, text, false, false).await
+}
+
+/// Shared body of [`send_hidden_existing`] and [`nudge_bus_read`]. The single
+/// lock makes the busy/idle decision atomic. When `ensure`, the resident process
+/// is spawned (if needed) under that same lock so reserving the slot races with
+/// no concurrent send. When `bus_read`, a busy engine reserves the wake's FIFO
+/// position (coalescing) instead of tail-queuing, and a stopped/not-accepting
+/// engine is skipped rather than erroring.
+async fn send_hidden_inner(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    text: String,
+    bus_read: bool,
+    ensure: bool,
+) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
+    if ensure {
+        // Spawn the resident process under THIS lock, never releasing it before
+        // the slot is reserved below. The reader task blocks on this lock and
+        // proceeds once we drop it on return.
+        if let Some((stdout, generation)) = ensure_running_locked(&mut inner).await? {
+            spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+        }
+    }
     let out = Outgoing {
         text,
         images: vec![],
@@ -1280,10 +1405,20 @@ pub async fn send_hidden_existing(
         inner.stopped,
     ) {
         HiddenDelivery::Noop => {
+            if bus_read {
+                return Ok(()); // a bus wake is best-effort; don't error
+            }
             anyhow::bail!("lead engine is not accepting hidden input");
         }
         HiddenDelivery::Queue => {
-            queue_hidden_delivery(app, &mut inner, out);
+            if bus_read {
+                // Busy: reserve the wake's FIFO position (coalescing further
+                // wakes into one read) instead of tail-queuing, so a later send
+                // can't be answered before the inbox read. Atomic under the lock.
+                inner.turn.request_bus_read();
+            } else {
+                queue_hidden_delivery(app, &mut inner, out);
+            }
             Ok(())
         }
         HiddenDelivery::WriteResident => {
@@ -2255,10 +2390,87 @@ mod tests {
     }
 
     #[test]
+    fn bus_read_coalesces_into_one_trailing_turn() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy
+                                     // Several wakes during the turn collapse into one pending read.
+        assert!(!t.request_bus_read());
+        assert!(!t.request_bus_read());
+        assert!(!t.request_bus_read());
+        // Turn-end with an empty queue synthesizes exactly one invisible read.
+        let read = t.on_turn_end().expect("a coalesced read turn");
+        assert_eq!(read.text, BUS_WAKE_PROMPT);
+        assert!(!read.tracked); // invisible plumbing, no timeline row
+        assert!(t.busy); // the read turn keeps the engine busy
+                         // No further pending read → the next turn-end goes idle.
+        assert!(t.on_turn_end().is_none());
+        assert!(!t.busy);
+    }
+
+    #[test]
+    fn bus_read_runs_after_messages_queued_before_the_wake() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // busy
+        t.queue.push_back(Outgoing {
+            text: "earlier".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+        });
+        t.request_bus_read(); // wake lands AFTER "earlier" was queued
+                              // "earlier" preceded the wake, so it drains first, then the read.
+        assert_eq!(t.on_turn_end().map(|o| o.text).as_deref(), Some("earlier"));
+        assert_eq!(
+            t.on_turn_end().map(|o| o.text).as_deref(),
+            Some(BUS_WAKE_PROMPT)
+        );
+        assert!(t.on_turn_end().is_none());
+    }
+
+    #[test]
+    fn bus_read_precedes_messages_queued_after_the_wake() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // busy
+        t.request_bus_read(); // wake lands first (queue empty → position 0)
+        t.queue.push_back(Outgoing {
+            text: "later".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+        });
+        // The wake arrived before "later", so the inbox read comes first — the
+        // agent can't answer the newer prompt without seeing the bus message.
+        assert_eq!(
+            t.on_turn_end().map(|o| o.text).as_deref(),
+            Some(BUS_WAKE_PROMPT)
+        );
+        assert_eq!(t.on_turn_end().map(|o| o.text).as_deref(), Some("later"));
+        assert!(t.on_turn_end().is_none());
+    }
+
+    #[test]
+    fn request_bus_read_on_idle_starts_a_turn() {
+        let mut t = TurnState::default();
+        assert!(t.request_bus_read()); // idle → caller starts a read turn now
+        assert!(t.busy);
+        assert!(t.bus_read_pos.is_none()); // consumed by starting the turn, not pending
+    }
+
+    #[test]
     fn wall_cap_fires_regardless_of_activity() {
         assert!(turn_verdict(Some(7200), 1, 7200, 1800, false)
             .unwrap()
             .contains("ran for over 2h"));
+    }
+
+    #[test]
+    fn codex_first_turn_prepends_prompt_only_on_new_thread() {
+        // brand-new thread + non-empty prompt → prepended to the first message
+        assert_eq!(codex_first_turn_text("SYS", "hello", false), "SYS\n\nhello");
+        // resumed thread → prompt already in history, message unchanged
+        assert_eq!(codex_first_turn_text("SYS", "hello", true), "hello");
+        // no prompt → message unchanged even on a new thread
+        assert_eq!(codex_first_turn_text("", "hello", false), "hello");
     }
 
     #[test]

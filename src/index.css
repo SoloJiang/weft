@@ -316,3 +316,17 @@
 .weft-pop[data-state="open"] {
   animation: weft-pop-in 160ms var(--ease-out-expo);
 }
+
+/* Chat file references stay quiet — they read as ordinary text or code chips.
+   The ⌘/Ctrl-held affordance (body[data-cmd], toggled in useCmdAffordance)
+   reveals an underline + pointer only when the user means to open one, so plain
+   clicks never fire and prose stays calm. */
+body[data-cmd="1"] .weft-file-ref {
+  cursor: pointer;
+}
+body[data-cmd="1"] .weft-file-ref:hover {
+  color: var(--color-brand);
+  text-decoration: underline;
+  text-decoration-color: var(--color-brand);
+  text-underline-offset: 2px;
+}

@@ -62,6 +62,8 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   const [promptState, setPromptState] = useState<PromptState | null>(null);
   const [rail, setRail] = useState<"info" | "none">("info");
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
+  // The lead's working dir — resolves relative file paths it mentions in chat.
+  const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
 
   const promptText = (title: string, placeholder?: string) =>
     new Promise<string | null>((resolve) =>
@@ -89,7 +91,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   }, [activeWorkspaceId, skillsDirtyAt]);
 
   // 非-claude lead 的带外 meta(model/window/MCP server)。claude lead 命令返回 null →
-  // 不并入(事件流 init/usage 已填,别被空快照覆盖)。开页 + turn 结束各拉一次。
+  // 不并入(事件流 init/usage 已填,别被空快照覆盖)。开页 + turn 结束 + 重载各拉一次。
   useEffect(() => {
     if (activeThreadId == null) return;
     void api
@@ -98,7 +100,25 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
         if (s) mergeLeadMeta(activeThreadId, s);
       })
       .catch(() => {});
-  }, [activeThreadId, leadTurn[activeThreadId ?? -1]?.state, mergeLeadMeta]);
+  }, [activeThreadId, leadTurn[activeThreadId ?? -1]?.state, skillsDirtyAt, mergeLeadMeta]);
+
+  useEffect(() => {
+    // Drop the previous thread's cwd immediately — otherwise a relative file
+    // ref clicked during the fetch window would resolve against the old lead
+    // workspace. Undefined cwd fails safe (relative paths report not-found).
+    setLeadCwd(undefined);
+    if (activeThreadId == null) return;
+    let alive = true;
+    void api
+      .leadState(activeThreadId)
+      .then((st) => {
+        if (alive) setLeadCwd(st.cwd);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [activeThreadId]);
 
   if (activeThreadId == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
@@ -164,6 +184,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
           threadId={activeThreadId}
           workspaceId={activeWorkspaceId}
           promptText={promptText}
+          cwd={leadCwd}
           emptyState={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
         />
         <ChatComposer
