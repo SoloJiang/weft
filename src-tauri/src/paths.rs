@@ -31,6 +31,15 @@ fn home_dir_name(debug_build: bool) -> &'static str {
     }
 }
 
+/// The default (non-`WEFT_HOME`) data home for a build profile: `~/.weft` for
+/// release, `~/.weft-dev` for debug. `None` if the home dir can't be resolved.
+/// Callers that must distinguish the canonical homes from a relocated `WEFT_HOME`
+/// (e.g. credential / worktree namespacing) compare the resolved [`weft_home`]
+/// against these.
+pub fn default_home(debug_build: bool) -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(home_dir_name(debug_build)))
+}
+
 /// ~/.weft/weft.db
 pub fn db_path() -> std::io::Result<PathBuf> {
     Ok(weft_home()?.join("weft.db"))

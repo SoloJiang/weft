@@ -18,27 +18,55 @@ pub fn worktree_path(repo_path: &Path, branch: &str) -> PathBuf {
 pub fn worktree_root(repo_path: &Path) -> PathBuf {
     repo_path
         .join(".worktrees")
-        .join(worktree_dirname(cfg!(debug_assertions)))
+        .join(worktree_dirname(crate::paths::weft_home().ok().as_deref()))
 }
 
-/// The `.worktrees/<this>` subdir for the active build profile. Debug builds
-/// (`tauri dev`) use `weft-dev` so dev checkouts never collide with — or get
-/// orphaned by — the installed release app's `weft` worktrees in the same repo
-/// (the two profiles run separate DBs that can't see each other's worktree rows).
-/// Release keeps `weft` so existing checkouts are unaffected.
+/// The `.worktrees/<this>` subdir for the active weft home. Keyed on the resolved
+/// HOME, not just the build profile, because `WEFT_HOME` can point a same-profile
+/// build at a different data set: two homes must never share a worktree root, or
+/// `gc::sweep_orphan_worktrees` — which tracks only the active DB's rows — would
+/// prune the other home's live worktrees after the TTL. The two default homes keep
+/// readable names (`weft` / `weft-dev`); a relocated `WEFT_HOME` gets a stable
+/// hash suffix so its root is unique.
 ///
 /// This isolates worktree *directories*. Branch *names* are repo-global, and
-/// `choose_branch_name` dedupes against the repo's real git refs (shared by both
-/// profiles), so once one profile's branch ref exists the other avoids it. Known
-/// limitation: if both profiles reserve the same branch name before either
+/// `choose_branch_name` dedupes against the repo's real git refs (shared across
+/// homes), so once one home's branch ref exists the others avoid it. Known
+/// limitation: if two homes reserve the same branch name before either
 /// materializes its ref, the second `git worktree add` fails loudly (recoverable
 /// by renaming) — the cross-DB form of the single-DB race `reserved` already guards.
-fn worktree_dirname(debug_build: bool) -> &'static str {
-    if debug_build {
-        "weft-dev"
-    } else {
-        "weft"
+fn worktree_dirname(home: Option<&Path>) -> String {
+    worktree_dirname_for(
+        home,
+        crate::paths::default_home(false).as_deref(),
+        crate::paths::default_home(true).as_deref(),
+    )
+}
+
+fn worktree_dirname_for(
+    home: Option<&Path>,
+    release_default: Option<&Path>,
+    dev_default: Option<&Path>,
+) -> String {
+    match home {
+        Some(h) if release_default == Some(h) => "weft".to_string(),
+        Some(h) if dev_default == Some(h) => "weft-dev".to_string(),
+        Some(h) => format!("weft-{}", home_token(h)),
+        // Home unresolvable (no $HOME): fall back to the release root.
+        None => "weft".to_string(),
     }
+}
+
+/// Stable, dependency-free FNV-1a hex of the home path. Deterministic across runs
+/// and platforms, so a relocated home's worktree root name never drifts (drift
+/// would orphan its existing worktrees and let the GC reclaim them).
+fn home_token(home: &Path) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in home.to_string_lossy().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Create the one worktree for `direction_id`'s bound repo at
@@ -128,7 +156,9 @@ mod tests {
 
     #[test]
     fn same_scope_is_deterministic() {
-        // Idempotent re-materialize must resolve to the identical path.
+        // Idempotent re-materialize must resolve to the identical path. Hold the
+        // env lock so a concurrent test can't change WEFT_HOME between the calls.
+        let _g = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let repo = Path::new("/repo");
         let a = worktree_path(repo, "feat/d1");
         let b = worktree_path(repo, "feat/d1");
@@ -137,20 +167,28 @@ mod tests {
 
     #[test]
     fn worktree_path_is_repo_local_and_branch_shaped() {
+        // The middle component is the active home's namespace (env-dependent), so
+        // assert the repo-local shape rather than a fixed name.
         let p = worktree_path(Path::new("/repo"), "feat/add-login");
-        // Profile-aware: `.worktrees/weft-dev` in debug/test runs, `.worktrees/weft`
-        // in release.
-        let expected = Path::new("/repo/.worktrees")
-            .join(worktree_dirname(cfg!(debug_assertions)))
-            .join("feat/add-login");
-        assert_eq!(p, expected);
+        assert!(p.starts_with("/repo/.worktrees"));
+        assert!(p.ends_with("feat/add-login"));
     }
 
     #[test]
-    fn worktree_dirname_isolates_dev_from_prod() {
-        // Dev checkouts get their own repo-local subdir so they never collide with
-        // or orphan the installed app's worktrees; release keeps `weft`.
-        assert_eq!(worktree_dirname(true), "weft-dev");
-        assert_eq!(worktree_dirname(false), "weft");
+    fn worktree_dirname_keys_on_home() {
+        let release = Path::new("/u/.weft");
+        let dev = Path::new("/u/.weft-dev");
+        let (r, d) = (Some(release), Some(dev));
+        // Default homes keep readable names...
+        assert_eq!(worktree_dirname_for(Some(release), r, d), "weft");
+        assert_eq!(worktree_dirname_for(Some(dev), r, d), "weft-dev");
+        // ...a relocated WEFT_HOME gets a distinct, stable suffix (never the
+        // default roots), so two homes never share a worktree root.
+        let reloc = worktree_dirname_for(Some(Path::new("/custom/home")), r, d);
+        assert!(reloc.starts_with("weft-") && reloc != "weft-dev");
+        assert_eq!(reloc, worktree_dirname_for(Some(Path::new("/custom/home")), r, d));
+        assert_ne!(reloc, worktree_dirname_for(Some(Path::new("/custom/other")), r, d));
+        // An unresolvable home falls back to the release root.
+        assert_eq!(worktree_dirname_for(None, r, d), "weft");
     }
 }
