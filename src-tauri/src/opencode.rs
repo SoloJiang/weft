@@ -16,7 +16,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::lead_chat::proto::SlashCmd;
+use crate::lead_chat::proto::{McpServer, SlashCmd};
+use crate::session_meta::{find_model_context, parse_opencode_mcp};
 
 #[derive(Default)]
 struct Serve {
@@ -70,6 +71,56 @@ async fn discover_inner(cwd: &str) -> anyhow::Result<Vec<SlashCmd>> {
             })
         })
         .collect())
+}
+
+/// 会话信息面板(M2):复用 app-lifetime 的 serve,取 `GET /mcp`(server + 状态)与
+/// `GET /config/providers`(按 model id 找 `limit.context`)。best-effort,失败给空/None。
+pub async fn server_window_and_mcp(
+    cwd: &str,
+    model_id: Option<&str>,
+) -> (Option<u64>, Vec<McpServer>) {
+    match server_window_and_mcp_inner(cwd, model_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[weft][opencode] session meta: {e}");
+            (None, vec![])
+        }
+    }
+}
+
+async fn server_window_and_mcp_inner(
+    cwd: &str,
+    model_id: Option<&str>,
+) -> anyhow::Result<(Option<u64>, Vec<McpServer>)> {
+    let base = ensure_base().await?;
+    let client = reqwest::Client::new();
+
+    let mcp_json: serde_json::Value = client
+        .get(format!("{base}/mcp"))
+        .query(&[("directory", cwd)])
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let servers = parse_opencode_mcp(&mcp_json);
+
+    let window = match model_id {
+        Some(mid) => {
+            let providers: serde_json::Value = client
+                .get(format!("{base}/config/providers"))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            find_model_context(&providers, mid)
+        }
+        None => None,
+    };
+    Ok((window, servers))
 }
 
 /// Return the base URL of a live serve, (re)spawning if the prior one died.

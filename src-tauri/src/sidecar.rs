@@ -340,6 +340,34 @@ fn parse_opencode_part(role: &str, data: &serde_json::Value, out: &mut Vec<NormE
     }
 }
 
+/// 会话信息面板(M2):opencode 会话级 usage 快照,按 session id(= 我们的 native_id)
+/// 查 `session` 表。返回 (context_tokens = tokens_input + tokens_cache_read, model JSON)。
+/// ro 连接,不扰动 live(WAL)db。
+pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<String>)> {
+    let home = std::env::var("HOME").ok()?;
+    let db = PathBuf::from(home).join(".local/share/opencode/opencode.db");
+    if !db.exists() {
+        return None;
+    }
+    let url = format!("sqlite://{}?mode=ro", db.to_string_lossy());
+    let mut opt = ConnectOptions::new(url);
+    opt.max_connections(1).sqlx_logging(false);
+    let conn = Database::connect(opt).await.ok()?;
+    let rows = conn
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT tokens_input, tokens_cache_read, model FROM session WHERE id = ? LIMIT 1",
+            vec![native_id.into()],
+        ))
+        .await
+        .ok()?;
+    let r = rows.first()?;
+    let ti: i64 = r.try_get("", "tokens_input").unwrap_or(0);
+    let tc: i64 = r.try_get("", "tokens_cache_read").unwrap_or(0);
+    let model: Option<String> = r.try_get("", "model").ok();
+    Some(((ti.max(0) as u64) + (tc.max(0) as u64), model))
+}
+
 async fn read_opencode(cwd: &Path) -> Option<Vec<NormEvent>> {
     use std::collections::HashMap;
     let home = std::env::var("HOME").ok()?;

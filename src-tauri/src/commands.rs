@@ -758,6 +758,28 @@ pub async fn session_for(
     }))
 }
 
+/// 会话信息面板(M2):codex/opencode 的带外 meta(Context / model / window / MCP
+/// server,**不含 tool**)。claude 不走这里——其 meta 全在事件流 + 引擎缓存。
+#[tauri::command]
+pub async fn session_meta(
+    db: State<'_, Db>,
+    direction_id: i32,
+    repo_id: i32,
+) -> R<crate::session_meta::SessionMetaSnapshot> {
+    let wt = repo::worktree_for(&db, direction_id, repo_id)
+        .await
+        .map_err(e)?;
+    let dir = repo::get_direction(&db, direction_id).await.map_err(e)?;
+    let (Some(wt), Some(dir)) = (wt, dir) else {
+        return Ok(Default::default());
+    };
+    let native = repo::latest_session_for(&db, direction_id, repo_id)
+        .await
+        .map_err(e)?
+        .and_then(|s| s.native_session_id.clone());
+    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref()).await)
+}
+
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,
 /// each tagged with the layer it comes from (personal / weft-global /
 /// weft-workspace / repo) and whether a higher layer shadows it. `ws_id`

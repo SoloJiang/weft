@@ -33,6 +33,7 @@ pub mod paths;
 mod planner;
 mod power;
 pub mod profile;
+mod session_meta;
 mod sidecar;
 pub mod skills;
 pub mod slug;
@@ -201,6 +202,7 @@ pub fn run() {
             commands::db_change_password,
             commands::set_guardrails,
             commands::session_for,
+            commands::session_meta,
             commands::effective_config,
             commands::needs_you,
             commands::write_triggers,
