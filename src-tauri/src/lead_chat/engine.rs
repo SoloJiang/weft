@@ -22,6 +22,12 @@ pub const EVENT: &str = "lead-chat";
 /// session the human may be driving in their own terminal.
 pub const STATUS_STOPPED: &str = "stopped";
 
+/// The invisible prompt a bus wake delivers: tell the agent to drain its inbox.
+/// One `bus_inbox` call reads every unread message, so a single read covers any
+/// number of coalesced wakes (see `TurnState::request_bus_read`).
+pub const BUS_WAKE_PROMPT: &str =
+    "You have new messages on the thread bus. Call the bus_inbox tool to read them.";
+
 /// Persist the turn-activity status for whichever surface this engine drives:
 /// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
 async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, status: &str) {
@@ -103,6 +109,12 @@ pub struct Outgoing {
 pub struct TurnState {
     pub busy: bool,
     pub queue: VecDeque<Outgoing>,
+    /// A bus wake landed while this engine was busy. Instead of queuing one
+    /// "read your inbox" turn per wake, we set this once and synthesize a SINGLE
+    /// inbox-read turn the moment the queue drains — one `bus_inbox` reads every
+    /// message, so any number of wakes during a turn coalesce into one trailing
+    /// read fired exactly at turn-end (no timer, never interleaved mid-turn).
+    pub bus_read_pending: bool,
 }
 
 impl TurnState {
@@ -115,15 +127,37 @@ impl TurnState {
         true
     }
 
-    /// Turn finished: pop the next queued message (stays busy) or go idle.
-    pub fn on_turn_end(&mut self) -> Option<Outgoing> {
-        match self.queue.pop_front() {
-            Some(next) => Some(next),
-            None => {
-                self.busy = false;
-                None
-            }
+    /// A bus wake arrived. Returns true if the caller should start a read turn
+    /// right now (engine idle); false means it was coalesced into the running
+    /// turn and will be read once the queue drains (see `on_turn_end`).
+    pub fn request_bus_read(&mut self) -> bool {
+        if self.busy {
+            self.bus_read_pending = true;
+            false
+        } else {
+            self.busy = true;
+            true
         }
+    }
+
+    /// Turn finished: pop the next queued message (stays busy); else, if a bus
+    /// wake coalesced during the turn, synthesize one invisible inbox-read turn;
+    /// otherwise go idle.
+    pub fn on_turn_end(&mut self) -> Option<Outgoing> {
+        if let Some(next) = self.queue.pop_front() {
+            return Some(next);
+        }
+        if self.bus_read_pending {
+            self.bus_read_pending = false;
+            return Some(Outgoing {
+                text: BUS_WAKE_PROMPT.to_string(),
+                images: vec![],
+                tracked: false,
+                origin_tag: None,
+            });
+        }
+        self.busy = false;
+        None
     }
 }
 
@@ -1171,6 +1205,30 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
     send_hidden_existing(app, db, eng, text.to_string()).await
 }
 
+/// Coordinator bus wake: drive the agent to read its inbox, coalescing wakes.
+/// While the engine is busy, this sets a single `bus_read_pending` flag instead
+/// of queuing one read per wake — the engine synthesizes exactly one inbox-read
+/// turn the moment its queue drains (immediate at turn-end, no fixed delay). An
+/// idle engine reads now; a stopped/taken-over engine is left untouched.
+pub async fn nudge_bus_read(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
+    ensure_running(app, db, eng).await?;
+    {
+        let mut inner = eng.lock().await;
+        if inner.stopped {
+            return Ok(()); // taken over in the user's terminal — don't drive it
+        }
+        if inner.turn.busy {
+            // Coalesce into the running turn; read once when it drains.
+            inner.turn.request_bus_read();
+            return Ok(());
+        }
+    }
+    // Idle: read now. (A benign race where the engine turns busy between the
+    // drop above and the re-lock below just queues one read, drained the same
+    // way at turn-end.)
+    send_hidden_existing(app, db, eng, BUS_WAKE_PROMPT.to_string()).await
+}
+
 /// Deliver invisible plumbing to an existing engine. Unlike [`nudge`], this
 /// intentionally does not start a missing/stopped resident process; action-card
 /// callbacks should not resurrect a lead the user stopped. Per-turn engines
@@ -2039,6 +2097,52 @@ mod tests {
         assert!(t.busy); // popped → still busy
         assert!(t.on_turn_end().is_none()); // empty queue → idle
         assert!(!t.busy);
+    }
+
+    #[test]
+    fn bus_read_coalesces_into_one_trailing_turn() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy
+                                     // Several wakes during the turn collapse into one pending read.
+        assert!(!t.request_bus_read());
+        assert!(!t.request_bus_read());
+        assert!(!t.request_bus_read());
+        // Turn-end with an empty queue synthesizes exactly one invisible read.
+        let read = t.on_turn_end().expect("a coalesced read turn");
+        assert_eq!(read.text, BUS_WAKE_PROMPT);
+        assert!(!read.tracked); // invisible plumbing, no timeline row
+        assert!(t.busy); // the read turn keeps the engine busy
+                         // No further pending read → the next turn-end goes idle.
+        assert!(t.on_turn_end().is_none());
+        assert!(!t.busy);
+    }
+
+    #[test]
+    fn bus_read_runs_after_queued_messages() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // busy
+        t.queue.push_back(Outgoing {
+            text: "human".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+        });
+        t.request_bus_read(); // a wake also landed
+                              // Explicit queued input drains first, then the coalesced read.
+        assert_eq!(t.on_turn_end().map(|o| o.text).as_deref(), Some("human"));
+        assert_eq!(
+            t.on_turn_end().map(|o| o.text).as_deref(),
+            Some(BUS_WAKE_PROMPT)
+        );
+        assert!(t.on_turn_end().is_none());
+    }
+
+    #[test]
+    fn request_bus_read_on_idle_starts_a_turn() {
+        let mut t = TurnState::default();
+        assert!(t.request_bus_read()); // idle → caller starts a read turn now
+        assert!(t.busy);
+        assert!(!t.bus_read_pending); // consumed by starting the turn, not pending
     }
 
     #[test]
