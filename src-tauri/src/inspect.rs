@@ -57,13 +57,24 @@ pub fn open_path(path: String, cwd: Option<String>) -> Result<(), String> {
     tauri_plugin_opener::open_path(&abs, None::<&str>).map_err(err)
 }
 
-/// Reveal `path` in the OS file manager — opens the PARENT and selects the item.
-/// `cwd` resolves relative chat paths; absolute paths (e.g. the Inspect working
-/// copy) ignore it.
+/// Reveal a file the agent referenced in chat — resolves the token (relative to
+/// `cwd`) like `open_path`, then selects it in the OS file manager.
 #[tauri::command]
-pub fn reveal_path(path: String, cwd: Option<String>) -> Result<(), String> {
+pub fn reveal_path_in(path: String, cwd: Option<String>) -> Result<(), String> {
     let abs = resolve_chat_path(&path, cwd.as_deref()).map_err(map_resolve_err)?;
     tauri_plugin_opener::reveal_item_in_dir(&abs).map_err(err)
+}
+
+/// Reveal a real, already-resolved filesystem path (the Inspect working copy):
+/// opens the PARENT and selects the item. The path is taken verbatim — it is NOT
+/// a chat URI token, so NO scheme/percent/fragment/`:line` normalization runs
+/// (a worktree under e.g. `/work/C#Service` must reveal as-is).
+#[tauri::command]
+pub fn reveal_path(path: String) -> Result<(), String> {
+    if !std::path::Path::new(&path).exists() {
+        return Err("not_found".into());
+    }
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
 }
 
 /// Why a chat path token couldn't be turned into an openable absolute path.
@@ -154,15 +165,17 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 /// Strip a `file://` scheme and an optional `localhost` authority, leaving the
-/// path body. `file:///p` → `/p`; `file://localhost/p` → `/p`. Non-URI tokens
+/// path body. `file:///p` → `/p`; `file://localhost/p` → `/p`. The scheme match
+/// is case-insensitive (`FILE://` == `file://`, per URI rules). Non-URI tokens
 /// (and a relative `localhost/…` dir) are returned untouched.
 fn strip_file_scheme(token: &str) -> &str {
-    match token.strip_prefix("file://") {
-        Some(rest) => match rest.strip_prefix("localhost") {
-            Some(after) if after.starts_with('/') => after,
-            _ => rest,
-        },
-        None => token,
+    let rest = match token.get(..7) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("file://") => &token[7..],
+        _ => return token,
+    };
+    match rest.strip_prefix("localhost") {
+        Some(after) if after.starts_with('/') => after,
+        _ => rest,
     }
 }
 
@@ -325,6 +338,8 @@ mod tests {
         assert_eq!(strip_file_scheme("file:///Users/me/x"), "/Users/me/x");
         assert_eq!(strip_file_scheme("file://localhost/Users/me/x"), "/Users/me/x");
         assert_eq!(strip_file_scheme("file://localhost/C:/repo"), "/C:/repo");
+        assert_eq!(strip_file_scheme("FILE:///tmp/x"), "/tmp/x"); // scheme is case-insensitive
+        assert_eq!(strip_file_scheme("File://localhost/y"), "/y");
         assert_eq!(strip_file_scheme("localhost/foo"), "localhost/foo"); // non-URI, untouched
         assert_eq!(strip_file_scheme("/plain/path"), "/plain/path");
     }

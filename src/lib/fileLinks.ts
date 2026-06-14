@@ -33,16 +33,22 @@ export function classifyHref(href: string): HrefKind {
   return { kind: "file", token: h };
 }
 
-/** Strip a `file://` scheme and a trailing `:line[:col]` editor suffix. */
+/**
+ * Normalize a token to a usable filesystem path (for copy + detection),
+ * mirroring the backend resolver: strip the `file://` scheme + optional
+ * `localhost` authority (case-insensitive), drop a URL fragment/query,
+ * percent-decode, then split off a trailing `:line[:col]` editor suffix.
+ */
 export function parsePathToken(token: string): { path: string; line?: number; col?: number } {
   let t = token.trim();
-  if (/^file:\/\//i.test(t)) {
-    t = t.replace(/^file:\/\//i, "");
-    try {
-      t = decodeURI(t);
-    } catch {
-      /* leave encoded */
-    }
+  const scheme = t.match(/^file:\/\//i);
+  if (scheme) t = t.slice(scheme[0].length).replace(/^localhost(?=\/)/i, "");
+  const frag = t.search(/[#?]/);
+  if (frag !== -1) t = t.slice(0, frag);
+  try {
+    t = decodeURIComponent(t);
+  } catch {
+    /* malformed %-escape — leave as-is */
   }
   const m = t.match(/^(.*?):(\d+)(?::(\d+))?$/);
   // `m[1].length > 1` keeps a lone Windows drive letter (e.g. "C:5") intact.
@@ -189,7 +195,7 @@ export async function openFileRef(token: string, cwd?: string): Promise<void> {
 /** Reveal a file reference's containing folder (selecting the item). */
 export async function revealFileRef(token: string, cwd?: string): Promise<void> {
   try {
-    await api.revealPath(token, cwd);
+    await api.revealPathIn(token, cwd);
   } catch (e) {
     failToast(e);
   }

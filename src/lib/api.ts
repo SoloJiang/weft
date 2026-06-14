@@ -176,12 +176,14 @@ export const api = {
 
   // Inspect escape hatches (§4.7): real ways into the hidden plumbing.
   openTerminal: (path: string) => invoke<void>("open_terminal", { path }),
-  revealPath: (path: string, cwd?: string) => invoke<void>("reveal_path", { path, cwd }),
+  // Reveal a real filesystem path (the Inspect working copy) — taken verbatim,
+  // no chat-URI normalization.
+  revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
-  // Open a file the agent referenced in chat with the OS default app. `cwd`
-  // resolves relative paths against the session's working copy. Rejects with
-  // "not_found" when the file is missing.
+  // Open / reveal a file the agent referenced in chat. `cwd` resolves relative
+  // paths against the session's working copy. Reject with "not_found" if missing.
   openPath: (path: string, cwd?: string) => invoke<void>("open_path", { path, cwd }),
+  revealPathIn: (path: string, cwd?: string) => invoke<void>("reveal_path_in", { path, cwd }),
 
   // Which coding-agent CLIs are installed locally (for Settings).
   detectTools: () => invoke<ToolStatus[]>("detect_tools"),
