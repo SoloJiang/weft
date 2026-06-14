@@ -11,6 +11,7 @@ import type {
   ImRoute,
   LeadMessage,
   LeadStateInfo,
+  LiveWorkerSlot,
   NeedItem,
   NormEvent,
   ObserveRef,
@@ -119,6 +120,14 @@ export const api = {
     invoke<LeadStateInfo>("lead_state", { threadId }),
   listLeadMessages: (threadId: number) =>
     invoke<LeadMessage[]>("list_lead_messages", { threadId }),
+  /** Live (actually-running) worker engines the backend wants the frontend to
+   *  adopt into its session map. Read-only — never starts/attaches an engine. */
+  listLiveWorkerSlots: () =>
+    invoke<LiveWorkerSlot[]>("list_live_worker_slots"),
+  /** Backend-authoritative auto-verify gate: returns the direction id to verify if
+   *  the worker's direction is in working/review (fresh DB read), else null. */
+  autoVerifyCheck: (sessionId: number) =>
+    invoke<number | null>("auto_verify_check", { sessionId }),
   /** Live slash-command discovery for a worker (sessionId) or the lead
    *  (threadId) — claude's initialize list, opencode's GET /command,
    *  codex's mirrored TUI built-ins plus dynamic skills. */

@@ -16,6 +16,7 @@ import type {
   ImageAttachment,
   LeadChatPush,
   LeadMessage,
+  LiveWorkerSlot,
   NeedItem,
   PermissionAsk,
   Proposal,
@@ -259,9 +260,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
   const [checksByDirection, setChecksByDirection] = useState<Record<number, RepoChecks[]>>({});
   const [checkingDirections, setCheckingDirections] = useState<Record<number, boolean>>({});
-  // Idle tracking for the auto-verify loop: last PTY-output time per session,
-  // and which directions we've already auto-checked this idle episode.
-  const autoCheckedRef = useRef<Set<number>>(new Set());
   // Directions with an auto-(re)dispatch in flight, so the poll-driven effect
   // never spawns a duplicate worker before the first spawn lands in `sessions`.
   const dispatchingRef = useRef<Set<number>>(new Set());
@@ -716,7 +714,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
-      autoCheckedRef.current.delete(directionId);
       setSessions((m) => ({
         ...m,
         [info.session_id]: {
@@ -764,7 +761,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return existing.info.session_id;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
-      autoCheckedRef.current.delete(directionId);
       setSessions((m) => {
         const pruned = Object.fromEntries(
           Object.entries(m).filter(
@@ -788,6 +784,123 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [activeThreadId, openWorker],
   );
+
+  // Adopt a backend-initiated worker (boot revive, or one still alive after a
+  // frontend reload/HMR) into the session map so it gets a status dot. Idempotent
+  // and keyed on the session id. Unlike driveDirection it NEVER calls chatOpenWorker
+  // — the engine is already live, so there is nothing to start; calling it would
+  // respawn a stopped worker. Uses the slot's OWN thread id (a revived worker can
+  // belong to any thread, not activeThreadId). Auto-verify is handled separately and
+  // authoritatively by the backend (see the idle-turn handler), so the busy seed
+  // below is UI-only (typing indicator / Stop button / nav running count) and arms
+  // no verify latch.
+  const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
+    const sid = slot.info.session_id;
+    if (slot.busy) {
+      // Seed the worker's busy turn state so the chat surface shows the typing
+      // indicator + Stop button and WorkspaceNav counts it as running — a revived
+      // worker emits no turn push until its turn completes. Done BEFORE the
+      // already-mapped early return so a session that driveDirection (the
+      // active-thread redispatch) inserted without a workerTurn entry still gets
+      // seeded. Guard on absence so a raced idle/stopped value the listener already
+      // recorded wins. (Verify is backend-driven, so this seeds UI state only.)
+      setWorkerTurn((t) =>
+        t[sid] ? t : { ...t, [sid]: { state: "busy", queued: slot.queued } },
+      );
+    }
+    if (sessionsRef.current[sid]) return;
+    // Reconcile status with any turn state the lead-chat listener already recorded:
+    // if the worker's idle push raced in before this adoption, the live slot still
+    // says busy, but the dot/live-counts must show idle (not stuck "running").
+    const ts = workerTurnRef.current[sid]?.state;
+    const status: SessionStatus =
+      ts === "idle" ? "idle" : ts === "stopped" ? "exited" : slot.busy ? "running" : "idle";
+    setSessions((m) =>
+      m[sid]
+        ? m
+        : {
+            ...m,
+            [sid]: {
+              info: slot.info,
+              status,
+              directionId: slot.direction_id,
+              repoId: slot.repo_id,
+              threadId: slot.thread_id,
+              nativeId: slot.info.native_id,
+            },
+          },
+    );
+  }, []);
+
+  // Pull the backend's live worker engines and adopt any the frontend doesn't
+  // know about. Called on mount (backstop for workers live before the listener
+  // registered) and on the `worker-revived` event (boot revives that land after
+  // mount). The in-flight guard collapses concurrent triggers; a request that
+  // arrives mid-pull sets `pending` so the latest state is re-fetched afterward
+  // (e.g. the revive event firing while the mount pull is still in flight).
+  const hydratingRef = useRef(false);
+  const hydratePendingRef = useRef(false);
+  const hydrateLiveWorkers = useCallback(async () => {
+    if (hydratingRef.current) {
+      hydratePendingRef.current = true;
+      return;
+    }
+    hydratingRef.current = true;
+    try {
+      do {
+        hydratePendingRef.current = false;
+        const slots = await api.listLiveWorkerSlots();
+        // Load each adopted worker's thread directions so WorkspaceNav can match the
+        // session to its direction and count it as running — a revived worker can
+        // live in a thread the user never opened this session, whose
+        // directionsByThread entry would otherwise be empty. (Best-effort; verify
+        // does not depend on this — the backend reads the phase itself.)
+        const threadIds = [...new Set(slots.map((s) => s.thread_id))];
+        await Promise.all(
+          threadIds.map(async (tid) => {
+            try {
+              const dirs = await api.listDirections(tid);
+              setDirections((m) => ({ ...m, [tid]: dirs }));
+            } catch {
+              /* best-effort: a thread whose directions fail to load just won't
+                 show its running count until opened */
+            }
+          }),
+        );
+        for (const slot of slots) adoptWorker(slot);
+      } while (hydratePendingRef.current);
+    } catch {
+      /* best-effort hydration */
+    } finally {
+      hydratingRef.current = false;
+    }
+  }, [adoptWorker]);
+
+  // Adopt backend-headless workers the frontend never drove (boot revive, or
+  // alive after a reload/HMR). Register the `worker-revived` listener BEFORE the
+  // mount pull: `listen` is async, so doing the pull first would leave a gap where
+  // a boot sweep that emits the event between the pull's snapshot and the
+  // subscription is lost with no later trigger. Awaiting `listen` first closes
+  // that gap — the mount pull then runs with the listener live (anything revived
+  // during it re-pulls via the pending guard), and later revives (whose
+  // nudge-driven turns emit no busy push to react to) are caught by the event.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let cancelled = false;
+    void (async () => {
+      un = await listen("worker-revived", () => void hydrateLiveWorkers());
+      if (cancelled) {
+        un();
+        un = undefined;
+        return;
+      }
+      void hydrateLiveWorkers();
+    })();
+    return () => {
+      cancelled = true;
+      un?.();
+    };
+  }, [hydrateLiveWorkers]);
 
   // Lazy attach + send: the worker surface is always input-able. Sending into a
   // worker with no live engine transparently resumes/dispatches it (focus=false,
@@ -875,6 +988,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [workerTurn, setWorkerTurn] = useState<
     Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
   >({});
+  const workerTurnRef = useRef(workerTurn);
+  workerTurnRef.current = workerTurn;
   const [workerSlash, setWorkerSlash] = useState<Record<number, SlashCmd[]>>({});
   const [leadActivity, setLeadActivity] = useState<
     Record<number, { name: string; summary: string } | null>
@@ -887,6 +1002,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [skillsDirtyAt, setSkillsDirtyAt] = useState(0);
   const markSkillsDirty = useCallback(() => setSkillsDirtyAt(Date.now()), []);
   const skillsRefreshedRef = useRef<Record<number, number>>({});
+  // Last worker turn state seen by the lead-chat listener, kept synchronously so
+  // auto-verify fires once per real turn end (see the turn handler).
+  const lastWorkerTurnRef = useRef<Record<number, string>>({});
 
   useEffect(() => {
     const un = listen<LeadChatPush>("lead-chat", (e) => {
@@ -931,6 +1049,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } else if (p.type === "turn") {
         if (p.session_id != null) {
           const sid = p.session_id;
+          // Prior turn state (synchronous) so auto-verify fires on a real turn end
+          // (busy/undefined→idle), not on every idle push: per-turn dialects
+          // (codex/opencode) emit a terminal idle then an EOF idle for ONE turn, and
+          // a revived worker's first observed state IS the idle push (no busy push).
+          const prevTurn = lastWorkerTurnRef.current[sid];
+          lastWorkerTurnRef.current[sid] = p.state;
           setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queued: p.queued } }));
           setSessions((m) =>
@@ -945,6 +1069,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 }
               : m,
           );
+          // Backend-authoritative auto-verify: when a worker turn ends, ask the
+          // backend (fresh DB phase read) whether this direction should be checked,
+          // and run it if so. Replaces the old frontend busy→idle/phase-cache effect
+          // — works for any worker (known, revived, or headless) and reads the phase
+          // at completion time, so a planning→working transition mid-turn is honored.
+          if (p.state === "idle" && prevTurn !== "idle") {
+            void (async () => {
+              try {
+                const dirId = await api.autoVerifyCheck(sid);
+                if (dirId != null) verifyDirectionRef.current(dirId);
+              } catch {
+                /* best-effort auto-verify */
+              }
+            })();
+          }
+
         } else {
           setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
@@ -1069,17 +1209,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const verifyingRef = useRef<Set<number>>(new Set());
+  const verifyAgainRef = useRef<Set<number>>(new Set());
   const verifyDirection = useCallback(async (directionId: number) => {
+    if (verifyingRef.current.has(directionId)) {
+      // A run is in flight; request one more pass after it (coalesced) so a
+      // re-verify (e.g. review-then-repair) isn't dropped and results don't lag
+      // the latest code.
+      verifyAgainRef.current.add(directionId);
+      return;
+    }
+    verifyingRef.current.add(directionId);
     setCheckingDirections((m) => ({ ...m, [directionId]: true }));
     try {
-      const res = await api.verifyDirection(directionId);
-      setChecksByDirection((m) => ({ ...m, [directionId]: res }));
+      do {
+        verifyAgainRef.current.delete(directionId);
+        const res = await api.verifyDirection(directionId);
+        setChecksByDirection((m) => ({ ...m, [directionId]: res }));
+      } while (verifyAgainRef.current.has(directionId));
     } catch {
       /* leave prior results */
     } finally {
+      verifyAgainRef.current.delete(directionId);
+      verifyingRef.current.delete(directionId);
       setCheckingDirections((m) => ({ ...m, [directionId]: false }));
     }
   }, []);
+  const verifyDirectionRef = useRef(verifyDirection);
+  verifyDirectionRef.current = verifyDirection;
 
   // Review = the global review skill running INSIDE the worker's own
   // conversation (no built-in review engine; the repo's PR harness stays the
@@ -1380,38 +1537,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       clearInterval(h);
     };
   }, [activeThreadId]);
-
-  // Auto-verify (ARCHITECTURE §4.13): a worker turning busy→idle means its
-  // queue drained and the turn finished — run that direction's checks once per
-  // idle episode so "done" means "checks ran", not self-report. Going busy
-  // again re-arms the latch (so the NEXT turn end verifies again); a fresh
-  // dispatch clears it too (spawnWorker/driveDirection). Only implementation
-  // phases verify: a planning turn produces a plan, not code worth checking.
-  const prevTurnRef = useRef<Record<number, string>>({});
-  useEffect(() => {
-    for (const [sidStr, turn] of Object.entries(workerTurn)) {
-      const sid = Number(sidStr);
-      const prev = prevTurnRef.current[sid];
-      if (prev === turn.state) continue;
-      prevTurnRef.current[sid] = turn.state;
-      const sess = sessionsRef.current[sid];
-      if (!sess) continue;
-      if (turn.state === "busy") {
-        autoCheckedRef.current.delete(sess.directionId);
-      } else if (
-        prev === "busy" &&
-        turn.state === "idle" &&
-        !autoCheckedRef.current.has(sess.directionId)
-      ) {
-        const phase = (directionsByThread[sess.threadId] ?? []).find(
-          (d) => d.id === sess.directionId,
-        )?.status;
-        if (phase !== "working" && phase !== "review") continue;
-        autoCheckedRef.current.add(sess.directionId);
-        void verifyDirection(sess.directionId);
-      }
-    }
-  }, [workerTurn, verifyDirection, directionsByThread]);
 
   // Idle skill-refresh: when skills changed (dirty timestamp) and a session goes
   // busy→idle, flag its engine once so the next send picks up new skills.
