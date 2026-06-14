@@ -1,0 +1,159 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { X, ChevronRight, ChevronDown } from "lucide-react";
+import type { SessionMeta, EnabledSkill } from "../lib/types";
+
+/**
+ * 常驻右栏「会话信息」:Context(token + %,不含花费)、Skills、MCP(server + 状态,
+ * claude 可展开看 tool;codex/opencode 只列 server)。纯展示——数据由 store 的
+ * leadMeta/workerMeta + workspaceSkills 喂;和 diff 互斥由宿主的 rail 状态驱动。
+ */
+export function SessionInfoPanel({
+  meta,
+  skills,
+  onClose,
+}: {
+  meta: SessionMeta | undefined;
+  skills: EnabledSkill[];
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const ct = meta?.contextTokens;
+  const win = meta?.window;
+  const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
+
+  return (
+    <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
+      <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
+        <span className="text-[12px] font-semibold text-ink">{t("sessionInfo.title")}</span>
+        <button
+          onClick={onClose}
+          aria-label={t("common.close")}
+          className="ml-auto grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+        >
+          <X size={15} />
+        </button>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {/* Context */}
+        <section className="border-b border-border px-4 py-3">
+          <div className="flex items-center">
+            <span className="text-[11px] text-ink-faint">Context</span>
+            {pct != null && (
+              <span className="ml-auto text-[11px] text-ink-muted">
+                {t("sessionInfo.used", { pct })}
+              </span>
+            )}
+          </div>
+          {ct != null ? (
+            <>
+              <div className="mt-1.5 flex items-baseline gap-1.5">
+                <span className="text-[18px] font-medium text-ink">{ct.toLocaleString()}</span>
+                <span className="text-[11px] text-ink-faint">tokens</span>
+              </div>
+              {pct != null && (
+                <div className="mt-2 h-1 overflow-hidden rounded-full bg-surface">
+                  <div className="h-full bg-brand" style={{ width: `${pct}%` }} />
+                </div>
+              )}
+              {meta?.model && (
+                <div className="mt-1.5 truncate font-mono text-[10.5px] text-ink-faint">
+                  {meta.model}
+                  {win ? ` · ${Math.round(win / 1000)}k` : ""}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
+          )}
+        </section>
+
+        {/* Skills */}
+        <section className="border-b border-border px-4 py-3">
+          <div className="flex items-center">
+            <span className="text-[11px] text-ink-faint">Skills</span>
+            <span className="ml-auto text-[11px] text-ink-faint">{skills.length}</span>
+          </div>
+          {skills.length > 0 ? (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {skills.map((s) => (
+                <span
+                  key={s.name}
+                  title={s.description}
+                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
+                >
+                  {s.name}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-2 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
+          )}
+        </section>
+
+        {/* MCP */}
+        <section className="px-4 py-3">
+          <div className="flex items-center">
+            <span className="text-[11px] text-ink-faint">MCP</span>
+            <span className="ml-auto text-[11px] text-ink-faint">
+              {t("sessionInfo.servers", { n: meta?.mcpServers.length ?? 0 })}
+            </span>
+          </div>
+          {meta && meta.mcpServers.length > 0 ? (
+            <div className="mt-1.5 flex flex-col gap-0.5">
+              {meta.mcpServers.map((s) => (
+                <McpRow key={s.name} name={s.name} status={s.status} tools={s.tools} />
+              ))}
+            </div>
+          ) : (
+            <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
+          )}
+        </section>
+      </div>
+    </aside>
+  );
+}
+
+function McpRow({ name, status, tools }: { name: string; status: string; tools: string[] }) {
+  const [open, setOpen] = useState(true); // 默认展开
+  const { t } = useTranslation();
+  const dot =
+    status === "connected" ? "bg-running" : status === "failed" ? "bg-danger" : "bg-idle";
+  const hasTools = tools.length > 0;
+  return (
+    <div>
+      <button
+        onClick={() => hasTools && setOpen((v) => !v)}
+        title={status}
+        className="flex w-full items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1 text-left hover:bg-surface"
+      >
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`} />
+        <span className="min-w-0 flex-1 truncate text-[12.5px] text-ink">{name}</span>
+        {hasTools && (
+          <span className="shrink-0 text-[10.5px] text-ink-faint">
+            {t("sessionInfo.tools", { n: tools.length })}
+          </span>
+        )}
+        {hasTools &&
+          (open ? (
+            <ChevronDown size={14} className="shrink-0 text-ink-faint" />
+          ) : (
+            <ChevronRight size={14} className="shrink-0 text-ink-faint" />
+          ))}
+      </button>
+      {hasTools && open && (
+        <div className="flex flex-col">
+          {tools.map((tool) => (
+            <span
+              key={tool}
+              className="truncate py-0.5 pl-[22px] font-mono text-[11.5px] text-ink-muted"
+            >
+              {tool}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
