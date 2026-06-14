@@ -68,8 +68,9 @@ export function metaFromUsage(
   };
 }
 
-/** session_meta(M2 带外)→ 并入现有 meta。codex 的 contextTokens 走 live event,
- *  快照为 null 时保留旧值,别覆盖。servers 用快照(只 server+状态,tools 恒空)。 */
+/** session_meta(M2 带外)→ 并入现有 meta。不变量:部分/空的来源**绝不覆盖**已有的更
+ *  富 meta —— contextTokens(codex 走 live event)、window、model 空时保留旧值;servers
+ *  快照为空(如 `codex mcp list` 瞬时失败)时也保留旧的,不闪空。 */
 export function mergeSnapshot(
   prev: SessionMeta | undefined,
   s: {
@@ -79,11 +80,12 @@ export function mergeSnapshot(
     mcp_servers: { name: string; status: string }[];
   },
 ): SessionMeta {
+  const grouped = groupMcpTools(s.mcp_servers, []);
   return {
     contextTokens: s.context_tokens ?? prev?.contextTokens,
     window: s.window ?? prev?.window ?? undefined,
     model: s.model ?? prev?.model ?? undefined,
-    mcpServers: groupMcpTools(s.mcp_servers, []),
+    mcpServers: grouped.length > 0 ? grouped : (prev?.mcpServers ?? []),
   };
 }
 
