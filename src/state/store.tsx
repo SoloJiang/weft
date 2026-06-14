@@ -1000,6 +1000,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [skillsDirtyAt, setSkillsDirtyAt] = useState(0);
   const markSkillsDirty = useCallback(() => setSkillsDirtyAt(Date.now()), []);
   const skillsRefreshedRef = useRef<Record<number, number>>({});
+  // Last worker turn state seen by the lead-chat listener, kept synchronously so
+  // auto-verify fires once per real turn end (see the turn handler).
+  const lastWorkerTurnRef = useRef<Record<number, string>>({});
 
   useEffect(() => {
     const un = listen<LeadChatPush>("lead-chat", (e) => {
@@ -1044,6 +1047,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } else if (p.type === "turn") {
         if (p.session_id != null) {
           const sid = p.session_id;
+          // Prior turn state (synchronous) so auto-verify fires on a real turn end
+          // (busy/undefined→idle), not on every idle push: per-turn dialects
+          // (codex/opencode) emit a terminal idle then an EOF idle for ONE turn, and
+          // a revived worker's first observed state IS the idle push (no busy push).
+          const prevTurn = lastWorkerTurnRef.current[sid];
+          lastWorkerTurnRef.current[sid] = p.state;
           setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queued: p.queued } }));
           setSessions((m) =>
@@ -1063,7 +1072,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // and run it if so. Replaces the old frontend busy→idle/phase-cache effect
           // — works for any worker (known, revived, or headless) and reads the phase
           // at completion time, so a planning→working transition mid-turn is honored.
-          if (p.state === "idle") {
+          if (p.state === "idle" && prevTurn !== "idle") {
             void (async () => {
               try {
                 const dirId = await api.autoVerifyCheck(sid);
