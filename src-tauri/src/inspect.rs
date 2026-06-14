@@ -115,9 +115,11 @@ fn resolve_chat_path(token: &str, cwd: Option<&str>, is_url: bool) -> Result<Pat
     if !abs.exists() {
         return Err(ResolveErr::NotFound);
     }
-    // Canonicalize for a tidy absolute path; fall back to the lexical join if the
-    // OS can't (e.g. permission quirks) — it still exists per the check above.
-    Ok(abs.canonicalize().unwrap_or(abs))
+    // Return the LEXICAL absolute path — do NOT canonicalize. Canonicalizing
+    // resolves symlinks, so revealing/opening a symlinked ref would jump to the
+    // target (possibly outside the repo) instead of the path the agent named.
+    // (tauri-plugin-opener keeps symlinks too — it uses dunce::simplified.)
+    Ok(abs)
 }
 
 /// Strip a trailing `:line` or `:line:col` (digits only) editor suffix. Leaves a

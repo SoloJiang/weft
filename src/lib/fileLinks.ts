@@ -30,7 +30,8 @@ export function classifyHref(href: string): HrefKind {
   const h = href.trim();
   if (/^file:\/\//i.test(h)) return { kind: "file", token: h };
   if (h.startsWith("#")) return { kind: "web", url: h }; // in-page anchor
-  if (h.startsWith("//")) return { kind: "web", url: h }; // protocol-relative URL
+  // Protocol-relative URL — give the opener a concrete scheme (no page to inherit one from).
+  if (h.startsWith("//")) return { kind: "web", url: `https:${h}` };
   if (SCHEME.test(h) && !WIN_DRIVE.test(h)) {
     // A scheme prefix is a URI UNLESS it's a `path:line` ref whose head is itself
     // path-like (Cargo.toml:42) — distinguishes files from scheme:opaque links

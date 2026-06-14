@@ -63,7 +63,7 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
             const content = nodeText(children);
             if (isPathLike(content)) {
               return (
-                <FilePathRef token={content} cwd={cwd} code>
+                <FilePathRef token={content} cwd={cwd} code isUrl={/^file:\/\//i.test(content)}>
                   {children}
                 </FilePathRef>
               );
@@ -79,7 +79,7 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
               ?.dataFilepath;
             if (typeof fp === "string") {
               return (
-                <FilePathRef token={fp} cwd={cwd}>
+                <FilePathRef token={fp} cwd={cwd} isUrl={/^file:\/\//i.test(fp)}>
                   {children}
                 </FilePathRef>
               );
