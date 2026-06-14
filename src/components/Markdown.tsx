@@ -58,9 +58,12 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
             );
           },
           code: ({ className, children }) => {
-            const inline = !String(className ?? "").includes("language-");
-            if (!inline) return <code className="font-mono text-[11.5px]">{children}</code>;
             const content = nodeText(children);
+            // Block code = a language class OR any newline. A language-less fence
+            // still carries a trailing \n (verified), so only true single-line
+            // inline code is eligible to become a file ref — never a fenced block.
+            const block = String(className ?? "").includes("language-") || content.includes("\n");
+            if (block) return <code className="font-mono text-[11.5px]">{children}</code>;
             if (isPathLike(content, true)) {
               return (
                 <FilePathRef token={content} cwd={cwd} code isUrl={/^file:/i.test(content)}>
