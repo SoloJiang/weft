@@ -134,7 +134,8 @@ fn parse_codex(line: &str) -> ChatEvent {
         }
         Some("turn.completed") => ChatEvent::TurnEnd {
             is_error: false,
-            context_tokens: None, // codex usage 解析留给后续里程碑
+            // codex usage.input_tokens 已含 cached 子集,即本回合送入的上下文体量。
+            context_tokens: v["usage"]["input_tokens"].as_u64(),
         },
         Some("turn.failed") | Some("error") => ChatEvent::TurnEnd {
             is_error: true,
@@ -466,8 +467,20 @@ mod tests {
         }
         assert!(matches!(
             parse_line_for("codex", r#"{"type":"turn.completed","usage":{}}"#),
-            ChatEvent::TurnEnd { is_error: false, .. }
+            ChatEvent::TurnEnd { is_error: false, context_tokens: None, .. }
         ));
+    }
+
+    #[test]
+    fn codex_turn_completed_carries_context_tokens() {
+        let l = r#"{"type":"turn.completed","usage":{"input_tokens":47163,"cached_input_tokens":27392,"output_tokens":284}}"#;
+        match parse_line_for("codex", l) {
+            ChatEvent::TurnEnd { context_tokens, is_error } => {
+                assert!(!is_error);
+                assert_eq!(context_tokens, Some(47163)); // input_tokens 已含 cached 子集
+            }
+            e => panic!("{e:?}"),
+        }
     }
 
     #[test]
