@@ -586,6 +586,130 @@ pub async fn list_lead_messages(
         .map_err(|e| e.to_string())
 }
 
+/// One live worker engine, advertised to the frontend so a backend-headless
+/// worker (boot recovery, or one still alive after a frontend reload) gets a
+/// status dot + auto-verify instead of running invisibly. `info` mirrors what
+/// `chat_open_worker` returns, so the frontend can adopt it WITHOUT a
+/// re-attach/ensure_running call (which would restart a stopped worker).
+#[derive(serde::Serialize)]
+pub struct LiveWorkerSlot {
+    pub info: SessionInfo,
+    pub direction_id: i32,
+    pub repo_id: i32,
+    /// The worker's OWN thread (from EngineInner.thread_id) — adoption must not
+    /// assume the active thread.
+    pub thread_id: i32,
+    pub busy: bool,
+    pub queued: usize,
+}
+
+/// A snapshot of one live worker engine taken under its lock. Pure input to
+/// `build_worker_slots`, so the busy-filter + DB assembly is testable without a
+/// running Tauri app / `LeadChatState`.
+struct WorkerSnapshot {
+    session_id: i32,
+    thread_id: i32,
+    busy: bool,
+    queued: usize,
+}
+
+/// Keep only the actually-running snapshots (`busy == true`) and assemble each
+/// into a full slot from the DB. `turn.busy` is the reliable "running, not
+/// stopped" signal: `stop`/`stop_quiet` reset `turn` to default (busy=false) and
+/// it is tool-independent (true during a codex per-turn run, false between
+/// turns). Best-effort: a snapshot whose session/worktree row is missing is
+/// skipped, not fatal.
+async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWorkerSlot> {
+    let mut out = Vec::new();
+    for s in snaps {
+        if !s.busy {
+            continue;
+        }
+        let Ok(Some(sess)) = repo::get_session(db, s.session_id).await else {
+            continue;
+        };
+        let Ok(Some(wt)) = repo::worktree_for(db, sess.direction_id, sess.repo_id).await else {
+            continue;
+        };
+        out.push(LiveWorkerSlot {
+            info: SessionInfo {
+                session_id: sess.id,
+                repo: wt.path.clone(),
+                worktree: wt.path,
+                branch: wt.branch,
+                tool: sess.tool,
+                resumed: sess.native_session_id.is_some(),
+                native_id: sess.native_session_id,
+            },
+            direction_id: sess.direction_id,
+            repo_id: sess.repo_id,
+            thread_id: s.thread_id,
+            busy: s.busy,
+            queued: s.queued,
+        });
+    }
+    out
+}
+
+/// Live worker engines the frontend should mirror into its session map. Snapshots
+/// `LeadChatState` worker entries (positive keys = session ids; negative keys are
+/// leads), then `build_worker_slots` keeps only the running ones. Read-only: it
+/// never starts or attaches an engine, so it cannot restart a stopped worker.
+#[tauri::command]
+pub async fn list_live_worker_slots(
+    app: AppHandle,
+    db: State<'_, Db>,
+) -> Result<Vec<LiveWorkerSlot>, String> {
+    // Clone the worker EngineRefs out under the std mutex, then release it before
+    // awaiting any tokio engine lock (never hold the std guard across .await).
+    let engines: Vec<EngineRef> = {
+        let state = app.state::<LeadChatState>();
+        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .filter(|(k, _)| **k > 0)
+            .map(|(_, e)| e.clone())
+            .collect()
+    };
+    let mut snaps = Vec::new();
+    for eng in engines {
+        let (session_id, thread_id, busy, queued) = {
+            let inner = eng.lock().await;
+            (inner.session_id, inner.thread_id, inner.turn.busy, inner.turn.queue.len())
+        };
+        if let Some(sid) = session_id {
+            snaps.push(WorkerSnapshot { session_id: sid, thread_id, busy, queued });
+        }
+    }
+    Ok(build_worker_slots(&db, snaps).await)
+}
+
+/// Backend-authoritative auto-verify gate. Given a worker session that just ended
+/// a turn, return its direction id IFF the direction is in an implementation phase
+/// (working/review) — read FRESH from the DB so a phase that changed mid-turn (e.g.
+/// planning→working via the bus set_task_status) is reflected, not a stale snapshot.
+/// The frontend calls this on a worker idle turn push and runs verify_direction when
+/// it returns Some; this replaces the racy frontend busy→idle / phase-cache effect.
+#[tauri::command]
+pub async fn auto_verify_check(
+    db: State<'_, Db>,
+    session_id: i32,
+) -> Result<Option<i32>, String> {
+    let Some(sess) = repo::get_session(&db, session_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some(dir) = repo::get_direction(&db, sess.direction_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    Ok((dir.status == "working" || dir.status == "review").then_some(sess.direction_id))
+}
+
 // ───────────────────── chat-mode workers ─────────────────────
 //
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
@@ -944,4 +1068,114 @@ async fn post_lead_tool_result_inner(
         log_hidden_feedback_ignored(thread_id, &e.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod live_slot_tests {
+    use super::{build_worker_slots, WorkerSnapshot};
+    use crate::store::{repo, Db};
+
+    async fn mem() -> Db {
+        Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    // workspace + repo_ref + thread + direction + a session row + a worktree row,
+    // returning (thread_id, direction_id, repo_id, session_id).
+    async fn fixture(db: &Db) -> (i32, i32, i32, i32) {
+        let ws = repo::create_workspace(db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-slot-fake", "main")
+            .await
+            .unwrap();
+        let th = repo::create_thread(db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let dir = repo::create_direction(db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only")
+            .await
+            .unwrap();
+        let sess = repo::create_session(db, dir.id, repo_ref.id, "codex", "/tmp/wt")
+            .await
+            .unwrap();
+        repo::set_session_native_id(db, sess.id, "nat-1").await.unwrap();
+        repo::record_worktree(db, repo_ref.id, dir.id, "feat/alpha", "/tmp/wt")
+            .await
+            .unwrap();
+        (th.id, dir.id, repo_ref.id, sess.id)
+    }
+
+    fn snap(session_id: i32, thread_id: i32, busy: bool) -> WorkerSnapshot {
+        WorkerSnapshot { session_id, thread_id, busy, queued: 0 }
+    }
+
+    /// A busy worker is assembled into a full slot carrying its own thread id and
+    /// DB-derived SessionInfo.
+    #[tokio::test]
+    async fn busy_worker_becomes_a_slot() {
+        let db = mem().await;
+        let (th, dir, repo_id, sess) = fixture(&db).await;
+
+        let slots = build_worker_slots(
+            &db,
+            vec![WorkerSnapshot { session_id: sess, thread_id: th, busy: true, queued: 2 }],
+        )
+        .await;
+
+        assert_eq!(slots.len(), 1);
+        let s = &slots[0];
+        assert_eq!(s.info.session_id, sess);
+        assert_eq!(s.direction_id, dir);
+        assert_eq!(s.repo_id, repo_id);
+        assert_eq!(s.thread_id, th);
+        assert!(s.busy);
+        assert_eq!(s.queued, 2);
+        assert_eq!(s.info.repo, "/tmp/wt");
+        assert_eq!(s.info.branch, "feat/alpha");
+        assert_eq!(s.info.worktree, "/tmp/wt");
+        assert_eq!(s.info.native_id.as_deref(), Some("nat-1"));
+        assert!(s.info.resumed);
+    }
+
+    /// A NOT-busy snapshot (stopped/taken-over/idle-between-turns) is dropped — the
+    /// busy filter is the whole defense against advertising a stopped engine.
+    #[tokio::test]
+    async fn idle_worker_is_excluded() {
+        let db = mem().await;
+        let (th, _dir, _repo_id, sess) = fixture(&db).await;
+
+        let slots = build_worker_slots(&db, vec![snap(sess, th, false)]).await;
+
+        assert!(slots.is_empty());
+    }
+
+    /// A snapshot whose session row is missing (e.g. a stale key) is skipped, not
+    /// fatal — assembly is best-effort over the live set.
+    #[tokio::test]
+    async fn missing_session_row_is_skipped() {
+        let db = mem().await;
+        let (th, _dir, _repo_id, _sess) = fixture(&db).await;
+
+        let slots = build_worker_slots(&db, vec![snap(999_999, th, true)]).await;
+
+        assert!(slots.is_empty());
+    }
+
+    /// A busy worker without a materialized worktree row is skipped (worktree_for
+    /// is None) rather than emitting a half-built slot.
+    #[tokio::test]
+    async fn busy_worker_without_worktree_is_skipped() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main").await.unwrap();
+        let th = repo::create_thread(&db, ws.id, "issue", "feature", "codex").await.unwrap();
+        let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only")
+            .await
+            .unwrap();
+        let sess = repo::create_session(&db, dir.id, repo_ref.id, "codex", "/tmp/wt")
+            .await
+            .unwrap();
+        // NOTE: no record_worktree call.
+
+        let slots = build_worker_slots(&db, vec![snap(sess.id, th.id, true)]).await;
+
+        assert!(slots.is_empty());
+    }
 }
