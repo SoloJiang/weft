@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, FileText, MessageSquarePlus, Send } from "lu
 import { api } from "../lib/api";
 import type { WorktreeDiff } from "../lib/types";
 import { cn } from "../lib/cn";
+import { useClickOutside } from "../lib/useClickOutside";
 import { Tooltip } from "../components/ui/Tooltip";
 
 /**
@@ -28,6 +29,10 @@ export function DiffView({
   const [touched, setTouched] = useState(false);
   /** The annotation being composed: a file, optionally pinned to one line. */
   const [ask, setAsk] = useState<{ path: string; line?: string } | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Pressing outside the diff closes an open AskBox. Scoped to the whole surface
+  // (not the box) so clicking another line just retargets it, keeping the draft.
+  useClickOutside(rootRef, ask != null, () => setAsk(null));
 
   useEffect(() => {
     let alive = true;
@@ -73,7 +78,7 @@ export function DiffView({
   const totalRemoved = files.reduce((s, f) => s + f.removed, 0);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+    <div ref={rootRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
       <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-bg/95 px-4 py-2.5 text-[11px] text-ink-faint backdrop-blur">
         <span>{t("diff.filesChanged", { count: files.length })}</span>
         <span className="text-running">+{totalAdded}</span>

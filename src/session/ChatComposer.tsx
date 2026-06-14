@@ -14,6 +14,7 @@ import {
 import type { ImageAttachment, SlashCmd } from "../lib/types";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
+import { useClickOutside } from "../lib/useClickOutside";
 import { Button } from "../components/ui/Button";
 import { Tooltip } from "../components/ui/Tooltip";
 
@@ -84,8 +85,12 @@ export function ChatComposer({
   const [files, setFiles] = useState<string[]>([]);
   const [slashIdx, setSlashIdx] = useState(0);
   const [copied, setCopied] = useState(false);
+  // Hide the palette when the user clicks away, without clearing their draft —
+  // reset on the next keystroke or when focus returns to the input.
+  const [dismissed, setDismissed] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
   const slashActiveRef = useRef<HTMLButtonElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const el = ref.current;
@@ -134,12 +139,19 @@ export function ChatComposer({
       ...C.within,
     ].slice(0, 16);
   }, [slashQuery, slashCommands, localSlash]);
-  const paletteOpen = slashMatches.length > 0;
+  const paletteOpen = slashMatches.length > 0 && !dismissed;
   const activeSlashIdx = slashMatches.length
     ? Math.min(slashIdx, slashMatches.length - 1)
     : 0;
 
-  useEffect(() => setSlashIdx(0), [slashQuery]);
+  useEffect(() => {
+    setSlashIdx(0);
+    setDismissed(false);
+  }, [slashQuery]);
+
+  // Click anywhere outside the composer dismisses the palette (clicks on the
+  // textarea or toolbar stay "inside", so typing the command isn't interrupted).
+  useClickOutside(wrapRef, paletteOpen, () => setDismissed(true));
 
   useEffect(() => {
     if (paletteOpen) {
@@ -232,7 +244,10 @@ export function ChatComposer({
 
   return (
     <div className="border-t border-border bg-bg px-4 py-3">
-      <div className="relative mx-auto max-w-[820px] rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-[0_12px_40px_-28px_rgba(0,0,0,0.65)]">
+      <div
+        ref={wrapRef}
+        className="relative mx-auto max-w-[820px] rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-[0_12px_40px_-28px_rgba(0,0,0,0.65)]"
+      >
         {paletteOpen && (
           <div className="absolute inset-x-2 bottom-full mb-2 max-h-64 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-raised shadow-[0_12px_40px_-20px_rgba(0,0,0,0.6)]">
             {slashMatches.map((item, i) => {
@@ -317,6 +332,7 @@ export function ChatComposer({
           rows={1}
           value={text}
           onChange={(e) => setText(e.currentTarget.value)}
+          onFocus={() => setDismissed(false)}
           onPaste={onPaste}
           onKeyDown={(e) => {
             if (paletteOpen) {
