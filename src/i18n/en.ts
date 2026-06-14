@@ -281,6 +281,12 @@ export const en = {
     denyWriteTitle: "Decline this change; tell the lead",
     runWith: "Run with",
   },
+  tool: {
+    input: "Input",
+    output: "Output",
+    showMore: "Show {{n}} more lines",
+    showLess: "Show less",
+  },
   session: {
     back: "Back to board",
     lead: "Lead",
