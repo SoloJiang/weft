@@ -4,8 +4,7 @@ import { AppTopBar } from "./nav/AppTopBar";
 import { ThreadBoard } from "./board/ThreadBoard";
 import { WorkspaceHome } from "./board/WorkspaceHome";
 import { NeedsYouView } from "./board/NeedsYouView";
-import { SessionView } from "./session/SessionView";
-import { ObserveView } from "./session/ObserveView";
+import { WorkerConversation } from "./session/WorkerConversation";
 import { DangerToast } from "./components/DangerToast";
 import { Toasts } from "./components/Toast";
 import { CommandPalette } from "./components/CommandPalette";
@@ -17,12 +16,11 @@ import { useAppShortcuts } from "./state/shortcuts";
 import { useSystemNotifications } from "./lib/notifications";
 
 function Main() {
-  const { activeSessionId, viewing, activeThreadId, showNeeds } = useStore();
+  const { viewing, activeThreadId, showNeeds } = useStore();
   // Needs-you is the workspace-wide exception queue — it takes precedence over
   // whatever thread/board is open underneath, so it's reachable from anywhere.
   if (showNeeds) return <NeedsYouView />;
-  if (activeSessionId != null) return <SessionView />;
-  if (viewing != null) return <ObserveView />;
+  if (viewing != null) return <WorkerConversation />;
   if (activeThreadId != null) return <ThreadBoard />;
   return <WorkspaceHome />;
 }
@@ -31,7 +29,6 @@ function Shell() {
   const {
     navCollapsed,
     activeWorkspaceId,
-    activeSessionId,
     viewing,
     activeThreadId,
     showNeeds,
@@ -42,7 +39,6 @@ function Shell() {
   if (
     homeTab === "settings" &&
     !showNeeds &&
-    activeSessionId == null &&
     viewing == null &&
     activeThreadId == null
   ) {
@@ -57,12 +53,11 @@ function Shell() {
   const showDock =
     activeWorkspaceId != null &&
     !showNeeds &&
-    (activeSessionId != null ||
-      viewing != null ||
+    (viewing != null ||
       activeThreadId != null ||
       homeTab === "board");
   // Key the boundary by route so navigating away from a crashed screen clears it.
-  const routeKey = `${showNeeds ? "needs" : ""}|${activeSessionId ?? ""}|${viewing ?? ""}|${activeThreadId ?? ""}|${homeTab}`;
+  const routeKey = `${showNeeds ? "needs" : ""}|${viewing ?? ""}|${activeThreadId ?? ""}|${homeTab}`;
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-bg text-ink">
       {!navCollapsed && <WorkspaceNav />}

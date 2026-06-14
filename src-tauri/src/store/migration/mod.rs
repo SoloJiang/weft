@@ -27,6 +27,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0014SkillEnable),
             Box::new(M0015ImRoute),
             Box::new(M0016BackupConfig),
+            Box::new(M0017SessionStatusReset),
         ]
     }
 }
@@ -614,6 +615,33 @@ impl MigrationTrait for M0016BackupConfig {
         manager
             .drop_table(Table::drop().table(Alias::new("backup_config")).to_owned())
             .await?;
+        Ok(())
+    }
+}
+
+/// Reconciles the legacy session.status high-water-mark. Before honest activity
+/// status, `status` was set to "running" on attach and never reset to idle, so
+/// every pre-upgrade worker row reads "running"/"starting" whether or not its
+/// turn finished. The boot revive sweep resumes orphaned "running" rows, so
+/// without this one-time reset the first launch after upgrade would resume and
+/// nudge every old idle/review worker. Reset them to "idle" once; from here on
+/// the engine writes status honestly at turn boundaries.
+pub struct M0017SessionStatusReset;
+impl MigrationName for M0017SessionStatusReset {
+    fn name(&self) -> &str {
+        "m0017_session_status_reset"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0017SessionStatusReset {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        crate::store::repo::reset_stale_running_sessions(manager.get_connection())
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Data reconcile only — nothing to reverse.
         Ok(())
     }
 }

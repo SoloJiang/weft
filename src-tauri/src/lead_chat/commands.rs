@@ -5,7 +5,7 @@ use super::engine::{self, EngineRef, LeadChatState};
 use crate::store::{repo, Db};
 use tauri::{AppHandle, Manager, State};
 
-fn lead_key(thread_id: i32) -> i64 {
+pub(crate) fn lead_key(thread_id: i32) -> i64 {
     -(thread_id as i64)
 }
 
@@ -565,7 +565,8 @@ pub async fn list_lead_messages(
 // ───────────────────── chat-mode workers ─────────────────────
 //
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
-// timeline in the SessionView, with per-tool wire dialects (engine::per_turn).
+// timeline in the worker conversation surface, with per-tool wire dialects
+// (engine::per_turn).
 // Each session remains takeover-able in the user's own terminal via its
 // native id.
 
@@ -591,7 +592,7 @@ pub async fn chat_open_worker(
     .map_err(|e| e.to_string())
 }
 
-async fn chat_open_worker_impl(
+pub(crate) async fn chat_open_worker_impl(
     app: &AppHandle,
     db: &Db,
     direction_id: i32,
@@ -884,6 +885,11 @@ pub async fn post_lead_tool_result(
                 // Card-click plumbing starts a turn directly (not via send): keep the
                 // invariant so a prior concierge tag can't leak onto this turn.
                 inner.current_origin_tag = None;
+                // A turn-start must persist `running`, or a crash while the lead
+                // processes this action result leaves the meta row `idle` and boot
+                // revive skips it (same invariant as send/nudge).
+                let db = app.state::<Db>();
+                let _ = repo::set_lead_status(&db, thread_id, "running").await;
                 engine::write_user(&mut inner, &out).await;
             } else {
                 inner.turn.queue.push_back(out);

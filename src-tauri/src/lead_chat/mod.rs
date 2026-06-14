@@ -9,4 +9,5 @@ pub mod engine;
 pub mod out_hub;
 pub mod proto;
 pub mod repo_state;
+pub mod revive;
 pub mod sentinels;

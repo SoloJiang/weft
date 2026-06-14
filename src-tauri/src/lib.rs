@@ -148,6 +148,7 @@ pub fn run() {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
             lead_chat::engine::spawn_watchdog(app.handle().clone());
+            lead_chat::revive::spawn_revive(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());

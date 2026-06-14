@@ -15,6 +15,19 @@ use tokio::process::{Child, ChildStdin, Command};
 
 pub const EVENT: &str = "lead-chat";
 
+/// Persist the turn-activity status for whichever surface this engine drives:
+/// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
+async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, status: &str) {
+    match session_id {
+        Some(sid) => {
+            let _ = repo::set_session_status(db, sid, status).await;
+        }
+        None => {
+            let _ = repo::set_lead_status(db, thread_id, status).await;
+        }
+    }
+}
+
 /// 流式节流间隔（ms）：每过这么久把当前累积文本落一次 DB 快照，并向 IM 桥发一帧
 /// LeadDelta（飞书 CardKit 流式卡据此逐帧更新）。桌面 UI 不受影响——它吃的是每个
 /// token 的原始 `Push::Delta`。150ms 是流式卡看着流畅的下限；再大就一顿一顿的。
@@ -370,6 +383,7 @@ pub async fn send(
         // This send starts a turn now → its tag IS the in-flight turn's tag.
         inner.current_origin_tag = origin_tag.clone();
         crate::power::on_turn_began(app);
+        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
     }
     let turn = inner.turn_id;
     let status = if direct { "complete" } else { "queued" };
@@ -679,6 +693,7 @@ async fn codex_consumer(
                     }
                 }
                 let still_busy = inner.turn.busy;
+                persist_activity(&db, inner.session_id, thread_id, if still_busy { "running" } else { "idle" }).await;
                 inner.clock.on_turn_end(still_busy);
                 let _ = app.emit(
                     EVENT,
@@ -854,6 +869,10 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
         // Plumbing nudge starts a turn directly (not via send): keep the invariant.
         inner.current_origin_tag = None;
         crate::power::on_turn_began(app);
+        // A nudge is a turn-start too (e.g. a coordinator bus-wake on an idle
+        // engine): persist `running` like send, so a crash mid-nudge-turn is
+        // revivable instead of reading a stale `idle`.
+        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
         if per_turn(&inner.tool) {
             drop(inner);
             spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
@@ -999,10 +1018,15 @@ pub async fn stop_quiet(eng: &EngineRef) {
     inner.clock = TurnClock::default();
 }
 
-/// Stop the engine outright (e.g. before a terminal takeover).
+/// Stop the engine outright (e.g. before a terminal takeover or by the runaway
+/// guard). Persists idle so a stopped/taken-over session can't be falsely
+/// revived into a COMPETING headless process on the next boot (see L204).
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     stop_quiet(eng).await;
     let inner = eng.lock().await;
+    if let Some(db) = app.try_state::<Db>() {
+        persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
+    }
     let _ = app.emit(
         EVENT,
         Push::Turn {
@@ -1399,6 +1423,7 @@ fn spawn_reader(
                         }
                     }
                     let still_busy = inner.turn.busy;
+                    persist_activity(&db, inner.session_id, thread_id, if still_busy { "running" } else { "idle" }).await;
                     inner.clock.on_turn_end(still_busy);
                     let state = if still_busy { "busy" } else { "idle" };
                     let _ = app.emit(
@@ -1479,6 +1504,7 @@ fn spawn_reader(
                 });
             }
             let still_busy = inner.turn.busy;
+            persist_activity(&db, inner.session_id, inner.thread_id, if still_busy { "running" } else { "idle" }).await;
             inner.clock.on_turn_end(still_busy);
             let state = if still_busy { "busy" } else { "idle" };
             let _ = app.emit(
@@ -1521,6 +1547,10 @@ fn spawn_reader(
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
+            // The turn is unconditionally reset to idle here; persist that so a
+            // resident-process death (incl. interrupt→kill) doesn't leave the row
+            // stuck "running" and falsely revive an engine on the next boot.
+            persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
             let _ = app.emit(
                 EVENT,
                 Push::Turn {
