@@ -788,10 +788,13 @@ pub async fn send(
     // codex (app-server): no resident stdin, no per-turn process — the shared
     // connection drives the turn after the lock drops. Gated; default stays exec.
     //
-    // BUT the app-server path (spawn_codex_turn) injects neither extra_args (the
-    // per-thread MCP, e.g. weft_global) nor system_prompt — only exec does. So any
-    // thread that needs them (the Concierge: non-empty system_prompt + weft_global
-    // MCP) must take the exec path, or it answers with no Weft tools and no prompt.
+    // system_prompt is now prepended to a new thread's first turn (codex has no
+    // thread/start prompt field — mirrors the exec adapter). The remaining gap is
+    // MCP: codex app-server MCP is APP-SCOPED (config.toml + config/mcpServer/
+    // reload), so today's per-thread bus URLs (weft_bus / weft_global) can't be
+    // carried by one global app-server without restructuring the bus to a single
+    // thread-routing endpoint. The gate keeps system_prompt.is_empty() and the
+    // path stays behind the off-by-default env flag until that's settled.
     let is_codex_appserver =
         inner.tool == "codex" && codex_appserver_enabled() && inner.system_prompt.is_empty();
     let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
@@ -851,13 +854,14 @@ async fn spawn_codex_turn(
     out: Outgoing,
 ) -> anyhow::Result<()> {
     let client = crate::codex_app_server::client().await?;
-    let (native, cwd, sid, thread_id_i) = {
+    let (native, cwd, sid, thread_id_i, system_prompt) = {
         let i = eng.lock().await;
         (
             i.native_id.clone(),
             i.cwd.to_string_lossy().into_owned(),
             i.session_id,
             i.thread_id,
+            i.system_prompt.clone(),
         )
     };
     let had_native = native.is_some();
@@ -890,9 +894,25 @@ async fn spawn_codex_turn(
         );
         tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
     }
-    let turn = client.start_turn(&thread, &out.text).await?;
+    // codex has no thread/start system-prompt field, so (like the exec adapter)
+    // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
+    // thread already carries it in conversation history.
+    let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
+    let turn = client.start_turn(&thread, &first_text).await?;
     client.set_active_turn(&thread, &turn).await;
     Ok(())
+}
+
+/// codex has no thread/start system-prompt field, so — exactly like the exec
+/// adapter (`CodexExecAdapter::build_argv`) — the engine's `system_prompt` is
+/// prepended to the FIRST turn of a brand-new thread. A resumed thread already
+/// carries it in history, so it's added only when `!had_native`.
+fn codex_first_turn_text(system_prompt: &str, message: &str, had_native: bool) -> String {
+    if !had_native && !system_prompt.is_empty() {
+        format!("{system_prompt}\n\n{message}")
+    } else {
+        message.to_string()
+    }
 }
 
 /// One long-lived task per codex session: consume the thread's app-server
@@ -2193,6 +2213,16 @@ mod tests {
         assert!(turn_verdict(Some(7200), 1, 7200, 1800, false)
             .unwrap()
             .contains("ran for over 2h"));
+    }
+
+    #[test]
+    fn codex_first_turn_prepends_prompt_only_on_new_thread() {
+        // brand-new thread + non-empty prompt → prepended to the first message
+        assert_eq!(codex_first_turn_text("SYS", "hello", false), "SYS\n\nhello");
+        // resumed thread → prompt already in history, message unchanged
+        assert_eq!(codex_first_turn_text("SYS", "hello", true), "hello");
+        // no prompt → message unchanged even on a new thread
+        assert_eq!(codex_first_turn_text("", "hello", false), "hello");
     }
 
     #[test]
