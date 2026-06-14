@@ -118,9 +118,15 @@ function walkHast(node: HNode): void {
   if (!kids || kids.length === 0) return;
   const out: HNode[] = [];
   for (const child of kids) {
-    if (child.type === "text" && typeof child.value === "string" && child.value.includes("/")) {
+    if (
+      child.type === "text" &&
+      typeof child.value === "string" &&
+      (child.value.includes("/") || child.value.includes("\\"))
+    ) {
       const segs = splitTextForPaths(child.value);
-      if (segs.length <= 1) {
+      // Skip only when nothing matched — a node that is *exactly* one path
+      // (e.g. a bullet containing just `src/App.tsx`) must still be wrapped.
+      if (!segs.some((s) => s.type === "path")) {
         out.push(child);
         continue;
       }

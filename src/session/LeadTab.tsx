@@ -70,6 +70,10 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   }, [activeThreadId, loadLeadChat]);
 
   useEffect(() => {
+    // Drop the previous thread's cwd immediately — otherwise a relative file
+    // ref clicked during the fetch window would resolve against the old lead
+    // workspace. Undefined cwd fails safe (relative paths report not-found).
+    setLeadCwd(undefined);
     if (activeThreadId == null) return;
     let alive = true;
     void api

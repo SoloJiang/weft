@@ -85,8 +85,14 @@ fn map_resolve_err(e: ResolveErr) -> String {
 /// Turn a raw path token from chat into an absolute, existing path.
 fn resolve_chat_path(token: &str, cwd: Option<&str>) -> Result<PathBuf, ResolveErr> {
     let trimmed = token.trim();
-    let unscheme = trimmed.strip_prefix("file://").unwrap_or(trimmed);
-    let bare = strip_line_suffix(unscheme);
+    // `file://` URIs are percent-encoded (e.g. a space is `%20`); decode them so
+    // `file:///Users/me/My%20Repo/App.tsx` resolves to the real path. Bare paths
+    // are left as-is (they aren't URI-encoded).
+    let decoded = match trimmed.strip_prefix("file://") {
+        Some(rest) => percent_decode(rest),
+        None => trimmed.to_string(),
+    };
+    let bare = strip_line_suffix(&decoded);
     let expanded = expand_tilde(bare);
 
     let abs = if expanded.is_absolute() {
@@ -148,6 +154,35 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Decode `%XX` percent-escapes in a `file://` URI body. Lone/invalid `%`
+/// sequences are passed through untouched.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +236,24 @@ mod tests {
     fn strips_file_scheme_and_line_then_resolves() {
         let abs = manifest().join("Cargo.toml");
         let token = format!("file://{}:10", abs.to_str().unwrap());
+        let got = resolve_chat_path(&token, None).unwrap();
+        assert!(got.ends_with("Cargo.toml"));
+    }
+
+    #[test]
+    fn decodes_percent_escapes() {
+        assert_eq!(percent_decode("My%20Repo/App.tsx"), "My Repo/App.tsx");
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("bad%2"), "bad%2"); // truncated escape passes through
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn decodes_file_uri_then_resolves() {
+        let dir = manifest();
+        // Encode the leading 'C' of Cargo.toml as %43 to exercise URI decoding.
+        let token = format!("file://{}/%43argo.toml", dir.to_str().unwrap());
         let got = resolve_chat_path(&token, None).unwrap();
         assert!(got.ends_with("Cargo.toml"));
     }
