@@ -27,13 +27,10 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
     format!("{base}/ask/{thread}/{dir}?tool={tool}")
 }
 
-/// Install the Ask Bridge for a session: a PreToolUse hook that POSTs each tool
-/// action to weft's /ask endpoint and blocks on the returned allow/deny. Both
-/// claude and codex use the IDENTICAL hookSpecificOutput contract, so the hook
-/// script is shared; only the per-tool wiring differs (claude `--settings`,
-/// codex `-c hooks.PreToolUse`). Additive — stacks with the user's own hooks.
-/// Best-effort: empty args if files can't be written. (OpenCode bridges via its
-/// server `/event` channel, not a hook — handled elsewhere.)
+/// Install the Ask Bridge for a session. Claude gets a worktree-local
+/// PreToolUse settings file; Codex writes only a worktree route file consumed
+/// by Weft's stable global hook in `~/.codex/config.toml`; OpenCode bridges via
+/// its server `/event` plugin. Best-effort: empty args if files can't be written.
 pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Path) -> Injection {
     if tool == "opencode" {
         return inject_opencode_ask_plugin(base, thread, dir, cwd);
@@ -42,6 +39,14 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
         return Injection { args: vec![] };
     }
     let url = ask_url(base, thread, dir, tool);
+    if tool == "codex" {
+        let route = cwd.join(".weft-codex-ask-url");
+        if std::fs::write(&route, &url).is_err() {
+            return Injection { args: vec![] };
+        }
+        crate::git::git_exclude(cwd, ".weft-codex-ask-url");
+        return Injection { args: vec![] };
+    }
     let script = cwd.join(".weft-ask-hook.sh");
     // Reads the PreToolUse JSON on stdin, asks weft, echoes weft's decision JSON
     // (empty on failure/timeout → the tool falls back to its own prompt).
@@ -88,19 +93,10 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
                 args: vec!["--settings".into(), settings.to_string_lossy().to_string()],
             }
         }
-        // Codex defines the same hook in config.toml. We pass it inline via `-c`
-        // and add --dangerously-bypass-hook-trust: that flag only waives
-        // SOURCE-trust for our own generated hook so it runs unattended — it does
-        // NOT skip approvals or the sandbox (the hook IS the approval surface).
-        "codex" => {
-            let hooks = format!(
-                "hooks.PreToolUse=[{{ matcher = \".*\", hooks = [{{ type = \"command\", command = \"bash {}\" }}] }}]",
-                script.to_string_lossy()
-            );
-            Injection {
-                args: vec!["--dangerously-bypass-hook-trust".into(), "-c".into(), hooks],
-            }
-        }
+        // Codex now warns loudly when --dangerously-bypass-hook-trust is used.
+        // Do not inject Weft's PreToolUse hook through that bypass path; Codex's
+        // own sandbox/approval mode remains authoritative for exec sessions.
+        "codex" => Injection { args: vec![] },
         _ => Injection { args: vec![] },
     }
 }
@@ -291,16 +287,20 @@ mod tests {
     }
 
     #[test]
-    fn codex_ask_hook_injects_pretooluse_via_config() {
+    fn codex_ask_hook_writes_worktree_route_without_launch_bypass() {
         let dir = std::env::temp_dir().join(format!("weft-askh-x-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let inj = inject_ask_hook("http://127.0.0.1:9", 2, "30", "codex", &dir);
-        assert_eq!(inj.args[0], "--dangerously-bypass-hook-trust");
-        assert_eq!(inj.args[1], "-c");
-        assert!(inj.args[2].starts_with("hooks.PreToolUse=["));
-        assert!(inj.args[2].contains(".weft-ask-hook.sh"));
-        let script = std::fs::read_to_string(dir.join(".weft-ask-hook.sh")).unwrap();
-        assert!(script.contains("/ask/2/30?tool=codex"));
+        assert!(
+            inj.args.is_empty(),
+            "global trusted hook needs no launch args"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".weft-codex-ask-url")).unwrap(),
+            "http://127.0.0.1:9/ask/2/30?tool=codex"
+        );
+        assert!(!dir.join(".weft-ask-hook.sh").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

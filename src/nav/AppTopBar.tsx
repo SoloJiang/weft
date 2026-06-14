@@ -6,7 +6,6 @@ import {
   LayoutGrid,
   MessagesSquare,
   Moon,
-  PanelLeftClose,
   PanelLeftOpen,
   Sun,
   X,
@@ -16,7 +15,6 @@ import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { currentLang, setLang } from "../i18n";
 import { Button } from "../components/ui/Button";
-import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { cn } from "../lib/cn";
 import { useStore } from "../state/store";
 import { useTheme } from "../state/theme";
@@ -27,10 +25,8 @@ export function AppTopBar() {
     navCollapsed,
     setNavCollapsed,
     activeThreadId,
-    activeSessionId,
     activeWorkspaceId,
     viewing,
-    sessions,
     showNeeds,
     homeTab,
     repos,
@@ -45,7 +41,6 @@ export function AppTopBar() {
     setReviewingProposal,
     threadTab,
     setThreadTab,
-    backToBoard,
     closeObserve,
     updateAvailable,
     installUpdate,
@@ -56,9 +51,7 @@ export function AppTopBar() {
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const lang = currentLang();
   const thread = threads.find((th) => th.id === activeThreadId);
-  const activeSession = activeSessionId != null ? sessions[activeSessionId] : null;
-  const inIssue = !!thread && activeSessionId == null && viewing == null && !showNeeds;
-  const inSession = activeSession != null && !showNeeds;
+  const inIssue = !!thread && viewing == null && !showNeeds;
   const inObserve = viewing != null && !showNeeds;
   const viewedRepo = viewing ? repos.find((r) => r.id === viewing.repoId) : null;
   const viewedDirection = viewing
@@ -66,21 +59,15 @@ export function AppTopBar() {
         .flat()
         .find((d) => d.id === viewing.directionId)
     : null;
-  const sessionRepo = activeSession ? repos.find((r) => r.id === activeSession.repoId) : null;
-  const sessionDirection = activeSession
-    ? directionsByThread[activeSession.threadId]?.find((d) => d.id === activeSession.directionId)
-    : null;
   const inWorkspaceBoard =
     activeWorkspaceId != null &&
     activeThreadId == null &&
-    activeSessionId == null &&
     viewing == null &&
     !showNeeds &&
     homeTab === "board";
   const inWorkspaceRepos =
     activeWorkspaceId != null &&
     activeThreadId == null &&
-    activeSessionId == null &&
     viewing == null &&
     !showNeeds &&
     homeTab === "repos";
@@ -126,15 +113,17 @@ export function AppTopBar() {
         </motion.div>
       )}
       <header className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border bg-bg px-3">
-        <button
-          type="button"
-          onClick={() => setNavCollapsed(!navCollapsed)}
-          aria-label={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
-          title={navCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")}
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-        >
-          {navCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-        </button>
+        {navCollapsed && (
+          <button
+            type="button"
+            onClick={() => setNavCollapsed(false)}
+            aria-label={t("nav.expandSidebar")}
+            title={t("nav.expandSidebar")}
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+          >
+            <PanelLeftOpen size={16} />
+          </button>
+        )}
 
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
         {navCollapsed && (
@@ -142,29 +131,6 @@ export function AppTopBar() {
             <img src="/weft-mark.svg" alt="" className="h-[18px] w-[18px]" draggable={false} />
             <span className="text-[15px] font-semibold tracking-[-0.01em] text-ink">weft</span>
           </>
-        )}
-        {inSession && (
-          <div className="flex min-w-0 items-center gap-2">
-            <button
-              type="button"
-              onClick={backToBoard}
-              aria-label={t("session.back")}
-              title={t("session.back")}
-              className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-            >
-              <ArrowLeft size={15} />
-            </button>
-            <span className="flex shrink-0 items-center gap-1.5 rounded-[var(--radius-sm)] bg-surface px-2 py-0.5 text-[11px] font-medium text-ink-muted">
-              <ToolIcon tool={activeSession.info.tool} size={12} />
-              {toolFullName(activeSession.info.tool)}
-            </span>
-            <span className="min-w-0 truncate text-[13px] font-semibold text-ink">
-              {sessionDirection?.name ?? "task"}
-            </span>
-            <span className="hidden shrink-0 text-[11.5px] text-ink-faint sm:inline">
-              {sessionRepo?.name ?? "working copy"}
-            </span>
-          </div>
         )}
         {inObserve && (
           <div className="flex min-w-0 items-center gap-2">

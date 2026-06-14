@@ -21,6 +21,155 @@ pub const K_REMOTE_STANDBY: &str = "im.remote_standby";
 /// 飞书 👀「看我看我」表情的 reaction key。
 const INBOUND_ACK_EMOJI: &str = "MeMeMe";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImProviderCapabilities {
+    pub provider_id: &'static str,
+    pub issue_thread_supported: bool,
+    pub default_create_thread_for_new_issue: bool,
+    pub can_create_thread_from_current_conversation: bool,
+    pub can_reply_to_message: bool,
+    pub terminology_zh: &'static str,
+    pub terminology_en: &'static str,
+}
+
+/// `can_create_topic_here` reflects the CURRENT conversation: Feishu issue topics
+/// can only be created from a group chat, not a DM. The provider supports topics in
+/// general (`issue_thread_supported`), but the "create" flags must be false in a DM
+/// so the lead/global tool doesn't advertise or attempt a topic there.
+pub fn feishu_provider_capabilities(can_create_topic_here: bool) -> ImProviderCapabilities {
+    ImProviderCapabilities {
+        provider_id: "feishu",
+        issue_thread_supported: true,
+        default_create_thread_for_new_issue: can_create_topic_here,
+        can_create_thread_from_current_conversation: can_create_topic_here,
+        can_reply_to_message: true,
+        terminology_zh: "飞书 topic",
+        terminology_en: "Feishu topic",
+    }
+}
+
+pub fn format_im_user_message(
+    sender_open_id: &str,
+    chat_id: &str,
+    im_thread_ref: &str,
+    reply_to: Option<&str>,
+    text: &str,
+    caps: &ImProviderCapabilities,
+) -> String {
+    let ctx = serde_json::json!({
+        "provider": caps.provider_id,
+        "conversation": {
+            "chat_id": chat_id,
+            "topic_ref": im_thread_ref,
+            "reply_to": reply_to,
+            "sender_id": sender_open_id,
+        },
+        "capabilities": {
+            "issue_topic": {
+                "supported": caps.issue_thread_supported,
+                "default_on_create_issue": caps.default_create_thread_for_new_issue,
+                "can_create_from_current_conversation": caps.can_create_thread_from_current_conversation,
+                "terminology": { "zh": caps.terminology_zh, "en": caps.terminology_en },
+            },
+            "reply": { "supported": caps.can_reply_to_message }
+        }
+    });
+    format!(
+        "<weft:im_context>{ctx}</weft:im_context>\n\n<weft:user_message>{}</weft:user_message>",
+        text.trim()
+    )
+}
+
+fn reply_target_ref(im_ref: &str) -> Option<&str> {
+    im_ref
+        .strip_prefix("reply:")
+        .or_else(|| im_ref.split_once(";reply:").map(|(_, reply)| reply))
+        .filter(|s| !s.is_empty())
+}
+
+fn dm_open_id_ref(im_ref: &str) -> Option<&str> {
+    im_ref
+        .strip_prefix("dm:")
+        .map(|rest| rest.split_once(';').map(|(id, _)| id).unwrap_or(rest))
+        .filter(|s| !s.is_empty())
+}
+
+fn chat_ref(im_ref: &str) -> Option<&str> {
+    im_ref
+        .strip_prefix("chat:")
+        .map(|rest| rest.split_once(';').map(|(id, _)| id).unwrap_or(rest))
+        .filter(|s| !s.is_empty())
+}
+
+enum LeadOutboundTarget<'a> {
+    Reply {
+        message_id: &'a str,
+        issue_style: bool,
+    },
+    DirectMessage {
+        open_id: &'a str,
+    },
+    Chat {
+        chat_id: &'a str,
+    },
+}
+
+fn lead_outbound_target<'a>(
+    route: &'a crate::store::entities::im_route::Model,
+    reply_to: Option<&'a str>,
+) -> Option<LeadOutboundTarget<'a>> {
+    match route.channel.as_str() {
+        // Prefer threading under the user's latest inbound message (the pending
+        // ack); fall back to the bound topic id so a bound issue topic always has
+        // a delivery target. Without the fallback, lead replies are silently
+        // dropped whenever no inbound ack was recorded — e.g. the lead is driven
+        // from the desktop/global tool, or the best-effort ack reaction is delayed
+        // or fails (pre-8f7f8c3 behavior delivered to route.im_thread_ref directly).
+        "feishu" => Some(LeadOutboundTarget::Reply {
+            message_id: reply_to.unwrap_or(route.im_thread_ref.as_str()),
+            issue_style: true,
+        }),
+        // Concierge: prefer the per-turn reply hint (the originating message id,
+        // carried via the frame's origin_tag) so two rapid messages each thread
+        // under their OWN message; fall back to a reply ref baked into the stable
+        // im_thread_ref, then DM, then chat.
+        "feishu_concierge" => {
+            if let Some(message_id) = reply_to.or_else(|| reply_target_ref(&route.im_thread_ref)) {
+                Some(LeadOutboundTarget::Reply {
+                    message_id,
+                    issue_style: false,
+                })
+            } else if let Some(open_id) = dm_open_id_ref(&route.im_thread_ref) {
+                Some(LeadOutboundTarget::DirectMessage { open_id })
+            } else {
+                chat_ref(&route.im_thread_ref).map(|_| LeadOutboundTarget::Chat {
+                    chat_id: &route.chat_id,
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn latest_pending_ack_message(
+    thread_id: i32,
+    acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
+) -> Option<String> {
+    acks.lock()
+        .await
+        .get(&thread_id)
+        .and_then(|items| items.last())
+        .map(|(message_id, _)| message_id.clone())
+}
+
+/// Setting key for the replyable seed message id of an issue topic. Stored at
+/// bind time as a member `om_*` message of the topic; used as the last-resort
+/// reply target when neither the frame's origin_tag nor a pending ack is present
+/// (replying to an `om_*` message succeeds where the `omt_*` topic id would not).
+fn issue_topic_seed_key(thread_id: i32) -> String {
+    format!("im.issue_topic_seed.{thread_id}")
+}
+
 #[derive(Clone, Default, PartialEq)]
 pub struct ImSettings {
     pub app_id: String,
@@ -161,9 +310,19 @@ pub trait Channel: Send + Sync {
     async fn patch_card(&self, message_id: &str, card: serde_json::Value) -> anyhow::Result<()>;
     /// 发纯文本到用户（p2p）。
     async fn send_text(&self, open_id: &str, text: &str) -> anyhow::Result<()>;
-    /// 发纯文本到群聊，返回根 message_id；用作 issue topic 的锚点。
+    /// 发纯文本到群聊，返回根 message_id；非话题群 fallback 会用它。
     async fn send_chat_text(&self, _chat_id: &str, _text: &str) -> anyhow::Result<String> {
         anyhow::bail!("send_chat_text unsupported by this channel")
+    }
+    /// 在群聊内创建 provider-native issue topic，返回 provider topic id（Feishu: `omt_*`）。
+    async fn create_chat_topic(
+        &self,
+        _chat_id: &str,
+        seed_message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        let _ = text;
+        self.reply_text(seed_message_id, "").await
     }
     /// 回复一条已存在的消息（M2-4：lead 回流飞书话题）。reply_to 必须是话题
     /// 根消息或话题内任意一条消息——飞书 `reply` API 自动把回复挂到同一话题。
@@ -294,6 +453,7 @@ pub async fn execute(
             thread_id,
             chat_id,
             im_thread_ref,
+            seed_message_id,
         } => {
             let thread = crate::store::repo::get_thread(db, thread_id).await?;
             let Some(thread) = thread else {
@@ -309,6 +469,11 @@ pub async fn execute(
                 return Ok(());
             };
             crate::store::repo::bind_im_route(db, thread_id, "feishu", &chat_id, &im_thread_ref)
+                .await?;
+            // Record the /bind message as the topic's replyable seed (a member of
+            // this topic), so a later desktop-driven / no-ack lead reply has a valid
+            // om_ target rather than the non-replyable omt_ topic id.
+            crate::store::repo::set_setting(db, &issue_topic_seed_key(thread_id), &seed_message_id)
                 .await?;
             if let Err(e) = channel
                 .send_text(
@@ -426,7 +591,7 @@ pub async fn execute(
         inbound::Route::IssueMessage {
             chat_id,
             im_thread_ref,
-            sender_open_id: _,
+            sender_open_id,
             text,
         } => {
             // 飞书话题/群会话里的消息 → 反查 im_route 命中 issue → 灌进 lead engine。
@@ -453,7 +618,20 @@ pub async fn execute(
             };
             record_inbound_reaction(ctx, channel, route.thread_id).await;
             let Some(app) = app else { return Ok(()) }; // 测试路径不进 engine
-            if let Err(e) = feed_issue_message(app, db, route.thread_id, &text, lang).await {
+            let reply_to = ctx.and_then(|c| c.inbound_message_id.as_deref());
+            if let Err(e) = feed_issue_message(
+                app,
+                db,
+                route.thread_id,
+                &chat_id,
+                &im_thread_ref,
+                reply_to,
+                &sender_open_id,
+                &text,
+                lang,
+            )
+            .await
+            {
                 eprintln!("[weft][im] issue lead send: {e}");
             }
         }
@@ -1040,11 +1218,35 @@ async fn feed_issue_message(
     app: &tauri::AppHandle,
     db: &crate::store::Db,
     thread_id: i32,
+    chat_id: &str,
+    im_thread_ref: &str,
+    reply_to: Option<&str>,
+    sender_open_id: &str,
     text: &str,
     lang: &str,
 ) -> anyhow::Result<()> {
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
-    crate::lead_chat::engine::send(app, db, &eng, text, Vec::new(), Vec::new()).await
+    let framed = format_im_user_message(
+        sender_open_id,
+        chat_id,
+        im_thread_ref,
+        reply_to,
+        text,
+        &feishu_provider_capabilities(true),
+    );
+    // Each issue-topic turn carries its originating message id via origin_tag so the
+    // response threads under that exact message; the pending ack is used only for
+    // draining 👀 reactions.
+    crate::lead_chat::engine::send(
+        app,
+        db,
+        &eng,
+        &framed,
+        Vec::new(),
+        Vec::new(),
+        reply_to.map(|s| s.to_string()),
+    )
+    .await
 }
 
 pub async fn ensure_issue_topic(
@@ -1095,21 +1297,25 @@ pub async fn ensure_issue_topic(
                 eprintln!("[weft][im] ensure-topic existing hint: {e}");
             }
         }
-        // route 保持不变：后续 lead 输出仍会进入已有 topic。
         let _ = route;
         return Ok(());
     }
 
-    let root = ch
-        .send_chat_text(
-            chat_id,
-            &format!(
-                "Weft issue #{} · {}\n这个飞书话题已绑定到 Weft issue。",
-                thread.id, thread.title
-            ),
-        )
+    let lead_intro = format!(
+        "Weft issue #{} · {}\n这个飞书话题已连接到该 issue 的 Lead agent。后续在这里发消息，会直接进入对应 Lead。",
+        thread.id, thread.title
+    );
+    let seed_message_id = match reply_to {
+        Some(mid) => mid.to_string(),
+        None => ch.send_chat_text(chat_id, &lead_intro).await?,
+    };
+    let topic_id = ch
+        .create_chat_topic(chat_id, &seed_message_id, &lead_intro)
         .await?;
-    crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &root).await?;
+    crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
+    // Persist a replyable seed message id (an `om_*` member of the topic) for the
+    // no-ack / no-origin_tag fallback (Finding C).
+    crate::store::repo::set_setting(db, &issue_topic_seed_key(thread.id), &seed_message_id).await?;
     if let Some(reply_to) = reply_to {
         if let Err(e) = ch
             .reply_text(
@@ -1134,18 +1340,24 @@ pub async fn ensure_issue_topic(
 }
 
 async fn send_delta_fallback(
-    route: &crate::store::entities::im_route::Model,
-    is_topic: bool,
+    target: &LeadOutboundTarget<'_>,
     ch: &dyn Channel,
     text: &str,
 ) -> anyhow::Result<()> {
-    if is_topic {
-        let body = outbound::issue_reply_text(IM_LANG, text);
-        ch.reply_text(&route.im_thread_ref, &body).await.map(|_| ())
-    } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
-        ch.send_text(open_id, text).await.map(|_| ())
-    } else {
-        ch.send_chat_text(&route.chat_id, text).await.map(|_| ())
+    match target {
+        LeadOutboundTarget::Reply {
+            message_id,
+            issue_style,
+        } => {
+            let body = if *issue_style {
+                outbound::issue_reply_text(IM_LANG, text)
+            } else {
+                text.to_string()
+            };
+            ch.reply_text(message_id, &body).await.map(|_| ())
+        }
+        LeadOutboundTarget::DirectMessage { open_id } => ch.send_text(open_id, text).await,
+        LeadOutboundTarget::Chat { chat_id } => ch.send_chat_text(chat_id, text).await.map(|_| ()),
     }
 }
 
@@ -1178,14 +1390,11 @@ async fn consume_lead_delta_frame(
     streams: &mut HashMap<i32, feishu::streaming::StreamSession>,
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
 ) {
-    // Concierge（主会话→出口 agent，新消息）和 issue 话题（→lead，回复挂话题）
-    // 都流式；其它路由由 LeadOut 整段发。
     let route = match crate::store::repo::im_route_of_thread(db, d.thread_id).await {
         Ok(Some(r)) if r.channel == "feishu_concierge" || r.channel == "feishu" => r,
         _ => return,
     };
     let is_topic = route.channel == "feishu";
-    // 话题里加「Lead：」前缀保持归属（与 issue_reply_text 一致）；DM 原样。
     let content = if is_topic {
         format!(
             "{}{}",
@@ -1195,21 +1404,38 @@ async fn consume_lead_delta_frame(
     } else {
         d.accumulated.clone()
     };
+    // Issue-topic reply target prefers the frame's own origin_tag (the originating
+    // message id), then the latest pending inbound ack, then the stored seed message
+    // id; concierge uses the frame's own origin_tag. Reaction draining still uses the
+    // ack map regardless — only the reply TARGET follows this chain.
+    let reply_to = if is_topic {
+        match d.origin_tag.clone() {
+            Some(t) => Some(t),
+            None => match latest_pending_ack_message(d.thread_id, acks).await {
+                Some(a) => Some(a),
+                None => crate::store::repo::get_setting(db, &issue_topic_seed_key(d.thread_id))
+                    .await
+                    .ok()
+                    .flatten(),
+            },
+        }
+    } else {
+        d.origin_tag.clone()
+    };
+    let Some(target) = lead_outbound_target(&route, reply_to.as_deref()) else {
+        return;
+    };
 
-    // 首帧建卡：空内容的中间帧先等真正内容；done 帧总处理。
     if !streams.contains_key(&d.message_id) {
         if d.accumulated.trim().is_empty() && !d.done {
             return;
         }
-        // 话题→回复式卡片挂到话题根；DM→新消息发给 open_id/chat_id。
-        let begun = if is_topic {
-            ch.stream_begin_reply(&route.im_thread_ref).await
-        } else if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
-            ch.stream_begin("open_id", open_id).await
-        } else if route.im_thread_ref.starts_with("chat:") {
-            ch.stream_begin("chat_id", &route.chat_id).await
-        } else {
-            return;
+        let begun = match &target {
+            LeadOutboundTarget::Reply { message_id, .. } => ch.stream_begin_reply(message_id).await,
+            LeadOutboundTarget::DirectMessage { open_id } => {
+                ch.stream_begin("open_id", open_id).await
+            }
+            LeadOutboundTarget::Chat { chat_id } => ch.stream_begin("chat_id", chat_id).await,
         };
         match begun {
             Ok(Some(s)) => {
@@ -1217,8 +1443,7 @@ async fn consume_lead_delta_frame(
             }
             Ok(None) => {
                 if d.done {
-                    if let Err(e) = send_delta_fallback(&route, is_topic, ch, &d.accumulated).await
-                    {
+                    if let Err(e) = send_delta_fallback(&target, ch, &d.accumulated).await {
                         eprintln!("[weft][im] stream fallback send: {e}");
                     } else {
                         drain_inbound_reactions(d.thread_id, ch, acks).await;
@@ -1229,8 +1454,7 @@ async fn consume_lead_delta_frame(
             Err(e) => {
                 eprintln!("[weft][im] stream begin: {e}");
                 if d.done {
-                    if let Err(e) = send_delta_fallback(&route, is_topic, ch, &d.accumulated).await
-                    {
+                    if let Err(e) = send_delta_fallback(&target, ch, &d.accumulated).await {
                         eprintln!("[weft][im] stream fallback send: {e}");
                     } else {
                         drain_inbound_reactions(d.thread_id, ch, acks).await;
@@ -1257,8 +1481,7 @@ async fn consume_lead_delta_frame(
                 eprintln!("[weft][im] stream push/end: {e}");
                 if d.done {
                     streams.remove(&d.message_id);
-                    if let Err(e) = send_delta_fallback(&route, is_topic, ch, &d.accumulated).await
-                    {
+                    if let Err(e) = send_delta_fallback(&target, ch, &d.accumulated).await {
                         eprintln!("[weft][im] stream fallback send: {e}");
                     } else {
                         drain_inbound_reactions(d.thread_id, ch, acks).await;
@@ -1279,8 +1502,6 @@ pub async fn consume_lead_out(
     acks: &Arc<tokio::sync::Mutex<HashMap<i32, Vec<(String, String)>>>>,
     streaming: bool,
 ) {
-    // 反查 im_route：普通 issue 通过绑定话题回飞书；Concierge 通过
-    // feishu_concierge route 回到发起它的 IM 会话。
     let route = match crate::store::repo::im_route_of_thread(db, out.thread_id).await {
         Ok(Some(r)) => r,
         Ok(None) => return,
@@ -1289,40 +1510,38 @@ pub async fn consume_lead_out(
             return;
         }
     };
-    if route.channel == "feishu_concierge" {
-        // streaming 开启时，Concierge 回复整段交给 LeadDelta 消费者流式发送
-        // （stream 或失败回落），此处不再重复发一遍，也不提前清回执——见
-        // consume_lead_delta_frame 的 done 帧处理。
-        if streaming {
-            return;
-        }
-        let send = if let Some(open_id) = route.im_thread_ref.strip_prefix("dm:") {
-            ch.send_text(open_id, &out.text).await.map(|_| ())
-        } else if route.im_thread_ref.starts_with("chat:") {
-            ch.send_chat_text(&route.chat_id, &out.text)
-                .await
-                .map(|_| ())
-        } else {
-            Err(anyhow::anyhow!(
-                "unknown concierge im_thread_ref {}",
-                route.im_thread_ref
-            ))
-        };
-        if let Err(e) = send {
-            eprintln!("[weft][im] concierge reply: {e}");
-            return;
-        }
-        drain_inbound_reactions(out.thread_id, ch, acks).await;
+    if streaming && route.channel == "feishu_concierge" {
         return;
     }
-    // issue 话题：streaming 时 reply 由 LeadDelta 消费者发流式卡（stream 或回落），
-    // 这里跳过一次性 reply；成功后的 👀 清理由 done 帧处理。否则照旧整段 reply。
+    // feishu (issue topic) reply target prefers the frame's own origin_tag (the
+    // originating message id), then the latest pending inbound ack, then the stored
+    // seed message id; concierge uses the frame's own origin_tag. Reaction draining
+    // still uses the ack map regardless — only the reply TARGET follows this chain.
+    let reply_to = if route.channel == "feishu" {
+        match out.origin_tag.clone() {
+            Some(t) => Some(t),
+            None => match latest_pending_ack_message(out.thread_id, acks).await {
+                Some(a) => Some(a),
+                None => crate::store::repo::get_setting(db, &issue_topic_seed_key(out.thread_id))
+                    .await
+                    .ok()
+                    .flatten(),
+            },
+        }
+    } else {
+        out.origin_tag.clone()
+    };
+    let Some(target) = lead_outbound_target(&route, reply_to.as_deref()) else {
+        eprintln!(
+            "[weft][im] lead-out missing delivery target for route {}",
+            route.id
+        );
+        return;
+    };
     if !streaming {
-        let body = outbound::issue_reply_text(IM_LANG, &out.text);
-        // im_thread_ref 即话题根 message_id：飞书 reply API 会把回复挂同一话题。
-        if let Err(e) = ch.reply_text(&route.im_thread_ref, &body).await {
-            eprintln!("[weft][im] reply lead text: {e}");
-            return; // reply 失败就不 clear 回执——下一条 lead 还会带它走。
+        if let Err(e) = send_delta_fallback(&target, ch, &out.text).await {
+            eprintln!("[weft][im] lead-out send: {e}");
+            return;
         }
         drain_inbound_reactions(out.thread_id, ch, acks).await;
     }
@@ -1341,7 +1560,6 @@ async fn ensure_concierge_workspace(db: &crate::store::Db) -> anyhow::Result<i32
             return Ok(id);
         }
     }
-
     let ws = crate::store::repo::create_workspace(db, "Concierge").await?;
     crate::store::repo::set_setting(
         db,
@@ -1358,10 +1576,14 @@ async fn ensure_im_concierge_thread(
     chat_id: &str,
     im_thread_ref: &str,
 ) -> anyhow::Result<i32> {
-    if let Some(route) =
+    let existing =
         crate::store::repo::im_route_of_thread_ref(db, "feishu_concierge", chat_id, im_thread_ref)
             .await?
-    {
+            .or(
+                crate::store::repo::im_route_of_channel_chat(db, "feishu_concierge", chat_id)
+                    .await?,
+            );
+    if let Some(route) = existing {
         if crate::store::repo::get_thread(db, route.thread_id)
             .await?
             .is_some()
@@ -1398,15 +1620,33 @@ async fn consume_free_text(
     ctx: Option<&ExecuteCtx>,
 ) -> anyhow::Result<()> {
     let thread_id = ensure_im_concierge_thread(db, sender_open_id, chat_id, im_thread_ref).await?;
+    // The route's im_thread_ref stays the STABLE conversation ref (dm:/chat:) set
+    // by ensure_im_concierge_thread. The per-message reply target rides the turn as
+    // origin_tag — two rapid free-text messages each thread under their OWN message
+    // instead of both binding the shared route to the latest reply ref.
     record_inbound_reaction(ctx, channel, thread_id).await;
     let eng = crate::lead_chat::commands::lead_engine(app, db, thread_id, lang).await?;
-    let framed = match reply_to {
-        Some(mid) => format!(
-            "[from {sender_open_id}; feishu_chat_id={chat_id}; feishu_message_id={mid}] {text}"
-        ),
-        None => format!("[from {sender_open_id}; feishu_chat_id={chat_id}] {text}"),
-    };
-    crate::lead_chat::engine::send(app, db, &eng, &framed, Vec::new(), Vec::new()).await
+    // Feishu topics can only be created from a group chat, never a DM — don't
+    // advertise topic creation to the lead/global tool on a DM Concierge turn.
+    let can_create_topic = !im_thread_ref.starts_with("dm:");
+    let framed = format_im_user_message(
+        sender_open_id,
+        chat_id,
+        im_thread_ref,
+        reply_to,
+        text,
+        &feishu_provider_capabilities(can_create_topic),
+    );
+    crate::lead_chat::engine::send(
+        app,
+        db,
+        &eng,
+        &framed,
+        Vec::new(),
+        Vec::new(),
+        reply_to.map(|s| s.to_string()),
+    )
+    .await
 }
 
 /// M3-4: 桥上线后向 owner 私聊推一次「待办摘要」。整段 best-effort：任一
@@ -1522,6 +1762,45 @@ mod tests {
     }
 
     #[test]
+    fn feishu_im_context_frame_contains_provider_capabilities() {
+        let frame = super::format_im_user_message(
+            "ou_sender",
+            "oc_chat",
+            "chat:oc_chat",
+            Some("om_msg"),
+            "创建一个 issue",
+            &super::feishu_provider_capabilities(true),
+        );
+
+        assert!(frame.contains("<weft:im_context>"));
+        assert!(frame.contains("\"provider\":\"feishu\""));
+        assert!(frame.contains("\"issue_topic\""));
+        assert!(frame.contains("\"topic_ref\""));
+        assert!(frame.contains("\"default_on_create_issue\":true"));
+        assert!(!frame.contains("thread_ref"));
+        assert!(!frame.contains("issue_thread"));
+        assert!(frame.contains("<weft:user_message>创建一个 issue</weft:user_message>"));
+        assert!(!frame.contains("feishu_chat_id="));
+
+        // DM Concierge: topic creation must NOT be advertised — only group chats
+        // can host a Feishu topic. The provider still supports topics in general.
+        let dm = super::feishu_provider_capabilities(false);
+        assert!(!dm.default_create_thread_for_new_issue);
+        assert!(!dm.can_create_thread_from_current_conversation);
+        assert!(dm.issue_thread_supported);
+        let dm_frame = super::format_im_user_message(
+            "ou_sender",
+            "oc_dm",
+            "dm:ou_sender",
+            None,
+            "创建一个 issue",
+            &dm,
+        );
+        assert!(dm_frame.contains("\"default_on_create_issue\":false"));
+        assert!(dm_frame.contains("\"can_create_from_current_conversation\":false"));
+    }
+
+    #[test]
     fn card_index_roundtrip() {
         let mut c = CardIndex::default();
         c.record_perm(7, "om_1", "Run: npm test");
@@ -1628,6 +1907,93 @@ mod tests {
             .unwrap();
         assert_eq!(thread.kind, "concierge");
         assert_eq!(thread.lead_tool, expected);
+    }
+
+    #[derive(Default)]
+    struct TopicChannel {
+        created_topics: std::sync::Mutex<Vec<(String, String)>>,
+        replies: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for TopicChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("om_card".into())
+        }
+
+        async fn patch_card(
+            &self,
+            _message_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_chat_text(&self, chat_id: &str, text: &str) -> anyhow::Result<String> {
+            self.created_topics
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string()));
+            Ok("om_plain_message".into())
+        }
+
+        async fn create_chat_topic(
+            &self,
+            chat_id: &str,
+            seed_message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<String> {
+            self.created_topics
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), format!("{seed_message_id}:{text}")));
+            Ok("omt_created_topic".into())
+        }
+
+        async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((reply_to.to_string(), text.to_string()));
+            Ok("om_reply".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_issue_topic_binds_feishu_thread_id_not_plain_message_id() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        let ch = TopicChannel::default();
+
+        ensure_issue_topic(&db, &ch, issue.id, "oc_chat", Some("om_request"), "zh")
+            .await
+            .unwrap();
+
+        let route = crate::store::repo::im_route_of_thread(&db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.im_thread_ref, "omt_created_topic");
+        let created = ch.created_topics.lock().unwrap();
+        assert!(
+            created
+                .iter()
+                .any(|(_, body)| body.contains("Lead agent") || body.contains("Lead Agent")),
+            "topic creation message should tell users this topic is connected to the issue Lead agent: {created:?}"
+        );
     }
 
     #[derive(Default)]
@@ -1738,6 +2104,7 @@ mod tests {
                 message_id: 11,
                 accumulated: "我查到了。".into(),
                 done: true,
+                origin_tag: None,
             },
             &db,
             &ch,
@@ -1758,6 +2125,391 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct TopicStreamFallbackChannel {
+        stream_replies: std::sync::Mutex<Vec<String>>,
+        replies: std::sync::Mutex<Vec<(String, String)>>,
+        deletions: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for TopicStreamFallbackChannel {
+        async fn send_card(
+            &self,
+            _open_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            Ok("om_card".into())
+        }
+
+        async fn patch_card(
+            &self,
+            _message_id: &str,
+            _card: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_text(&self, _open_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((reply_to.to_string(), text.to_string()));
+            Ok("om_reply".into())
+        }
+
+        async fn delete_reaction(&self, message_id: &str, reaction_id: &str) -> anyhow::Result<()> {
+            self.deletions
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), reaction_id.to_string()));
+            Ok(())
+        }
+
+        async fn stream_begin_reply(
+            &self,
+            reply_to: &str,
+        ) -> anyhow::Result<Option<feishu::streaming::StreamSession>> {
+            self.stream_replies
+                .lock()
+                .unwrap()
+                .push(reply_to.to_string());
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn topic_stream_uses_latest_inbound_message_not_stored_topic_ref() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+        acks.lock().await.insert(
+            issue.id,
+            vec![("provider-message-id".into(), "reaction-id".into())],
+        );
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "我查到了。".into(),
+                done: true,
+                origin_tag: None,
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["provider-message-id".to_string()]
+        );
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [("provider-message-id".into(), "Lead：我查到了。".into())]
+        );
+        assert_eq!(
+            ch.deletions.lock().unwrap().as_slice(),
+            [("provider-message-id".into(), "reaction-id".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_stream_falls_back_to_bound_topic_when_no_ack() {
+        // Regression: a bound Feishu issue topic must stay deliverable even when
+        // no inbound ack was recorded (lead driven from the desktop/global tool,
+        // or the best-effort reaction delayed/failed) — previously the streamed
+        // reply was silently dropped because lead_outbound_target returned None.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        // No acks recorded for this thread.
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "我查到了。".into(),
+                done: true,
+                origin_tag: None,
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Threaded under the bound topic id, not dropped.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["provider-topic-id".to_string()]
+        );
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [("provider-topic-id".into(), "Lead：我查到了。".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_lead_out_falls_back_to_bound_topic_when_no_ack() {
+        // Same regression on the non-streaming delivery path.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        consume_lead_out(
+            crate::lead_chat::out_hub::LeadOut {
+                thread_id: issue.id,
+                message_id: 7,
+                text: "我查到了。".into(),
+                origin_tag: None,
+            },
+            &db,
+            &ch,
+            &acks,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [("provider-topic-id".into(), "Lead：我查到了。".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_topic_reply_threads_under_origin_tag() {
+        // Finding D: each issue-topic turn threads under its OWN originating message
+        // (carried via the frame's origin_tag), NOT under the thread-wide latest ack.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        // No acks recorded for this thread — the per-turn origin_tag must win.
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        // Turn A: originating message m1.
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 101,
+                accumulated: "答复一".into(),
+                done: true,
+                origin_tag: Some("m1".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+        // Turn B: originating message m2.
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 102,
+                accumulated: "答复二".into(),
+                done: true,
+                origin_tag: Some("m2".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Each issue-topic response threads under its OWN originating message.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["m1".to_string(), "m2".to_string()]
+        );
+        // Issue-topic content is "Lead：" prefixed (is_topic=true).
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [
+                ("m1".into(), "Lead：答复一".into()),
+                ("m2".into(), "Lead：答复二".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_topic_falls_back_to_seed_when_no_ack() {
+        // Finding C: with no origin_tag and no pending ack, the issue-topic reply
+        // falls back to the stored replyable seed message id (an `om_*` message),
+        // NOT the `omt_*` topic id — replying to the topic id would hit
+        // /messages/{id}/reply with a thread id and fail.
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        crate::store::repo::bind_im_route(&db, issue.id, "feishu", "oc_chat", "provider-topic-id")
+            .await
+            .unwrap();
+        crate::store::repo::set_setting(&db, &issue_topic_seed_key(issue.id), "om_seed")
+            .await
+            .unwrap();
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        // No acks recorded for this thread.
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id: issue.id,
+                message_id: 12,
+                accumulated: "我查到了。".into(),
+                done: true,
+                origin_tag: None,
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Falls back to the stored seed message id, not the topic id.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["om_seed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn concierge_reply_threads_under_originating_message_via_origin_tag() {
+        // Finding 2 regression: two rapid free-text messages in one chat must each
+        // get their reply threaded under their OWN originating message. The per-turn
+        // target now rides the FRAME's origin_tag (not a shared im_route write), so a
+        // later message can't steal the earlier reply's target. The route's
+        // im_thread_ref stays the stable conversation ref ("dm:ou_owner").
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        crate::store::repo::create_workspace(&db, "Concierge")
+            .await
+            .unwrap();
+        let thread_id = ensure_im_concierge_thread(&db, "ou_owner", "oc_dm", "dm:ou_owner")
+            .await
+            .unwrap();
+        // Route is bound to the stable conversation ref — no ;reply: suffix.
+        let route = crate::store::repo::im_route_of_thread(&db, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.im_thread_ref, "dm:ou_owner");
+
+        let ch = TopicStreamFallbackChannel::default();
+        let mut streams = HashMap::new();
+        let acks = Arc::new(tokio::sync::Mutex::new(
+            HashMap::<i32, Vec<(String, String)>>::new(),
+        ));
+
+        // Frame A: response to message m1.
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id,
+                message_id: 101,
+                accumulated: "答复一".into(),
+                done: true,
+                origin_tag: Some("m1".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+        // Frame B: response to message m2 (the LATER inbound message).
+        consume_lead_delta_frame(
+            crate::lead_chat::delta_hub::LeadDelta {
+                thread_id,
+                message_id: 102,
+                accumulated: "答复二".into(),
+                done: true,
+                origin_tag: Some("m2".into()),
+            },
+            &db,
+            &ch,
+            &mut streams,
+            &acks,
+        )
+        .await;
+
+        // Each response threads under its OWN originating message — NOT both under
+        // the latest. Before this change, both resolved to the shared route ref.
+        assert_eq!(
+            ch.stream_replies.lock().unwrap().as_slice(),
+            ["m1".to_string(), "m2".to_string()]
+        );
+        // Concierge stream has no "Lead：" prefix (is_topic=false): the fallback body
+        // is the raw accumulated text, replied to the matching originating message.
+        assert_eq!(
+            ch.replies.lock().unwrap().as_slice(),
+            [
+                ("m1".into(), "答复一".into()),
+                ("m2".into(), "答复二".into())
+            ]
+        );
+    }
+
     #[test]
     fn coalesces_streaming_delta_frames_to_latest_per_message() {
         let frames = coalesce_delta_frames(
@@ -1766,6 +2518,7 @@ mod tests {
                 message_id: 10,
                 accumulated: "h".into(),
                 done: false,
+                origin_tag: None,
             },
             vec![
                 crate::lead_chat::delta_hub::LeadDelta {
@@ -1773,18 +2526,21 @@ mod tests {
                     message_id: 10,
                     accumulated: "he".into(),
                     done: false,
+                    origin_tag: None,
                 },
                 crate::lead_chat::delta_hub::LeadDelta {
                     thread_id: 2,
                     message_id: 20,
                     accumulated: "x".into(),
                     done: false,
+                    origin_tag: None,
                 },
                 crate::lead_chat::delta_hub::LeadDelta {
                     thread_id: 1,
                     message_id: 10,
                     accumulated: "hello".into(),
                     done: true,
+                    origin_tag: None,
                 },
             ],
         );

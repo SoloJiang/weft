@@ -24,7 +24,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERBM0Q1RDBDNEFCNzI5N0UKUldSK0tiZEtERjA5MnRSY1dSNWlFU3dUK3JhOGlaWGJEa2NTZ3hnVFVRNENVVnJDUnhMNWVyTkwK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg1RTgyRUNGQ0U4ODkxMzYKUldRMmtZak96eTdvaFZKejlZOGRnVk9iQ2M1RlZDNDRkY25nMmdPNkF5NDZIWWs2L1hxL2NWZzMK",
       "endpoints": [
         "https://github.com/SoloJiang/weft/releases/latest/download/latest.json"
       ]

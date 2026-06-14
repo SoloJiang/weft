@@ -78,8 +78,12 @@ fn infer_node(f: &mut RepoFacts, dir: &Path, raw: &str) {
     if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
         f.published.push(name.to_string());
     }
-    if let Some(desc) = json.get("description").and_then(|v| v.as_str()) {
-        f.summary = desc.trim().to_string();
+    if let Some(desc) = json
+        .get("description")
+        .and_then(|v| v.as_str())
+        .and_then(sanitize_summary)
+    {
+        f.summary = desc;
     }
     for key in ["dependencies", "devDependencies", "peerDependencies"] {
         if let Some(obj) = json.get(key).and_then(|v| v.as_object()) {
@@ -140,8 +144,12 @@ fn infer_rust(f: &mut RepoFacts, dir: &Path, raw: &str) {
         if let Some(name) = pkg.get("name").and_then(|v| v.as_str()) {
             f.published.push(name.to_string());
         }
-        if let Some(desc) = pkg.get("description").and_then(|v| v.as_str()) {
-            f.summary = desc.trim().to_string();
+        if let Some(desc) = pkg
+            .get("description")
+            .and_then(|v| v.as_str())
+            .and_then(sanitize_summary)
+        {
+            f.summary = desc;
         }
     }
     if let Some(deps) = doc.get("dependencies").and_then(|v| v.as_table()) {
@@ -232,7 +240,7 @@ fn maven_collect_project(
     }
 
     if f.summary.is_empty() {
-        if let Some(desc) = maven_child_text(root, "description") {
+        if let Some(desc) = maven_child_text(root, "description").and_then(|s| sanitize_summary(&s)) {
             f.summary = desc;
         }
     }
@@ -644,6 +652,47 @@ fn infer_fallback_role(dir: &Path) -> String {
     "unknown".into()
 }
 
+fn sanitize_summary(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    let mut in_tag = false;
+    let mut wrote_space = false;
+    for c in trimmed.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                if !out.is_empty() && !wrote_space {
+                    out.push(' ');
+                    wrote_space = true;
+                }
+            }
+            '>' => in_tag = false,
+            _ if in_tag => {}
+            _ if c.is_whitespace() => {
+                if !out.is_empty() && !wrote_space {
+                    out.push(' ');
+                    wrote_space = true;
+                }
+            }
+            _ => {
+                out.push(c);
+                wrote_space = false;
+            }
+        }
+    }
+
+    let cleaned = out.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.chars().take(160).collect())
+    }
+}
+
 /// First real prose line of the README: skip headings, badges, and blanks.
 fn readme_summary(dir: &Path) -> Option<String> {
     let raw = read(dir, "README.md").or_else(|| read(dir, "readme.md"))?;
@@ -656,7 +705,9 @@ fn readme_summary(dir: &Path) -> Option<String> {
         if l.is_empty() {
             continue;
         }
-        return Some(l.chars().take(160).collect());
+        if let Some(summary) = sanitize_summary(l) {
+            return Some(summary);
+        }
     }
     None
 }
@@ -937,6 +988,30 @@ mod tests {
         ]);
         let f = super::infer_repo_facts(&dir);
         assert_eq!(f.summary, "A small utility for parsing logs.");
+    }
+
+    #[test]
+    fn readme_summary_skips_html_blocks() {
+        let dir = tmp_repo(&[
+            ("Cargo.toml", "[package]\nname = \"thing\"\n"),
+            (
+                "README.md",
+                "# Thing\n\n<p align=\"center\"><img src=\"logo.svg\" /></p>\n\nA small utility for parsing logs.\n",
+            ),
+        ]);
+        let f = super::infer_repo_facts(&dir);
+        assert_eq!(f.summary, "A small utility for parsing logs.");
+    }
+
+    #[test]
+    fn manifest_summary_strips_html_tags() {
+        let dir = tmp_repo(&[(
+            "package.json",
+            r#"{ "name": "web-app", "description": "<p>Checkout frontend</p>",
+                 "dependencies": { "react": "^18" } }"#,
+        )]);
+        let f = super::infer_repo_facts(&dir);
+        assert_eq!(f.summary, "Checkout frontend");
     }
 
     #[test]

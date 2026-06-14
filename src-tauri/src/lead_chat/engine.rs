@@ -15,6 +15,19 @@ use tokio::process::{Child, ChildStdin, Command};
 
 pub const EVENT: &str = "lead-chat";
 
+/// Persist the turn-activity status for whichever surface this engine drives:
+/// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
+async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, status: &str) {
+    match session_id {
+        Some(sid) => {
+            let _ = repo::set_session_status(db, sid, status).await;
+        }
+        None => {
+            let _ = repo::set_lead_status(db, thread_id, status).await;
+        }
+    }
+}
+
 /// 流式节流间隔（ms）：每过这么久把当前累积文本落一次 DB 快照，并向 IM 桥发一帧
 /// LeadDelta（飞书 CardKit 流式卡据此逐帧更新）。桌面 UI 不受影响——它吃的是每个
 /// token 的原始 `Push::Delta`。150ms 是流式卡看着流畅的下限；再大就一顿一顿的。
@@ -70,6 +83,10 @@ pub struct Outgoing {
     /// true = backed by a queued timeline row (flips to complete on flush);
     /// false = invisible plumbing (coordinator nudges).
     pub tracked: bool,
+    /// Opaque per-turn reply target carried from the caller (IM bridge) onto this
+    /// turn's output frames. None for every non-IM send. Rides the queue so a
+    /// queued turn keeps its own tag even when emitted after later sends.
+    pub origin_tag: Option<String>,
 }
 
 /// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
@@ -174,6 +191,10 @@ pub struct EngineInner {
     /// Set on idle when skills changed; the next send silently restarts the
     /// resident process so it picks up newly-injected skills. UI never sees it.
     pub pending_skill_refresh: bool,
+    /// Opaque tag of the turn whose output is currently being emitted. Set at
+    /// every turn-start (including None turns) so a prior concierge reply target
+    /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
+    pub current_origin_tag: Option<String>,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -339,6 +360,7 @@ pub async fn send(
     text: &str,
     images: Vec<(String, String)>,
     files: Vec<String>,
+    origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
@@ -358,7 +380,10 @@ pub async fn send(
     if direct {
         inner.turn_id += 1;
         inner.clock.begin_turn();
+        // This send starts a turn now → its tag IS the in-flight turn's tag.
+        inner.current_origin_tag = origin_tag.clone();
         crate::power::on_turn_began(app);
+        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
     }
     let turn = inner.turn_id;
     let status = if direct { "complete" } else { "queued" };
@@ -418,6 +443,8 @@ pub async fn send(
         text: outbound,
         images,
         tracked: true,
+        // Rides the turn (and the queue, if queued) so output frames recover it.
+        origin_tag: origin_tag.clone(),
     };
     // codex (app-server): no resident stdin, no per-turn process — the shared
     // connection drives the turn after the lock drops. Gated; default stays exec.
@@ -457,13 +484,11 @@ pub async fn send(
     Ok(())
 }
 
-/// codex transport selector. Default = `app-server` (the migration target);
-/// `WEFT_CODEX_EXEC=1` forces the legacy exec path as an escape hatch. A failed
-/// app-server connection ALSO falls back to exec at send time (see [`send`]), so
-/// an older codex without the `app-server` subcommand keeps working transparently
-/// — the thread id is shared with exec's rollout store, so resume is seamless.
+/// Codex app-server transport selector. Default = exec; app-server is opt-in via
+/// `WEFT_CODEX_APPSERVER=1` because its `initialized` handshake may initialize
+/// ChatGPT Apps and fail on network/auth state before a normal Weft turn starts.
 fn codex_appserver_enabled() -> bool {
-    !std::env::var("WEFT_CODEX_EXEC").is_ok_and(|v| !v.is_empty() && v != "0")
+    crate::adapters::codex_prefers_appserver()
 }
 
 /// Drive a codex turn over the shared, multiplexed `codex app-server` connection
@@ -573,12 +598,14 @@ async fn codex_consumer(
                         id
                     }
                 };
+                // Read the in-flight turn's tag before borrowing inner.current mutably.
+                let origin_tag = inner.current_origin_tag.clone();
                 if let Some(c) = &mut inner.current {
                     if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
                         c.2 = std::time::Instant::now();
                         let content = serde_json::json!({ "text": c.1 }).to_string();
                         let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
-                        emit_lead_delta(&app, thread_id, row, &c.1, false);
+                        emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
                     }
                 }
                 let _ = app.emit(
@@ -636,7 +663,7 @@ async fn codex_consumer(
                         },
                     );
                     if status == "complete" {
-                        emit_lead_out(&app, thread_id, id, &text);
+                        emit_lead_out(&app, thread_id, id, &text, inner.current_origin_tag.clone());
                     }
                 } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
                     &db,
@@ -656,6 +683,9 @@ async fn codex_consumer(
                     );
                 }
                 let next = inner.turn.on_turn_end();
+                // Next turn's tag becomes the in-flight tag (None when going idle),
+                // so the dequeued turn's output frames carry its own origin_tag.
+                inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
                 if let Some(n) = &next {
                     inner.turn_id += 1;
                     if n.tracked {
@@ -663,6 +693,7 @@ async fn codex_consumer(
                     }
                 }
                 let still_busy = inner.turn.busy;
+                persist_activity(&db, inner.session_id, thread_id, if still_busy { "running" } else { "idle" }).await;
                 inner.clock.on_turn_end(still_busy);
                 let _ = app.emit(
                     EVENT,
@@ -830,11 +861,18 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
         text: text.to_string(),
         images: vec![],
         tracked: false,
+        origin_tag: None,
     };
     if inner.turn.try_begin_send() {
         inner.turn_id += 1;
         inner.clock.begin_turn();
+        // Plumbing nudge starts a turn directly (not via send): keep the invariant.
+        inner.current_origin_tag = None;
         crate::power::on_turn_began(app);
+        // A nudge is a turn-start too (e.g. a coordinator bus-wake on an idle
+        // engine): persist `running` like send, so a crash mid-nudge-turn is
+        // revivable instead of reading a stale `idle`.
+        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
         if per_turn(&inner.tool) {
             drop(inner);
             spawn_turn(app.clone(), db.clone(), eng.clone(), out).await?;
@@ -980,10 +1018,15 @@ pub async fn stop_quiet(eng: &EngineRef) {
     inner.clock = TurnClock::default();
 }
 
-/// Stop the engine outright (e.g. before a terminal takeover).
+/// Stop the engine outright (e.g. before a terminal takeover or by the runaway
+/// guard). Persists idle so a stopped/taken-over session can't be falsely
+/// revived into a COMPETING headless process on the next boot (see L204).
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     stop_quiet(eng).await;
     let inner = eng.lock().await;
+    if let Some(db) = app.try_state::<Db>() {
+        persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
+    }
     let _ = app.emit(
         EVENT,
         Push::Turn {
@@ -1113,13 +1156,15 @@ fn spawn_reader(
                         }
                     };
                     // Throttle DB snapshots + IM streaming frames; the live UI rides raw Delta events.
+                    // Read the in-flight turn's tag before borrowing inner.current mutably.
+                    let origin_tag = inner.current_origin_tag.clone();
                     if let Some(c) = &mut inner.current {
                         if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
                             c.2 = std::time::Instant::now();
                             let content = serde_json::json!({ "text": c.1 }).to_string();
                             let _ =
                                 repo::update_lead_message(&db, row, &content, "streaming").await;
-                            emit_lead_delta(&app, thread_id, row, &c.1, false);
+                            emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
                         }
                     }
                     let _ = app.emit(
@@ -1159,7 +1204,13 @@ fn spawn_reader(
                                         status: "complete".into(),
                                     },
                                 );
-                                emit_lead_out(&app, thread_id, id, &clean);
+                                emit_lead_out(
+                                    &app,
+                                    thread_id,
+                                    id,
+                                    &clean,
+                                    inner.current_origin_tag.clone(),
+                                );
                             }
                             None => {
                                 let (sid, turn) = (inner.session_id, inner.turn_id);
@@ -1183,7 +1234,13 @@ fn spawn_reader(
                                             message: m,
                                         },
                                     );
-                                    emit_lead_out(&app, thread_id, mid, &clean);
+                                    emit_lead_out(
+                                        &app,
+                                        thread_id,
+                                        mid,
+                                        &clean,
+                                        inner.current_origin_tag.clone(),
+                                    );
                                 }
                             }
                         }
@@ -1280,6 +1337,7 @@ fn spawn_reader(
                                             text: reply,
                                             images: Vec::new(),
                                             tracked: false,
+                                            origin_tag: None,
                                         };
                                         write_user(&mut inner, &out).await;
                                     }
@@ -1327,7 +1385,7 @@ fn spawn_reader(
                             },
                         );
                         if status == "complete" {
-                            emit_lead_out(&app, thread_id, id, &text);
+                            emit_lead_out(&app, thread_id, id, &text, inner.current_origin_tag.clone());
                         }
                     } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
                         &db,
@@ -1346,7 +1404,11 @@ fn spawn_reader(
                             },
                         );
                     }
-                    if let Some(next) = inner.turn.on_turn_end() {
+                    let next = inner.turn.on_turn_end();
+                    // The next turn's tag becomes the in-flight tag (None when going
+                    // idle), set BEFORE its input is dispatched so its frames carry it.
+                    inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+                    if let Some(next) = next {
                         inner.turn_id += 1;
                         if next.tracked {
                             let _ = repo::complete_queued(&db, thread_id, &next.text).await;
@@ -1361,6 +1423,7 @@ fn spawn_reader(
                         }
                     }
                     let still_busy = inner.turn.busy;
+                    persist_activity(&db, inner.session_id, thread_id, if still_busy { "running" } else { "idle" }).await;
                     inner.clock.on_turn_end(still_busy);
                     let state = if still_busy { "busy" } else { "idle" };
                     let _ = app.emit(
@@ -1423,11 +1486,14 @@ fn spawn_reader(
                 );
                 // 仅 complete 才回流 IM——interrupted/error 的半截不应上桥。
                 if status == "complete" {
-                    emit_lead_out(&app, inner.thread_id, id, &text);
+                    emit_lead_out(&app, inner.thread_id, id, &text, inner.current_origin_tag.clone());
                 }
             }
             inner.child = None;
-            if let Some(next) = inner.turn.on_turn_end() {
+            let next = inner.turn.on_turn_end();
+            // Carry the dequeued turn's tag (None when going idle) onto its frames.
+            inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+            if let Some(next) = next {
                 inner.turn_id += 1;
                 if next.tracked {
                     let _ = repo::complete_queued(&db, inner.thread_id, &next.text).await;
@@ -1438,6 +1504,7 @@ fn spawn_reader(
                 });
             }
             let still_busy = inner.turn.busy;
+            persist_activity(&db, inner.session_id, inner.thread_id, if still_busy { "running" } else { "idle" }).await;
             inner.clock.on_turn_end(still_busy);
             let state = if still_busy { "busy" } else { "idle" };
             let _ = app.emit(
@@ -1480,6 +1547,10 @@ fn spawn_reader(
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
+            // The turn is unconditionally reset to idle here; persist that so a
+            // resident-process death (incl. interrupt→kill) doesn't leave the row
+            // stuck "running" and falsely revive an engine on the next boot.
+            persist_activity(&db, inner.session_id, inner.thread_id, "idle").await;
             let _ = app.emit(
                 EVENT,
                 Push::Turn {
@@ -1496,7 +1567,13 @@ fn spawn_reader(
 /// M2-4 tap: 把 assistant 段「complete」时的清洗文本广播给订阅者
 /// （IM 桥据此回流到飞书话题）。`LeadOutHub` 未注册或无订阅都静默——
 /// 单测/单进程跑的 `tauri::test::mock_app` 没注册该状态也不会 panic。
-fn emit_lead_out(app: &AppHandle, thread_id: i32, message_id: i32, text: &str) {
+fn emit_lead_out(
+    app: &AppHandle,
+    thread_id: i32,
+    message_id: i32,
+    text: &str,
+    origin_tag: Option<String>,
+) {
     let t = text.trim();
     if t.is_empty() {
         return;
@@ -1506,6 +1583,31 @@ fn emit_lead_out(app: &AppHandle, thread_id: i32, message_id: i32, text: &str) {
             thread_id,
             message_id,
             text: t.to_string(),
+            origin_tag: origin_tag.clone(),
+        });
+    }
+    // streaming 收尾：每个「段落完成」处同时发一帧 done（与 LeadOut 同源、同清洗后文本），
+    // IM 桥据 done 定稿流式卡片。中间帧由两处 500ms 节流点发（见 emit_lead_delta）。
+    emit_lead_delta(app, thread_id, message_id, t, true, origin_tag);
+}
+
+/// streaming 增量帧。`accumulated` 是到当前为止的全文；`done` 标记最后一帧。
+/// 未注册 LeadDeltaHub（如 mock_app 测试）静默——不 panic。
+fn emit_lead_delta(
+    app: &AppHandle,
+    thread_id: i32,
+    message_id: i32,
+    accumulated: &str,
+    done: bool,
+    origin_tag: Option<String>,
+) {
+    if let Some(hub) = app.try_state::<super::delta_hub::LeadDeltaHub>() {
+        hub.emit(super::delta_hub::LeadDelta {
+            thread_id,
+            message_id,
+            accumulated: accumulated.to_string(),
+            done,
+            origin_tag,
         });
     }
     // streaming 收尾：每个「段落完成」处同时发一帧 done（与 LeadOut 同源、同清洗后文本），
@@ -1545,6 +1647,7 @@ mod tests {
             text: "second".into(),
             images: vec![],
             tracked: true,
+            origin_tag: None,
         });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
@@ -1703,6 +1806,7 @@ mod tests {
             interrupting: false,
             generation: 0,
             pending_skill_refresh: false,
+            current_origin_tag: None,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));

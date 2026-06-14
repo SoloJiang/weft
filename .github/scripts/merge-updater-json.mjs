@@ -24,7 +24,7 @@ for (const file of files) {
     platform = "darwin-aarch64";
   } else if (bundleFile.includes("x64") && bundleFile.endsWith(".app.tar.gz")) {
     platform = "darwin-x86_64";
-  } else if (bundleFile.endsWith(".AppImage.tar.gz")) {
+  } else if (bundleFile.endsWith(".AppImage")) {
     platform = "linux-x86_64";
   } else {
     console.log("Skipping unknown bundle:", bundleFile);

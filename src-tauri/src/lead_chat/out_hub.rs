@@ -20,6 +20,9 @@ pub struct LeadOut {
     /// lead_message.id — 桥侧可用于去重/记账。
     pub message_id: i32,
     pub text: String,
+    /// 不透明的「这一轮回复对应哪条入站消息」标记（per-turn 透传，非 IM 调用恒为
+    /// None）。Concierge 桥据此把回复 reply 到正确的原始消息下；engine 只携带不解析。
+    pub origin_tag: Option<String>,
 }
 
 /// Tauri-managed 单例。
@@ -59,6 +62,7 @@ mod tests {
             thread_id: 1,
             message_id: 10,
             text: "hi".into(),
+            origin_tag: None,
         });
         let ra = a.recv().await.unwrap();
         let rb = b.recv().await.unwrap();
@@ -73,6 +77,7 @@ mod tests {
             thread_id: 1,
             message_id: 1,
             text: "x".into(),
+            origin_tag: None,
         }); // 不应 panic
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
 import {
   ArrowRight,
@@ -13,15 +13,15 @@ import { ToolIcon, toolFullName } from "./ToolIcon";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
+import {
+  addPendingRepo,
+  removePendingRepo,
+  renamePendingRepo,
+  type PendingRepo,
+} from "./firstRunOnboardingRepos";
+import { submitOnboarding, InvalidReposError } from "./firstRunOnboardingSubmit";
 
 const STORAGE_KEY = "weft-first-run-onboarding-v2-dismissed";
-
-const REPOS = [
-  { id: "api", name: "api", role: "service", one: "结算与订单核心服务,对外发布 /checkout 契约" },
-  { id: "web", name: "web-app", role: "app", one: "面向用户的 Web 结算前端,消费 api 的 /checkout" },
-  { id: "mobile", name: "mobile", role: "app", one: "iOS / Android 原生结算流程" },
-  { id: "tokens", name: "tokens", role: "library", one: "跨端设计令牌与组件原语" },
-];
 
 const NODES: Record<string, [number, number]> = {
   api: [150, 40],
@@ -47,6 +47,7 @@ export function FirstRunOnboarding() {
   const [task, setTask] = useState("");
   const [issueKind, setIssueKind] = useState("");
   const [busy, setBusy] = useState(false);
+  const [repos, setRepos] = useState<PendingRepo[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const steps = t("onboarding.steps", { returnObjects: true }) as string[];
   const open = ready && workspaces.length === 0 && !dismissed;
@@ -68,18 +69,35 @@ export function FirstRunOnboarding() {
     setBusy(true);
     setErr(null);
     try {
-      const name = workspaceName.trim();
-      const title = task.trim();
-      const ws = await api.createWorkspace(name);
-      await api.createThread(ws.id, title, issueKind);
+      const ws = await submitOnboarding(api, {
+        name: workspaceName.trim(),
+        title: task.trim(),
+        issueKind,
+        repos,
+      });
       await refreshWorkspaces();
       await selectWorkspace(ws.id);
       dismiss();
     } catch (e) {
-      setErr(String(e));
+      if (e instanceof InvalidReposError) {
+        setErr(t("onboarding.repoInvalid", { paths: e.invalidRepos.join(", ") }));
+      } else {
+        setErr(String(e));
+      }
     } finally {
       setBusy(false);
     }
+  }
+
+  async function pickRepo() {
+    const picked = await api.pickFolder(t("dialog.addRepoTitle"));
+    if (!picked) return;
+    setRepos((current) => {
+      const result = addPendingRepo(current, picked);
+      if (!result.added) setErr(t("onboarding.repoDuplicate"));
+      else setErr(null);
+      return result.repos;
+    });
   }
 
   if (!open) return null;
@@ -139,6 +157,9 @@ export function FirstRunOnboarding() {
             setIssueKind={setIssueKind}
             workspaceName={workspaceName}
             setWorkspaceName={setWorkspaceName}
+            repos={repos}
+            setRepos={setRepos}
+            pickRepo={pickRepo}
           />
         </div>
       </main>
@@ -179,6 +200,9 @@ function OnboardingStage({
   setTask,
   issueKind,
   setIssueKind,
+  repos,
+  setRepos,
+  pickRepo,
 }: {
   step: number;
   workspaceName: string;
@@ -187,6 +211,9 @@ function OnboardingStage({
   setTask: (v: string) => void;
   issueKind: string;
   setIssueKind: (v: string) => void;
+  repos: PendingRepo[];
+  setRepos: Dispatch<SetStateAction<PendingRepo[]>>;
+  pickRepo: () => void;
 }) {
   const { t } = useTranslation();
 
@@ -229,31 +256,46 @@ function OnboardingStage({
       <section className="w-full max-w-[560px]">
         <h2 className="text-[17px] font-semibold text-ink">{t("onboarding.addReposTitle")}</h2>
         <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">{t("onboarding.addReposBody")}</p>
-        <div className="mt-5 flex flex-col gap-2">
-          {REPOS.map((repo, i) => (
-            <div
-              key={repo.id}
-              className="flex items-center gap-3 rounded-[var(--radius-md)] border border-border bg-bg/70 px-3 py-2.5"
-              style={{ animationDelay: `${i * 80}ms` }}
-            >
-              <span className="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-brand-ghost text-brand">
-                <Check size={12} />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-[12px] font-semibold text-ink">{repo.name}</span>
-                  <span className="rounded-full border border-border px-1.5 py-px text-[10px] text-ink-faint">
-                    {repo.role}
-                  </span>
-                </div>
-                <div className="truncate text-[11.5px] text-ink-faint">{repo.one}</div>
-              </div>
+        <div className="mt-5 flex flex-col gap-3">
+          {repos.length === 0 ? (
+            <div className="rounded-[var(--radius-md)] border border-dashed border-border bg-bg/60 px-3 py-4 text-[12px] leading-relaxed text-ink-faint">
+              {t("onboarding.repoEmpty")}
             </div>
-          ))}
-          <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-dashed border-border px-3 py-2 text-[12px] text-ink-faint">
+          ) : (
+            repos.map((repo) => (
+              <div key={repo.id} className="rounded-[var(--radius-md)] border border-border bg-bg/70 p-3">
+                <div className="flex items-center gap-2">
+                  <GitBranch size={15} className="shrink-0 text-brand" />
+                  <input
+                    value={repo.name}
+                    aria-label={t("onboarding.repoNameLabel")}
+                    onChange={(e) =>
+                      setRepos((current) => renamePendingRepo(current, repo.id, e.currentTarget.value))
+                    }
+                    className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-1 text-[12px] font-semibold text-ink outline-none focus:border-brand focus:ring-2 focus:ring-brand/25"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setRepos((current) => removePendingRepo(current, repo.id))}
+                    className="rounded-[var(--radius-sm)] px-2 py-1 text-[11px] text-ink-faint hover:bg-brand-ghost hover:text-ink"
+                  >
+                    {t("onboarding.removeRepo")}
+                  </button>
+                </div>
+                <div className="mt-2 truncate font-mono text-[11px] text-ink-faint" title={repo.path}>
+                  {repo.path}
+                </div>
+              </div>
+            ))
+          )}
+          <button
+            type="button"
+            onClick={() => void pickRepo()}
+            className="inline-flex h-9 items-center justify-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 text-[12.5px] font-medium text-ink transition-colors hover:border-brand hover:bg-brand-ghost"
+          >
             <Plus size={14} />
-            ~/code/ {t("onboarding.moreRepos")}
-          </div>
+            {t("onboarding.addLocalRepo")}
+          </button>
         </div>
       </section>
     );

@@ -59,7 +59,6 @@ interface Store {
 
   activeThreadId: number | null;
   sessions: Record<number, OpenSession>;
-  activeSessionId: number | null;
   messages: BusMsg[];
   postHuman: (to: string | null, text: string) => Promise<void>;
 
@@ -176,7 +175,6 @@ interface Store {
   refreshWorkspaces: () => Promise<void>;
   selectThread: (threadId: number) => Promise<void>;
   loadThreadChildren: (threadId: number) => Promise<void>;
-  backToBoard: () => void;
   /** Leave the active thread for the workspace portfolio board. */
   backToWorkspace: () => void;
 
@@ -199,7 +197,18 @@ interface Store {
 
   viewing: { directionId: number; repoId: number; diff?: boolean } | null;
   viewDirection: (directionId: number, repoId: number, opts?: { diff?: boolean }) => void;
-  driveDirection: (directionId: number, repoId: number, focus: boolean) => Promise<void>;
+  driveDirection: (
+    directionId: number,
+    repoId: number,
+    focus: boolean,
+  ) => Promise<number | null>;
+  sendToWorker: (
+    directionId: number,
+    repoId: number,
+    text: string,
+    images?: ImageAttachment[],
+    files?: string[],
+  ) => Promise<void>;
   reviveDirection: (directionId: number) => Promise<void>;
   closeObserve: () => void;
   /** Set a task's lifecycle status (human override). */
@@ -211,8 +220,6 @@ interface Store {
   /** Review-agent rung: on-demand pre-PR self-review verdict + in-flight set. */
   /** Run the global review skill inside the direction's own session. */
   requestSkillReview: (directionId: number) => Promise<void>;
-  /** Deliver a message to a (direction, repo)'s worker, waking it if needed. */
-  sendToDirection: (directionId: number, repoId: number, text: string) => Promise<void>;
   /** The configured review skill ("" = auto-detect superpowers'). */
   reviewSkill: string;
   setReviewSkill: (s: string) => void;
@@ -260,7 +267,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const dispatchingRef = useRef<Set<number>>(new Set());
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
-  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [viewing, setViewing] = useState<{
     directionId: number;
     repoId: number;
@@ -280,7 +286,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const prevHomeRef = useRef<{
     homeTab: HomeTab;
     activeThreadId: number | null;
-    activeSessionId: number | null;
     viewing: { directionId: number; repoId: number; diff?: boolean } | null;
     showNeeds: boolean;
   } | null>(null);
@@ -368,25 +373,40 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void api.setKeepAwake(localStorage.getItem("weft-keep-awake") !== "0");
   }, []);
-  // Auto-check for app updates on launch (silent; only surface when found).
+  // Auto-check for app updates on launch and hourly thereafter (silent; only
+  // surface when found, and don't re-nag a version the user already dismissed).
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body: string } | null>(null);
+  const dismissedUpdateRef = useRef<string | null>(null);
   useEffect(() => {
-    void (async () => {
+    let cancelled = false;
+    const run = async () => {
       try {
         const { checkUpdate } = await import("../lib/updater");
         const info = await checkUpdate();
-        if (info) setUpdateAvailable(info);
+        if (cancelled || !info) return;
+        if (info.version === dismissedUpdateRef.current) return; // already dismissed this one
+        setUpdateAvailable((prev) => (prev?.version === info.version ? prev : info));
       } catch {
         /* updater unavailable in dev or offline */
       }
-    })();
+    };
+    void run();
+    const UPDATE_POLL_MS = 60 * 60 * 1000; // re-check hourly for long-running sessions
+    const id = setInterval(() => void run(), UPDATE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
   const installUpdate = useCallback(async () => {
     const { installUpdate: doInstall } = await import("../lib/updater");
     await doInstall();
   }, []);
   const dismissUpdate = useCallback(() => {
-    setUpdateAvailable(null);
+    setUpdateAvailable((cur) => {
+      if (cur) dismissedUpdateRef.current = cur.version; // suppress re-nag until a newer version
+      return null;
+    });
   }, []);
   const [dangerousMode, setDangerousModeState] = useState(
     () => localStorage.getItem("weft-dangerous") === "1",
@@ -461,7 +481,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setDirections({});
     setWorktrees({});
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setViewing(null);
     setShowNeeds(false);
     setHomeTab("board");
@@ -487,7 +506,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const selectThread = useCallback(
     async (threadId: number) => {
       setActiveThreadId(threadId);
-      setActiveSessionId(null);
       setViewing(null);
       setShowNeeds(false);
       setHomeTab("board");
@@ -504,8 +522,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [loadThreadChildren],
   );
 
-  const backToBoard = useCallback(() => setActiveSessionId(null), []);
-
   const refreshOverview = useCallback(async () => {
     if (activeWorkspaceId == null) {
       setOverview([]);
@@ -520,7 +536,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const backToWorkspace = useCallback(() => {
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setViewing(null);
     setShowNeeds(false);
     setHomeTab("board");
@@ -528,21 +543,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const openSettings = useCallback(() => {
-    // Snapshot first — once we flip homeTab + clear thread/session/viewing the
+    // Snapshot first — once we flip homeTab + clear thread/viewing the
     // info is gone and the back arrow can't restore it.
     prevHomeRef.current = {
       homeTab,
       activeThreadId,
-      activeSessionId,
       viewing,
       showNeeds,
     };
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setViewing(null);
     setShowNeeds(false);
     setHomeTab("settings");
-  }, [homeTab, activeThreadId, activeSessionId, viewing, showNeeds]);
+  }, [homeTab, activeThreadId, viewing, showNeeds]);
 
   const closeSettings = useCallback(() => {
     const prev = prevHomeRef.current;
@@ -554,7 +567,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     setShowNeeds(prev.showNeeds);
     setViewing(prev.viewing);
-    setActiveSessionId(prev.activeSessionId);
     setActiveThreadId(prev.activeThreadId);
     setHomeTab(prev.homeTab === "settings" ? "board" : prev.homeTab);
   }, []);
@@ -684,6 +696,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // --format json). Escape hatches per tool: codex app deep link, terminal
   // takeover command for all three.
 
+  // Single entry to a worker's conversation surface. All "open/focus a worker"
+  // paths route here → `viewing` → WorkerConversation (no separate activeSessionId).
+  const openWorker = useCallback((directionId: number, repoId: number) => {
+    setViewing({ directionId, repoId });
+    setShowNeeds(false);
+    setHomeTab("board");
+  }, []);
+
   // Spawn (or focus) a worker for a (direction, repo) slot. focus=true opens it
   // full-screen (a click); focus=false dispatches it in the background.
   const spawnWorker = useCallback(
@@ -692,11 +712,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         (s) => s.directionId === directionId && s.repoId === repoId,
       );
       if (existing) {
-        if (focus) {
-          setActiveSessionId(existing.info.session_id);
-          setShowNeeds(false);
-          setHomeTab("board");
-        }
+        if (focus) openWorker(directionId, repoId);
         return;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
@@ -712,19 +728,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           nativeId: info.native_id,
         },
       }));
-      if (focus) {
-        setActiveSessionId(info.session_id);
-        setShowNeeds(false);
-        setHomeTab("board");
-      }
+      if (focus) openWorker(directionId, repoId);
     },
-    [activeThreadId],
+    [activeThreadId, openWorker],
   );
 
   const viewDirection = useCallback(
     (directionId: number, repoId: number, opts?: { diff?: boolean }) => {
       setViewing({ directionId, repoId, diff: opts?.diff });
-      setActiveSessionId(null);
       setShowNeeds(false);
       setHomeTab("board");
     },
@@ -737,7 +748,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // the backend to resume the same native conversation (or fresh-dispatch only
   // when no native id was ever captured). Never re-seeds a live/finished task.
   const driveDirection = useCallback(
-    async (directionId: number, repoId: number, focus: boolean) => {
+    async (
+      directionId: number,
+      repoId: number,
+      focus: boolean,
+    ): Promise<number | null> => {
       const existing = Object.values(sessionsRef.current).find(
         (s) =>
           s.directionId === directionId &&
@@ -745,12 +760,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           s.status !== "exited",
       );
       if (existing) {
-        if (focus) {
-          setActiveSessionId(existing.info.session_id);
-          setShowNeeds(false);
-          setHomeTab("board");
-        }
-        return;
+        if (focus) openWorker(directionId, repoId);
+        return existing.info.session_id;
       }
       const info = await api.chatOpenWorker(directionId, repoId, currentLang());
       autoCheckedRef.current.delete(directionId);
@@ -772,13 +783,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           },
         };
       });
-      if (focus) {
-        setActiveSessionId(info.session_id);
-        setShowNeeds(false);
-        setHomeTab("board");
-      }
+      if (focus) openWorker(directionId, repoId);
+      return info.session_id;
     },
-    [activeThreadId],
+    [activeThreadId, openWorker],
+  );
+
+  // Lazy attach + send: the worker surface is always input-able. Sending into a
+  // worker with no live engine transparently resumes/dispatches it (focus=false,
+  // so we stay on the same surface — no navigation), then delivers the message.
+  // resume reuses the prior session row, so session_id is stable (no flicker).
+  const sendToWorker = useCallback(
+    async (
+      directionId: number,
+      repoId: number,
+      text: string,
+      images?: ImageAttachment[],
+      files?: string[],
+    ) => {
+      const live = Object.values(sessionsRef.current).find(
+        (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
+      );
+      // driveDirection returns the (possibly freshly-resumed) session id directly.
+      // sessionsRef won't reflect a new session until React re-renders, so re-scanning
+      // it here would drop the first message to an idle/recovered worker (the send
+      // would no-op after ChatComposer already cleared the input).
+      const sessionId =
+        live?.info.session_id ?? (await driveDirection(directionId, repoId, false));
+      if (sessionId == null) return;
+      await api.chatSend(sessionId, text, images, files);
+    },
+    [driveDirection],
   );
 
   // Automation-first (§4 principle 7): once a task is materialized, dispatch its
@@ -1060,26 +1095,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     );
   }, [reviewSkill, leadSlash, workerSlash]);
 
-  // Deliver a composed message to a (direction, repo)'s worker — waking it
-  // first when nothing is live (the engine resumes). The delivery half of diff
-  // annotations and skill reviews.
-  const sendToDirection = useCallback(
-    async (directionId: number, repoId: number, text: string) => {
-      let sess = Object.values(sessionsRef.current).find(
-        (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
-      );
-      if (!sess) {
-        await driveDirection(directionId, repoId, false);
-        sess = Object.values(sessionsRef.current).find(
-          (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
-        );
-      }
-      if (!sess) return;
-      await api.chatSend(sess.info.session_id, text);
-    },
-    [driveDirection],
-  );
-
   const requestSkillReview = useCallback(
     async (directionId: number) => {
       const writes = await api.listWorktrees(directionId).catch(() => []);
@@ -1123,7 +1138,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [directionsByThread, autoReview, requestSkillReview]);
 
-  const focusSession = useCallback((id: number) => setActiveSessionId(id), []);
+  const focusSession = useCallback((id: number) => {
+    const s = sessionsRef.current[id];
+    if (s) openWorker(s.directionId, s.repoId);
+  }, [openWorker]);
 
   const postHuman = useCallback(
     async (to: string | null, text: string) => {
@@ -1160,7 +1178,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeWorkspaceId]);
 
   const openNeeds = useCallback(() => {
-    setActiveSessionId(null);
     setViewing(null);
     setHomeTab("board");
     setShowNeeds(true);
@@ -1183,8 +1200,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const openRepoMap = useCallback(() => {
     setActiveThreadId(null);
-    setActiveSessionId(null);
     setShowNeeds(false);
+    setViewing(null); // else Main renders WorkerConversation over the repo tab
     setHomeTab("repos");
     void refreshRepoMap();
   }, [refreshRepoMap]);
@@ -1303,12 +1320,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       );
       if (live) {
         setActiveThreadId(item.thread_id);
-        setActiveSessionId(live.info.session_id);
+        openWorker(live.directionId, live.repoId);
         return;
       }
       await selectThread(item.thread_id);
     },
-    [sessions, selectThread],
+    [sessions, selectThread, openWorker],
   );
 
   useEffect(() => {
@@ -1485,7 +1502,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     worktreesByDirection,
     activeThreadId,
     sessions,
-    activeSessionId,
     messages,
     postHuman,
     leadMessages,
@@ -1556,7 +1572,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshWorkspaces,
     selectThread,
     loadThreadChildren,
-    backToBoard,
     backToWorkspace,
     createWorkspace,
     renameWorkspace,
@@ -1571,6 +1586,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     viewing,
     viewDirection,
     driveDirection,
+    sendToWorker,
     reviveDirection,
     closeObserve,
     setTaskStatus,
@@ -1578,7 +1594,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     checkingDirections,
     verifyDirection,
     requestSkillReview,
-    sendToDirection,
     reviewSkill,
     setReviewSkill,
     autoReview,

@@ -5,7 +5,7 @@ use super::engine::{self, EngineRef, LeadChatState};
 use crate::store::{repo, Db};
 use tauri::{AppHandle, Manager, State};
 
-fn lead_key(thread_id: i32) -> i64 {
+pub(crate) fn lead_key(thread_id: i32) -> i64 {
     -(thread_id as i64)
 }
 
@@ -35,18 +35,16 @@ pub struct SessionInfo {
     pub native_id: Option<String>,
 }
 
-const BASE_PROMPT: &str = "You are the lead for this thread in weft — the human's main collaborator. \
-Start by greeting briefly and using the weft_planner MCP tools to orient: call get_task to read \
-what's being asked, and get_repo_map to learn each repo's role and the cross-repo dependency graph. \
-Then DISCUSS the requirement and approach with the human; ask clarifying questions when it matters. \
-You do not write code, and you do not plan the directions' implementations — each worker plans its \
-own direction. Your job is to converge the scope and ASSIGN ROLES. When you and the human have \
-converged on how to split the work, call propose_directions with a short rationale and the directions \
-(name, the ONE repo each writes, reason, mandate); only list repos each direction must WRITE \
-(reads are free). Pick mandate per direction: plan+impl (default — the worker plans first) or \
-impl-only (small/fully-specified — build straight away). The human reviews and confirms in weft; you \
-can re-propose after more discussion. Prefer splitting frontend/backend/shared work to run in \
-parallel, owner of a shared contract first.";
+const BASE_PROMPT: &str = "You are the lead for this thread in weft — the human's main collaborator for converging write scope. \
+Your mission is to converge the issue's write scope with the human, then propose worker directions. \
+Use the weft_planner MCP capabilities when they materially affect scope: read the task when the request is unclear, and read the repo map when repo ownership or cross-repo dependencies matter. \
+Do not write code, and do not plan the directions' implementations — each worker decides how to deliver its own direction. \
+Ask clarifying questions only when ambiguity changes write scope, acceptance, or sequencing. \
+When the write boundary is clear enough for workers to start, call propose_directions with a short rationale and directions \
+(name, the ONE repo each writes, reason, mandate). Only list repos each direction must WRITE; reads are free. \
+Pick mandate per direction as a planning-depth hint: plan+impl for directions that need worker planning, impl-only for small or fully specified directions. \
+Prefer independent directions that can proceed in parallel; put shared contract owners first only when they block others. \
+The human reviews and confirms in weft; you can re-propose after more discussion.";
 
 /// Sentinel usage directives appended to the lead prompt. Each subsequent task
 /// (Task 3-5) keeps growing this block, so it lives as its own const for easy
@@ -81,47 +79,21 @@ pub fn lang_directive(lang: &str) -> &'static str {
 /// follows the caller's lang (defaults to zh — IM bridge fixes it that way).
 pub fn concierge_prompt(lang: &str) -> String {
     let body = if lang == "zh" {
-        "你是 weft 桌面端的助理（Concierge），用户从某个飞书会话找你。weft 桌面端正在运行，\
-真实状态都在 weft_global MCP 工具里——回答任何关于工作区、issue、待办、agent 提问的问题前，\
-必须先用工具核实（list_workspaces / list_issues / pending_needs_you / issue_status），不要凭印象作答。\n\
-如果用户消息里带有 feishu_chat_id，那就是当前飞书会话的 chat_id；只有用户语义明确要求为某个已有 issue 创建、打开或继续飞书 topic 时，才可把这个 chat_id 传给 ensure_issue_topic。\n\
-\n\
-工具一览：\n\
-- list_workspaces / list_issues / issue_status / pending_needs_you —— 只读，先用它们摸清状态。\n\
-- answer_permission(ask_id, verdict) —— 用户明确告诉你判决时才代答；不确定就先用 pending_needs_you 列出再问用户。\n\
-- answer_question(thread_id, ask_id, text) —— 转达用户对 agent 提问的回答。\n\
-- message_lead(thread_id, text) —— 把用户的话喂给某个 issue 的 lead。\n\
-- ensure_issue_topic(thread_id, chat_id) —— 当用户语义明确要为某个已有 issue 创建/打开/继续飞书 topic 时调用；普通聊天不要调用。\n\
-- create_issue(workspace_id, title, kind) —— 新建 issue；kind 必须显式传入 feature / bugfix / refactor / spike 之一。\n\
-\n\
-不要做的事：\n\
-- 不要替用户决定需要桌面确认的事（scope 拍板、批准 write trigger、合并保护分支）——把状态报清楚，请用户去桌面处理。\n\
-- 不要臆造 issue/工作区/ask 的细节；找不到就说没找到，不要编。\n\
-- 不要在不可逆动作之前自行批准权限请求（answer_permission allow/full）——除非用户在这条消息里明确同意。\n\
-\n\
-回复风格：简短中文，用 markdown 列表/编号；引用 issue 时带 thread_id；引用 ask 时带 ask_id。"
+        "你是 weft 桌面端的 IM Concierge，用户从一个 IM 会话找你。weft 桌面端正在运行，真实状态都在 weft_global MCP 能力里；回答任何关于工作区、issue、待办、agent 提问的问题前，必须先用工具核实，不要凭印象作答。\n\
+每条 IM 消息会带结构化 <weft:im_context>，其中包含 IM provider、当前会话、当前消息和 provider 能力。根据这些能力决定是否能创建或复用 issue 的原生 topic。\n\
+当用户从 IM 创建新的 issue/task 时，必须先使用 list_workspaces 让用户选择已有 workspace；不要因为飞书会话自动新建 workspace。选择明确后使用 IM-aware 的 issue 创建能力；如果 provider 支持 issue topic，默认创建并绑定，让用户进入该 issue 的原生讨论位置。\n\
+当用户希望介入已有 issue、打开 issue、继续某个 task，或把话转给某个 issue lead 时，先确保该 issue 有 provider-native topic，并引导用户进入那里。只有用户给出明确要转达给 lead 的内容时，才把 initial message 发送给 lead。\n\
+普通状态查询、列表查询、待办查询不要创建 topic。无法唯一匹配 workspace 或 issue 时，先列出候选并让用户选择。\n\
+不要替用户决定需要桌面确认的事（scope 拍板、批准 write trigger、合并保护分支）。不要臆造 issue/工作区/ask 的细节；找不到就说没找到。不要在不可逆动作之前自行批准权限请求，除非用户在这条消息里明确同意。\n\
+回复风格：简短中文，用 markdown 列表/编号；引用 issue 时带 issue_id；引用 ask 时带 ask_id。"
     } else {
-        "You are weft's desktop Concierge, reached by the user through one Feishu conversation. weft is \
-running on the user's desktop and authoritative state lives behind the `weft_global` MCP \
-tools — ALWAYS verify with the tools before answering anything about workspaces, issues, \
-pending asks, or agent questions (list_workspaces / list_issues / pending_needs_you / \
-issue_status). Never answer from your imagination.\n\
-If the user's message includes feishu_chat_id, that is the current Feishu chat_id; only pass it to ensure_issue_topic when the user semantically asks to create, open, or continue a Feishu topic for an existing issue.\n\
-\n\
-Tools:\n\
-- list_workspaces / list_issues / issue_status / pending_needs_you — read-only; lead with these.\n\
-- answer_permission(ask_id, verdict) — only when the user explicitly tells you the verdict; otherwise list pending asks and ask.\n\
-- answer_question(thread_id, ask_id, text) — relay the user's answer to an agent's open question.\n\
-- message_lead(thread_id, text) — deliver the user's message into a specific issue's lead.\n\
-- ensure_issue_topic(thread_id, chat_id) — call only when the user semantically asks to create/open/continue a Feishu topic for an existing issue; do not call for ordinary chat.\n\
-- create_issue(workspace_id, title, kind) — file a new issue; kind must be explicitly set to feature, bugfix, refactor, or spike.\n\
-\n\
-Do not:\n\
-- Decide things that require the desktop (scope approval, write-trigger approve/deny, merge-protected branches) — report the state and ask the user to go to the desktop.\n\
-- Invent workspace / issue / ask details; if you can't find it, say so.\n\
-- Pre-approve irreversible permission asks (answer_permission allow/full) unless the user explicitly consents in this message.\n\
-\n\
-Style: short, markdown bullets / numbered lists; mention thread_id when citing an issue, ask_id when citing an ask."
+        "You are weft's IM Concierge, reached by the user through one IM conversation. weft is running on the user's desktop and authoritative state lives behind weft_global capabilities; verify with tools before answering anything about workspaces, issues, pending asks, or agent questions. Never answer from memory.\n\
+Each IM message includes structured <weft:im_context> with the provider, current conversation, current message, and provider capabilities. Use those capabilities to decide whether an issue can have a provider-native topic.\n\
+When the user creates a new issue/task from IM, first use list_workspaces and have the user choose an existing workspace; never create a workspace just because the user is chatting from Feishu. Once the workspace is explicit, use the IM-aware issue creation capability. If the provider supports issue topics, default to creating and binding one so the user can continue in the issue's native discussion location.\n\
+When the user wants to intervene in an existing issue, open an issue, continue a task, or relay a concrete instruction to an issue lead, first ensure that issue has a provider-native topic and guide the user there. Send an initial message to the lead only when the user provided concrete text to relay.\n\
+Read-only status, list, and pending-ask queries must not create topics. If a workspace or issue reference is ambiguous, list candidates and ask the user to choose.\n\
+Do not decide things that require the desktop: scope approval, write-trigger approval, or protected-branch merge. Do not invent workspace, issue, or ask details. Do not pre-approve irreversible permission asks unless the user explicitly consents in this message.\n\
+Style: short markdown bullets or numbered lists; mention issue_id when citing an issue and ask_id when citing an ask."
     };
     format!("{}{}", body, lang_directive(lang))
 }
@@ -192,6 +164,7 @@ pub async fn lead_engine(
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        current_origin_tag: None,
     };
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(lead_key(thread_id), eng))
@@ -233,6 +206,7 @@ pub async fn lead_send(
         &text,
         to_pairs(images),
         files.unwrap_or_default(),
+        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -302,7 +276,7 @@ fn lead_state_label(alive: bool, busy: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::lead_state_label;
+    use super::{lead_prompt, lead_state_label};
 
     #[test]
     fn busy_turn_reports_busy_even_without_resident_child() {
@@ -313,6 +287,45 @@ mod tests {
         assert_eq!(lead_state_label(true, true), "busy");
         assert_eq!(lead_state_label(true, false), "idle");
         assert_eq!(lead_state_label(false, false), "stopped");
+    }
+
+    #[test]
+    fn lead_prompt_is_policy_not_fixed_sequence() {
+        let prompt = lead_prompt();
+        assert!(prompt.contains("converge the issue's write scope"));
+        assert!(prompt
+            .contains("Use the weft_planner MCP capabilities when they materially affect scope"));
+        assert!(!prompt.contains("Start by greeting"));
+        assert!(!prompt.contains("call get_task"));
+    }
+
+    #[test]
+    fn stale_cleanup_skips_only_busy_sessions() {
+        use std::collections::HashSet;
+        // Session 1 busy; lead (None) + session 2 idle → clean lead and [2], not 1.
+        let busy: HashSet<Option<i32>> = [Some(1)].into_iter().collect();
+        let (clean_lead, sessions) = super::stale_cleanup_targets(&busy, &[1, 2]);
+        assert!(clean_lead);
+        assert_eq!(sessions, vec![2]);
+        // Lead (None) busy → don't clean the lead group; idle sessions still cleaned.
+        let busy2: HashSet<Option<i32>> = [None].into_iter().collect();
+        let (clean_lead2, sessions2) = super::stale_cleanup_targets(&busy2, &[1, 2]);
+        assert!(!clean_lead2);
+        assert_eq!(sessions2, vec![1, 2]);
+        // Nothing busy → clean every group.
+        let (cl3, s3) = super::stale_cleanup_targets(&HashSet::new(), &[1, 2]);
+        assert!(cl3);
+        assert_eq!(s3, vec![1, 2]);
+    }
+
+    #[test]
+    fn concierge_prompt_is_provider_aware_not_feishu_scripted() {
+        let prompt = super::concierge_prompt("zh");
+        assert!(prompt.contains("IM provider"));
+        assert!(prompt.contains("provider-native"));
+        assert!(prompt.contains("创建并绑定"));
+        assert!(!prompt.contains("feishu_chat_id"));
+        assert!(!prompt.contains("ensure_issue_topic"));
     }
 }
 
@@ -492,11 +505,58 @@ async fn wait_for_slash_commands(eng: &EngineRef) -> Vec<crate::lead_chat::proto
     vec![]
 }
 
+/// A streaming row is only legitimately live while ITS OWN engine is busy, so the
+/// `None` (lead, sessionless) group and each `Some(session)` group is cleanable
+/// unless that exact engine is busy. Returns (clean the lead group?, the session
+/// ids to clean). Gating per `(thread, session)` instead of one issue-wide busy
+/// flag stops a busy session from leaving another idle session's stale row stuck
+/// in `streaming` (a forever-"typing" assistant) until the next all-idle reload.
+fn stale_cleanup_targets(
+    busy: &std::collections::HashSet<Option<i32>>,
+    sessions: &[i32],
+) -> (bool, Vec<i32>) {
+    let clean_lead = !busy.contains(&None);
+    let clean_sessions = sessions
+        .iter()
+        .copied()
+        .filter(|s| !busy.contains(&Some(*s)))
+        .collect();
+    (clean_lead, clean_sessions)
+}
+
 #[tauri::command]
 pub async fn list_lead_messages(
+    app: AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
 ) -> Result<Vec<crate::store::entities::lead_message::Model>, String> {
+    let engines: Vec<EngineRef> = {
+        let state = app.state::<LeadChatState>();
+        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().cloned().collect()
+    };
+    let mut busy: std::collections::HashSet<Option<i32>> = std::collections::HashSet::new();
+    for eng in engines {
+        let inner = eng.lock().await;
+        if inner.thread_id == thread_id && inner.turn.busy {
+            busy.insert(inner.session_id);
+        }
+    }
+    let sessions = repo::sessions_for_thread(&db, thread_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let session_ids: Vec<i32> = sessions.iter().map(|s| s.id).collect();
+    let (clean_lead, clean_sessions) = stale_cleanup_targets(&busy, &session_ids);
+    if clean_lead {
+        repo::mark_incomplete_turns_interrupted(&db, thread_id, None)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    for sid in clean_sessions {
+        repo::mark_incomplete_turns_interrupted(&db, thread_id, Some(sid))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     repo::list_lead_messages(&db, thread_id)
         .await
         .map_err(|e| e.to_string())
@@ -505,7 +565,8 @@ pub async fn list_lead_messages(
 // ───────────────────── chat-mode workers ─────────────────────
 //
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
-// timeline in the SessionView, with per-tool wire dialects (engine::per_turn).
+// timeline in the worker conversation surface, with per-tool wire dialects
+// (engine::per_turn).
 // Each session remains takeover-able in the user's own terminal via its
 // native id.
 
@@ -531,7 +592,7 @@ pub async fn chat_open_worker(
     .map_err(|e| e.to_string())
 }
 
-async fn chat_open_worker_impl(
+pub(crate) async fn chat_open_worker_impl(
     app: &AppHandle,
     db: &Db,
     direction_id: i32,
@@ -602,6 +663,7 @@ async fn chat_open_worker_impl(
                 interrupting: false,
                 generation: 0,
                 pending_skill_refresh: false,
+                current_origin_tag: None,
             };
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
             state.get_or_insert(key, e)
@@ -609,15 +671,15 @@ async fn chat_open_worker_impl(
     };
     engine::ensure_running(app, db, &eng).await?;
 
-    // A fresh conversation gets its brief as the opening message (the brief is
-    // a message, not a system prompt).
+    // A fresh conversation starts with a user-shaped task request, followed by
+    // the structured Weft brief as context.
     if !resumed {
         let mut brief = crate::brief::assemble(db, direction_id)
             .await
             .unwrap_or_default();
         if !brief.trim().is_empty() {
             brief.push_str(lang_directive(lang));
-            engine::send(app, db, &eng, &brief, vec![], vec![]).await?;
+            engine::send(app, db, &eng, &brief, vec![], vec![], None).await?;
         }
     }
     // Dispatch enters the mandate's first phase: plan+impl workers start by
@@ -698,6 +760,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        current_origin_tag: None,
     };
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(session_id as i64, e))
@@ -722,6 +785,7 @@ pub async fn chat_send(
         &text,
         to_pairs(images),
         files.unwrap_or_default(),
+        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -813,10 +877,19 @@ pub async fn post_lead_tool_result(
                 text,
                 images: vec![],
                 tracked: false,
+                origin_tag: None,
             };
             if inner.turn.try_begin_send() {
                 inner.turn_id += 1;
                 inner.clock.begin_turn();
+                // Card-click plumbing starts a turn directly (not via send): keep the
+                // invariant so a prior concierge tag can't leak onto this turn.
+                inner.current_origin_tag = None;
+                // A turn-start must persist `running`, or a crash while the lead
+                // processes this action result leaves the meta row `idle` and boot
+                // revive skips it (same invariant as send/nudge).
+                let db = app.state::<Db>();
+                let _ = repo::set_lead_status(&db, thread_id, "running").await;
                 engine::write_user(&mut inner, &out).await;
             } else {
                 inner.turn.queue.push_back(out);

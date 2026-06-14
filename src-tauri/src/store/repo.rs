@@ -391,7 +391,7 @@ pub async fn create_direction(
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-    let ws = workspace::Entity::find_by_id(t.workspace_id)
+    let _ws = workspace::Entity::find_by_id(t.workspace_id)
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("workspace missing"))?;
@@ -402,8 +402,34 @@ pub async fn create_direction(
         .into_iter()
         .map(|d| d.slug)
         .collect();
+    let repo_ref = repo_ref::Entity::find_by_id(repo_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
     let slug = unique_slug(name, &existing);
-    let branch = format!("ws/{}/{}/{}", ws.slug, t.slug, slug);
+    let branch_title = if t.title.trim().is_empty() {
+        name
+    } else {
+        &t.title
+    };
+    // Branches/worktrees are keyed per repo, so dedup against branches ALREADY
+    // reserved by other directions on this repo — not just git refs. Otherwise two
+    // directions created before the first worktree materializes derive the same
+    // branch from the same title and collide on `.worktrees/weft/<branch>`.
+    let reserved: Vec<String> = direction::Entity::find()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|d| d.branch)
+        .filter(|b| !b.is_empty())
+        .collect();
+    let branch = crate::git::choose_branch_name(
+        std::path::Path::new(&repo_ref.local_git_path),
+        &t.kind,
+        branch_title,
+        &reserved,
+    );
     let dir = direction::ActiveModel {
         thread_id: Set(thread_id),
         name: Set(name.to_string()),
@@ -578,8 +604,47 @@ pub async fn set_session_native_id(db: &Db, session_id: i32, native_id: &str) ->
     if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
         let mut a: session::ActiveModel = s.into();
         a.native_session_id = Set(Some(native_id.to_string()));
-        a.status = Set("running".to_string());
+        // Capturing the native id does NOT mean a turn is running. The readers
+        // call this on every attach (including an idle re-attach for command
+        // discovery), so writing "running" here would make the boot revive sweep
+        // treat an idle resume as interrupted work. Status is owned by the turn
+        // boundaries (persist_activity); a real turn is already "running" by now.
         a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// Set a worker session's activity status directly. Unlike
+/// `set_session_native_id` (which forces `running` as a side effect of
+/// capturing the id), this writes whatever caller-chosen value — e.g.
+/// flipping a live session to `idle` once its turn drains, or a boot sweep
+/// marking a crash-interrupted row. No-op if the row is gone.
+pub async fn set_session_status(db: &Db, session_id: i32, status: &str) -> Result<()> {
+    if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
+        let mut a: session::ActiveModel = s.into();
+        a.status = Set(status.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// One-time upgrade reconcile: before honest activity status existed, `status`
+/// was a write-once high-water-mark (`running` on attach, never reset to idle),
+/// so every legacy worker row reads `running`/`starting` regardless of whether
+/// its turn finished. Reset those to `idle` so the boot revive sweep doesn't
+/// resume+nudge every old idle/review worker on the first launch after upgrade.
+/// Run by migration M0017; from then on the engine writes status honestly.
+/// Generic over the connection so the migration (`SchemaManagerConnection`) and
+/// tests (`DatabaseConnection`) share one implementation.
+pub async fn reset_stale_running_sessions<C: sea_orm::ConnectionTrait>(conn: &C) -> Result<()> {
+    for s in session::Entity::find()
+        .filter(session::Column::Status.is_in(["running", "starting"]))
+        .all(conn)
+        .await?
+    {
+        let mut a: session::ActiveModel = s.into();
+        a.status = Set("idle".to_string());
+        a.update(conn).await?;
     }
     Ok(())
 }
@@ -616,6 +681,23 @@ pub async fn latest_session_for_direction(
         .await?)
 }
 
+pub async fn sessions_for_thread(db: &Db, thread_id: i32) -> Result<Vec<session::Model>> {
+    let direction_ids: Vec<i32> = direction::Entity::find()
+        .filter(direction::Column::ThreadId.eq(thread_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    if direction_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(session::Entity::find()
+        .filter(session::Column::DirectionId.is_in(direction_ids))
+        .all(&db.0)
+        .await?)
+}
+
 // ---- chat timeline (lead console + chat-mode workers) ----
 
 #[allow(clippy::too_many_arguments)]
@@ -649,6 +731,33 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
         let mut a: lead_message::ActiveModel = m.into();
         a.content = Set(content.to_string());
         a.status = Set(status.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// Close rows left `streaming` by a previous app process. Live turn state is
+/// memory-only; after restart these rows can no longer receive deltas, so show
+/// them as interrupted instead of a forever-typing assistant.
+pub async fn mark_incomplete_turns_interrupted(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<()> {
+    // A crash leaves both a half-streamed assistant row and any user message the
+    // user queued behind it (the in-memory FIFO is gone, so a `queued` row has no
+    // live processor and would otherwise show as pending forever). Close both as
+    // interrupted; full queued-message replay is the backend-queue feature (later).
+    let mut q = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Status.is_in(["streaming", "queued"]));
+    q = match session_id {
+        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
+        None => q.filter(lead_message::Column::SessionId.is_null()),
+    };
+    for m in q.all(&db.0).await? {
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set("interrupted".to_string());
         a.update(&db.0).await?;
     }
     Ok(())
@@ -710,7 +819,54 @@ pub async fn lead_native_id(db: &Db, thread_id: i32) -> Result<Option<String>> {
 }
 
 pub async fn set_lead_native_id(db: &Db, thread_id: i32, native_id: &str) -> Result<()> {
-    let content = serde_json::json!({ "native_id": native_id }).to_string();
+    let existing = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&db.0)
+        .await?;
+    match existing {
+        // Merge, don't replace: the meta row may already carry a `status` field
+        // (set first by `set_lead_status`); blowing the whole object away would
+        // clobber it. Read → set one key → write back.
+        Some(m) => {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
+            v["native_id"] = serde_json::json!(native_id);
+            let mut a: lead_message::ActiveModel = m.into();
+            a.content = Set(v.to_string());
+            a.update(&db.0).await?;
+        }
+        None => {
+            let content = serde_json::json!({ "native_id": native_id }).to_string();
+            insert_lead_message(
+                db, thread_id, None, 0, "system", "meta", &content, "complete",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The lead's persisted activity status, co-located with `native_id` in the
+/// single role=system kind=meta row. None until first written.
+pub async fn lead_status(db: &Db, thread_id: i32) -> Result<Option<String>> {
+    Ok(lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(&db.0)
+        .await?
+        .and_then(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .ok()?
+                .get("status")?
+                .as_str()
+                .map(String::from)
+        }))
+}
+
+/// Upsert the per-thread lead `meta` row's `status` field, preserving any other
+/// fields it already holds (notably `native_id`).
+pub async fn set_lead_status(db: &Db, thread_id: i32, status: &str) -> Result<()> {
     let existing = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
         .filter(lead_message::Column::Kind.eq("meta"))
@@ -718,11 +874,15 @@ pub async fn set_lead_native_id(db: &Db, thread_id: i32, native_id: &str) -> Res
         .await?;
     match existing {
         Some(m) => {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
+            v["status"] = serde_json::json!(status);
             let mut a: lead_message::ActiveModel = m.into();
-            a.content = Set(content);
+            a.content = Set(v.to_string());
             a.update(&db.0).await?;
         }
         None => {
+            let content = serde_json::json!({ "status": status }).to_string();
             insert_lead_message(
                 db, thread_id, None, 0, "system", "meta", &content, "complete",
             )
@@ -787,7 +947,21 @@ pub async fn im_route_of_thread(db: &Db, thread_id: i32) -> Result<Option<im_rou
         .await?)
 }
 
-/// Reverse lookup: which issue is this IM thread bound to?
+/// Broad lookup by channel + chat. Used by Concierge because its latest reply
+/// target changes per inbound message while the chat-level conversation stays one.
+pub async fn im_route_of_channel_chat(
+    db: &Db,
+    channel: &str,
+    chat_id: &str,
+) -> Result<Option<im_route::Model>> {
+    Ok(im_route::Entity::find()
+        .filter(im_route::Column::Channel.eq(channel))
+        .filter(im_route::Column::ChatId.eq(chat_id))
+        .one(&db.0)
+        .await?)
+}
+
+/// Reverse lookup: which issue is this IM thread/topic bound to?
 pub async fn im_route_of_thread_ref(
     db: &Db,
     channel: &str,
@@ -837,6 +1011,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_streaming_messages_mark_interrupted_on_reopen() {
+        let db = mem().await;
+        let streaming = insert_lead_message(
+            &db,
+            4,
+            Some(9),
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"partial"}"#,
+            "streaming",
+        )
+        .await
+        .unwrap();
+        let queued = insert_lead_message(
+            &db,
+            4,
+            Some(9),
+            2,
+            "user",
+            "text",
+            r#"{"text":"next"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
+
+        mark_incomplete_turns_interrupted(&db, 4, Some(9))
+            .await
+            .unwrap();
+
+        let all = list_lead_messages(&db, 4).await.unwrap();
+        assert_eq!(
+            all.iter().find(|m| m.id == streaming.id).unwrap().status,
+            "interrupted"
+        );
+        // A queued user message orphaned by the crash (no live FIFO to deliver it)
+        // is closed as interrupted too, so it doesn't show as pending forever.
+        assert_eq!(
+            all.iter().find(|m| m.id == queued.id).unwrap().status,
+            "interrupted"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_stale_running_sessions_idles_legacy_rows() {
+        let db = mem().await;
+        // Pre-fix rows: status was a write-once high-water-mark, so an idle worker
+        // reads "running" (or "starting" before it ever attached).
+        let running = create_session(&db, 1, 1, "codex", "/tmp/a").await.unwrap();
+        set_session_status(&db, running.id, "running").await.unwrap();
+        let starting = create_session(&db, 2, 1, "codex", "/tmp/b").await.unwrap();
+        set_session_status(&db, starting.id, "starting").await.unwrap();
+        let idle = create_session(&db, 3, 1, "codex", "/tmp/c").await.unwrap();
+        set_session_status(&db, idle.id, "idle").await.unwrap();
+
+        reset_stale_running_sessions(&db.0).await.unwrap();
+
+        assert_eq!(get_session(&db, running.id).await.unwrap().unwrap().status, "idle");
+        assert_eq!(get_session(&db, starting.id).await.unwrap().unwrap().status, "idle");
+        assert_eq!(get_session(&db, idle.id).await.unwrap().unwrap().status, "idle");
+    }
+    #[tokio::test]
     async fn queued_flips_to_complete() {
         let db = mem().await;
         insert_lead_message(
@@ -868,6 +1105,33 @@ mod tests {
         );
         // meta row stays single + out of turn numbering
         assert_eq!(list_lead_messages(&db, 3).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_status_round_trips() {
+        let db = mem().await;
+        let s = create_session(&db, 1, 1, "codex", "/tmp/wt").await.unwrap();
+        set_session_status(&db, s.id, "idle").await.unwrap();
+        assert_eq!(get_session(&db, s.id).await.unwrap().unwrap().status, "idle");
+        set_session_status(&db, s.id, "running").await.unwrap();
+        assert_eq!(
+            get_session(&db, s.id).await.unwrap().unwrap().status,
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_status_round_trips_and_preserves_native_id() {
+        let db = mem().await;
+        set_lead_native_id(&db, 7, "nat-xyz").await.unwrap();
+        set_lead_status(&db, 7, "running").await.unwrap();
+        assert_eq!(lead_status(&db, 7).await.unwrap().as_deref(), Some("running"));
+        assert_eq!(lead_native_id(&db, 7).await.unwrap().as_deref(), Some("nat-xyz"));
+        // opposite write order must also coexist (status first, native id second)
+        set_lead_status(&db, 8, "idle").await.unwrap();
+        set_lead_native_id(&db, 8, "nat-8").await.unwrap();
+        assert_eq!(lead_status(&db, 8).await.unwrap().as_deref(), Some("idle"));
+        assert_eq!(lead_native_id(&db, 8).await.unwrap().as_deref(), Some("nat-8"));
     }
 
     #[tokio::test]
@@ -933,7 +1197,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(dir.branch, "ws/demo-ws/add-login/main");
+        assert_eq!(dir.branch, "feature/add-login");
         assert_eq!(dir.repo_id, repo.id);
         assert_eq!(dir.reason, "build the feature");
 
@@ -951,7 +1215,7 @@ mod tests {
             vec![(
                 repo.id,
                 "/tmp/wt".to_string(),
-                "ws/demo-ws/add-login/main".to_string()
+                "feature/add-login".to_string()
             )]
         );
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
@@ -1014,7 +1278,7 @@ mod tests {
             name: Set("main".to_string()),
             slug: Set("main".to_string()),
             tool: Set("claude".to_string()),
-            branch: Set("ws/demo-ws/add-login/main".to_string()),
+            branch: Set("feature/add-login".to_string()),
             status: Set("queued".to_string()),
             repo_id: Set(0),
             reason: Set(String::new()),
@@ -1095,7 +1359,7 @@ mod tests {
         let d2 = rename_direction(&db, d.id, "api work").await.unwrap();
         assert_eq!(d2.name, "api work");
         assert_eq!(d2.slug, "main");
-        assert_eq!(d2.branch, "ws/demo-ws/add-login/main");
+        assert_eq!(d2.branch, "feature/add-login");
     }
 
     #[tokio::test]

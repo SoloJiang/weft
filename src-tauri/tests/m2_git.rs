@@ -32,7 +32,7 @@ fn worktree_list_and_diff() {
             "add",
             "-q",
             "-b",
-            "ws/d/t/m",
+            "feat/diff-test",
             wt.to_str().unwrap(),
         ],
     );
@@ -41,7 +41,7 @@ fn worktree_list_and_diff() {
     std::fs::write(wt.join("hello.txt"), "a\nb\n").unwrap();
 
     let wts = weft::git::list_worktrees(&repo).unwrap();
-    assert!(wts.iter().any(|(_, b)| b == "ws/d/t/m"));
+    assert!(wts.iter().any(|(_, b)| b == "feat/diff-test"));
 
     let diff = weft::git::repo_diff(&wt).unwrap();
     let hello = diff.files.iter().find(|f| f.path == "hello.txt").unwrap();

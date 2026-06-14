@@ -31,6 +31,19 @@ fn make_bare(parent: &std::path::Path) -> String {
     format!("file://{}", bare.to_string_lossy())
 }
 
+/// Delete a file, retrying briefly. On Windows a file with any live handle
+/// can't be removed, and a just-closed SQLite pool can linger a few ms; on
+/// Unix the first attempt succeeds (open files unlink freely).
+async fn remove_file_eventually(p: &std::path::Path) {
+    for _ in 0..100 {
+        if std::fs::remove_file(p).is_ok() || !p.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    std::fs::remove_file(p).unwrap();
+}
+
 #[tokio::test]
 async fn backup_then_restore_roundtrip() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -66,12 +79,16 @@ async fn backup_then_restore_roundtrip() {
             r,
             weft::backup::RunOutcome::Success { .. }
         ));
+        // Windows can't delete a file that still has open handles; close the
+        // SQLite pool so weft.db is released before it's removed below.
+        drop(svc);
+        db.0.close().await;
     }
 
     let rk_path = tmp.path().join("rk.json");
     recovery_key::export_to(&rk_path).unwrap();
 
-    std::fs::remove_file(home.join("weft.db")).unwrap();
+    remove_file_eventually(&home.join("weft.db")).await;
     let _ = std::fs::remove_file(home.join("weft.db-wal"));
     let _ = std::fs::remove_file(home.join("weft.db-shm"));
 

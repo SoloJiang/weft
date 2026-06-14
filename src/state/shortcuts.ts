@@ -9,7 +9,7 @@ import { useStore } from "./store";
  *
  *   ⌘\        toggle the sidebar
  *   ⌘1/2      workspace board / repo map
- *   ⌘[        go up one level (session → board → workspace)
+ *   ⌘[        go up one level (worker → board → workspace)
  *
  * No chrome — keeps the "精简" home headerless while making the whole app
  * navigable from the keyboard.
@@ -21,11 +21,9 @@ export function useAppShortcuts() {
     backToWorkspace,
     setHomeTab,
     openRepoMap,
-    activeSessionId,
     viewing,
     showNeeds,
     activeThreadId,
-    backToBoard,
     closeObserve,
   } = useStore();
 
@@ -49,8 +47,7 @@ export function useAppShortcuts() {
         case "[":
           // Up one level, mirroring the route hierarchy in App's Main().
           e.preventDefault();
-          if (activeSessionId != null) backToBoard();
-          else if (viewing != null) closeObserve();
+          if (viewing != null) closeObserve();
           else if (showNeeds || activeThreadId != null) backToWorkspace();
           break;
         default:
@@ -65,11 +62,9 @@ export function useAppShortcuts() {
     backToWorkspace,
     setHomeTab,
     openRepoMap,
-    activeSessionId,
     viewing,
     showNeeds,
     activeThreadId,
-    backToBoard,
     closeObserve,
   ]);
 }

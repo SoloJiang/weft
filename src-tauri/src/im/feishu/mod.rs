@@ -32,6 +32,13 @@ pub struct FeishuChannel {
     stream: streaming::StreamClient,
 }
 
+fn value_string(resp: &serde_json::Value, key: &str) -> Option<String> {
+    resp.get(key)
+        .or_else(|| resp.get("data").and_then(|d| d.get(key)))
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+}
+
 impl FeishuChannel {
     /// 构造适配器。0.17 的 `ClientBuilder::build()` 返回 `Result`（凭证校验），故本函数
     /// 也返回 `Result`，调用方需传播。
@@ -50,11 +57,14 @@ impl FeishuChannel {
 
     /// 从 0.17 send/reply 返回的 Value 里取 message_id（兼容「已抽 data」与「原始响应」两种形态）。
     fn message_id_of(resp: &serde_json::Value) -> anyhow::Result<String> {
-        resp.get("message_id")
-            .or_else(|| resp.get("data").and_then(|d| d.get("message_id")))
-            .and_then(|m| m.as_str())
-            .map(|s| s.to_string())
+        value_string(resp, "message_id")
             .ok_or_else(|| anyhow::anyhow!("feishu: no message_id in response {resp}"))
+    }
+
+    /// 从 reply_in_thread=true 的响应里取飞书 topic id（`omt_*` thread_id）。
+    fn thread_id_of(resp: &serde_json::Value) -> anyhow::Result<String> {
+        value_string(resp, "thread_id")
+            .ok_or_else(|| anyhow::anyhow!("feishu: no thread_id in response {resp}"))
     }
 
     /// 发消息（msg_type 由调用方定，content 为序列化好的 JSON 字符串）。返回飞书 message_id。
@@ -114,6 +124,27 @@ impl super::Channel for FeishuChannel {
         let content = serde_json::json!({ "text": text }).to_string();
         self.create(ReceiveIdType::ChatId, chat_id, "text", content)
             .await
+    }
+
+    async fn create_chat_topic(
+        &self,
+        _chat_id: &str,
+        seed_message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<String> {
+        let content = serde_json::json!({ "text": text }).to_string();
+        let body = ReplyMessageBody {
+            content,
+            msg_type: "text".to_string(),
+            reply_in_thread: Some(true),
+            uuid: None,
+        };
+        let resp = ReplyMessageRequest::new(self.config.clone())
+            .message_id(seed_message_id)
+            .execute_with_options(body, RequestOption::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("feishu create topic: {e}"))?;
+        Self::thread_id_of(&resp)
     }
 
     async fn reply_text(&self, reply_to: &str, text: &str) -> anyhow::Result<String> {
