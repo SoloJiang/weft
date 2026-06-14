@@ -421,6 +421,7 @@ export const en = {
     appearance: "Appearance",
     interface: "Interface",
     theme: "Theme",
+    system: "System",
     light: "Light",
     dark: "Dark",
     language: "Language",

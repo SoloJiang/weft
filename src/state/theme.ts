@@ -1,42 +1,108 @@
-import { useEffect, useState } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 
-export type Theme = "dark" | "light";
+/** Persisted user choice. "system" follows the OS appearance live. */
+export type ThemePref = "system" | "light" | "dark";
+/** Concrete appearance reflected on <html data-theme>. */
+export type ResolvedTheme = "light" | "dark";
+
 const KEY = "weft-theme";
 
-/** Saved choice, else the OS preference, else dark. */
-export function resolveInitialTheme(): Theme {
+function darkQuery(): MediaQueryList | null {
   try {
-    const saved = localStorage.getItem(KEY);
-    if (saved === "dark" || saved === "light") return saved;
-    return window.matchMedia("(prefers-color-scheme: light)").matches
-      ? "light"
-      : "dark";
+    return window.matchMedia("(prefers-color-scheme: dark)");
   } catch {
-    return "dark";
+    return null;
   }
 }
 
-export function applyTheme(t: Theme) {
-  document.documentElement.dataset.theme = t;
+/** The OS-reported appearance right now (falls back to dark). */
+export function systemTheme(): ResolvedTheme {
+  return darkQuery()?.matches ? "dark" : "light";
 }
 
-/** Theme + toggle. Persists the explicit choice; reflects it on <html>. */
-export function useTheme(): { theme: Theme; toggle: () => void } {
-  const [theme, setTheme] = useState<Theme>(
-    () => (document.documentElement.dataset.theme as Theme) || resolveInitialTheme(),
-  );
-  useEffect(() => {
-    applyTheme(theme);
-  }, [theme]);
-  const toggle = () =>
-    setTheme((t) => {
-      const next: Theme = t === "dark" ? "light" : "dark";
-      try {
-        localStorage.setItem(KEY, next);
-      } catch {
-        /* private mode / no storage */
-      }
-      return next;
-    });
-  return { theme, toggle };
+/** The concrete light/dark a preference resolves to. */
+export function resolvePref(pref: ThemePref): ResolvedTheme {
+  return pref === "system" ? systemTheme() : pref;
+}
+
+/** Cycle order for the quick toggle: System → Light → Dark → System. */
+export function nextPref(pref: ThemePref): ThemePref {
+  return pref === "system" ? "light" : pref === "light" ? "dark" : "system";
+}
+
+/** Saved preference, else "system". Tolerates legacy "dark"/"light" values. */
+export function readPref(): ThemePref {
+  try {
+    const saved = localStorage.getItem(KEY);
+    if (saved === "system" || saved === "dark" || saved === "light") return saved;
+  } catch {
+    /* private mode / no storage */
+  }
+  return "system";
+}
+
+/** Reflect a resolved theme on <html>. */
+export function applyResolved(r: ResolvedTheme) {
+  document.documentElement.dataset.theme = r;
+}
+
+// --- shared module-level store: every useTheme() consumer stays in sync ---
+
+let state: { pref: ThemePref; resolved: ResolvedTheme } = (() => {
+  const pref = readPref();
+  return { pref, resolved: resolvePref(pref) };
+})();
+applyResolved(state.resolved);
+
+const listeners = new Set<() => void>();
+function emit() {
+  for (const l of listeners) l();
+}
+
+function commit(pref: ThemePref) {
+  state = { pref, resolved: resolvePref(pref) };
+  applyResolved(state.resolved);
+  emit();
+}
+
+function setPrefGlobal(pref: ThemePref) {
+  try {
+    localStorage.setItem(KEY, pref);
+  } catch {
+    /* private mode / no storage */
+  }
+  commit(pref);
+}
+
+// Follow live OS appearance changes while in system mode (registered once).
+darkQuery()?.addEventListener("change", () => {
+  if (state.pref === "system") commit("system");
+});
+
+function subscribe(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+function getSnapshot() {
+  return state;
+}
+
+/**
+ * Theme preference + resolved appearance.
+ * - `pref` is the persisted choice (system/light/dark).
+ * - `resolved` is the applied light/dark, reflected on <html data-theme>.
+ * In system mode `resolved` live-tracks the OS; explicit modes pin it.
+ */
+export function useTheme(): {
+  pref: ThemePref;
+  resolved: ResolvedTheme;
+  setPref: (p: ThemePref) => void;
+  cycle: () => void;
+} {
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const setPref = useCallback((p: ThemePref) => setPrefGlobal(p), []);
+  const cycle = useCallback(() => setPrefGlobal(nextPref(state.pref)), []);
+  return { pref: snapshot.pref, resolved: snapshot.resolved, setPref, cycle };
 }

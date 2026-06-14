@@ -409,6 +409,7 @@ export const zh = {
     appearance: "外观",
     interface: "界面",
     theme: "主题",
+    system: "跟随系统",
     light: "亮色",
     dark: "暗色",
     language: "语言",
