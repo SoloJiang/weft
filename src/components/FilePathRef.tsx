@@ -1,6 +1,16 @@
-import type { ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
 import { cn } from "../lib/cn";
 import { openFileMenu, openFileRef } from "../lib/fileLinks";
+
+/**
+ * True when already inside an interactive link / file-ref. Descendant file refs
+ * (e.g. an inline-code label inside `[`App.tsx`](src/App.tsx)`) then render inert
+ * so the OUTER element owns the click — otherwise the inner ref would hijack the
+ * gesture and act on the label instead of the href.
+ */
+export const InsideRefContext = createContext(false);
+
+const CODE_CHIP = "rounded bg-raised px-1 py-0.5 font-mono text-[11.5px] text-ink";
 
 /**
  * A file path mentioned in chat, rendered quiet (looks like ordinary text or an
@@ -23,12 +33,14 @@ export function FilePathRef({
   isUrl?: boolean;
   children: ReactNode;
 }) {
+  // Nested under a link/file-ref → stay inert; the outer element owns the gesture.
+  if (useContext(InsideRefContext)) {
+    return <span className={cn(code && CODE_CHIP)}>{children}</span>;
+  }
+
   return (
     <span
-      className={cn(
-        "weft-file-ref",
-        code && "rounded bg-raised px-1 py-0.5 font-mono text-[11.5px] text-ink",
-      )}
+      className={cn("weft-file-ref", code && CODE_CHIP)}
       title={token}
       onClick={(e) => {
         if (!(e.metaKey || e.ctrlKey)) return;
@@ -42,7 +54,7 @@ export function FilePathRef({
         openFileMenu({ x: e.clientX, y: e.clientY, token, cwd, isUrl });
       }}
     >
-      {children}
+      <InsideRefContext.Provider value={true}>{children}</InsideRefContext.Provider>
     </span>
   );
 }

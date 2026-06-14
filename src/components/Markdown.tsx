@@ -3,7 +3,7 @@ import ReactMarkdown, { defaultUrlTransform, type Options } from "react-markdown
 import remarkGfm from "remark-gfm";
 import { api } from "../lib/api";
 import { classifyHref, filePathsRehype, isPathLike } from "../lib/fileLinks";
-import { FilePathRef } from "./FilePathRef";
+import { FilePathRef, InsideRefContext } from "./FilePathRef";
 
 // Script-y schemes are never handed to the DOM href or the OS opener.
 const UNSAFE_HREF = /^\s*(?:javascript|data|vbscript):/i;
@@ -53,7 +53,8 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
                 }}
                 className="text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
               >
-                {children}
+                {/* Inline-code label inside the link stays inert — the <a> owns the click. */}
+                <InsideRefContext.Provider value={true}>{children}</InsideRefContext.Provider>
               </a>
             );
           },
