@@ -9,6 +9,12 @@ pub(crate) fn lead_key(thread_id: i32) -> i64 {
     -(thread_id as i64)
 }
 
+fn log_hidden_feedback_ignored(thread_id: i32, reason: &str) {
+    eprintln!(
+        "[weft] post_lead_tool_result: ignored hidden feedback for thread {thread_id}: {reason}"
+    );
+}
+
 fn ensure_lead_cwd(thread_id: i32) -> anyhow::Result<std::path::PathBuf> {
     let cwd = crate::paths::weft_home()?
         .join("leads")
@@ -50,8 +56,8 @@ The human reviews and confirms in weft; you can re-propose after more discussion
 /// (Task 3-5) keeps growing this block, so it lives as its own const for easy
 /// editing — raw string keeps quotes/JSON readable.
 const SENTINEL_DIRECTIVES: &str = r#"When the user has no suitable repo for the work, render a single-line action card by outputting exactly:
-<weft:action_card>{"title":"...","body":"...","actions":[{"id":"...","label":"...","kind":"add"|"new"|"clone"}]}</weft:action_card>
-Each action's kind must be one of "add" (import existing folder), "new" (create a new repo), or "clone" (clone a remote URL). Use language matching the user's locale for title/body/label. To query the full repo list when the <repo_state> hint is truncated, emit on its own line: <weft:list_repos/> You will receive the reply as <weft:list_repos_result>{...}</weft:list_repos_result>. After a user finishes an action, you will receive <weft:repo_action>{...}</weft:repo_action> with status: ok/error/cancelled."#;
+<weft:action_card>{"title":"...","body":"...","steps":["..."],"actions":[{"id":"...","label":"...","kind":"add"|"new"|"clone"}]}</weft:action_card>
+`steps` is optional; include short setup steps only when they clarify the repo action. Each action's kind must be one of "add" (import existing folder), "new" (create a new repo), or "clone" (clone a remote URL). Use language matching the user's locale for title/body/label. To query the full repo list when the <repo_state> hint is truncated, emit on its own line: <weft:list_repos/> You will receive the reply as <weft:list_repos_result>{...}</weft:list_repos_result>. After a user finishes an action, you will receive <weft:repo_action>{...}</weft:repo_action> with status: ok/error/cancelled."#;
 
 /// The conversational lead prompt. The lead is the human's main collaborator for
 /// the thread: it discusses the work, and the plan EMERGES from that conversation
@@ -145,6 +151,14 @@ pub async fn lead_engine(
             repo_state
         )
     };
+    let stopped = matches!(
+        repo::lead_status(db, thread_id)
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("stopped")
+    );
     let inner = engine::EngineInner {
         thread_id,
         tool: t.lead_tool.clone(),
@@ -165,6 +179,7 @@ pub async fn lead_engine(
         generation: 0,
         pending_skill_refresh: false,
         current_origin_tag: None,
+        stopped,
     };
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(lead_key(thread_id), eng))
@@ -264,10 +279,10 @@ pub struct LeadStateInfo {
 /// 故进行中也 alive=false。若先判 alive 会把正在跑的一轮误报成 "stopped"，切页重挂时
 /// loadLeadChat 便用它覆盖实时 "busy"，「处理中」占位随之消失。turn 结束/进程死时
 /// busy 都会被复位（见 engine.rs on_turn_end / 死亡清理），故 busy 优先是安全的。
-fn lead_state_label(alive: bool, busy: bool) -> &'static str {
+fn lead_state_label(alive: bool, busy: bool, stopped: bool) -> &'static str {
     if busy {
         "busy"
-    } else if !alive {
+    } else if stopped || !alive {
         "stopped"
     } else {
         "idle"
@@ -283,10 +298,11 @@ mod tests {
         // codex app-server 在共享连接上跑 turn，没有 per-turn 子进程，故进行中
         // alive=false。正在跑的一轮必须仍报 "busy"——否则切页重挂时 loadLeadChat
         // 会用陈旧的 "stopped" 覆盖实时态，「处理中」占位消失。（回归）
-        assert_eq!(lead_state_label(false, true), "busy");
-        assert_eq!(lead_state_label(true, true), "busy");
-        assert_eq!(lead_state_label(true, false), "idle");
-        assert_eq!(lead_state_label(false, false), "stopped");
+        assert_eq!(lead_state_label(false, true, true), "busy");
+        assert_eq!(lead_state_label(true, true, false), "busy");
+        assert_eq!(lead_state_label(true, false, false), "idle");
+        assert_eq!(lead_state_label(true, false, true), "stopped");
+        assert_eq!(lead_state_label(false, false, false), "stopped");
     }
 
     #[test]
@@ -297,6 +313,14 @@ mod tests {
             .contains("Use the weft_planner MCP capabilities when they materially affect scope"));
         assert!(!prompt.contains("Start by greeting"));
         assert!(!prompt.contains("call get_task"));
+    }
+
+    #[test]
+    fn lead_prompt_action_card_schema_includes_optional_steps() {
+        let prompt = lead_prompt();
+        assert!(prompt.contains("\"steps\""));
+        assert!(prompt.contains("`steps` is optional"));
+        assert!(prompt.contains("<weft:repo_action>"));
     }
 
     #[test]
@@ -359,7 +383,7 @@ pub async fn lead_state(
                 .map(|c| c.try_wait().ok().flatten().is_none())
                 .unwrap_or(false);
             Ok(LeadStateInfo {
-                state: lead_state_label(alive, i.turn.busy).into(),
+                state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
                 queued: i.turn.queue.len(),
                 native_id: i.native_id.clone(),
                 slash_commands: i.slash_commands.clone(),
@@ -664,6 +688,7 @@ pub(crate) async fn chat_open_worker_impl(
                 generation: 0,
                 pending_skill_refresh: false,
                 current_origin_tag: None,
+                stopped: sess.status == "stopped",
             };
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
             state.get_or_insert(key, e)
@@ -761,6 +786,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         generation: 0,
         pending_skill_refresh: false,
         current_origin_tag: None,
+        stopped: sess.status == "stopped",
     };
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(session_id as i64, e))
@@ -855,49 +881,67 @@ pub async fn flag_lead_skill_refresh(
 /// and delivers it as an invisible user turn so the agent can react without
 /// the result polluting the visible timeline. Respects the turn machine:
 /// mid-turn clicks get queued and flush at the next boundary instead of
-/// shoving JSON between in-flight protocol lines. Does NOT ensure_running —
-/// a click into a dead lead is a no-op (we don't want a card click to
-/// resurrect a stopped engine behind the user's back).
+/// shoving JSON between in-flight protocol lines. Best-effort by design:
+/// stopped leads ignore this hidden feedback, while non-stopped missing
+/// engines are recreated so fast empty-state clicks can still close the loop.
 #[tauri::command]
 pub async fn post_lead_tool_result(
     app: AppHandle,
+    db: State<'_, Db>,
     thread_id: i32,
     payload: serde_json::Value,
+    lang: Option<String>,
 ) -> Result<(), String> {
-    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    post_lead_tool_result_inner(&app, &db, thread_id, payload, lang.as_deref().unwrap_or("en"))
+        .await
+}
+
+async fn post_lead_tool_result_inner(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    payload: serde_json::Value,
+    lang: &str,
+) -> Result<(), String> {
+    let json = match serde_json::to_string(&payload) {
+        Ok(json) => json,
+        Err(e) => {
+            log_hidden_feedback_ignored(thread_id, &e.to_string());
+            return Ok(());
+        }
+    };
     let text = format!("<weft:repo_action>{json}</weft:repo_action>");
     let key = lead_key(thread_id);
-    match app.state::<LeadChatState>().get(key) {
-        Some(eng) => {
-            // TODO: frontend currently can't distinguish delivered vs queued vs
-            // no-engine. Acceptable now — action cards are visual + ephemeral
-            // — revisit if "card click did nothing" debugging gets noisy.
-            let mut inner = eng.lock().await;
-            let out = engine::Outgoing {
-                text,
-                images: vec![],
-                tracked: false,
-                origin_tag: None,
-            };
-            if inner.turn.try_begin_send() {
-                inner.turn_id += 1;
-                inner.clock.begin_turn();
-                // Card-click plumbing starts a turn directly (not via send): keep the
-                // invariant so a prior concierge tag can't leak onto this turn.
-                inner.current_origin_tag = None;
-                // A turn-start must persist `running`, or a crash while the lead
-                // processes this action result leaves the meta row `idle` and boot
-                // revive skips it (same invariant as send/nudge).
-                let db = app.state::<Db>();
-                let _ = repo::set_lead_status(&db, thread_id, "running").await;
-                engine::write_user(&mut inner, &out).await;
-            } else {
-                inner.turn.queue.push_back(out);
+    let eng = match app.state::<LeadChatState>().get(key) {
+        Some(eng) => eng,
+        None => {
+            let stopped = matches!(
+                repo::lead_status(db, thread_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+                Some("stopped")
+            );
+            if stopped {
+                log_hidden_feedback_ignored(thread_id, "lead is stopped");
+                return Ok(());
+            }
+            match lead_engine(app, db, thread_id, lang).await {
+                Ok(eng) => eng,
+                Err(e) => {
+                    log_hidden_feedback_ignored(thread_id, &e.to_string());
+                    return Ok(());
+                }
             }
         }
-        None => {
-            eprintln!("[weft] post_lead_tool_result: no lead engine for thread {thread_id}");
-        }
+    };
+    if let Err(e) = engine::ensure_running(app, db, &eng).await {
+        log_hidden_feedback_ignored(thread_id, &e.to_string());
+        return Ok(());
+    }
+    if let Err(e) = engine::send_hidden_existing(app, db, &eng, text).await {
+        log_hidden_feedback_ignored(thread_id, &e.to_string());
     }
     Ok(())
 }

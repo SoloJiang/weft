@@ -782,23 +782,72 @@ pub async fn next_turn_id(db: &Db, thread_id: i32) -> Result<i32> {
         + 1)
 }
 
-/// Flip the OLDEST queued user message to complete — called when the engine
-/// flushes the front of its FIFO into the process; queue order equals row
-/// insertion order, so position (not content) is the identity. `_text` kept
-/// for telemetry/debug call sites.
-pub async fn complete_queued(db: &Db, thread_id: i32, _text: &str) -> Result<()> {
-    if let Some(m) = lead_message::Entity::find()
+/// Flip the OLDEST queued user message for one lead/worker surface. Queue order
+/// equals row insertion order, so position (not content) is the identity.
+pub async fn complete_queued(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<Option<lead_message::Model>> {
+    update_oldest_queued_status(db, thread_id, session_id, "complete").await
+}
+
+pub async fn fail_queued(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<Vec<lead_message::Model>> {
+    set_queued_status(db, thread_id, session_id, "error").await
+}
+
+pub async fn set_queued_status(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    status: &str,
+) -> Result<Vec<lead_message::Model>> {
+    update_all_queued_status(db, thread_id, session_id, status).await
+}
+
+fn queued_query(thread_id: i32, session_id: Option<i32>) -> sea_orm::Select<lead_message::Entity> {
+    let q = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
         .filter(lead_message::Column::Status.eq("queued"))
-        .order_by_asc(lead_message::Column::Id)
-        .one(&db.0)
-        .await?
-    {
-        let mut a: lead_message::ActiveModel = m.into();
-        a.status = Set("complete".to_string());
-        a.update(&db.0).await?;
+        .order_by_asc(lead_message::Column::Id);
+    match session_id {
+        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
+        None => q.filter(lead_message::Column::SessionId.is_null()),
     }
-    Ok(())
+}
+
+async fn update_oldest_queued_status(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    status: &str,
+) -> Result<Option<lead_message::Model>> {
+    if let Some(m) = queued_query(thread_id, session_id).one(&db.0).await? {
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set(status.to_string());
+        return Ok(Some(a.update(&db.0).await?));
+    }
+    Ok(None)
+}
+
+async fn update_all_queued_status(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    status: &str,
+) -> Result<Vec<lead_message::Model>> {
+    let rows = queued_query(thread_id, session_id).all(&db.0).await?;
+    let mut updated = Vec::with_capacity(rows.len());
+    for m in rows {
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set(status.to_string());
+        updated.push(a.update(&db.0).await?);
+    }
+    Ok(updated)
 }
 
 /// The lead's persisted engine metadata (native session id) lives in a single
@@ -1061,17 +1110,30 @@ mod tests {
         // Pre-fix rows: status was a write-once high-water-mark, so an idle worker
         // reads "running" (or "starting" before it ever attached).
         let running = create_session(&db, 1, 1, "codex", "/tmp/a").await.unwrap();
-        set_session_status(&db, running.id, "running").await.unwrap();
+        set_session_status(&db, running.id, "running")
+            .await
+            .unwrap();
         let starting = create_session(&db, 2, 1, "codex", "/tmp/b").await.unwrap();
-        set_session_status(&db, starting.id, "starting").await.unwrap();
+        set_session_status(&db, starting.id, "starting")
+            .await
+            .unwrap();
         let idle = create_session(&db, 3, 1, "codex", "/tmp/c").await.unwrap();
         set_session_status(&db, idle.id, "idle").await.unwrap();
 
         reset_stale_running_sessions(&db.0).await.unwrap();
 
-        assert_eq!(get_session(&db, running.id).await.unwrap().unwrap().status, "idle");
-        assert_eq!(get_session(&db, starting.id).await.unwrap().unwrap().status, "idle");
-        assert_eq!(get_session(&db, idle.id).await.unwrap().unwrap().status, "idle");
+        assert_eq!(
+            get_session(&db, running.id).await.unwrap().unwrap().status,
+            "idle"
+        );
+        assert_eq!(
+            get_session(&db, starting.id).await.unwrap().unwrap().status,
+            "idle"
+        );
+        assert_eq!(
+            get_session(&db, idle.id).await.unwrap().unwrap().status,
+            "idle"
+        );
     }
     #[tokio::test]
     async fn queued_flips_to_complete() {
@@ -1088,9 +1150,59 @@ mod tests {
         )
         .await
         .unwrap();
-        complete_queued(&db, 2, "later").await.unwrap();
+        let updated = complete_queued(&db, 2, None).await.unwrap().unwrap();
+        assert_eq!(updated.status, "complete");
         let all = list_lead_messages(&db, 2).await.unwrap();
         assert_eq!(all[0].status, "complete");
+    }
+
+    #[tokio::test]
+    async fn queued_status_updates_are_session_scoped() {
+        let db = mem().await;
+        let lead = insert_lead_message(
+            &db,
+            7,
+            None,
+            1,
+            "user",
+            "text",
+            r#"{"text":"lead"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
+        let worker = insert_lead_message(
+            &db,
+            7,
+            Some(3),
+            1,
+            "user",
+            "text",
+            r#"{"text":"worker"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
+
+        let completed = complete_queued(&db, 7, Some(3)).await.unwrap().unwrap();
+        assert_eq!(completed.id, worker.id);
+        let failed = set_queued_status(&db, 7, None, "interrupted")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            failed.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![lead.id]
+        );
+        let all = list_lead_messages(&db, 7).await.unwrap();
+        assert_eq!(
+            all.iter().find(|m| m.id == worker.id).unwrap().status,
+            "complete"
+        );
+        assert_eq!(
+            all.iter().find(|m| m.id == lead.id).unwrap().status,
+            "interrupted"
+        );
     }
 
     #[tokio::test]
@@ -1112,7 +1224,10 @@ mod tests {
         let db = mem().await;
         let s = create_session(&db, 1, 1, "codex", "/tmp/wt").await.unwrap();
         set_session_status(&db, s.id, "idle").await.unwrap();
-        assert_eq!(get_session(&db, s.id).await.unwrap().unwrap().status, "idle");
+        assert_eq!(
+            get_session(&db, s.id).await.unwrap().unwrap().status,
+            "idle"
+        );
         set_session_status(&db, s.id, "running").await.unwrap();
         assert_eq!(
             get_session(&db, s.id).await.unwrap().unwrap().status,
@@ -1125,13 +1240,22 @@ mod tests {
         let db = mem().await;
         set_lead_native_id(&db, 7, "nat-xyz").await.unwrap();
         set_lead_status(&db, 7, "running").await.unwrap();
-        assert_eq!(lead_status(&db, 7).await.unwrap().as_deref(), Some("running"));
-        assert_eq!(lead_native_id(&db, 7).await.unwrap().as_deref(), Some("nat-xyz"));
+        assert_eq!(
+            lead_status(&db, 7).await.unwrap().as_deref(),
+            Some("running")
+        );
+        assert_eq!(
+            lead_native_id(&db, 7).await.unwrap().as_deref(),
+            Some("nat-xyz")
+        );
         // opposite write order must also coexist (status first, native id second)
         set_lead_status(&db, 8, "idle").await.unwrap();
         set_lead_native_id(&db, 8, "nat-8").await.unwrap();
         assert_eq!(lead_status(&db, 8).await.unwrap().as_deref(), Some("idle"));
-        assert_eq!(lead_native_id(&db, 8).await.unwrap().as_deref(), Some("nat-8"));
+        assert_eq!(
+            lead_native_id(&db, 8).await.unwrap().as_deref(),
+            Some("nat-8")
+        );
     }
 
     #[tokio::test]

@@ -54,8 +54,8 @@ export const api = {
     invoke<RepoRef>("clone_repo", { workspaceId, url, dest, name }),
   createRepo: (workspaceId: number, name: string, dest: string) =>
     invoke<RepoRef>("create_repo", { workspaceId, name, dest }),
-  postLeadToolResult: (threadId: number, payload: unknown) =>
-    invoke<void>("post_lead_tool_result", { threadId, payload }),
+  postLeadToolResult: (threadId: number, payload: unknown, lang: string) =>
+    invoke<void>("post_lead_tool_result", { threadId, payload, lang }),
 
   // Repo map (curator): profiles + cross-repo dependency graph.
   repoGraph: (workspaceId: number) =>
