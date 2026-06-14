@@ -72,10 +72,20 @@ export function ChatTimeline({
     .reduce((n, m) => n + m.content.length, 0);
   useEffect(() => {
     if (!atBottomRef.current || visible.length === 0) return;
-    // Scroll to the true list bottom — past the Footer (activity line + bottom
-    // padding), which renders after the last item — so the live tool/working
-    // indicator stays visible while following, not just the last message row.
-    virtuosoRef.current?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: "auto" });
+    // Single source of truth for bottom-follow: scroll to the absolute list
+    // bottom — past the Footer (activity line + bottom padding) which renders
+    // after the last item — so appended rows, intra-message streaming growth,
+    // and the live tool/working indicator all stay in view. scrollTo (not
+    // scrollToIndex, which would align only the last row) targets the true
+    // bottom. The next-frame re-scroll catches a freshly appended row whose
+    // height Virtuoso hasn't measured yet, where the first scrollTo would land
+    // just short of the bottom.
+    const v = virtuosoRef.current;
+    v?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: "auto" });
+    const raf = requestAnimationFrame(() =>
+      v?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior: "auto" }),
+    );
+    return () => cancelAnimationFrame(raf);
   }, [visible.length, lastTextLen, busy, activity]);
 
   if (visible.length === 0 && !busy) {
@@ -105,10 +115,8 @@ export function ChatTimeline({
         initialTopMostItemIndex={
           visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
         }
-        // Smoothly follow newly appended message rows (count changes) while the
-        // user is at the bottom; intra-message streaming growth is handled by the
-        // effect above. Returning false when scrolled up preserves "don't yank".
-        followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
+        // Tracks whether the user is parked at the bottom; the effect above reads
+        // this to decide whether to follow growth or leave the reader alone.
         atBottomStateChange={(atBottom) => {
           atBottomRef.current = atBottom;
         }}
