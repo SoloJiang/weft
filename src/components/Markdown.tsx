@@ -36,6 +36,8 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
         components={{
           a: ({ href, children }) => {
             if (!href) return <>{children}</>;
+            // In-page anchor: let the DOM handle the jump, never the OS opener.
+            if (href.startsWith("#")) return <a href={href}>{children}</a>;
             const c = classifyHref(href);
             if (c.kind === "file") {
               return (

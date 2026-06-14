@@ -94,7 +94,13 @@ const MANIFEST_RE = new RegExp(`(?:^|[/\\\\])(?:${MANIFEST})$`);
 export function isPathLike(token: string, allowSpaces = false): boolean {
   const { path } = parsePathToken(token);
   if (!path) return false;
-  if (!allowSpaces && /\s/.test(path)) return false;
+  if (/\s/.test(path)) {
+    // Spaces are allowed only for inline-code tokens, and only when the path is
+    // ANCHORED (absolute / ~ / ./ / drive) — this rejects commands whose first
+    // space-separated token is a bare word, e.g. `cat src/App.tsx`, while still
+    // accepting real spaced paths like `~/Library/Application Support/x.json`.
+    if (!allowSpaces || !/^(\/|~[\\/]?|\.\.?[\\/]|[a-zA-Z]:[\\/])/.test(path)) return false;
+  }
   if (/^(\/|\\|~[\\/]?|\.\.?[\\/])/.test(path)) return true; // /abs \abs ~ ~/ ~\ ./ .\ ../ ..\
   if (WIN_DRIVE.test(path)) return true;
   if (EXT_RE.test(path)) return true; // foo.ts, a/b/foo.ts, a\b\foo.ts (known extension)
