@@ -85,7 +85,10 @@ fn map_resolve_err(e: ResolveErr) -> String {
 /// Turn a raw path token from chat into an absolute, existing path.
 fn resolve_chat_path(token: &str, cwd: Option<&str>) -> Result<PathBuf, ResolveErr> {
     let trimmed = token.trim();
-    let body = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    // Strip the `file://` scheme + optional `localhost` authority, then any URL
+    // fragment/query (`#L42`, `#usage`, `?v=`) — like `:line`, the opener can't
+    // use it.
+    let body = strip_fragment(strip_file_scheme(trimmed));
     // Markdown link hrefs (and `file://` URIs) are percent-encoded — a space is
     // `%20` — so decode every token. Bare/inline literal paths rarely contain a
     // literal `%XX`, so this is safe in practice.
@@ -137,17 +140,39 @@ fn strip_line_suffix(s: &str) -> &str {
     result
 }
 
-/// Expand a leading `~` / `~/` to the user's home directory; otherwise verbatim.
+/// Expand a leading `~`, `~/`, or `~\` to the user's home directory; else verbatim.
 fn expand_tilde(s: &str) -> PathBuf {
     if s == "~" {
         return home_dir().unwrap_or_else(|| PathBuf::from(s));
     }
-    if let Some(rest) = s.strip_prefix("~/") {
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
         if let Some(home) = home_dir() {
             return home.join(rest);
         }
     }
     PathBuf::from(s)
+}
+
+/// Strip a `file://` scheme and an optional `localhost` authority, leaving the
+/// path body. `file:///p` → `/p`; `file://localhost/p` → `/p`. Non-URI tokens
+/// (and a relative `localhost/…` dir) are returned untouched.
+fn strip_file_scheme(token: &str) -> &str {
+    match token.strip_prefix("file://") {
+        Some(rest) => match rest.strip_prefix("localhost") {
+            Some(after) if after.starts_with('/') => after,
+            _ => rest,
+        },
+        None => token,
+    }
+}
+
+/// Drop a trailing URL fragment/query (`#L42`, `#usage`, `?v=1`). The opener
+/// can't act on it and it would otherwise break the existence check.
+fn strip_fragment(s: &str) -> &str {
+    match s.find(['#', '?']) {
+        Some(i) => &s[..i],
+        None => s,
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -230,6 +255,7 @@ mod tests {
         if let Some(home) = home_dir() {
             assert_eq!(expand_tilde("~"), home);
             assert_eq!(expand_tilde("~/a/b"), home.join("a/b"));
+            assert!(expand_tilde("~\\a").starts_with(&home)); // Windows-style ~\
         }
         assert_eq!(expand_tilde("plain/rel"), PathBuf::from("plain/rel"));
     }
@@ -292,6 +318,23 @@ mod tests {
         );
         assert_eq!(strip_leading_drive_slash("/Users/me/x".into()), "/Users/me/x");
         assert_eq!(strip_leading_drive_slash("relative/x".into()), "relative/x");
+    }
+
+    #[test]
+    fn strips_file_scheme_and_localhost_authority() {
+        assert_eq!(strip_file_scheme("file:///Users/me/x"), "/Users/me/x");
+        assert_eq!(strip_file_scheme("file://localhost/Users/me/x"), "/Users/me/x");
+        assert_eq!(strip_file_scheme("file://localhost/C:/repo"), "/C:/repo");
+        assert_eq!(strip_file_scheme("localhost/foo"), "localhost/foo"); // non-URI, untouched
+        assert_eq!(strip_file_scheme("/plain/path"), "/plain/path");
+    }
+
+    #[test]
+    fn strips_url_fragment_and_query() {
+        assert_eq!(strip_fragment("README.md#usage"), "README.md");
+        assert_eq!(strip_fragment("/repo/App.tsx#L42"), "/repo/App.tsx");
+        assert_eq!(strip_fragment("a/b?v=1"), "a/b");
+        assert_eq!(strip_fragment("plain/path.rs"), "plain/path.rs");
     }
 
     #[test]
