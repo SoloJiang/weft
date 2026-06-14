@@ -73,11 +73,21 @@ pub enum Push {
     },
     /// The tool call currently executing — transient: rendered while it runs,
     /// replaced by the next one, cleared by the Turn event. Never persisted.
+    /// Used for codex pills, which carry no input/output to expand.
     Activity {
         thread_id: i32,
         session_id: Option<i32>,
         name: String,
         summary: String,
+    },
+    /// A persisted `kind:"tool"` row received its result: replace the row's
+    /// content (now carrying output) and status. Pairs with the earlier
+    /// Push::Message that inserted the running row.
+    ToolResult {
+        thread_id: i32,
+        message_id: i32,
+        content: String,
+        status: String,
     },
 }
 
@@ -300,9 +310,39 @@ async fn rollback_failed_visible_turn(
     rollback_failed_turn(app, db, eng, turn_id).await;
 }
 
+/// Finalize tool rows still awaiting a result, marking each `status` and pushing
+/// the update. Called wherever a turn ends — clean TurnEnd, stop/takeover,
+/// runaway kill, or process EOF — so a `tool_use` whose `tool_result` never
+/// arrived stops spinning in the timeline and the DB.
+async fn finalize_orphan_tool_rows(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    rows: Vec<(i32, serde_json::Value)>,
+    status: &str,
+) {
+    for (row_id, content) in rows {
+        let content_str = content.to_string();
+        let _ = repo::update_lead_message(db, row_id, &content_str, status).await;
+        let _ = app.emit(
+            EVENT,
+            Push::ToolResult {
+                thread_id,
+                message_id: row_id,
+                content: content_str,
+                status: status.into(),
+            },
+        );
+    }
+}
+
 async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fallback_status: &str) {
     let mut inner = eng.lock().await;
-    if !inner.turn.busy && inner.current.is_none() && inner.turn.queue.is_empty() {
+    if !inner.turn.busy
+        && inner.current.is_none()
+        && inner.turn.queue.is_empty()
+        && inner.tool_rows.is_empty()
+    {
         return;
     }
     let thread_id = inner.thread_id;
@@ -315,6 +355,8 @@ async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fa
         fallback_status
     };
     let current = inner.current.take().map(|(id, text, _)| (id, text));
+    let orphan_tools: Vec<(i32, serde_json::Value)> =
+        inner.tool_rows.drain().map(|(_, v)| v).collect();
     inner.interrupting = false;
     inner.child = None;
     inner.stdin = None;
@@ -359,6 +401,7 @@ async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fa
             }
         }
     }
+    finalize_orphan_tool_rows(app, db, thread_id, orphan_tools, status).await;
     mark_queued_status(app, db, thread_id, session_id, status).await;
 }
 
@@ -465,6 +508,11 @@ pub struct EngineInner {
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
     pub current_origin_tag: Option<String>,
+    /// Maps an in-flight tool call's id (claude `tool_use_id`) to its persisted
+    /// `kind:"tool"` row id and current content JSON, so the out-of-band tool
+    /// result can merge its output without re-reading the row. Cleared at each
+    /// turn boundary; codex pills never populate it.
+    pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
     /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
     /// engines; explicit sends/ensure clear this and restart as needed.
     pub stopped: bool,
@@ -655,8 +703,11 @@ pub async fn send(
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
     let pending = { eng.lock().await.pending_skill_refresh };
     if pending {
-        let _ = stop_quiet(eng).await;
+        let (tid, _sid, _current, orphans) = stop_quiet(eng).await;
         eng.lock().await.pending_skill_refresh = false;
+        // The bounce fires from idle, so orphans is normally empty; finalize
+        // defensively so a still-open tool row can't outlive the bounce.
+        finalize_orphan_tool_rows(app, db, tid, orphans, "interrupted").await;
     }
     ensure_running_for_send(app, db, eng).await?;
     let mut inner = eng.lock().await;
@@ -921,14 +972,14 @@ async fn codex_consumer(
                 let inner = eng.lock().await;
                 let (thread_id, sid) = (inner.thread_id, inner.session_id);
                 drop(inner);
-                for (name, summary) in tools {
+                for tool in tools {
                     let _ = app.emit(
                         EVENT,
                         Push::Activity {
                             thread_id,
                             session_id: sid,
-                            name,
-                            summary,
+                            name: tool.name,
+                            summary: tool.summary,
                         },
                     );
                 }
@@ -1343,10 +1394,18 @@ pub fn spawn_watchdog(app: AppHandle) {
 /// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
-pub async fn stop_quiet(eng: &EngineRef) -> (i32, Option<i32>, Option<(i32, String)>) {
+pub async fn stop_quiet(
+    eng: &EngineRef,
+) -> (i32, Option<i32>, Option<(i32, String)>, Vec<(i32, serde_json::Value)>) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let current = inner.current.take().map(|(id, text, _)| (id, text));
+    // Drain tool rows still awaiting a result, but DON'T finalize here: the
+    // caller makes the stop visible (sets `stopped`) first. Awaiting DB/event
+    // work while the engine is reset-but-not-yet-stopped would let a concurrent
+    // send start a turn on the idle engine that we'd then wrongly mark stopped.
+    let orphan_tools: Vec<(i32, serde_json::Value)> =
+        inner.tool_rows.drain().map(|(_, v)| v).collect();
     inner.generation += 1; // orphan the reader so EOF handling is ours
     if let Some(c) = inner.child.as_mut() {
         let _ = c.kill().await;
@@ -1355,7 +1414,7 @@ pub async fn stop_quiet(eng: &EngineRef) -> (i32, Option<i32>, Option<(i32, Stri
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
-    (target.0, target.1, current)
+    (target.0, target.1, current, orphan_tools)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -1365,12 +1424,15 @@ pub async fn stop_quiet(eng: &EngineRef) -> (i32, Option<i32>, Option<(i32, Stri
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, current) = stop_quiet(eng).await;
+    let (thread_id, session_id, current, orphans) = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
     if let Some(db) = app.try_state::<Db>() {
         persist_activity(&db, session_id, thread_id, STATUS_STOPPED).await;
+        // Stop is now visible to the engine, so finalizing here can't race a
+        // concurrent send into a turn we'd wrongly kill.
+        finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
         if let Some((id, text)) = current {
             let _ = repo::update_lead_message(
                 &db,
@@ -1701,16 +1763,90 @@ fn spawn_reader(
                             }
                         }
                     }
-                    // Tool calls are transient activity, not timeline rows:
-                    // show the one currently running, gone when the turn moves on.
-                    for (name, summary) in tools {
+                    // Codex exec items carry no input/output to expand, so they
+                    // stay transient activity pills; claude/opencode tool calls
+                    // become persisted, expandable `kind:"tool"` rows.
+                    if inner.tool == "codex" {
+                        for tool in tools {
+                            let _ = app.emit(
+                                EVENT,
+                                Push::Activity {
+                                    thread_id,
+                                    session_id: inner.session_id,
+                                    name: tool.name,
+                                    summary: tool.summary,
+                                },
+                            );
+                        }
+                    } else {
+                        for call in tools {
+                            let (sid, turn) = (inner.session_id, inner.turn_id);
+                            // No output yet (claude `tool_use`) → a running row to
+                            // be filled by a later ToolResults; output already
+                            // present (opencode completed) → a final row in one shot.
+                            let running = call.output.is_none();
+                            let status = if running {
+                                "streaming"
+                            } else if call.is_error {
+                                "error"
+                            } else {
+                                "complete"
+                            };
+                            let content = serde_json::json!({
+                                "name": call.name,
+                                "summary": call.summary,
+                                "input": call.input,
+                                "output": call.output.unwrap_or_default(),
+                                "is_error": call.is_error,
+                            });
+                            let content_str = content.to_string();
+                            let call_id = call.id;
+                            match repo::insert_lead_message(
+                                &db, thread_id, sid, turn, "assistant", "tool",
+                                &content_str, status,
+                            )
+                            .await
+                            {
+                                Ok(m) => {
+                                    let row_id = m.id;
+                                    let _ = app.emit(
+                                        EVENT,
+                                        Push::Message { thread_id, message: m },
+                                    );
+                                    if running && !call_id.is_empty() {
+                                        inner.tool_rows.insert(call_id, (row_id, content));
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[weft] lead tool row insert failed: {e}")
+                                }
+                            }
+                        }
+                    }
+                }
+                super::proto::ChatEvent::ToolResults { items } => {
+                    // Fill in the output of running tool rows — claude delivers
+                    // results out-of-band as a `user` turn. A result for a row we
+                    // never tracked is dropped rather than left orphaned.
+                    for item in items {
+                        let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id)
+                        else {
+                            continue;
+                        };
+                        if let Some(obj) = content.as_object_mut() {
+                            obj.insert("output".into(), item.output.into());
+                            obj.insert("is_error".into(), item.is_error.into());
+                        }
+                        let status = if item.is_error { "error" } else { "complete" };
+                        let content_str = content.to_string();
+                        let _ = repo::update_lead_message(&db, row_id, &content_str, status).await;
                         let _ = app.emit(
                             EVENT,
-                            Push::Activity {
+                            Push::ToolResult {
                                 thread_id,
-                                session_id: inner.session_id,
-                                name,
-                                summary,
+                                message_id: row_id,
+                                content: content_str,
+                                status: status.into(),
                             },
                         );
                     }
@@ -1724,6 +1860,12 @@ fn spawn_reader(
                         "complete"
                     };
                     inner.interrupting = false;
+                    // Finalize any tool rows still awaiting a result — an
+                    // interrupted or errored turn can leave a `tool_use` without
+                    // its `tool_result`, which would otherwise spin forever.
+                    let orphans: Vec<(i32, serde_json::Value)> =
+                        inner.tool_rows.drain().map(|(_, v)| v).collect();
+                    finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
                     if let Some((id, text, _)) = inner.current.take() {
                         let _ = repo::update_lead_message(
                             &db,
@@ -1931,6 +2073,11 @@ fn spawn_reader(
             let thread_id = inner.thread_id;
             let session_id = inner.session_id;
             inner.interrupting = false;
+            // claude's long-lived process died mid-turn: finalize any tool rows
+            // still awaiting a result so they don't spin forever in the timeline.
+            let orphans: Vec<(i32, serde_json::Value)> =
+                inner.tool_rows.drain().map(|(_, v)| v).collect();
+            finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
             if let Some((id, text, _)) = inner.current.take() {
                 let _ = repo::update_lead_message(
                     &db,
@@ -2201,6 +2348,7 @@ mod tests {
             generation: 0,
             pending_skill_refresh: false,
             current_origin_tag: None,
+            tool_rows: std::collections::HashMap::new(),
             stopped: false,
         }
     }
@@ -2336,6 +2484,7 @@ mod tests {
             generation: 0,
             pending_skill_refresh: false,
             current_origin_tag: None,
+            tool_rows: std::collections::HashMap::new(),
             stopped: false,
         };
         let fresh = build_args(&inner);

@@ -1,7 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, FileText, Sparkles } from "lucide-react";
+import { ArrowRight, ChevronRight, FileText, Sparkles } from "lucide-react";
 import type { LeadMessage } from "../lib/types";
 import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
@@ -53,9 +53,10 @@ export function ChatTimeline({
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
 
-  // Tool rows (legacy imports / older builds) are hidden: tool calls render
-  // only while running, via the activity bar below the list.
-  const visible = messages.filter((m) => m.kind !== "meta" && m.kind !== "tool");
+  // Tool calls (claude/opencode) render inline as expandable `kind:"tool"` rows;
+  // only `meta` bookkeeping rows are hidden. (Codex tools still arrive as the
+  // transient activity bar below the list.)
+  const visible = messages.filter((m) => m.kind !== "meta");
 
   // Virtuoso's followOutput only fires on item-COUNT changes, so it misses
   // intra-message streaming growth (text appended to the existing last row).
@@ -67,13 +68,13 @@ export function ChatTimeline({
   // before scrolling — so there is no scrollTo(MAX)/rAF drift to correct, and
   // because the activity bar lives OUTSIDE the scroller the last row is the
   // unambiguous bottom.
-  const lastTextLen = visible
-    .filter((m) => m.kind === "text")
+  const growthLen = visible
+    .filter((m) => m.kind === "text" || m.kind === "tool")
     .reduce((n, m) => n + m.content.length, 0);
   useEffect(() => {
     if (!atBottomRef.current || visible.length === 0) return;
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
-  }, [visible.length, lastTextLen, busy, activity]);
+  }, [visible.length, growthLen, busy, activity]);
 
   if (visible.length === 0 && !busy) {
     return (
@@ -265,6 +266,126 @@ function ActivityLine({ name, summary }: { name: string; summary: string }) {
   );
 }
 
+/**
+ * A persisted tool call (claude/opencode): a compact collapsed line — icon +
+ * tool label + target + a status dot — that expands to show the full input and
+ * the tool's output. `status` mirrors the row: "streaming" = running,
+ * "complete"/"error" = finished.
+ */
+function ToolRow({ m }: { m: LeadMessage }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const c = parse(m.content);
+  const name = typeof c.name === "string" ? c.name : "tool";
+  const summary = typeof c.summary === "string" ? c.summary : "";
+  const output = typeof c.output === "string" ? c.output : "";
+  const inputText = formatToolValue(c.input);
+  const running = m.status === "streaming";
+  const isError = c.is_error === true || m.status === "error";
+  const Icon = toolIcon(name);
+  const labelKey = toolLabelKey(name);
+  const label = labelKey === "session.toolCalling" ? cleanToolName(name) : t(labelKey);
+  const { target } = compactToolTarget(name, summary);
+  const hasDetail = inputText.length > 0 || output.length > 0;
+
+  return (
+    <div className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface/60">
+      <button
+        type="button"
+        disabled={!hasDetail}
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
+          hasDetail && "hover:bg-surface",
+        )}
+      >
+        <span
+          className={cn(
+            "h-1.5 w-1.5 shrink-0 rounded-full",
+            running ? "animate-pulse bg-running" : isError ? "bg-danger" : "bg-ink-faint",
+          )}
+        />
+        <Icon size={14} className="shrink-0 text-ink-faint" />
+        <span className="shrink-0 font-medium text-ink-muted">{label}</span>
+        {(target || summary) && (
+          <span className="min-w-0 truncate font-mono text-brand">{target || summary}</span>
+        )}
+        {hasDetail && (
+          <ChevronRight
+            size={13}
+            className={cn(
+              "ml-auto shrink-0 text-ink-faint transition-transform",
+              open && "rotate-90",
+            )}
+          />
+        )}
+      </button>
+      {open && hasDetail && (
+        <div className="space-y-2 border-t border-border px-2.5 py-2">
+          {inputText && <ToolBlock label={t("tool.input")} body={inputText} />}
+          {output && (
+            <ToolBlock label={t("tool.output")} body={output} tone={isError ? "error" : "default"} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A labeled monospace block inside an expanded tool row, with show-more past a
+ *  line budget so a huge stdout/diff doesn't blow up the timeline. */
+function ToolBlock({
+  label,
+  body,
+  tone = "default",
+}: {
+  label: string;
+  body: string;
+  tone?: "default" | "error";
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const lines = body.split("\n");
+  const LIMIT = 20;
+  const long = lines.length > LIMIT;
+  const shown = expanded || !long ? body : lines.slice(0, LIMIT).join("\n");
+  return (
+    <div>
+      <p className="mb-1 text-[10.5px] font-medium uppercase tracking-wide text-ink-faint">
+        {label}
+      </p>
+      <pre
+        className={cn(
+          "max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-bg px-2 py-1.5 font-mono text-[11.5px] leading-relaxed",
+          tone === "error" ? "text-danger" : "text-ink-muted",
+        )}
+      >
+        {shown}
+      </pre>
+      {long && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1 text-[11px] text-brand hover:underline"
+        >
+          {expanded ? t("tool.showLess") : t("tool.showMore", { n: lines.length - LIMIT })}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Render a tool input for display: strings verbatim, objects pretty-printed. */
+function formatToolValue(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
 function parse(content: string): Record<string, unknown> {
   try {
     return JSON.parse(content) as Record<string, unknown>;
@@ -289,9 +410,14 @@ function safeParseObj(content: string): Record<string, unknown> {
 
 // Read-only history replay: only the most recent assistant row is interactive.
 // Older action_cards stay rendered for context but their buttons are disabled.
+// Tool rows are role:"assistant" too: skip only those from m's OWN turn (a card
+// and the tools it kicked off share a turn) so they don't read-only the card —
+// but a LATER turn's tool rows are genuine newer activity and must disqualify it.
 function isLastAssistant(m: LeadMessage, all: LeadMessage[]): boolean {
   for (let i = all.length - 1; i >= 0; i--) {
-    if (all[i].role === "assistant") return all[i].id === m.id;
+    const row = all[i];
+    if (row.kind === "tool" && row.turn_id === m.turn_id) continue;
+    if (row.role === "assistant") return row.id === m.id;
   }
   return false;
 }
@@ -317,6 +443,10 @@ function TimelineRow({
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
+
+  if (m.kind === "tool") {
+    return <ToolRow m={m} />;
+  }
 
   if (m.kind === "action_card") {
     const parsed = safeParseObj(m.content);

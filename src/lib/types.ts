@@ -164,12 +164,22 @@ export type LeadChatPush =
       slash_commands: SlashCmd[];
     }
   | {
-      /** The tool call currently executing — transient, cleared by `turn`. */
+      /** The tool call currently executing — transient, cleared by `turn`.
+       *  Used for codex pills, which have no input/output to expand. */
       type: "activity";
       thread_id: number;
       session_id: number | null;
       name: string;
       summary: string;
+    }
+  | {
+      /** A persisted `kind:"tool"` row received its result: replace the row's
+       *  content (now carrying output) and its status. */
+      type: "tool_result";
+      thread_id: number;
+      message_id: number;
+      content: string;
+      status: string;
     };
 
 /** One slash command for the composer palette: the token plus whatever metadata

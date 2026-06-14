@@ -1038,6 +1038,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               : x,
           ),
         }));
+      } else if (p.type === "tool_result") {
+        // A running tool row got its output: replace content + status in place.
+        setLeadMessages((m) => ({
+          ...m,
+          [p.thread_id]: (m[p.thread_id] ?? []).map((x) =>
+            x.id === p.message_id
+              ? { ...x, content: p.content, status: p.status as LeadMessage["status"] }
+              : x,
+          ),
+        }));
       } else if (p.type === "activity") {
         const act = { name: p.name, summary: p.summary };
         if (p.session_id != null) {

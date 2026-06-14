@@ -194,7 +194,10 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                 }),
                 Some(kind) => Some(ChatEvent::Assistant {
                     texts: vec![],
-                    tools: vec![(kind.to_string(), item_summary(kind, item))],
+                    tools: vec![crate::lead_chat::proto::ToolCall::pill(
+                        kind,
+                        item_summary(kind, item),
+                    )],
                 }),
             }
         }
@@ -576,7 +579,9 @@ mod tests {
             &json!({"item":{"id":"i","type":"commandExecution","command":"npm test"}}),
         ) {
             Some(ChatEvent::Assistant { tools, .. }) => {
-                assert_eq!(tools[0], ("commandExecution".into(), "npm test".into()));
+                assert_eq!(tools[0].name, "commandExecution");
+                assert_eq!(tools[0].summary, "npm test");
+                assert!(tools[0].id.is_empty());
             }
             e => panic!("{e:?}"),
         }
