@@ -16,7 +16,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::lead_chat::proto::SlashCmd;
+use crate::lead_chat::proto::{McpServer, SlashCmd};
+use crate::session_meta::{find_model_context, parse_opencode_mcp};
 
 #[derive(Default)]
 struct Serve {
@@ -70,6 +71,67 @@ async fn discover_inner(cwd: &str) -> anyhow::Result<Vec<SlashCmd>> {
             })
         })
         .collect())
+}
+
+/// 会话信息面板(M2):复用 app-lifetime serve,取 `GET /mcp`(server + 状态)与
+/// `GET /config/providers`(按 providerID+id 找 `limit.context`)。两个请求**互不拖累**——
+/// provider 查询失败/超时不会丢掉已取到的 server。servers = Some 表示成功(即使空,权威);
+/// None 表示 `/mcp` 本身失败(前端保留旧行)。
+pub async fn server_window_and_mcp(
+    cwd: &str,
+    provider_id: Option<&str>,
+    model_id: Option<&str>,
+) -> (Option<u64>, Option<Vec<McpServer>>) {
+    let Ok(base) = ensure_base().await else {
+        return (None, None);
+    };
+    let client = reqwest::Client::new();
+    let servers = fetch_mcp_servers(&client, &base, cwd).await;
+    let window = match model_id {
+        Some(mid) => fetch_model_window(&client, &base, cwd, provider_id, mid).await,
+        None => None,
+    };
+    (window, servers)
+}
+
+async fn fetch_mcp_servers(client: &reqwest::Client, base: &str, cwd: &str) -> Option<Vec<McpServer>> {
+    let v: serde_json::Value = client
+        .get(format!("{base}/mcp"))
+        .query(&[("directory", cwd)])
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    // 对象 body → Some(可空,空 `{}` 即权威无 server);非对象(2xx 但畸形)→ None,
+    // 与 HTTP 失败一样保留旧行,不把"没读懂"当成"没有"。
+    parse_opencode_mcp(&v)
+}
+
+async fn fetch_model_window(
+    client: &reqwest::Client,
+    base: &str,
+    cwd: &str,
+    provider_id: Option<&str>,
+    model_id: &str,
+) -> Option<u64> {
+    let v: serde_json::Value = client
+        .get(format!("{base}/config/providers"))
+        .query(&[("directory", cwd)])
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    find_model_context(&v, provider_id, model_id)
 }
 
 /// Return the base URL of a live serve, (re)spawning if the prior one died.

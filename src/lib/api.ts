@@ -23,6 +23,7 @@ import type {
   RepoRef,
   ResolvedProposal,
   SessionInfo,
+  SessionMetaSnapshot,
   SkillSource,
   SlashCmd,
   Thread,
@@ -118,6 +119,9 @@ export const api = {
   leadStop: (threadId: number) => invoke<void>("lead_stop", { threadId }),
   leadState: (threadId: number) =>
     invoke<LeadStateInfo>("lead_state", { threadId }),
+  /** Band-outside meta for a non-claude lead (null for claude — event-fed). */
+  leadSessionMeta: (threadId: number) =>
+    invoke<SessionMetaSnapshot | null>("lead_session_meta", { threadId }),
   listLeadMessages: (threadId: number) =>
     invoke<LeadMessage[]>("list_lead_messages", { threadId }),
   /** Live (actually-running) worker engines the backend wants the frontend to
@@ -148,6 +152,8 @@ export const api = {
   chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),
   sessionFor: (directionId: number, repoId: number) =>
     invoke<ObserveRef | null>("session_for", { directionId, repoId }),
+  sessionMeta: (directionId: number, repoId: number) =>
+    invoke<SessionMetaSnapshot>("session_meta", { directionId, repoId }),
   readTranscript: (cwd: string, tool: string) =>
     invoke<NormEvent[]>("read_transcript", { cwd, tool }),
   worktreeDiff: (cwd: string) =>

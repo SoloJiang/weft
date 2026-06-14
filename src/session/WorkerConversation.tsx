@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { GitCompare } from "lucide-react";
+import { GitCompare, Info } from "lucide-react";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
-import type { ObserveRef } from "../lib/types";
+import type { EnabledSkill, ObserveRef } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
 import { ChatComposer } from "./ChatComposer";
 import { DiffPanel } from "./DiffPanel";
+import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { appLink, resumeCommand } from "../lib/resume";
@@ -25,17 +26,24 @@ export function WorkerConversation() {
     workerTurn,
     workerSlash,
     workerActivity,
+    workerMeta,
+    hydrateWorkerMeta,
+    mergeWorkerMeta,
     discoverWorkerSlash,
     loadLeadChat,
     needs,
     answerAsk,
     sendToWorker,
     activeThreadId,
+    activeWorkspaceId,
+    skillsDirtyAt,
+    markSkillsDirty,
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [showDiff, setShowDiff] = useState(false);
+  const [rail, setRail] = useState<"info" | "diff" | "none">("info");
+  const [skills, setSkills] = useState<EnabledSkill[]>([]);
 
   const directionId = viewing?.directionId ?? null;
   const repoId = viewing?.repoId ?? null;
@@ -69,7 +77,7 @@ export function WorkerConversation() {
   // Resolve the worker's session ref (worktree/branch/tool/session_id/native_id).
   // Polls while not live so a backgrounded worker's status stays fresh.
   useEffect(() => {
-    setShowDiff(viewing?.diff ?? false);
+    setRail(viewing?.diff ? "diff" : "info");
     if (directionId == null || repoId == null) {
       setRef(null);
       return;
@@ -82,6 +90,7 @@ export function WorkerConversation() {
           if (alive) {
             setRef(r);
             setLoadError(null);
+            if (r && r.session_id != null) hydrateWorkerMeta(r.session_id, r);
           }
         })
         .catch((e: unknown) => {
@@ -93,7 +102,47 @@ export function WorkerConversation() {
       alive = false;
       clearInterval(h);
     };
-  }, [directionId, repoId, viewing?.diff]);
+  }, [directionId, repoId, viewing?.diff, hydrateWorkerMeta]);
+
+  // Enabled skills for the panel (workspace-level, CLI-agnostic). Re-fetch when
+  // skills change so the silent skill-refresh is reflected without a restart.
+  useEffect(() => {
+    if (activeWorkspaceId == null) return;
+    void api
+      .workspaceSkills(activeWorkspaceId)
+      .then((s) => setSkills(s.filter((x) => !x.overridden)))
+      .catch(() => {});
+  }, [activeWorkspaceId, skillsDirtyAt]);
+
+  // codex/opencode 的带外 meta(model/window/MCP server,+ opencode 的 usage)。
+  // claude 走事件流不用拉。开页 + 每次 turn 状态变(running/idle)各拉一次。
+  // 该 effect 按 live.status 触发,turn 起/止都会跑;running 期的请求读的是上一条
+  // assistant 行(旧 usage),若它晚于 idle 期的请求返回,会用旧值盖掉新的 contextTokens。
+  // 用 alive 标志丢弃被取代的旧请求(也防 thread 切换后旧请求落到新会话)。
+  useEffect(() => {
+    const tool = ref?.tool;
+    const metaSid = live?.info.session_id ?? ref?.session_id ?? null;
+    if (directionId == null || repoId == null || metaSid == null) return;
+    if (tool == null || tool === "claude") return;
+    let alive = true;
+    void api
+      .sessionMeta(directionId, repoId)
+      .then((s) => {
+        if (alive) mergeWorkerMeta(metaSid, s);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [
+    directionId,
+    repoId,
+    ref?.session_id,
+    ref?.tool,
+    live?.info.session_id,
+    live?.status,
+    mergeWorkerMeta,
+  ]);
 
   if (viewing == null || directionId == null || repoId == null) return null;
 
@@ -112,6 +161,20 @@ export function WorkerConversation() {
   // unlike the async `ref` — so relative file refs resolve against this worker.
   const cwd = live?.info.worktree ?? ref?.worktree;
 
+  // 重载会话:重拉 skills + 标记静默 re-spawn(下条消息拾取新 MCP/skill);
+  // codex/opencode 立即重拉 session_meta(server/window 即时刷新)。
+  const onReload = () => {
+    markSkillsDirty();
+    if (sid == null) return;
+    void api.flagSessionSkillRefresh(sid);
+    if (ref?.tool && ref.tool !== "claude") {
+      void api
+        .sessionMeta(directionId, repoId)
+        .then((s) => mergeWorkerMeta(sid, s))
+        .catch(() => {});
+    }
+  };
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -126,7 +189,19 @@ export function WorkerConversation() {
             {ref?.branch}
           </span>
           <button
-            onClick={() => setShowDiff(true)}
+            onClick={() => setRail((r) => (r === "info" ? "none" : "info"))}
+            title={t("sessionInfo.title")}
+            aria-label={t("sessionInfo.title")}
+            className={`grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border transition-colors ${
+              rail === "info"
+                ? "border-brand bg-brand-ghost text-brand"
+                : "border-border text-ink-muted hover:bg-surface hover:text-ink"
+            }`}
+          >
+            <Info size={13} />
+          </button>
+          <button
+            onClick={() => setRail("diff")}
             title={t("diff.tab")}
             aria-label={t("diff.tab")}
             className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border border-border text-ink-muted transition-colors hover:bg-surface hover:text-ink"
@@ -185,11 +260,20 @@ export function WorkerConversation() {
         </div>
       </section>
 
+      {rail === "info" && (
+        <SessionInfoPanel
+          meta={sid != null ? workerMeta[sid] : undefined}
+          skills={skills}
+          onClose={() => setRail("none")}
+          onReload={onReload}
+          busy={busy}
+        />
+      )}
       {ref && (
         <DiffPanel
           cwd={ref.worktree}
-          open={showDiff}
-          onClose={() => setShowDiff(false)}
+          open={rail === "diff"}
+          onClose={() => setRail("info")}
           onAsk={(text) => void sendToWorker(directionId, repoId, text)}
         />
       )}

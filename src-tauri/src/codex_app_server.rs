@@ -210,6 +210,7 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
         "item/completed" => None,
         "turn/completed" => Some(ChatEvent::TurnEnd {
             is_error: params["turn"]["status"].as_str() != Some("completed"),
+            context_tokens: None, // codex app-server usage 解析留给后续里程碑
         }),
         _ => None, // thread/started, turn/started, hook/*, skills/changed → Stage 2/4
     }
@@ -601,11 +602,11 @@ mod tests {
         .is_none());
         assert!(matches!(
             notification_to_event("turn/completed", &json!({"turn":{"status":"completed"}})),
-            Some(ChatEvent::TurnEnd { is_error: false })
+            Some(ChatEvent::TurnEnd { is_error: false, .. })
         ));
         assert!(matches!(
             notification_to_event("turn/completed", &json!({"turn":{"status":"failed"}})),
-            Some(ChatEvent::TurnEnd { is_error: true })
+            Some(ChatEvent::TurnEnd { is_error: true, .. })
         ));
         // reasoning + lifecycle markers are ignored
         assert!(

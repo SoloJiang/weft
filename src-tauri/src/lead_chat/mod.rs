@@ -11,3 +11,4 @@ pub mod proto;
 pub mod repo_state;
 pub mod revive;
 pub mod sentinels;
+pub mod window;

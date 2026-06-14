@@ -187,6 +187,11 @@ pub async fn lead_engine(
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        last_context_tokens: None,
+        last_model: None,
+        last_window: None,
+        last_mcp_servers: vec![],
+        last_tools: vec![],
         current_origin_tag: None,
         tool_rows: std::collections::HashMap::new(),
         stopped,
@@ -280,6 +285,12 @@ pub struct LeadStateInfo {
     pub native_id: Option<String>,
     pub slash_commands: Vec<crate::lead_chat::proto::SlashCmd>,
     pub cwd: String,
+    // —— 会话信息面板回填(常驻面板重挂不空白)——
+    pub context_tokens: Option<u64>,
+    pub window: Option<u64>,
+    pub model: Option<String>,
+    pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
+    pub tools: Vec<String>,
 }
 
 /// 由「常驻子进程是否存活」与「当前 turn 是否在跑」决定 lead engine 对外报的 state。
@@ -384,6 +395,11 @@ pub async fn lead_state(
                         .into_owned()
                 })
                 .unwrap_or_default(),
+            context_tokens: None,
+            window: None,
+            model: None,
+            mcp_servers: vec![],
+            tools: vec![],
         }),
         Some(e) => {
             let mut i = e.lock().await;
@@ -398,9 +414,37 @@ pub async fn lead_state(
                 native_id: i.native_id.clone(),
                 slash_commands: i.slash_commands.clone(),
                 cwd: i.cwd.to_string_lossy().into_owned(),
+                context_tokens: i.last_context_tokens,
+                window: i.last_window,
+                model: i.last_model.clone(),
+                mcp_servers: i.last_mcp_servers.clone(),
+                tools: i.last_tools.clone(),
             })
         }
     }
+}
+
+/// 会话信息面板:非-claude lead 的带外 meta(model / window / MCP server)。claude
+/// lead 走事件流(init/usage),返回 None —— 让前端别用空快照覆盖事件填的富 meta。
+#[tauri::command]
+pub async fn lead_session_meta(
+    db: State<'_, Db>,
+    thread_id: i32,
+) -> Result<Option<crate::session_meta::SessionMetaSnapshot>, String> {
+    let Some(t) = repo::get_thread(&db, thread_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    if t.lead_tool == "claude" {
+        return Ok(None);
+    }
+    let cwd = ensure_lead_cwd(thread_id).map_err(|e| e.to_string())?;
+    let native = repo::lead_native_id(&db, thread_id).await.ok().flatten();
+    Ok(Some(
+        crate::session_meta::gather(&t.lead_tool, &cwd.to_string_lossy(), native.as_deref()).await,
+    ))
 }
 
 /// Discover the slash commands a session's CLI actually supports — never
@@ -821,6 +865,11 @@ pub(crate) async fn chat_open_worker_impl(
                 interrupting: false,
                 generation: 0,
                 pending_skill_refresh: false,
+                last_context_tokens: None,
+                last_model: None,
+                last_window: None,
+                last_mcp_servers: vec![],
+                last_tools: vec![],
                 current_origin_tag: None,
                 tool_rows: std::collections::HashMap::new(),
                 stopped: sess.status == "stopped",
@@ -920,6 +969,11 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        last_context_tokens: None,
+        last_model: None,
+        last_window: None,
+        last_mcp_servers: vec![],
+        last_tools: vec![],
         current_origin_tag: None,
         tool_rows: std::collections::HashMap::new(),
         stopped: sess.status == "stopped",

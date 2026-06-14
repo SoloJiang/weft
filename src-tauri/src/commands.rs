@@ -3,6 +3,7 @@
 
 use crate::materialize;
 use crate::store::{entities, repo, Db};
+use tauri::Manager;
 use tauri::State;
 
 type R<T> = Result<T, String>;
@@ -695,10 +696,19 @@ pub struct ObserveRef {
     pub session_id: Option<i32>,
     pub native_id: Option<String>,
     pub status: Option<String>,
+    // —— 会话信息面板回填(worker 重挂不空白)——
+    pub context_tokens: Option<u64>,
+    pub window: Option<u64>,
+    pub model: Option<String>,
+    pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
+    /// claude `mcp__<server>__<tool>` 名(分组成每个 server 的 tool 列表);重挂后
+    /// 即便 init 已不再重放也能展开 tool。
+    pub tools: Vec<String>,
 }
 
 #[tauri::command]
 pub async fn session_for(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     direction_id: i32,
     repo_id: i32,
@@ -717,6 +727,27 @@ pub async fn session_for(
     let latest = repo::latest_session_for(&db, direction_id, repo_id)
         .await
         .map_err(e)?;
+    // 有活引擎(claude worker)就读它缓存的会话信息快照;否则给空(由 init/usage
+    // event 在首条消息后补全)。
+    let (context_tokens, window, model, mcp_servers, tools) = match latest
+        .as_ref()
+        .map(|s| s.id)
+        .and_then(|sid| {
+            app.state::<crate::lead_chat::engine::LeadChatState>()
+                .get(sid as i64)
+        }) {
+        Some(eng) => {
+            let g = eng.lock().await;
+            (
+                g.last_context_tokens,
+                g.last_window,
+                g.last_model.clone(),
+                g.last_mcp_servers.clone(),
+                g.last_tools.clone(),
+            )
+        }
+        None => (None, None, None, vec![], vec![]),
+    };
     Ok(Some(ObserveRef {
         worktree: wt.path,
         branch: wt.branch,
@@ -724,7 +755,34 @@ pub async fn session_for(
         session_id: latest.as_ref().map(|s| s.id),
         native_id: latest.as_ref().and_then(|s| s.native_session_id.clone()),
         status: latest.as_ref().map(|s| s.status.clone()),
+        context_tokens,
+        window,
+        model,
+        mcp_servers,
+        tools,
     }))
+}
+
+/// 会话信息面板(M2):codex/opencode 的带外 meta(Context / model / window / MCP
+/// server,**不含 tool**)。claude 不走这里——其 meta 全在事件流 + 引擎缓存。
+#[tauri::command]
+pub async fn session_meta(
+    db: State<'_, Db>,
+    direction_id: i32,
+    repo_id: i32,
+) -> R<crate::session_meta::SessionMetaSnapshot> {
+    let wt = repo::worktree_for(&db, direction_id, repo_id)
+        .await
+        .map_err(e)?;
+    let dir = repo::get_direction(&db, direction_id).await.map_err(e)?;
+    let (Some(wt), Some(dir)) = (wt, dir) else {
+        return Ok(Default::default());
+    };
+    let native = repo::latest_session_for(&db, direction_id, repo_id)
+        .await
+        .map_err(e)?
+        .and_then(|s| s.native_session_id.clone());
+    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref()).await)
 }
 
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,

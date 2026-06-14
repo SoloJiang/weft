@@ -33,6 +33,7 @@ pub mod paths;
 mod planner;
 mod power;
 pub mod profile;
+mod session_meta;
 mod sidecar;
 pub mod skills;
 pub mod slug;
@@ -201,6 +202,7 @@ pub fn run() {
             commands::db_change_password,
             commands::set_guardrails,
             commands::session_for,
+            commands::session_meta,
             commands::effective_config,
             commands::needs_you,
             commands::write_triggers,
@@ -212,6 +214,7 @@ pub fn run() {
             lead_chat::commands::lead_ensure,
             lead_chat::commands::lead_stop,
             lead_chat::commands::lead_state,
+            lead_chat::commands::lead_session_meta,
             lead_chat::commands::list_lead_messages,
             lead_chat::commands::list_live_worker_slots,
             lead_chat::commands::auto_verify_check,

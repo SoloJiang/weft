@@ -35,6 +35,8 @@ export interface Thread {
   title: string;
   slug: string;
   kind: string;
+  /** The CLI the lead engine runs (claude | codex | opencode). */
+  lead_tool: string;
   created_at: string;
 }
 
@@ -107,6 +109,40 @@ export interface ObserveRef {
   session_id: number | null;
   native_id: string | null;
   status: string | null;
+  // —— 会话信息面板回填 ——
+  context_tokens: number | null;
+  window: number | null;
+  model: string | null;
+  mcp_servers: { name: string; status: string }[];
+  /** claude 引擎缓存的扁平 tools(`mcp__server__tool`);codex/opencode 为空。 */
+  tools: string[];
+}
+
+/** One MCP server row in the session info panel. */
+export interface McpServerInfo {
+  name: string;
+  status: string;
+  /** claude 才有:由 init.tools 按 mcp__<server>__<tool> 分组;codex/opencode 为空。 */
+  tools: string[];
+}
+
+/** Per-session snapshot for the session info panel
+ *  (lead 按 thread_id、worker 按 session_id 存)。 */
+export interface SessionMeta {
+  contextTokens?: number;
+  window?: number;
+  model?: string;
+  mcpServers: McpServerInfo[];
+}
+
+/** Band-outside meta for codex/opencode workers (M2), from the `session_meta`
+ *  command. 只列 server(无 tools 目录)。`mcp_servers` 是 Option:`null` = 探测失败
+ *  (前端保留旧行);非 null = 权威(即使空数组也替换/清空)。 */
+export interface SessionMetaSnapshot {
+  context_tokens: number | null;
+  window: number | null;
+  model: string | null;
+  mcp_servers: { name: string; status: string }[] | null;
 }
 
 /** One executable verification rung's result (ARCHITECTURE §4.13). */
@@ -162,6 +198,19 @@ export type LeadChatPush =
       session_id: number | null;
       native_id: string;
       slash_commands: SlashCmd[];
+      mcp_servers: { name: string; status: string }[];
+      tools: string[];
+      model: string | null;
+      window: number | null;
+    }
+  | {
+      /** 每个 turn 结束推一次当前上下文占用。 */
+      type: "usage";
+      thread_id: number;
+      session_id: number | null;
+      context_tokens: number;
+      window: number | null;
+      model: string | null;
     }
   | {
       /** The tool call currently executing — transient, cleared by `turn`.
@@ -205,6 +254,13 @@ export interface LeadStateInfo {
   native_id: string | null;
   slash_commands: SlashCmd[];
   cwd: string;
+  // —— 会话信息面板回填 ——
+  context_tokens: number | null;
+  window: number | null;
+  model: string | null;
+  mcp_servers: { name: string; status: string }[];
+  /** claude 引擎缓存的扁平 tools(`mcp__server__tool`);codex/opencode 为空。 */
+  tools: string[];
 }
 
 /** UI-side runtime status for a live session panel. */
