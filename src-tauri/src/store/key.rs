@@ -82,10 +82,27 @@ pub fn pragma_literal(password: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// 取 Keychain 里保存的密码；不存在返回 None。优先 env bypass 用于测试隔离。
-/// 对非默认 home（dev 的 `~/.weft-dev` 或重定位的 `WEFT_HOME`），若自己的账户尚无
-/// 条目，则沿用并迁移历史 bare 账户里的凭据，避免老的加密 relocated home 打不开。
+/// The password stored under THIS home's own scoped account, or `None`. Env bypass
+/// wins for tests. Deliberately does NO legacy fallback: it is the honest "does
+/// this home have its own credential" signal that callers (recovery-key export,
+/// snapshot) use to judge whether encryption is on for the active DB. A plaintext
+/// home must read `None` here, never another home's credential. The legacy
+/// bare-account fallback for opening a pre-scoping encrypted DB lives in
+/// [`open_password`], gated on the encrypted-open path.
 pub fn get_password() -> Result<Option<String>> {
+    if let Ok(pwd) = std::env::var(ENV_BYPASS) {
+        return Ok(Some(pwd));
+    }
+    read_account(&keychain_account(&active_home()?))
+}
+
+/// The password to open the encrypted DB at the active home. Tries this home's
+/// scoped account; for a non-canonical home with no entry yet, adopts the legacy
+/// bare credential (where pre-scoping versions stored every home's password) and
+/// migrates it into the scoped account. ONLY the encrypted-DB open path calls
+/// this — `get_password` is the side-effect-free read for everyone else, so a
+/// plaintext home can never pull or migrate the release credential.
+pub fn open_password() -> Result<Option<String>> {
     if let Ok(pwd) = std::env::var(ENV_BYPASS) {
         return Ok(Some(pwd));
     }

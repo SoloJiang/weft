@@ -46,7 +46,7 @@ impl Db {
         let want_encrypted = detect_encrypted(&path)?;
 
         if want_encrypted {
-            let pwd = crate::store::key::get_password()?.ok_or_else(|| {
+            let pwd = crate::store::key::open_password()?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "weft.db is encrypted but no password is stored in the keychain. \
                      Set the password from Settings → General → Security, then restart Weft."
