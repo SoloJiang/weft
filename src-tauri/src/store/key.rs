@@ -5,22 +5,37 @@
 //! Keychain。集成测试搭配 `tempfile + WEFT_HOME + WEFT_TEST_DB_PASSWORD` 隔离环境。
 
 use anyhow::Result;
+use std::path::{Path, PathBuf};
 
 const KEYCHAIN_SERVICE: &str = "weft";
 const KEYCHAIN_ACCOUNT: &str = "db-password-v1";
-/// Debug builds (`tauri dev`, `~/.weft-dev`) key the DB password under a separate
-/// account so enabling/changing/disabling encryption while iterating never
-/// overwrites or deletes the installed release app's `~/.weft` credential.
-/// Release keeps `db-password-v1` so existing encrypted installs need no re-entry.
-const KEYCHAIN_ACCOUNT_DEV: &str = "db-password-v1-dev";
 const ENV_BYPASS: &str = "WEFT_TEST_DB_PASSWORD";
 
-/// The Keychain account for the active build profile (see [`KEYCHAIN_ACCOUNT_DEV`]).
-fn keychain_account(debug_build: bool) -> &'static str {
-    if debug_build {
-        KEYCHAIN_ACCOUNT_DEV
+/// The canonical release data home (`~/.weft`). Its DB password keeps the bare
+/// [`KEYCHAIN_ACCOUNT`] so existing encrypted installs need no re-entry.
+fn default_release_home() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".weft"))
+}
+
+/// The active weft home, used to scope the DB credential. Surfaces the io error.
+fn active_home() -> Result<PathBuf> {
+    crate::paths::weft_home().map_err(|e| anyhow::anyhow!("weft_home: {e}"))
+}
+
+/// The Keychain account for the DB at `home`. Keyed to the *active home* — not the
+/// build profile — because `WEFT_HOME` can point a debug build at the release DB
+/// (or any relocated home); the credential must pair with the DB actually opened,
+/// or an encrypted home gets read under the wrong account and fails to unlock. The
+/// canonical release home keeps the bare account for backward compatibility.
+fn keychain_account(home: &Path) -> String {
+    keychain_account_for(home, default_release_home().as_deref())
+}
+
+fn keychain_account_for(home: &Path, release_home: Option<&Path>) -> String {
+    if release_home == Some(home) {
+        KEYCHAIN_ACCOUNT.to_string()
     } else {
-        KEYCHAIN_ACCOUNT
+        format!("{KEYCHAIN_ACCOUNT}::{}", home.display())
     }
 }
 
@@ -36,7 +51,8 @@ pub fn get_password() -> Result<Option<String>> {
     if let Ok(pwd) = std::env::var(ENV_BYPASS) {
         return Ok(Some(pwd));
     }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, keychain_account(cfg!(debug_assertions)))
+    let home = active_home()?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&home))
         .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
     match entry.get_password() {
         Ok(pwd) => Ok(Some(pwd)),
@@ -51,7 +67,8 @@ pub fn set_password(password: &str) -> Result<()> {
         std::env::set_var(ENV_BYPASS, password);
         return Ok(());
     }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, keychain_account(cfg!(debug_assertions)))
+    let home = active_home()?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&home))
         .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
     entry
         .set_password(password)
@@ -66,7 +83,8 @@ pub fn delete_password() -> Result<()> {
         std::env::remove_var(ENV_BYPASS);
         return Ok(());
     }
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, keychain_account(cfg!(debug_assertions)))
+    let home = active_home()?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(&home))
         .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -104,11 +122,26 @@ mod tests {
     }
 
     #[test]
-    fn keychain_account_isolates_dev_from_prod() {
-        // Dev builds must not share the release app's DB-password credential, or
-        // toggling dev encryption would clobber it; release keeps the original
-        // account so existing encrypted installs need no re-entry.
-        assert_eq!(keychain_account(true), "db-password-v1-dev");
-        assert_eq!(keychain_account(false), "db-password-v1");
+    fn release_home_keeps_bare_account() {
+        // The installed app's home must keep the original account name, or existing
+        // encrypted installs would look up the wrong credential and fail to unlock.
+        let release = Path::new("/u/.weft");
+        assert_eq!(keychain_account_for(release, Some(release)), "db-password-v1");
+    }
+
+    #[test]
+    fn dev_and_relocated_homes_get_distinct_accounts() {
+        // Dev's home and any WEFT_HOME-relocated home are keyed to that home, so a
+        // debug build (or a relocated home) never reads or writes the release
+        // credential — the account always pairs with the DB actually opened.
+        let release = Some(Path::new("/u/.weft"));
+        assert_eq!(
+            keychain_account_for(Path::new("/u/.weft-dev"), release),
+            "db-password-v1::/u/.weft-dev"
+        );
+        assert_eq!(
+            keychain_account_for(Path::new("/custom/home"), release),
+            "db-password-v1::/custom/home"
+        );
     }
 }
