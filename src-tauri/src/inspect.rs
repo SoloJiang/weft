@@ -85,14 +85,16 @@ fn map_resolve_err(e: ResolveErr) -> String {
 /// Turn a raw path token from chat into an absolute, existing path.
 fn resolve_chat_path(token: &str, cwd: Option<&str>) -> Result<PathBuf, ResolveErr> {
     let trimmed = token.trim();
-    // `file://` URIs are percent-encoded (e.g. a space is `%20`); decode them so
-    // `file:///Users/me/My%20Repo/App.tsx` resolves to the real path. Bare paths
-    // are left as-is (they aren't URI-encoded).
-    let decoded = match trimmed.strip_prefix("file://") {
-        Some(rest) => percent_decode(rest),
-        None => trimmed.to_string(),
-    };
-    let bare = strip_line_suffix(&decoded);
+    let body = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    // Markdown link hrefs (and `file://` URIs) are percent-encoded — a space is
+    // `%20` — so decode every token. Bare/inline literal paths rarely contain a
+    // literal `%XX`, so this is safe in practice.
+    let decoded = percent_decode(body);
+    // `file:///C:/…` leaves `/C:/…` after the scheme strip; drop the leading
+    // slash before a Windows drive letter so the path exists on disk. No-op for
+    // POSIX paths.
+    let normalized = strip_leading_drive_slash(decoded);
+    let bare = strip_line_suffix(&normalized);
     let expanded = expand_tilde(bare);
 
     let abs = if expanded.is_absolute() {
@@ -183,6 +185,21 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Drop a leading `/` before a Windows drive letter (`/C:/…` → `C:/…`) — the
+/// form `file:///C:/…` leaves once the scheme is stripped. No-op for POSIX paths.
+fn strip_leading_drive_slash(s: String) -> String {
+    let b = s.as_bytes();
+    if b.len() >= 4
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b[2] == b':'
+        && (b[3] == b'/' || b[3] == b'\\')
+    {
+        return s[1..].to_string();
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +273,25 @@ mod tests {
         let token = format!("file://{}/%43argo.toml", dir.to_str().unwrap());
         let got = resolve_chat_path(&token, None).unwrap();
         assert!(got.ends_with("Cargo.toml"));
+    }
+
+    #[test]
+    fn decodes_percent_escapes_in_bare_token() {
+        // A non-`file://` link href is still URL-encoded — must decode too.
+        let dir = manifest();
+        let token = format!("{}/%43argo.toml", dir.to_str().unwrap());
+        let got = resolve_chat_path(&token, None).unwrap();
+        assert!(got.ends_with("Cargo.toml"));
+    }
+
+    #[test]
+    fn strips_leading_drive_slash() {
+        assert_eq!(
+            strip_leading_drive_slash("/C:/repo/main.rs".into()),
+            "C:/repo/main.rs"
+        );
+        assert_eq!(strip_leading_drive_slash("/Users/me/x".into()), "/Users/me/x");
+        assert_eq!(strip_leading_drive_slash("relative/x".into()), "relative/x");
     }
 
     #[test]

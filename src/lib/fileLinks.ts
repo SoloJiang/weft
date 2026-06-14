@@ -58,15 +58,15 @@ const CODE_EXT =
 const MANIFEST =
   "package(?:-lock)?\\.json|pnpm-lock\\.yaml|yarn\\.lock|tsconfig(?:\\.[\\w.-]+)?\\.json|Cargo\\.(?:toml|lock)|Dockerfile|Makefile|\\.gitignore|\\.env(?:\\.[\\w.-]+)?";
 const EXT_RE = new RegExp(`\\.(?:${CODE_EXT})$`, "i");
-const MANIFEST_RE = new RegExp(`(?:^|/)(?:${MANIFEST})$`);
+const MANIFEST_RE = new RegExp(`(?:^|[/\\\\])(?:${MANIFEST})$`);
 
 /** Conservative test: is this token a local file path worth wiring up? */
 export function isPathLike(token: string): boolean {
   const { path } = parsePathToken(token);
   if (!path || /\s/.test(path)) return false;
-  if (/^(\/|~\/?|\.\.?\/)/.test(path)) return true; // /abs, ~, ~/, ./, ../
+  if (/^(\/|\\|~[\\/]?|\.\.?[\\/])/.test(path)) return true; // /abs \abs ~ ~/ ~\ ./ .\ ../ ..\
   if (WIN_DRIVE.test(path)) return true;
-  if (path.includes("/") && EXT_RE.test(path)) return true; // a/b/foo.ts
+  if (/[/\\]/.test(path) && EXT_RE.test(path)) return true; // a/b/foo.ts or a\b\foo.ts
   if (MANIFEST_RE.test(path)) return true; // Cargo.toml, package.json, Makefile
   return false;
 }
@@ -75,31 +75,48 @@ export function isPathLike(token: string): boolean {
 
 export type Seg = { type: "text" | "path"; value: string };
 
-// A whitespace-delimited chunk containing a path separator; surrounding
-// punctuation is peeled back into text and the core re-validated.
-const SEP_TOKEN = /\S*[/\\]\S*/g;
 const LEAD_PUNCT = /^[([{<'"`]+/;
 const TAIL_PUNCT = /[)\]}>'"`.,;:!?]+$/;
 
-/** Split prose into text/path segments (re-joining to the original string). */
+// Cheap gate before the heavier isPathLike: a separator, a dot (extensions or
+// dotfiles), or the two dotless manifest names. Lets ordinary prose words bail
+// out without a regex match.
+function couldBePath(core: string): boolean {
+  return /[/\\.]/.test(core) || core === "Dockerfile" || core === "Makefile";
+}
+
+function pushText(segs: Seg[], v: string): void {
+  const last = segs[segs.length - 1];
+  if (last && last.type === "text") last.value += v;
+  else segs.push({ type: "text", value: v });
+}
+
+/**
+ * Split prose into text/path segments (re-joining to the original string). Works
+ * token-by-token so bare names (`Cargo.toml`) are caught alongside separator
+ * paths (`src/foo.ts`, `src\foo.ts`); surrounding punctuation is peeled back
+ * into the text run.
+ */
 export function splitTextForPaths(text: string): Seg[] {
   const segs: Seg[] = [];
-  let last = 0;
-  for (const match of text.matchAll(SEP_TOKEN)) {
-    const idx = match.index ?? 0;
-    const chunk = match[0];
-    const lead = chunk.match(LEAD_PUNCT)?.[0] ?? "";
-    let core = chunk.slice(lead.length);
+  for (const part of text.split(/(\s+)/)) {
+    if (!part) continue;
+    if (/^\s/.test(part)) {
+      pushText(segs, part);
+      continue;
+    }
+    const lead = part.match(LEAD_PUNCT)?.[0] ?? "";
+    let core = part.slice(lead.length);
     const tail = core.match(TAIL_PUNCT)?.[0] ?? "";
     if (tail) core = core.slice(0, core.length - tail.length);
-    if (!core || !isPathLike(core)) continue; // leave in the surrounding text run
-    const before = text.slice(last, idx) + lead;
-    if (before) segs.push({ type: "text", value: before });
-    segs.push({ type: "path", value: core });
-    last = idx + lead.length + core.length; // tail stays as text for the next gap
+    if (core && couldBePath(core) && isPathLike(core)) {
+      if (lead) pushText(segs, lead);
+      segs.push({ type: "path", value: core });
+      if (tail) pushText(segs, tail);
+    } else {
+      pushText(segs, part);
+    }
   }
-  const rest = text.slice(last);
-  if (rest) segs.push({ type: "text", value: rest });
   return segs;
 }
 
@@ -118,11 +135,7 @@ function walkHast(node: HNode): void {
   if (!kids || kids.length === 0) return;
   const out: HNode[] = [];
   for (const child of kids) {
-    if (
-      child.type === "text" &&
-      typeof child.value === "string" &&
-      (child.value.includes("/") || child.value.includes("\\"))
-    ) {
+    if (child.type === "text" && typeof child.value === "string") {
       const segs = splitTextForPaths(child.value);
       // Skip only when nothing matched — a node that is *exactly* one path
       // (e.g. a bullet containing just `src/App.tsx`) must still be wrapped.
