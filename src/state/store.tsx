@@ -796,6 +796,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // no verify latch.
   const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
     const sid = slot.info.session_id;
+    if (slot.busy) {
+      // Seed the worker's busy turn state so the chat surface shows the typing
+      // indicator + Stop button and WorkspaceNav counts it as running — a revived
+      // worker emits no turn push until its turn completes. Done BEFORE the
+      // already-mapped early return so a session that driveDirection (the
+      // active-thread redispatch) inserted without a workerTurn entry still gets
+      // seeded. Guard on absence so a raced idle/stopped value the listener already
+      // recorded wins. (Verify is backend-driven, so this seeds UI state only.)
+      setWorkerTurn((t) =>
+        t[sid] ? t : { ...t, [sid]: { state: "busy", queued: slot.queued } },
+      );
+    }
     if (sessionsRef.current[sid]) return;
     // Reconcile status with any turn state the lead-chat listener already recorded:
     // if the worker's idle push raced in before this adoption, the live slot still
@@ -818,16 +830,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             },
           },
     );
-    if (slot.busy) {
-      // Seed the worker's busy turn state so the chat surface shows the typing
-      // indicator + Stop button and WorkspaceNav counts it as running — a revived
-      // worker emits no turn push until its turn completes. Guard on absence so a
-      // raced idle/stopped value the listener already recorded wins. (Verify is
-      // backend-driven, so this seeds UI state only — it arms no latch.)
-      setWorkerTurn((t) =>
-        t[sid] ? t : { ...t, [sid]: { state: "busy", queued: slot.queued } },
-      );
-    }
   }, []);
 
   // Pull the backend's live worker engines and adopt any the frontend doesn't
