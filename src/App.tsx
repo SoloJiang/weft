@@ -7,6 +7,7 @@ import { NeedsYouView } from "./board/NeedsYouView";
 import { WorkerConversation } from "./session/WorkerConversation";
 import { DangerToast } from "./components/DangerToast";
 import { Toasts } from "./components/Toast";
+import { FileMenu, useCmdAffordance } from "./components/FileMenu";
 import { CommandPalette } from "./components/CommandPalette";
 import { NeedsDock } from "./components/NeedsDock";
 import { FirstRunOnboarding } from "./components/FirstRunOnboarding";
@@ -36,6 +37,7 @@ function Shell() {
   } = useStore();
   useAppShortcuts();
   useSystemNotifications();
+  useCmdAffordance();
   if (
     homeTab === "settings" &&
     !showNeeds &&
@@ -72,6 +74,7 @@ function Shell() {
       </div>
       <DangerToast />
       <Toasts />
+      <FileMenu />
       <CommandPalette />
       <FirstRunOnboarding />
     </div>

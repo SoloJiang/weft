@@ -131,9 +131,9 @@ export function Transcript({
       {before}
       <div className={cn("flex flex-col gap-2.5", contentClassName)}>
         {visibleEvents.map((e, i) => (
-          <TranscriptEvent key={i} event={e} variant={variant} />
+          <TranscriptEvent key={i} event={e} variant={variant} cwd={cwd} />
         ))}
-        {activeTool && <TranscriptEvent event={activeTool} variant={variant} />}
+        {activeTool && <TranscriptEvent event={activeTool} variant={variant} cwd={cwd} />}
         {running && variant !== "console" && (
           <div
             className={cn(
@@ -153,9 +153,11 @@ export function Transcript({
 function TranscriptEvent({
   event,
   variant,
+  cwd,
 }: {
   event: NormEvent;
   variant: "default" | "console";
+  cwd: string;
 }) {
   const { t } = useTranslation();
   if (variant !== "console") {
@@ -182,7 +184,7 @@ function TranscriptEvent({
     }
     return (
       <div className="break-words">
-        <Markdown text={event.text} />
+        <Markdown text={event.text} cwd={cwd} />
       </div>
     );
   }
@@ -218,7 +220,7 @@ function TranscriptEvent({
         <Sparkles size={14} />
       </span>
       <div className="min-w-0 flex-1 rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-        <Markdown text={event.text} />
+        <Markdown text={event.text} cwd={cwd} />
       </div>
     </div>
   );

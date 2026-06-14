@@ -395,6 +395,13 @@ export const en = {
     branchLabel: "branch",
     sessionLabel: "session",
   },
+  fileLink: {
+    openWith: "Open with default app",
+    openFolder: "Open containing folder",
+    copyPath: "Copy path",
+    notFound: "Can't open — file not found",
+    openFailed: "Couldn't open that file",
+  },
   dialog: {
     newWorkspaceTitle: "New workspace",
     workspaceName: "Name",

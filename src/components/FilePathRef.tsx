@@ -1,0 +1,60 @@
+import { createContext, useContext, type ReactNode } from "react";
+import { cn } from "../lib/cn";
+import { openFileMenu, openFileRef } from "../lib/fileLinks";
+
+/**
+ * True when already inside an interactive link / file-ref. Descendant file refs
+ * (e.g. an inline-code label inside `[`App.tsx`](src/App.tsx)`) then render inert
+ * so the OUTER element owns the click — otherwise the inner ref would hijack the
+ * gesture and act on the label instead of the href.
+ */
+export const InsideRefContext = createContext(false);
+
+const CODE_CHIP = "rounded bg-raised px-1 py-0.5 font-mono text-[11.5px] text-ink";
+
+/**
+ * A file path mentioned in chat, rendered quiet (looks like ordinary text or an
+ * inline-code chip). The ⌘/Ctrl-held affordance — underline + pointer on hover —
+ * comes from `body[data-cmd]` CSS, so plain clicks never open anything by
+ * accident. ⌘/Ctrl-click opens it; right-click opens the menu.
+ */
+export function FilePathRef({
+  token,
+  cwd,
+  code,
+  isUrl,
+  children,
+}: {
+  token: string;
+  cwd?: string;
+  /** Render with the inline-code chip styling (for `` `path` `` spans). */
+  code?: boolean;
+  /** Token came from a markdown link href (URI semantics) vs a literal path. */
+  isUrl?: boolean;
+  children: ReactNode;
+}) {
+  // Nested under a link/file-ref → stay inert; the outer element owns the gesture.
+  if (useContext(InsideRefContext)) {
+    return <span className={cn(code && CODE_CHIP)}>{children}</span>;
+  }
+
+  return (
+    <span
+      className={cn("weft-file-ref", code && CODE_CHIP)}
+      title={token}
+      onClick={(e) => {
+        if (!(e.metaKey || e.ctrlKey)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        void openFileRef(token, cwd, isUrl);
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openFileMenu({ x: e.clientX, y: e.clientY, token, cwd, isUrl });
+      }}
+    >
+      <InsideRefContext.Provider value={true}>{children}</InsideRefContext.Provider>
+    </span>
+  );
+}

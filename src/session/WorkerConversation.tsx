@@ -59,6 +59,13 @@ export function WorkerConversation() {
     if (threadId != null) void loadLeadChat(threadId);
   }, [threadId, loadLeadChat]);
 
+  // Slot changed — drop the previous worker's ref immediately so cwd/header
+  // never render with stale data while sessionFor refreshes. A relative file ref
+  // clicked in that window would otherwise resolve against the prior worktree.
+  useEffect(() => {
+    setRef(null);
+  }, [directionId, repoId]);
+
   // Resolve the worker's session ref (worktree/branch/tool/session_id/native_id).
   // Polls while not live so a backgrounded worker's status stays fresh.
   useEffect(() => {
@@ -101,6 +108,9 @@ export function WorkerConversation() {
       : [];
   const openAsks = needs.filter((n) => n.direction_id === directionId);
   const nativeId = live?.nativeId ?? ref?.native_id ?? null;
+  // Prefer the live engine's worktree — available synchronously on slot switch,
+  // unlike the async `ref` — so relative file refs resolve against this worker.
+  const cwd = live?.info.worktree ?? ref?.worktree;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
@@ -148,6 +158,7 @@ export function WorkerConversation() {
             busy={busy}
             activity={sid != null ? workerActivity[sid] : undefined}
             onReviewProposal={() => {}}
+            cwd={cwd}
           />
           <ChatComposer
             slashCommands={(sid != null ? workerSlash[sid] : undefined) ?? []}
