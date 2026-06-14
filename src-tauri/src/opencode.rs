@@ -107,7 +107,9 @@ async fn fetch_mcp_servers(client: &reqwest::Client, base: &str, cwd: &str) -> O
         .json()
         .await
         .ok()?;
-    Some(parse_opencode_mcp(&v))
+    // 对象 body → Some(可空,空 `{}` 即权威无 server);非对象(2xx 但畸形)→ None,
+    // 与 HTTP 失败一样保留旧行,不把"没读懂"当成"没有"。
+    parse_opencode_mcp(&v)
 }
 
 async fn fetch_model_window(

@@ -19,25 +19,28 @@ pub struct SessionMetaSnapshot {
 // ───────────────────────── 纯解析(可单测) ─────────────────────────
 
 /// `codex mcp list --json` 输出 → server 列表;status 取自 `enabled`。
-pub fn parse_codex_mcp_servers(json: &str) -> Vec<McpServer> {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| {
-            let name = s["name"].as_str()?.to_string();
-            let status = if s["enabled"].as_bool().unwrap_or(false) {
-                "connected"
-            } else {
-                "disabled"
-            };
-            Some(McpServer {
-                name,
-                status: status.into(),
+/// 返回 `Option`,区分**权威空**与**解析失败**(贯彻 [`SessionMetaSnapshot::mcp_servers`]
+/// 的不变量):顶层是数组 → `Some`(可空,会话真的没 server);非 JSON / 非数组(进程
+/// success 但输出畸形 / API 漂移)→ `None`,前端保留旧行,不把"没读懂"当成"没有"。
+pub fn parse_codex_mcp_servers(json: &str) -> Option<Vec<McpServer>> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = v.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|s| {
+                let name = s["name"].as_str()?.to_string();
+                let status = if s["enabled"].as_bool().unwrap_or(false) {
+                    "connected"
+                } else {
+                    "disabled"
+                };
+                Some(McpServer {
+                    name,
+                    status: status.into(),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// `~/.codex/models_cache.json` 内容 + 模型名 → context_window(按 `slug` 匹配)。
@@ -114,18 +117,18 @@ pub fn find_model_context(
     }
 }
 
-/// opencode `GET /mcp` 响应(`{name:{status}}`)→ server 列表。
-pub fn parse_opencode_mcp(v: &serde_json::Value) -> Vec<McpServer> {
-    v.as_object()
-        .map(|o| {
-            o.iter()
-                .map(|(name, s)| McpServer {
-                    name: name.clone(),
-                    status: s["status"].as_str().unwrap_or("unknown").to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// opencode `GET /mcp` 响应(`{name:{status}}`)→ server 列表。返回 `Option`,同
+/// [`parse_codex_mcp_servers`] 的不变量:body 是对象 → `Some`(空 `{}` = 权威无 server);
+/// 非对象(2xx 但 body 畸形 / API 漂移,如返回 `[]`/`null`)→ `None`,前端保留旧行。
+pub fn parse_opencode_mcp(v: &serde_json::Value) -> Option<Vec<McpServer>> {
+    v.as_object().map(|o| {
+        o.iter()
+            .map(|(name, s)| McpServer {
+                name: name.clone(),
+                status: s["status"].as_str().unwrap_or("unknown").to_string(),
+            })
+            .collect()
+    })
 }
 
 // ───────────────────────── 带外取数(I/O) ─────────────────────────
@@ -158,7 +161,8 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
                     .and_then(|c| codex_window_from_cache(&c, m))
             })
         });
-    // `codex mcp list` 成功 → 权威(Some,可空);失败 → None(前端保留旧行,不闪空)。
+    // `codex mcp list` 成功且输出是数组 → 权威(Some,可空);进程失败 / 输出畸形 →
+    // None(前端保留旧行,不把"没读懂"当成"没有")。
     let mcp_servers = match tokio::process::Command::new("codex")
         .args(["mcp", "list", "--json"])
         .current_dir(cwd)
@@ -166,7 +170,7 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
         .await
     {
         Ok(o) if o.status.success() => {
-            Some(parse_codex_mcp_servers(&String::from_utf8_lossy(&o.stdout)))
+            parse_codex_mcp_servers(&String::from_utf8_lossy(&o.stdout))
         }
         _ => None,
     };
@@ -219,7 +223,7 @@ mod tests {
     #[test]
     fn parses_codex_mcp_servers_status_from_enabled() {
         let j = r#"[{"name":"codegraph","enabled":true,"auth_status":"unsupported"},{"name":"old","enabled":false}]"#;
-        let s = parse_codex_mcp_servers(j);
+        let s = parse_codex_mcp_servers(j).expect("array parses to Some");
         assert_eq!(s.len(), 2);
         assert_eq!(
             s[0],
@@ -229,7 +233,10 @@ mod tests {
             }
         );
         assert_eq!(s[1].status, "disabled");
-        assert!(parse_codex_mcp_servers("not json").is_empty());
+        // 权威空(会话真的没 server)vs 解析失败 —— 必须可区分:
+        assert_eq!(parse_codex_mcp_servers("[]"), Some(vec![])); // 空数组 = 权威空
+        assert_eq!(parse_codex_mcp_servers("not json"), None); // 非 JSON = 没读懂
+        assert_eq!(parse_codex_mcp_servers("{}"), None); // 非数组(API 漂移)= 没读懂
     }
 
     #[test]
@@ -306,9 +313,13 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(r#"{"codegraph":{"status":"connected"},"x":{"status":"failed"}}"#)
                 .unwrap();
-        let s = parse_opencode_mcp(&v);
+        let s = parse_opencode_mcp(&v).expect("object parses to Some");
         assert_eq!(s.len(), 2);
         assert!(s.iter().any(|m| m.name == "codegraph" && m.status == "connected"));
         assert!(s.iter().any(|m| m.name == "x" && m.status == "failed"));
+        // 权威空 vs body 畸形(2xx 但非对象):
+        assert_eq!(parse_opencode_mcp(&serde_json::json!({})), Some(vec![])); // {} = 权威空
+        assert_eq!(parse_opencode_mcp(&serde_json::json!([])), None); // 非对象 = 没读懂
+        assert_eq!(parse_opencode_mcp(&serde_json::json!(null)), None);
     }
 }
