@@ -88,8 +88,12 @@ const MANIFEST_RE = new RegExp(`(?:^|[/\\\\])(?:${MANIFEST})$`);
 
 /**
  * Conservative test: is this token a local file path worth wiring up?
- * `allowSpaces` is for inline-code tokens, where the whole span is the path
- * (e.g. `My Dir/App.tsx`); prose keeps the no-space rule so words aren't joined.
+ * `allowSpaces` (inline-code tokens) accepts spaces ONLY in an ANCHORED path
+ * (e.g. `~/Library/Application Support/x.json`, `/Users/me/My Repo/App.tsx`). A
+ * RELATIVE spaced token is deliberately not matched: it is indistinguishable
+ * from a command (`My Dir/App.tsx` vs `cat src/App.tsx` have identical shape),
+ * and false-flagging common commands is worse than missing a rare spaced relpath.
+ * Prose always keeps the no-space rule so words aren't joined.
  */
 export function isPathLike(token: string, allowSpaces = false): boolean {
   const { path } = parsePathToken(token);
