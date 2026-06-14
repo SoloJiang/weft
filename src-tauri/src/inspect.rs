@@ -173,8 +173,12 @@ fn strip_file_scheme(token: &str) -> &str {
         Some(prefix) if prefix.eq_ignore_ascii_case("file://") => &token[7..],
         _ => return token,
     };
-    match rest.strip_prefix("localhost") {
-        Some(after) if after.starts_with('/') => after,
+    // The host authority is case-insensitive: strip a `localhost` host (any case)
+    // when it's followed by the absolute path, e.g. `file://LOCALHOST/Users/…`.
+    match rest.get(..9) {
+        Some(host) if host.eq_ignore_ascii_case("localhost") && rest[9..].starts_with('/') => {
+            &rest[9..]
+        }
         _ => rest,
     }
 }
@@ -340,6 +344,8 @@ mod tests {
         assert_eq!(strip_file_scheme("file://localhost/C:/repo"), "/C:/repo");
         assert_eq!(strip_file_scheme("FILE:///tmp/x"), "/tmp/x"); // scheme is case-insensitive
         assert_eq!(strip_file_scheme("File://localhost/y"), "/y");
+        assert_eq!(strip_file_scheme("file://LOCALHOST/Users/me/x"), "/Users/me/x"); // host case-insensitive
+        assert_eq!(strip_file_scheme("file://localhostish/x"), "localhostish/x"); // not the localhost host
         assert_eq!(strip_file_scheme("localhost/foo"), "localhost/foo"); // non-URI, untouched
         assert_eq!(strip_file_scheme("/plain/path"), "/plain/path");
     }
