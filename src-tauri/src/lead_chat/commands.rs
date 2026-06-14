@@ -660,6 +660,32 @@ pub async fn list_live_worker_slots(
     Ok(build_worker_slots(&db, snaps).await)
 }
 
+/// Backend-authoritative auto-verify gate. Given a worker session that just ended
+/// a turn, return its direction id IFF the direction is in an implementation phase
+/// (working/review) — read FRESH from the DB so a phase that changed mid-turn (e.g.
+/// planning→working via the bus set_task_status) is reflected, not a stale snapshot.
+/// The frontend calls this on a worker idle turn push and runs verify_direction when
+/// it returns Some; this replaces the racy frontend busy→idle / phase-cache effect.
+#[tauri::command]
+pub async fn auto_verify_check(
+    db: State<'_, Db>,
+    session_id: i32,
+) -> Result<Option<i32>, String> {
+    let Some(sess) = repo::get_session(&db, session_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some(dir) = repo::get_direction(&db, sess.direction_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    Ok((dir.status == "working" || dir.status == "review").then_some(sess.direction_id))
+}
+
 // ───────────────────── chat-mode workers ─────────────────────
 //
 // Every worker (claude/codex/opencode) runs on the engine: a weft-owned chat
