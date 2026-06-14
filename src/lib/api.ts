@@ -119,6 +119,9 @@ export const api = {
   leadStop: (threadId: number) => invoke<void>("lead_stop", { threadId }),
   leadState: (threadId: number) =>
     invoke<LeadStateInfo>("lead_state", { threadId }),
+  /** Band-outside meta for a non-claude lead (null for claude — event-fed). */
+  leadSessionMeta: (threadId: number) =>
+    invoke<SessionMetaSnapshot | null>("lead_session_meta", { threadId }),
   listLeadMessages: (threadId: number) =>
     invoke<LeadMessage[]>("list_lead_messages", { threadId }),
   /** Live (actually-running) worker engines the backend wants the frontend to

@@ -411,6 +411,29 @@ pub async fn lead_state(
     }
 }
 
+/// 会话信息面板:非-claude lead 的带外 meta(model / window / MCP server)。claude
+/// lead 走事件流(init/usage),返回 None —— 让前端别用空快照覆盖事件填的富 meta。
+#[tauri::command]
+pub async fn lead_session_meta(
+    db: State<'_, Db>,
+    thread_id: i32,
+) -> Result<Option<crate::session_meta::SessionMetaSnapshot>, String> {
+    let Some(t) = repo::get_thread(&db, thread_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    if t.lead_tool == "claude" {
+        return Ok(None);
+    }
+    let cwd = ensure_lead_cwd(thread_id).map_err(|e| e.to_string())?;
+    let native = repo::lead_native_id(&db, thread_id).await.ok().flatten();
+    Ok(Some(
+        crate::session_meta::gather(&t.lead_tool, &cwd.to_string_lossy(), native.as_deref()).await,
+    ))
+}
+
 /// Discover the slash commands a session's CLI actually supports — never
 /// hardcoded for tools whose CLI exposes the list. claude: the live
 /// `initialize` list the engine already holds; opencode: GET /command off a

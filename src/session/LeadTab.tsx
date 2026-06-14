@@ -54,6 +54,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     asks,
     skillsDirtyAt,
     markSkillsDirty,
+    mergeLeadMeta,
   } = useStore();
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
@@ -85,6 +86,18 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
       .then((s) => setSkills(s.filter((x) => !x.overridden)))
       .catch(() => {});
   }, [activeWorkspaceId, skillsDirtyAt]);
+
+  // 非-claude lead 的带外 meta(model/window/MCP server)。claude lead 命令返回 null →
+  // 不并入(事件流 init/usage 已填,别被空快照覆盖)。开页 + turn 结束各拉一次。
+  useEffect(() => {
+    if (activeThreadId == null) return;
+    void api
+      .leadSessionMeta(activeThreadId)
+      .then((s) => {
+        if (s) mergeLeadMeta(activeThreadId, s);
+      })
+      .catch(() => {});
+  }, [activeThreadId, leadTurn[activeThreadId ?? -1]?.state, mergeLeadMeta]);
 
   if (activeThreadId == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.

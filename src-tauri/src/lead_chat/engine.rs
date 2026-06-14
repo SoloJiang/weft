@@ -2256,6 +2256,11 @@ mod tests {
             interrupting: false,
             generation: 0,
             pending_skill_refresh: false,
+            last_context_tokens: None,
+            last_model: None,
+            last_window: None,
+            last_mcp_servers: vec![],
+            last_tools: vec![],
             current_origin_tag: None,
             stopped: false,
         }

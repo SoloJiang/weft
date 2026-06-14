@@ -100,6 +100,8 @@ interface Store {
   hydrateWorkerMeta: (sessionId: number, snap: ObserveRef) => void;
   /** codex/opencode worker 的带外 meta(session_meta 命令)并入 workerMeta。 */
   mergeWorkerMeta: (sessionId: number, snap: SessionMetaSnapshot) => void;
+  /** 非-claude lead 的带外 meta(lead_session_meta 命令)并入 leadMeta。 */
+  mergeLeadMeta: (threadId: number, snap: SessionMetaSnapshot) => void;
   /** The thread-bus drawer (demoted from a permanent rail). */
   showBus: boolean;
   setShowBus: (open: boolean) => void;
@@ -1021,6 +1023,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const mergeWorkerMeta = useCallback((sessionId: number, snap: SessionMetaSnapshot) => {
     setWorkerMeta((m) => ({ ...m, [sessionId]: mergeSnapshot(m[sessionId], snap) }));
   }, []);
+  const mergeLeadMeta = useCallback((threadId: number, snap: SessionMetaSnapshot) => {
+    setLeadMeta((m) => ({ ...m, [threadId]: mergeSnapshot(m[threadId], snap) }));
+  }, []);
   // Skills dirty latch: bump on any skills mutation; idle sessions/leads compare
   // against their last-refreshed stamp to flag one engine refresh per episode.
   const [skillsDirtyAt, setSkillsDirtyAt] = useState(0);
@@ -1681,6 +1686,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     workerMeta,
     hydrateWorkerMeta,
     mergeWorkerMeta,
+    mergeLeadMeta,
     showBus,
     setShowBus,
     navCollapsed,

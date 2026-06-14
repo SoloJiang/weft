@@ -214,6 +214,7 @@ pub fn run() {
             lead_chat::commands::lead_ensure,
             lead_chat::commands::lead_stop,
             lead_chat::commands::lead_state,
+            lead_chat::commands::lead_session_meta,
             lead_chat::commands::list_lead_messages,
             lead_chat::commands::list_live_worker_slots,
             lead_chat::commands::auto_verify_check,
