@@ -203,7 +203,7 @@ fn parse_opencode(line: &str) -> ChatEvent {
                 tools: vec![ToolCall {
                     id: String::new(),
                     name: part["tool"].as_str().unwrap_or("tool").to_string(),
-                    input,
+                    input: cap_input(input),
                     summary,
                     output: Some(opencode_output(state)),
                     is_error: status == "error",
@@ -237,6 +237,21 @@ fn cap_output(s: String) -> String {
     let mut out: String = s.chars().take(MAX).collect();
     out.push_str("\n… (truncated)");
     out
+}
+
+/// Cap a tool input the same way: a huge payload (e.g. a claude `Write`/`Edit`
+/// carrying full file contents) is replaced by a truncated string so it can't
+/// bloat the persisted row, its push, or the store. Small inputs pass through
+/// unchanged so the UI still renders the structured object.
+fn cap_input(input: Value) -> Value {
+    const MAX: usize = 16_000;
+    let s = input.to_string();
+    if s.chars().count() <= MAX {
+        return input;
+    }
+    let mut capped: String = s.chars().take(MAX).collect();
+    capped.push_str("… (truncated)");
+    Value::String(capped)
 }
 
 pub(crate) fn error_text_from_item(item: &Value) -> String {
@@ -299,7 +314,7 @@ pub fn parse_line(line: &str) -> ChatEvent {
                         tools.push(ToolCall {
                             id: b["id"].as_str().unwrap_or_default().to_string(),
                             name: b["name"].as_str().unwrap_or("tool").to_string(),
-                            input,
+                            input: cap_input(input),
                             summary,
                             output: None,
                             is_error: false,
@@ -506,6 +521,23 @@ mod tests {
             ChatEvent::ToolResults { items } => {
                 assert!(items[0].output.chars().count() < 20_000);
                 assert!(items[0].output.ends_with("(truncated)"));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn caps_huge_tool_input() {
+        let big = "x".repeat(20_000);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t","name":"Write","input":{{"content":"{big}"}}}}]}}}}"#
+        );
+        match parse_line(&line) {
+            ChatEvent::Assistant { tools, .. } => {
+                // a huge object input collapses to a single truncated string
+                let s = tools[0].input.as_str().expect("capped input is a string");
+                assert!(s.chars().count() < 20_000);
+                assert!(s.ends_with("(truncated)"));
             }
             e => panic!("{e:?}"),
         }

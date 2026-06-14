@@ -703,8 +703,11 @@ pub async fn send(
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
     let pending = { eng.lock().await.pending_skill_refresh };
     if pending {
-        let _ = stop_quiet(app, eng).await;
+        let (tid, _sid, _current, orphans) = stop_quiet(eng).await;
         eng.lock().await.pending_skill_refresh = false;
+        // The bounce fires from idle, so orphans is normally empty; finalize
+        // defensively so a still-open tool row can't outlive the bounce.
+        finalize_orphan_tool_rows(app, db, tid, orphans, "interrupted").await;
     }
     ensure_running_for_send(app, db, eng).await?;
     let mut inner = eng.lock().await;
@@ -1392,12 +1395,15 @@ pub fn spawn_watchdog(app: AppHandle) {
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
 pub async fn stop_quiet(
-    app: &AppHandle,
     eng: &EngineRef,
-) -> (i32, Option<i32>, Option<(i32, String)>) {
+) -> (i32, Option<i32>, Option<(i32, String)>, Vec<(i32, serde_json::Value)>) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let current = inner.current.take().map(|(id, text, _)| (id, text));
+    // Drain tool rows still awaiting a result, but DON'T finalize here: the
+    // caller makes the stop visible (sets `stopped`) first. Awaiting DB/event
+    // work while the engine is reset-but-not-yet-stopped would let a concurrent
+    // send start a turn on the idle engine that we'd then wrongly mark stopped.
     let orphan_tools: Vec<(i32, serde_json::Value)> =
         inner.tool_rows.drain().map(|(_, v)| v).collect();
     inner.generation += 1; // orphan the reader so EOF handling is ours
@@ -1408,15 +1414,7 @@ pub async fn stop_quiet(
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
-    drop(inner);
-    // A killed turn can leave claude tool rows mid-flight; finalize them so they
-    // don't spin forever (callers finalize `current` themselves).
-    if !orphan_tools.is_empty() {
-        if let Some(db) = app.try_state::<Db>() {
-            finalize_orphan_tool_rows(app, &db, target.0, orphan_tools, "interrupted").await;
-        }
-    }
-    (target.0, target.1, current)
+    (target.0, target.1, current, orphan_tools)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -1426,12 +1424,15 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, current) = stop_quiet(app, eng).await;
+    let (thread_id, session_id, current, orphans) = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
     if let Some(db) = app.try_state::<Db>() {
         persist_activity(&db, session_id, thread_id, STATUS_STOPPED).await;
+        // Stop is now visible to the engine, so finalizing here can't race a
+        // concurrent send into a turn we'd wrongly kill.
+        finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
         if let Some((id, text)) = current {
             let _ = repo::update_lead_message(
                 &db,
