@@ -129,6 +129,8 @@ interface Store {
   threadTab: ThreadTab;
   setThreadTab: (tab: ThreadTab) => void;
   /** Mark skills as changed; idle sessions/leads lazily refresh their engines. */
+  /** Bumped on any skills mutation; consumers re-fetch enabled skills off this. */
+  skillsDirtyAt: number;
   markSkillsDirty: () => void;
 
   /** Open agent→human questions across the workspace; the Needs-you surface. */
@@ -1550,6 +1552,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setReviewingProposal,
     threadTab,
     setThreadTab,
+    skillsDirtyAt,
     markSkillsDirty,
     projectsDir,
     setProjectsDir,

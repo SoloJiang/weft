@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { GitCompare } from "lucide-react";
+import { GitCompare, Info } from "lucide-react";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
-import type { ObserveRef } from "../lib/types";
+import type { EnabledSkill, ObserveRef } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
 import { ChatComposer } from "./ChatComposer";
 import { DiffPanel } from "./DiffPanel";
+import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { appLink, resumeCommand } from "../lib/resume";
@@ -25,17 +26,22 @@ export function WorkerConversation() {
     workerTurn,
     workerSlash,
     workerActivity,
+    workerMeta,
+    hydrateWorkerMeta,
     discoverWorkerSlash,
     loadLeadChat,
     needs,
     answerAsk,
     sendToWorker,
     activeThreadId,
+    activeWorkspaceId,
+    skillsDirtyAt,
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [showDiff, setShowDiff] = useState(false);
+  const [rail, setRail] = useState<"info" | "diff" | "none">("info");
+  const [skills, setSkills] = useState<EnabledSkill[]>([]);
 
   const directionId = viewing?.directionId ?? null;
   const repoId = viewing?.repoId ?? null;
@@ -62,7 +68,7 @@ export function WorkerConversation() {
   // Resolve the worker's session ref (worktree/branch/tool/session_id/native_id).
   // Polls while not live so a backgrounded worker's status stays fresh.
   useEffect(() => {
-    setShowDiff(viewing?.diff ?? false);
+    setRail(viewing?.diff ? "diff" : "info");
     if (directionId == null || repoId == null) {
       setRef(null);
       return;
@@ -75,6 +81,7 @@ export function WorkerConversation() {
           if (alive) {
             setRef(r);
             setLoadError(null);
+            if (r && r.session_id != null) hydrateWorkerMeta(r.session_id, r);
           }
         })
         .catch((e: unknown) => {
@@ -86,7 +93,17 @@ export function WorkerConversation() {
       alive = false;
       clearInterval(h);
     };
-  }, [directionId, repoId, viewing?.diff]);
+  }, [directionId, repoId, viewing?.diff, hydrateWorkerMeta]);
+
+  // Enabled skills for the panel (workspace-level, CLI-agnostic). Re-fetch when
+  // skills change so the silent skill-refresh is reflected without a restart.
+  useEffect(() => {
+    if (activeWorkspaceId == null) return;
+    void api
+      .workspaceSkills(activeWorkspaceId)
+      .then((s) => setSkills(s.filter((x) => !x.overridden)))
+      .catch(() => {});
+  }, [activeWorkspaceId, skillsDirtyAt]);
 
   if (viewing == null || directionId == null || repoId == null) return null;
 
@@ -116,7 +133,19 @@ export function WorkerConversation() {
             {ref?.branch}
           </span>
           <button
-            onClick={() => setShowDiff(true)}
+            onClick={() => setRail((r) => (r === "info" ? "none" : "info"))}
+            title={t("sessionInfo.title")}
+            aria-label={t("sessionInfo.title")}
+            className={`grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border transition-colors ${
+              rail === "info"
+                ? "border-brand bg-brand-ghost text-brand"
+                : "border-border text-ink-muted hover:bg-surface hover:text-ink"
+            }`}
+          >
+            <Info size={13} />
+          </button>
+          <button
+            onClick={() => setRail("diff")}
             title={t("diff.tab")}
             aria-label={t("diff.tab")}
             className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border border-border text-ink-muted transition-colors hover:bg-surface hover:text-ink"
@@ -174,11 +203,18 @@ export function WorkerConversation() {
         </div>
       </section>
 
+      {rail === "info" && (
+        <SessionInfoPanel
+          meta={sid != null ? workerMeta[sid] : undefined}
+          skills={skills}
+          onClose={() => setRail("none")}
+        />
+      )}
       {ref && (
         <DiffPanel
           cwd={ref.worktree}
-          open={showDiff}
-          onClose={() => setShowDiff(false)}
+          open={rail === "diff"}
+          onClose={() => setRail("info")}
           onAsk={(text) => void sendToWorker(directionId, repoId, text)}
         />
       )}
