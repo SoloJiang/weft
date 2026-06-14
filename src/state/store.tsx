@@ -791,8 +791,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // — the engine is already live, so there is nothing to start; calling it would
   // respawn a stopped worker. Uses the slot's OWN thread id (a revived worker can
   // belong to any thread, not activeThreadId). Auto-verify is handled separately and
-  // authoritatively by the backend (see the idle-turn handler), so adoption no longer
-  // seeds turn state.
+  // authoritatively by the backend (see the idle-turn handler), so the busy seed
+  // below is UI-only (typing indicator / Stop button / nav running count) and arms
+  // no verify latch.
   const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
     const sid = slot.info.session_id;
     if (sessionsRef.current[sid]) return;
@@ -817,6 +818,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             },
           },
     );
+    if (slot.busy) {
+      // Seed the worker's busy turn state so the chat surface shows the typing
+      // indicator + Stop button and WorkspaceNav counts it as running — a revived
+      // worker emits no turn push until its turn completes. Guard on absence so a
+      // raced idle/stopped value the listener already recorded wins. (Verify is
+      // backend-driven, so this seeds UI state only — it arms no latch.)
+      setWorkerTurn((t) =>
+        t[sid] ? t : { ...t, [sid]: { state: "busy", queued: slot.queued } },
+      );
+    }
   }, []);
 
   // Pull the backend's live worker engines and adopt any the frontend doesn't
@@ -837,6 +848,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       do {
         hydratePendingRef.current = false;
         const slots = await api.listLiveWorkerSlots();
+        // Load each adopted worker's thread directions so WorkspaceNav can match the
+        // session to its direction and count it as running — a revived worker can
+        // live in a thread the user never opened this session, whose
+        // directionsByThread entry would otherwise be empty. (Best-effort; verify
+        // does not depend on this — the backend reads the phase itself.)
+        const threadIds = [...new Set(slots.map((s) => s.thread_id))];
+        await Promise.all(
+          threadIds.map(async (tid) => {
+            try {
+              const dirs = await api.listDirections(tid);
+              setDirections((m) => ({ ...m, [tid]: dirs }));
+            } catch {
+              /* best-effort: a thread whose directions fail to load just won't
+                 show its running count until opened */
+            }
+          }),
+        );
         for (const slot of slots) adoptWorker(slot);
       } while (hydratePendingRef.current);
     } catch {
