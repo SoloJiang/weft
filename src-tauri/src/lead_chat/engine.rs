@@ -73,11 +73,21 @@ pub enum Push {
     },
     /// The tool call currently executing — transient: rendered while it runs,
     /// replaced by the next one, cleared by the Turn event. Never persisted.
+    /// Used for codex pills, which carry no input/output to expand.
     Activity {
         thread_id: i32,
         session_id: Option<i32>,
         name: String,
         summary: String,
+    },
+    /// A persisted `kind:"tool"` row received its result: replace the row's
+    /// content (now carrying output) and status. Pairs with the earlier
+    /// Push::Message that inserted the running row.
+    ToolResult {
+        thread_id: i32,
+        message_id: i32,
+        content: String,
+        status: String,
     },
 }
 
@@ -465,6 +475,11 @@ pub struct EngineInner {
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
     pub current_origin_tag: Option<String>,
+    /// Maps an in-flight tool call's id (claude `tool_use_id`) to its persisted
+    /// `kind:"tool"` row id and current content JSON, so the out-of-band tool
+    /// result can merge its output without re-reading the row. Cleared at each
+    /// turn boundary; codex pills never populate it.
+    pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
     /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
     /// engines; explicit sends/ensure clear this and restart as needed.
     pub stopped: bool,
@@ -921,14 +936,14 @@ async fn codex_consumer(
                 let inner = eng.lock().await;
                 let (thread_id, sid) = (inner.thread_id, inner.session_id);
                 drop(inner);
-                for (name, summary) in tools {
+                for tool in tools {
                     let _ = app.emit(
                         EVENT,
                         Push::Activity {
                             thread_id,
                             session_id: sid,
-                            name,
-                            summary,
+                            name: tool.name,
+                            summary: tool.summary,
                         },
                     );
                 }
@@ -1701,16 +1716,90 @@ fn spawn_reader(
                             }
                         }
                     }
-                    // Tool calls are transient activity, not timeline rows:
-                    // show the one currently running, gone when the turn moves on.
-                    for (name, summary) in tools {
+                    // Codex exec items carry no input/output to expand, so they
+                    // stay transient activity pills; claude/opencode tool calls
+                    // become persisted, expandable `kind:"tool"` rows.
+                    if inner.tool == "codex" {
+                        for tool in tools {
+                            let _ = app.emit(
+                                EVENT,
+                                Push::Activity {
+                                    thread_id,
+                                    session_id: inner.session_id,
+                                    name: tool.name,
+                                    summary: tool.summary,
+                                },
+                            );
+                        }
+                    } else {
+                        for call in tools {
+                            let (sid, turn) = (inner.session_id, inner.turn_id);
+                            // No output yet (claude `tool_use`) → a running row to
+                            // be filled by a later ToolResults; output already
+                            // present (opencode completed) → a final row in one shot.
+                            let running = call.output.is_none();
+                            let status = if running {
+                                "streaming"
+                            } else if call.is_error {
+                                "error"
+                            } else {
+                                "complete"
+                            };
+                            let content = serde_json::json!({
+                                "name": call.name,
+                                "summary": call.summary,
+                                "input": call.input,
+                                "output": call.output.unwrap_or_default(),
+                                "is_error": call.is_error,
+                            });
+                            let content_str = content.to_string();
+                            let call_id = call.id;
+                            match repo::insert_lead_message(
+                                &db, thread_id, sid, turn, "assistant", "tool",
+                                &content_str, status,
+                            )
+                            .await
+                            {
+                                Ok(m) => {
+                                    let row_id = m.id;
+                                    let _ = app.emit(
+                                        EVENT,
+                                        Push::Message { thread_id, message: m },
+                                    );
+                                    if running && !call_id.is_empty() {
+                                        inner.tool_rows.insert(call_id, (row_id, content));
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[weft] lead tool row insert failed: {e}")
+                                }
+                            }
+                        }
+                    }
+                }
+                super::proto::ChatEvent::ToolResults { items } => {
+                    // Fill in the output of running tool rows — claude delivers
+                    // results out-of-band as a `user` turn. A result for a row we
+                    // never tracked is dropped rather than left orphaned.
+                    for item in items {
+                        let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id)
+                        else {
+                            continue;
+                        };
+                        if let Some(obj) = content.as_object_mut() {
+                            obj.insert("output".into(), item.output.into());
+                            obj.insert("is_error".into(), item.is_error.into());
+                        }
+                        let status = if item.is_error { "error" } else { "complete" };
+                        let content_str = content.to_string();
+                        let _ = repo::update_lead_message(&db, row_id, &content_str, status).await;
                         let _ = app.emit(
                             EVENT,
-                            Push::Activity {
+                            Push::ToolResult {
                                 thread_id,
-                                session_id: inner.session_id,
-                                name,
-                                summary,
+                                message_id: row_id,
+                                content: content_str,
+                                status: status.into(),
                             },
                         );
                     }
@@ -1724,6 +1813,24 @@ fn spawn_reader(
                         "complete"
                     };
                     inner.interrupting = false;
+                    // Finalize any tool rows still awaiting a result — an
+                    // interrupted or errored turn can leave a `tool_use` without
+                    // its `tool_result`, which would otherwise spin forever.
+                    let orphans: Vec<(i32, serde_json::Value)> =
+                        inner.tool_rows.drain().map(|(_, v)| v).collect();
+                    for (row_id, content) in orphans {
+                        let content_str = content.to_string();
+                        let _ = repo::update_lead_message(&db, row_id, &content_str, status).await;
+                        let _ = app.emit(
+                            EVENT,
+                            Push::ToolResult {
+                                thread_id,
+                                message_id: row_id,
+                                content: content_str,
+                                status: status.into(),
+                            },
+                        );
+                    }
                     if let Some((id, text, _)) = inner.current.take() {
                         let _ = repo::update_lead_message(
                             &db,
@@ -2201,6 +2308,7 @@ mod tests {
             generation: 0,
             pending_skill_refresh: false,
             current_origin_tag: None,
+            tool_rows: std::collections::HashMap::new(),
             stopped: false,
         }
     }
@@ -2336,6 +2444,7 @@ mod tests {
             generation: 0,
             pending_skill_refresh: false,
             current_origin_tag: None,
+            tool_rows: std::collections::HashMap::new(),
             stopped: false,
         };
         let fresh = build_args(&inner);
