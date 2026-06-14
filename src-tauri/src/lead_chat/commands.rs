@@ -51,7 +51,7 @@ When the write boundary is clear enough for workers to start, call propose_direc
 Pick mandate per direction as a planning-depth hint: plan+impl for directions that need worker planning, impl-only for small or fully specified directions. \
 Prefer independent directions that can proceed in parallel; put shared contract owners first only when they block others. \
 The human reviews and confirms in weft; you can re-propose after more discussion. \
-After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), reply with bus_post to the sender's direction id, and use bus_broadcast for thread-wide coordination. Reading the bus is your job; do not assume silence means nothing happened.";
+After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), and reply with bus_post to a worker's direction id — a direct bus_post reliably reaches that worker even if it is currently idle. bus_broadcast only reaches participants already active on the bus, so to be sure a specific worker sees something, bus_post it directly rather than relying on a broadcast. Reading the bus is your job; do not assume silence means nothing happened.";
 
 /// Sentinel usage directives appended to the lead prompt. Each subsequent task
 /// (Task 3-5) keeps growing this block, so it lives as its own const for easy

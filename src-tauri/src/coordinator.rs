@@ -167,6 +167,16 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
             crate::lead_chat::engine::nudge(app, &db, &eng, WAKE_PROMPT).await
         }
         Route::Worker(dir) => {
+            // Direction ids are global, but a wake belongs to the thread it was
+            // posted on. A post to a foreign dir (an id that lives in another
+            // thread) must not drive that unrelated worker — it would read its
+            // own thread's inbox, not where the message actually landed.
+            let Some(d) = crate::store::repo::get_direction(&db, dir).await? else {
+                return Ok(());
+            };
+            if d.thread_id != thread {
+                return Ok(());
+            }
             let Some(s) = crate::store::repo::latest_session_for_direction(&db, dir).await? else {
                 return Ok(());
             };
@@ -183,11 +193,7 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
                     // Not resident: lazily open the worker so an idle/closed
                     // worker can still be driven by a bus post. Never resurrect a
                     // finished direction — a stray message must not restart it.
-                    let done = crate::store::repo::get_direction(&db, dir)
-                        .await?
-                        .map(|d| d.status == "done")
-                        .unwrap_or(true);
-                    if done {
+                    if d.status == "done" {
                         return Ok(());
                     }
                     let info = crate::lead_chat::commands::chat_open_worker_impl(
