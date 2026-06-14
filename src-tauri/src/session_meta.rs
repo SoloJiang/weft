@@ -75,6 +75,18 @@ pub fn parse_toml_context_window(cfg: &str) -> Option<u64> {
         .map(|i| i as u64)
 }
 
+/// 由 opencode message 行的 `providerID`/`modelID` 拼出 `{id, providerID}` JSON,语义同
+/// 旧 `session.model` 列,供 [`opencode_model_label`]/`_id`/`_provider` 复用。modelID 缺失
+/// → None。**必要**:当前 opencode 的 `session.model` 列对最新会话常为空,model 身份只在
+/// message 行可靠(`providerID`/`modelID`),故从 message 取并在此重组。
+pub fn opencode_model_json(provider_id: Option<String>, model_id: Option<String>) -> Option<String> {
+    let id = model_id.filter(|s| !s.is_empty())?;
+    match provider_id.filter(|s| !s.is_empty()) {
+        Some(p) => Some(serde_json::json!({ "id": id, "providerID": p }).to_string()),
+        None => Some(serde_json::json!({ "id": id }).to_string()),
+    }
+}
+
 /// opencode `session.model` JSON → 展示标签 `providerID/id`(无 provider 时退回 id)。
 pub fn opencode_model_label(model_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(model_json).ok()?;
@@ -134,7 +146,12 @@ pub fn parse_opencode_mcp(v: &serde_json::Value) -> Option<Vec<McpServer>> {
 // ───────────────────────── 带外取数(I/O) ─────────────────────────
 
 fn codex_home() -> std::path::PathBuf {
-    // dirs::home_dir() is platform-aware (HOME is often unset on Windows GUI launches).
+    // CODEX_HOME 优先:codex 文档把它定义为 state root,我们 spawn 的 codex 子进程与
+    // `codex mcp list` 探测都从这里读 config.toml / models_cache.json。它若未设才回退
+    // ~/.codex。dirs::home_dir() 平台感知(HOME 在 Windows GUI 启动常未设)。
+    if let Some(h) = std::env::var_os("CODEX_HOME").filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(h);
+    }
     dirs::home_dir().map(|h| h.join(".codex")).unwrap_or_default()
 }
 
@@ -279,6 +296,23 @@ mod tests {
             parse_toml_context_window("model_context_window = \"big\"\n"),
             None
         );
+    }
+
+    #[test]
+    fn opencode_model_json_from_message_fields() {
+        // message 行的 providerID/modelID → {id,providerID} JSON,喂回三个解析器。
+        let j = opencode_model_json(Some("kimi-for-coding".into()), Some("k2p6".into()))
+            .expect("modelID present → Some");
+        assert_eq!(opencode_model_label(&j).as_deref(), Some("kimi-for-coding/k2p6"));
+        assert_eq!(opencode_model_id(&j).as_deref(), Some("k2p6"));
+        assert_eq!(opencode_model_provider(&j).as_deref(), Some("kimi-for-coding"));
+        // provider 缺失 → 只 id,label 退回裸 id。
+        let j2 = opencode_model_json(None, Some("k2p6".into())).expect("modelID present → Some");
+        assert_eq!(opencode_model_label(&j2).as_deref(), Some("k2p6"));
+        assert_eq!(opencode_model_provider(&j2), None);
+        // modelID 缺失 / 空 → None(没有可展示的 model)。
+        assert_eq!(opencode_model_json(Some("p".into()), None), None);
+        assert_eq!(opencode_model_json(Some("p".into()), Some(String::new())), None);
     }
 
     #[test]
