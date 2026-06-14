@@ -340,9 +340,11 @@ fn parse_opencode_part(role: &str, data: &serde_json::Value, out: &mut Vec<NormE
     }
 }
 
-/// 会话信息面板(M2):opencode 会话级 usage 快照,按 session id(= 我们的 native_id)
-/// 查 `session` 表。返回 (context_tokens = tokens_input + tokens_cache_read, model JSON)。
-/// ro 连接,不扰动 live(WAL)db。
+/// 会话信息面板(M2):opencode 会话的「当前上下文」usage,按 session id(= 我们的
+/// native_id)取**最近一条 assistant 消息**的 `tokens.input + tokens.cache.read`。
+/// 不用 `session` 表的 `tokens_*` 列——那是整个会话的**累计**值(实测:= 各轮 input
+/// 之和),会随轮次无界增长、超出 window,不是当前上下文。model 仍取 `session.model`
+/// (稳定的 {id,providerID} JSON)。ro 连接,不扰动 live(WAL)db。
 pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<String>)> {
     let home = std::env::var("HOME").ok()?;
     let db = PathBuf::from(home).join(".local/share/opencode/opencode.db");
@@ -353,19 +355,42 @@ pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<Stri
     let mut opt = ConnectOptions::new(url);
     opt.max_connections(1).sqlx_logging(false);
     let conn = Database::connect(opt).await.ok()?;
-    let rows = conn
+    // 当前上下文 = 最近一条 assistant 消息的 input + cache.read。
+    let ctx = match conn
         .query_all(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT tokens_input, tokens_cache_read, model FROM session WHERE id = ? LIMIT 1",
+            "SELECT json_extract(data, '$.tokens.input') AS ti, \
+             json_extract(data, '$.tokens.cache.read') AS tcr \
+             FROM message \
+             WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant' \
+             ORDER BY time_created DESC LIMIT 1",
             vec![native_id.into()],
         ))
         .await
-        .ok()?;
-    let r = rows.first()?;
-    let ti: i64 = r.try_get("", "tokens_input").unwrap_or(0);
-    let tc: i64 = r.try_get("", "tokens_cache_read").unwrap_or(0);
-    let model: Option<String> = r.try_get("", "model").ok();
-    Some(((ti.max(0) as u64) + (tc.max(0) as u64), model))
+    {
+        Ok(rows) => rows
+            .first()
+            .map(|r| {
+                let ti: i64 = r.try_get("", "ti").unwrap_or(0);
+                let tcr: i64 = r.try_get("", "tcr").unwrap_or(0);
+                (ti.max(0) as u64) + (tcr.max(0) as u64)
+            })
+            .unwrap_or(0),
+        Err(_) => 0,
+    };
+    // model:稳定的 session 行(供 opencode_model_label 解析 {id,providerID})。
+    let model = match conn
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT model FROM session WHERE id = ? LIMIT 1",
+            vec![native_id.into()],
+        ))
+        .await
+    {
+        Ok(rows) => rows.first().and_then(|r| r.try_get::<String>("", "model").ok()),
+        Err(_) => None,
+    };
+    Some((ctx, model))
 }
 
 async fn read_opencode(cwd: &Path) -> Option<Vec<NormEvent>> {

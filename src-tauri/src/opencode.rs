@@ -110,6 +110,7 @@ async fn server_window_and_mcp_inner(
         Some(mid) => {
             let providers: serde_json::Value = client
                 .get(format!("{base}/config/providers"))
+                .query(&[("directory", cwd)])
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await?
