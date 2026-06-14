@@ -346,28 +346,55 @@ fn is_opencode_db(name: &str) -> bool {
     name.starts_with("opencode") && name.ends_with(".db")
 }
 
-/// 解析 opencode 当前活跃的 DB 文件路径。硬编码 `opencode.db` 会在 prod/stable 渠道上读不到
-/// (那里是 `opencode-prod.db` / `opencode-stable.db`),故取数据目录下所有 `opencode*.db` 里
-/// **mtime 最新**的那个(= 正在写的活跃库),按文件名渠道无关。dirs::home_dir() 平台感知
-/// (HOME 在 Windows GUI 启动常未设)。
-fn opencode_db_path() -> Option<PathBuf> {
-    let dir = dirs::home_dir()?.join(".local/share/opencode");
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !is_opencode_db(name) {
-            continue;
+/// opencode 数据目录的候选位置(按出现顺序扫描,跨平台 + 跨渠道)。opencode 在
+/// Linux **和** macOS 都用 XDG `~/.local/share/opencode`(实测 macOS 即此,**不是**
+/// `~/Library/Application Support`,故不能只用 `dirs::data_dir()`——那会漏掉 mac);
+/// Windows 用 `%APPDATA%\opencode`(= `dirs::data_dir()`)。`XDG_DATA_HOME` 若设则优先。
+fn opencode_data_dirs() -> Vec<PathBuf> {
+    let mut dirs_out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !dirs_out.contains(&p) {
+            dirs_out.push(p);
         }
-        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+    };
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+        push(PathBuf::from(xdg).join("opencode"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        push(home.join(".local/share/opencode"));
+    }
+    if let Some(data) = dirs::data_dir() {
+        push(data.join("opencode")); // %APPDATA%\opencode on Windows
+    }
+    dirs_out
+}
+
+/// 解析 opencode 当前活跃的 DB 文件路径。硬编码 `opencode.db` 会在 prod/stable 渠道上读不到
+/// (那里是 `opencode-prod.db` / `opencode-stable.db`),也会在 Windows 上读不到(库在
+/// `%APPDATA%`)。故扫描所有候选数据目录里的 `opencode*.db`,取 **mtime 最新**的那个
+/// (= 正在写的活跃库),跨平台 + 跨渠道。
+fn opencode_db_path() -> Option<PathBuf> {
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for dir in opencode_data_dirs() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let newer = match &best {
-            Some((t, _)) => mtime > *t,
-            None => true,
-        };
-        if newer {
-            best = Some((mtime, entry.path()));
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_opencode_db(name) {
+                continue;
+            }
+            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            let newer = match &best {
+                Some((t, _)) => mtime > *t,
+                None => true,
+            };
+            if newer {
+                best = Some((mtime, entry.path()));
+            }
         }
     }
     best.map(|(_, p)| p)
