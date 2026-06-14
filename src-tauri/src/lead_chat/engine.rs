@@ -109,12 +109,15 @@ pub struct Outgoing {
 pub struct TurnState {
     pub busy: bool,
     pub queue: VecDeque<Outgoing>,
-    /// A bus wake landed while this engine was busy. Instead of queuing one
-    /// "read your inbox" turn per wake, we set this once and synthesize a SINGLE
-    /// inbox-read turn the moment the queue drains — one `bus_inbox` reads every
-    /// message, so any number of wakes during a turn coalesce into one trailing
-    /// read fired exactly at turn-end (no timer, never interleaved mid-turn).
-    pub bus_read_pending: bool,
+    /// A bus wake landed while this engine was busy. Rather than queue one "read
+    /// your inbox" turn per wake, we remember the wake's FIFO position — the
+    /// number of messages already queued when it arrived — and synthesize a
+    /// SINGLE inbox-read there. Messages queued BEFORE the wake drain first, then
+    /// the read, then anything queued after (so a later user send can't jump
+    /// ahead of an earlier bus message). One `bus_inbox` reads everything, so any
+    /// number of wakes during a turn coalesce into this one read (`is_none`
+    /// guard keeps the earliest position). No timer, never interleaved mid-turn.
+    pub bus_read_pos: Option<usize>,
 }
 
 impl TurnState {
@@ -129,10 +132,14 @@ impl TurnState {
 
     /// A bus wake arrived. Returns true if the caller should start a read turn
     /// right now (engine idle); false means it was coalesced into the running
-    /// turn and will be read once the queue drains (see `on_turn_end`).
+    /// turn and will be read at its FIFO position once the queue drains there
+    /// (see `on_turn_end`). The `is_none` guard keeps the earliest wake's
+    /// position so a later wake can't push the read behind newer messages.
     pub fn request_bus_read(&mut self) -> bool {
         if self.busy {
-            self.bus_read_pending = true;
+            if self.bus_read_pos.is_none() {
+                self.bus_read_pos = Some(self.queue.len());
+            }
             false
         } else {
             self.busy = true;
@@ -140,24 +147,38 @@ impl TurnState {
         }
     }
 
-    /// Turn finished: pop the next queued message (stays busy); else, if a bus
-    /// wake coalesced during the turn, synthesize one invisible inbox-read turn;
-    /// otherwise go idle.
+    /// Turn finished: deliver the next thing in FIFO order. Messages queued
+    /// before a coalesced bus wake drain first; when the wake's position is
+    /// reached, synthesize one invisible inbox-read turn; then the rest; finally
+    /// go idle.
     pub fn on_turn_end(&mut self) -> Option<Outgoing> {
-        if let Some(next) = self.queue.pop_front() {
-            return Some(next);
+        match self.bus_read_pos {
+            // The wake sits at the front: read the inbox now (stays busy).
+            Some(0) => {
+                self.bus_read_pos = None;
+                Some(Outgoing {
+                    text: BUS_WAKE_PROMPT.to_string(),
+                    images: vec![],
+                    tracked: false,
+                    origin_tag: None,
+                })
+            }
+            // A message queued before the wake goes first; the wake slides up one.
+            Some(n) => {
+                let next = self.queue.pop_front();
+                self.bus_read_pos = Some(n.saturating_sub(1));
+                // Defensive: if the queue emptied early, read at turn-end anyway
+                // rather than stranding the pending wake.
+                next.or_else(|| self.on_turn_end())
+            }
+            None => match self.queue.pop_front() {
+                Some(next) => Some(next),
+                None => {
+                    self.busy = false;
+                    None
+                }
+            },
         }
-        if self.bus_read_pending {
-            self.bus_read_pending = false;
-            return Some(Outgoing {
-                text: BUS_WAKE_PROMPT.to_string(),
-                images: vec![],
-                tracked: false,
-                origin_tag: None,
-            });
-        }
-        self.busy = false;
-        None
     }
 }
 
@@ -2118,18 +2139,18 @@ mod tests {
     }
 
     #[test]
-    fn bus_read_runs_after_queued_messages() {
+    fn bus_read_runs_after_messages_queued_before_the_wake() {
         let mut t = TurnState::default();
         assert!(t.try_begin_send()); // busy
         t.queue.push_back(Outgoing {
-            text: "human".into(),
+            text: "earlier".into(),
             images: vec![],
             tracked: true,
             origin_tag: None,
         });
-        t.request_bus_read(); // a wake also landed
-                              // Explicit queued input drains first, then the coalesced read.
-        assert_eq!(t.on_turn_end().map(|o| o.text).as_deref(), Some("human"));
+        t.request_bus_read(); // wake lands AFTER "earlier" was queued
+                              // "earlier" preceded the wake, so it drains first, then the read.
+        assert_eq!(t.on_turn_end().map(|o| o.text).as_deref(), Some("earlier"));
         assert_eq!(
             t.on_turn_end().map(|o| o.text).as_deref(),
             Some(BUS_WAKE_PROMPT)
@@ -2138,11 +2159,32 @@ mod tests {
     }
 
     #[test]
+    fn bus_read_precedes_messages_queued_after_the_wake() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // busy
+        t.request_bus_read(); // wake lands first (queue empty → position 0)
+        t.queue.push_back(Outgoing {
+            text: "later".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+        });
+        // The wake arrived before "later", so the inbox read comes first — the
+        // agent can't answer the newer prompt without seeing the bus message.
+        assert_eq!(
+            t.on_turn_end().map(|o| o.text).as_deref(),
+            Some(BUS_WAKE_PROMPT)
+        );
+        assert_eq!(t.on_turn_end().map(|o| o.text).as_deref(), Some("later"));
+        assert!(t.on_turn_end().is_none());
+    }
+
+    #[test]
     fn request_bus_read_on_idle_starts_a_turn() {
         let mut t = TurnState::default();
         assert!(t.request_bus_read()); // idle → caller starts a read turn now
         assert!(t.busy);
-        assert!(!t.bus_read_pending); // consumed by starting the turn, not pending
+        assert!(t.bus_read_pos.is_none()); // consumed by starting the turn, not pending
     }
 
     #[test]
