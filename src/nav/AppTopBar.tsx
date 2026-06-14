@@ -5,6 +5,7 @@ import {
   Languages,
   LayoutGrid,
   MessagesSquare,
+  Monitor,
   Moon,
   PanelLeftOpen,
   Sun,
@@ -47,7 +48,9 @@ export function AppTopBar() {
     dismissUpdate,
   } = useStore();
   const { t } = useTranslation();
-  const { theme, toggle } = useTheme();
+  const { pref, cycle } = useTheme();
+  const themeLabel =
+    pref === "system" ? t("settings.system") : pref === "light" ? t("settings.light") : t("settings.dark");
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const lang = currentLang();
   const thread = threads.find((th) => th.id === activeThreadId);
@@ -241,11 +244,11 @@ export function AppTopBar() {
 
       <button
         type="button"
-        onClick={toggle}
-        title={t("palette.theme")}
+        onClick={cycle}
+        title={`${t("palette.theme")} · ${themeLabel}`}
         className="grid h-8 w-8 place-items-center rounded-[var(--radius-md)] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
       >
-        {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+        {pref === "system" ? <Monitor size={15} /> : pref === "light" ? <Sun size={15} /> : <Moon size={15} />}
       </button>
       <AddRepoDialog open={repoDialogOpen} onOpenChange={setRepoDialogOpen} />
     </header>

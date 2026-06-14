@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, FileText, Sparkles } from "lucide-react";
 import type { LeadMessage } from "../lib/types";
@@ -52,27 +53,30 @@ export function ChatTimeline({
   emptyState?: EmptyStateMode;
 }) {
   const { t } = useTranslation();
-  const endRef = useRef<HTMLDivElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
-  const lastTextLen = messages
-    .filter((m) => m.kind === "text")
-    .reduce((n, m) => n + m.content.length, 0);
-
-  // Stick to the bottom while the user is already there (streaming included);
-  // never yank them down when they've scrolled up to read history.
-  useEffect(() => {
-    if (atBottomRef.current) endRef.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, lastTextLen, busy, activity]);
-
-  const onScroll = () => {
-    const el = scrollRef.current;
-    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  };
 
   // Tool rows (legacy imports / older builds) are hidden: tool calls render
-  // only while running, via the activity line below.
+  // only while running, via the activity bar below the list.
   const visible = messages.filter((m) => m.kind !== "meta" && m.kind !== "tool");
+
+  // Virtuoso's followOutput only fires on item-COUNT changes, so it misses
+  // intra-message streaming growth (text appended to the existing last row).
+  // Follow the bottom ourselves on every growth signal, but only while the user
+  // is parked at the bottom. atBottomThreshold (set on Virtuoso below) restores
+  // the old ~80px tolerance, so a reader a few px short of the exact bottom still
+  // auto-follows while one who scrolled up to read history is left alone.
+  // scrollToIndex is measurement-aware — it renders and measures the target row
+  // before scrolling — so there is no scrollTo(MAX)/rAF drift to correct, and
+  // because the activity bar lives OUTSIDE the scroller the last row is the
+  // unambiguous bottom.
+  const lastTextLen = visible
+    .filter((m) => m.kind === "text")
+    .reduce((n, m) => n + m.content.length, 0);
+  useEffect(() => {
+    if (!atBottomRef.current || visible.length === 0) return;
+    virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+  }, [visible.length, lastTextLen, busy, activity]);
 
   if (visible.length === 0 && !busy) {
     return (
@@ -88,37 +92,74 @@ export function ChatTimeline({
   }
 
   return (
-    <div
-      ref={scrollRef}
-      onScroll={onScroll}
-      className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-4 py-4"
-    >
-      <div className="mx-auto flex w-full max-w-[820px] flex-col gap-2.5">
-        {visible.map((m) => (
-          <TimelineRow
-            key={m.id}
-            m={m}
-            all={visible}
-            onReviewProposal={onReviewProposal}
-            runAction={runAction}
-            actionsBusy={actionsBusy}
-            threadId={threadId ?? null}
-            workspaceId={workspaceId ?? null}
-            promptText={promptText}
-            cwd={cwd}
-          />
-        ))}
-        {busy && activity && <ActivityLine name={activity.name} summary={activity.summary} />}
-        {busy && !activity && (
-          <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
-            {t("lead.working")}
+    <div className="flex min-h-0 flex-1 flex-col">
+      <Virtuoso<LeadMessage>
+        ref={virtuosoRef}
+        className="min-h-0 flex-1"
+        data={visible}
+        computeItemKey={(_index, m) => m.id}
+        // Open at the BOTTOM of the last message (align "end"), so a final
+        // message taller than the viewport opens at its latest line, not its top.
+        // Omitted while empty (busy-only turn): index 0 is out of range for
+        // data=[] and would misinitialize Virtuoso.
+        initialTopMostItemIndex={
+          visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
+        }
+        // Restore the old 80px "close enough to the bottom" tolerance: a reader a
+        // few px up (e.g. a trackpad nudge) still counts as at-bottom and keeps
+        // auto-following. Virtuoso's default is only a few px.
+        atBottomThreshold={80}
+        atBottomStateChange={(atBottom) => {
+          atBottomRef.current = atBottom;
+        }}
+        increaseViewportBy={{ top: 600, bottom: 600 }}
+        components={{ Header, Footer }}
+        itemContent={(_index, m) => (
+          <div className="mx-auto w-full max-w-[820px] px-4 pb-2.5">
+            <TimelineRow
+              m={m}
+              all={visible}
+              onReviewProposal={onReviewProposal}
+              runAction={runAction}
+              actionsBusy={actionsBusy}
+              threadId={threadId ?? null}
+              workspaceId={workspaceId ?? null}
+              promptText={promptText}
+              cwd={cwd}
+            />
           </div>
         )}
-      </div>
-      <div ref={endRef} />
+      />
+      {/* The in-flight tool / working indicator sits OUTSIDE the virtualized
+          scroller as a fixed bottom bar. Keeping it out of the list makes the
+          last message the unambiguous list bottom (so the follow-scroll target
+          is exact) and keeps the indicator visible even while the user scrolls
+          back through history. */}
+      {busy && (
+        <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
+          {activity ? (
+            <ActivityLine name={activity.name} summary={activity.summary} />
+          ) : (
+            <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
+              {t("lead.working")}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+/** Top breathing room — mirrors the old scroll container's py-4 top padding. */
+function Header() {
+  return <div className="h-4" />;
+}
+
+/** Bottom breathing room inside the scroller; the activity bar now renders
+ *  outside the virtualized list (see ChatTimeline). */
+function Footer() {
+  return <div className="h-4" />;
 }
 
 function EmptyLeadState({
