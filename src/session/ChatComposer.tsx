@@ -412,29 +412,25 @@ export function ChatComposer({
               </button>
             </Tooltip>
           )}
-          {/* Send stays clickable while busy (click = queue the message); Stop is a
-              separate, small icon-only key shown only while a turn is in flight.
-              Enter also sends/queues. */}
-          {busy && (
+          {/* While a turn is in flight the single button IS Stop (no separate Stop
+              button). A new message is queued via Enter (onKeyDown, unchanged) and
+              shows in the queue area above the composer; idle, the button is Send. */}
+          {busy ? (
+            <Button size="sm" variant="ghost" onClick={onStop}>
+              <Square size={12} />
+              {t("lead.stop")}
+            </Button>
+          ) : (
             <Button
               size="sm"
-              variant="ghost"
-              onClick={onStop}
-              aria-label={t("lead.stop")}
-              title={t("lead.stop")}
+              variant="primary"
+              disabled={!text.trim() && images.length === 0 && files.length === 0}
+              onClick={send}
             >
-              <Square size={12} />
+              <Send size={13} />
+              {t("lead.send")}
             </Button>
           )}
-          <Button
-            size="sm"
-            variant="primary"
-            disabled={!text.trim() && images.length === 0 && files.length === 0}
-            onClick={send}
-          >
-            <Send size={13} />
-            {t("lead.send")}
-          </Button>
         </div>
       </div>
     </div>
