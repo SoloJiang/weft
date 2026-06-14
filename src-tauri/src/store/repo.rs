@@ -552,19 +552,6 @@ pub async fn worktree_for(
         .await?)
 }
 
-/// Repoint an existing worktree row to `path`. Used when re-materializing a row
-/// that pointed into another profile's namespace (e.g. a DB copied across homes),
-/// so the row tracks this profile's checkout rather than the foreign one.
-pub async fn update_worktree_path(db: &Db, id: i32, path: &str) -> Result<worktree::Model> {
-    Ok(worktree::ActiveModel {
-        id: Set(id),
-        path: Set(path.to_string()),
-        ..Default::default()
-    }
-    .update(&db.0)
-    .await?)
-}
-
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
 pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, String, String)>> {
