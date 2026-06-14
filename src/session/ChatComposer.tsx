@@ -150,6 +150,10 @@ export function ChatComposer({
   // Typing "/" before the engine reported its command list: ask for a refresh
   // (once per palette attempt) so the palette appears as soon as data exists.
   const askedSlashRef = useRef(false);
+  // The button morphs to Stop while busy, so a double-clicked Send could send then
+  // immediately interrupt its own turn. Record the last send so a Stop click that
+  // lands right after is ignored (guardedStop below).
+  const lastSendRef = useRef(0);
   useEffect(() => {
     if (slashQuery == null) {
       askedSlashRef.current = false;
@@ -164,6 +168,7 @@ export function ChatComposer({
   const send = () => {
     const v = text.trim();
     if (!v && images.length === 0 && files.length === 0) return;
+    lastSendRef.current = Date.now();
     const imgs = images.map(({ media_type, data }) => ({ media_type, data }));
     const prevText = text;
     const prevImages = images;
@@ -178,6 +183,13 @@ export function ChatComposer({
       setImages(prevImages);
       setFiles(prevFiles);
     });
+  };
+
+  // Swallow a Stop click that lands within a beat of a send, so a double-clicked
+  // Send (which morphs to Stop) can't immediately interrupt the turn it just started.
+  const guardedStop = () => {
+    if (Date.now() - lastSendRef.current < 400) return;
+    onStop();
   };
 
   const complete = (item: SlashItem) => {
@@ -416,7 +428,7 @@ export function ChatComposer({
               button). A new message is queued via Enter (onKeyDown, unchanged) and
               shows in the queue area above the composer; idle, the button is Send. */}
           {busy ? (
-            <Button size="sm" variant="ghost" onClick={onStop}>
+            <Button size="sm" variant="ghost" onClick={guardedStop}>
               <Square size={12} />
               {t("lead.stop")}
             </Button>
