@@ -5,8 +5,13 @@ import type { McpServerInfo, SessionMeta } from "../lib/types";
 const norm = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
+/** Weft 自己在 spawn 时注入的内部协调 MCP(weft_bus / weft_planner / …):是 Weft 的
+ *  管道,不是用户配置的 MCP。面板只展示用户的 MCP,所以三家统一过滤掉。claude 的
+ *  `system/init` 会带上它们(codex/opencode 的探测本就不含),在此统一隐藏以保持一致。 */
+const isInternalMcp = (name: string) => /^weft[-_]/i.test(name);
+
 /** claude init:把扁平 tools 里 `mcp__<server>__<tool>` 按 server 归到对应条目。
- *  codex/opencode 不传 tools,这里只产出 server + 状态(tools 为空)。 */
+ *  codex/opencode 不传 tools,这里只产出 server + 状态(tools 为空)。weft_* 内部 server 过滤掉。 */
 export function groupMcpTools(
   servers: { name: string; status: string }[],
   tools: string[],
@@ -20,11 +25,13 @@ export function groupMcpTools(
     list.push(m[2]);
     byPrefix.set(key, list);
   }
-  return servers.map((s) => ({
-    name: s.name,
-    status: s.status,
-    tools: byPrefix.get(norm(s.name)) ?? [],
-  }));
+  return servers
+    .filter((s) => !isInternalMcp(s.name))
+    .map((s) => ({
+      name: s.name,
+      status: s.status,
+      tools: byPrefix.get(norm(s.name)) ?? [],
+    }));
 }
 
 /** init push → SessionMeta(init 不带 usage,保留旧 contextTokens)。 */
