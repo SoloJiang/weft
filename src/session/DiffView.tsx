@@ -292,6 +292,7 @@ function parsePatch(patch: string): Record<string, DiffLine[]> {
   let buf: DiffLine[] = [];
   let oldNo = 0;
   let newNo = 0;
+  let inHunk = false;
   const flush = () => {
     if (cur) out[cur] = buf;
   };
@@ -301,6 +302,7 @@ function parsePatch(patch: string): Record<string, DiffLine[]> {
       buf = [];
       oldNo = 0;
       newNo = 0;
+      inHunk = false;
       const m = line.match(/ b\/(.+)$/);
       cur = m ? m[1] : line;
     } else if (
@@ -322,7 +324,11 @@ function parsePatch(patch: string): Record<string, DiffLine[]> {
         if (m) {
           oldNo = Number(m[1]);
           newNo = Number(m[2]);
+          inHunk = true;
         }
+        buf.push({ text: line });
+      } else if (!inHunk) {
+        // pre-hunk metadata (e.g. "Binary files … differ") — owns no line number
         buf.push({ text: line });
       } else if (line.startsWith("+")) {
         buf.push({ text: line, rno: newNo });
