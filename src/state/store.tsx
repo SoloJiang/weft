@@ -797,12 +797,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // would respawn a stopped worker. Uses the slot's OWN thread id (a revived
   // worker can belong to any thread, not activeThreadId).
   //
-  // When the slot is busy, also seed workerTurn to "busy": the revive path drives
-  // the worker via engine::nudge, which — unlike engine::send — emits NO busy
-  // turn-start push, so the lead-chat listener never marks it busy on its own.
-  // Seeding here arms the auto-verify effect so the worker's busy→idle at turn
-  // end runs that direction's checks. Both inserts guard on absence so a fresher
-  // live listener value is never clobbered.
+  // When the slot is busy it also arms the auto-verify latch (see the seed block
+  // below) — necessary because the nudge-driven revive turn emits no busy push.
   const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
     const sid = slot.info.session_id;
     if (sessionsRef.current[sid]) return;
@@ -822,9 +818,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           },
     );
     if (slot.busy) {
-      setWorkerTurn((t) =>
-        t[sid] ? t : { ...t, [sid]: { state: "busy", queued: slot.queued } },
-      );
+      // Arm the auto-verify latch. The revive path drives the worker via
+      // engine::nudge, which — unlike engine::send — emits NO busy turn-start
+      // push, so the listener never marks it busy on its own. Prime the latch's
+      // "previous" to busy and (re)publish workerTurn so the effect re-evaluates:
+      // a still-running worker verifies on its real busy→idle, and one whose idle
+      // push already raced in before adoption now reads as a busy→idle (session
+      // present) — so the completed revive turn still gets checked.
+      prevTurnRef.current[sid] = "busy";
+      setWorkerTurn((t) => ({
+        ...t,
+        [sid]: t[sid] ?? { state: "busy", queued: slot.queued },
+      }));
     }
   }, []);
 
@@ -846,6 +851,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       do {
         hydratePendingRef.current = false;
         const slots = await api.listLiveWorkerSlots();
+        // Load each adopted worker's thread directions BEFORE adopting, so the
+        // auto-verify effect can read the direction phase. A revived worker can
+        // live in a thread the user never opened this session, whose
+        // directionsByThread entry is empty → phase unknown → the busy→idle would
+        // record idle and skip verification permanently.
+        const threadIds = [...new Set(slots.map((s) => s.thread_id))];
+        await Promise.all(
+          threadIds.map(async (tid) => {
+            try {
+              const dirs = await api.listDirections(tid);
+              setDirections((m) => ({ ...m, [tid]: dirs }));
+            } catch {
+              /* best-effort: a thread whose directions fail to load just won't
+                 auto-verify, the same as before this change */
+            }
+          }),
+        );
         for (const slot of slots) adoptWorker(slot);
       } while (hydratePendingRef.current);
     } catch {
