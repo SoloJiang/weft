@@ -35,8 +35,10 @@ export function groupMcpTools(
 }
 
 /** init push → SessionMeta(init 不带 usage,保留旧 contextTokens)。
- *  codex/opencode 的 init push 不带 mcp_servers(只有 claude 的 `system/init` 带)——
- *  这种空 init 不能覆盖 session_meta 已填的 server,故空时保留 prev.mcpServers。 */
+ *  只有 claude 的 `system/init` 带权威 mcp_servers/tools/model;codex/opencode 的
+ *  "裸" init(native-id 抽取 / 命令刷新回包)带 `model:null` + 空 server,只是占位,
+ *  绝不能覆盖 session_meta 带外填好的 server。用 `model != null` 区分两者:
+ *  claude 权威 → 即使空也替换(会话真的没 MCP 时清掉陈旧行);裸 init → 空时保留旧的。 */
 export function metaFromInit(
   prev: SessionMeta | undefined,
   p: {
@@ -47,11 +49,12 @@ export function metaFromInit(
   },
 ): SessionMeta {
   const grouped = groupMcpTools(p.mcp_servers, p.tools);
+  const authoritative = p.model != null;
   return {
     contextTokens: prev?.contextTokens,
     window: p.window ?? prev?.window ?? undefined,
     model: p.model ?? prev?.model ?? undefined,
-    mcpServers: grouped.length > 0 ? grouped : (prev?.mcpServers ?? []),
+    mcpServers: authoritative ? grouped : grouped.length > 0 ? grouped : (prev?.mcpServers ?? []),
   };
 }
 
@@ -69,37 +72,40 @@ export function metaFromUsage(
 }
 
 /** session_meta(M2 带外)→ 并入现有 meta。不变量:部分/空的来源**绝不覆盖**已有的更
- *  富 meta —— contextTokens(codex 走 live event)、window、model 空时保留旧值;servers
- *  快照为空(如 `codex mcp list` 瞬时失败)时也保留旧的,不闪空。 */
+ *  富 meta —— contextTokens(codex 走 live event)、window、model 空时保留旧值。
+ *  mcp_servers 是 Option:`null` = 探测失败(`codex mcp list`/`/mcp` 瞬时错),保留旧行;
+ *  非 null = 权威结果(即使空数组也替换——会话此刻确实没 MCP server,该清掉陈旧行)。 */
 export function mergeSnapshot(
   prev: SessionMeta | undefined,
   s: {
     context_tokens: number | null;
     window: number | null;
     model: string | null;
-    mcp_servers: { name: string; status: string }[];
+    mcp_servers: { name: string; status: string }[] | null;
   },
 ): SessionMeta {
-  const grouped = groupMcpTools(s.mcp_servers, []);
   return {
     contextTokens: s.context_tokens ?? prev?.contextTokens,
     window: s.window ?? prev?.window ?? undefined,
     model: s.model ?? prev?.model ?? undefined,
-    mcpServers: grouped.length > 0 ? grouped : (prev?.mcpServers ?? []),
+    mcpServers: s.mcp_servers == null ? (prev?.mcpServers ?? []) : groupMcpTools(s.mcp_servers, []),
   };
 }
 
-/** lead_state / session_for 回包 → SessionMeta(快照里没有 tools,只回填 server+状态)。 */
+/** lead_state / session_for 回包 → SessionMeta(引擎缓存的回填,重挂常驻面板不空白)。
+ *  claude 的回包带 tools(引擎 `last_tools`),据此把 `mcp__server__tool` 归到 server 下;
+ *  codex/opencode 不给 tools(空数组),只回填 server + 状态。 */
 export function metaFromSnapshot(snap: {
   context_tokens: number | null;
   window: number | null;
   model: string | null;
   mcp_servers: { name: string; status: string }[];
+  tools: string[];
 }): SessionMeta {
   return {
     contextTokens: snap.context_tokens ?? undefined,
     window: snap.window ?? undefined,
     model: snap.model ?? undefined,
-    mcpServers: groupMcpTools(snap.mcp_servers, []),
+    mcpServers: groupMcpTools(snap.mcp_servers, snap.tools),
   };
 }

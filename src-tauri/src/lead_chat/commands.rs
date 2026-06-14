@@ -290,6 +290,7 @@ pub struct LeadStateInfo {
     pub window: Option<u64>,
     pub model: Option<String>,
     pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
+    pub tools: Vec<String>,
 }
 
 /// 由「常驻子进程是否存活」与「当前 turn 是否在跑」决定 lead engine 对外报的 state。
@@ -398,6 +399,7 @@ pub async fn lead_state(
             window: None,
             model: None,
             mcp_servers: vec![],
+            tools: vec![],
         }),
         Some(e) => {
             let mut i = e.lock().await;
@@ -416,6 +418,7 @@ pub async fn lead_state(
                 window: i.last_window,
                 model: i.last_model.clone(),
                 mcp_servers: i.last_mcp_servers.clone(),
+                tools: i.last_tools.clone(),
             })
         }
     }

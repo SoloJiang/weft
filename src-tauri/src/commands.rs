@@ -701,6 +701,9 @@ pub struct ObserveRef {
     pub window: Option<u64>,
     pub model: Option<String>,
     pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
+    /// claude `mcp__<server>__<tool>` 名(分组成每个 server 的 tool 列表);重挂后
+    /// 即便 init 已不再重放也能展开 tool。
+    pub tools: Vec<String>,
 }
 
 #[tauri::command]
@@ -726,7 +729,7 @@ pub async fn session_for(
         .map_err(e)?;
     // 有活引擎(claude worker)就读它缓存的会话信息快照;否则给空(由 init/usage
     // event 在首条消息后补全)。
-    let (context_tokens, window, model, mcp_servers) = match latest
+    let (context_tokens, window, model, mcp_servers, tools) = match latest
         .as_ref()
         .map(|s| s.id)
         .and_then(|sid| {
@@ -740,9 +743,10 @@ pub async fn session_for(
                 g.last_window,
                 g.last_model.clone(),
                 g.last_mcp_servers.clone(),
+                g.last_tools.clone(),
             )
         }
-        None => (None, None, None, vec![]),
+        None => (None, None, None, vec![], vec![]),
     };
     Ok(Some(ObserveRef {
         worktree: wt.path,
@@ -755,6 +759,7 @@ pub async fn session_for(
         window,
         model,
         mcp_servers,
+        tools,
     }))
 }
 

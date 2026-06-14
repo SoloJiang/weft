@@ -73,57 +73,63 @@ async fn discover_inner(cwd: &str) -> anyhow::Result<Vec<SlashCmd>> {
         .collect())
 }
 
-/// 会话信息面板(M2):复用 app-lifetime 的 serve,取 `GET /mcp`(server + 状态)与
-/// `GET /config/providers`(按 model id 找 `limit.context`)。best-effort,失败给空/None。
+/// 会话信息面板(M2):复用 app-lifetime serve,取 `GET /mcp`(server + 状态)与
+/// `GET /config/providers`(按 providerID+id 找 `limit.context`)。两个请求**互不拖累**——
+/// provider 查询失败/超时不会丢掉已取到的 server。servers = Some 表示成功(即使空,权威);
+/// None 表示 `/mcp` 本身失败(前端保留旧行)。
 pub async fn server_window_and_mcp(
     cwd: &str,
     provider_id: Option<&str>,
     model_id: Option<&str>,
-) -> (Option<u64>, Vec<McpServer>) {
-    match server_window_and_mcp_inner(cwd, provider_id, model_id).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[weft][opencode] session meta: {e}");
-            (None, vec![])
-        }
-    }
+) -> (Option<u64>, Option<Vec<McpServer>>) {
+    let Ok(base) = ensure_base().await else {
+        return (None, None);
+    };
+    let client = reqwest::Client::new();
+    let servers = fetch_mcp_servers(&client, &base, cwd).await;
+    let window = match model_id {
+        Some(mid) => fetch_model_window(&client, &base, cwd, provider_id, mid).await,
+        None => None,
+    };
+    (window, servers)
 }
 
-async fn server_window_and_mcp_inner(
-    cwd: &str,
-    provider_id: Option<&str>,
-    model_id: Option<&str>,
-) -> anyhow::Result<(Option<u64>, Vec<McpServer>)> {
-    let base = ensure_base().await?;
-    let client = reqwest::Client::new();
-
-    let mcp_json: serde_json::Value = client
+async fn fetch_mcp_servers(client: &reqwest::Client, base: &str, cwd: &str) -> Option<Vec<McpServer>> {
+    let v: serde_json::Value = client
         .get(format!("{base}/mcp"))
         .query(&[("directory", cwd)])
         .timeout(Duration::from_secs(10))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
         .json()
-        .await?;
-    let servers = parse_opencode_mcp(&mcp_json);
+        .await
+        .ok()?;
+    Some(parse_opencode_mcp(&v))
+}
 
-    let window = match model_id {
-        Some(mid) => {
-            let providers: serde_json::Value = client
-                .get(format!("{base}/config/providers"))
-                .query(&[("directory", cwd)])
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            find_model_context(&providers, provider_id, mid)
-        }
-        None => None,
-    };
-    Ok((window, servers))
+async fn fetch_model_window(
+    client: &reqwest::Client,
+    base: &str,
+    cwd: &str,
+    provider_id: Option<&str>,
+    model_id: &str,
+) -> Option<u64> {
+    let v: serde_json::Value = client
+        .get(format!("{base}/config/providers"))
+        .query(&[("directory", cwd)])
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    find_model_context(&v, provider_id, model_id)
 }
 
 /// Return the base URL of a live serve, (re)spawning if the prior one died.

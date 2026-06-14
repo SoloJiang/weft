@@ -11,7 +11,9 @@ pub struct SessionMetaSnapshot {
     pub context_tokens: Option<u64>,
     pub window: Option<u64>,
     pub model: Option<String>,
-    pub mcp_servers: Vec<McpServer>,
+    /// None = 探测失败 / 不可用(前端保留旧 server 行);Some = 权威结果(替换,即使
+    /// 为空——会话此刻确实没有 MCP server,该清掉陈旧行)。区分"瞬时失败"与"真的没有"。
+    pub mcp_servers: Option<Vec<McpServer>>,
 }
 
 // ───────────────────────── 纯解析(可单测) ─────────────────────────
@@ -58,6 +60,16 @@ pub fn parse_toml_model(cfg: &str) -> Option<String> {
         .get("model")?
         .as_str()
         .map(String::from)
+}
+
+/// codex `config.toml` 顶层 `model_context_window` 显式覆盖(整数)。优先于 models_cache。
+pub fn parse_toml_context_window(cfg: &str) -> Option<u64> {
+    toml::from_str::<toml::Value>(cfg)
+        .ok()?
+        .get("model_context_window")?
+        .as_integer()
+        .filter(|i| *i > 0)
+        .map(|i| i as u64)
 }
 
 /// opencode `session.model` JSON → 展示标签 `providerID/id`(无 provider 时退回 id)。
@@ -128,28 +140,36 @@ fn codex_home() -> std::path::PathBuf {
 /// 优先项目级 `<cwd>/.codex/config.toml`、回退全局 `~/.codex/config.toml`。
 /// context_tokens 走 live `turn.completed`,不在这里取。
 async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
-    let model = std::fs::read_to_string(std::path::Path::new(cwd).join(".codex/config.toml"))
-        .ok()
-        .and_then(|t| parse_toml_model(&t))
+    let proj_cfg = std::fs::read_to_string(std::path::Path::new(cwd).join(".codex/config.toml")).ok();
+    let global_cfg = std::fs::read_to_string(codex_home().join("config.toml")).ok();
+    let model = proj_cfg
+        .as_deref()
+        .and_then(parse_toml_model)
+        .or_else(|| global_cfg.as_deref().and_then(parse_toml_model));
+    // window:先认显式 `model_context_window` 覆盖(项目 → 全局),再回退 per-model 缓存。
+    let window = proj_cfg
+        .as_deref()
+        .and_then(parse_toml_context_window)
+        .or_else(|| global_cfg.as_deref().and_then(parse_toml_context_window))
         .or_else(|| {
-            std::fs::read_to_string(codex_home().join("config.toml"))
-                .ok()
-                .and_then(|t| parse_toml_model(&t))
+            model.as_deref().and_then(|m| {
+                std::fs::read_to_string(codex_home().join("models_cache.json"))
+                    .ok()
+                    .and_then(|c| codex_window_from_cache(&c, m))
+            })
         });
-    let window = model.as_deref().and_then(|m| {
-        std::fs::read_to_string(codex_home().join("models_cache.json"))
-            .ok()
-            .and_then(|c| codex_window_from_cache(&c, m))
-    });
-    let mcp_servers = tokio::process::Command::new("codex")
+    // `codex mcp list` 成功 → 权威(Some,可空);失败 → None(前端保留旧行,不闪空)。
+    let mcp_servers = match tokio::process::Command::new("codex")
         .args(["mcp", "list", "--json"])
         .current_dir(cwd)
         .output()
         .await
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| parse_codex_mcp_servers(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default();
+    {
+        Ok(o) if o.status.success() => {
+            Some(parse_codex_mcp_servers(&String::from_utf8_lossy(&o.stdout)))
+        }
+        _ => None,
+    };
     SessionMetaSnapshot {
         context_tokens: None,
         window,
@@ -235,6 +255,23 @@ mod tests {
     #[test]
     fn toml_model_not_confused_by_reasoning_effort() {
         assert_eq!(parse_toml_model("model_reasoning_effort = \"xhigh\"\n"), None);
+    }
+
+    #[test]
+    fn toml_context_window_override_beats_cache() {
+        // 显式 `model_context_window` 是面板分母的权威覆盖,优先于 per-model 缓存。
+        assert_eq!(
+            parse_toml_context_window("model = \"gpt-5.5\"\nmodel_context_window = 400000\n"),
+            Some(400_000)
+        );
+        // 无覆盖键 → None(回退缓存)。
+        assert_eq!(parse_toml_context_window("model = \"gpt-5.5\"\n"), None);
+        // 非正数 / 非整数都不算覆盖。
+        assert_eq!(parse_toml_context_window("model_context_window = 0\n"), None);
+        assert_eq!(
+            parse_toml_context_window("model_context_window = \"big\"\n"),
+            None
+        );
     }
 
     #[test]
