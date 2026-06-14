@@ -115,16 +115,25 @@ export function WorkerConversation() {
   }, [activeWorkspaceId, skillsDirtyAt]);
 
   // codex/opencode 的带外 meta(model/window/MCP server,+ opencode 的 usage)。
-  // claude 走事件流不用拉。开页 + 每次 turn 结束(live.status 变)各拉一次。
+  // claude 走事件流不用拉。开页 + 每次 turn 状态变(running/idle)各拉一次。
+  // 该 effect 按 live.status 触发,turn 起/止都会跑;running 期的请求读的是上一条
+  // assistant 行(旧 usage),若它晚于 idle 期的请求返回,会用旧值盖掉新的 contextTokens。
+  // 用 alive 标志丢弃被取代的旧请求(也防 thread 切换后旧请求落到新会话)。
   useEffect(() => {
     const tool = ref?.tool;
     const metaSid = live?.info.session_id ?? ref?.session_id ?? null;
     if (directionId == null || repoId == null || metaSid == null) return;
     if (tool == null || tool === "claude") return;
+    let alive = true;
     void api
       .sessionMeta(directionId, repoId)
-      .then((s) => mergeWorkerMeta(metaSid, s))
+      .then((s) => {
+        if (alive) mergeWorkerMeta(metaSid, s);
+      })
       .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [
     directionId,
     repoId,

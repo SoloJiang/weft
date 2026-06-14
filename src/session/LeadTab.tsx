@@ -94,12 +94,18 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   // 不并入(事件流 init/usage 已填,别被空快照覆盖)。开页 + turn 结束 + 重载各拉一次。
   useEffect(() => {
     if (activeThreadId == null) return;
+    // 按 turn state 触发,running/idle 都会跑;用 alive 丢弃被取代的旧请求,避免
+    // running 期请求晚于 idle 期返回而用旧 meta 盖掉新值(也防 thread 切换串台)。
+    let alive = true;
     void api
       .leadSessionMeta(activeThreadId)
       .then((s) => {
-        if (s) mergeLeadMeta(activeThreadId, s);
+        if (alive && s) mergeLeadMeta(activeThreadId, s);
       })
       .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [activeThreadId, leadTurn[activeThreadId ?? -1]?.state, skillsDirtyAt, mergeLeadMeta]);
 
   useEffect(() => {
