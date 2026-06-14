@@ -50,15 +50,14 @@ pub fn codex_window_from_cache(cache_json: &str, model: &str) -> Option<u64> {
     })
 }
 
-/// 从 `config.toml` 抠裸 `model = "..."`(不被 `model_reasoning_effort` 等迷惑)。
-pub fn parse_toml_model(toml: &str) -> Option<String> {
-    toml.lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("model ") || l.starts_with("model="))
-        .and_then(|l| {
-            let rest = l.split_once('=')?.1.trim();
-            Some(rest.trim_matches('"').to_string()).filter(|s| !s.is_empty())
-        })
+/// codex `config.toml` 顶层 `model`。用真正的 TOML 解析(正确处理行内注释 / 引号 /
+/// 转义),也不会被 `model_reasoning_effort` 等同前缀键迷惑。
+pub fn parse_toml_model(cfg: &str) -> Option<String> {
+    toml::from_str::<toml::Value>(cfg)
+        .ok()?
+        .get("model")?
+        .as_str()
+        .map(String::from)
 }
 
 /// opencode `session.model` JSON → 展示标签 `providerID/id`(无 provider 时退回 id)。
@@ -225,6 +224,13 @@ mod tests {
     fn toml_model_picks_bare_model_line() {
         let t = "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"xhigh\"\n";
         assert_eq!(parse_toml_model(t), Some("gpt-5.5".into()));
+        // 行内注释不能漏进 value(回归 Codex review)。
+        assert_eq!(
+            parse_toml_model("model = \"gpt-5.5\"  # work profile\n"),
+            Some("gpt-5.5".into())
+        );
+        // 不是合法 TOML → None,不 panic。
+        assert_eq!(parse_toml_model("model = "), None);
     }
 
     #[test]
