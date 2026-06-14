@@ -608,27 +608,32 @@ fn merge_init_slash_commands(
         .collect()
 }
 
-/// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
-/// Per-turn dialects have no resident process — sending spawns one per turn.
-pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
-    let mut inner = eng.lock().await;
+/// Spawn the resident process if it isn't alive, under the CALLER's already-held
+/// lock. Returns the new child's stdout + generation when a process was spawned
+/// (the caller must `spawn_reader` after it drops the lock), or `None` when no
+/// spawn was needed (stopped, per-turn, or already alive). Keeping the spawn
+/// under one continuous lock lets a caller reserve a turn slot atomically with
+/// ensuring the process — no window for a racing send to slip a turn in.
+async fn ensure_running_locked(
+    inner: &mut EngineInner,
+) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64)>> {
     if inner.stopped {
-        return Ok(());
+        return Ok(None);
     }
     if per_turn(&inner.tool) {
-        return Ok(());
+        return Ok(None);
     }
     if inner.tool != "claude" {
         anyhow::bail!("unknown lead tool {}", inner.tool);
     }
     if let Some(c) = inner.child.as_mut() {
         if c.try_wait().ok().flatten().is_none() {
-            return Ok(()); // alive
+            return Ok(None); // alive
         }
     }
     crate::claude::ensure_trusted(&inner.cwd);
     let mut child = Command::new("claude")
-        .args(build_args(&inner))
+        .args(build_args(inner))
         .current_dir(&inner.cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -657,9 +662,18 @@ pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow
     inner.clock = TurnClock::default();
     inner.current = None;
     inner.interrupting = false;
-    let generation = inner.generation;
+    Ok(Some((stdout, inner.generation)))
+}
+
+/// Spawn the process if it isn't alive (fresh or `--resume`), wiring the reader.
+/// Per-turn dialects have no resident process — sending spawns one per turn.
+pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
+    let mut inner = eng.lock().await;
+    let reader = ensure_running_locked(&mut inner).await?;
     drop(inner);
-    spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+    if let Some((stdout, generation)) = reader {
+        spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+    }
     Ok(())
 }
 
@@ -1229,12 +1243,12 @@ pub async fn nudge(app: &AppHandle, db: &Db, eng: &EngineRef, text: &str) -> any
 /// Coordinator bus wake: drive the agent to read its inbox, coalescing wakes.
 /// Idle → read now; busy → reserve the wake's FIFO position (`request_bus_read`)
 /// so one inbox-read fires at that spot when the queue drains, never behind a
-/// later send; stopped/taken-over → left untouched. The whole decision runs
-/// under a single engine lock (in `send_hidden_inner`), so a racing user send
-/// can't slip the read out of order.
+/// later send; stopped/taken-over → left untouched. Ensuring the process and
+/// reserving the slot happen under ONE continuous lock (`ensure = true`), so a
+/// racing user send can't slip a turn in ahead of the read — even when the
+/// resident process has to be spawned first.
 pub async fn nudge_bus_read(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
-    ensure_running(app, db, eng).await?;
-    send_hidden_inner(app, db, eng, BUS_WAKE_PROMPT.to_string(), true).await
+    send_hidden_inner(app, db, eng, BUS_WAKE_PROMPT.to_string(), true, true).await
 }
 
 /// Deliver invisible plumbing to an existing engine. Unlike [`nudge`], this
@@ -1247,21 +1261,32 @@ pub async fn send_hidden_existing(
     eng: &EngineRef,
     text: String,
 ) -> anyhow::Result<()> {
-    send_hidden_inner(app, db, eng, text, false).await
+    send_hidden_inner(app, db, eng, text, false, false).await
 }
 
 /// Shared body of [`send_hidden_existing`] and [`nudge_bus_read`]. The single
-/// lock makes the busy/idle decision atomic. When `bus_read`, a busy engine
-/// reserves the wake's FIFO position (coalescing) instead of tail-queuing, and a
-/// stopped/not-accepting engine is skipped rather than erroring.
+/// lock makes the busy/idle decision atomic. When `ensure`, the resident process
+/// is spawned (if needed) under that same lock so reserving the slot races with
+/// no concurrent send. When `bus_read`, a busy engine reserves the wake's FIFO
+/// position (coalescing) instead of tail-queuing, and a stopped/not-accepting
+/// engine is skipped rather than erroring.
 async fn send_hidden_inner(
     app: &AppHandle,
     db: &Db,
     eng: &EngineRef,
     text: String,
     bus_read: bool,
+    ensure: bool,
 ) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
+    if ensure {
+        // Spawn the resident process under THIS lock, never releasing it before
+        // the slot is reserved below. The reader task blocks on this lock and
+        // proceeds once we drop it on return.
+        if let Some((stdout, generation)) = ensure_running_locked(&mut inner).await? {
+            spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
+        }
+    }
     let out = Outgoing {
         text,
         images: vec![],
