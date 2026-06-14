@@ -3,6 +3,7 @@
 
 use crate::materialize;
 use crate::store::{entities, repo, Db};
+use tauri::Manager;
 use tauri::State;
 
 type R<T> = Result<T, String>;
@@ -695,10 +696,16 @@ pub struct ObserveRef {
     pub session_id: Option<i32>,
     pub native_id: Option<String>,
     pub status: Option<String>,
+    // —— 会话信息面板回填(worker 重挂不空白)——
+    pub context_tokens: Option<u64>,
+    pub window: Option<u64>,
+    pub model: Option<String>,
+    pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
 }
 
 #[tauri::command]
 pub async fn session_for(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     direction_id: i32,
     repo_id: i32,
@@ -717,6 +724,26 @@ pub async fn session_for(
     let latest = repo::latest_session_for(&db, direction_id, repo_id)
         .await
         .map_err(e)?;
+    // 有活引擎(claude worker)就读它缓存的会话信息快照;否则给空(由 init/usage
+    // event 在首条消息后补全)。
+    let (context_tokens, window, model, mcp_servers) = match latest
+        .as_ref()
+        .map(|s| s.id)
+        .and_then(|sid| {
+            app.state::<crate::lead_chat::engine::LeadChatState>()
+                .get(sid as i64)
+        }) {
+        Some(eng) => {
+            let g = eng.lock().await;
+            (
+                g.last_context_tokens,
+                g.last_window,
+                g.last_model.clone(),
+                g.last_mcp_servers.clone(),
+            )
+        }
+        None => (None, None, None, vec![]),
+    };
     Ok(Some(ObserveRef {
         worktree: wt.path,
         branch: wt.branch,
@@ -724,6 +751,10 @@ pub async fn session_for(
         session_id: latest.as_ref().map(|s| s.id),
         native_id: latest.as_ref().and_then(|s| s.native_session_id.clone()),
         status: latest.as_ref().map(|s| s.status.clone()),
+        context_tokens,
+        window,
+        model,
+        mcp_servers,
     }))
 }
 

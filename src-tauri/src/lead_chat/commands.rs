@@ -260,6 +260,11 @@ pub struct LeadStateInfo {
     pub native_id: Option<String>,
     pub slash_commands: Vec<crate::lead_chat::proto::SlashCmd>,
     pub cwd: String,
+    // —— 会话信息面板回填(常驻面板重挂不空白)——
+    pub context_tokens: Option<u64>,
+    pub window: Option<u64>,
+    pub model: Option<String>,
+    pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
 }
 
 /// 由「常驻子进程是否存活」与「当前 turn 是否在跑」决定 lead engine 对外报的 state。
@@ -355,6 +360,10 @@ pub async fn lead_state(
                         .into_owned()
                 })
                 .unwrap_or_default(),
+            context_tokens: None,
+            window: None,
+            model: None,
+            mcp_servers: vec![],
         }),
         Some(e) => {
             let mut i = e.lock().await;
@@ -369,6 +378,10 @@ pub async fn lead_state(
                 native_id: i.native_id.clone(),
                 slash_commands: i.slash_commands.clone(),
                 cwd: i.cwd.to_string_lossy().into_owned(),
+                context_tokens: i.last_context_tokens,
+                window: i.last_window,
+                model: i.last_model.clone(),
+                mcp_servers: i.last_mcp_servers.clone(),
             })
         }
     }
