@@ -103,15 +103,16 @@ pub fn get_password() -> Result<Option<String>> {
     read_account(&keychain_account(&active_home()?))
 }
 
-/// The password to open the encrypted DB at the active home. Tries this home's
-/// scoped account; for a non-canonical home with no entry yet, adopts the legacy
-/// bare credential (where pre-scoping versions stored every home's password) and
-/// migrates it into the scoped account. ONLY the encrypted-DB open path calls
-/// this — `get_password` is the side-effect-free read for everyone else, so a
-/// plaintext home can never pull or migrate the release credential.
-pub fn open_password() -> Result<Option<String>> {
+/// The password to open the encrypted DB at the active home, and whether it came
+/// from the legacy bare account (so the caller adopts it into this home's scoped
+/// account AFTER a successful open). Tries this home's scoped account; for a
+/// non-canonical home with no entry yet, falls back to the legacy bare credential
+/// (where pre-scoping versions stored every home's password). ONLY the
+/// encrypted-DB open path calls this — `get_password` is the side-effect-free read
+/// for everyone else, so a plaintext home can never pull the release credential.
+pub fn open_password() -> Result<Option<(String, bool)>> {
     if let Ok(pwd) = std::env::var(ENV_BYPASS) {
-        return Ok(Some(pwd));
+        return Ok(Some((pwd, false)));
     }
     let account = keychain_account(&active_home()?);
     let account_is_bare = account == KEYCHAIN_ACCOUNT;
@@ -122,17 +123,28 @@ pub fn open_password() -> Result<Option<String>> {
     } else {
         read_account(KEYCHAIN_ACCOUNT)?
     };
-    match resolve_lookup(scoped, account_is_bare, legacy_bare) {
-        Some((pwd, migrate)) => {
-            if migrate {
-                entry(&account)?
-                    .set_password(&pwd)
-                    .map_err(|e| anyhow::anyhow!("keyring migrate: {e}"))?;
-            }
-            Ok(Some(pwd))
-        }
-        None => Ok(None),
+    // Return (password, from_legacy) WITHOUT writing — migrating before the
+    // password is proven against the DB could poison the scoped account.
+    Ok(resolve_lookup(scoped, account_is_bare, legacy_bare))
+}
+
+/// Adopt `password` into the active home's scoped account. Call ONLY after an
+/// encrypted open has succeeded with a legacy bare credential, so a wrong legacy
+/// password (e.g. a relocated DB with a different key) never overwrites the scoped
+/// account and blocks future recovery. No-op for the canonical release home (it
+/// already keys on the bare account) and under the env-bypass test path.
+pub fn adopt_scoped_password(password: &str) -> Result<()> {
+    if std::env::var(ENV_BYPASS).is_ok() {
+        return Ok(());
     }
+    let account = keychain_account(&active_home()?);
+    if account == KEYCHAIN_ACCOUNT {
+        return Ok(());
+    }
+    entry(&account)?
+        .set_password(password)
+        .map_err(|e| anyhow::anyhow!("keyring adopt: {e}"))?;
+    Ok(())
 }
 
 /// 写密码到 Keychain（覆盖已有）。env bypass 模式下只设 process env var。

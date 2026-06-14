@@ -139,7 +139,11 @@ pub fn run() {
                     // never sees the window hang.
                     let svc = svc.clone();
                     tauri::async_runtime::spawn(async move {
-                        backup::scheduler::run_on_exit(&svc).await;
+                        // Auto-backup is a production-only side effect: a dev or
+                        // copied-config profile must never push to the release remote.
+                        if paths::is_release_home() {
+                            backup::scheduler::run_on_exit(&svc).await;
+                        }
                     });
                 }
             }
@@ -153,7 +157,12 @@ pub fn run() {
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             im::spawn(app.handle().clone());
-            backup::scheduler::spawn(backup_svc.clone());
+            // Only the canonical release home auto-backs-up; a dev/relocated profile
+            // (incl. one whose DB was copied with backup enabled) never pushes to the
+            // release remote.
+            if paths::is_release_home() {
+                backup::scheduler::spawn(backup_svc.clone());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

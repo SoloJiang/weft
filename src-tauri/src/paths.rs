@@ -49,6 +49,18 @@ pub fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// True if the active home is the canonical release home (`~/.weft`) — the
+/// production data set. Dev (`~/.weft-dev`) and any relocated `WEFT_HOME` home
+/// return false. Scopes production-only side effects (auto-backup to a remote) so
+/// a copied or dev profile never pushes to the release backup remote. Compares
+/// canonicalized paths so a symlinked/`..` alias of the release home still counts.
+pub fn is_release_home() -> bool {
+    match (weft_home().ok(), default_home(false)) {
+        (Some(home), Some(release)) => canonical(&home) == canonical(&release),
+        _ => false,
+    }
+}
+
 /// ~/.weft/weft.db
 pub fn db_path() -> std::io::Result<PathBuf> {
     Ok(weft_home()?.join("weft.db"))
@@ -95,6 +107,20 @@ mod tests {
         assert!(db_path().unwrap().ends_with("weft.db"));
         assert!(worktree_home().unwrap().ends_with("worktrees"));
         assert!(skills_home().unwrap().ends_with("skills/sources"));
+    }
+
+    #[test]
+    fn is_release_home_false_for_relocated() {
+        // A WEFT_HOME-relocated home is not the production home, so production-only
+        // side effects (auto-backup) stay off there.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("weft-relocated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("WEFT_HOME", &tmp);
+        assert!(!is_release_home());
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

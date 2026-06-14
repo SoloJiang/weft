@@ -71,6 +71,14 @@ fn home_token(home: &Path) -> String {
     format!("{h:016x}")
 }
 
+/// True if a stored worktree path lies outside the active root — e.g. a row from a
+/// DB copied or relocated across homes, pointing into another profile's namespace.
+/// Such a worktree is re-materialized under the active root, not reused, so one
+/// profile never operates on or deletes another profile's checkout.
+fn is_foreign_worktree(stored_path: &Path, active_root: &Path) -> bool {
+    !stored_path.starts_with(active_root)
+}
+
 /// Create the one worktree for `direction_id`'s bound repo at
 /// `<repo>/.worktrees/weft/<branch>` on the direction's branch.
 /// Idempotent: an existing worktree row/path is reused. Returns empty if the
@@ -92,22 +100,35 @@ pub async fn materialize_direction(
     let Some(repo_ref) = repo::direction_repo_of(db, direction_id).await? else {
         return Ok(Vec::new());
     };
-    if let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
-        return Ok(vec![existing]);
-    }
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
     let path = worktree_path(repo_path, &dir.branch);
+
+    let existing = repo::worktree_for(db, direction_id, repo_ref.id).await?;
+    // Reuse only if the stored worktree is in THIS home's namespace. A row from a DB
+    // copied/relocated across homes points into another profile's root; re-materialize
+    // it here instead of reusing, so this profile never touches the other's worktree.
+    if let Some(e) = &existing {
+        if !is_foreign_worktree(std::path::Path::new(&e.path), &worktree_root(repo_path)) {
+            return Ok(vec![e.clone()]);
+        }
+    }
+
     git::git_exclude(repo_path, ".worktrees/");
     git::add_worktree(repo_path, &dir.branch, &path, &repo_ref.base_ref)
         .with_context(|| format!("worktree for repo {}", repo_ref.name))?;
-    let rec = repo::record_worktree(
-        db,
-        repo_ref.id,
-        direction_id,
-        &dir.branch,
-        &path.to_string_lossy(),
-    )
-    .await?;
+    let rec = match existing {
+        Some(e) => repo::update_worktree_path(db, e.id, &path.to_string_lossy()).await?,
+        None => {
+            repo::record_worktree(
+                db,
+                repo_ref.id,
+                direction_id,
+                &dir.branch,
+                &path.to_string_lossy(),
+            )
+            .await?
+        }
+    };
     Ok(vec![rec])
 }
 
@@ -192,5 +213,20 @@ mod tests {
         assert_ne!(reloc, worktree_dirname_for(Some(Path::new("/custom/other")), r, d));
         // An unresolvable home falls back to the release root.
         assert_eq!(worktree_dirname_for(None, r, d), "weft");
+    }
+
+    #[test]
+    fn foreign_worktree_row_detected_by_namespace() {
+        let active = Path::new("/repo/.worktrees/weft-dev");
+        // Same namespace → reusable.
+        assert!(!is_foreign_worktree(
+            Path::new("/repo/.worktrees/weft-dev/feat/x"),
+            active
+        ));
+        // Another profile's namespace under the same repo → foreign, re-materialize.
+        assert!(is_foreign_worktree(
+            Path::new("/repo/.worktrees/weft/feat/x"),
+            active
+        ));
     }
 }
