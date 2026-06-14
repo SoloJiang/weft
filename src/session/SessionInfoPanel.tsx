@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { X, ChevronRight, ChevronDown } from "lucide-react";
+import { X, ChevronRight, ChevronDown, RefreshCw } from "lucide-react";
 import type { SessionMeta, EnabledSkill } from "../lib/types";
 
 /**
@@ -12,10 +12,16 @@ export function SessionInfoPanel({
   meta,
   skills,
   onClose,
+  onReload,
+  busy,
 }: {
   meta: SessionMeta | undefined;
   skills: EnabledSkill[];
   onClose: () => void;
+  /** 重载会话:复用静默 re-spawn,拾取新加的 MCP / skill。 */
+  onReload?: () => void;
+  /** turn 进行中:重载灰掉(re-spawn 在下次 send 生效)。 */
+  busy?: boolean;
 }) {
   const { t } = useTranslation();
   const ct = meta?.contextTokens;
@@ -26,10 +32,21 @@ export function SessionInfoPanel({
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
       <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
         <span className="text-[12px] font-semibold text-ink">{t("sessionInfo.title")}</span>
+        {onReload && (
+          <button
+            onClick={onReload}
+            disabled={busy}
+            title={t("sessionInfo.reloadHint")}
+            aria-label={t("sessionInfo.reload")}
+            className="ml-auto grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <RefreshCw size={14} />
+          </button>
+        )}
         <button
           onClick={onClose}
           aria-label={t("common.close")}
-          className="ml-auto grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+          className={`${onReload ? "" : "ml-auto "}grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink`}
         >
           <X size={15} />
         </button>

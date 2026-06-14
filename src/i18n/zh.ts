@@ -298,6 +298,8 @@ export const zh = {
     used: "已用 {{pct}}%",
     pending: "首条消息后可见",
     noSkills: "未启用 skill",
+    reload: "重载会话",
+    reloadHint: "加载新的 MCP / skill(下条消息生效)",
     servers_other: "{{count}} 个 server",
     tools_other: "{{count}} 个 tool",
   },

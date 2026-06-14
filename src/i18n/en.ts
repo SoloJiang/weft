@@ -308,6 +308,8 @@ export const en = {
     used: "{{pct}}% used",
     pending: "Available after first message",
     noSkills: "No skills enabled",
+    reload: "Reload session",
+    reloadHint: "Picks up new MCP / skills",
     servers_one: "{{count}} server",
     servers_other: "{{count}} servers",
     tools_one: "{{count}} tool",
