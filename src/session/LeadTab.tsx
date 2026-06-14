@@ -52,6 +52,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     setReviewingProposal,
     asks,
     skillsDirtyAt,
+    markSkillsDirty,
   } = useStore();
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
@@ -88,6 +89,12 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[activeThreadId] ?? []).filter((m) => m.session_id == null);
   const turn = leadTurn[activeThreadId] ?? { state: "stopped" as const, queued: 0 };
+
+  // 重载会话:重拉 skills + 标记静默 re-spawn(claude 下条消息拾取新 MCP/skill)。
+  const onReload = () => {
+    markSkillsDirty();
+    void api.flagLeadSkillRefresh(activeThreadId);
+  };
 
   const onLocalSlash = (name: string) => {
     const item = LOCAL_SLASH.find((x) => x.name === name);
@@ -216,6 +223,8 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
           meta={leadMeta[activeThreadId]}
           skills={skills}
           onClose={() => setRail("none")}
+          onReload={onReload}
+          busy={turn.state === "busy"}
         />
       )}
     </div>

@@ -37,6 +37,7 @@ export function WorkerConversation() {
     activeThreadId,
     activeWorkspaceId,
     skillsDirtyAt,
+    markSkillsDirty,
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
@@ -141,6 +142,20 @@ export function WorkerConversation() {
   const openAsks = needs.filter((n) => n.direction_id === directionId);
   const nativeId = live?.nativeId ?? ref?.native_id ?? null;
 
+  // 重载会话:重拉 skills + 标记静默 re-spawn(下条消息拾取新 MCP/skill);
+  // codex/opencode 立即重拉 session_meta(server/window 即时刷新)。
+  const onReload = () => {
+    markSkillsDirty();
+    if (sid == null) return;
+    void api.flagSessionSkillRefresh(sid);
+    if (ref?.tool && ref.tool !== "claude") {
+      void api
+        .sessionMeta(directionId, repoId)
+        .then((s) => mergeWorkerMeta(sid, s))
+        .catch(() => {});
+    }
+  };
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -230,6 +245,8 @@ export function WorkerConversation() {
           meta={sid != null ? workerMeta[sid] : undefined}
           skills={skills}
           onClose={() => setRail("none")}
+          onReload={onReload}
+          busy={busy}
         />
       )}
       {ref && (
