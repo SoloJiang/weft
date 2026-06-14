@@ -28,6 +28,7 @@ export function WorkerConversation() {
     workerActivity,
     workerMeta,
     hydrateWorkerMeta,
+    mergeWorkerMeta,
     discoverWorkerSlash,
     loadLeadChat,
     needs,
@@ -104,6 +105,27 @@ export function WorkerConversation() {
       .then((s) => setSkills(s.filter((x) => !x.overridden)))
       .catch(() => {});
   }, [activeWorkspaceId, skillsDirtyAt]);
+
+  // codex/opencode 的带外 meta(model/window/MCP server,+ opencode 的 usage)。
+  // claude 走事件流不用拉。开页 + 每次 turn 结束(live.status 变)各拉一次。
+  useEffect(() => {
+    const tool = ref?.tool;
+    const metaSid = live?.info.session_id ?? ref?.session_id ?? null;
+    if (directionId == null || repoId == null || metaSid == null) return;
+    if (tool == null || tool === "claude") return;
+    void api
+      .sessionMeta(directionId, repoId)
+      .then((s) => mergeWorkerMeta(metaSid, s))
+      .catch(() => {});
+  }, [
+    directionId,
+    repoId,
+    ref?.session_id,
+    ref?.tool,
+    live?.info.session_id,
+    live?.status,
+    mergeWorkerMeta,
+  ]);
 
   if (viewing == null || directionId == null || repoId == null) return null;
 

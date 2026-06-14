@@ -22,6 +22,7 @@ import type {
   RepoRef,
   ResolvedProposal,
   SessionInfo,
+  SessionMetaSnapshot,
   SkillSource,
   SlashCmd,
   Thread,
@@ -139,6 +140,8 @@ export const api = {
   chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),
   sessionFor: (directionId: number, repoId: number) =>
     invoke<ObserveRef | null>("session_for", { directionId, repoId }),
+  sessionMeta: (directionId: number, repoId: number) =>
+    invoke<SessionMetaSnapshot>("session_meta", { directionId, repoId }),
   readTranscript: (cwd: string, tool: string) =>
     invoke<NormEvent[]>("read_transcript", { cwd, tool }),
   worktreeDiff: (cwd: string) =>

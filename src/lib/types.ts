@@ -119,6 +119,15 @@ export interface SessionMeta {
   mcpServers: McpServerInfo[];
 }
 
+/** Band-outside meta for codex/opencode workers (M2), from the `session_meta`
+ *  command. tools 恒空(只列 server)。 */
+export interface SessionMetaSnapshot {
+  context_tokens: number | null;
+  window: number | null;
+  model: string | null;
+  mcp_servers: { name: string; status: string }[];
+}
+
 /** One executable verification rung's result (ARCHITECTURE §4.13). */
 export interface CheckResult {
   name: string;

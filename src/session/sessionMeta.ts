@@ -58,6 +58,25 @@ export function metaFromUsage(
   };
 }
 
+/** session_meta(M2 带外)→ 并入现有 meta。codex 的 contextTokens 走 live event,
+ *  快照为 null 时保留旧值,别覆盖。servers 用快照(只 server+状态,tools 恒空)。 */
+export function mergeSnapshot(
+  prev: SessionMeta | undefined,
+  s: {
+    context_tokens: number | null;
+    window: number | null;
+    model: string | null;
+    mcp_servers: { name: string; status: string }[];
+  },
+): SessionMeta {
+  return {
+    contextTokens: s.context_tokens ?? prev?.contextTokens,
+    window: s.window ?? prev?.window ?? undefined,
+    model: s.model ?? prev?.model ?? undefined,
+    mcpServers: groupMcpTools(s.mcp_servers, []),
+  };
+}
+
 /** lead_state / session_for 回包 → SessionMeta(快照里没有 tools,只回填 server+状态)。 */
 export function metaFromSnapshot(snap: {
   context_tokens: number | null;

@@ -10,7 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { currentLang } from "../i18n";
-import { metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
+import { mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
   Direction,
@@ -29,6 +29,7 @@ import type {
   ObserveRef,
   SessionInfo,
   SessionMeta,
+  SessionMetaSnapshot,
   SessionStatus,
   SlashCmd,
   Thread,
@@ -96,6 +97,8 @@ interface Store {
   workerMeta: Record<number, SessionMeta>;
   /** worker 重挂时由 session_for 回包回填 meta(首条消息前不空白)。 */
   hydrateWorkerMeta: (sessionId: number, snap: ObserveRef) => void;
+  /** codex/opencode worker 的带外 meta(session_meta 命令)并入 workerMeta。 */
+  mergeWorkerMeta: (sessionId: number, snap: SessionMetaSnapshot) => void;
   /** The thread-bus drawer (demoted from a permanent rail). */
   showBus: boolean;
   setShowBus: (open: boolean) => void;
@@ -897,6 +900,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const hydrateWorkerMeta = useCallback((sessionId: number, snap: ObserveRef) => {
     setWorkerMeta((m) => ({ ...m, [sessionId]: metaFromSnapshot(snap) }));
   }, []);
+  const mergeWorkerMeta = useCallback((sessionId: number, snap: SessionMetaSnapshot) => {
+    setWorkerMeta((m) => ({ ...m, [sessionId]: mergeSnapshot(m[sessionId], snap) }));
+  }, []);
   // Skills dirty latch: bump on any skills mutation; idle sessions/leads compare
   // against their last-refreshed stamp to flag one engine refresh per episode.
   const [skillsDirtyAt, setSkillsDirtyAt] = useState(0);
@@ -1544,6 +1550,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     leadMeta,
     workerMeta,
     hydrateWorkerMeta,
+    mergeWorkerMeta,
     showBus,
     setShowBus,
     navCollapsed,
