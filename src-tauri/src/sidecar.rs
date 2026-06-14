@@ -340,17 +340,46 @@ fn parse_opencode_part(role: &str, data: &serde_json::Value, out: &mut Vec<NormE
     }
 }
 
+/// `opencode*.db` 活跃库文件名判定。不同发布渠道把库写成 `opencode.db` /
+/// `opencode-prod.db` / `opencode-stable.db` 等;排除 `-wal` / `-shm` 边车(它们不以 `.db` 结尾)。
+fn is_opencode_db(name: &str) -> bool {
+    name.starts_with("opencode") && name.ends_with(".db")
+}
+
+/// 解析 opencode 当前活跃的 DB 文件路径。硬编码 `opencode.db` 会在 prod/stable 渠道上读不到
+/// (那里是 `opencode-prod.db` / `opencode-stable.db`),故取数据目录下所有 `opencode*.db` 里
+/// **mtime 最新**的那个(= 正在写的活跃库),按文件名渠道无关。dirs::home_dir() 平台感知
+/// (HOME 在 Windows GUI 启动常未设)。
+fn opencode_db_path() -> Option<PathBuf> {
+    let dir = dirs::home_dir()?.join(".local/share/opencode");
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_opencode_db(name) {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        let newer = match &best {
+            Some((t, _)) => mtime > *t,
+            None => true,
+        };
+        if newer {
+            best = Some((mtime, entry.path()));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// 会话信息面板(M2):opencode 会话的「当前上下文」usage + model,按 session id(= 我们的
 /// native_id)取**最近一条 assistant 消息**:`tokens.input + tokens.cache.read` 是当前上下文
 /// (不用 `session.tokens_*` 列——那是整会话**累计**值,会随轮次无界增长、超出 window),
 /// model 取 message 行的 `providerID`/`modelID`(不用 `session.model` 列——当前 opencode 对
 /// 最新会话该列常为空,model 身份只在 message 行可靠)。ro 连接,不扰动 live(WAL)db。
 pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<String>)> {
-    // dirs::home_dir() is platform-aware (HOME is often unset on Windows GUI launches).
-    let db = dirs::home_dir()?.join(".local/share/opencode/opencode.db");
-    if !db.exists() {
-        return None;
-    }
+    let db = opencode_db_path()?;
     let url = format!("sqlite://{}?mode=ro", db.to_string_lossy());
     let mut opt = ConnectOptions::new(url);
     opt.max_connections(1).sqlx_logging(false);
@@ -387,11 +416,8 @@ pub async fn opencode_session_usage(native_id: &str) -> Option<(u64, Option<Stri
 
 async fn read_opencode(cwd: &Path) -> Option<Vec<NormEvent>> {
     use std::collections::HashMap;
-    let home = std::env::var("HOME").ok()?;
-    let db = PathBuf::from(home).join(".local/share/opencode/opencode.db");
-    if !db.exists() {
-        return None;
-    }
+    // 渠道无关地挑活跃库(opencode.db / opencode-prod.db / opencode-stable.db…)。
+    let db = opencode_db_path()?;
     let raw = cwd.to_string_lossy().to_string();
     let canon = std::fs::canonicalize(cwd)
         .ok()
@@ -459,6 +485,18 @@ async fn read_opencode(cwd: &Path) -> Option<Vec<NormEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_db_filename_match() {
+        // 渠道变体命中,WAL/SHM 边车与无关库不命中。
+        assert!(is_opencode_db("opencode.db"));
+        assert!(is_opencode_db("opencode-prod.db"));
+        assert!(is_opencode_db("opencode-stable.db"));
+        assert!(!is_opencode_db("opencode.db-wal"));
+        assert!(!is_opencode_db("opencode.db-shm"));
+        assert!(!is_opencode_db("other.db"));
+        assert!(!is_opencode_db("opencode.sqlite"));
+    }
 
     #[test]
     fn parses_text_and_tool_calls_skips_seed() {
