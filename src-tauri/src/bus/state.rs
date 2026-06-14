@@ -14,6 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// through this; a wake on it tells the UI an ask is waiting.
 pub const HUMAN: &str = "you";
 
+/// The sentinel "direction" id for the thread lead. Workers address the lead
+/// through this; a wake on it drives the lead engine to read its inbox. Unlike a
+/// worker, the lead has no numeric direction id, so it joins the bus under this
+/// stable name (one lead per thread).
+pub const LEAD: &str = "lead";
+
 /// Emitted when a direction should be woken to read its inbox.
 #[derive(Clone, Debug)]
 pub struct Wake {
