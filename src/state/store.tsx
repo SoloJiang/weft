@@ -795,9 +795,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // session id. Unlike driveDirection it NEVER calls chatOpenWorker — the engine
   // is already live in the backend, so there is nothing to start; calling it
   // would respawn a stopped worker. Uses the slot's OWN thread id (a revived
-  // worker can belong to any thread, not activeThreadId). The unconditional
-  // setWorkerTurn in the lead-chat listener already seeds turn state, so a
-  // busy→idle transition fires the auto-verify effect once the session exists.
+  // worker can belong to any thread, not activeThreadId).
+  //
+  // When the slot is busy, also seed workerTurn to "busy": the revive path drives
+  // the worker via engine::nudge, which — unlike engine::send — emits NO busy
+  // turn-start push, so the lead-chat listener never marks it busy on its own.
+  // Seeding here arms the auto-verify effect so the worker's busy→idle at turn
+  // end runs that direction's checks. Both inserts guard on absence so a fresher
+  // live listener value is never clobbered.
   const adoptWorker = useCallback((slot: LiveWorkerSlot) => {
     const sid = slot.info.session_id;
     if (sessionsRef.current[sid]) return;
@@ -816,19 +821,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             },
           },
     );
+    if (slot.busy) {
+      setWorkerTurn((t) =>
+        t[sid] ? t : { ...t, [sid]: { state: "busy", queued: slot.queued } },
+      );
+    }
   }, []);
 
   // Pull the backend's live worker engines and adopt any the frontend doesn't
   // know about. Called on mount (backstop for workers live before the listener
-  // registered) and when a turn push references an unknown busy session. The
-  // in-flight guard collapses concurrent triggers into one pull.
+  // registered) and on the `worker-revived` event (boot revives that land after
+  // mount). The in-flight guard collapses concurrent triggers; a request that
+  // arrives mid-pull sets `pending` so the latest state is re-fetched afterward
+  // (e.g. the revive event firing while the mount pull is still in flight).
   const hydratingRef = useRef(false);
+  const hydratePendingRef = useRef(false);
   const hydrateLiveWorkers = useCallback(async () => {
-    if (hydratingRef.current) return;
+    if (hydratingRef.current) {
+      hydratePendingRef.current = true;
+      return;
+    }
     hydratingRef.current = true;
     try {
-      const slots = await api.listLiveWorkerSlots();
-      for (const slot of slots) adoptWorker(slot);
+      do {
+        hydratePendingRef.current = false;
+        const slots = await api.listLiveWorkerSlots();
+        for (const slot of slots) adoptWorker(slot);
+      } while (hydratePendingRef.current);
     } catch {
       /* best-effort hydration */
     } finally {
@@ -842,10 +861,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void hydrateLiveWorkers();
   }, [hydrateLiveWorkers]);
 
-  // Live ref: the lead-chat listener effect has empty deps (registers once), so
-  // it reads the current hydrate fn through a ref instead of re-subscribing.
-  const hydrateLiveWorkersRef = useRef(hydrateLiveWorkers);
-  hydrateLiveWorkersRef.current = hydrateLiveWorkers;
+  // Boot revives that land after this component mounted miss the mount backstop
+  // above, and a nudge-driven revive turn emits no busy push to react to — so the
+  // backend emits `worker-revived` when its boot sweep recovers worker(s); re-pull
+  // and adopt them then.
+  useEffect(() => {
+    const un = listen("worker-revived", () => void hydrateLiveWorkers());
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [hydrateLiveWorkers]);
 
   // Lazy attach + send: the worker surface is always input-able. Sending into a
   // worker with no live engine transparently resumes/dispatches it (focus=false,
@@ -1003,14 +1028,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 }
               : m,
           );
-          // A worker we don't know about turned busy: it's a backend-headless
-          // engine (boot revive that landed after mount, or a runtime headless
-          // spawn). Pull the live set so it gets a session entry → status dot +
-          // auto-verify. Stopped/idle engines are not busy, so they're never
-          // pulled (and adoptWorker never restarts anything).
-          if (p.state === "busy" && !sessionsRef.current[sid]) {
-            void hydrateLiveWorkersRef.current();
-          }
+
         } else {
           setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
