@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { useRef } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, FileText, Sparkles } from "lucide-react";
 import type { LeadMessage } from "../lib/types";
@@ -10,6 +11,12 @@ import type { useRepoActions } from "./useRepoActions";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 type EmptyStateMode = "default" | "lead-task" | "lead-repo-guide";
+
+/** Passed to Virtuoso's Header/Footer components for the live busy/activity row. */
+type TimelineContext = {
+  busy: boolean;
+  activity?: { name: string; summary: string } | null;
+};
 
 /**
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
@@ -48,27 +55,10 @@ export function ChatTimeline({
   /** Lead hosts opt into task/repo guidance; workers keep the default empty state. */
   emptyState?: EmptyStateMode;
 }) {
-  const { t } = useTranslation();
-  const endRef = useRef<HTMLDivElement>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const atBottomRef = useRef(true);
-  const lastTextLen = messages
-    .filter((m) => m.kind === "text")
-    .reduce((n, m) => n + m.content.length, 0);
-
-  // Stick to the bottom while the user is already there (streaming included);
-  // never yank them down when they've scrolled up to read history.
-  useEffect(() => {
-    if (atBottomRef.current) endRef.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, lastTextLen, busy, activity]);
-
-  const onScroll = () => {
-    const el = scrollRef.current;
-    if (el) atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  };
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
 
   // Tool rows (legacy imports / older builds) are hidden: tool calls render
-  // only while running, via the activity line below.
+  // only while running, via the activity line in the footer.
   const visible = messages.filter((m) => m.kind !== "meta" && m.kind !== "tool");
 
   if (visible.length === 0 && !busy) {
@@ -85,34 +75,63 @@ export function ChatTimeline({
   }
 
   return (
-    <div
-      ref={scrollRef}
-      onScroll={onScroll}
-      className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-4 py-4"
-    >
-      <div className="mx-auto flex w-full max-w-[820px] flex-col gap-2.5">
-        {visible.map((m) => (
-          <TimelineRow
-            key={m.id}
-            m={m}
-            all={visible}
-            onReviewProposal={onReviewProposal}
-            runAction={runAction}
-            actionsBusy={actionsBusy}
-            threadId={threadId ?? null}
-            workspaceId={workspaceId ?? null}
-            promptText={promptText}
-          />
-        ))}
-        {busy && activity && <ActivityLine name={activity.name} summary={activity.summary} />}
-        {busy && !activity && (
-          <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
-            {t("lead.working")}
+    <div className="min-h-0 flex-1">
+      <Virtuoso<LeadMessage, TimelineContext>
+        ref={virtuosoRef}
+        style={{ height: "100%" }}
+        data={visible}
+        computeItemKey={(_index, m) => m.id}
+        // Open pinned to the latest message instead of scrolling up from the top.
+        initialTopMostItemIndex={Math.max(0, visible.length - 1)}
+        // Stick to bottom during streaming ONLY when the user is already there;
+        // returning false when scrolled up preserves "don't yank them down".
+        followOutput={(isAtBottom) => (isAtBottom ? "smooth" : false)}
+        increaseViewportBy={{ top: 600, bottom: 600 }}
+        context={{ busy, activity: activity ?? null }}
+        components={{ Header, Footer }}
+        itemContent={(_index, m) => (
+          <div className="mx-auto w-full max-w-[820px] px-4 pb-2.5">
+            <TimelineRow
+              m={m}
+              all={visible}
+              onReviewProposal={onReviewProposal}
+              runAction={runAction}
+              actionsBusy={actionsBusy}
+              threadId={threadId ?? null}
+              workspaceId={workspaceId ?? null}
+              promptText={promptText}
+            />
           </div>
         )}
-      </div>
-      <div ref={endRef} />
+      />
+    </div>
+  );
+}
+
+/** Top breathing room — mirrors the old scroll container's py-4 top padding. */
+function Header() {
+  return <div className="h-4" />;
+}
+
+/**
+ * Bottom region: the live busy/activity indicator (transient, cleared on the
+ * next turn) plus the old container's py-4 bottom padding. Reads Virtuoso's
+ * injected `context` rather than closing over props so the component reference
+ * stays stable across renders.
+ */
+function Footer({ context }: { context?: TimelineContext }) {
+  const { t } = useTranslation();
+  const busy = context?.busy ?? false;
+  const activity = context?.activity ?? null;
+  return (
+    <div className="mx-auto w-full max-w-[820px] px-4 pb-4">
+      {busy && activity && <ActivityLine name={activity.name} summary={activity.summary} />}
+      {busy && !activity && (
+        <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
+          {t("lead.working")}
+        </div>
+      )}
     </div>
   );
 }
