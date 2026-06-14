@@ -77,9 +77,10 @@ async fn discover_inner(cwd: &str) -> anyhow::Result<Vec<SlashCmd>> {
 /// `GET /config/providers`(按 model id 找 `limit.context`)。best-effort,失败给空/None。
 pub async fn server_window_and_mcp(
     cwd: &str,
+    provider_id: Option<&str>,
     model_id: Option<&str>,
 ) -> (Option<u64>, Vec<McpServer>) {
-    match server_window_and_mcp_inner(cwd, model_id).await {
+    match server_window_and_mcp_inner(cwd, provider_id, model_id).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[weft][opencode] session meta: {e}");
@@ -90,6 +91,7 @@ pub async fn server_window_and_mcp(
 
 async fn server_window_and_mcp_inner(
     cwd: &str,
+    provider_id: Option<&str>,
     model_id: Option<&str>,
 ) -> anyhow::Result<(Option<u64>, Vec<McpServer>)> {
     let base = ensure_base().await?;
@@ -117,7 +119,7 @@ async fn server_window_and_mcp_inner(
                 .error_for_status()?
                 .json()
                 .await?;
-            find_model_context(&providers, mid)
+            find_model_context(&providers, provider_id, mid)
         }
         None => None,
     };

@@ -79,13 +79,28 @@ pub fn opencode_model_id(model_json: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// opencode `GET /config/providers` 响应 + model id → `limit.context`。
-/// 结构(实测):`{providers:[{models:{<id>:{limit:{context:N}}}}]}`。
-pub fn find_model_context(providers: &serde_json::Value, model_id: &str) -> Option<u64> {
-    providers["providers"]
-        .as_array()?
-        .iter()
-        .find_map(|p| p["models"][model_id]["limit"]["context"].as_u64())
+/// opencode `session.model` JSON → providerID(同一 model id 可能在多个 provider 下)。
+pub fn opencode_model_provider(model_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(model_json)
+        .ok()?["providerID"]
+        .as_str()
+        .map(String::from)
+}
+
+/// opencode `GET /config/providers` 响应 +(providerID, model id)→ `limit.context`。
+/// 结构(实测):`{providers:[{id, models:{<id>:{limit:{context:N}}}}]}`。先按 providerID
+/// 锁定 provider(同名 model id 可能跨多个 provider),拿不到 providerID 时退回首个命中。
+pub fn find_model_context(
+    providers: &serde_json::Value,
+    provider_id: Option<&str>,
+    model_id: &str,
+) -> Option<u64> {
+    let ps = providers["providers"].as_array()?;
+    let ctx = |p: &serde_json::Value| p["models"][model_id]["limit"]["context"].as_u64();
+    match provider_id {
+        Some(pid) => ps.iter().find(|p| p["id"].as_str() == Some(pid)).and_then(ctx),
+        None => ps.iter().find_map(ctx),
+    }
 }
 
 /// opencode `GET /mcp` 响应(`{name:{status}}`)→ server 列表。
@@ -111,11 +126,18 @@ fn codex_home() -> std::path::PathBuf {
 }
 
 /// codex:`codex mcp list --json`(servers)+ config.toml(model)+ models_cache(window)。
+/// **cwd-aware**:在 worker cwd 下跑 `codex mcp list`(拾取项目级 MCP 配置),model 也
+/// 优先项目级 `<cwd>/.codex/config.toml`、回退全局 `~/.codex/config.toml`。
 /// context_tokens 走 live `turn.completed`,不在这里取。
-async fn gather_codex() -> SessionMetaSnapshot {
-    let model = std::fs::read_to_string(codex_home().join("config.toml"))
+async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
+    let model = std::fs::read_to_string(std::path::Path::new(cwd).join(".codex/config.toml"))
         .ok()
-        .and_then(|t| parse_toml_model(&t));
+        .and_then(|t| parse_toml_model(&t))
+        .or_else(|| {
+            std::fs::read_to_string(codex_home().join("config.toml"))
+                .ok()
+                .and_then(|t| parse_toml_model(&t))
+        });
     let window = model.as_deref().and_then(|m| {
         std::fs::read_to_string(codex_home().join("models_cache.json"))
             .ok()
@@ -123,6 +145,7 @@ async fn gather_codex() -> SessionMetaSnapshot {
     });
     let mcp_servers = tokio::process::Command::new("codex")
         .args(["mcp", "list", "--json"])
+        .current_dir(cwd)
         .output()
         .await
         .ok()
@@ -147,8 +170,13 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnaps
     };
     let model = model_json.as_deref().and_then(opencode_model_label);
     let model_id = model_json.as_deref().and_then(opencode_model_id);
-    let (window, mcp_servers) =
-        crate::opencode::server_window_and_mcp(cwd, model_id.as_deref()).await;
+    let provider_id = model_json.as_deref().and_then(opencode_model_provider);
+    let (window, mcp_servers) = crate::opencode::server_window_and_mcp(
+        cwd,
+        provider_id.as_deref(),
+        model_id.as_deref(),
+    )
+    .await;
     SessionMetaSnapshot {
         context_tokens: (ctx > 0).then_some(ctx),
         window,
@@ -160,7 +188,7 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnaps
 /// 按 tool 分派。claude 不走这里(返回空)。
 pub async fn gather(tool: &str, cwd: &str, native_id: Option<&str>) -> SessionMetaSnapshot {
     match tool {
-        "codex" => gather_codex().await,
+        "codex" => gather_codex(cwd).await,
         "opencode" => gather_opencode(cwd, native_id).await,
         _ => SessionMetaSnapshot::default(),
     }
@@ -205,22 +233,30 @@ mod tests {
     }
 
     #[test]
-    fn opencode_model_label_and_id() {
+    fn opencode_model_label_id_provider() {
         let m = r#"{"id":"k2p6","providerID":"kimi-for-coding","variant":"default"}"#;
         assert_eq!(opencode_model_label(m).as_deref(), Some("kimi-for-coding/k2p6"));
         assert_eq!(opencode_model_id(m).as_deref(), Some("k2p6"));
+        assert_eq!(opencode_model_provider(m).as_deref(), Some("kimi-for-coding"));
         assert_eq!(opencode_model_label(r#"{"id":"x"}"#).as_deref(), Some("x"));
+        assert_eq!(opencode_model_provider(r#"{"id":"x"}"#), None);
     }
 
     #[test]
-    fn finds_model_context_in_providers() {
+    fn finds_model_context_by_provider_and_id() {
+        // 同名 model id 跨两个 provider、window 不同 —— 必须按 providerID 锁定。
         let v: serde_json::Value = serde_json::from_str(
-            r#"{"providers":[{"models":{"k2p6":{"limit":{"context":262144}}}},{"models":{"gpt":{"limit":{"context":400000}}}}]}"#,
+            r#"{"providers":[
+                {"id":"kimi","models":{"k2":{"limit":{"context":262144}}}},
+                {"id":"acme","models":{"k2":{"limit":{"context":99}}}}
+            ]}"#,
         )
         .unwrap();
-        assert_eq!(find_model_context(&v, "k2p6"), Some(262144));
-        assert_eq!(find_model_context(&v, "gpt"), Some(400000));
-        assert_eq!(find_model_context(&v, "missing"), None);
+        assert_eq!(find_model_context(&v, Some("kimi"), "k2"), Some(262144));
+        assert_eq!(find_model_context(&v, Some("acme"), "k2"), Some(99));
+        assert_eq!(find_model_context(&v, None, "k2"), Some(262144)); // 首个命中
+        assert_eq!(find_model_context(&v, Some("kimi"), "missing"), None);
+        assert_eq!(find_model_context(&v, Some("nope"), "k2"), None);
     }
 
     #[test]
