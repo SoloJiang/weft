@@ -649,7 +649,7 @@ export const zh = {
     permissionDeny: "已拒绝 · {{summary}}",
     permissionAlways: "已始终允许 · {{summary}}",
     permissionFull: "已授予完全访问 · {{summary}}",
-    askAnswered: "已回答 · {{text}}",
+    askAnswered: "已回答 · {{text}} → {{answer}}",
   },
   repoActions: {
     chooseDir: "选择目录",

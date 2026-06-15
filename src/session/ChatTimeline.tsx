@@ -551,7 +551,8 @@ function TimelineRow({
     }
     if (variant === "ask") {
       const text = typeof v.text === "string" ? v.text : "";
-      return <SettledLine label={t("settled.askAnswered", { text })} />;
+      const answer = typeof v.answer === "string" ? v.answer : "";
+      return <SettledLine label={t("settled.askAnswered", { text, answer })} />;
     }
     return null;
   }

@@ -671,7 +671,7 @@ export const en = {
     permissionDeny: "Denied · {{summary}}",
     permissionAlways: "Always allowed · {{summary}}",
     permissionFull: "Full access granted · {{summary}}",
-    askAnswered: "Answered · {{text}}",
+    askAnswered: "Answered · {{text}} → {{answer}}",
   },
   repoActions: {
     chooseDir: "Choose a folder",
