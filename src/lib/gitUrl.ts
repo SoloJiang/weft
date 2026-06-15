@@ -3,14 +3,14 @@
  *
  * Shared by the Add-repo dialog (batch paste) and the clone slash-command. Pure +
  * dependency-free. Two accepted URL shapes:
- *   - scheme URL:  https:// | http:// | ssh:// | git://  + host/path
+ *   - scheme URL:  https:// | http:// | ssh:// | git:// | file://  + host/path
  *   - scp-style:   user@host:org/repo(.git)   (classic `git@github.com:a/b.git`)
  */
 
 // `,`/`;`/whitespace/wrappers terminate a URL body so separated pastes split.
 // `]` is allowed so bracketed IPv6 hosts (`[::1]`, `[2001:db8::1]`) survive; a
 // trailing `]` wrapper is peeled by trimUrl below.
-const SCHEME_URL = /\b(?:https?|ssh|git):\/\/[^\s<>"'`),;]+/gi;
+const SCHEME_URL = /\b(?:https?|ssh|git|file):\/\/[^\s<>"'`),;]+/gi;
 const SCP_URL = /\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s<>"'`),;]+/gi;
 // scp-style WITHOUT a user (`host.tld:path`, the `[<user>@]<host>:<path>` form).
 // Require a dotted host AND a `/` in the path so it doesn't swallow tokens like
@@ -35,8 +35,15 @@ function dedupKey(url: string): string {
   const base = url.replace(/\/+$/, "").replace(/\.git$/i, "");
   const scheme = base.match(/^([a-z][a-z0-9+.-]*:\/\/[^/]*)(\/.*)?$/i);
   if (scheme) return scheme[1].toLowerCase() + (scheme[2] ?? "");
-  const scp = base.match(/^([^:]*:)(.*)$/); // user@host:  +  path
-  if (scp) return scp[1].toLowerCase() + scp[2];
+  const scp = base.match(/^([^:]+):(.*)$/); // [user@]host : path
+  if (scp) {
+    const authority = scp[1];
+    const at = authority.lastIndexOf("@");
+    // Host is case-insensitive; the optional SSH user is NOT (Unix usernames).
+    const user = at >= 0 ? authority.slice(0, at + 1) : "";
+    const host = at >= 0 ? authority.slice(at + 1) : authority;
+    return `${user}${host.toLowerCase()}:${scp[2]}`;
+  }
   return base.toLowerCase();
 }
 

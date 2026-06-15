@@ -655,10 +655,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // current workspace's repo list/map (e.g. after a cancelled batch import).
     const ws = workspaceId ?? activeWorkspaceIdRef.current;
     if (ws == null || ws !== activeWorkspaceIdRef.current) return;
-    setRepos(await api.listRepos(ws));
+    const list = await api.listRepos(ws);
+    if (ws !== activeWorkspaceIdRef.current) return; // user switched during the fetch
+    setRepos(list);
     // a freshly added repo is eagerly profiled server-side; pull the new map
     try {
       const g = await api.repoGraph(ws);
+      if (ws !== activeWorkspaceIdRef.current) return; // user switched during the fetch
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
     } catch {

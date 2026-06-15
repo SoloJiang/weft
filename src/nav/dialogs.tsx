@@ -328,6 +328,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                 placeholder="/Users/you/code/web-app"
                 onChange={setPath}
                 onPick={() => pickInto(setPath)}
+                disabled={busy}
               />
             </Field>
           )}
@@ -341,6 +342,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                   placeholder={"https://github.com/acme/web-app.git\ngit@github.com:acme/api.git"}
                   value={url}
                   onChange={(e) => setUrl(e.currentTarget.value)}
+                  disabled={busy}
                 />
               </Field>
 
@@ -395,6 +397,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                 placeholder="/Users/you/code"
                 onChange={setDest}
                 onPick={() => pickInto(setDest)}
+                disabled={busy}
               />
             </Field>
           )}
@@ -408,6 +411,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                 placeholder={mode === "local" ? basename(path) || "web-app" : "web-app"}
                 value={name}
                 onChange={(e) => setName(e.currentTarget.value)}
+                disabled={busy}
               />
             </Field>
           )}
@@ -433,11 +437,13 @@ function PathInput({
   placeholder,
   onChange,
   onPick,
+  disabled,
 }: {
   value: string;
   placeholder: string;
   onChange: (v: string) => void;
   onPick: () => void;
+  disabled?: boolean;
 }) {
   const { t } = useTranslation();
   return (
@@ -446,12 +452,14 @@ function PathInput({
         placeholder={placeholder}
         value={value}
         onChange={(e) => onChange(e.currentTarget.value)}
+        disabled={disabled}
       />
       <button
         type="button"
         onClick={onPick}
+        disabled={disabled}
         title={t("settings.choose")}
-        className="grid h-9 w-9 shrink-0 place-items-center rounded-[var(--radius-md)] border border-border text-ink-muted transition-colors hover:bg-surface hover:text-ink"
+        className="grid h-9 w-9 shrink-0 place-items-center rounded-[var(--radius-md)] border border-border text-ink-muted transition-colors hover:bg-surface hover:text-ink disabled:opacity-50"
       >
         <FolderOpen size={15} />
       </button>
