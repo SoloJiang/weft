@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -254,14 +253,7 @@ pub enum ThreadMsg {
 }
 
 struct Inner {
-    /// Bytes destined for the app-server's stdin are queued here and written by a
-    /// dedicated [`write_loop`] task — NEVER under this connection lock. A write
-    /// that blocks on stdin pipe backpressure would otherwise hold the lock while
-    /// the `read_loop`'s `resolve`/`route` (which need the same lock) stall, the
-    /// stdout pipe fills, the child stops reading stdin, and the write never
-    /// drains: a textbook two-pipe deadlock. The channel send is non-blocking, so
-    /// the lock is only ever held for in-memory bookkeeping.
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    stdin: ChildStdin,
     next_id: i64,
     /// our request id → awaiting caller (Ok(result) / Err(message)).
     pending: HashMap<i64, oneshot::Sender<Result<Value, String>>>,
@@ -269,16 +261,8 @@ struct Inner {
     threads: HashMap<String, mpsc::UnboundedSender<ThreadMsg>>,
     /// thread_id → the in-flight turn id (needed by turn/interrupt).
     active_turn: HashMap<String, String>,
-    /// Monotonic id of THIS connection instance. The read_loop, writer, and a
-    /// request timeout each remember the epoch they were spawned for and only
-    /// tear down if it still matches — so a stale task from a dead connection
-    /// can't drop a freshly reconnected one (ABA).
-    epoch: u64,
     _child: tokio::process::Child,
 }
-
-/// Hands out a fresh epoch per connection instance (see `Inner::epoch`).
-static CONN_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Handle to the single global `codex app-server` connection.
 #[derive(Clone)]
@@ -299,31 +283,6 @@ pub async fn client() -> anyhow::Result<Client> {
     }
     c.connect().await?;
     Ok(c)
-}
-
-/// Serialize every write to the app-server's stdin on one task, OFF the
-/// connection lock. A full stdin pipe blocks only this task — never a caller
-/// holding the lock — so the `read_loop` keeps draining stdout and the two-pipe
-/// deadlock can't form. Exits when every `write_tx` is dropped (i.e. the `Inner`
-/// is torn down) or stdin errors; either way it tears the connection down so
-/// pending callers fail fast and the next `client()` reconnects.
-async fn write_loop(
-    client: Client,
-    epoch: u64,
-    mut stdin: ChildStdin,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
-) {
-    while let Some(buf) = rx.recv().await {
-        if stdin.write_all(&buf).await.is_err() || stdin.flush().await.is_err() {
-            break; // stdin closed/errored
-        }
-    }
-    // A stdin error with stdout still open would otherwise leave the request
-    // mid-write unresolved (its caller waits out the full 60s) and `client()`
-    // reporting "connected" until stdout EOFs. Tear down THIS connection now so
-    // the codex fallback/reconnect path runs promptly — scoped by epoch so a
-    // since-reconnected connection is left alone. No-op if already torn down.
-    client.teardown(epoch).await;
 }
 
 impl Client {
@@ -347,24 +306,18 @@ impl Client {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
-        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let epoch = CONN_EPOCH.fetch_add(1, Ordering::Relaxed);
         *g = Some(Inner {
-            write_tx,
+            stdin,
             next_id: 1,
             pending: HashMap::new(),
             threads: HashMap::new(),
             active_turn: HashMap::new(),
-            epoch,
             _child: child,
         });
         drop(g);
 
-        // Writer owns stdin and awaits each write off the lock (see `write_tx`).
-        tauri::async_runtime::spawn(write_loop(self.clone(), epoch, stdin, write_rx));
-
         let me = self.clone();
-        tauri::async_runtime::spawn(async move { me.read_loop(epoch, stdout).await });
+        tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
 
         // Handshake: initialize (await), then the `initialized` notification.
         self.request(
@@ -378,7 +331,7 @@ impl Client {
 
     /// Demux the server's stdout for the connection's lifetime: correlate replies
     /// by id, route notifications + approval requests to the owning thread.
-    async fn read_loop(&self, epoch: u64, stdout: tokio::process::ChildStdout) {
+    async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             match classify(&line) {
@@ -404,21 +357,7 @@ impl Client {
             }
         }
         // EOF/crash → drop the connection so the next use reconnects + re-resumes.
-        self.teardown(epoch).await;
-    }
-
-    /// Drop the live `Inner` IF it is still the `epoch` instance the caller was
-    /// working with: stops the writer (its `write_tx` is gone), fails every
-    /// pending caller at once (their oneshot senders drop → `rx` errors instead
-    /// of waiting out the 60s timeout), and kills the child (`kill_on_drop`) so
-    /// no buffered request is processed late. The next `client()` reconnects.
-    /// The epoch guard means a stale read_loop/writer/timeout from a dead
-    /// connection can't drop a since-reconnected one (ABA). Idempotent.
-    async fn teardown(&self, epoch: u64) {
-        let mut g = self.0.lock().await;
-        if g.as_ref().is_some_and(|inner| inner.epoch == epoch) {
-            *g = None;
-        }
+        *self.0.lock().await = None;
     }
 
     async fn resolve(&self, id: i64, res: Result<Value, String>) {
@@ -440,41 +379,30 @@ impl Client {
     /// Send a request and await its reply (`result` on success, `error.message`
     /// on failure), with a hard timeout so a wedged server can't hang a caller.
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        // The pending waiter is keyed by `id` inside the block; the timeout path
-        // tears the whole connection down rather than removing one entry, so the
-        // id isn't needed out here. Capture the connection epoch so a timeout only
-        // tears down THIS connection, not one that reconnected meanwhile.
-        let (rx, epoch) = {
+        let (id, rx) = {
             let mut g = self.0.lock().await;
             let inner = g
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
             let id = inner.next_id;
             inner.next_id += 1;
-            // Queue the write (non-blocking) under the lock so wire order matches
-            // id-allocation order; the awaited write happens on `write_loop`, never
-            // here. Register the waiter only after the enqueue succeeds, all while
-            // holding the lock — so a reply (resolve, same lock) can't race ahead.
-            inner
-                .write_tx
-                .send(encode_request(id, method, params).into_bytes())
-                .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
-            (rx, inner.epoch)
+            inner
+                .stdin
+                .write_all(encode_request(id, method, params).as_bytes())
+                .await?;
+            inner.stdin.flush().await?;
+            (id, rx)
         };
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => anyhow::bail!("codex app-server {method}: {e}"),
             Ok(Err(_)) => anyhow::bail!("codex app-server {method}: reply dropped"),
             Err(_) => {
-                // 60s with no reply ⇒ the connection is wedged. Tear it down so the
-                // still-buffered request (notably turn/start) can't be written and
-                // run late after the caller already fell back to exec — which would
-                // execute the same turn twice. Dropping Inner also discards the
-                // queued bytes and kills the child. Epoch-scoped so a connection
-                // that reconnected during the wait is left untouched.
-                self.teardown(epoch).await;
+                if let Some(inner) = self.0.lock().await.as_mut() {
+                    inner.pending.remove(&id);
+                }
                 anyhow::bail!("codex app-server {method}: timed out")
             }
         }
@@ -487,9 +415,10 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
         inner
-            .write_tx
-            .send(encode_notification(method, params).into_bytes())
-            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
+            .stdin
+            .write_all(encode_notification(method, params).as_bytes())
+            .await?;
+        inner.stdin.flush().await?;
         Ok(())
     }
 
@@ -562,10 +491,8 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
         let line = encode_response(id, json!({ "decision": decision }));
-        inner
-            .write_tx
-            .send(line.into_bytes())
-            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
+        inner.stdin.write_all(line.as_bytes()).await?;
+        inner.stdin.flush().await?;
         Ok(())
     }
 }
