@@ -396,6 +396,75 @@ pub fn worktree_diff(cwd: String) -> R<crate::git::WorktreeDiff> {
     Ok(crate::git::WorktreeDiff { files, patch })
 }
 
+/// Diff panel "vs target" response: PR-style diff against the task's target
+/// branch, plus the resolved comparison ref and the editor's current/default
+/// values so the frontend has everything in one round-trip.
+#[derive(serde::Serialize)]
+pub struct TargetDiffResp {
+    pub files: Vec<crate::git::FileDiff>,
+    pub patch: String,
+    /// The ref actually compared against, e.g. `origin/main`.
+    pub resolved: String,
+    /// The direction's stored target branch ("" = using the default).
+    pub target: String,
+    /// The effective default target branch (repo base) shown as the placeholder.
+    pub default_branch: String,
+}
+
+/// The worker's diff against its task's target branch (PR-style: the task's
+/// changes since the merge-base with the target's latest remote, incl.
+/// uncommitted edits). `fetch` refreshes `origin/<target>` first — the frontend
+/// passes true on mode-enter / manual refresh / after a target edit, false on
+/// the live poll. Runs the git work off the async runtime.
+#[tauri::command]
+pub async fn worktree_diff_target(
+    db: State<'_, Db>,
+    cwd: String,
+    direction_id: i32,
+    fetch: bool,
+) -> R<TargetDiffResp> {
+    let (stored, base_ref) = repo::direction_target_branch(&db, direction_id)
+        .await
+        .map_err(e)?;
+    let cwd2 = cwd.clone();
+    let (default_branch, effective) = {
+        let p = std::path::Path::new(&cwd);
+        let default_branch = crate::git::default_target_branch(p, &base_ref);
+        let effective = if stored.trim().is_empty() {
+            default_branch.clone()
+        } else {
+            stored.trim().to_string()
+        };
+        (default_branch, effective)
+    };
+    // git (subprocess; fetch may hit the network) off the async worker threads.
+    let td = tokio::task::spawn_blocking(move || {
+        crate::git::target_diff(std::path::Path::new(&cwd2), &effective, fetch)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(e)?;
+    Ok(TargetDiffResp {
+        files: td.files,
+        patch: td.patch,
+        resolved: td.resolved,
+        target: stored,
+        default_branch,
+    })
+}
+
+/// Persist a task's diff target branch ("" = use the repo default).
+#[tauri::command]
+pub async fn set_direction_target_branch(
+    db: State<'_, Db>,
+    direction_id: i32,
+    target: String,
+) -> R<()> {
+    repo::set_direction_target_branch(&db, direction_id, &target)
+        .await
+        .map_err(e)
+}
+
 /// Observe-mode (§4.4): the agent's own transcript, normalized to app-native
 /// events so the chat view never depends on rendering the live TUI.
 #[tauri::command]

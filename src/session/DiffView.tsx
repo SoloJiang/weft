@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronRight, FileText, MessageSquarePlus, Send } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  FileText,
+  MessageSquarePlus,
+  RefreshCw,
+  Send,
+} from "lucide-react";
 import { api } from "../lib/api";
 import type { WorktreeDiff } from "../lib/types";
 import { cn } from "../lib/cn";
@@ -16,9 +23,12 @@ import { Tooltip } from "../components/ui/Tooltip";
  */
 export function DiffView({
   cwd,
+  directionId,
   onAsk,
 }: {
   cwd: string;
+  /** The task whose worktree this is — enables the "vs target" mode + editor. */
+  directionId?: number | null;
   /** Deliver an annotation question to the responsible worker. */
   onAsk?: (text: string) => void;
 }) {
@@ -29,43 +39,60 @@ export function DiffView({
   const [touched, setTouched] = useState(false);
   /** The annotation being composed: a file, optionally pinned to one line. */
   const [ask, setAsk] = useState<{ path: string; line?: DiffLine } | null>(null);
+  // "worktree" = working-tree changes vs HEAD (default). "target" = PR-style
+  // diff vs the task's target branch. The target view needs to know the task.
+  const canTarget = directionId != null;
+  const [mode, setMode] = useState<"worktree" | "target">("worktree");
+  const [tgt, setTgt] = useState<TargetMeta | null>(null);
+  // Bumped to re-run the effect WITH a fresh origin/<target> fetch (manual
+  // refresh + after a target edit; mode-enter already re-runs the effect).
+  const [reload, setReload] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   // Pressing outside the diff closes an open AskBox. Scoped to the whole surface
   // (not the box) so clicking another line just retargets it, keeping the draft.
   useClickOutside(rootRef, ask != null, () => setAsk(null));
 
+  const targetMode = mode === "target" && canTarget;
+
   useEffect(() => {
     let alive = true;
+    // Fetch origin/<target> only on the first tick of a (re)entered target view;
+    // the 3s poll afterwards recomputes against the cached ref (cheap, no network).
+    let fresh = true;
     const tick = async () => {
       try {
-        const d = await api.worktreeDiff(cwd);
-        if (alive) {
-          setDiff(d);
-          setLoaded(true);
+        if (targetMode && directionId != null) {
+          const d = await api.worktreeDiffTarget(cwd, directionId, fresh);
+          if (alive) {
+            setDiff({ files: d.files, patch: d.patch });
+            setTgt({ target: d.target, defaultBranch: d.default_branch, resolved: d.resolved });
+            setLoaded(true);
+          }
+        } else {
+          const d = await api.worktreeDiff(cwd);
+          if (alive) {
+            setDiff(d);
+            setLoaded(true);
+          }
         }
       } catch {
         /* not ready */
       }
+      fresh = false;
     };
+    setLoaded(false);
     void tick();
     const h = setInterval(tick, 3000);
     return () => {
       alive = false;
       clearInterval(h);
     };
-  }, [cwd]);
+  }, [cwd, targetMode, directionId, reload]);
 
   const bodyByPath = useMemo(() => parsePatch(diff?.patch ?? ""), [diff?.patch]);
 
-  if (loaded && diff && diff.files.length === 0) {
-    return (
-      <div className="flex flex-1 items-center justify-center px-6 text-center">
-        <p className="text-[12px] leading-relaxed text-ink-faint">{t("diff.empty")}</p>
-      </div>
-    );
-  }
-
   const files = diff?.files ?? [];
+  const isEmpty = loaded && files.length === 0;
   // Default: expand all when few files, collapse when many (until the user acts).
   const isOpen = (p: string) =>
     touched ? !!open[p] : files.length <= 4;
@@ -79,12 +106,38 @@ export function DiffView({
 
   return (
     <div ref={rootRef} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
-      <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-bg/95 px-4 py-2.5 text-[11px] text-ink-faint backdrop-blur">
-        <span>{t("diff.filesChanged", { count: files.length })}</span>
-        <span className="text-running">+{totalAdded}</span>
-        <span className="text-danger">−{totalRemoved}</span>
+      <div className="sticky top-0 z-10 flex flex-col gap-2 border-b border-border bg-bg/95 px-4 py-2.5 backdrop-blur">
+        <div className="flex items-center gap-2 text-[11px] text-ink-faint">
+          {canTarget && (
+            <div className="flex items-center gap-0.5 rounded-[var(--radius-md)] border border-border p-0.5">
+              <ModeBtn active={mode === "worktree"} onClick={() => setMode("worktree")}>
+                {t("diff.modeWorktree")}
+              </ModeBtn>
+              <ModeBtn active={mode === "target"} onClick={() => setMode("target")}>
+                {t("diff.modeTarget")}
+              </ModeBtn>
+            </div>
+          )}
+          <span className="ml-auto">{t("diff.filesChanged", { count: files.length })}</span>
+          <span className="text-running">+{totalAdded}</span>
+          <span className="text-danger">−{totalRemoved}</span>
+        </div>
+        {targetMode && (
+          <TargetEditor
+            directionId={directionId!}
+            meta={tgt}
+            onChanged={() => setReload((n) => n + 1)}
+          />
+        )}
       </div>
 
+      {isEmpty ? (
+        <div className="flex flex-1 items-center justify-center px-6 text-center">
+          <p className="text-[12px] leading-relaxed text-ink-faint">
+            {targetMode ? t("diff.emptyTarget") : t("diff.empty")}
+          </p>
+        </div>
+      ) : (
       <div className="flex min-w-0 flex-col">
         {files.map((f) => {
           const body = bodyByPath[f.path];
@@ -160,6 +213,105 @@ export function DiffView({
           );
         })}
       </div>
+      )}
+    </div>
+  );
+}
+
+/** Segmented-toggle button for the diff mode switch. */
+function ModeBtn({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "rounded-[var(--radius-sm)] px-2 py-0.5 text-[11px] font-medium transition-colors",
+        active ? "bg-brand-ghost text-brand" : "text-ink-faint hover:text-ink",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+type TargetMeta = { target: string; defaultBranch: string; resolved: string };
+
+/** Editable per-task target branch for "vs target" mode: type a branch + ↵ to
+ *  save (persisted on the direction), blank reverts to the repo default. The
+ *  refresh button re-fetches origin/<target> for the latest remote state. */
+function TargetEditor({
+  directionId,
+  meta,
+  onChanged,
+}: {
+  directionId: number;
+  meta: TargetMeta | null;
+  onChanged: () => void;
+}) {
+  const { t } = useTranslation();
+  const [val, setVal] = useState(meta?.target ?? "");
+  // Keep the field in sync when the backend value arrives/changes, but don't
+  // clobber an edit in progress (only adopt when it matches the last loaded).
+  const lastLoaded = useRef(meta?.target ?? "");
+  useEffect(() => {
+    const incoming = meta?.target ?? "";
+    if (incoming !== lastLoaded.current) {
+      lastLoaded.current = incoming;
+      setVal(incoming);
+    }
+  }, [meta?.target]);
+
+  const save = () => {
+    const next = val.trim();
+    if (next === (meta?.target ?? "").trim()) return; // unchanged
+    lastLoaded.current = next;
+    void api.setDirectionTargetBranch(directionId, next).then(onChanged).catch(() => {});
+  };
+
+  return (
+    <div className="flex items-center gap-1.5 text-[11px] text-ink-faint">
+      <span className="shrink-0">{t("diff.compareAgainst")}</span>
+      <input
+        value={val}
+        onChange={(e) => setVal(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            (e.target as HTMLInputElement).blur();
+          } else if (e.key === "Escape") {
+            setVal(meta?.target ?? "");
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        placeholder={meta?.defaultBranch || "main"}
+        spellCheck={false}
+        className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-bg px-2 py-0.5 font-mono text-[11px] text-ink outline-none focus:border-brand"
+      />
+      {meta?.resolved && (
+        <span
+          className="shrink-0 truncate font-mono text-[10.5px] text-ink-faint/70"
+          title={meta.resolved}
+        >
+          {meta.resolved}
+        </span>
+      )}
+      <Tooltip label={t("diff.refreshTarget")}>
+        <button
+          onClick={onChanged}
+          aria-label={t("diff.refreshTarget")}
+          className="grid h-6 w-6 shrink-0 place-items-center rounded text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
+        >
+          <RefreshCw size={12} />
+        </button>
+      </Tooltip>
     </div>
   );
 }

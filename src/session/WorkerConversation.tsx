@@ -272,6 +272,7 @@ export function WorkerConversation() {
       {ref && (
         <DiffPanel
           cwd={ref.worktree}
+          directionId={directionId}
           open={rail === "diff"}
           onClose={() => setRail("info")}
           onAsk={(text) => void sendToWorker(directionId, repoId, text)}

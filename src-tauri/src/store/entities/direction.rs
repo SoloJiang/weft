@@ -27,6 +27,11 @@ pub struct Model {
     /// straight away). The brief renders per-mandate.
     #[sea_orm(default_value = "plan+impl")]
     pub mandate: String,
+    /// Diff-panel "vs target" comparison branch (per-task). Empty = use the
+    /// repo's default branch (repo_ref.base_ref). The diff compares the task's
+    /// changes against the merge-base with `origin/<target_branch>`.
+    #[sea_orm(default_value = "")]
+    pub target_branch: String,
     pub created_at: String,
 }
 

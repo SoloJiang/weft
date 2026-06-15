@@ -33,26 +33,23 @@ pub fn is_git_repo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True if `r` resolves to a commit in `dir` (non-empty + `rev-parse` verifies).
+fn ref_resolves(dir: &Path, r: &str) -> bool {
+    !r.is_empty()
+        && Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")])
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+}
+
 /// Resolve a usable base commit-ish for a NEW worktree branch: prefer the repo's
 /// recorded base_ref; if it no longer resolves, fall back through origin/HEAD →
 /// main → master → HEAD so worktree creation never silently branches off whatever
 /// happens to be checked out in the canonical repo.
 fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
-    let resolves = |r: &str| {
-        !r.is_empty()
-            && Command::new("git")
-                .args([
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("{r}^{{commit}}"),
-                ])
-                .current_dir(repo)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-    };
-    if resolves(recorded) {
+    if ref_resolves(repo, recorded) {
         return recorded.to_string();
     }
     if let Ok(out) = Command::new("git")
@@ -62,17 +59,84 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
     {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if resolves(&s) {
+            if ref_resolves(repo, &s) {
                 return s;
             }
         }
     }
     for c in ["main", "master", "origin/main", "origin/master"] {
-        if resolves(c) {
+        if ref_resolves(repo, c) {
             return c.to_string();
         }
     }
     "HEAD".to_string()
+}
+
+/// The default target-branch *name* for a worktree's diff "vs target" mode:
+/// the repo's recorded base branch (stripped of any `origin/` prefix) if set,
+/// else detected via origin/HEAD → main → master. Used as the placeholder /
+/// fallback when a direction has no explicit target_branch.
+pub fn default_target_branch(worktree: &Path, base_ref: &str) -> String {
+    let strip = |s: &str| s.strip_prefix("origin/").unwrap_or(s).to_string();
+    let b = base_ref.trim();
+    if !b.is_empty() {
+        return strip(b);
+    }
+    let detected = resolve_base_ref(worktree, "");
+    if detected == "HEAD" {
+        "main".to_string()
+    } else {
+        strip(&detected)
+    }
+}
+
+/// Resolve the ref to compare a target branch against: prefer the (freshly
+/// fetched) remote `origin/<target>`, else a local `<target>`, else fall back
+/// through the repo's default-branch chain (origin/HEAD → main → master → HEAD).
+fn resolve_target_ref(worktree: &Path, target: &str) -> String {
+    let t = target.trim();
+    if !t.is_empty() {
+        let remote = format!("origin/{t}");
+        if ref_resolves(worktree, &remote) {
+            return remote;
+        }
+        if ref_resolves(worktree, t) {
+            return t.to_string();
+        }
+    }
+    resolve_base_ref(worktree, "")
+}
+
+/// PR-style diff (files + patch + the ref compared against) of a worktree
+/// against a target branch: the task's own changes relative to where it
+/// branched off the target's latest *remote* state (merge-base with
+/// `origin/<target>`), **including uncommitted edits**. The target's own newer
+/// commits don't appear as noise. With `fetch`, refreshes `origin/<target>`
+/// first ("对齐远端最新") — best-effort, so offline/no-remote never breaks the diff.
+pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<TargetDiff> {
+    if fetch {
+        let t = target.trim();
+        if !t.is_empty() {
+            // Best-effort; a failed fetch (offline / no remote / auth) must not
+            // abort the diff — we fall through to the cached origin/<target>.
+            let _ = git(worktree_path, &["fetch", "--quiet", "origin", t]);
+        }
+    }
+    let resolved = resolve_target_ref(worktree_path, target);
+    // PR-style base = merge-base(resolved, HEAD). If it fails (unrelated
+    // histories / missing ref), fall back to diffing against the resolved ref
+    // directly, then HEAD — always produce *some* diff rather than erroring.
+    let base = git(worktree_path, &["merge-base", &resolved, "HEAD"])
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| resolved.clone());
+    let files = repo_diff_from(worktree_path, &base)?.files;
+    let patch = repo_patch_from(worktree_path, &base).unwrap_or_default();
+    Ok(TargetDiff {
+        files,
+        patch,
+        resolved,
+    })
 }
 
 /// Create a worktree for `repo` on a fresh `branch` at `worktree_path`, branched
@@ -204,12 +268,27 @@ pub struct WorktreeDiff {
     pub patch: String,
 }
 
-/// Unified patch of a worktree's changes: tracked via `git diff HEAD`, plus
-/// untracked files synthesized as add-patches (workers building from scratch
-/// create new files, which `git diff HEAD` omits). Skips unreadable (binary) and
-/// very large files.
+/// "vs target" diff: like [`WorktreeDiff`] but relative to a target branch's
+/// merge-base, plus the ref actually compared against (e.g. `origin/main`).
+#[derive(Serialize, Debug, Default)]
+pub struct TargetDiff {
+    pub files: Vec<FileDiff>,
+    pub patch: String,
+    pub resolved: String,
+}
+
+/// Unified patch of a worktree's changes against HEAD (the working-tree view).
 pub fn repo_patch(worktree_path: &Path) -> Result<String> {
-    let mut out = git(worktree_path, &["diff", "HEAD"])?;
+    repo_patch_from(worktree_path, "HEAD")
+}
+
+/// Unified patch of a worktree's changes from `base` to the working tree:
+/// tracked via `git diff <base>`, plus untracked files synthesized as
+/// add-patches (workers building from scratch create new files, which
+/// `git diff` omits). Skips unreadable (binary) and very large files. `base`
+/// is "HEAD" for the working-tree view, or a merge-base sha for "vs target".
+pub fn repo_patch_from(worktree_path: &Path, base: &str) -> Result<String> {
+    let mut out = git(worktree_path, &["diff", base])?;
     let untracked = git(
         worktree_path,
         &["ls-files", "--others", "--exclude-standard"],
@@ -256,11 +335,16 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<(String, String)>> {
     Ok(res)
 }
 
-/// Diff stat for a worktree: tracked changes via `git diff --numstat HEAD`
-/// plus untracked files counted as fully-added.
+/// Diff stat for a worktree against HEAD (the working-tree view).
 pub fn repo_diff(worktree_path: &Path) -> Result<DiffSummary> {
+    repo_diff_from(worktree_path, "HEAD")
+}
+
+/// Diff stat for a worktree from `base` to the working tree: tracked changes
+/// via `git diff --numstat <base>` plus untracked files counted as fully-added.
+pub fn repo_diff_from(worktree_path: &Path, base: &str) -> Result<DiffSummary> {
     let mut files = Vec::new();
-    let numstat = git(worktree_path, &["diff", "--numstat", "HEAD"])?;
+    let numstat = git(worktree_path, &["diff", "--numstat", base])?;
     for line in numstat.lines() {
         let mut parts = line.split('\t');
         let added = parts.next().unwrap_or("0").parse().unwrap_or(0);
@@ -521,6 +605,61 @@ mod tests {
         assert_eq!(resolve_base_ref(&repo, &base), base);
         let fb = resolve_base_ref(&repo, "nope-xyz");
         assert!(git(&repo, &["rev-parse", "--verify", &fb]).is_ok());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn target_diff_is_pr_style_excludes_target_advance_includes_uncommitted() {
+        let repo = tmp("tdiff");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        // A tracked file on the base, then branch a worktree off that point.
+        std::fs::write(repo.join("keep.txt"), "0\n").unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "base file"]).unwrap();
+
+        let wt = tmp("tdiff-wt");
+        add_worktree(&repo, "feat/tdiff", &wt, &base).unwrap();
+
+        // Task work: a committed new file, an uncommitted edit, and an untracked file.
+        std::fs::write(wt.join("task.txt"), "task\n").unwrap();
+        git(&wt, &["add", "task.txt"]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "task work"]).unwrap();
+        std::fs::write(wt.join("keep.txt"), "0\nmod\n").unwrap(); // uncommitted edit
+        std::fs::write(wt.join("untracked.txt"), "u\n").unwrap(); // untracked
+
+        // The TARGET advances after the branch point with an unrelated commit.
+        std::fs::write(repo.join("other.txt"), "other\n").unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-q", "-m", "base advances"]).unwrap();
+
+        let td = target_diff(&wt, &base, false).unwrap();
+        let paths: Vec<&str> = td.files.iter().map(|f| f.path.as_str()).collect();
+        // The task's own changes — committed, uncommitted, and untracked — are all shown.
+        assert!(paths.contains(&"task.txt"), "committed change missing: {paths:?}");
+        assert!(paths.contains(&"keep.txt"), "uncommitted edit missing: {paths:?}");
+        assert!(paths.contains(&"untracked.txt"), "untracked missing: {paths:?}");
+        // The target's later unrelated commit must NOT appear (merge-base excludes it).
+        assert!(!paths.contains(&"other.txt"), "target advance leaked: {paths:?}");
+        assert!(td.patch.contains("task.txt"));
+        assert!(!td.patch.contains("other.txt"));
+        // No remote in the test → resolves to the local base branch.
+        assert_eq!(td.resolved, base);
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn default_target_branch_prefers_base_ref_strips_origin() {
+        let repo = tmp("dtb");
+        init_repo(&repo).unwrap();
+        assert_eq!(default_target_branch(&repo, "main"), "main");
+        assert_eq!(default_target_branch(&repo, "origin/develop"), "develop");
+        // Empty base_ref → detect from the repo; init_repo's branch resolves.
+        let detected = default_target_branch(&repo, "");
+        assert!(!detected.is_empty() && detected != "HEAD");
         let _ = std::fs::remove_dir_all(&repo);
     }
 

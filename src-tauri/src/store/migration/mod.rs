@@ -28,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0015ImRoute),
             Box::new(M0016BackupConfig),
             Box::new(M0017SessionStatusReset),
+            Box::new(M0018DirectionTargetBranch),
         ]
     }
 }
@@ -643,5 +644,49 @@ impl MigrationTrait for M0017SessionStatusReset {
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         // Data reconcile only — nothing to reverse.
         Ok(())
+    }
+}
+
+/// Per-task (direction) target branch for the diff panel's "vs target" mode.
+/// Empty = use the repo's default branch (repo_ref.base_ref). Tolerate a
+/// duplicate column so re-running against a hand-patched db is a no-op.
+pub struct M0018DirectionTargetBranch;
+impl MigrationName for M0018DirectionTargetBranch {
+    fn name(&self) -> &str {
+        "m0018_direction_target_branch"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0018DirectionTargetBranch {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("target_branch"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .drop_column(Alias::new("target_branch"))
+                    .to_owned(),
+            )
+            .await
     }
 }

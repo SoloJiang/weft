@@ -179,6 +179,8 @@ pub fn run() {
             commands::set_task_status,
             commands::read_transcript,
             commands::worktree_diff,
+            commands::worktree_diff_target,
+            commands::set_direction_target_branch,
             commands::get_proposal,
             commands::save_proposal,
             commands::confirm_proposal,

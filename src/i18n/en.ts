@@ -323,6 +323,11 @@ export const en = {
   diff: {
     tab: "Diff",
     empty: "No changes yet.",
+    emptyTarget: "No changes vs the target branch yet.",
+    modeWorktree: "Working tree",
+    modeTarget: "Target branch",
+    compareAgainst: "Compare against",
+    refreshTarget: "Refresh from remote",
     filesChanged_one: "{{count}} file",
     filesChanged_other: "{{count}} files",
     untrackedOnly: "Only new (untracked) files so far.",

@@ -15,11 +15,14 @@ const clampW = (x: number) => Math.max(MIN_W, Math.min(MAX_W, x));
  */
 export function DiffPanel({
   cwd,
+  directionId,
   open,
   onClose,
   onAsk,
 }: {
   cwd: string;
+  /** The task whose worktree this is — enables "vs target" mode (see DiffView). */
+  directionId?: number | null;
   open: boolean;
   onClose: () => void;
   /** Deliver a diff annotation to the responsible worker (see DiffView). */
@@ -95,7 +98,7 @@ export function DiffPanel({
             <X size={15} />
           </button>
         </header>
-        <DiffView cwd={cwd} onAsk={onAsk} />
+        <DiffView cwd={cwd} directionId={directionId} onAsk={onAsk} />
       </aside>
     </div>
   );
