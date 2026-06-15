@@ -7,8 +7,10 @@
  *   - scp-style:   user@host:org/repo(.git)   (classic `git@github.com:a/b.git`)
  */
 
-const SCHEME_URL = /\b(?:https?|ssh|git):\/\/[^\s<>"'`)\]]+/gi;
-const SCP_URL = /\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s<>"'`)\]]+/gi;
+// `,` and `;` are excluded from the body so comma/semicolon-separated pastes
+// split even without surrounding whitespace (`a.git,https://…/b.git`).
+const SCHEME_URL = /\b(?:https?|ssh|git):\/\/[^\s<>"'`),;\]]+/gi;
+const SCP_URL = /\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s<>"'`),;\]]+/gi;
 
 /** Strip wrapping/trailing punctuation a paste often carries around a URL. */
 function trimUrl(raw: string): string {
