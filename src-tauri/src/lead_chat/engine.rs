@@ -410,7 +410,11 @@ async fn finalize_orphan_tool_rows(
 /// spin forever (nothing could ever fill it).
 fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'static str {
     if has_output {
-        if is_error { "error" } else { "complete" }
+        if is_error {
+            "error"
+        } else {
+            "complete"
+        }
     } else if trackable {
         "streaming"
     } else {
@@ -442,13 +446,26 @@ async fn persist_tool_calls(
         let content_str = content.to_string();
         let call_id = call.id;
         match repo::insert_lead_message(
-            db, thread_id, sid, turn, "assistant", "tool", &content_str, status,
+            db,
+            thread_id,
+            sid,
+            turn,
+            "assistant",
+            "tool",
+            &content_str,
+            status,
         )
         .await
         {
             Ok(m) => {
                 let row_id = m.id;
-                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                let _ = app.emit(
+                    EVENT,
+                    Push::Message {
+                        thread_id,
+                        message: m,
+                    },
+                );
                 if trackable {
                     inner.tool_rows.insert(call_id, (row_id, content));
                 }
@@ -511,12 +528,25 @@ async fn apply_lead_sentinels(
                     Ok(v) if v.is_object() => {
                         let (sid, turn) = (inner.session_id, inner.turn_id);
                         match repo::insert_lead_message(
-                            db, thread_id, sid, turn, "assistant", "action_card", &json, "complete",
+                            db,
+                            thread_id,
+                            sid,
+                            turn,
+                            "assistant",
+                            "action_card",
+                            &json,
+                            "complete",
                         )
                         .await
                         {
                             Ok(m) => {
-                                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                                let _ = app.emit(
+                                    EVENT,
+                                    Push::Message {
+                                        thread_id,
+                                        message: m,
+                                    },
+                                );
                             }
                             Err(e) => {
                                 eprintln!("[weft] lead sentinel: insert action_card failed: {e}")
@@ -535,7 +565,9 @@ async fn apply_lead_sentinels(
                 let ws_id = match repo::get_thread(db, thread_id).await {
                     Ok(Some(t)) => Some(t.workspace_id),
                     Ok(None) => {
-                        eprintln!("[weft] lead sentinel: list_repos — thread {thread_id} not found");
+                        eprintln!(
+                            "[weft] lead sentinel: list_repos — thread {thread_id} not found"
+                        );
                         None
                     }
                     Err(e) => {
@@ -563,7 +595,9 @@ async fn apply_lead_sentinels(
                     let body = match serde_json::to_string(&payload) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[weft] lead sentinel: serialize list_repos_result failed: {e}");
+                            eprintln!(
+                                "[weft] lead sentinel: serialize list_repos_result failed: {e}"
+                            );
                             continue;
                         }
                     };
@@ -601,18 +635,32 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     } else {
         text
     };
-    let _ = repo::update_lead_message(db, id, &serde_json::json!({ "text": clean }).to_string(), status)
-        .await;
+    let _ = repo::update_lead_message(
+        db,
+        id,
+        &serde_json::json!({ "text": clean }).to_string(),
+        status,
+    )
+    .await;
     let _ = app.emit(
         EVENT,
-        Push::Finalize { thread_id, message_id: id, status: status.into() },
+        Push::Finalize {
+            thread_id,
+            message_id: id,
+            status: status.into(),
+        },
     );
     if status == "complete" {
         emit_lead_out(app, thread_id, id, &clean, origin_tag);
     }
 }
 
-async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fallback_status: &str) {
+async fn cleanup_disconnected_turn(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    fallback_status: &str,
+) {
     let mut inner = eng.lock().await;
     if !inner.turn.busy
         && inner.current.is_none()
@@ -667,13 +715,7 @@ async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fa
                 emit_finalize(app, thread_id, message_id, status);
             }
             DisconnectedTurnRow::Inserted(message) => {
-                let _ = app.emit(
-                    EVENT,
-                    Push::Message {
-                        thread_id,
-                        message,
-                    },
-                );
+                let _ = app.emit(EVENT, Push::Message { thread_id, message });
             }
         }
     }
@@ -1232,6 +1274,14 @@ async fn spawn_codex_turn_or_exec(
         if eng.lock().await.interrupting {
             return Err(e);
         }
+        // Tear down the half-started app-server first: thread/start + the consumer
+        // subscription may already be live, and a lingering consumer (single-thread
+        // routing) could finalize/reset the exec fallback turn or break thread-less
+        // routing on the next retry. shutdown() drops the child + closes the consumer.
+        let stale = eng.lock().await.codex_client.take();
+        if let Some(c) = stale {
+            c.shutdown().await;
+        }
         eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
         spawn_turn(app, db, eng, out).await?;
     }
@@ -1338,7 +1388,10 @@ async fn codex_consumer(
                 let mut inner = eng.lock().await;
                 merge_tool_results(&app, &db, &mut inner, items).await;
             }
-            ThreadMsg::Event(ChatEvent::Usage { context_tokens, window }) => {
+            ThreadMsg::Event(ChatEvent::Usage {
+                context_tokens,
+                window,
+            }) => {
                 // app-server's current-context usage (last.inputTokens + window):
                 // the accurate Context-panel value codex exec couldn't give.
                 let mut inner = eng.lock().await;
@@ -1358,7 +1411,10 @@ async fn codex_consumer(
                     },
                 );
             }
-            ThreadMsg::Event(ChatEvent::TurnEnd { is_error, context_tokens }) => {
+            ThreadMsg::Event(ChatEvent::TurnEnd {
+                is_error,
+                context_tokens,
+            }) => {
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
@@ -1449,19 +1505,36 @@ async fn codex_consumer(
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
                             client.set_active_turn(&thread, &t).await;
+                            // Stop pressed during this flush's start_turn? interrupt()
+                            // had no active turn id to act on (same window as a direct
+                            // send) — honor it now that the turn is recorded.
+                            if eng.lock().await.interrupting {
+                                let _ = client.interrupt(&thread, &t).await;
+                            }
                         }
                         // App-server died/rejecting between turns: don't drop the
                         // queued message — fall back to the same exec path a direct
                         // send uses (native id is shared, so resume is seamless).
                         Err(e) => {
-                            eprintln!("[weft][codex] flush via app-server failed ({e}); trying exec");
-                            match spawn_turn(app.clone(), db.clone(), eng.clone(), n.clone()).await {
-                                Ok(()) => {
-                                    mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
-                                }
-                                Err(e2) => {
-                                    eprintln!("[weft][codex] exec fallback for queued turn failed: {e2}");
-                                    rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                            // A Stop during the failed start: roll the queued turn back
+                            // interrupted instead of resurrecting it on exec.
+                            if eng.lock().await.interrupting {
+                                rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                            } else {
+                                eprintln!(
+                                    "[weft][codex] flush via app-server failed ({e}); trying exec"
+                                );
+                                match spawn_turn(app.clone(), db.clone(), eng.clone(), n.clone())
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        mark_queued_delivered(&app, &db, thread_id, session_id, &n)
+                                            .await;
+                                    }
+                                    Err(e2) => {
+                                        eprintln!("[weft][codex] exec fallback for queued turn failed: {e2}");
+                                        rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                                    }
                                 }
                             }
                         }
@@ -1475,9 +1548,13 @@ async fn codex_consumer(
                 eng.lock().await.clock.last_activity = std::time::Instant::now();
             }
             ThreadMsg::Approval { id, method, params } => {
-                // Route the app-server's approval request through Weft's Ask Bridge
-                // (the same Needs-you surface the exec path uses), then reply with
-                // the v2 decision. accept = run, decline = deny but continue.
+                // Route every blocking server ask (approval / permissions /
+                // elicitation) through Weft's Ask Bridge (the same Needs-you surface
+                // the exec path uses), then reply with the SHAPE that ask kind wants:
+                // approval `{decision}`, permissions `{permissions}`, elicitation
+                // `{action}` — a wrong shape leaves the turn hung or the grant a no-op.
+                let is_elicit = crate::codex_app_server::is_elicitation_request(&method);
+                let is_perm = method.contains("permissions");
                 let (thread_id, dir) = {
                     let i = eng.lock().await;
                     (i.thread_id, i.ask_dir.clone())
@@ -1496,7 +1573,15 @@ async fn codex_consumer(
                     .as_array()
                     .or_else(|| params["item"]["changes"].as_array())
                     .is_some_and(|c| !c.is_empty());
-                let (tool, summary) = if is_cmd {
+                let (tool, summary) = if is_elicit {
+                    // An MCP server is asking the user for input — show its prompt.
+                    let msg = params["message"]
+                        .as_str()
+                        .or_else(|| params["params"]["message"].as_str())
+                        .or_else(|| params["elicitation"]["message"].as_str())
+                        .unwrap_or("MCP server requests input");
+                    ("Ask", msg.chars().take(200).collect::<String>())
+                } else if is_cmd {
                     ("Bash", cmd.unwrap_or("(command)").to_string())
                 } else if let Some(net) = net {
                     // Network-only approval: classify distinctly so it isn't shown
@@ -1531,11 +1616,31 @@ async fn codex_consumer(
                         rx.await.unwrap_or(crate::ask::Decision::Deny)
                     }
                 };
-                let verdict = match decision {
-                    crate::ask::Decision::Allow => "accept",
-                    crate::ask::Decision::Deny => "decline",
+                let allow = matches!(decision, crate::ask::Decision::Allow);
+                // Reply with the shape this ask kind expects.
+                let result = if is_elicit {
+                    serde_json::json!({ "action": if allow { "accept" } else { "decline" } })
+                } else if is_perm {
+                    // Permission asks are answered with the GRANTED permissions
+                    // (omitted = denied), not a decision: echo the requested set on
+                    // allow, none on deny. Without this an approved permission is a
+                    // silent no-op.
+                    let granted = if allow {
+                        params
+                            .get("permissions")
+                            .or_else(|| params["item"].get("permissions"))
+                            .or_else(|| params["params"].get("permissions"))
+                            .filter(|v| !v.is_null())
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([]))
+                    } else {
+                        serde_json::json!([])
+                    };
+                    serde_json::json!({ "permissions": granted })
+                } else {
+                    serde_json::json!({ "decision": if allow { "accept" } else { "decline" } })
                 };
-                let _ = client.reply_approval(&id, verdict).await;
+                let _ = client.reply_result(&id, result).await;
             }
         }
     }
@@ -1555,7 +1660,10 @@ fn codex_change_approval_summary(params: &serde_json::Value) -> String {
     if paths.is_empty() {
         return "apply file changes".to_string();
     }
-    let mut s = format!("apply file changes: {}", paths.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+    let mut s = format!(
+        "apply file changes: {}",
+        paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+    );
     let more = paths.len().saturating_sub(3);
     if more > 0 {
         s.push_str(&format!(" +{more}"));
@@ -1909,7 +2017,12 @@ pub fn spawn_watchdog(app: AppHandle) {
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
 pub async fn stop_quiet(
     eng: &EngineRef,
-) -> (i32, Option<i32>, Option<(i32, String)>, Vec<(i32, serde_json::Value)>) {
+) -> (
+    i32,
+    Option<i32>,
+    Option<(i32, String)>,
+    Vec<(i32, serde_json::Value)>,
+) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let current = inner.current.take().map(|(id, text, _)| (id, text));
@@ -2211,7 +2324,10 @@ fn spawn_reader(
                     merge_tool_results(&app, &db, &mut inner, items).await;
                 }
                 super::proto::ChatEvent::Usage { .. } => {}
-                super::proto::ChatEvent::TurnEnd { is_error, context_tokens } => {
+                super::proto::ChatEvent::TurnEnd {
+                    is_error,
+                    context_tokens,
+                } => {
                     if let Some(ct) = context_tokens {
                         inner.last_context_tokens = Some(ct);
                         let _ = app.emit(

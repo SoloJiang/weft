@@ -170,6 +170,18 @@ pub fn is_approval_request(method: &str) -> bool {
     )
 }
 
+/// A blocking MCP elicitation (`mcpServer/elicitation/request`): a configured MCP
+/// server asking the user for input. Must be answered (`{action}`) or the turn
+/// hangs until a watchdog — so it's routed to the Ask Bridge like an approval.
+pub fn is_elicitation_request(method: &str) -> bool {
+    method.ends_with("/elicitation/request")
+}
+
+/// Any server→client request that blocks the turn until Weft replies.
+pub fn is_server_ask(method: &str) -> bool {
+    is_approval_request(method) || is_elicitation_request(method)
+}
+
 /// Map a server notification to the engine's `ChatEvent`. Tool items (camelCase:
 /// commandExecution/fileChange/mcpToolCall …) become a running tool row on
 /// `item/started` and its result on `item/completed`; agent text streams via
@@ -178,10 +190,14 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
     use crate::lead_chat::proto::ChatEvent;
     let item = &params["item"];
     match method {
-        "item/agentMessage/delta" => params["delta"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| ChatEvent::TextDelta { text: s.to_string() }),
+        "item/agentMessage/delta" => {
+            params["delta"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| ChatEvent::TextDelta {
+                    text: s.to_string(),
+                })
+        }
         "item/started" => match item["type"].as_str() {
             Some("error") => Some(ChatEvent::TextDelta {
                 text: crate::lead_chat::proto::error_text_from_item(item),
@@ -498,13 +514,23 @@ impl Client {
         let me = self.clone();
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
 
-        // Handshake: initialize (await), then the `initialized` notification.
-        self.request(
-            "initialize",
-            initialize_params("weft", env!("CARGO_PKG_VERSION")),
-        )
-        .await?;
-        self.notify("initialized", None).await?;
+        // Handshake: initialize (await), then the `initialized` notification. If it
+        // wedges/errors (auth/network/version), tear the half-open client down
+        // (drops the child + closes read_loop) so a retry doesn't leak app-server /
+        // MCP processes while the turn falls back to exec.
+        let handshake = async {
+            self.request(
+                "initialize",
+                initialize_params("weft", env!("CARGO_PKG_VERSION")),
+            )
+            .await?;
+            self.notify("initialized", None).await
+        }
+        .await;
+        if let Err(e) = handshake {
+            self.shutdown().await;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -543,7 +569,9 @@ impl Client {
                     }
                 }
                 Incoming::ServerRequest { id, method, params } => {
-                    if is_approval_request(&method) {
+                    // Approvals AND elicitations block the turn until answered — route
+                    // both to the Ask Bridge (each gets its own reply shape there).
+                    if is_server_ask(&method) {
                         let tid = params["threadId"].as_str().map(String::from);
                         self.route_resolved(
                             tid.as_deref(),
@@ -706,16 +734,23 @@ impl Client {
             .await
             .map(|_| ())
     }
-    /// Answer an approval request. `decision` ∈ accept | acceptForSession | decline | cancel.
-    pub async fn reply_approval(&self, id: &Value, decision: &str) -> anyhow::Result<()> {
+    /// Answer a server→client request with a raw `result` payload. Each ask kind
+    /// has its own shape: approval `{decision}`, permissions `{permissions}`,
+    /// elicitation `{action}` — the caller builds the right one.
+    pub async fn reply_result(&self, id: &Value, result: Value) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
         let inner = g
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
-        let line = encode_response(id, json!({ "decision": decision }));
+        let line = encode_response(id, result);
         inner.stdin.write_all(line.as_bytes()).await?;
         inner.stdin.flush().await?;
         Ok(())
+    }
+
+    /// Answer an approval request. `decision` ∈ accept | acceptForSession | decline | cancel.
+    pub async fn reply_approval(&self, id: &Value, decision: &str) -> anyhow::Result<()> {
+        self.reply_result(id, json!({ "decision": decision })).await
     }
 }
 
@@ -853,7 +888,10 @@ mod tests {
             "thread/tokenUsage/updated",
             &json!({"tokenUsage":{"last":{"inputTokens":18440},"modelContextWindow":258400}}),
         ) {
-            Some(ChatEvent::Usage { context_tokens, window }) => {
+            Some(ChatEvent::Usage {
+                context_tokens,
+                window,
+            }) => {
                 assert_eq!(context_tokens, 18440);
                 assert_eq!(window, Some(258400));
             }
@@ -873,11 +911,15 @@ mod tests {
         )
         .is_none());
         assert!(
-            notification_to_event("item/started", &json!({"item":{"type":"userMessage"}})).is_none()
+            notification_to_event("item/started", &json!({"item":{"type":"userMessage"}}))
+                .is_none()
         );
         assert!(matches!(
             notification_to_event("turn/completed", &json!({"turn":{"status":"completed"}})),
-            Some(ChatEvent::TurnEnd { is_error: false, .. })
+            Some(ChatEvent::TurnEnd {
+                is_error: false,
+                ..
+            })
         ));
         assert!(matches!(
             notification_to_event("turn/completed", &json!({"turn":{"status":"failed"}})),
@@ -899,7 +941,10 @@ mod tests {
             &json!({"item":{"id":"m","type":"mcpToolCall","tool":"t","arguments":{"blob":big}}}),
         ) {
             Some(ChatEvent::Assistant { tools, .. }) => {
-                let s = tools[0].input.as_str().expect("oversized input capped to string");
+                let s = tools[0]
+                    .input
+                    .as_str()
+                    .expect("oversized input capped to string");
                 assert!(s.ends_with("… (truncated)"));
                 assert!(s.chars().count() < 17_000);
             }
@@ -994,6 +1039,17 @@ mod tests {
         assert!(is_approval_request("item/fileChange/requestApproval"));
         assert!(is_approval_request("item/permissions/requestApproval"));
         assert!(!is_approval_request("item/completed"));
+    }
+
+    #[test]
+    fn server_asks_include_elicitation() {
+        // Elicitation is a blocking ask too — it must route (else the turn hangs),
+        // but it is NOT an approval (different reply shape: {action} vs {decision}).
+        assert!(is_elicitation_request("mcpServer/elicitation/request"));
+        assert!(!is_approval_request("mcpServer/elicitation/request"));
+        assert!(is_server_ask("mcpServer/elicitation/request"));
+        assert!(is_server_ask("item/commandExecution/requestApproval"));
+        assert!(!is_server_ask("turn/completed"));
     }
 
     #[test]
