@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import * as DM from "@radix-ui/react-dropdown-menu";
@@ -6,10 +6,12 @@ import {
   Check,
   ChevronDown,
   Copy,
+  FolderGit2,
   GitBranch,
   GitCompare,
   Layers,
   MessagesSquare,
+  MoreHorizontal,
   Pencil,
   ScanEye,
   TerminalSquare,
@@ -64,10 +66,10 @@ export function ThreadBoard() {
   const { t } = useTranslation();
   const thread = threads.find((th) => th.id === activeThreadId);
   const [renamingDirectionId, setRenamingDirectionId] = useState<number | null>(null);
-  useEffect(() => {
-    setThreadTab("lead");
-    setReviewingProposal(false);
-  }, [activeThreadId, setReviewingProposal, setThreadTab]);
+  // Resetting the sub-tab here (on mount) is what made backing out of a worker
+  // snap to the lead chat: opening the worker unmounts the board, closing it
+  // remounts and re-ran this reset. The reset now lives in the store, keyed on a
+  // real thread change, so the board tab survives the worker overlay.
 
   if (!thread) return null;
   const dirs = directionsByThread[thread.id] ?? [];
@@ -181,8 +183,6 @@ function DirectionCard({
 }) {
   const {
     worktreesByDirection,
-    repos,
-    sessions,
     viewDirection,
     needs,
     asks,
@@ -193,7 +193,6 @@ function DirectionCard({
   const { t } = useTranslation();
   const writes = worktreesByDirection[direction.id] ?? [];
   const checks = checksByDirection[direction.id];
-  const [reviewSent, setReviewSent] = useState(false);
 
   const allChecks = (checks ?? []).flatMap((rc) => rc.checks);
   const failed = allChecks.filter((c) => c.status === "fail").length;
@@ -260,31 +259,8 @@ function DirectionCard({
         </div>
       </div>
 
-      {/* The write copies are the card's working entry points. Keep them
-          quiet so status and review state remain the strongest signals. */}
-      {writes.length > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2 pl-11">
-          {writes.map((w) => {
-            const repo = repos.find((r) => r.id === w.repo_id);
-            const sess = Object.values(sessions).find(
-              (s) => s.directionId === direction.id && s.repoId === w.repo_id,
-            );
-            return (
-              <button
-                key={w.id}
-                onClick={() => viewDirection(direction.id, w.repo_id)}
-                className="inline-flex h-6 max-w-full items-center gap-1.5 rounded-[var(--radius-sm)] border border-border bg-bg px-2 text-[11px] text-ink-muted transition-colors hover:border-brand/45 hover:bg-brand-ghost hover:text-ink"
-              >
-                <TerminalSquare size={11} className="shrink-0 text-brand" />
-                <span className="truncate font-mono">{repo?.name ?? `repo ${w.repo_id}`}</span>
-                {sess && <StatusDot status={sess.status as SessionStatus} />}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {/* One honest trust signal (the real checks) + provenance, then actions. */}
+      {/* One honest trust signal (the real checks) + the details menu (repos /
+          branches / paths), then actions. */}
       <div className="flex items-center justify-between gap-2 border-t border-border bg-bg/55 px-3 py-2">
         <div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
           <TrustSignal
@@ -295,27 +271,19 @@ function DirectionCard({
                 : t("thread.testsPending")
             }
           />
-          <ProvenanceMenu writes={writes} checks={checks} />
+          <ProvenanceMenu direction={direction} writes={writes} checks={checks} />
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {canRunReview && (
-            <Tooltip label={reviewSent ? t("thread.reviewSent") : t("thread.reviewTip")}>
+            <Tooltip label={t("thread.reviewTip")}>
               <button
                 type="button"
-                onClick={() => {
-                  setReviewSent(true);
-                  window.setTimeout(() => setReviewSent(false), 2500);
-                  void requestSkillReview(direction.id);
-                }}
+                onClick={() => void requestSkillReview(direction.id, { focus: true })}
                 disabled={writes.length === 0}
                 aria-label={t("thread.review")}
                 className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-muted outline-none transition-colors hover:bg-brand-ghost hover:text-ink disabled:opacity-40"
               >
-                {reviewSent ? (
-                  <Check size={13} className="text-running" />
-                ) : (
-                  <ScanEye size={13} className="text-brand" />
-                )}
+                <ScanEye size={13} className="text-brand" />
               </button>
             </Tooltip>
           )}
@@ -339,19 +307,30 @@ function DirectionCard({
 }
 
 /**
- * Provenance, demoted to one icon: a dropdown with the per-repo check results
- * and the work branches — click a branch to copy it. The full escape hatch
- * (worktree path, terminal) stays in the session view's Inspect.
+ * Task details, demoted to one three-dots icon: a dropdown with the per-repo
+ * working copies (name → open the session, plus branch and worktree path to
+ * copy) and the check results. Replaces the on-card repo chips so status and
+ * review state stay the strongest signals on the card face.
  */
 function ProvenanceMenu({
+  direction,
   writes,
   checks,
 }: {
+  direction: Direction;
   writes: { id: number; repo_id: number; branch: string; path: string }[];
   checks?: RepoChecks[];
 }) {
   const { t } = useTranslation();
-  const [copiedId, setCopiedId] = useState<number | null>(null);
+  const { repos, sessions, viewDirection } = useStore();
+  // Copy feedback keyed per-field ("b<id>" branch, "p<id>" path) so each row
+  // flips its own checkmark.
+  const [copied, setCopied] = useState<string | null>(null);
+  const copy = (key: string, text: string) => {
+    void navigator.clipboard.writeText(text);
+    setCopied(key);
+    window.setTimeout(() => setCopied((k) => (k === key ? null : k)), 1800);
+  };
   return (
     <DM.Root>
       <Tooltip label={t("thread.provenanceTip")}>
@@ -360,50 +339,85 @@ function ProvenanceMenu({
           onClick={(e) => e.stopPropagation()}
           className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-faint outline-none transition-colors hover:bg-brand-ghost hover:text-ink data-[state=open]:bg-brand-ghost data-[state=open]:text-ink"
         >
-          <GitBranch size={13} />
+          <MoreHorizontal size={14} />
         </DM.Trigger>
       </Tooltip>
       <DM.Portal>
         <DM.Content
-          align="start"
+          align="end"
           sideOffset={4}
           onClick={(e) => e.stopPropagation()}
           className="weft-pop z-[60] w-72 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.5)]"
         >
-          {checks && checks.length > 0 && (
-            <>
-              <div className="flex flex-col gap-1 px-2 py-1.5">
-                {checks.map((rc) => (
-                  <ChecksRow key={rc.repo} rc={rc} />
-                ))}
-              </div>
-              <DM.Separator className="my-1 h-px bg-border" />
-            </>
-          )}
           {writes.length === 0 ? (
             <div className="px-2 py-1.5 text-[11px] text-ink-faint">
               {t("thread.noWriteCopy")}
             </div>
           ) : (
-            writes.map((w) => (
-              <DM.Item
-                key={w.id}
-                onSelect={(e) => {
-                  e.preventDefault(); // stay open: copying is not a navigation
-                  void navigator.clipboard.writeText(w.branch);
-                  setCopiedId(w.id);
-                  window.setTimeout(() => setCopiedId(null), 1800);
-                }}
-                className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[11.5px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
-              >
-                <span className="min-w-0 flex-1 truncate font-mono">{w.branch}</span>
-                {copiedId === w.id ? (
-                  <Check size={12} className="shrink-0 text-running" />
-                ) : (
-                  <Copy size={12} className="shrink-0 text-ink-faint" />
-                )}
-              </DM.Item>
-            ))
+            writes.map((w) => {
+              const repo = repos.find((r) => r.id === w.repo_id);
+              const sess = Object.values(sessions).find(
+                (s) => s.directionId === direction.id && s.repoId === w.repo_id,
+              );
+              const name = repo?.name ?? `repo ${w.repo_id}`;
+              return (
+                <div key={w.id} className="pb-0.5">
+                  {/* Repo header → open this repo's session. */}
+                  <DM.Item
+                    onSelect={() => viewDirection(direction.id, w.repo_id)}
+                    className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[12px] text-ink outline-none data-[highlighted]:bg-brand-ghost"
+                  >
+                    <TerminalSquare size={12} className="shrink-0 text-brand" />
+                    <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
+                    {sess && <StatusDot status={sess.status as SessionStatus} />}
+                  </DM.Item>
+                  {/* Branch → copy. */}
+                  <DM.Item
+                    title={t("thread.copyBranch")}
+                    onSelect={(e) => {
+                      e.preventDefault(); // stay open: copying is not a navigation
+                      copy(`b${w.id}`, w.branch);
+                    }}
+                    className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] py-1 pl-7 pr-2 text-[11px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
+                  >
+                    <GitBranch size={11} className="shrink-0 text-ink-faint" />
+                    <span className="min-w-0 flex-1 truncate font-mono">{w.branch}</span>
+                    {copied === `b${w.id}` ? (
+                      <Check size={11} className="shrink-0 text-running" />
+                    ) : (
+                      <Copy size={11} className="shrink-0 text-ink-faint" />
+                    )}
+                  </DM.Item>
+                  {/* Worktree path (the repo address) → copy. */}
+                  <DM.Item
+                    title={w.path}
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      copy(`p${w.id}`, w.path);
+                    }}
+                    className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] py-1 pl-7 pr-2 text-[11px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
+                  >
+                    <FolderGit2 size={11} className="shrink-0 text-ink-faint" />
+                    <span className="min-w-0 flex-1 truncate font-mono">{w.path}</span>
+                    {copied === `p${w.id}` ? (
+                      <Check size={11} className="shrink-0 text-running" />
+                    ) : (
+                      <Copy size={11} className="shrink-0 text-ink-faint" />
+                    )}
+                  </DM.Item>
+                </div>
+              );
+            })
+          )}
+          {checks && checks.length > 0 && (
+            <>
+              <DM.Separator className="my-1 h-px bg-border" />
+              <div className="flex flex-col gap-1 px-2 py-1.5">
+                {checks.map((rc) => (
+                  <ChecksRow key={rc.repo} rc={rc} />
+                ))}
+              </div>
+            </>
           )}
         </DM.Content>
       </DM.Portal>
