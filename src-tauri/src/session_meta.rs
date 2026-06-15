@@ -23,6 +23,8 @@ pub struct SessionMetaSnapshot {
     pub mcp_servers: Option<Vec<McpServer>>,
     /// codex 的真实 skill;None = 没探到(保留旧行),Some = 权威列表。claude 留 None。
     pub skills: Option<Vec<SkillInfo>>,
+    /// codex 的思考强度(config.toml `model_reasoning_effort`,如 low/medium/high)。
+    pub reasoning_effort: Option<String>,
 }
 
 // ───────────────────────── 纯解析(可单测) ─────────────────────────
@@ -71,6 +73,16 @@ pub fn parse_toml_model(cfg: &str) -> Option<String> {
         .ok()?
         .get("model")?
         .as_str()
+        .map(String::from)
+}
+
+/// codex `config.toml` 顶层 `model_reasoning_effort`(如 low/medium/high/xhigh)。
+pub fn parse_toml_reasoning_effort(cfg: &str) -> Option<String> {
+    toml::from_str::<toml::Value>(cfg)
+        .ok()?
+        .get("model_reasoning_effort")?
+        .as_str()
+        .filter(|s| !s.is_empty())
         .map(String::from)
 }
 
@@ -175,6 +187,10 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
         .as_deref()
         .and_then(parse_toml_model)
         .or_else(|| global_cfg.as_deref().and_then(parse_toml_model));
+    let reasoning_effort = proj_cfg
+        .as_deref()
+        .and_then(parse_toml_reasoning_effort)
+        .or_else(|| global_cfg.as_deref().and_then(parse_toml_reasoning_effort));
     // window:先认显式 `model_context_window` 覆盖(项目 → 全局),再回退 per-model 缓存。
     let window = proj_cfg
         .as_deref()
@@ -225,6 +241,7 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
         model,
         mcp_servers,
         skills,
+        reasoning_effort,
     }
 }
 
@@ -252,6 +269,7 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnaps
         mcp_servers,
         // opencode 无对等 `skills/list`;留 None。
         skills: None,
+        reasoning_effort: None,
     }
 }
 
@@ -310,6 +328,17 @@ mod tests {
     #[test]
     fn toml_model_not_confused_by_reasoning_effort() {
         assert_eq!(parse_toml_model("model_reasoning_effort = \"xhigh\"\n"), None);
+    }
+
+    #[test]
+    fn toml_reasoning_effort_parsed() {
+        assert_eq!(
+            parse_toml_reasoning_effort("model = \"gpt-5.5\"\nmodel_reasoning_effort = \"xhigh\"\n")
+                .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(parse_toml_reasoning_effort("model = \"gpt-5.5\"\n"), None);
+        assert_eq!(parse_toml_reasoning_effort("model_reasoning_effort = \"\"\n"), None);
     }
 
     #[test]

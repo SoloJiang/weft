@@ -275,8 +275,8 @@ function ActivityLine({ name, summary }: { name: string; summary: string }) {
 }
 
 /**
- * A persisted tool call (claude/opencode): a compact collapsed line — icon +
- * tool label + target + a status dot — that expands to show the full input and
+ * A persisted tool call: a low-weight, borderless line (codex-style) — a
+ * state-colored icon + label + target — that expands to show the full input and
  * the tool's output. `status` mirrors the row: "streaming" = running,
  * "complete"/"error" = finished.
  */
@@ -297,39 +297,43 @@ function ToolRow({ m }: { m: LeadMessage }) {
   const hasDetail = inputText.length > 0 || output.length > 0;
 
   return (
-    <div className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface/60">
+    <div>
       <button
         type="button"
         disabled={!hasDetail}
         onClick={() => setOpen((v) => !v)}
         className={cn(
-          "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
-          hasDetail && "hover:bg-surface",
+          "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
+          hasDetail && "hover:bg-surface/60",
         )}
       >
-        <span
+        <Icon
+          size={13}
           className={cn(
-            "h-1.5 w-1.5 shrink-0 rounded-full",
-            running ? "animate-pulse bg-running" : isError ? "bg-danger" : "bg-ink-faint",
+            "shrink-0",
+            running
+              ? "animate-pulse text-running"
+              : isError
+                ? "text-danger"
+                : "text-ink-faint",
           )}
         />
-        <Icon size={14} className="shrink-0 text-ink-faint" />
-        <span className="shrink-0 font-medium text-ink-muted">{label}</span>
+        <span className="shrink-0 text-ink-muted">{label}</span>
         {(target || summary) && (
-          <span className="min-w-0 truncate font-mono text-brand">{target || summary}</span>
+          <span className="min-w-0 truncate font-mono text-ink-faint">{target || summary}</span>
         )}
         {hasDetail && (
           <ChevronRight
-            size={13}
+            size={12}
             className={cn(
-              "ml-auto shrink-0 text-ink-faint transition-transform",
+              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
               open && "rotate-90",
             )}
           />
         )}
       </button>
       {open && hasDetail && (
-        <div className="space-y-2 border-t border-border px-2.5 py-2">
+        <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
           {inputText && <ToolBlock label={t("tool.input")} body={inputText} />}
           {output && (
             <ToolBlock label={t("tool.output")} body={output} tone={isError ? "error" : "default"} />

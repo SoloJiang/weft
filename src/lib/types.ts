@@ -141,6 +141,8 @@ export interface SessionMeta {
   mcpServers: McpServerInfo[];
   /** codex 的真实 skill,带外 `session_meta` 填;claude 不填。 */
   engineSkills?: EngineSkill[];
+  /** codex 的思考强度(low/medium/high/…)。 */
+  reasoningEffort?: string;
 }
 
 /** Band-outside meta for codex/opencode workers (M2), from the `session_meta`
@@ -153,6 +155,8 @@ export interface SessionMetaSnapshot {
   mcp_servers: { name: string; status: string }[] | null;
   /** codex 真实 skill;`null` = 没探到(保留旧行),非 null = 权威列表。 */
   skills: { name: string; description: string }[] | null;
+  /** codex 思考强度;`null` = 未配置。 */
+  reasoning_effort: string | null;
 }
 
 /** One executable verification rung's result (ARCHITECTURE §4.13). */

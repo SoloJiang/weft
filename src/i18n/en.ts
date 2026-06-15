@@ -338,6 +338,7 @@ export const en = {
     reloadHint: "Picks up new MCP / skills",
     context: "Context",
     tokens: "tokens",
+    reasoning: "Reasoning",
     skills: "Skills",
     mcp: "MCP",
     servers_one: "{{count}} server",

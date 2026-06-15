@@ -39,6 +39,11 @@ export function SessionInfoPanel({
     return [...byName.values()];
   }, [skills, meta?.engineSkills]);
 
+  // Collapsible skills: a long list (codex exposes dozens) would bury the MCP
+  // section, so default to expanded only when there are few; null = use default.
+  const [skillsOpen, setSkillsOpen] = useState<boolean | null>(null);
+  const skillsExpanded = skillsOpen ?? allSkills.length <= 12;
+
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
       <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
@@ -95,6 +100,12 @@ export function SessionInfoPanel({
               {win ? ` · ${Math.round(win / 1000)}k` : ""}
             </div>
           )}
+          {meta?.reasoningEffort && (
+            <div className="mt-1 flex items-center gap-1.5 text-[10.5px]">
+              <span className="text-ink-faint">{t("sessionInfo.reasoning")}</span>
+              <span className="font-mono text-ink-muted">{meta.reasoningEffort}</span>
+            </div>
+          )}
           {ct == null && !meta?.model && (
             <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
           )}
@@ -102,24 +113,36 @@ export function SessionInfoPanel({
 
         {/* Skills */}
         <section className="border-b border-border px-4 py-3">
-          <div className="flex items-center">
+          <button
+            type="button"
+            onClick={() => allSkills.length > 0 && setSkillsOpen(!skillsExpanded)}
+            className="flex w-full items-center"
+          >
             <span className="text-[11px] text-ink-faint">{t("sessionInfo.skills")}</span>
             <span className="ml-auto text-[11px] text-ink-faint">{allSkills.length}</span>
-          </div>
-          {allSkills.length > 0 ? (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {allSkills.map((s) => (
-                <span
-                  key={s.name}
-                  title={s.description}
-                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
-                >
-                  {s.name}
-                </span>
+            {allSkills.length > 0 &&
+              (skillsExpanded ? (
+                <ChevronDown size={13} className="ml-1 text-ink-faint" />
+              ) : (
+                <ChevronRight size={13} className="ml-1 text-ink-faint" />
               ))}
-            </div>
-          ) : (
+          </button>
+          {allSkills.length === 0 ? (
             <div className="mt-2 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
+          ) : (
+            skillsExpanded && (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {allSkills.map((s) => (
+                  <span
+                    key={s.name}
+                    title={s.description}
+                    className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
+                  >
+                    {s.name}
+                  </span>
+                ))}
+              </div>
+            )
           )}
         </section>
 

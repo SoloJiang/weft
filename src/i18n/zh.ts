@@ -327,6 +327,7 @@ export const zh = {
     reloadHint: "加载新的 MCP / skill(下条消息生效)",
     context: "Context",
     tokens: "tokens",
+    reasoning: "思考强度",
     skills: "Skills",
     mcp: "MCP",
     servers_other: "{{count}} 个 server",
