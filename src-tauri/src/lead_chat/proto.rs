@@ -394,7 +394,7 @@ fn cap_output(s: String) -> String {
 /// carrying full file contents) is replaced by a truncated string so it can't
 /// bloat the persisted row, its push, or the store. Small inputs pass through
 /// unchanged so the UI still renders the structured object.
-fn cap_input(input: Value) -> Value {
+pub(crate) fn cap_input(input: Value) -> Value {
     const MAX: usize = 16_000;
     let s = input.to_string();
     if s.chars().count() <= MAX {

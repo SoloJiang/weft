@@ -269,7 +269,10 @@ fn appserver_tool_input(item: &Value) -> Value {
             }
         }
     }
-    Value::Object(obj)
+    // Cap like the exec/claude path: a big MCP `arguments` or `changes` payload
+    // would otherwise bloat the persisted row + its push even though output is
+    // capped. Small inputs pass through unchanged (UI still renders the object).
+    crate::lead_chat::proto::cap_input(Value::Object(obj))
 }
 
 fn appserver_tool_summary(item: &Value) -> String {
@@ -854,6 +857,24 @@ mod tests {
             notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none()
         );
         assert!(notification_to_event("turn/started", &json!({"threadId":"t"})).is_none());
+    }
+
+    #[test]
+    fn appserver_caps_large_tool_input() {
+        // A huge MCP arguments payload must be truncated before it lands in the
+        // persisted row (cap_input collapses an oversized object to a string).
+        let big = "x".repeat(20_000);
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{"id":"m","type":"mcpToolCall","tool":"t","arguments":{"blob":big}}}),
+        ) {
+            Some(ChatEvent::Assistant { tools, .. }) => {
+                let s = tools[0].input.as_str().expect("oversized input capped to string");
+                assert!(s.ends_with("… (truncated)"));
+                assert!(s.chars().count() < 17_000);
+            }
+            e => panic!("{e:?}"),
+        }
     }
 
     #[test]

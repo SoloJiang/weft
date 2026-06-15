@@ -490,6 +490,99 @@ async fn merge_tool_results(
     }
 }
 
+/// Persist / answer the `<weft:*>` sentinels forked out of a finalized assistant
+/// message — action_card becomes its own row, list_repos triggers a hidden
+/// stdin-style reply. Errors are logged but never abort the stream. Shared by the
+/// exec/claude reader and the codex app-server consumer so both transports render
+/// action cards and answer list_repos.
+async fn apply_lead_sentinels(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    thread_id: i32,
+    sentinels: Vec<super::sentinels::Sentinel>,
+) {
+    for s in sentinels {
+        match s {
+            super::sentinels::Sentinel::ActionCard(json) => {
+                // Reject anything that isn't a JSON object so the UI can rely on
+                // `card.title / actions / …`.
+                match serde_json::from_str::<serde_json::Value>(&json) {
+                    Ok(v) if v.is_object() => {
+                        let (sid, turn) = (inner.session_id, inner.turn_id);
+                        match repo::insert_lead_message(
+                            db, thread_id, sid, turn, "assistant", "action_card", &json, "complete",
+                        )
+                        .await
+                        {
+                            Ok(m) => {
+                                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                            }
+                            Err(e) => {
+                                eprintln!("[weft] lead sentinel: insert action_card failed: {e}")
+                            }
+                        }
+                    }
+                    Ok(_) => eprintln!(
+                        "[weft] lead sentinel: action_card payload is not an object — dropped"
+                    ),
+                    Err(e) => eprintln!("[weft] lead sentinel: action_card JSON parse failed: {e}"),
+                }
+            }
+            super::sentinels::Sentinel::ListRepos => {
+                // Look up workspace via the thread row (engine doesn't cache it; one
+                // extra query per call is cheap and avoids a wider refactor).
+                let ws_id = match repo::get_thread(db, thread_id).await {
+                    Ok(Some(t)) => Some(t.workspace_id),
+                    Ok(None) => {
+                        eprintln!("[weft] lead sentinel: list_repos — thread {thread_id} not found");
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("[weft] lead sentinel: list_repos — get_thread failed: {e}");
+                        None
+                    }
+                };
+                if let Some(workspace_id) = ws_id {
+                    let repos = match repo::list_repos(db, workspace_id).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[weft] lead sentinel: list_repos query failed: {e}");
+                            Vec::new()
+                        }
+                    };
+                    let payload = serde_json::json!({
+                        "repos": repos.iter().map(|r| serde_json::json!({
+                            "id": r.id,
+                            "name": r.name,
+                            "slug": r.slug,
+                            "local_git_path": r.local_git_path,
+                            "base_ref": r.base_ref,
+                        })).collect::<Vec<_>>()
+                    });
+                    let body = match serde_json::to_string(&payload) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[weft] lead sentinel: serialize list_repos_result failed: {e}");
+                            continue;
+                        }
+                    };
+                    let reply = format!("<weft:list_repos_result>{body}</weft:list_repos_result>");
+                    // Invisible plumbing: tracked=false keeps this off the timeline;
+                    // the agent reads it as a tool-result-style user turn.
+                    let out = Outgoing {
+                        text: reply,
+                        images: Vec::new(),
+                        tracked: false,
+                        origin_tag: None,
+                    };
+                    queue_hidden_delivery(app, inner, out);
+                }
+            }
+        }
+    }
+}
+
 async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fallback_status: &str) {
     let mut inner = eng.lock().await;
     if !inner.turn.busy
@@ -1085,6 +1178,12 @@ async fn spawn_codex_turn(
             let _ = repo::set_lead_native_id(&db, thread_id_i, &thread).await;
         }
     }
+    // Stop pressed while turn/start was in flight? interrupt() ran before the turn
+    // id existed (no active turn, no exec child), so it was a no-op — honor it now
+    // that the turn is recorded, instead of letting it run despite the user.
+    if eng.lock().await.interrupting {
+        let _ = client.interrupt(&thread, &turn).await;
+    }
     Ok(())
 }
 
@@ -1249,10 +1348,22 @@ async fn codex_consumer(
                     inner.tool_rows.drain().map(|(_, v)| v).collect();
                 finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
                 if let Some((id, text, _)) = inner.current.take() {
+                    // On a clean finish, fork <weft:*> sentinels out of the streamed
+                    // body (action cards become their own rows, list_repos gets a
+                    // hidden reply) and persist the CLEANED text — same as the exec/
+                    // claude path. A partial (interrupted/error) turn keeps its raw
+                    // text and skips sentinel handling.
+                    let clean = if status == "complete" {
+                        let (clean, sentinels) = super::sentinels::extract_sentinels(&text);
+                        apply_lead_sentinels(&app, &db, &mut inner, thread_id, sentinels).await;
+                        clean
+                    } else {
+                        text
+                    };
                     let _ = repo::update_lead_message(
                         &db,
                         id,
-                        &serde_json::json!({ "text": text }).to_string(),
+                        &serde_json::json!({ "text": clean }).to_string(),
                         status,
                     )
                     .await;
@@ -1265,7 +1376,7 @@ async fn codex_consumer(
                         },
                     );
                     if status == "complete" {
-                        emit_lead_out(&app, thread_id, id, &text, inner.current_origin_tag.clone());
+                        emit_lead_out(&app, thread_id, id, &clean, inner.current_origin_tag.clone());
                     }
                 } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
                     &db,
@@ -1324,9 +1435,20 @@ async fn codex_consumer(
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
                             client.set_active_turn(&thread, &t).await;
                         }
+                        // App-server died/rejecting between turns: don't drop the
+                        // queued message — fall back to the same exec path a direct
+                        // send uses (native id is shared, so resume is seamless).
                         Err(e) => {
-                            eprintln!("[weft][codex] flush next turn: {e}");
-                            rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                            eprintln!("[weft][codex] flush via app-server failed ({e}); trying exec");
+                            match spawn_turn(app.clone(), db.clone(), eng.clone(), n.clone()).await {
+                                Ok(()) => {
+                                    mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
+                                }
+                                Err(e2) => {
+                                    eprintln!("[weft][codex] exec fallback for queued turn failed: {e2}");
+                                    rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -1354,7 +1476,10 @@ async fn codex_consumer(
                 let (tool, summary) = if is_cmd {
                     ("Bash", cmd.unwrap_or("(command)").to_string())
                 } else {
-                    ("Edit", "apply file changes".to_string())
+                    // Include the changed path(s): the AskRegistry keys Always rules
+                    // by (thread, dir, summary), so a constant "apply file changes"
+                    // would let one Always blanket-allow every later edit.
+                    ("Edit", codex_change_approval_summary(&params))
                 };
                 let detail = params["cwd"]
                     .as_str()
@@ -1379,6 +1504,27 @@ async fn codex_consumer(
         }
     }
     cleanup_disconnected_turn(&app, &db, &eng, "error").await;
+}
+
+/// Specific Needs-you summary for an app-server file-change approval: the
+/// changed path(s) (top-level or nested under `item`), so each distinct edit
+/// gets its own Always-rule key instead of one blanket "apply file changes".
+fn codex_change_approval_summary(params: &serde_json::Value) -> String {
+    let changes = params["changes"]
+        .as_array()
+        .or_else(|| params["item"]["changes"].as_array());
+    let paths: Vec<&str> = changes
+        .map(|cs| cs.iter().filter_map(|c| c["path"].as_str()).collect())
+        .unwrap_or_default();
+    if paths.is_empty() {
+        return "apply file changes".to_string();
+    }
+    let mut s = format!("apply file changes: {}", paths.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+    let more = paths.len().saturating_sub(3);
+    if more > 0 {
+        s.push_str(&format!(" +{more}"));
+    }
+    s
 }
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
@@ -2018,106 +2164,9 @@ fn spawn_reader(
                                 }
                             }
                         }
-                        // Persist / answer sentinels in encounter order. Errors are
-                        // logged but never abort the reader — a malformed card must
-                        // not wedge the chat stream.
-                        for s in sentinels {
-                            match s {
-                                super::sentinels::Sentinel::ActionCard(json) => {
-                                    // Reject anything that isn't a JSON object so the
-                                    // UI can rely on `card.title / actions / …`.
-                                    match serde_json::from_str::<serde_json::Value>(&json) {
-                                        Ok(v) if v.is_object() => {
-                                            let (sid, turn) = (inner.session_id, inner.turn_id);
-                                            match repo::insert_lead_message(
-                                                &db, thread_id, sid, turn,
-                                                "assistant", "action_card", &json, "complete",
-                                            )
-                                            .await
-                                            {
-                                                Ok(m) => {
-                                                    let _ = app.emit(EVENT, Push::Message {
-                                                        thread_id, message: m,
-                                                    });
-                                                }
-                                                Err(e) => eprintln!(
-                                                    "[weft] lead sentinel: insert action_card failed: {e}"
-                                                ),
-                                            }
-                                        }
-                                        Ok(_) => eprintln!(
-                                            "[weft] lead sentinel: action_card payload is not an object — dropped"
-                                        ),
-                                        Err(e) => eprintln!(
-                                            "[weft] lead sentinel: action_card JSON parse failed: {e}"
-                                        ),
-                                    }
-                                }
-                                super::sentinels::Sentinel::ListRepos => {
-                                    // Look up workspace via the thread row (engine
-                                    // doesn't cache it; one extra query per call is
-                                    // cheap and avoids a wider refactor).
-                                    let ws_id = match repo::get_thread(&db, thread_id).await {
-                                        Ok(Some(t)) => Some(t.workspace_id),
-                                        Ok(None) => {
-                                            eprintln!(
-                                                "[weft] lead sentinel: list_repos — thread {thread_id} not found"
-                                            );
-                                            None
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[weft] lead sentinel: list_repos — get_thread failed: {e}"
-                                            );
-                                            None
-                                        }
-                                    };
-                                    if let Some(workspace_id) = ws_id {
-                                        let repos = match repo::list_repos(&db, workspace_id).await
-                                        {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[weft] lead sentinel: list_repos query failed: {e}"
-                                                );
-                                                Vec::new()
-                                            }
-                                        };
-                                        let payload = serde_json::json!({
-                                            "repos": repos.iter().map(|r| serde_json::json!({
-                                                "id": r.id,
-                                                "name": r.name,
-                                                "slug": r.slug,
-                                                "local_git_path": r.local_git_path,
-                                                "base_ref": r.base_ref,
-                                            })).collect::<Vec<_>>()
-                                        });
-                                        let body = match serde_json::to_string(&payload) {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[weft] lead sentinel: serialize list_repos_result failed: {e}"
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                        let reply = format!(
-                                            "<weft:list_repos_result>{body}</weft:list_repos_result>"
-                                        );
-                                        // Invisible plumbing: tracked=false keeps this
-                                        // off the timeline; the agent reads it as a
-                                        // tool-result-style user turn.
-                                        let out = Outgoing {
-                                            text: reply,
-                                            images: Vec::new(),
-                                            tracked: false,
-                                            origin_tag: None,
-                                        };
-                                        queue_hidden_delivery(&app, &mut inner, out);
-                                    }
-                                }
-                            }
-                        }
+                        // Persist / answer sentinels in encounter order (shared with
+                        // the app-server consumer).
+                        apply_lead_sentinels(&app, &db, &mut inner, thread_id, sentinels).await;
                     }
                     // Every dialect's tool calls become inline `kind:"tool"` rows.
                     persist_tool_calls(&app, &db, &mut inner, tools).await;
@@ -2689,6 +2738,30 @@ mod tests {
         assert_eq!(human_dur(7200), "2h");
         assert_eq!(human_dur(1800), "30min");
         assert_eq!(human_dur(45), "45s");
+    }
+
+    #[test]
+    fn codex_change_approval_summary_is_path_specific() {
+        // distinct edits get distinct summaries → distinct AskRegistry Always keys.
+        let a = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path": "src/a.rs", "kind": {"type": "edit"}}]
+        }));
+        let b = codex_change_approval_summary(&serde_json::json!({
+            "item": {"changes": [{"path": "src/b.rs"}]}
+        }));
+        assert_eq!(a, "apply file changes: src/a.rs");
+        assert_eq!(b, "apply file changes: src/b.rs");
+        assert_ne!(a, b);
+        // >3 paths are capped with a +N suffix.
+        let many = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"4"},{"path":"5"}]
+        }));
+        assert_eq!(many, "apply file changes: 1, 2, 3 +2");
+        // no paths → the generic label (still answerable, just not Always-specific).
+        assert_eq!(
+            codex_change_approval_summary(&serde_json::json!({})),
+            "apply file changes"
+        );
     }
 
     #[test]
