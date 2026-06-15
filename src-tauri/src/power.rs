@@ -196,8 +196,7 @@ pub fn spawn_sweep(app: tauri::AppHandle) {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let engines: Vec<crate::lead_chat::engine::EngineRef> = {
                 let state = app.state::<crate::lead_chat::engine::LeadChatState>();
-                let g = state.0.lock().unwrap_or_else(|e| e.into_inner());
-                g.values().cloned().collect()
+                state.0.iter().map(|r| r.value().clone()).collect()
             };
             let mut any_busy = false;
             for eng in engines {

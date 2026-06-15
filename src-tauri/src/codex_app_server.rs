@@ -253,7 +253,14 @@ pub enum ThreadMsg {
 }
 
 struct Inner {
-    stdin: ChildStdin,
+    /// Bytes destined for the app-server's stdin are queued here and written by a
+    /// dedicated [`write_loop`] task — NEVER under this connection lock. A write
+    /// that blocks on stdin pipe backpressure would otherwise hold the lock while
+    /// the `read_loop`'s `resolve`/`route` (which need the same lock) stall, the
+    /// stdout pipe fills, the child stops reading stdin, and the write never
+    /// drains: a textbook two-pipe deadlock. The channel send is non-blocking, so
+    /// the lock is only ever held for in-memory bookkeeping.
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
     next_id: i64,
     /// our request id → awaiting caller (Ok(result) / Err(message)).
     pending: HashMap<i64, oneshot::Sender<Result<Value, String>>>,
@@ -285,6 +292,19 @@ pub async fn client() -> anyhow::Result<Client> {
     Ok(c)
 }
 
+/// Serialize every write to the app-server's stdin on one task, OFF the
+/// connection lock. A full stdin pipe blocks only this task — never a caller
+/// holding the lock — so the `read_loop` keeps draining stdout and the two-pipe
+/// deadlock can't form. Exits when every `write_tx` is dropped (i.e. the `Inner`
+/// is torn down on EOF), which closes stdin and lets the child wind down.
+async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    while let Some(buf) = rx.recv().await {
+        if stdin.write_all(&buf).await.is_err() || stdin.flush().await.is_err() {
+            break; // child stdin closed/errored; read_loop will tear down the conn
+        }
+    }
+}
+
 impl Client {
     async fn connect(&self) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
@@ -306,8 +326,9 @@ impl Client {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         *g = Some(Inner {
-            stdin,
+            write_tx,
             next_id: 1,
             pending: HashMap::new(),
             threads: HashMap::new(),
@@ -315,6 +336,9 @@ impl Client {
             _child: child,
         });
         drop(g);
+
+        // Writer owns stdin and awaits each write off the lock (see `write_tx`).
+        tauri::async_runtime::spawn(write_loop(stdin, write_rx));
 
         let me = self.clone();
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
@@ -386,13 +410,16 @@ impl Client {
                 .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
             let id = inner.next_id;
             inner.next_id += 1;
+            // Queue the write (non-blocking) under the lock so wire order matches
+            // id-allocation order; the awaited write happens on `write_loop`, never
+            // here. Register the waiter only after the enqueue succeeds, all while
+            // holding the lock — so a reply (resolve, same lock) can't race ahead.
+            inner
+                .write_tx
+                .send(encode_request(id, method, params).into_bytes())
+                .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
-            inner
-                .stdin
-                .write_all(encode_request(id, method, params).as_bytes())
-                .await?;
-            inner.stdin.flush().await?;
             (id, rx)
         };
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
@@ -415,10 +442,9 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
         inner
-            .stdin
-            .write_all(encode_notification(method, params).as_bytes())
-            .await?;
-        inner.stdin.flush().await?;
+            .write_tx
+            .send(encode_notification(method, params).into_bytes())
+            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
 
@@ -491,8 +517,10 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
         let line = encode_response(id, json!({ "decision": decision }));
-        inner.stdin.write_all(line.as_bytes()).await?;
-        inner.stdin.flush().await?;
+        inner
+            .write_tx
+            .send(line.into_bytes())
+            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
 }

@@ -81,8 +81,7 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
     let db = Db(db.0.clone(), db.1);
     let live: HashSet<i64> = {
         let st = app.state::<LeadChatState>();
-        let g = st.0.lock().unwrap_or_else(|e| e.into_inner());
-        g.keys().copied().collect()
+        st.0.iter().map(|r| *r.key()).collect()
     };
     let (leads, workers) = collect_targets(&db, &live).await?;
     if leads.is_empty() && workers.is_empty() {
