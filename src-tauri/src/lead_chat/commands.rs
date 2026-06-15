@@ -311,9 +311,17 @@ fn lead_state_label(alive: bool, busy: bool, stopped: bool) -> &'static str {
     }
 }
 
+/// Is the lead's engine alive (can accept a send)? The exec/claude path keys off a
+/// resident child; a codex app-server lead has NO per-turn child when idle but
+/// stays alive while its client handle is present (a send reconnects if needed) —
+/// without this a remount's `loadLeadChat` mislabels the idle lead as "stopped".
+fn lead_alive(child_alive: bool, has_codex_client: bool) -> bool {
+    child_alive || has_codex_client
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{lead_prompt, lead_state_label};
+    use super::{lead_alive, lead_prompt, lead_state_label};
 
     #[test]
     fn busy_turn_reports_busy_even_without_resident_child() {
@@ -325,6 +333,16 @@ mod tests {
         assert_eq!(lead_state_label(true, false, false), "idle");
         assert_eq!(lead_state_label(true, false, true), "stopped");
         assert_eq!(lead_state_label(false, false, false), "stopped");
+    }
+
+    #[test]
+    fn idle_appserver_lead_is_alive_without_a_child() {
+        // An idle codex app-server lead has no per-turn child but a live client
+        // handle → alive, so it reports "idle" not "stopped" on remount.
+        assert!(lead_alive(false, true)); // no child, app-server client present
+        assert!(lead_alive(true, false)); // resident child (exec/claude)
+        assert!(!lead_alive(false, false)); // neither → genuinely down
+        assert_eq!(lead_state_label(lead_alive(false, true), false, false), "idle");
     }
 
     #[test]
@@ -404,11 +422,13 @@ pub async fn lead_state(
         }),
         Some(e) => {
             let mut i = e.lock().await;
-            let alive = i
+            let child_alive = i
                 .child
                 .as_mut()
                 .map(|c| c.try_wait().ok().flatten().is_none())
                 .unwrap_or(false);
+            // codex app-server leads are childless when idle but alive via the client.
+            let alive = lead_alive(child_alive, i.codex_client.is_some());
             Ok(LeadStateInfo {
                 state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
                 queued: i.turn.queue.len(),

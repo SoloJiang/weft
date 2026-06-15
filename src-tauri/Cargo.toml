@@ -28,6 +28,10 @@ sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio
 async-trait = "0.1"
 dirs = "5"
 futures = "0.3"
+# Lock-free concurrent map for the codex consumer's in-flight ask ids (touched by
+# the consumer loop AND its spawned per-ask reply tasks) — avoids an async
+# Mutex<HashMap> for the serverRequest/resolved → cancel-card mapping.
+crossbeam-skiplist = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 axum = "0.7"
 tower = "0.5"

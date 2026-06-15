@@ -431,6 +431,10 @@ pub enum ThreadMsg {
         method: String,
         params: Value,
     },
+    /// The server cleared a still-open ask (`serverRequest/resolved`, e.g. on
+    /// interrupt) — the consumer cancels the matching Needs-you card so it doesn't
+    /// linger and send a stale reply when clicked. `request_id` echoes the ask's id.
+    AskResolved { request_id: Value },
 }
 
 struct Inner {
@@ -623,6 +627,14 @@ impl Client {
                         // marked alive so the idle watchdog doesn't kill it.
                         self.route_resolved(tid.as_deref(), ThreadMsg::Heartbeat)
                             .await;
+                    } else if method == "serverRequest/resolved" {
+                        // The server cleared an open ask (e.g. on interrupt) — tell
+                        // the consumer to cancel the matching Needs-you card.
+                        self.route_resolved(
+                            tid.as_deref(),
+                            ThreadMsg::AskResolved { request_id: params["requestId"].clone() },
+                        )
+                        .await;
                     }
                 }
                 Incoming::ServerRequest { id, method, params } => {

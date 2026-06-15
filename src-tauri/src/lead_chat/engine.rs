@@ -1323,6 +1323,11 @@ async fn codex_consumer(
 ) {
     use super::proto::ChatEvent;
     use crate::codex_app_server::ThreadMsg;
+    // server-request id → AskRegistry ask id, for the in-flight Needs-you cards
+    // this session opened. Shared (lock-free) with the per-ask reply tasks so a
+    // later serverRequest/resolved can cancel the right card. Cleared when answered.
+    let pending_asks: Arc<crossbeam_skiplist::SkipMap<String, u64>> =
+        Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
         match msg {
             ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
@@ -1643,18 +1648,32 @@ async fn codex_consumer(
                     // stale card is answered. A late reply to an already-resolved turn
                     // is harmless (codex ignores it).
                     None => {
-                        let (_aid, rx) = registry.request(thread_id, &dir, tool, &summary, &detail);
+                        let (aid, rx) = registry.request(thread_id, &dir, tool, &summary, &detail);
+                        // Remember this card by server-request id so a later
+                        // serverRequest/resolved can cancel it; clear on answer.
+                        let key = id.to_string();
+                        pending_asks.insert(key.clone(), aid);
                         let client = client.clone();
+                        let pending = pending_asks.clone();
                         tauri::async_runtime::spawn(async move {
                             let allow = matches!(
                                 rx.await.unwrap_or(crate::ask::Decision::Deny),
                                 crate::ask::Decision::Allow
                             );
+                            pending.remove(&key);
                             let _ = client
                                 .reply_result(&id, codex_approval_reply(is_perm, allow, requested))
                                 .await;
                         });
                     }
+                }
+            }
+            ThreadMsg::AskResolved { request_id } => {
+                // The server cleared this ask (interrupt / otherwise): cancel the
+                // matching Needs-you card so it doesn't linger and send a stale
+                // reply when clicked. The reply task's rx then errors → it declines.
+                if let Some(entry) = pending_asks.remove(&request_id.to_string()) {
+                    app.state::<crate::ask::AskRegistry>().inner().cancel(*entry.value());
                 }
             }
         }
