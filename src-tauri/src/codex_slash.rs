@@ -376,18 +376,32 @@ pub(crate) fn local_skill_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCm
 async fn fetch_skills() -> anyhow::Result<Vec<SlashCmd>> {
     let client = crate::codex_app_server::client().await?;
     let v = client.request("skills/list", serde_json::json!({})).await?;
-    // `skills/list` shape isn't pinned across codex versions; accept either
-    // `{ skills: [...] }` or a top-level array, pulling (name, description) per
-    // entry. Anything unrecognised yields no skills (silent fallback).
-    let arr = v
-        .get("skills")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .or_else(|| v.as_array().cloned())
-        .unwrap_or_default();
-    Ok(arr
-        .iter()
+    Ok(parse_skills_list(&v))
+}
+
+/// Parse a `skills/list` result. Shape verified live (codex-cli 0.139.0):
+/// `{ data: [ { cwd, skills: [ {name, description, enabled} ] } ] }`; also
+/// accepts `{ skills: [...] }` or a top-level array. Disabled skills are skipped.
+fn parse_skills_list(v: &serde_json::Value) -> Vec<SlashCmd> {
+    let flat: Vec<&serde_json::Value> =
+        if let Some(groups) = v.get("data").and_then(|d| d.as_array()) {
+            groups
+                .iter()
+                .filter_map(|g| g.get("skills").and_then(|s| s.as_array()))
+                .flatten()
+                .collect()
+        } else if let Some(arr) = v.get("skills").and_then(|x| x.as_array()) {
+            arr.iter().collect()
+        } else if let Some(arr) = v.as_array() {
+            arr.iter().collect()
+        } else {
+            vec![]
+        };
+    flat.into_iter()
         .filter_map(|e| {
+            if e.get("enabled").and_then(|b| b.as_bool()) == Some(false) {
+                return None;
+            }
             let name = e.get("name")?.as_str()?.trim();
             if name.is_empty() {
                 return None;
@@ -404,13 +418,34 @@ async fn fetch_skills() -> anyhow::Result<Vec<SlashCmd>> {
                 arg_hint: None,
             })
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn parses_skills_list_nested_data_groups() {
+        // Real shape (codex-cli 0.139.0): result.data[].skills[].
+        let v = serde_json::json!({
+            "data": [{
+                "cwd": "/tmp",
+                "skills": [
+                    {"name": "archimate", "description": "EA diagrams", "enabled": true},
+                    {"name": "off", "description": "x", "enabled": false},
+                    {"name": "bpmn", "description": "process diagrams"}
+                ]
+            }]
+        });
+        let names: Vec<String> = parse_skills_list(&v).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["archimate", "bpmn"]); // disabled skipped
+        // back-compat: flat { skills: [...] } and a top-level array still parse.
+        assert_eq!(parse_skills_list(&serde_json::json!({"skills":[{"name":"a"}]})).len(), 1);
+        assert_eq!(parse_skills_list(&serde_json::json!([{"name":"b"}])).len(), 1);
+        assert!(parse_skills_list(&serde_json::json!({"junk":1})).is_empty());
+    }
 
     #[test]
     fn builtins_carry_unique_names_and_nonempty_descriptions() {
