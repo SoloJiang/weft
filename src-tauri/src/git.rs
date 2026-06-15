@@ -44,6 +44,16 @@ fn ref_resolves(dir: &Path, r: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// The bare branch name a user means for the diff target: trimmed, with a
+/// leading `origin/` (the remote the UI surfaces) stripped — so typing or
+/// pasting `origin/main` behaves like `main` for BOTH the fetch refspec
+/// (`git fetch origin main`, not the failing `git fetch origin origin/main`)
+/// and ref resolution.
+fn normalize_target(target: &str) -> String {
+    let t = target.trim();
+    t.strip_prefix("origin/").unwrap_or(t).to_string()
+}
+
 /// Resolve a usable base commit-ish for a NEW worktree branch: prefer the repo's
 /// recorded base_ref; if it no longer resolves, fall back through origin/HEAD →
 /// main → master → HEAD so worktree creation never silently branches off whatever
@@ -79,7 +89,11 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
 pub fn default_target_branch(worktree: &Path, base_ref: &str) -> String {
     let strip = |s: &str| s.strip_prefix("origin/").unwrap_or(s).to_string();
     let b = base_ref.trim();
-    if !b.is_empty() {
+    // A repo registered while detached records base_ref = "HEAD" — that's not a
+    // real branch, so treat it like "unset" and detect, rather than letting the
+    // default target become "HEAD" (which would resolve to the worker's own HEAD
+    // and hide all committed task changes).
+    if !b.is_empty() && b != "HEAD" {
         return strip(b);
     }
     let detected = resolve_base_ref(worktree, "");
@@ -94,14 +108,16 @@ pub fn default_target_branch(worktree: &Path, base_ref: &str) -> String {
 /// fetched) remote `origin/<target>`, else a local `<target>`, else fall back
 /// through the repo's default-branch chain (origin/HEAD → main → master → HEAD).
 fn resolve_target_ref(worktree: &Path, target: &str) -> String {
-    let t = target.trim();
-    if !t.is_empty() {
+    let t = normalize_target(target);
+    // "HEAD" is not a real target branch (see default_target_branch); falling
+    // through to the default chain avoids merge-base(HEAD, HEAD) hiding commits.
+    if !t.is_empty() && t != "HEAD" {
         let remote = format!("origin/{t}");
         if ref_resolves(worktree, &remote) {
             return remote;
         }
-        if ref_resolves(worktree, t) {
-            return t.to_string();
+        if ref_resolves(worktree, &t) {
+            return t;
         }
     }
     resolve_base_ref(worktree, "")
@@ -114,15 +130,15 @@ fn resolve_target_ref(worktree: &Path, target: &str) -> String {
 /// commits don't appear as noise. With `fetch`, refreshes `origin/<target>`
 /// first ("对齐远端最新") — best-effort, so offline/no-remote never breaks the diff.
 pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<TargetDiff> {
-    if fetch {
-        let t = target.trim();
-        if !t.is_empty() {
-            // Best-effort; a failed fetch (offline / no remote / auth) must not
-            // abort the diff — we fall through to the cached origin/<target>.
-            let _ = git(worktree_path, &["fetch", "--quiet", "origin", t]);
-        }
+    // Normalize so a remote-prefixed input (e.g. the `origin/main` the UI shows)
+    // fetches as `main` rather than failing on `git fetch origin origin/main`.
+    let target = normalize_target(target);
+    if fetch && !target.is_empty() && target != "HEAD" {
+        // Best-effort; a failed fetch (offline / no remote / auth) must not
+        // abort the diff — we fall through to the cached origin/<target>.
+        let _ = git(worktree_path, &["fetch", "--quiet", "origin", &target]);
     }
-    let resolved = resolve_target_ref(worktree_path, target);
+    let resolved = resolve_target_ref(worktree_path, &target);
     // PR-style base = merge-base(resolved, HEAD). If it fails (unrelated
     // histories / missing ref), fall back to diffing against the resolved ref
     // directly, then HEAD — always produce *some* diff rather than erroring.
@@ -646,6 +662,12 @@ mod tests {
         // No remote in the test → resolves to the local base branch.
         assert_eq!(td.resolved, base);
 
+        // A remote-prefixed input (origin/<base>) normalizes to the same diff —
+        // the `origin/` is stripped, not treated as a literal branch name.
+        let td_prefixed = target_diff(&wt, &format!("origin/{base}"), false).unwrap();
+        let prefixed_paths: Vec<&str> = td_prefixed.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(prefixed_paths, paths, "origin/<base> must normalize to <base>");
+
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
@@ -660,6 +682,9 @@ mod tests {
         // Empty base_ref → detect from the repo; init_repo's branch resolves.
         let detected = default_target_branch(&repo, "");
         assert!(!detected.is_empty() && detected != "HEAD");
+        // A "HEAD" base_ref (repo registered while detached) is NOT a branch —
+        // must fall through to detection, never returning "HEAD".
+        assert_ne!(default_target_branch(&repo, "HEAD"), "HEAD");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
