@@ -80,6 +80,11 @@ export function DiffView({
       }
       fresh = false;
     };
+    // Clear the prior view's data on a mode / worktree / reload change so the
+    // panel never flashes the old mode's file list (or stale target value)
+    // before the first tick of the new view resolves.
+    setDiff(null);
+    setTgt(null);
     setLoaded(false);
     void tick();
     const h = setInterval(tick, 3000);
