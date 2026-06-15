@@ -152,6 +152,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
       setErr(null);
       setBusy(false);
       setProgress({});
+      abortRef.current = null;
     } else {
       setDest(projectsDir);
     }
@@ -182,55 +183,78 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     if (!canSubmit) return;
     setBusy(true);
     setErr(null);
-    try {
-      if (mode === "local") {
-        await addRepo(finalName || "repo", path.trim());
+
+    if (mode === "local" || mode === "new") {
+      try {
+        if (mode === "local") await addRepo(finalName || "repo", path.trim());
+        else await createRepo(finalName || "repo", dest.trim());
         onOpenChange(false);
-      } else if (mode === "new") {
-        await createRepo(finalName || "repo", dest.trim());
-        onOpenChange(false);
-      } else {
-        // clone — one or many recognized URLs, each into <dest>/<name>
-        const items =
-          recognized.length === 1
-            ? [
-                {
-                  url: recognized[0],
-                  name: name.trim() || repoNameFromUrl(recognized[0]) || "repo",
-                },
-              ]
-            : recognized.map((u) => ({ url: u, name: repoNameFromUrl(u) || "repo" }));
-        setProgress(
-          Object.fromEntries(items.map((_, i) => [i, { status: "queued" as RowStatus }])),
-        );
-        const controller = new AbortController();
-        abortRef.current = controller;
-        const errors: Array<string | undefined> = [];
-        await importRepos(
-          items,
-          dest.trim(),
-          (i, status, error) => {
-            setProgress((p) => ({ ...p, [i]: { status, error } }));
-            if (status === "error") errors[i] = error;
-          },
-          controller.signal,
-        );
-        abortRef.current = null;
-        if (controller.signal.aborted) return; // dialog closed mid-import — nothing to report
-        const failed = errors.filter(Boolean).length;
-        if (failed === 0) {
-          if (items.length > 1) toast(t("dialog.importedToast", { count: items.length }));
-          onOpenChange(false);
-        } else if (items.length === 1) {
-          setErr(errors.find(Boolean) ?? t("dialog.importFailed"));
-        } else {
-          setErr(t("dialog.importSummary", { ok: items.length - failed, failed }));
-        }
+      } catch (e) {
+        setErr(String(e));
+      } finally {
+        setBusy(false);
       }
+      return;
+    }
+
+    // clone — one or many recognized URLs, each into <dest>/<name>. Skip rows
+    // already cloned this session so a retry re-runs only failures (re-cloning a
+    // success would collide with its existing folder). Indices stay aligned to
+    // `recognized` so the status list maps correctly.
+    const entries = recognized.map((u, idx) => ({
+      idx,
+      url: u,
+      name:
+        recognized.length === 1 ? name.trim() || repoNameFromUrl(u) || "repo" : repoNameFromUrl(u) || "repo",
+    }));
+    const pending = entries.filter((e) => progress[e.idx]?.status !== "ok");
+    if (pending.length === 0) {
+      onOpenChange(false);
+      return;
+    }
+    setProgress((p) => {
+      const next = { ...p };
+      for (const e of pending) next[e.idx] = { status: "queued" };
+      return next;
+    });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const errors: Record<number, string> = {};
+    try {
+      await importRepos(
+        pending.map((e) => ({ url: e.url, name: e.name })),
+        dest.trim(),
+        (j, status, error) => {
+          const idx = pending[j].idx;
+          setProgress((p) => ({ ...p, [idx]: { status, error } }));
+          if (status === "error" && error) errors[idx] = error;
+        },
+        controller.signal,
+      );
     } catch (e) {
-      setErr(String(e));
-    } finally {
-      setBusy(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setErr(String(e));
+        setBusy(false);
+      }
+      return;
+    }
+    // Ignore a stale completion: after close+reopen, a newer batch owns the ref.
+    if (abortRef.current !== controller) return;
+    abortRef.current = null;
+    setBusy(false);
+    if (controller.signal.aborted) return; // dialog was closed mid-import
+    // Every prior-ok row stays ok and every pending row is now ok or error, so
+    // total failed == this run's errors and total ok == recognized − failed.
+    const failed = Object.keys(errors).length;
+    if (failed === 0) {
+      if (entries.length > 1) toast(t("dialog.importedToast", { count: entries.length }));
+      onOpenChange(false);
+    } else if (entries.length === 1) {
+      setErr(Object.values(errors)[0] ?? t("dialog.importFailed"));
+    } else {
+      setErr(t("dialog.importSummary", { ok: entries.length - failed, failed }));
     }
   }
 
@@ -311,7 +335,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
               </Field>
 
               {recognized.length >= 2 && (
-                <div className="flex flex-col gap-0.5 rounded-[var(--radius-md)] border border-border bg-bg/50 p-2">
+                <div className="flex max-h-48 flex-col gap-0.5 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-bg/50 p-2">
                   <div className="px-1 pb-1 text-[11px] text-ink-faint">
                     {t("dialog.cloneRecognized", { count: recognized.length })}
                   </div>
