@@ -187,6 +187,7 @@ export const zh = {
     waitingScopeBody: "给这个 issue 下达任务后，Lead 会读取仓库地图并生成可审阅的拆分卡。",
     send: "发送",
     proposalReady_other: "建议 {{count}} 个子任务",
+    proposalResolved_other: "已处理 {{count}} 个子任务",
     reviewCreate: "查看并创建",
     starting: "正在启动 lead…",
     stopped: "lead 已停止。",
@@ -641,6 +642,7 @@ export const zh = {
     newRepoLabel: "新建仓库",
     cloneRepoLabel: "克隆仓库",
     readOnlyHint: "这张卡片属于较早的轮次。",
+    resolved: "已添加 {{name}}",
   },
   repoActions: {
     chooseDir: "选择目录",

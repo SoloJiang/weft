@@ -183,6 +183,12 @@ interface Store {
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: () => Promise<void>;
 
+  /** Action cards resolved this session: message id → onboarded repo name.
+   *  Collapses the card to a settled summary so its repo flow can't re-fire
+   *  (or double-add) after it already succeeded. */
+  actionCardOutcomes: Record<number, string>;
+  markActionCardResolved: (messageId: number, name: string) => void;
+
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
   refreshOverview: () => Promise<void>;
@@ -996,6 +1002,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // ── Lead chat (weft-owned conversation; engine pushes via `lead-chat`) ──
   const [leadMessages, setLeadMessages] = useState<Record<number, LeadMessage[]>>({});
+  // Action cards whose repo flow succeeded this session (message id → repo name).
+  const [actionCardOutcomes, setActionCardOutcomes] = useState<Record<number, string>>({});
+  const markActionCardResolved = useCallback((messageId: number, name: string) => {
+    setActionCardOutcomes((m) => ({ ...m, [messageId]: name }));
+  }, []);
   const [leadTurn, setLeadTurn] = useState<
     Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
   >({});
@@ -1681,6 +1692,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     messages,
     postHuman,
     leadMessages,
+    actionCardOutcomes,
+    markActionCardResolved,
     leadTurn,
     leadSlash,
     loadLeadChat,

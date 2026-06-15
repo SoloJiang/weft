@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, ChevronRight, FileText, Sparkles } from "lucide-react";
-import type { LeadMessage } from "../lib/types";
+import { ArrowRight, Check, ChevronRight, FileText, Sparkles } from "lucide-react";
+import type { LeadMessage, ResolvedProposal } from "../lib/types";
 import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
 import { cleanToolName, compactToolTarget, toolIcon, toolLabelKey } from "./transcriptBits";
@@ -28,8 +28,10 @@ export function ChatTimeline({
   busy,
   activity,
   onReviewProposal,
+  proposal,
   runAction,
   actionsBusy,
+  actionsResolved,
   threadId,
   workspaceId,
   promptText,
@@ -41,9 +43,15 @@ export function ChatTimeline({
   /** The tool call executing right now (transient), if any. */
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
+  /** The active thread's live plan, binding the LATEST proposal card to its
+   *  open/confirmed state. Omit (worker hosts) → proposal cards render settled. */
+  proposal?: ResolvedProposal | null;
   /** Lead-only: dispatch a repo action card. Omit → cards render read-only. */
   runAction?: RunAction;
   actionsBusy?: Record<string, boolean>;
+  /** action_card message id → onboarded repo name, once its flow succeeded.
+   *  Collapses the card to a settled summary. */
+  actionsResolved?: Record<number, string>;
   threadId?: number | null;
   workspaceId?: number | null;
   promptText?: (title: string, placeholder?: string) => Promise<string | null>;
@@ -121,8 +129,10 @@ export function ChatTimeline({
               m={m}
               all={visible}
               onReviewProposal={onReviewProposal}
+              proposal={proposal ?? null}
               runAction={runAction}
               actionsBusy={actionsBusy}
+              actionsResolved={actionsResolved}
               threadId={threadId ?? null}
               workspaceId={workspaceId ?? null}
               promptText={promptText}
@@ -426,12 +436,23 @@ function isLastAssistant(m: LeadMessage, all: LeadMessage[]): boolean {
   return false;
 }
 
+// The live plan binds to the MOST RECENT proposal row only: a re-propose
+// replaces the stored plan, so older proposal cards are already settled.
+function isLatestProposal(m: LeadMessage, all: LeadMessage[]): boolean {
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (all[i].kind === "proposal") return all[i].id === m.id;
+  }
+  return false;
+}
+
 function TimelineRow({
   m,
   all,
   onReviewProposal,
+  proposal,
   runAction,
   actionsBusy,
+  actionsResolved,
   threadId,
   workspaceId,
   promptText,
@@ -440,7 +461,9 @@ function TimelineRow({
   m: LeadMessage;
   all: LeadMessage[];
   onReviewProposal: () => void;
+  proposal: ResolvedProposal | null;
   runAction?: RunAction;
+  actionsResolved?: Record<number, string>;
   actionsBusy?: Record<string, boolean>;
   threadId: number | null;
   workspaceId: number | null;
@@ -455,6 +478,17 @@ function TimelineRow({
   }
 
   if (m.kind === "action_card") {
+    // Resolved this session: its repo flow succeeded, so the card collapses to a
+    // settled one-line summary — the loop is closed and it can't re-fire.
+    const resolvedName = actionsResolved?.[m.id];
+    if (resolvedName) {
+      return (
+        <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-[12px] text-ink-muted">
+          <Check size={13} className="shrink-0 text-ink-faint" />
+          <span className="truncate">{t("actionCard.resolved", { name: resolvedName })}</span>
+        </div>
+      );
+    }
     const parsed = safeParseObj(m.content);
     const title = typeof parsed.title === "string" ? parsed.title : "";
     const body = typeof parsed.body === "string" ? parsed.body : undefined;
@@ -478,6 +512,7 @@ function TimelineRow({
               kind: a.kind,
               ctx: {
                 threadId: threadId ?? undefined,
+                messageId: m.id,
                 preferredWorkspaceId: workspaceId,
               },
               promptText,
@@ -517,6 +552,21 @@ function TimelineRow({
 
   if (m.kind === "proposal") {
     const count = Number(c.count ?? 0);
+    // A proposal card is "open" (interactive) only while it is the latest
+    // proposal AND its live plan is still awaiting review. Once confirmed (or
+    // superseded by a re-propose, or replayed in a worker host with no live
+    // plan), it collapses to a settled one-line summary so the interaction
+    // closes the loop instead of looping back into the review flow.
+    const open =
+      isLatestProposal(m, all) && proposal != null && proposal.status === "proposed";
+    if (!open) {
+      return (
+        <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-[12px] text-ink-muted">
+          <Check size={13} className="shrink-0 text-ink-faint" />
+          <span className="truncate">{t("lead.proposalResolved", { count })}</span>
+        </div>
+      );
+    }
     return (
       <button
         onClick={onReviewProposal}
