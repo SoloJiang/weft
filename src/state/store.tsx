@@ -1323,20 +1323,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const writes = await api.listWorktrees(directionId).catch(() => []);
       const first = writes[0];
       if (!first) return;
-      let sess = Object.values(sessionsRef.current).find(
+      const live = Object.values(sessionsRef.current).find(
         (s) => s.directionId === directionId && s.status !== "exited",
       );
       // Manual trigger: open the worker conversation up front so the human lands
       // in the session and watches the review command get inserted. Auto-review
       // (opts undefined) stays headless — it only surfaces the post-fix state.
-      if (opts?.focus) openWorker(directionId, sess?.repoId ?? first.repo_id);
-      if (!sess) {
-        await driveDirection(directionId, first.repo_id, false);
-        sess = Object.values(sessionsRef.current).find(
-          (s) => s.directionId === directionId && s.status !== "exited",
-        );
-      }
-      if (!sess) return;
+      if (opts?.focus) openWorker(directionId, live?.repoId ?? first.repo_id);
+      // driveDirection returns the (possibly freshly-resumed) session id directly;
+      // sessionsRef won't reflect a new session until React re-renders, so reuse
+      // that id rather than re-scanning the ref (which could miss the just-created
+      // session and drop the review command, stranding the user in an idle view).
+      const sessionId =
+        live?.info.session_id ??
+        (await driveDirection(directionId, first.repo_id, false));
+      if (sessionId == null) return;
       // Review-then-repair: the skill reviews, the same agent fixes what it
       // found and re-verifies — the human only sees the post-fix state.
       const directive =
@@ -1344,7 +1345,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           ? "review 结束后，直接修复发现的问题并重新跑检查自验，然后简要汇报。"
           : "After the review, fix the findings directly, re-run the checks to verify, then report briefly.";
       const cmd = `/${resolveReviewSkill()} ${directive}`;
-      await api.chatSend(sess.info.session_id, cmd);
+      await api.chatSend(sessionId, cmd);
     },
     [driveDirection, openWorker, resolveReviewSkill],
   );
