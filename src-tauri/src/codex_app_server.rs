@@ -296,13 +296,19 @@ pub async fn client() -> anyhow::Result<Client> {
 /// connection lock. A full stdin pipe blocks only this task — never a caller
 /// holding the lock — so the `read_loop` keeps draining stdout and the two-pipe
 /// deadlock can't form. Exits when every `write_tx` is dropped (i.e. the `Inner`
-/// is torn down on EOF), which closes stdin and lets the child wind down.
-async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+/// is torn down) or stdin errors; either way it tears the connection down so
+/// pending callers fail fast and the next `client()` reconnects.
+async fn write_loop(client: Client, mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(buf) = rx.recv().await {
         if stdin.write_all(&buf).await.is_err() || stdin.flush().await.is_err() {
-            break; // child stdin closed/errored; read_loop will tear down the conn
+            break; // stdin closed/errored
         }
     }
+    // A stdin error with stdout still open would otherwise leave the request
+    // mid-write unresolved (its caller waits out the full 60s) and `client()`
+    // reporting "connected" until stdout EOFs. Tear down now so the codex
+    // fallback/reconnect path runs promptly. No-op if already torn down.
+    client.teardown().await;
 }
 
 impl Client {
@@ -338,7 +344,7 @@ impl Client {
         drop(g);
 
         // Writer owns stdin and awaits each write off the lock (see `write_tx`).
-        tauri::async_runtime::spawn(write_loop(stdin, write_rx));
+        tauri::async_runtime::spawn(write_loop(self.clone(), stdin, write_rx));
 
         let me = self.clone();
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
@@ -381,6 +387,16 @@ impl Client {
             }
         }
         // EOF/crash → drop the connection so the next use reconnects + re-resumes.
+        self.teardown().await;
+    }
+
+    /// Drop the live `Inner`: stops the writer (its `write_tx` is gone), fails
+    /// every pending caller at once (their oneshot senders drop → `rx` errors
+    /// instead of waiting out the 60s timeout), and kills the child
+    /// (`kill_on_drop`) so no buffered request is processed late. The next
+    /// `client()` reconnects. Idempotent — safe to call from read_loop, the
+    /// writer, and a request timeout.
+    async fn teardown(&self) {
         *self.0.lock().await = None;
     }
 
@@ -403,7 +419,10 @@ impl Client {
     /// Send a request and await its reply (`result` on success, `error.message`
     /// on failure), with a hard timeout so a wedged server can't hang a caller.
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let (id, rx) = {
+        // The pending waiter is keyed by `id` inside the block; the timeout path
+        // tears the whole connection down rather than removing one entry, so the
+        // id isn't needed out here.
+        let rx = {
             let mut g = self.0.lock().await;
             let inner = g
                 .as_mut()
@@ -420,16 +439,19 @@ impl Client {
                 .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
-            (id, rx)
+            rx
         };
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => anyhow::bail!("codex app-server {method}: {e}"),
             Ok(Err(_)) => anyhow::bail!("codex app-server {method}: reply dropped"),
             Err(_) => {
-                if let Some(inner) = self.0.lock().await.as_mut() {
-                    inner.pending.remove(&id);
-                }
+                // 60s with no reply ⇒ the connection is wedged. Tear it down so the
+                // still-buffered request (notably turn/start) can't be written and
+                // run late after the caller already fell back to exec — which would
+                // execute the same turn twice. Dropping Inner also discards the
+                // queued bytes and kills the child.
+                self.teardown().await;
                 anyhow::bail!("codex app-server {method}: timed out")
             }
         }

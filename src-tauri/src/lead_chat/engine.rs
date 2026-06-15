@@ -761,11 +761,21 @@ pub async fn ensure_running_for_send(
     ensure_running(app, db, eng).await
 }
 
+/// Drop the resident child and its stdin so the next send respawns a clean
+/// process. Used when a write fails or times out mid-line: a partial JSON
+/// message may be stuck in the old stdin pipe, so reusing that pipe would
+/// corrupt the next turn (the next message concatenates onto the prefix), and
+/// the child is evidently wedged or dead. Killing it (and clearing the handles)
+/// makes `ensure_running_locked` respawn on the next send. `kill_on_drop` would
+/// also reap it, but `start_kill` makes the intent explicit and immediate.
+pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
+    inner.stdin = None;
+    if let Some(mut child) = inner.child.take() {
+        let _ = child.start_kill();
+    }
+}
+
 pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
-    let stdin = inner
-        .stdin
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("resident stdin is unavailable"))?;
     let mut content = vec![serde_json::json!({ "type": "text", "text": out.text })];
     for (media_type, data) in &out.images {
         content.push(serde_json::json!({
@@ -778,19 +788,36 @@ pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyho
         "message": { "role": "user", "content": content }
     });
     let line = format!("{msg}\n");
+    let Some(stdin) = inner.stdin.as_mut() else {
+        return Err(anyhow::anyhow!("resident stdin is unavailable"));
+    };
     // Time-box the write. This runs while the caller holds the engine lock, so an
     // unbounded write to a child that has stopped reading its stdin would pin the
     // lock forever — wedging stop/interrupt/status for the whole session. A live
     // child (we only write-through when it's idle and reading) drains in
-    // microseconds; the timeout only fires on a genuinely stuck process, where it
-    // surfaces as a turn error and the lock is released for recovery.
-    tokio::time::timeout(WRITE_USER_TIMEOUT, async {
+    // microseconds; the timeout only fires on a genuinely stuck process.
+    let res = tokio::time::timeout(WRITE_USER_TIMEOUT, async {
         stdin.write_all(line.as_bytes()).await?;
         stdin.flush().await
     })
-    .await
-    .map_err(|_| anyhow::anyhow!("resident stdin write timed out (child not reading)"))??;
-    Ok(())
+    .await;
+    match res {
+        Ok(Ok(())) => Ok(()),
+        // Either failure mode can leave a partial line in the pipe and an
+        // unresponsive child. Invalidate the resident process so the next send
+        // respawns clean instead of appending to a corrupt prefix or re-targeting
+        // a wedged child; the caller rolls the turn back.
+        Ok(Err(e)) => {
+            invalidate_resident(inner);
+            Err(anyhow::Error::new(e).context("resident stdin write failed"))
+        }
+        Err(_) => {
+            invalidate_resident(inner);
+            Err(anyhow::anyhow!(
+                "resident stdin write timed out (child not reading)"
+            ))
+        }
+    }
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
