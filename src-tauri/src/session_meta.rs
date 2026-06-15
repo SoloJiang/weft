@@ -5,6 +5,13 @@
 
 use crate::lead_chat::proto::McpServer;
 
+/// 会话实际拥有的一个 skill,供会话信息面板展示。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
 /// 一次带外取数的结果。字段对齐前端 `SessionMeta`(snake_case 序列化)。
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SessionMetaSnapshot {
@@ -14,6 +21,8 @@ pub struct SessionMetaSnapshot {
     /// None = 探测失败 / 不可用(前端保留旧 server 行);Some = 权威结果(替换,即使
     /// 为空——会话此刻确实没有 MCP server,该清掉陈旧行)。区分"瞬时失败"与"真的没有"。
     pub mcp_servers: Option<Vec<McpServer>>,
+    /// codex 的真实 skill;None = 没探到(保留旧行),Some = 权威列表。claude 留 None。
+    pub skills: Option<Vec<SkillInfo>>,
 }
 
 // ───────────────────────── 纯解析(可单测) ─────────────────────────
@@ -192,11 +201,30 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
         }
         _ => None,
     };
+    // best-effort + 10s 上限,空 → None(保留旧行,不把"读不到"当"没有")。
+    let skills = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        crate::codex_slash::discover_skills_for_cwd(cwd),
+    )
+    .await
+    {
+        Ok(found) if !found.is_empty() => Some(
+            found
+                .into_iter()
+                .map(|c| SkillInfo {
+                    name: c.name,
+                    description: c.description.unwrap_or_default(),
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
     SessionMetaSnapshot {
         context_tokens: None,
         window,
         model,
         mcp_servers,
+        skills,
     }
 }
 
@@ -222,6 +250,8 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnaps
         window,
         model,
         mcp_servers,
+        // opencode 无对等 `skills/list`;留 None。
+        skills: None,
     }
 }
 

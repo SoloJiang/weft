@@ -404,6 +404,83 @@ async fn finalize_orphan_tool_rows(
     }
 }
 
+/// Persist a turn's tool calls as `kind:"tool"` rows (running until their result
+/// arrives). Shared by spawn_reader (claude/exec) and codex_consumer (app-server).
+async fn persist_tool_calls(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    tools: Vec<super::proto::ToolCall>,
+) {
+    let thread_id = inner.thread_id;
+    for call in tools {
+        let (sid, turn) = (inner.session_id, inner.turn_id);
+        let running = call.output.is_none();
+        let status = if running {
+            "streaming"
+        } else if call.is_error {
+            "error"
+        } else {
+            "complete"
+        };
+        let content = serde_json::json!({
+            "name": call.name,
+            "summary": call.summary,
+            "input": call.input,
+            "output": call.output.unwrap_or_default(),
+            "is_error": call.is_error,
+        });
+        let content_str = content.to_string();
+        let call_id = call.id;
+        match repo::insert_lead_message(
+            db, thread_id, sid, turn, "assistant", "tool", &content_str, status,
+        )
+        .await
+        {
+            Ok(m) => {
+                let row_id = m.id;
+                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                if running && !call_id.is_empty() {
+                    inner.tool_rows.insert(call_id, (row_id, content));
+                }
+            }
+            Err(e) => eprintln!("[weft] lead tool row insert failed: {e}"),
+        }
+    }
+}
+
+/// Merge tool results into their running rows (claude tool_result / codex
+/// item.completed); a result for an untracked row is dropped.
+async fn merge_tool_results(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    items: Vec<super::proto::ToolResultItem>,
+) {
+    let thread_id = inner.thread_id;
+    for item in items {
+        let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id) else {
+            continue;
+        };
+        if let Some(obj) = content.as_object_mut() {
+            obj.insert("output".into(), item.output.into());
+            obj.insert("is_error".into(), item.is_error.into());
+        }
+        let status = if item.is_error { "error" } else { "complete" };
+        let content_str = content.to_string();
+        let _ = repo::update_lead_message(db, row_id, &content_str, status).await;
+        let _ = app.emit(
+            EVENT,
+            Push::ToolResult {
+                thread_id,
+                message_id: row_id,
+                content: content_str,
+                status: status.into(),
+            },
+        );
+    }
+}
+
 async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fallback_status: &str) {
     let mut inner = eng.lock().await;
     if !inner.turn.busy
@@ -583,14 +660,16 @@ pub struct EngineInner {
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
     pub current_origin_tag: Option<String>,
-    /// Maps an in-flight tool call's id (claude `tool_use_id`) to its persisted
-    /// `kind:"tool"` row id and current content JSON, so the out-of-band tool
-    /// result can merge its output without re-reading the row. Cleared at each
-    /// turn boundary; codex pills never populate it.
+    /// Maps an in-flight tool call's id (claude `tool_use_id` / codex item id) to
+    /// its persisted `kind:"tool"` row id and content JSON, so the out-of-band
+    /// result merges its output without re-reading the row. Cleared per turn.
     pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
     /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
     /// engines; explicit sends/ensure clear this and restart as needed.
     pub stopped: bool,
+    /// Per-session `codex app-server` connection (app-server transport only),
+    /// spawned lazily on the first turn with this session's `-c mcp_servers` args.
+    pub codex_client: Option<crate::codex_app_server::Client>,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -874,18 +953,12 @@ pub async fn send(
         // Rides the turn (and the queue, if queued) so output frames recover it.
         origin_tag: origin_tag.clone(),
     };
-    // codex (app-server): no resident stdin, no per-turn process — the shared
-    // connection drives the turn after the lock drops. Gated; default stays exec.
-    //
-    // system_prompt is now prepended to a new thread's first turn (codex has no
-    // thread/start prompt field — mirrors the exec adapter). The remaining gap is
-    // MCP: codex app-server MCP is APP-SCOPED (config.toml + config/mcpServer/
-    // reload), so today's per-thread bus URLs (weft_bus / weft_global) can't be
-    // carried by one global app-server without restructuring the bus to a single
-    // thread-routing endpoint. The gate keeps system_prompt.is_empty() and the
-    // path stays behind the off-by-default env flag until that's settled.
-    let is_codex_appserver =
-        inner.tool == "codex" && codex_appserver_enabled() && inner.system_prompt.is_empty();
+    // codex (app-server): a per-session connection drives the turn after the lock
+    // drops (streaming via item/agentMessage/delta). system_prompt is prepended to
+    // a new thread's first turn; per-thread bus MCP rides the connection's own
+    // `-c mcp_servers` spawn args. Falls back to exec if the app-server is
+    // unreachable.
+    let is_codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
     let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
     if direct && !spawn_now && !is_codex_appserver {
         if let Err(e) = write_user(&mut inner, &out).await {
@@ -912,22 +985,16 @@ pub async fn send(
             return Err(e);
         }
     } else if direct && is_codex_appserver {
-        // Fall back to exec if the app-server can't be reached (old codex, crash):
-        // the thread id is shared with exec's rollout store, so resume is seamless.
-        if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
-            eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
-            if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
-                rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
-                return Err(e);
-            }
+        if let Err(e) = spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await {
+            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+            return Err(e);
         }
     }
     Ok(())
 }
 
-/// Codex app-server transport selector. Default = exec; app-server is opt-in via
-/// `WEFT_CODEX_APPSERVER=1` because its `initialized` handshake may initialize
-/// ChatGPT Apps and fail on network/auth state before a normal Weft turn starts.
+/// Codex app-server transport selector (default ON; `WEFT_CODEX_APPSERVER=0` →
+/// exec). See [`crate::adapters::codex_prefers_appserver`].
 fn codex_appserver_enabled() -> bool {
     crate::adapters::codex_prefers_appserver()
 }
@@ -942,17 +1009,30 @@ async fn spawn_codex_turn(
     eng: EngineRef,
     out: Outgoing,
 ) -> anyhow::Result<()> {
-    let client = crate::codex_app_server::client().await?;
-    let (native, cwd, sid, thread_id_i, system_prompt) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing) = {
         let i = eng.lock().await;
         (
             i.native_id.clone(),
-            i.cwd.to_string_lossy().into_owned(),
+            i.cwd.clone(),
             i.session_id,
             i.thread_id,
             i.system_prompt.clone(),
+            i.extra_args.clone(),
+            i.codex_client.clone(),
         )
     };
+    // Per-session app-server: reuse the engine's connection or spawn one with this
+    // session's `-c mcp_servers` bus flags. Its own process keeps the per-thread
+    // MCP isolated (app-server MCP is app-scoped).
+    let client = match existing {
+        Some(c) if c.is_alive().await => c,
+        _ => {
+            let c = crate::codex_app_server::Client::connect_session(&extra_args, &cwd).await?;
+            eng.lock().await.codex_client = Some(c.clone());
+            c
+        }
+    };
+    let cwd = cwd.to_string_lossy().into_owned();
     let had_native = native.is_some();
     let thread = match native {
         Some(t) => t,
@@ -989,6 +1069,22 @@ async fn spawn_codex_turn(
     let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
     let turn = client.start_turn(&thread, &first_text).await?;
     client.set_active_turn(&thread, &turn).await;
+    Ok(())
+}
+
+/// Start a codex turn on the app-server, falling back to exec per-turn if the
+/// app-server can't be reached (the native id is shared with exec's rollout, so
+/// resume is seamless). The caller must have already begun the turn (busy/turn_id).
+async fn spawn_codex_turn_or_exec(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    out: Outgoing,
+) -> anyhow::Result<()> {
+    if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
+        eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
+        spawn_turn(app, db, eng, out).await?;
+    }
     Ok(())
 }
 
@@ -1076,22 +1172,35 @@ async fn codex_consumer(
                 );
             }
             ThreadMsg::Event(ChatEvent::Assistant { texts: _, tools }) => {
-                // Codex streams text via deltas; only non-text items arrive here,
-                // as transient activity pills.
-                let inner = eng.lock().await;
-                let (thread_id, sid) = (inner.thread_id, inner.session_id);
-                drop(inner);
-                for tool in tools {
-                    let _ = app.emit(
-                        EVENT,
-                        Push::Activity {
-                            thread_id,
-                            session_id: sid,
-                            name: tool.name,
-                            summary: tool.summary,
-                        },
-                    );
+                // Codex streams text via deltas; non-text items are tool calls →
+                // inline `kind:"tool"` rows, filled by their item.completed result.
+                let mut inner = eng.lock().await;
+                inner.clock.last_activity = std::time::Instant::now();
+                persist_tool_calls(&app, &db, &mut inner, tools).await;
+            }
+            ThreadMsg::Event(ChatEvent::ToolResults { items }) => {
+                let mut inner = eng.lock().await;
+                merge_tool_results(&app, &db, &mut inner, items).await;
+            }
+            ThreadMsg::Event(ChatEvent::Usage { context_tokens, window }) => {
+                // app-server's current-context usage (last.inputTokens + window):
+                // the accurate Context-panel value codex exec couldn't give.
+                let mut inner = eng.lock().await;
+                inner.last_context_tokens = Some(context_tokens);
+                if window.is_some() {
+                    inner.last_window = window;
                 }
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Usage {
+                        thread_id,
+                        session_id,
+                        context_tokens,
+                        window: inner.last_window,
+                        model: inner.last_model.clone(),
+                    },
+                );
             }
             ThreadMsg::Event(ChatEvent::TurnEnd { is_error, context_tokens }) => {
                 let mut inner = eng.lock().await;
@@ -1293,8 +1402,9 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     // TurnEnd then finalizes the row as `interrupted`.
     if inner.tool == "codex" && codex_appserver_enabled() {
         let thread = inner.native_id.clone();
+        let client = inner.codex_client.clone();
         drop(inner);
-        if let (Some(thread), Ok(client)) = (thread, crate::codex_app_server::client().await) {
+        if let (Some(thread), Some(client)) = (thread, client) {
             if let Some(turn) = client.active_turn(&thread).await {
                 let _ = client.interrupt(&thread, &turn).await;
             }
@@ -1431,9 +1541,18 @@ async fn send_hidden_inner(
             Ok(())
         }
         HiddenDelivery::SpawnTurn => {
+            // codex on app-server must stay on app-server even for hidden turns
+            // (bus wakes), else an exec turn and the app-server connection diverge
+            // on the same thread.
+            let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
             drop(inner);
-            if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
+            let res = if codex_appserver {
+                spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await
+            } else {
+                spawn_turn(app.clone(), db.clone(), eng.clone(), out).await
+            };
+            if let Err(e) = res {
                 rollback_failed_turn(app, db, eng, turn_id).await;
                 return Err(e);
             }
@@ -1577,6 +1696,11 @@ pub async fn stop_quiet(
     inner.generation += 1; // orphan the reader so EOF handling is ours
     if let Some(c) = inner.child.as_mut() {
         let _ = c.kill().await;
+    }
+    // Kill the per-session app-server too (its consumer task exits as the sinks
+    // close); the next send respawns it, picking up refreshed skills/MCP.
+    if let Some(c) = inner.codex_client.take() {
+        c.shutdown().await;
     }
     inner.child = None;
     inner.stdin = None;
@@ -1951,94 +2075,13 @@ fn spawn_reader(
                             }
                         }
                     }
-                    // Codex exec items carry no input/output to expand, so they
-                    // stay transient activity pills; claude/opencode tool calls
-                    // become persisted, expandable `kind:"tool"` rows.
-                    if inner.tool == "codex" {
-                        for tool in tools {
-                            let _ = app.emit(
-                                EVENT,
-                                Push::Activity {
-                                    thread_id,
-                                    session_id: inner.session_id,
-                                    name: tool.name,
-                                    summary: tool.summary,
-                                },
-                            );
-                        }
-                    } else {
-                        for call in tools {
-                            let (sid, turn) = (inner.session_id, inner.turn_id);
-                            // No output yet (claude `tool_use`) → a running row to
-                            // be filled by a later ToolResults; output already
-                            // present (opencode completed) → a final row in one shot.
-                            let running = call.output.is_none();
-                            let status = if running {
-                                "streaming"
-                            } else if call.is_error {
-                                "error"
-                            } else {
-                                "complete"
-                            };
-                            let content = serde_json::json!({
-                                "name": call.name,
-                                "summary": call.summary,
-                                "input": call.input,
-                                "output": call.output.unwrap_or_default(),
-                                "is_error": call.is_error,
-                            });
-                            let content_str = content.to_string();
-                            let call_id = call.id;
-                            match repo::insert_lead_message(
-                                &db, thread_id, sid, turn, "assistant", "tool",
-                                &content_str, status,
-                            )
-                            .await
-                            {
-                                Ok(m) => {
-                                    let row_id = m.id;
-                                    let _ = app.emit(
-                                        EVENT,
-                                        Push::Message { thread_id, message: m },
-                                    );
-                                    if running && !call_id.is_empty() {
-                                        inner.tool_rows.insert(call_id, (row_id, content));
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[weft] lead tool row insert failed: {e}")
-                                }
-                            }
-                        }
-                    }
+                    // Every dialect's tool calls become inline `kind:"tool"` rows.
+                    persist_tool_calls(&app, &db, &mut inner, tools).await;
                 }
                 super::proto::ChatEvent::ToolResults { items } => {
-                    // Fill in the output of running tool rows — claude delivers
-                    // results out-of-band as a `user` turn. A result for a row we
-                    // never tracked is dropped rather than left orphaned.
-                    for item in items {
-                        let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id)
-                        else {
-                            continue;
-                        };
-                        if let Some(obj) = content.as_object_mut() {
-                            obj.insert("output".into(), item.output.into());
-                            obj.insert("is_error".into(), item.is_error.into());
-                        }
-                        let status = if item.is_error { "error" } else { "complete" };
-                        let content_str = content.to_string();
-                        let _ = repo::update_lead_message(&db, row_id, &content_str, status).await;
-                        let _ = app.emit(
-                            EVENT,
-                            Push::ToolResult {
-                                thread_id,
-                                message_id: row_id,
-                                content: content_str,
-                                status: status.into(),
-                            },
-                        );
-                    }
+                    merge_tool_results(&app, &db, &mut inner, items).await;
                 }
+                super::proto::ChatEvent::Usage { .. } => {}
                 super::proto::ChatEvent::TurnEnd { is_error, context_tokens } => {
                     if let Some(ct) = context_tokens {
                         inner.last_context_tokens = Some(ct);
@@ -2633,6 +2676,7 @@ mod tests {
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
+            codex_client: None,
         }
     }
 
@@ -2774,6 +2818,7 @@ mod tests {
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
+            codex_client: None,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));

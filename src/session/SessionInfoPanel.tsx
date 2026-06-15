@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { X, ChevronRight, ChevronDown, RefreshCw } from "lucide-react";
 import type { SessionMeta, EnabledSkill } from "../lib/types";
@@ -27,6 +27,17 @@ export function SessionInfoPanel({
   const ct = meta?.contextTokens;
   const win = meta?.window;
   const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
+
+  // Workspace skills (`skills`) ∪ engine skills (`meta.engineSkills`), deduped by
+  // name (workspace wins).
+  const allSkills = useMemo(() => {
+    const byName = new Map<string, { name: string; description: string }>();
+    for (const s of skills) byName.set(s.name, { name: s.name, description: s.description });
+    for (const s of meta?.engineSkills ?? []) {
+      if (!byName.has(s.name)) byName.set(s.name, s);
+    }
+    return [...byName.values()];
+  }, [skills, meta?.engineSkills]);
 
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
@@ -93,11 +104,11 @@ export function SessionInfoPanel({
         <section className="border-b border-border px-4 py-3">
           <div className="flex items-center">
             <span className="text-[11px] text-ink-faint">{t("sessionInfo.skills")}</span>
-            <span className="ml-auto text-[11px] text-ink-faint">{skills.length}</span>
+            <span className="ml-auto text-[11px] text-ink-faint">{allSkills.length}</span>
           </div>
-          {skills.length > 0 ? (
+          {allSkills.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-1.5">
-              {skills.map((s) => (
+              {allSkills.map((s) => (
                 <span
                   key={s.name}
                   title={s.description}

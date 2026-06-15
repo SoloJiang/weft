@@ -16,8 +16,10 @@ import {
 /** Map a (cleaned) tool name to a glyph so the pills are scannable. */
 export function toolIcon(name: string): ComponentType<LucideProps> {
   const n = name.toLowerCase();
-  if (/(bash|exec_command|shell|run)/.test(n)) return SquareTerminal;
-  if (/(write|edit|apply_patch|patch)/.test(n)) return FilePen;
+  // `command_execution` / `file_change` are codex's item-type names; keep them in
+  // step with claude/opencode tool names so codex tool rows get the same glyphs.
+  if (/(bash|exec_command|command_execution|shell|run)/.test(n)) return SquareTerminal;
+  if (/(write|edit|apply_patch|patch|file_change)/.test(n)) return FilePen;
   if (/(grep|glob|rg|ripgrep|ls|find|list)/.test(n)) return Search;
   if (/read|view|cat/.test(n)) return FileText;
   if (/(bus_|broadcast|ask_human|announce|interface|inbox|status)/.test(n)) return Radio;
@@ -35,10 +37,10 @@ export function cleanToolName(name: string) {
 /** i18n key for the tool's activity label — call t() on the result. */
 export function toolLabelKey(name: string) {
   const n = name.toLowerCase();
-  if (/(write|edit|apply_patch|patch)/.test(n)) return "session.toolEditing";
+  if (/(write|edit|apply_patch|patch|file_change)/.test(n)) return "session.toolEditing";
   if (/(read|view|cat)/.test(n)) return "session.toolReading";
   if (/(grep|glob|rg|ripgrep|ls|find|list|search)/.test(n)) return "session.toolSearching";
-  if (/(bash|exec_command|shell|run)/.test(n)) return "session.toolRunning";
+  if (/(bash|exec_command|command_execution|shell|run)/.test(n)) return "session.toolRunning";
   if (/(bus_|broadcast|ask_human|announce|interface|inbox|status)/.test(n)) return "session.toolSyncing";
   if (/todo/.test(n)) return "session.toolOrganizing";
   return "session.toolCalling";

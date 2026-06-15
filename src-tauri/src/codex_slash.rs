@@ -325,6 +325,17 @@ pub async fn discover_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
     out
 }
 
+/// The session's real skills (app-server `skills/list` + cwd `.agents`/`.claude`),
+/// deduped, no built-ins — for the session-info panel. Best-effort.
+pub(crate) async fn discover_skills_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
+    let mut out = Vec::new();
+    if let Ok(skills) = fetch_skills().await {
+        push_unique(&mut out, skills);
+    }
+    push_unique(&mut out, local_skill_commands_for_cwd(cwd.as_ref()));
+    out
+}
+
 fn builtin_commands() -> Vec<SlashCmd> {
     builtins()
         .into_iter()

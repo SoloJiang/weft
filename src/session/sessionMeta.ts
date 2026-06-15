@@ -58,6 +58,7 @@ export function metaFromInit(
     window: p.window ?? prev?.window ?? undefined,
     model: p.model ?? prev?.model ?? undefined,
     mcpServers: authoritative ? grouped : grouped.length > 0 ? grouped : (prev?.mcpServers ?? []),
+    engineSkills: prev?.engineSkills, // 走带外 session_meta,保留已并入的
   };
 }
 
@@ -71,6 +72,7 @@ export function metaFromUsage(
     model: p.model ?? prev?.model ?? undefined,
     window: p.window ?? prev?.window ?? undefined,
     contextTokens: p.context_tokens,
+    engineSkills: prev?.engineSkills,
   };
 }
 
@@ -85,6 +87,7 @@ export function mergeSnapshot(
     window: number | null;
     model: string | null;
     mcp_servers: { name: string; status: string }[] | null;
+    skills?: { name: string; description: string }[] | null;
   },
 ): SessionMeta {
   return {
@@ -92,6 +95,8 @@ export function mergeSnapshot(
     window: s.window ?? prev?.window ?? undefined,
     model: s.model ?? prev?.model ?? undefined,
     mcpServers: s.mcp_servers == null ? (prev?.mcpServers ?? []) : groupMcpTools(s.mcp_servers, []),
+    // null = 没探到(保留旧),非 null = 权威列表
+    engineSkills: s.skills == null ? prev?.engineSkills : s.skills,
   };
 }
 

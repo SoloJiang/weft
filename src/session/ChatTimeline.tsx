@@ -16,8 +16,8 @@ type EmptyStateMode = "default" | "lead-task" | "lead-repo-guide";
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
  * no jsonl). Structured cards (proposal/approval/worker events) live inline in
  * the flow, where they happened — the conversation IS the console. Tool calls
- * are NOT rows: the one currently running shows as a transient activity line
- * under the stream and disappears when the turn moves on.
+ * are `kind:"tool"` rows, inline and expandable, in the order they ran; the
+ * bottom activity line is only the generic "working" pulse between rows.
  *
  * The lead host wires up runAction/promptText so action_card buttons trigger
  * the real repo flows; worker hosts (Observe/Session) omit them and any
@@ -60,9 +60,8 @@ export function ChatTimeline({
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
 
-  // Tool calls (claude/opencode) render inline as expandable `kind:"tool"` rows;
-  // only `meta` bookkeeping rows are hidden. (Codex tools still arrive as the
-  // transient activity bar below the list.)
+  // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
+  // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
   const visible = messages.filter((m) => m.kind !== "meta");
 
   // Virtuoso's followOutput only fires on item-COUNT changes, so it misses

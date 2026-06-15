@@ -168,62 +168,134 @@ pub fn is_approval_request(method: &str) -> bool {
     )
 }
 
-/// Map a server notification to the engine's `ChatEvent`. Returns `None` for
-/// notifications the streaming pipeline ignores (reasoning, thread/turn
-/// lifecycle markers, hook/skills observability — handled separately in Stage
-/// 4). Mirrors how the exec dialect renders agent text + tool pills.
+/// Map a server notification to the engine's `ChatEvent`. Tool items (camelCase:
+/// commandExecution/fileChange/mcpToolCall …) become a running tool row on
+/// `item/started` and its result on `item/completed`; agent text streams via
+/// deltas; `thread/tokenUsage/updated` carries the current-context usage.
 pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> {
+    use crate::lead_chat::proto::ChatEvent;
+    let item = &params["item"];
     match method {
-        "item/agentMessage/delta" => {
-            params["delta"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(|s| ChatEvent::TextDelta {
-                    text: s.to_string(),
+        "item/agentMessage/delta" => params["delta"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| ChatEvent::TextDelta { text: s.to_string() }),
+        "item/started" => match item["type"].as_str() {
+            Some("agentMessage") | Some("userMessage") | Some("reasoning") | None => None,
+            Some("error") => Some(ChatEvent::TextDelta {
+                text: crate::lead_chat::proto::error_text_from_item(item),
+            }),
+            Some(_) => Some(ChatEvent::Assistant {
+                texts: vec![],
+                tools: vec![appserver_tool_call(item)],
+            }),
+        },
+        // agentMessage text already streamed via deltas → no-op; tool items deliver
+        // their result here, merged into the running row by item id.
+        "item/completed" => match item["type"].as_str() {
+            Some("agentMessage") | Some("userMessage") | Some("reasoning") | Some("error")
+            | None => None,
+            Some(_) => Some(ChatEvent::ToolResults {
+                items: vec![appserver_tool_result(item)],
+            }),
+        },
+        "thread/tokenUsage/updated" => {
+            let tu = &params["tokenUsage"];
+            tu["last"]["inputTokens"]
+                .as_u64()
+                .map(|ct| ChatEvent::Usage {
+                    context_tokens: ct,
+                    window: tu["modelContextWindow"].as_u64(),
                 })
         }
-        "item/started" => {
-            // Non-text items surface as activity pills as soon as they start;
-            // agentMessage waits for its deltas / completion.
-            let item = &params["item"];
-            match item["type"].as_str() {
-                Some("agentMessage") | None => None,
-                Some("reasoning") => None,
-                Some("error") => Some(ChatEvent::TextDelta {
-                    text: crate::lead_chat::proto::error_text_from_item(item),
-                }),
-                Some(kind) => Some(ChatEvent::Assistant {
-                    texts: vec![],
-                    tools: vec![crate::lead_chat::proto::ToolCall::pill(
-                        kind,
-                        item_summary(kind, item),
-                    )],
-                }),
-            }
-        }
-        // Final item state. Verified live: an agentMessage's text already arrived
-        // token-by-token via `item/agentMessage/delta`, so re-emitting it here
-        // would double-render — deltas are authoritative. Non-text items showed
-        // their pill on item/started; userMessage/reasoning are ignored. (A
-        // no-delta config would need an item.text fallback at wire-in, but codex
-        // streams deltas in practice.)
-        "item/completed" => None,
         "turn/completed" => Some(ChatEvent::TurnEnd {
             is_error: params["turn"]["status"].as_str() != Some("completed"),
-            context_tokens: None, // codex app-server usage 解析留给后续里程碑
+            context_tokens: None, // 准确上下文走 thread/tokenUsage/updated
         }),
-        _ => None, // thread/started, turn/started, hook/*, skills/changed → Stage 2/4
+        _ => None,
     }
 }
 
-/// A compact, truncated summary string for a non-text item's activity pill.
-fn item_summary(kind: &str, item: &Value) -> String {
-    let s = match kind {
-        "commandExecution" => item["command"].as_str().unwrap_or_default(),
-        "fileChange" => item["changes"][0]["path"].as_str().unwrap_or_default(),
-        _ => "",
-    };
+/// Running `ToolCall` from an app-server `item.started` tool item.
+fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
+    crate::lead_chat::proto::ToolCall {
+        id: item["id"].as_str().unwrap_or_default().to_string(),
+        name: item["type"].as_str().unwrap_or("tool").to_string(),
+        input: appserver_tool_input(item),
+        summary: appserver_tool_summary(item),
+        output: None,
+        is_error: false,
+    }
+}
+
+/// Result of an app-server `item.completed` tool item, keyed by item id.
+fn appserver_tool_result(item: &Value) -> crate::lead_chat::proto::ToolResultItem {
+    crate::lead_chat::proto::ToolResultItem {
+        id: item["id"].as_str().unwrap_or_default().to_string(),
+        output: appserver_tool_output(item),
+        is_error: appserver_tool_is_error(item),
+    }
+}
+
+fn appserver_tool_input(item: &Value) -> Value {
+    let mut obj = serde_json::Map::new();
+    for k in ["command", "cwd", "changes", "server", "tool", "arguments"] {
+        if let Some(v) = item.get(k) {
+            if !v.is_null() {
+                obj.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(obj)
+}
+
+fn appserver_tool_summary(item: &Value) -> String {
+    let s = item["command"]
+        .as_str()
+        .or_else(|| item["tool"].as_str())
+        .or_else(|| item["changes"][0]["path"].as_str())
+        .unwrap_or_default();
     s.chars().take(120).collect()
+}
+
+/// commandExecution → `aggregatedOutput`; fileChange → the per-change diffs;
+/// mcpToolCall → result/output.
+fn appserver_tool_output(item: &Value) -> String {
+    if let Some(s) = item["aggregatedOutput"].as_str() {
+        return cap_out(s);
+    }
+    if let Some(changes) = item["changes"].as_array() {
+        let diff = changes
+            .iter()
+            .filter_map(|c| c["diff"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !diff.is_empty() {
+            return cap_out(&diff);
+        }
+    }
+    item["output"]
+        .as_str()
+        .or_else(|| item["result"].as_str())
+        .map(cap_out)
+        .unwrap_or_default()
+}
+
+fn appserver_tool_is_error(item: &Value) -> bool {
+    if let Some(code) = item["exitCode"].as_i64() {
+        return code != 0;
+    }
+    matches!(item["status"].as_str(), Some("failed") | Some("error"))
+}
+
+fn cap_out(s: &str) -> String {
+    const MAX: usize = 16_000;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX).collect();
+    out.push_str("\n… (truncated)");
+    out
 }
 
 // ───────────────────── runtime client (Stage 1.5 — UNWIRED) ─────────────────
@@ -286,13 +358,49 @@ pub async fn client() -> anyhow::Result<Client> {
 }
 
 impl Client {
+    /// Spawn + handshake a fresh `codex app-server`, injecting `extra_args` (a
+    /// session's `-c mcp_servers...` bus flags) and running in `cwd`. Each session
+    /// gets its OWN process so its per-thread MCP config is isolated — app-server
+    /// MCP is app-scoped, so one shared connection couldn't carry per-thread bus URLs.
+    pub async fn connect_session(
+        extra_args: &[String],
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<Client> {
+        let client = Client(Arc::new(Mutex::new(None)));
+        client.spawn_inner(extra_args, Some(cwd)).await?;
+        Ok(client)
+    }
+
+    /// Whether the connection is still alive (read_loop clears the inner on EOF).
+    pub async fn is_alive(&self) -> bool {
+        self.0.lock().await.is_some()
+    }
+
+    /// Kill the connection: drops the child (kill_on_drop) and closes the thread
+    /// sinks, so the per-session consumer task exits.
+    pub async fn shutdown(&self) {
+        *self.0.lock().await = None;
+    }
+
     async fn connect(&self) -> anyhow::Result<()> {
+        self.spawn_inner(&[], None).await
+    }
+
+    async fn spawn_inner(
+        &self,
+        extra_args: &[String],
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
         if g.is_some() {
             return Ok(());
         }
-        let mut child = Command::new("codex")
-            .arg("app-server")
+        let mut command = Command::new("codex");
+        command.arg("app-server").arg("--stdio").args(extra_args);
+        if let Some(c) = cwd {
+            command.current_dir(c);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -568,6 +676,7 @@ mod tests {
 
     #[test]
     fn maps_streaming_notifications_to_events() {
+        // agent text streams token-by-token.
         match notification_to_event(
             "item/agentMessage/delta",
             &json!({"threadId":"t","turnId":"u","itemId":"i","delta":"He"}),
@@ -575,17 +684,60 @@ mod tests {
             Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "He"),
             e => panic!("{e:?}"),
         }
+        // commandExecution started → a running tool row with id + input (camelCase
+        // shape verified live, codex-cli 0.139.0).
         match notification_to_event(
             "item/started",
-            &json!({"item":{"id":"i","type":"commandExecution","command":"npm test"}}),
+            &json!({"item":{"id":"call_1","type":"commandExecution","command":"echo hi","cwd":"/tmp","status":"inProgress"}}),
         ) {
             Some(ChatEvent::Assistant { tools, .. }) => {
                 assert_eq!(tools[0].name, "commandExecution");
-                assert_eq!(tools[0].summary, "npm test");
-                assert!(tools[0].id.is_empty());
+                assert_eq!(tools[0].id, "call_1");
+                assert_eq!(tools[0].summary, "echo hi");
+                assert_eq!(tools[0].input["command"], "echo hi");
+                assert!(tools[0].output.is_none());
             }
             e => panic!("{e:?}"),
         }
+        // commandExecution completed → ToolResults (aggregatedOutput + exitCode).
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_1","type":"commandExecution","aggregatedOutput":"hi\n","exitCode":0,"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => {
+                assert_eq!(items[0].id, "call_1");
+                assert_eq!(items[0].output, "hi\n");
+                assert!(!items[0].is_error);
+            }
+            e => panic!("{e:?}"),
+        }
+        // fileChange completed → its diff(s) as output; non-zero exit / failed = error.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_2","type":"fileChange","changes":[{"path":"/r/x","kind":{"type":"add"},"diff":"hi\n"}],"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert_eq!(items[0].output, "hi\n"),
+            e => panic!("{e:?}"),
+        }
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_3","type":"commandExecution","aggregatedOutput":"","exitCode":1,"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert!(items[0].is_error),
+            e => panic!("{e:?}"),
+        }
+        // thread/tokenUsage/updated → current context (last.inputTokens) + window.
+        match notification_to_event(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage":{"last":{"inputTokens":18440},"modelContextWindow":258400}}),
+        ) {
+            Some(ChatEvent::Usage { context_tokens, window }) => {
+                assert_eq!(context_tokens, 18440);
+                assert_eq!(window, Some(258400));
+            }
+            e => panic!("{e:?}"),
+        }
+        // error item → text; agentMessage/userMessage/reasoning + lifecycle ignored.
         match notification_to_event(
             "item/started",
             &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
@@ -593,13 +745,14 @@ mod tests {
             Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "unknown slash command"),
             e => panic!("{e:?}"),
         }
-        // agentMessage text already streamed via deltas — item/completed is a
-        // no-op to avoid double-rendering (verified against live 0.137.0).
         assert!(notification_to_event(
             "item/completed",
             &json!({"item":{"id":"i","type":"agentMessage","text":"done"}}),
         )
         .is_none());
+        assert!(
+            notification_to_event("item/started", &json!({"item":{"type":"userMessage"}})).is_none()
+        );
         assert!(matches!(
             notification_to_event("turn/completed", &json!({"turn":{"status":"completed"}})),
             Some(ChatEvent::TurnEnd { is_error: false, .. })
@@ -608,7 +761,6 @@ mod tests {
             notification_to_event("turn/completed", &json!({"turn":{"status":"failed"}})),
             Some(ChatEvent::TurnEnd { is_error: true, .. })
         ));
-        // reasoning + lifecycle markers are ignored
         assert!(
             notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none()
         );

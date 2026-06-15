@@ -40,8 +40,8 @@ pub struct McpServer {
 /// A tool invocation captured from the stream. Carries enough to render an
 /// expandable row — the full `input` plus a compact `summary` for the collapsed
 /// line. `output` is set only when the dialect delivers the result inline
-/// (opencode's completed `tool_use`); claude sends results separately as
-/// `ToolResults`, and codex builds pill-only calls (empty `id`, no `input`).
+/// (opencode's completed `tool_use`); claude and codex send results separately as
+/// `ToolResults`, merged into the running row by `id`.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
     pub id: String,
@@ -50,21 +50,6 @@ pub struct ToolCall {
     pub summary: String,
     pub output: Option<String>,
     pub is_error: bool,
-}
-
-impl ToolCall {
-    /// Pill-only call (codex exec items): name + compact summary, no id/io — the
-    /// engine renders these as a transient activity pill, not a persisted row.
-    pub(crate) fn pill(name: impl Into<String>, summary: impl Into<String>) -> Self {
-        Self {
-            id: String::new(),
-            name: name.into(),
-            input: Value::Null,
-            summary: summary.into(),
-            output: None,
-            is_error: false,
-        }
-    }
 }
 
 /// One tool result block (claude `user` message), correlated to its `Assistant`
@@ -106,6 +91,12 @@ pub enum ChatEvent {
         /// 当前上下文 token(input + cache_read + cache_creation);拿不到为 None。
         context_tokens: Option<u64>,
     },
+    /// 带外 token 用量(codex app-server `thread/tokenUsage/updated`):当前上下文
+    /// (最近一次模型调用的 input)+ 模型窗口。区别于 TurnEnd 的会话级累计。
+    Usage {
+        context_tokens: u64,
+        window: Option<u64>,
+    },
     /// Response to our `initialize` control_request: the CLI's slash commands.
     /// Sent right after spawn — the `init` system message only arrives with the
     /// FIRST user turn, far too late for the composer's palette.
@@ -145,11 +136,14 @@ fn parse_codex(line: &str) -> ChatEvent {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return ChatEvent::Other;
     };
-    match v["type"].as_str() {
-        Some("item.completed") | Some("item.started") => {
+    let kind = v["type"].as_str();
+    match kind {
+        Some("item.started") | Some("item.completed") => {
+            let completed = kind == Some("item.completed");
             let item = &v["item"];
             match item["type"].as_str() {
-                Some("agent_message") if v["type"] == "item.completed" => ChatEvent::Assistant {
+                // codex exec has no deltas: full text arrives on completed.
+                Some("agent_message") if completed => ChatEvent::Assistant {
                     texts: item["text"]
                         .as_str()
                         .map(|t| vec![t.to_string()])
@@ -160,21 +154,19 @@ fn parse_codex(line: &str) -> ChatEvent {
                 Some("error") => ChatEvent::TextDelta {
                     text: error_text_from_item(item),
                 },
-                Some(other) => {
-                    // command_execution / file_change / mcp_tool_call / reasoning…
-                    if other == "reasoning" {
-                        return ChatEvent::Other;
-                    }
-                    let summary = ["command", "text", "name", "path"]
-                        .iter()
-                        .find_map(|k| item[k].as_str())
-                        .unwrap_or_default();
-                    ChatEvent::Assistant {
-                        texts: vec![],
-                        tools: vec![ToolCall::pill(
-                            other,
-                            summary.chars().take(120).collect::<String>(),
-                        )],
+                Some("reasoning") => ChatEvent::Other,
+                // Tool item: started → running row, completed → its result, merged
+                // by item id (like claude's tool_use → tool_result).
+                Some(_) => {
+                    if completed {
+                        ChatEvent::ToolResults {
+                            items: vec![codex_tool_result(item)],
+                        }
+                    } else {
+                        ChatEvent::Assistant {
+                            texts: vec![],
+                            tools: vec![codex_tool_call(item)],
+                        }
                     }
                 }
                 None => ChatEvent::Other,
@@ -182,8 +174,9 @@ fn parse_codex(line: &str) -> ChatEvent {
         }
         Some("turn.completed") => ChatEvent::TurnEnd {
             is_error: false,
-            // codex usage.input_tokens 已含 cached 子集,即本回合送入的上下文体量。
-            context_tokens: v["usage"]["input_tokens"].as_u64(),
+            // exec 的 input_tokens 是会话累计吞吐量,不是当前上下文(实测会随 resume 累加),
+            // 当 % 分子会涨到 100% —— 不上报;准确值由 app-server 的 last_token_usage 给。
+            context_tokens: None,
         },
         Some("turn.failed") | Some("error") => ChatEvent::TurnEnd {
             is_error: true,
@@ -191,6 +184,96 @@ fn parse_codex(line: &str) -> ChatEvent {
         },
         _ => ChatEvent::Other,
     }
+}
+
+/// Running `ToolCall` from a codex `item.started` tool item; `output` filled
+/// later by the matching `item.completed`.
+fn codex_tool_call(item: &Value) -> ToolCall {
+    ToolCall {
+        id: item["id"].as_str().unwrap_or_default().to_string(),
+        name: item["type"].as_str().unwrap_or("tool").to_string(),
+        input: cap_input(codex_tool_input(item)),
+        summary: codex_tool_summary(item),
+        output: None,
+        is_error: false,
+    }
+}
+
+/// Result of a codex `item.completed` tool item, keyed by item id so the engine
+/// merges its output into the running row.
+fn codex_tool_result(item: &Value) -> ToolResultItem {
+    ToolResultItem {
+        id: item["id"].as_str().unwrap_or_default().to_string(),
+        output: cap_output(codex_item_output(item)),
+        is_error: codex_item_is_error(item),
+    }
+}
+
+/// The call's descriptive fields (command/cwd, changes/path, mcp server/tool/args)
+/// for the row's Input block; skips status/output/id noise.
+fn codex_tool_input(item: &Value) -> Value {
+    let mut obj = serde_json::Map::new();
+    for k in [
+        "command",
+        "cwd",
+        "changes",
+        "path",
+        "server",
+        "tool",
+        "arguments",
+        "invocation",
+    ] {
+        match item.get(k) {
+            Some(val) if !val.is_null() => {
+                obj.insert(k.to_string(), val.clone());
+            }
+            _ => {}
+        }
+    }
+    Value::Object(obj)
+}
+
+/// A compact, truncated summary for the collapsed tool row.
+fn codex_tool_summary(item: &Value) -> String {
+    let s = ["command", "tool", "path", "name"]
+        .iter()
+        .find_map(|k| item[k].as_str())
+        .map(String::from)
+        .or_else(|| item["changes"][0]["path"].as_str().map(String::from))
+        .unwrap_or_default();
+    s.chars().take(120).collect()
+}
+
+/// Output text for the expanded row: command stdout / mcp result, or — for a
+/// file_change (no inline diff) — a `kind  path` line per change.
+fn codex_item_output(item: &Value) -> String {
+    if let Some(s) = ["aggregated_output", "unified_diff", "diff", "output", "result"]
+        .iter()
+        .find_map(|k| item[k].as_str())
+    {
+        return s.to_string();
+    }
+    if let Some(changes) = item["changes"].as_array() {
+        return changes
+            .iter()
+            .filter_map(|c| {
+                let path = c["path"].as_str()?;
+                let kind = c["kind"].as_str().unwrap_or("change");
+                Some(format!("{kind}  {path}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    String::new()
+}
+
+/// Whether a completed codex tool item failed: a non-zero `exit_code`
+/// (command_execution) or a failed/error `status`.
+fn codex_item_is_error(item: &Value) -> bool {
+    if let Some(code) = item["exit_code"].as_i64() {
+        return code != 0;
+    }
+    matches!(item["status"].as_str(), Some("failed") | Some("error"))
 }
 
 fn parse_opencode(line: &str) -> ChatEvent {
@@ -664,16 +747,18 @@ mod tests {
             ChatEvent::Assistant { texts, .. } => assert_eq!(texts, vec!["ok"]),
             e => panic!("{e:?}"),
         }
+        // item.started for a tool item → a running row with id + input (shape
+        // verified live, codex-cli 0.139.0).
         match parse_line_for(
             "codex",
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"npm test"}}"#,
+            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo hi'","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#,
         ) {
             ChatEvent::Assistant { tools, .. } => {
                 assert_eq!(tools[0].name, "command_execution");
-                assert_eq!(tools[0].summary, "npm test");
-                // codex stays a transient pill: no correlation id, no persisted io
-                assert!(tools[0].id.is_empty());
-                assert!(tools[0].output.is_none());
+                assert_eq!(tools[0].id, "item_1"); // stable id correlates started→completed
+                assert_eq!(tools[0].summary, "/bin/zsh -lc 'echo hi'");
+                assert_eq!(tools[0].input["command"], "/bin/zsh -lc 'echo hi'");
+                assert!(tools[0].output.is_none()); // running: filled by item.completed
             }
             e => panic!("{e:?}"),
         }
@@ -691,12 +776,87 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_completed_carries_context_tokens() {
+    fn codex_tool_item_completes_into_tool_result() {
+        // command_execution completed → ToolResults (stdout + exit_code), keyed by
+        // item id (shape verified live, codex-cli 0.139.0).
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo hi'","aggregated_output":"hi\n","exit_code":0,"status":"completed"}}"#,
+        ) {
+            ChatEvent::ToolResults { items } => {
+                assert_eq!(items[0].id, "item_1");
+                assert_eq!(items[0].output, "hi\n");
+                assert!(!items[0].is_error);
+            }
+            e => panic!("{e:?}"),
+        }
+        // A non-zero exit code marks the result as an error.
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"false","aggregated_output":"","exit_code":1,"status":"completed"}}"#,
+        ) {
+            ChatEvent::ToolResults { items } => {
+                assert_eq!(items[0].id, "item_2");
+                assert!(items[0].is_error);
+            }
+            e => panic!("{e:?}"),
+        }
+        // agent_message still completes as assistant text, not a tool result.
+        assert!(matches!(
+            parse_line_for(
+                "codex",
+                r#"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"done"}}"#,
+            ),
+            ChatEvent::Assistant { .. }
+        ));
+    }
+
+    #[test]
+    fn codex_file_change_item_captures_paths() {
+        // file_change has no diff, only `changes:[{path,kind}]`; output lists
+        // `kind  path` (shape verified live, codex-cli 0.139.0).
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.started","item":{"id":"item_3","type":"file_change","changes":[{"path":"/repo/hello.txt","kind":"add"}],"status":"in_progress"}}"#,
+        ) {
+            ChatEvent::Assistant { tools, .. } => {
+                assert_eq!(tools[0].name, "file_change");
+                assert_eq!(tools[0].id, "item_3");
+                assert_eq!(tools[0].summary, "/repo/hello.txt");
+                assert!(tools[0].output.is_none());
+            }
+            e => panic!("{e:?}"),
+        }
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/repo/hello.txt","kind":"add"}],"status":"completed"}}"#,
+        ) {
+            ChatEvent::ToolResults { items } => {
+                assert_eq!(items[0].id, "item_3");
+                assert_eq!(items[0].output, "add  /repo/hello.txt");
+                assert!(!items[0].is_error);
+            }
+            e => panic!("{e:?}"),
+        }
+        // A failed file_change (status) is flagged as an error.
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"item_4","type":"file_change","changes":[{"path":"/repo/x","kind":"add"}],"status":"failed"}}"#,
+        ) {
+            ChatEvent::ToolResults { items } => assert!(items[0].is_error),
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_turn_completed_does_not_report_cumulative_usage_as_context() {
+        // exec's input_tokens is cumulative session throughput, not current context
+        // (verified live), so we report None rather than a value that climbs to 100%.
         let l = r#"{"type":"turn.completed","usage":{"input_tokens":47163,"cached_input_tokens":27392,"output_tokens":284}}"#;
         match parse_line_for("codex", l) {
             ChatEvent::TurnEnd { context_tokens, is_error } => {
                 assert!(!is_error);
-                assert_eq!(context_tokens, Some(47163)); // input_tokens 已含 cached 子集
+                assert_eq!(context_tokens, None);
             }
             e => panic!("{e:?}"),
         }
