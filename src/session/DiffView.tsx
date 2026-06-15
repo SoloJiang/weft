@@ -24,18 +24,22 @@ import { Tooltip } from "../components/ui/Tooltip";
 export function DiffView({
   cwd,
   directionId,
+  open = true,
   onAsk,
 }: {
   cwd: string;
   /** The task whose worktree this is — enables the "vs target" mode + editor. */
   directionId?: number | null;
+  /** Whether the diff rail is open. Polling pauses while closed; reopening
+   *  re-runs the effect (so target mode re-fetches the latest remote). */
+  open?: boolean;
   /** Deliver an annotation question to the responsible worker. */
   onAsk?: (text: string) => void;
 }) {
   const { t } = useTranslation();
   const [diff, setDiff] = useState<WorktreeDiff | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [open, setOpen] = useState<Record<string, boolean>>({});
+  const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
   const [touched, setTouched] = useState(false);
   /** The annotation being composed: a file, optionally pinned to one line. */
   const [ask, setAsk] = useState<{ path: string; line?: DiffLine } | null>(null);
@@ -55,14 +59,25 @@ export function DiffView({
   const targetMode = mode === "target" && canTarget;
 
   useEffect(() => {
+    // Don't poll a closed rail (DiffPanel keeps us mounted at width 0). Reopening
+    // flips `open` true and re-runs this effect, so target mode re-fetches the
+    // latest remote — fixing a stale diff after the rail was closed a while.
+    if (!open) return;
     let alive = true;
-    // Fetch origin/<target> only on the first tick of a (re)entered target view;
+    // Fetch origin/<target> only on the FIRST tick of a (re)entered target view;
     // the 3s poll afterwards recomputes against the cached ref (cheap, no network).
     let fresh = true;
+    // Skip a tick while one is still in flight, so a slow/hanging fetch can't
+    // pile up overlapping git-fetch subprocesses on the 3s interval.
+    let inFlight = false;
     const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      const doFetch = fresh; // one-shot: capture + clear before awaiting
+      fresh = false;
       try {
         if (targetMode && directionId != null) {
-          const d = await api.worktreeDiffTarget(cwd, directionId, fresh);
+          const d = await api.worktreeDiffTarget(cwd, directionId, doFetch);
           if (alive) {
             setDiff({ files: d.files, patch: d.patch });
             setTgt({ target: d.target, defaultBranch: d.default_branch, resolved: d.resolved });
@@ -77,12 +92,13 @@ export function DiffView({
         }
       } catch {
         /* not ready */
+      } finally {
+        inFlight = false;
       }
-      fresh = false;
     };
-    // Clear the prior view's data on a mode / worktree / reload change so the
-    // panel never flashes the old mode's file list (or stale target value)
-    // before the first tick of the new view resolves.
+    // Clear the prior view's data on a mode / worktree / reload / reopen change
+    // so the panel never flashes the old view's file list (or stale target
+    // value) before the first tick of the new view resolves.
     setDiff(null);
     setTgt(null);
     setLoaded(false);
@@ -92,7 +108,7 @@ export function DiffView({
       alive = false;
       clearInterval(h);
     };
-  }, [cwd, targetMode, directionId, reload]);
+  }, [cwd, targetMode, directionId, reload, open]);
 
   const bodyByPath = useMemo(() => parsePatch(diff?.patch ?? ""), [diff?.patch]);
 
@@ -100,10 +116,10 @@ export function DiffView({
   const isEmpty = loaded && files.length === 0;
   // Default: expand all when few files, collapse when many (until the user acts).
   const isOpen = (p: string) =>
-    touched ? !!open[p] : files.length <= 4;
+    touched ? !!openFiles[p] : files.length <= 4;
   const toggle = (p: string) => {
     setTouched(true);
-    setOpen((m) => ({ ...m, [p]: !isOpen(p) }));
+    setOpenFiles((m) => ({ ...m, [p]: !isOpen(p) }));
   };
 
   const totalAdded = files.reduce((s, f) => s + f.added, 0);

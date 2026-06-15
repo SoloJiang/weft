@@ -134,9 +134,20 @@ pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<Ta
     // fetches as `main` rather than failing on `git fetch origin origin/main`.
     let target = normalize_target(target);
     if fetch && !target.is_empty() && target != "HEAD" {
-        // Best-effort; a failed fetch (offline / no remote / auth) must not
-        // abort the diff — we fall through to the cached origin/<target>.
-        let _ = git(worktree_path, &["fetch", "--quiet", "origin", &target]);
+        // Explicit destination refspec so the branch lands in
+        // refs/remotes/origin/<target> regardless of the clone's configured
+        // remote.origin.fetch — a --single-branch clone otherwise drops an
+        // unmapped branch in FETCH_HEAD only, and resolve_target_ref would
+        // miss origin/<target> and silently fall back to the default branch.
+        // Best-effort (offline / no remote / branch absent must not abort the
+        // diff); GIT_TERMINAL_PROMPT=0 makes a credential-needing fetch fail
+        // fast instead of hanging on a prompt.
+        let refspec = format!("+{target}:refs/remotes/origin/{target}");
+        let _ = Command::new("git")
+            .args(["fetch", "--quiet", "origin", &refspec])
+            .current_dir(worktree_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output();
     }
     let resolved = resolve_target_ref(worktree_path, &target);
     // PR-style base = merge-base(resolved, HEAD). If it fails (unrelated
@@ -671,6 +682,51 @@ mod tests {
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn target_fetch_uses_explicit_refspec_updates_remote_tracking() {
+        // origin with main + a develop branch that has an extra commit.
+        let origin = tmp("rfs-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        std::fs::write(origin.join("d.txt"), "d\n").unwrap();
+        git(&origin, &["add", "-A"]).unwrap();
+        git(&origin, &["commit", "-q", "-m", "develop work"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        // Clone, then narrow remote.origin.fetch to main-only and drop
+        // origin/develop — simulating a --single-branch clone.
+        let clone = tmp("rfs-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        git(
+            &clone,
+            &[
+                "config",
+                "remote.origin.fetch",
+                &format!("+refs/heads/{main}:refs/remotes/origin/{main}"),
+            ],
+        )
+        .unwrap();
+        let _ = git(&clone, &["update-ref", "-d", "refs/remotes/origin/develop"]);
+        assert!(
+            !ref_resolves(&clone, "origin/develop"),
+            "precondition: origin/develop pruned"
+        );
+
+        // target_diff(develop, fetch=true) must repopulate origin/develop via the
+        // explicit refspec (the plain `git fetch origin develop` would land it in
+        // FETCH_HEAD only under the narrowed mapping) and resolve to it.
+        let td = target_diff(&clone, "develop", true).unwrap();
+        assert_eq!(td.resolved, "origin/develop");
+
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
     }
 
     #[test]

@@ -98,7 +98,7 @@ export function DiffPanel({
             <X size={15} />
           </button>
         </header>
-        <DiffView cwd={cwd} directionId={directionId} onAsk={onAsk} />
+        <DiffView cwd={cwd} directionId={directionId} open={open} onAsk={onAsk} />
       </aside>
     </div>
   );
