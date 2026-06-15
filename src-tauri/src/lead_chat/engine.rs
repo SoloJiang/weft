@@ -1548,12 +1548,11 @@ async fn codex_consumer(
                 eng.lock().await.clock.last_activity = std::time::Instant::now();
             }
             ThreadMsg::Approval { id, method, params } => {
-                // Route every blocking server ask (approval / permissions /
-                // elicitation) through Weft's Ask Bridge (the same Needs-you surface
-                // the exec path uses), then reply with the SHAPE that ask kind wants:
-                // approval `{decision}`, permissions `{permissions}`, elicitation
-                // `{action}` — a wrong shape leaves the turn hung or the grant a no-op.
-                let is_elicit = crate::codex_app_server::is_elicitation_request(&method);
+                // An approval (command / file-change / permissions) — route to Weft's
+                // Ask Bridge (the same Needs-you the exec path uses), then reply with
+                // the SHAPE that kind wants: permissions `{permissions}` (omitted =
+                // denied), everything else `{decision}`. Elicitation / other server
+                // asks never reach here — they're declined in the read_loop.
                 let is_perm = method.contains("permissions");
                 let (thread_id, dir) = {
                     let i = eng.lock().await;
@@ -1573,34 +1572,38 @@ async fn codex_consumer(
                     .as_array()
                     .or_else(|| params["item"]["changes"].as_array())
                     .is_some_and(|c| !c.is_empty());
-                let (tool, summary) = if is_elicit {
-                    // An MCP server is asking the user for input — show its prompt.
-                    let msg = params["message"]
-                        .as_str()
-                        .or_else(|| params["params"]["message"].as_str())
-                        .or_else(|| params["elicitation"]["message"].as_str())
-                        .unwrap_or("MCP server requests input");
-                    ("Ask", msg.chars().take(200).collect::<String>())
-                } else if is_cmd {
-                    ("Bash", cmd.unwrap_or("(command)").to_string())
-                } else if let Some(net) = net {
-                    // Network-only approval: classify distinctly so it isn't shown
-                    // (and Always-keyed) as "apply file changes".
+                // Requested permission profile (also echoed back as the grant on allow).
+                let requested = params
+                    .get("permissions")
+                    .or_else(|| params["item"].get("permissions"))
+                    .or_else(|| params["params"].get("permissions"))
+                    .filter(|v| !v.is_null())
+                    .cloned();
+                // Network FIRST: a network-only ask arrives as a commandExecution
+                // approval (so is_cmd is true) with the command omitted, so the cmd
+                // branch would otherwise mislabel + Always-key it as Bash.
+                let (tool, summary) = if let Some(net) = net {
                     let host = net["host"]
                         .as_str()
                         .or_else(|| net["url"].as_str())
                         .or_else(|| net["domain"].as_str())
                         .unwrap_or("network");
                     ("Network", format!("network access: {host}"))
+                } else if is_cmd {
+                    ("Bash", cmd.unwrap_or("(command)").to_string())
                 } else if has_changes {
                     // Include the changed path(s): the AskRegistry keys Always rules
                     // by (thread, dir, summary), so a constant "apply file changes"
                     // would let one Always blanket-allow every later edit.
                     ("Edit", codex_change_approval_summary(&params))
                 } else {
-                    // Some other permission escalation — don't mislabel it as a file
-                    // edit (which would also taint the file-change Always summary).
-                    ("Permission", "permission request".to_string())
+                    // A permission escalation — key it by the REQUESTED scope, else an
+                    // Always for one profile silently grants a later, different one.
+                    let scope = requested
+                        .as_ref()
+                        .map(|v| v.to_string().chars().take(120).collect::<String>())
+                        .unwrap_or_else(|| "(unspecified)".to_string());
+                    ("Permission", format!("permission: {scope}"))
                 };
                 let detail = params["cwd"]
                     .as_str()
@@ -1617,22 +1620,12 @@ async fn codex_consumer(
                     }
                 };
                 let allow = matches!(decision, crate::ask::Decision::Allow);
-                // Reply with the shape this ask kind expects.
-                let result = if is_elicit {
-                    serde_json::json!({ "action": if allow { "accept" } else { "decline" } })
-                } else if is_perm {
-                    // Permission asks are answered with the GRANTED permissions
-                    // (omitted = denied), not a decision: echo the requested set on
-                    // allow, none on deny. Without this an approved permission is a
-                    // silent no-op.
+                let result = if is_perm {
+                    // Answered with the GRANTED permissions (omitted = denied): echo
+                    // the requested set on allow, none on deny — a `{decision}` reply
+                    // would silently no-op an approved permission.
                     let granted = if allow {
-                        params
-                            .get("permissions")
-                            .or_else(|| params["item"].get("permissions"))
-                            .or_else(|| params["params"].get("permissions"))
-                            .filter(|v| !v.is_null())
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([]))
+                        requested.unwrap_or_else(|| serde_json::json!([]))
                     } else {
                         serde_json::json!([])
                     };
@@ -1644,7 +1637,13 @@ async fn codex_consumer(
             }
         }
     }
-    cleanup_disconnected_turn(&app, &db, &eng, "error").await;
+    // Only a GENUINE disconnect runs the turn cleanup. If the engine's client was
+    // taken/replaced (the exec-fallback teardown shut us down on purpose), skip it
+    // — else this cleanup races spawn_turn and can kill/stop the fallback turn.
+    let still_active = matches!(&eng.lock().await.codex_client, Some(c) if c.ptr_eq(&client));
+    if still_active {
+        cleanup_disconnected_turn(&app, &db, &eng, "error").await;
+    }
 }
 
 /// Specific Needs-you summary for an app-server file-change approval: the

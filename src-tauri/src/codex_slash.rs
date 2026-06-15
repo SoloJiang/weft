@@ -309,23 +309,28 @@ fn builtins() -> Vec<Builtin> {
 pub async fn discover_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
     let cwd = cwd.as_ref();
     let mut out = builtin_commands();
-    if let Ok(skills) = fetch_skills(Some(cwd)).await {
+    // Bound the app-server probe: a wedged helper can stall its request up to the
+    // client's 60s timeout, which would freeze the composer palette. On timeout we
+    // simply skip dynamic skills — built-ins + local still populate the list.
+    let fetch = tokio::time::timeout(std::time::Duration::from_secs(4), fetch_skills(Some(cwd)));
+    if let Ok(Ok(skills)) = fetch.await {
         push_unique(&mut out, skills);
     }
     push_unique(&mut out, local_skill_commands_for_cwd(cwd));
     out
 }
 
-/// The session's real skills (app-server `skills/list` + cwd `.agents`/`.claude`),
-/// deduped, no built-ins — for the session-info panel. Best-effort.
-pub(crate) async fn discover_skills_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
+/// The session's real skills for the info panel: `Some(engine ∪ local)` when the
+/// app-server probe succeeds (authoritative — `Some(vec![])` means "no skills",
+/// which clears the panel), `None` only when the probe FAILS (so the frontend
+/// keeps the previous list rather than treating "couldn't read" as "none").
+pub(crate) async fn discover_skills_for_cwd(cwd: impl AsRef<Path>) -> Option<Vec<SlashCmd>> {
     let cwd = cwd.as_ref();
-    let mut out = Vec::new();
-    if let Ok(skills) = fetch_skills(Some(cwd)).await {
-        push_unique(&mut out, skills);
-    }
+    // app-server is the authoritative source; if it errors we can't tell empty
+    // from unknown, so report failure (None) and let the panel keep its old list.
+    let mut out = fetch_skills(Some(cwd)).await.ok()?;
     push_unique(&mut out, local_skill_commands_for_cwd(cwd));
-    out
+    Some(out)
 }
 
 fn builtin_commands() -> Vec<SlashCmd> {

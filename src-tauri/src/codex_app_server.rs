@@ -56,6 +56,15 @@ pub fn encode_response(id: &Value, result: Value) -> String {
     format!("{}\n", json!({ "id": id, "result": result }))
 }
 
+/// Encode an error reply to a server-initiated request — our "can't satisfy this"
+/// answer to a blocking request we don't support, so the turn doesn't hang.
+pub fn encode_error_response(id: &Value, code: i64, message: &str) -> String {
+    format!(
+        "{}\n",
+        json!({ "id": id, "error": { "code": code, "message": message } })
+    )
+}
+
 // ── the core request builders (params shapes verified against v2 source) ──
 
 /// `initialize` params. capabilities.experimentalApi=false — the core
@@ -171,15 +180,11 @@ pub fn is_approval_request(method: &str) -> bool {
 }
 
 /// A blocking MCP elicitation (`mcpServer/elicitation/request`): a configured MCP
-/// server asking the user for input. Must be answered (`{action}`) or the turn
-/// hangs until a watchdog — so it's routed to the Ask Bridge like an approval.
+/// server asking the user for STRUCTURED input. Weft has no UI to collect that
+/// content, so it's declined (`{action:"decline"}`) rather than routed to a
+/// yes/no Ask Bridge that can't supply the required `content`.
 pub fn is_elicitation_request(method: &str) -> bool {
     method.ends_with("/elicitation/request")
-}
-
-/// Any server→client request that blocks the turn until Weft replies.
-pub fn is_server_ask(method: &str) -> bool {
-    is_approval_request(method) || is_elicitation_request(method)
 }
 
 /// Map a server notification to the engine's `ChatEvent`. Tool items (camelCase:
@@ -463,6 +468,30 @@ impl Client {
         self.0.lock().await.is_some()
     }
 
+    /// Same underlying connection? Lets a consumer tell a genuine disconnect (still
+    /// the engine's active client → run the disconnect cleanup) from an intentional
+    /// teardown/replace (client taken or swapped → skip cleanup, don't clobber the
+    /// exec fallback turn).
+    pub fn ptr_eq(&self, other: &Client) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Decline a non-approval server request so the turn doesn't hang: elicitation
+    /// gets the README's `{action:"decline"}` (we can't collect its content), any
+    /// other unsupported blocking request gets a JSON-RPC error reply.
+    async fn decline_server_request(&self, id: &Value, method: &str) {
+        if is_elicitation_request(method) {
+            let _ = self.reply_result(id, json!({ "action": "decline" })).await;
+        } else {
+            let mut g = self.0.lock().await;
+            if let Some(inner) = g.as_mut() {
+                let line = encode_error_response(id, -32601, "unsupported request");
+                let _ = inner.stdin.write_all(line.as_bytes()).await;
+                let _ = inner.stdin.flush().await;
+            }
+        }
+    }
+
     /// Kill the connection: drops the child (kill_on_drop) and closes the thread
     /// sinks, so the per-session consumer task exits.
     pub async fn shutdown(&self) {
@@ -569,15 +598,20 @@ impl Client {
                     }
                 }
                 Incoming::ServerRequest { id, method, params } => {
-                    // Approvals AND elicitations block the turn until answered — route
-                    // both to the Ask Bridge (each gets its own reply shape there).
-                    if is_server_ask(&method) {
+                    // Approvals route to the Ask Bridge (user decides). EVERY other
+                    // server→client request also blocks the turn until answered, but
+                    // it needs interactive content Weft can't collect (elicitation,
+                    // requestUserInput, future kinds) — decline so the turn proceeds
+                    // instead of hanging until a watchdog.
+                    if is_approval_request(&method) {
                         let tid = params["threadId"].as_str().map(String::from);
                         self.route_resolved(
                             tid.as_deref(),
                             ThreadMsg::Approval { id, method, params },
                         )
                         .await;
+                    } else {
+                        self.decline_server_request(&id, &method).await;
                     }
                 }
                 Incoming::Other => {}
@@ -1042,14 +1076,25 @@ mod tests {
     }
 
     #[test]
-    fn server_asks_include_elicitation() {
-        // Elicitation is a blocking ask too — it must route (else the turn hangs),
-        // but it is NOT an approval (different reply shape: {action} vs {decision}).
+    fn elicitation_is_not_an_approval() {
+        // Elicitation blocks the turn but is NOT an approval: it's declined in the
+        // read_loop (we can't collect its content), not routed to the Ask Bridge.
         assert!(is_elicitation_request("mcpServer/elicitation/request"));
         assert!(!is_approval_request("mcpServer/elicitation/request"));
-        assert!(is_server_ask("mcpServer/elicitation/request"));
-        assert!(is_server_ask("item/commandExecution/requestApproval"));
-        assert!(!is_server_ask("turn/completed"));
+        // requestUserInput is likewise not an approval → declined generically.
+        assert!(!is_approval_request("item/tool/requestUserInput"));
+        assert!(!is_elicitation_request("item/tool/requestUserInput"));
+    }
+
+    #[test]
+    fn error_response_encodes_id_and_message() {
+        let v: Value =
+            serde_json::from_str(encode_error_response(&json!("a1"), -32601, "nope").trim())
+                .unwrap();
+        assert_eq!(v["id"], json!("a1"));
+        assert_eq!(v["error"]["code"], -32601);
+        assert_eq!(v["error"]["message"], "nope");
+        assert!(v.get("result").is_none());
     }
 
     #[test]

@@ -217,14 +217,15 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
         }
         _ => None,
     };
-    // best-effort + 10s 上限,空 → None(保留旧行,不把"读不到"当"没有")。
+    // best-effort + 10s 上限。probe 成功(Ok(Some))即权威——即使为空也回 Some(vec![])
+    // 让面板清掉旧技能;只有 probe 失败 / 超时(Ok(None) / Err)才回 None 保留旧行。
     let skills = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         crate::codex_slash::discover_skills_for_cwd(cwd),
     )
     .await
     {
-        Ok(found) if !found.is_empty() => Some(
+        Ok(Some(found)) => Some(
             found
                 .into_iter()
                 .map(|c| SkillInfo {
