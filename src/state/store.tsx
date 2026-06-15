@@ -200,6 +200,13 @@ interface Store {
   renameDirection: (directionId: number, name: string) => Promise<void>;
   addRepo: (name: string, path: string) => Promise<void>;
   cloneRepo: (url: string, dest: string, name: string) => Promise<void>;
+  /** Batch clone: each item to `<dest>/<name>`, sequential + tolerant. Reports
+   *  per-item progress; refreshes the repo list once at the end. */
+  importRepos: (
+    items: Array<{ url: string; name: string }>,
+    dest: string,
+    onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+  ) => Promise<void>;
   createRepo: (name: string, dest: string) => Promise<void>;
   createThread: (title: string, kind: string) => Promise<Thread>;
   createDirection: (
@@ -673,6 +680,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (name: string, dest: string) => {
       if (activeWorkspaceId == null) return;
       await api.createRepo(activeWorkspaceId, name, dest);
+      await refreshReposAndMap(activeWorkspaceId);
+    },
+    [activeWorkspaceId, refreshReposAndMap],
+  );
+
+  const importRepos = useCallback(
+    async (
+      items: Array<{ url: string; name: string }>,
+      dest: string,
+      onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+    ) => {
+      if (activeWorkspaceId == null) return;
+      // Sequential + tolerant: one failed clone doesn't abort the rest.
+      for (let i = 0; i < items.length; i++) {
+        onProgress(i, "cloning");
+        try {
+          await api.cloneRepo(activeWorkspaceId, items[i].url, dest, items[i].name);
+          onProgress(i, "ok");
+        } catch (e) {
+          onProgress(i, "error", String(e));
+        }
+      }
       await refreshReposAndMap(activeWorkspaceId);
     },
     [activeWorkspaceId, refreshReposAndMap],
@@ -1769,6 +1798,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     renameDirection,
     addRepo,
     cloneRepo,
+    importRepos,
     createRepo,
     createThread,
     createDirection,

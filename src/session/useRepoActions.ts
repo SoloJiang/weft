@@ -11,6 +11,7 @@ import { toast } from "../components/Toast";
 import { currentLang } from "../i18n";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
+import { repoNameFromUrl } from "../lib/gitUrl";
 import type { RepoRef } from "../lib/types";
 
 export type RepoActionKind = "add" | "new" | "clone";
@@ -186,10 +187,4 @@ function basename(p: string): string {
   const trimmed = p.replace(/[\\/]+$/, "");
   const parts = trimmed.split(/[\\/]/);
   return parts[parts.length - 1] || p;
-}
-
-function repoNameFromUrl(url: string): string {
-  const trimmed = url.trim().replace(/\.git$/i, "").replace(/[\\/]+$/, "");
-  const parts = trimmed.split(/[\\/:]/);
-  return parts[parts.length - 1] || "";
 }

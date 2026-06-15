@@ -1,9 +1,19 @@
 import type { ReactNode } from "react";
+import { cn } from "../../lib/cn";
 
 /** A zero-dependency hover tooltip: wraps its child, shows `label` above. */
-export function Tooltip({ label, children }: { label: string; children: ReactNode }) {
+export function Tooltip({
+  label,
+  children,
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  /** Extra classes for the wrapper (e.g. `w-full` so the child can stretch). */
+  className?: string;
+}) {
   return (
-    <span className="group/tip relative inline-flex">
+    <span className={cn("group/tip relative inline-flex", className)}>
       {children}
       <span
         role="tooltip"

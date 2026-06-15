@@ -1,13 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as RD from "@radix-ui/react-dialog";
 import { useTranslation } from "react-i18next";
-import { FolderOpen, Network, X } from "lucide-react";
+import { Check, FolderOpen, Loader2, Network, X } from "lucide-react";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Button } from "../components/ui/Button";
-import { Input, Field } from "../components/ui/Input";
+import { Input, Field, Textarea } from "../components/ui/Input";
 import { Select } from "../components/ui/Select";
+import { toast } from "../components/Toast";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
+import { parseGitUrls, repoNameFromUrl } from "../lib/gitUrl";
 import { cn } from "../lib/cn";
 
 export function CreateWorkspaceDialog({ open, onOpenChange }: DProps) {
@@ -108,19 +110,34 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: DProps) {
 type RepoMode = "local" | "clone" | "new";
 
 const basename = (p: string) => p.trim().replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? "";
-const repoNameFromUrl = (u: string) =>
-  u.trim().replace(/\.git$/, "").replace(/\/+$/, "").split(/[/:]/).filter(Boolean).pop() ?? "";
+
+type RowStatus = "queued" | "cloning" | "ok" | "error";
+
+/** Per-repo status icon in the batch-import list. */
+function StatusDot({ status }: { status: RowStatus }) {
+  if (status === "cloning")
+    return <Loader2 size={13} className="shrink-0 animate-spin text-brand" />;
+  if (status === "ok") return <Check size={13} className="shrink-0 text-running" />;
+  if (status === "error") return <X size={13} className="shrink-0 text-danger" />;
+  return <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-ink-faint/50" />;
+}
 
 export function AddRepoDialog({ open, onOpenChange }: DProps) {
-  const { addRepo, cloneRepo, createRepo, projectsDir } = useStore();
+  const { addRepo, importRepos, createRepo, projectsDir } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<RepoMode>("local");
   const [path, setPath] = useState(""); // local
-  const [url, setUrl] = useState(""); // clone
+  const [url, setUrl] = useState(""); // clone — one or many pasted URLs
   const [dest, setDest] = useState(""); // clone/new parent
-  const [name, setName] = useState(""); // all
+  const [name, setName] = useState(""); // local name / single-clone override / new name
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Record<number, { status: RowStatus; error?: string }>>(
+    {},
+  );
+
+  // Recognized git URLs parsed live from the paste box (deduped, first-seen order).
+  const recognized = useMemo(() => parseGitUrls(url), [url]);
 
   // Reset on close; default the destination to the configured projects dir.
   useEffect(() => {
@@ -132,21 +149,25 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
       setName("");
       setErr(null);
       setBusy(false);
+      setProgress({});
     } else {
       setDest(projectsDir);
     }
   }, [open, projectsDir]);
 
-  const finalName =
-    name.trim() ||
-    (mode === "local" ? basename(path) : mode === "clone" ? repoNameFromUrl(url) : "");
+  // Clear stale per-row status when the pasted URLs change.
+  useEffect(() => {
+    setProgress((p) => (Object.keys(p).length ? {} : p));
+  }, [url]);
+
+  const finalName = name.trim() || (mode === "local" ? basename(path) : "");
 
   const canSubmit =
     !busy &&
     (mode === "local"
       ? !!path.trim()
       : mode === "clone"
-        ? !!url.trim() && !!dest.trim()
+        ? recognized.length >= 1 && !!dest.trim()
         : !!name.trim() && !!dest.trim());
 
   async function submit() {
@@ -154,11 +175,41 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     setBusy(true);
     setErr(null);
     try {
-      const n = finalName || "repo";
-      if (mode === "local") await addRepo(n, path.trim());
-      else if (mode === "clone") await cloneRepo(url.trim(), dest.trim(), n);
-      else await createRepo(n, dest.trim());
-      onOpenChange(false);
+      if (mode === "local") {
+        await addRepo(finalName || "repo", path.trim());
+        onOpenChange(false);
+      } else if (mode === "new") {
+        await createRepo(finalName || "repo", dest.trim());
+        onOpenChange(false);
+      } else {
+        // clone — one or many recognized URLs, each into <dest>/<name>
+        const items =
+          recognized.length === 1
+            ? [
+                {
+                  url: recognized[0],
+                  name: name.trim() || repoNameFromUrl(recognized[0]) || "repo",
+                },
+              ]
+            : recognized.map((u) => ({ url: u, name: repoNameFromUrl(u) || "repo" }));
+        setProgress(
+          Object.fromEntries(items.map((_, i) => [i, { status: "queued" as RowStatus }])),
+        );
+        const errors: Array<string | undefined> = [];
+        await importRepos(items, dest.trim(), (i, status, error) => {
+          setProgress((p) => ({ ...p, [i]: { status, error } }));
+          if (status === "error") errors[i] = error;
+        });
+        const failed = errors.filter(Boolean).length;
+        if (failed === 0) {
+          if (items.length > 1) toast(t("dialog.importedToast", { count: items.length }));
+          onOpenChange(false);
+        } else if (items.length === 1) {
+          setErr(errors.find(Boolean) ?? t("dialog.importFailed"));
+        } else {
+          setErr(t("dialog.importSummary", { ok: items.length - failed, failed }));
+        }
+      }
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -181,7 +232,9 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
       : mode === "clone"
         ? busy
           ? t("dialog.cloning")
-          : t("dialog.cloneRepo")
+          : recognized.length > 1
+            ? t("dialog.cloneReposCta", { count: recognized.length })
+            : t("dialog.cloneRepo")
         : busy
           ? t("dialog.creating")
           : t("dialog.createRepoCta");
@@ -230,14 +283,49 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
 
           {mode === "clone" && (
             <>
-              <Field label={t("dialog.repoUrl")}>
-                <Input
+              <Field label={t("dialog.repoUrl")} hint={t("dialog.clonePasteHint")}>
+                <Textarea
                   autoFocus
-                  placeholder="https://github.com/acme/web-app.git"
+                  rows={3}
+                  placeholder={"https://github.com/acme/web-app.git\ngit@github.com:acme/api.git"}
                   value={url}
                   onChange={(e) => setUrl(e.currentTarget.value)}
                 />
               </Field>
+
+              {recognized.length >= 2 && (
+                <div className="flex flex-col gap-0.5 rounded-[var(--radius-md)] border border-border bg-bg/50 p-2">
+                  <div className="px-1 pb-1 text-[11px] text-ink-faint">
+                    {t("dialog.cloneRecognized", { count: recognized.length })}
+                  </div>
+                  {recognized.map((u, i) => {
+                    const row = progress[i];
+                    const status: RowStatus = row?.status ?? "queued";
+                    return (
+                      <div key={u} className="flex items-center gap-2 px-1 py-0.5 text-[12px]">
+                        <StatusDot status={status} />
+                        <span className="shrink-0 font-medium text-ink">
+                          {repoNameFromUrl(u) || "repo"}
+                        </span>
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate font-mono text-[11px]",
+                            status === "error" ? "text-danger" : "text-ink-faint",
+                          )}
+                          title={row?.error || u}
+                        >
+                          {row?.error || u}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {recognized.length === 0 && url.trim() !== "" && (
+                <p className="text-[12px] text-ink-faint">{t("dialog.cloneNoneRecognized")}</p>
+              )}
+
               <Field label={t("dialog.repoLocation")}>
                 <PathInput
                   value={dest}
@@ -260,20 +348,13 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
             </Field>
           )}
 
-          {mode !== "local" && (
+          {(mode === "local" ||
+            mode === "new" ||
+            (mode === "clone" && recognized.length === 1)) && (
             <Field label={t("dialog.repoName")}>
               <Input
                 autoFocus={mode === "new"}
-                placeholder="web-app"
-                value={name}
-                onChange={(e) => setName(e.currentTarget.value)}
-              />
-            </Field>
-          )}
-          {mode === "local" && (
-            <Field label={t("dialog.repoName")}>
-              <Input
-                placeholder={basename(path) || "web-app"}
+                placeholder={mode === "local" ? basename(path) || "web-app" : "web-app"}
                 value={name}
                 onChange={(e) => setName(e.currentTarget.value)}
               />
