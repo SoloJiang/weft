@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, ChevronRight, FileText, Sparkles } from "lucide-react";
+import { ArrowRight, Check, ChevronRight, Copy, FileText, Sparkles } from "lucide-react";
 import type { LeadMessage, ResolvedProposal } from "../lib/types";
 import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
@@ -621,8 +621,9 @@ function TimelineRow({
   if (m.role === "user") {
     const images = Array.isArray(c.images) ? (c.images as string[]) : [];
     const files = Array.isArray(c.files) ? (c.files as string[]) : [];
+    const text = String(c.text ?? "");
     return (
-      <div className="flex justify-end">
+      <div className="group flex flex-col items-end">
         <div
           className={cn(
             "flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5",
@@ -654,9 +655,9 @@ function TimelineRow({
               ))}
             </div>
           )}
-          {String(c.text ?? "") && (
+          {text && (
             <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-ink">
-              {String(c.text ?? "")}
+              {text}
             </p>
           )}
           {m.status === "queued" && (
@@ -668,6 +669,7 @@ function TimelineRow({
             <p className="self-end text-[11px] text-danger">{t("lead.errored")}</p>
           )}
         </div>
+        {text && <CopyMessageButton text={text} align="end" />}
       </div>
     );
   }
@@ -681,20 +683,25 @@ function TimelineRow({
         ? t("lead.terminalInterruptedBeforeOutput")
         : String(c.text ?? "");
   return (
-    <div className="flex items-start gap-2.5">
+    <div className="group flex items-start gap-2.5">
       <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
         <Sparkles size={14} />
       </span>
-      <div className="min-w-0 flex-1 rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-        {assistantText && <Markdown text={assistantText} cwd={cwd} />}
-        {m.status === "streaming" && (
-          <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
-        )}
-        {m.status === "interrupted" && (
-          <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>
-        )}
-        {m.status === "error" && (
-          <p className="mt-1.5 text-[11px] text-danger">{t("lead.errored")}</p>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
+          {assistantText && <Markdown text={assistantText} cwd={cwd} />}
+          {m.status === "streaming" && (
+            <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
+          )}
+          {m.status === "interrupted" && (
+            <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>
+          )}
+          {m.status === "error" && (
+            <p className="mt-1.5 text-[11px] text-danger">{t("lead.errored")}</p>
+          )}
+        </div>
+        {assistantText && m.status !== "streaming" && (
+          <CopyMessageButton text={assistantText} align="start" />
         )}
       </div>
     </div>
@@ -717,5 +724,42 @@ function QueuedChip() {
     <span className="rounded-full bg-bg px-1.5 py-px text-[10px] text-ink-faint">
       {t("lead.queuedChip")}
     </span>
+  );
+}
+
+/**
+ * Per-message copy affordance: a small icon button under a chat bubble, revealed
+ * on hover of the row (the parent carries `group`) or on keyboard focus. The
+ * action row reserves a fixed height even while hidden so hovering never changes
+ * row geometry — Virtuoso measures rows by height, and a hover-driven reflow
+ * would jump the scroll position. Copies the raw message text (markdown source
+ * for assistant turns), matching the rest of the app's clipboard affordances.
+ */
+function CopyMessageButton({ text, align }: { text: string; align: "start" | "end" }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+  const onCopy = () => {
+    void navigator.clipboard?.writeText(text);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
+  const label = copied ? t("lead.copied") : t("lead.copyMessage");
+  return (
+    <div
+      className={cn(
+        "mt-0.5 flex h-5 w-full items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100",
+        align === "end" ? "justify-end" : "justify-start",
+      )}
+    >
+      <button
+        type="button"
+        onClick={onCopy}
+        title={label}
+        aria-label={label}
+        className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[11px] text-ink-faint outline-none transition-colors hover:bg-surface hover:text-ink focus-visible:bg-surface focus-visible:text-ink"
+      >
+        {copied ? <Check size={12} className="text-running" /> : <Copy size={12} />}
+      </button>
+    </div>
   );
 }
