@@ -188,16 +188,19 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             }),
             // Only real tool items open a row; agentMessage/reasoning/plan/review/
             // other content items are ignored so they don't show as empty rows.
-            Some("commandExecution" | "fileChange" | "mcpToolCall") => Some(ChatEvent::Assistant {
-                texts: vec![],
-                tools: vec![appserver_tool_call(item)],
-            }),
+            // collabToolCall = spawn_agent/send_input/wait delegation.
+            Some("commandExecution" | "fileChange" | "mcpToolCall" | "collabToolCall") => {
+                Some(ChatEvent::Assistant {
+                    texts: vec![],
+                    tools: vec![appserver_tool_call(item)],
+                })
+            }
             _ => None,
         },
         // agentMessage text already streamed via deltas → no-op; tool items deliver
         // their result here, merged into the running row by item id.
         "item/completed" => match item["type"].as_str() {
-            Some("commandExecution" | "fileChange" | "mcpToolCall") => {
+            Some("commandExecution" | "fileChange" | "mcpToolCall" | "collabToolCall") => {
                 Some(ChatEvent::ToolResults {
                     items: vec![appserver_tool_result(item)],
                 })
@@ -237,6 +240,19 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
         }),
         _ => None,
     }
+}
+
+/// Error text carried on a failed `turn/completed` (auth / quota / context), if
+/// any — surfaced before the TurnEnd so the row shows the real cause instead of a
+/// generic `error_before_output` when the failure is reported only here.
+pub fn turn_error_text(params: &Value) -> Option<String> {
+    let t = &params["turn"];
+    let s = t["error"]["message"]
+        .as_str()
+        .or_else(|| t["error"].as_str())
+        .unwrap_or("")
+        .trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Running `ToolCall` from an app-server `item.started` tool item.
@@ -503,6 +519,20 @@ impl Client {
                 Incoming::Notification { method, params } => {
                     let tid = params["threadId"].as_str().map(String::from);
                     if let Some(ev) = notification_to_event(&method, &params) {
+                        // A failed turn may carry its only error message on
+                        // turn/completed — surface it as text before the TurnEnd so
+                        // the row shows the real cause, not error_before_output.
+                        if method == "turn/completed" {
+                            if let Some(text) = turn_error_text(&params) {
+                                self.route_resolved(
+                                    tid.as_deref(),
+                                    ThreadMsg::Event(
+                                        crate::lead_chat::proto::ChatEvent::TextDelta { text },
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
                         self.route_resolved(tid.as_deref(), ThreadMsg::Event(ev))
                             .await;
                     } else if method.ends_with("/outputDelta") {
@@ -918,6 +948,42 @@ mod tests {
         }
         // An empty error message yields nothing (turn/completed still flags error).
         assert!(notification_to_event("error", &json!({"message":""})).is_none());
+    }
+
+    #[test]
+    fn turn_completed_error_message_is_surfaced() {
+        // A failure reported only on turn/completed carries turn.error.message.
+        assert_eq!(
+            turn_error_text(
+                &json!({"turn":{"status":"failed","error":{"message":"context window exceeded"}}})
+            )
+            .as_deref(),
+            Some("context window exceeded")
+        );
+        // A clean turn carries no error text.
+        assert!(turn_error_text(&json!({"turn":{"status":"completed"}})).is_none());
+    }
+
+    #[test]
+    fn collab_tool_call_renders_as_tool_row() {
+        // spawn_agent/send_input/wait delegation must open + close a tool row.
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{"id":"c","type":"collabToolCall","tool":"spawn_agent","status":"inProgress"}}),
+        ) {
+            Some(ChatEvent::Assistant { tools, .. }) => {
+                assert_eq!(tools[0].id, "c");
+                assert_eq!(tools[0].name, "collabToolCall");
+            }
+            e => panic!("{e:?}"),
+        }
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"c","type":"collabToolCall","status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert_eq!(items[0].id, "c"),
+            e => panic!("{e:?}"),
+        }
     }
 
     #[test]

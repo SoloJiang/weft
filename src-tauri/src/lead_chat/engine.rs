@@ -583,6 +583,35 @@ async fn apply_lead_sentinels(
     }
 }
 
+/// Finalize the open streaming text row (codex app-server): fork `<weft:*>`
+/// sentinels out of the body on a clean finish, persist the cleaned text, close
+/// its IM streaming card, and clear `inner.current`. Called both at a tool
+/// boundary — so post-tool deltas open a NEW row BELOW the tool, keeping inline
+/// tool history in order — and at turn end. No-op when no row is open.
+async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner, status: &str) {
+    let Some((id, text, _)) = inner.current.take() else {
+        return;
+    };
+    let thread_id = inner.thread_id;
+    let origin_tag = inner.current_origin_tag.clone();
+    let clean = if status == "complete" {
+        let (clean, sentinels) = super::sentinels::extract_sentinels(&text);
+        apply_lead_sentinels(app, db, inner, thread_id, sentinels).await;
+        clean
+    } else {
+        text
+    };
+    let _ = repo::update_lead_message(db, id, &serde_json::json!({ "text": clean }).to_string(), status)
+        .await;
+    let _ = app.emit(
+        EVENT,
+        Push::Finalize { thread_id, message_id: id, status: status.into() },
+    );
+    if status == "complete" {
+        emit_lead_out(app, thread_id, id, &clean, origin_tag);
+    }
+}
+
 async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fallback_status: &str) {
     let mut inner = eng.lock().await;
     if !inner.turn.busy
@@ -1197,6 +1226,12 @@ async fn spawn_codex_turn_or_exec(
     out: Outgoing,
 ) -> anyhow::Result<()> {
     if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
+        // Stop pressed while the app-server start was pending and it then errored:
+        // don't resurrect the canceled turn on exec — propagate so the caller rolls
+        // it back (otherwise the interrupted turn runs anyway on the fallback).
+        if eng.lock().await.interrupting {
+            return Err(e);
+        }
         eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
         spawn_turn(app, db, eng, out).await?;
     }
@@ -1291,6 +1326,12 @@ async fn codex_consumer(
                 // inline `kind:"tool"` rows, filled by their item.completed result.
                 let mut inner = eng.lock().await;
                 inner.clock.last_activity = std::time::Instant::now();
+                // Close any open text row BEFORE the tool row so later deltas open a
+                // fresh row BELOW it — keeps "I'll inspect…" → command → explanation
+                // flows in order instead of stacking post-tool prose above the tool.
+                if !tools.is_empty() {
+                    finalize_current_text(&app, &db, &mut inner, "complete").await;
+                }
                 persist_tool_calls(&app, &db, &mut inner, tools).await;
             }
             ThreadMsg::Event(ChatEvent::ToolResults { items }) => {
@@ -1347,37 +1388,11 @@ async fn codex_consumer(
                 let orphans: Vec<(i32, serde_json::Value)> =
                     inner.tool_rows.drain().map(|(_, v)| v).collect();
                 finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
-                if let Some((id, text, _)) = inner.current.take() {
-                    // On a clean finish, fork <weft:*> sentinels out of the streamed
-                    // body (action cards become their own rows, list_repos gets a
-                    // hidden reply) and persist the CLEANED text — same as the exec/
-                    // claude path. A partial (interrupted/error) turn keeps its raw
-                    // text and skips sentinel handling.
-                    let clean = if status == "complete" {
-                        let (clean, sentinels) = super::sentinels::extract_sentinels(&text);
-                        apply_lead_sentinels(&app, &db, &mut inner, thread_id, sentinels).await;
-                        clean
-                    } else {
-                        text
-                    };
-                    let _ = repo::update_lead_message(
-                        &db,
-                        id,
-                        &serde_json::json!({ "text": clean }).to_string(),
-                        status,
-                    )
-                    .await;
-                    let _ = app.emit(
-                        EVENT,
-                        Push::Finalize {
-                            thread_id,
-                            message_id: id,
-                            status: status.into(),
-                        },
-                    );
-                    if status == "complete" {
-                        emit_lead_out(&app, thread_id, id, &clean, inner.current_origin_tag.clone());
-                    }
+                if inner.current.is_some() {
+                    // Finalize the open text row (forks <weft:*> sentinels out on a
+                    // clean finish, closes its IM card) — same helper the tool
+                    // boundary uses, so the final segment is handled identically.
+                    finalize_current_text(&app, &db, &mut inner, status).await;
                 } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
                     &db,
                     thread_id,
@@ -1473,13 +1488,34 @@ async fn codex_consumer(
                     .as_str()
                     .or_else(|| params["item"]["command"].as_str());
                 let is_cmd = method.contains("commandExecution") || cmd.is_some();
+                let net = params
+                    .get("networkApprovalContext")
+                    .or_else(|| params["item"].get("networkApprovalContext"))
+                    .filter(|v| !v.is_null());
+                let has_changes = params["changes"]
+                    .as_array()
+                    .or_else(|| params["item"]["changes"].as_array())
+                    .is_some_and(|c| !c.is_empty());
                 let (tool, summary) = if is_cmd {
                     ("Bash", cmd.unwrap_or("(command)").to_string())
-                } else {
+                } else if let Some(net) = net {
+                    // Network-only approval: classify distinctly so it isn't shown
+                    // (and Always-keyed) as "apply file changes".
+                    let host = net["host"]
+                        .as_str()
+                        .or_else(|| net["url"].as_str())
+                        .or_else(|| net["domain"].as_str())
+                        .unwrap_or("network");
+                    ("Network", format!("network access: {host}"))
+                } else if has_changes {
                     // Include the changed path(s): the AskRegistry keys Always rules
                     // by (thread, dir, summary), so a constant "apply file changes"
                     // would let one Always blanket-allow every later edit.
                     ("Edit", codex_change_approval_summary(&params))
+                } else {
+                    // Some other permission escalation — don't mislabel it as a file
+                    // edit (which would also taint the file-change Always summary).
+                    ("Permission", "permission request".to_string())
                 };
                 let detail = params["cwd"]
                     .as_str()

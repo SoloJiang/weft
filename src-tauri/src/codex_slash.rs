@@ -302,37 +302,29 @@ fn builtins() -> Vec<Builtin> {
     ]
 }
 
-/// Built-in + dynamic-skills slash command list for the codex composer palette.
-/// Skills come from `skills/list` over the shared `codex app-server` connection
-/// when reachable; failures degrade silently to just the built-ins so the
-/// composer never blocks on discovery.
-pub async fn discover_commands() -> Vec<SlashCmd> {
+/// Built-ins + app-server skills + skills materialized into this session cwd.
+/// `skills/list` is queried for THIS cwd, and Weft also injects workspace skills
+/// into each lead/worker cwd under `.agents/skills`, so local discovery covers
+/// workspace-scoped skill commands. Failures degrade to the built-ins.
+pub async fn discover_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
+    let cwd = cwd.as_ref();
     let mut out = builtin_commands();
-
-    if let Ok(skills) = fetch_skills().await {
+    if let Ok(skills) = fetch_skills(Some(cwd)).await {
         push_unique(&mut out, skills);
     }
-    out
-}
-
-/// Built-ins + app-server skills + skills materialized into this session cwd.
-/// The app-server `skills/list` is global, while Weft injects workspace skills
-/// into each lead/worker cwd under `.agents/skills`, so local discovery is the
-/// reliable path for workspace-scoped skill commands.
-pub async fn discover_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
-    let mut out = discover_commands().await;
-    push_unique(&mut out, local_skill_commands_for_cwd(cwd.as_ref()));
+    push_unique(&mut out, local_skill_commands_for_cwd(cwd));
     out
 }
 
 /// The session's real skills (app-server `skills/list` + cwd `.agents`/`.claude`),
 /// deduped, no built-ins — for the session-info panel. Best-effort.
 pub(crate) async fn discover_skills_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
+    let cwd = cwd.as_ref();
     let mut out = Vec::new();
-    if let Ok(skills) = fetch_skills().await {
+    if let Ok(skills) = fetch_skills(Some(cwd)).await {
         push_unique(&mut out, skills);
     }
-    push_unique(&mut out, local_skill_commands_for_cwd(cwd.as_ref()));
+    push_unique(&mut out, local_skill_commands_for_cwd(cwd));
     out
 }
 
@@ -373,20 +365,36 @@ pub(crate) fn local_skill_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCm
     out
 }
 
-async fn fetch_skills() -> anyhow::Result<Vec<SlashCmd>> {
+async fn fetch_skills(cwd: Option<&Path>) -> anyhow::Result<Vec<SlashCmd>> {
     let client = crate::codex_app_server::client().await?;
-    let v = client.request("skills/list", serde_json::json!({})).await?;
-    Ok(parse_skills_list(&v))
+    // skills/list groups by cwd; pass THIS session's cwd so we get its skills
+    // (repo-specific / disabled differ per worktree) rather than the global
+    // helper's. Omitting cwd → global resolution (palette without a session).
+    let cwd_str = cwd.map(|c| c.to_string_lossy().into_owned());
+    let params = match &cwd_str {
+        Some(c) => serde_json::json!({ "cwds": [c] }),
+        None => serde_json::json!({}),
+    };
+    let v = client.request("skills/list", params).await?;
+    Ok(parse_skills_list(&v, cwd_str.as_deref()))
 }
 
 /// Parse a `skills/list` result. Shape verified live (codex-cli 0.139.0):
 /// `{ data: [ { cwd, skills: [ {name, description, enabled} ] } ] }`; also
 /// accepts `{ skills: [...] }` or a top-level array. Disabled skills are skipped.
-fn parse_skills_list(v: &serde_json::Value) -> Vec<SlashCmd> {
+/// When `want_cwd` is given and any group matches it, only that group's skills are
+/// returned (so the panel shows THIS session's skills); if no group matches (codex
+/// ignored the cwd / resolved globally) we fall back to all groups — never empty.
+fn parse_skills_list(v: &serde_json::Value, want_cwd: Option<&str>) -> Vec<SlashCmd> {
     let flat: Vec<&serde_json::Value> =
         if let Some(groups) = v.get("data").and_then(|d| d.as_array()) {
+            let any_match = want_cwd.is_some()
+                && groups
+                    .iter()
+                    .any(|g| g.get("cwd").and_then(|c| c.as_str()) == want_cwd);
             groups
                 .iter()
+                .filter(|g| !any_match || g.get("cwd").and_then(|c| c.as_str()) == want_cwd)
                 .filter_map(|g| g.get("skills").and_then(|s| s.as_array()))
                 .flatten()
                 .collect()
@@ -439,12 +447,35 @@ mod tests {
                 ]
             }]
         });
-        let names: Vec<String> = parse_skills_list(&v).into_iter().map(|c| c.name).collect();
+        let names: Vec<String> =
+            parse_skills_list(&v, None).into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["archimate", "bpmn"]); // disabled skipped
         // back-compat: flat { skills: [...] } and a top-level array still parse.
-        assert_eq!(parse_skills_list(&serde_json::json!({"skills":[{"name":"a"}]})).len(), 1);
-        assert_eq!(parse_skills_list(&serde_json::json!([{"name":"b"}])).len(), 1);
-        assert!(parse_skills_list(&serde_json::json!({"junk":1})).is_empty());
+        assert_eq!(parse_skills_list(&serde_json::json!({"skills":[{"name":"a"}]}), None).len(), 1);
+        assert_eq!(parse_skills_list(&serde_json::json!([{"name":"b"}]), None).len(), 1);
+        assert!(parse_skills_list(&serde_json::json!({"junk":1}), None).is_empty());
+    }
+
+    #[test]
+    fn parse_skills_list_filters_to_requested_cwd() {
+        // Multiple cwd groups → only the requested session's group is returned.
+        let v = serde_json::json!({
+            "data": [
+                {"cwd": "/work/a", "skills": [{"name": "a_skill"}]},
+                {"cwd": "/work/b", "skills": [{"name": "b_skill"}]}
+            ]
+        });
+        let names: Vec<String> = parse_skills_list(&v, Some("/work/b"))
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["b_skill"]);
+        // cwd codex didn't return → fall back to all groups rather than empty.
+        let all: Vec<String> = parse_skills_list(&v, Some("/work/missing"))
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(all, vec!["a_skill", "b_skill"]);
     }
 
     #[test]
