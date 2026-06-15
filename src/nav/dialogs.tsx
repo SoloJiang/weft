@@ -140,6 +140,14 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
 
   // Recognized git URLs parsed live from the paste box (deduped, first-seen order).
   const recognized = useMemo(() => parseGitUrls(url), [url]);
+  // What we actually clone. Fall back to the raw single line for valid git inputs
+  // the parser doesn't model (file://, ssh aliases, local paths, host:repo),
+  // preserving the old single-URL dialog — but only when it's one token.
+  const cloneTargets = useMemo(() => {
+    if (recognized.length > 0) return recognized;
+    const single = url.trim();
+    return single !== "" && !/\s/.test(single) ? [single] : [];
+  }, [recognized, url]);
 
   // Reset on close; default the destination to the configured projects dir.
   useEffect(() => {
@@ -158,10 +166,11 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     }
   }, [open, projectsDir]);
 
-  // Clear stale per-row status when the pasted URLs change.
+  // Clear stale per-row status when the URLs OR the destination change — a new
+  // dest means the prior successes aren't there, so they must re-clone too.
   useEffect(() => {
     setProgress((p) => (Object.keys(p).length ? {} : p));
-  }, [url]);
+  }, [url, dest]);
 
   // Closing/cancelling mid-batch aborts the loop so it stops queuing more clones.
   function handleOpenChange(o: boolean) {
@@ -176,7 +185,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     (mode === "local"
       ? !!path.trim()
       : mode === "clone"
-        ? recognized.length >= 1 && !!dest.trim()
+        ? cloneTargets.length >= 1 && !!dest.trim()
         : !!name.trim() && !!dest.trim());
 
   async function submit() {
@@ -201,11 +210,11 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     // already cloned this session so a retry re-runs only failures (re-cloning a
     // success would collide with its existing folder). Indices stay aligned to
     // `recognized` so the status list maps correctly.
-    const entries = recognized.map((u, idx) => ({
+    const entries = cloneTargets.map((u, idx) => ({
       idx,
       url: u,
       name:
-        recognized.length === 1 ? name.trim() || repoNameFromUrl(u) || "repo" : repoNameFromUrl(u) || "repo",
+        cloneTargets.length === 1 ? name.trim() || repoNameFromUrl(u) || "repo" : repoNameFromUrl(u) || "repo",
     }));
     const pending = entries.filter((e) => progress[e.idx]?.status !== "ok");
     if (pending.length === 0) {
@@ -274,8 +283,8 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
       : mode === "clone"
         ? busy
           ? t("dialog.cloning")
-          : recognized.length > 1
-            ? t("dialog.cloneReposCta", { count: recognized.length })
+          : cloneTargets.length > 1
+            ? t("dialog.cloneReposCta", { count: cloneTargets.length })
             : t("dialog.cloneRepo")
         : busy
           ? t("dialog.creating")
@@ -335,12 +344,12 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                 />
               </Field>
 
-              {recognized.length >= 2 && (
+              {cloneTargets.length >= 2 && (
                 <div className="flex max-h-48 flex-col gap-0.5 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-bg/50 p-2">
                   <div className="px-1 pb-1 text-[11px] text-ink-faint">
-                    {t("dialog.cloneRecognized", { count: recognized.length })}
+                    {t("dialog.cloneRecognized", { count: cloneTargets.length })}
                   </div>
-                  {recognized.map((u, i) => {
+                  {cloneTargets.map((u, i) => {
                     const row = progress[i];
                     const status: RowStatus = row?.status ?? "queued";
                     return (
@@ -364,7 +373,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                 </div>
               )}
 
-              {recognized.length === 0 && url.trim() !== "" && (
+              {cloneTargets.length === 0 && url.trim() !== "" && (
                 <p className="text-[12px] text-ink-faint">{t("dialog.cloneNoneRecognized")}</p>
               )}
 
@@ -392,7 +401,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
 
           {(mode === "local" ||
             mode === "new" ||
-            (mode === "clone" && recognized.length === 1)) && (
+            (mode === "clone" && cloneTargets.length === 1)) && (
             <Field label={t("dialog.repoName")}>
               <Input
                 autoFocus={mode === "new"}

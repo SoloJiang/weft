@@ -275,6 +275,10 @@ export const useStore = () => {
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<number | null>(null);
+  // Live mirror so async tasks (e.g. a slow batch clone) can check the CURRENT
+  // workspace instead of the stale one captured when they started.
+  const activeWorkspaceIdRef = useRef(activeWorkspaceId);
+  activeWorkspaceIdRef.current = activeWorkspaceId;
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
@@ -646,8 +650,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshReposAndMap = useCallback(async (workspaceId?: number) => {
-    const ws = workspaceId ?? activeWorkspaceId;
-    if (ws == null || ws !== activeWorkspaceId) return;
+    // Compare against the LIVE active workspace (ref), so a refresh for a
+    // workspace the user has since left is dropped instead of overwriting the
+    // current workspace's repo list/map (e.g. after a cancelled batch import).
+    const ws = workspaceId ?? activeWorkspaceIdRef.current;
+    if (ws == null || ws !== activeWorkspaceIdRef.current) return;
     setRepos(await api.listRepos(ws));
     // a freshly added repo is eagerly profiled server-side; pull the new map
     try {
@@ -657,7 +664,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch {
       /* ignore */
     }
-  }, [activeWorkspaceId]);
+  }, []);
 
   const addRepo = useCallback(
     async (name: string, path: string) => {
