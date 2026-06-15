@@ -610,8 +610,7 @@ pub async fn list_lead_messages(
 ) -> Result<Vec<crate::store::entities::lead_message::Model>, String> {
     let engines: Vec<EngineRef> = {
         let state = app.state::<LeadChatState>();
-        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard.values().cloned().collect()
+        state.0.iter().map(|r| r.value().clone()).collect()
     };
     let mut busy: std::collections::HashSet<Option<i32>> = std::collections::HashSet::new();
     for eng in engines {
@@ -714,15 +713,16 @@ pub async fn list_live_worker_slots(
     app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<Vec<LiveWorkerSlot>, String> {
-    // Clone the worker EngineRefs out under the std mutex, then release it before
-    // awaiting any tokio engine lock (never hold the std guard across .await).
+    // Clone the worker EngineRefs out of the registry; each DashMap ref is dropped
+    // by the collect, so nothing is held across the tokio engine lock below.
+    // Positive keys are worker session ids; negative keys are leads.
     let engines: Vec<EngineRef> = {
         let state = app.state::<LeadChatState>();
-        let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard
+        state
+            .0
             .iter()
-            .filter(|(k, _)| **k > 0)
-            .map(|(_, e)| e.clone())
+            .filter(|r| *r.key() > 0)
+            .map(|r| r.value().clone())
             .collect()
     };
     let mut snaps = Vec::new();

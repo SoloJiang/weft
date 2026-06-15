@@ -7,6 +7,7 @@
 //! via the stored native session id on the next send.
 
 use crate::store::{repo, Db};
+use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
@@ -45,6 +46,11 @@ async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, stat
 /// LeadDelta（飞书 CardKit 流式卡据此逐帧更新）。桌面 UI 不受影响——它吃的是每个
 /// token 的原始 `Push::Delta`。150ms 是流式卡看着流畅的下限；再大就一顿一顿的。
 const STREAM_THROTTLE_MS: u128 = 150;
+
+/// Upper bound on a single resident-stdin write held under the engine lock (see
+/// [`write_user`]). Generous: a healthy child drains instantly, so this only
+/// trips on a wedged/dead child to keep the session from becoming unstoppable.
+const WRITE_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
 #[derive(Clone, serde::Serialize)]
@@ -596,28 +602,29 @@ pub struct EngineInner {
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
 
 /// All live chat engines, keyed by `-thread_id` (lead) or `session_id` (worker).
+///
+/// A [`DashMap`] (sharded, lock-free at the map level) rather than a
+/// `Mutex<HashMap>`: every accessor returns a cloned [`EngineRef`] (an `Arc`), so
+/// there is NO map-wide guard a caller could accidentally hold across an
+/// `eng.lock().await` — the audit's #1 fragility (registry guard held across the
+/// per-engine async lock) is structurally impossible here. The only rule for
+/// callers is the natural one DashMap already enforces: don't keep a per-entry
+/// `Ref`/`RefMut` alive across an `.await` (clone the value out and drop it).
 #[derive(Default)]
-pub struct LeadChatState(pub std::sync::Mutex<HashMap<i64, EngineRef>>);
+pub struct LeadChatState(pub DashMap<i64, EngineRef>);
 
 impl LeadChatState {
     pub fn get(&self, key: i64) -> Option<EngineRef> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned()
+        self.0.get(&key).map(|r| r.value().clone())
     }
 
     /// Atomic get-or-insert: concurrent constructors (e.g. React StrictMode's
     /// double-mount firing two ensures) must converge on ONE engine — a lost
     /// race would orphan a duplicate headless process writing the same session.
+    /// DashMap's `entry` takes the shard lock for the get-or-insert, so this stays
+    /// race-free; the `RefMut` is dropped at the end of the statement.
     pub fn get_or_insert(&self, key: i64, eng: EngineRef) -> EngineRef {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_insert(eng)
-            .clone()
+        self.0.entry(key).or_insert(eng).value().clone()
     }
 }
 
@@ -754,11 +761,27 @@ pub async fn ensure_running_for_send(
     ensure_running(app, db, eng).await
 }
 
+/// Drop the resident child and its stdin so the next send respawns a clean
+/// process. Used when a write fails or times out mid-line: a partial JSON
+/// message may be stuck in the old stdin pipe, so reusing that pipe would
+/// corrupt the next turn (the next message concatenates onto the prefix), and
+/// the child is evidently wedged or dead. Killing it (and clearing the handles)
+/// makes `ensure_running_locked` respawn on the next send. `kill_on_drop` would
+/// also reap it, but `start_kill` makes the intent explicit and immediate.
+pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
+    // Orphan the existing reader (mirrors `stop_quiet`): once we kill the child,
+    // its stdout EOFs and the reader wakes; without bumping the generation it
+    // would still see itself as current and process that EOF/buffered output as
+    // the live turn — emitting a spurious stopped/error or clearing the queue of
+    // the freshly respawned process. The generation bump makes it exit instead.
+    inner.generation += 1;
+    inner.stdin = None;
+    if let Some(mut child) = inner.child.take() {
+        let _ = child.start_kill();
+    }
+}
+
 pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
-    let stdin = inner
-        .stdin
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("resident stdin is unavailable"))?;
     let mut content = vec![serde_json::json!({ "type": "text", "text": out.text })];
     for (media_type, data) in &out.images {
         content.push(serde_json::json!({
@@ -770,9 +793,37 @@ pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyho
         "type": "user",
         "message": { "role": "user", "content": content }
     });
-    stdin.write_all(format!("{msg}\n").as_bytes()).await?;
-    stdin.flush().await?;
-    Ok(())
+    let line = format!("{msg}\n");
+    let Some(stdin) = inner.stdin.as_mut() else {
+        return Err(anyhow::anyhow!("resident stdin is unavailable"));
+    };
+    // Time-box the write. This runs while the caller holds the engine lock, so an
+    // unbounded write to a child that has stopped reading its stdin would pin the
+    // lock forever — wedging stop/interrupt/status for the whole session. A live
+    // child (we only write-through when it's idle and reading) drains in
+    // microseconds; the timeout only fires on a genuinely stuck process.
+    let res = tokio::time::timeout(WRITE_USER_TIMEOUT, async {
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => Ok(()),
+        // Either failure mode can leave a partial line in the pipe and an
+        // unresponsive child. Invalidate the resident process so the next send
+        // respawns clean instead of appending to a corrupt prefix or re-targeting
+        // a wedged child; the caller rolls the turn back.
+        Ok(Err(e)) => {
+            invalidate_resident(inner);
+            Err(anyhow::Error::new(e).context("resident stdin write failed"))
+        }
+        Err(_) => {
+            invalidate_resident(inner);
+            Err(anyhow::anyhow!(
+                "resident stdin write timed out (child not reading)"
+            ))
+        }
+    }
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
@@ -1519,8 +1570,7 @@ pub fn spawn_watchdog(app: AppHandle) {
             }
             let engines: Vec<EngineRef> = {
                 let state = app.state::<LeadChatState>();
-                let g = state.0.lock().unwrap_or_else(|e| e.into_inner());
-                g.values().cloned().collect()
+                state.0.iter().map(|r| r.value().clone()).collect()
             };
             for eng in engines {
                 let (verdict, thread_id, ask_dir) = {
