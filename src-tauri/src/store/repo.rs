@@ -497,6 +497,47 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
     Ok(a.update(&db.0).await?)
 }
 
+/// A direction's diff "vs target" config: `(stored, base_ref)` where `stored`
+/// is the per-task target branch ("" = use the repo default) and `base_ref` is
+/// the bound repo's default branch (the effective default). Both empty if the
+/// direction or its repo is gone.
+pub async fn direction_target_branch(db: &Db, direction_id: i32) -> Result<(String, String)> {
+    let Some(d) = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+    else {
+        return Ok((String::new(), String::new()));
+    };
+    let base_ref = if d.repo_id == 0 {
+        String::new()
+    } else {
+        repo_ref::Entity::find_by_id(d.repo_id)
+            .one(&db.0)
+            .await?
+            .map(|r| r.base_ref)
+            .unwrap_or_default()
+    };
+    Ok((d.target_branch, base_ref))
+}
+
+/// Persist a direction's diff target branch. Trimmed; "" means "use the repo
+/// default". No-op if the direction is gone.
+pub async fn set_direction_target_branch(
+    db: &Db,
+    direction_id: i32,
+    target: &str,
+) -> Result<()> {
+    if let Some(d) = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+    {
+        let mut a: direction::ActiveModel = d.into();
+        a.target_branch = Set(target.trim().to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// The single write repo bound to a direction (scope rework). None if the
 /// direction has no repo set (repo_id = 0) or the repo row is gone.
 pub async fn direction_repo_of(db: &Db, direction_id: i32) -> Result<Option<repo_ref::Model>> {

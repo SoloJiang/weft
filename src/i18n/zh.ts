@@ -314,6 +314,11 @@ export const zh = {
   diff: {
     tab: "改动",
     empty: "还没有改动。",
+    emptyTarget: "与目标分支暂无差异。",
+    modeWorktree: "工作区",
+    modeTarget: "目标分支",
+    compareAgainst: "对比",
+    refreshTarget: "从远端刷新",
     filesChanged_other: "{{count}} 个文件",
     untrackedOnly: "目前只有新增（未跟踪）文件。",
     ask: "标注这个文件",

@@ -32,6 +32,7 @@ import type {
   Workspace,
   Worktree,
   WorktreeDiff,
+  TargetDiff,
   WriteTrigger,
 } from "./types";
 
@@ -160,6 +161,12 @@ export const api = {
     invoke<NormEvent[]>("read_transcript", { cwd, tool }),
   worktreeDiff: (cwd: string) =>
     invoke<WorktreeDiff>("worktree_diff", { cwd }),
+  /** PR-style diff against the task's target branch. `fetch` refreshes
+   *  origin/<target> first (mode-enter / manual refresh / after a target edit). */
+  worktreeDiffTarget: (cwd: string, directionId: number, fetch: boolean) =>
+    invoke<TargetDiff>("worktree_diff_target", { cwd, directionId, fetch }),
+  setDirectionTargetBranch: (directionId: number, target: string) =>
+    invoke<void>("set_direction_target_branch", { directionId, target }),
 
   // Quality loop: run inferred checks across a direction's write worktrees.
   verifyDirection: (directionId: number) =>
