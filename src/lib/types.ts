@@ -85,6 +85,8 @@ export interface SessionInfo {
   worktree: string;
   branch: string;
   tool: string;
+  /** Effective binary for the resume command (configured alias, else `tool`). */
+  command: string;
   resumed: boolean;
   native_id: string | null;
 }
@@ -106,6 +108,8 @@ export interface ObserveRef {
   worktree: string;
   branch: string;
   tool: string;
+  /** Effective binary for the resume command (configured alias, else `tool`). */
+  command: string;
   session_id: number | null;
   native_id: string | null;
   status: string | null;
@@ -277,6 +281,8 @@ export interface LeadStateInfo {
   native_id: string | null;
   slash_commands: SlashCmd[];
   cwd: string;
+  /** Effective binary for the lead's resume command (alias, else identity). */
+  command: string;
   // —— 会话信息面板回填 ——
   context_tokens: number | null;
   window: number | null;

@@ -19,6 +19,7 @@ export function Inspect({
   branch,
   nativeId,
   tool,
+  command,
   className,
   size = 14,
 }: {
@@ -26,6 +27,8 @@ export function Inspect({
   branch?: string;
   nativeId?: string | null;
   tool?: string;
+  /** Effective binary for the resume command (configured alias, else `tool`). */
+  command?: string;
   className?: string;
   size?: number;
 }) {
@@ -36,7 +39,7 @@ export function Inspect({
   async function copyResume() {
     if (!tool || !nativeId) return;
     try {
-      await navigator.clipboard?.writeText(resumeCommand(tool, path, nativeId));
+      await navigator.clipboard?.writeText(resumeCommand(tool, path, nativeId, command));
       setCopied(true);
       setTimeout(() => setCopied(false), 1400);
     } catch {

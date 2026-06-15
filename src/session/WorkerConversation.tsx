@@ -214,6 +214,7 @@ export function WorkerConversation() {
               branch={ref.branch}
               nativeId={ref.native_id}
               tool={ref.tool}
+              command={ref.command}
               className="h-7 w-7 shrink-0"
             />
           )}
@@ -247,7 +248,7 @@ export function WorkerConversation() {
               if (!ref || !nativeId || sid == null) return false;
               await api.chatStop(sid);
               await navigator.clipboard.writeText(
-                resumeCommand(ref.tool, ref.worktree, nativeId),
+                resumeCommand(ref.tool, ref.worktree, nativeId, ref.command),
               );
               return true;
             }}

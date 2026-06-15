@@ -189,6 +189,7 @@ function GeneralSettings() {
     configuredTool,
     installedTools,
     refreshInstalledTools,
+    refreshDefaultTool,
     notifyEnabled,
     setNotifyEnabled,
   } = useStore();
@@ -215,8 +216,10 @@ function GeneralSettings() {
     const m = await api.getToolCommands();
     setSavedCommands(m);
     setDraftCommands(m);
-    // Re-probe so diagnostics reflect the aliased binary's install status.
-    refreshInstalledTools();
+    // Re-probe so diagnostics reflect the aliased binary's install status, and
+    // re-resolve the default tool (an alias can change which tool is available).
+    await refreshInstalledTools();
+    await refreshDefaultTool();
   }
 
   // OS notification permission, re-queried every time Settings opens — the

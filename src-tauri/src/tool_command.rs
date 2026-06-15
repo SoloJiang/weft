@@ -88,32 +88,28 @@ pub fn to_json(map: &HashMap<String, String>) -> String {
 mod tests {
     use super::*;
 
+    // These assertions all mutate the PROCESS-global override map, so they live in
+    // ONE test: cargo runs tests in the same binary concurrently by default, and
+    // separate tests racing on `set_overrides` would be nondeterministic.
     #[test]
-    fn command_for_falls_back_to_identity_when_unset() {
+    fn global_override_and_pin_resolution() {
         // No override configured → the identity is its own command.
         set_overrides(HashMap::new());
         assert_eq!(command_for("claude"), "claude");
         assert_eq!(command_for("codex"), "codex");
-    }
 
-    #[test]
-    fn command_for_returns_configured_override() {
+        // A configured override is returned; unconfigured tools still fall back.
         set_overrides(HashMap::from([("claude".to_string(), "cc-claude".to_string())]));
         assert_eq!(command_for("claude"), "cc-claude");
-        // Unconfigured tools still fall back to identity.
         assert_eq!(command_for("codex"), "codex");
-        set_overrides(HashMap::new()); // don't leak into other tests
-    }
 
-    #[test]
-    fn effective_pin_wins_over_global() {
-        set_overrides(HashMap::from([("claude".to_string(), "cc-claude".to_string())]));
-        // A pinned session keeps its frozen command despite the global override.
+        // A per-session pin wins over the global override.
         assert_eq!(effective(Some("claude"), "claude"), "claude");
         // Blank/whitespace pin is ignored → falls through to the global override.
         assert_eq!(effective(Some("  "), "claude"), "cc-claude");
         assert_eq!(effective(None, "claude"), "cc-claude");
-        set_overrides(HashMap::new());
+
+        set_overrides(HashMap::new()); // leave the global map clean
     }
 
     #[test]

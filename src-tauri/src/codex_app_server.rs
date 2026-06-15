@@ -484,11 +484,12 @@ impl Client {
     /// gets its OWN process so its per-thread MCP config is isolated — app-server
     /// MCP is app-scoped, so one shared connection couldn't carry per-thread bus URLs.
     pub async fn connect_session(
+        program: &str,
         extra_args: &[String],
         cwd: &std::path::Path,
     ) -> anyhow::Result<Client> {
         let client = Client(Arc::new(Mutex::new(None)));
-        client.spawn_inner(extra_args, Some(cwd)).await?;
+        client.spawn_inner(program, extra_args, Some(cwd)).await?;
         Ok(client)
     }
 
@@ -531,11 +532,15 @@ impl Client {
     }
 
     async fn connect(&self) -> anyhow::Result<()> {
-        self.spawn_inner(&[], None).await
+        // The app-scoped global client has no per-session pin; use the global codex
+        // override (alias).
+        self.spawn_inner(&crate::tool_command::command_for("codex"), &[], None)
+            .await
     }
 
     async fn spawn_inner(
         &self,
+        program: &str,
         extra_args: &[String],
         cwd: Option<&std::path::Path>,
     ) -> anyhow::Result<()> {
@@ -543,10 +548,9 @@ impl Client {
         if g.is_some() {
             return Ok(());
         }
-        // Honor a user-configured codex alias (global override). The app-server
-        // transport is shared per-session and not pin-aware; the dominant alias
-        // use case (a renamed binary) is the global override, which this covers.
-        let mut command = Command::new(crate::tool_command::command_for("codex"));
+        // `program` is the effective codex binary for this session — a per-session
+        // pin (alias opt-out) when present, else the global codex override.
+        let mut command = Command::new(program);
         command.arg("app-server").arg("--stdio").args(extra_args);
         if let Some(c) = cwd {
             command.current_dir(c);

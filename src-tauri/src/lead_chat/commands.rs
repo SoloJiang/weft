@@ -37,6 +37,10 @@ pub struct SessionInfo {
     pub worktree: String,
     pub branch: String,
     pub tool: String,
+    /// Effective binary for terminal takeover (resume command): the per-session
+    /// pin / global alias, else the tool identity. Lets "Copy resume command"
+    /// produce the actual CLI (e.g. `cc-claude`) for an aliased session.
+    pub command: String,
     pub resumed: bool,
     pub native_id: Option<String>,
 }
@@ -285,6 +289,9 @@ pub struct LeadStateInfo {
     pub state: String,
     pub queued: usize,
     pub native_id: Option<String>,
+    /// Effective binary for the lead's resume command (per-thread pin / alias,
+    /// else identity). Empty only when the thread row is missing.
+    pub command: String,
     pub slash_commands: Vec<crate::lead_chat::proto::SlashCmd>,
     pub cwd: String,
     // —— 会话信息面板回填(常驻面板重挂不空白)——
@@ -406,6 +413,12 @@ pub async fn lead_state(
             state: "stopped".into(),
             queued: 0,
             native_id: repo::lead_native_id(&db, thread_id).await.ok().flatten(),
+            command: repo::get_thread(&db, thread_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool))
+                .unwrap_or_default(),
             slash_commands: vec![],
             cwd: crate::paths::weft_home()
                 .map(|h| {
@@ -430,10 +443,12 @@ pub async fn lead_state(
                 .unwrap_or(false);
             // codex app-server leads are childless when idle but alive via the client.
             let alive = lead_alive(child_alive, i.codex_client.is_some());
+            let command = crate::tool_command::effective(i.command.as_deref(), &i.tool);
             Ok(LeadStateInfo {
                 state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
                 queued: i.turn.queue.len(),
                 native_id: i.native_id.clone(),
+                command,
                 slash_commands: i.slash_commands.clone(),
                 cwd: i.cwd.to_string_lossy().into_owned(),
                 context_tokens: i.last_context_tokens,
@@ -706,6 +721,7 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
         let Ok(Some(wt)) = repo::worktree_for(db, sess.direction_id, sess.repo_id).await else {
             continue;
         };
+        let command = crate::tool_command::effective(sess.command.as_deref(), &sess.tool);
         out.push(LiveWorkerSlot {
             info: SessionInfo {
                 session_id: sess.id,
@@ -713,6 +729,7 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
                 worktree: wt.path,
                 branch: wt.branch,
                 tool: sess.tool,
+                command,
                 resumed: sess.native_session_id.is_some(),
                 native_id: sess.native_session_id,
             },
@@ -927,12 +944,14 @@ pub(crate) async fn chat_open_worker_impl(
         let _ = repo::set_direction_status(db, direction_id, phase).await;
     }
 
+    let command = crate::tool_command::effective(sess.command.as_deref(), &dir.tool);
     Ok(SessionInfo {
         session_id: sess.id,
         repo: wt.path.clone(),
         worktree: wt.path,
         branch: wt.branch,
         tool: dir.tool,
+        command,
         resumed,
         native_id: native,
     })

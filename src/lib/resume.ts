@@ -6,18 +6,29 @@ function shq(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-/** `cd <cwd> && <tool> resume <id>` for the given tool. */
-export function resumeCommand(tool: string, cwd: string, nativeId: string): string {
+/**
+ * `cd <cwd> && <bin> resume <id>` for the given tool. `command` is the actual
+ * binary to invoke (a configured alias, e.g. `cc-claude`); it falls back to the
+ * tool identity so an un-aliased session is unchanged. The per-tool argument
+ * shape always follows the identity.
+ */
+export function resumeCommand(
+  tool: string,
+  cwd: string,
+  nativeId: string,
+  command?: string,
+): string {
+  const bin = command?.trim() || tool;
   const at = `cd ${shq(cwd)} && `;
   switch (tool) {
     case "claude":
-      return `${at}claude --resume ${nativeId}`;
+      return `${at}${bin} --resume ${nativeId}`;
     case "codex":
-      return `${at}codex resume ${nativeId}`;
+      return `${at}${bin} resume ${nativeId}`;
     case "opencode":
-      return `${at}opencode . --session ${nativeId}`;
+      return `${at}${bin} . --session ${nativeId}`;
     default:
-      return at + tool;
+      return at + bin;
   }
 }
 

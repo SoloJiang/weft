@@ -535,6 +535,7 @@ pub async fn get_tool_commands(
 /// Refreshes the process-global override map so spawns see the change immediately.
 #[tauri::command]
 pub async fn set_tool_command(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     tool: String,
     command: String,
@@ -546,10 +547,33 @@ pub async fn set_tool_command(
             crate::detect::TOOL_PRIORITY
         ));
     }
-    let map = repo::set_tool_command(&db, &tool, &command, apply_to_existing)
+    let (map, prev) = repo::set_tool_command(&db, &tool, &command, apply_to_existing)
         .await
         .map_err(e)?;
     crate::tool_command::set_overrides(map);
+
+    // Sync live engines so the reconcile applies WITHOUT closing/reopening the
+    // session (their `command` was captured when the engine was built). Mirror the
+    // DB: apply-to-existing clears pins (follow new global); opt-out freezes
+    // currently un-pinned engines of this tool to their prior command.
+    use tauri::Manager;
+    let engines: Vec<crate::lead_chat::engine::EngineRef> = app
+        .state::<crate::lead_chat::engine::LeadChatState>()
+        .0
+        .iter()
+        .map(|r| r.value().clone())
+        .collect();
+    for eng in engines {
+        let mut inner = eng.lock().await;
+        if inner.tool != tool {
+            continue;
+        }
+        if apply_to_existing {
+            inner.command = None;
+        } else if inner.command.is_none() {
+            inner.command = Some(prev.clone());
+        }
+    }
     Ok(())
 }
 
@@ -752,6 +776,9 @@ pub struct ObserveRef {
     pub worktree: String,
     pub branch: String,
     pub tool: String,
+    /// Effective binary for the resume command (configured alias / per-session
+    /// pin, else the tool identity).
+    pub command: String,
     pub session_id: Option<i32>,
     pub native_id: Option<String>,
     pub status: Option<String>,
@@ -807,10 +834,15 @@ pub async fn session_for(
         }
         None => (None, None, None, vec![], vec![]),
     };
+    let command = crate::tool_command::effective(
+        latest.as_ref().and_then(|s| s.command.as_deref()),
+        &dir.tool,
+    );
     Ok(Some(ObserveRef {
         worktree: wt.path,
         branch: wt.branch,
         tool: dir.tool,
+        command,
         session_id: latest.as_ref().map(|s| s.id),
         native_id: latest.as_ref().and_then(|s| s.native_session_id.clone()),
         status: latest.as_ref().map(|s| s.status.clone()),

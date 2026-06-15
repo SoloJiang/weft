@@ -1250,7 +1250,7 @@ async fn spawn_codex_turn(
     eng: EngineRef,
     out: Outgoing,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
         let i = eng.lock().await;
         (
             i.native_id.clone(),
@@ -1260,6 +1260,10 @@ async fn spawn_codex_turn(
             i.system_prompt.clone(),
             i.extra_args.clone(),
             i.codex_client.clone(),
+            // Effective codex binary for THIS session: a per-session pin wins over
+            // the global override, so a pinned (opt-out) codex session keeps its
+            // command even on the default app-server transport.
+            crate::tool_command::effective(i.command.as_deref(), &i.tool),
         )
     };
     // Per-session app-server: reuse the engine's connection or spawn one with this
@@ -1271,7 +1275,9 @@ async fn spawn_codex_turn(
             // Pre-accept folder trust (like the exec adapter's prepare) so the
             // app-server's first thread/start doesn't block on codex's trust prompt.
             crate::codex::ensure_codex_trusted(&cwd);
-            let c = crate::codex_app_server::Client::connect_session(&extra_args, &cwd).await?;
+            let c =
+                crate::codex_app_server::Client::connect_session(&program, &extra_args, &cwd)
+                    .await?;
             eng.lock().await.codex_client = Some(c.clone());
             c
         }
