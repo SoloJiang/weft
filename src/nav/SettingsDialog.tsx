@@ -196,6 +196,29 @@ function GeneralSettings() {
 
   const installed = installedTools.filter((tl) => tl.installed);
 
+  // Per-tool command overrides ("aliases", e.g. claude → cc-claude). `draft`
+  // holds in-progress edits; `saved` is what the backend persisted, so a Save
+  // affordance only shows for a changed row. `applyToExisting` chooses whether a
+  // newly-saved alias also retargets sessions created before now.
+  const [savedCommands, setSavedCommands] = useState<Record<string, string>>({});
+  const [draftCommands, setDraftCommands] = useState<Record<string, string>>({});
+  const [applyToExisting, setApplyToExisting] = useState(true);
+  useEffect(() => {
+    void api.getToolCommands().then((m) => {
+      setSavedCommands(m);
+      setDraftCommands(m);
+    });
+  }, []);
+  async function saveToolCommand(tool: string) {
+    const value = (draftCommands[tool] ?? "").trim();
+    await api.setToolCommand(tool, value, applyToExisting);
+    const m = await api.getToolCommands();
+    setSavedCommands(m);
+    setDraftCommands(m);
+    // Re-probe so diagnostics reflect the aliased binary's install status.
+    refreshInstalledTools();
+  }
+
   // OS notification permission, re-queried every time Settings opens — the
   // user may have just flipped it in the system pane.
   const [notifyPerm, setNotifyPerm] = useState<NotifyPermission | null>(null);
@@ -358,6 +381,47 @@ function GeneralSettings() {
               { value: "zh", label: "中文" },
               { value: "en", label: "English" },
             ]}
+          />
+        </SettingRow>
+      </SettingsGroup>
+      <SettingsGroup title={t("settings.agentCommands")}>
+        <div className="px-3 pt-2 text-[12px] leading-relaxed text-ink-muted">
+          {t("settings.agentCommandsHint")}
+        </div>
+        {installedTools.map((tl) => {
+          const saved = savedCommands[tl.tool] ?? "";
+          const draft = draftCommands[tl.tool] ?? "";
+          const changed = draft.trim() !== saved.trim();
+          return (
+            <SettingRow key={tl.tool} label={toolFullName(tl.tool)}>
+              <div className="flex w-[360px] max-w-[42vw] items-center gap-2">
+                <Input
+                  value={draft}
+                  placeholder={tl.tool}
+                  onChange={(e) =>
+                    setDraftCommands((m) => ({ ...m, [tl.tool]: e.currentTarget.value }))
+                  }
+                  className="h-8 min-w-0 bg-bg/80 font-mono text-[12px]"
+                />
+                <Button
+                  variant="default"
+                  disabled={!changed}
+                  onClick={() => void saveToolCommand(tl.tool)}
+                >
+                  {t("settings.save")}
+                </Button>
+              </div>
+            </SettingRow>
+          );
+        })}
+        <SettingRow
+          label={t("settings.applyToExisting")}
+          hint={t("settings.applyToExistingHint")}
+        >
+          <Toggle
+            on={applyToExisting}
+            onChange={setApplyToExisting}
+            label={t("settings.applyToExisting")}
           />
         </SettingRow>
       </SettingsGroup>

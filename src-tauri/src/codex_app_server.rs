@@ -543,7 +543,10 @@ impl Client {
         if g.is_some() {
             return Ok(());
         }
-        let mut command = Command::new("codex");
+        // Honor a user-configured codex alias (global override). The app-server
+        // transport is shared per-session and not pin-aware; the dominant alias
+        // use case (a renamed binary) is the global override, which this covers.
+        let mut command = Command::new(crate::tool_command::command_for("codex"));
         command.arg("app-server").arg("--stdio").args(extra_args);
         if let Some(c) = cwd {
             command.current_dir(c);

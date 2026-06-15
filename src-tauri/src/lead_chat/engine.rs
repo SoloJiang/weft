@@ -810,6 +810,10 @@ pub struct EngineInner {
     pub thread_id: i32,
     /// claude | codex | opencode — selects the wire dialect + process model.
     pub tool: String,
+    /// Per-session command pin (from thread.lead_command / session.command).
+    /// None = resolve the spawn binary from the global tool→command override map;
+    /// Some = this session was frozen to a specific command (alias opt-out).
+    pub command: Option<String>,
     /// Chat-mode worker session; None for the lead.
     pub session_id: Option<i32>,
     pub cwd: std::path::PathBuf,
@@ -969,7 +973,10 @@ async fn ensure_running_locked(
         }
     }
     crate::claude::ensure_trusted(&inner.cwd);
-    let mut child = Command::new("claude")
+    // Resolve the actual binary: a per-session pin, else the global override for
+    // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
+    let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
+    let mut child = Command::new(&program)
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .stdin(std::process::Stdio::piped())
@@ -1790,7 +1797,7 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
     let adapter = crate::adapters::adapter_for(&inner.tool)
         .ok_or_else(|| anyhow::anyhow!("unknown per-turn lead tool {}", inner.tool))?;
     adapter.prepare(&inner.cwd);
-    let (program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
+    let (_program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
         cwd: &inner.cwd,
         system_prompt: &inner.system_prompt,
         extra_args: &inner.extra_args,
@@ -1798,6 +1805,9 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
         message: &out.text,
         slash_commands: &inner.slash_commands,
     })?;
+    // The adapter's program is the tool identity; resolve it through the
+    // per-session pin / global override map so an aliased binary is spawned.
+    let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
     let mut child = Command::new(&program)
         .args(&args)
         .current_dir(&inner.cwd)
@@ -3051,6 +3061,7 @@ mod tests {
         EngineInner {
             thread_id: 1,
             tool: tool.into(),
+            command: None,
             session_id: None,
             cwd: "/tmp".into(),
             extra_args: vec![],
@@ -3193,6 +3204,7 @@ mod tests {
         let mut inner = EngineInner {
             thread_id: 1,
             tool: "claude".into(),
+            command: None,
             session_id: None,
             cwd: "/tmp".into(),
             extra_args: vec!["--mcp-config".into(), "x".into()],

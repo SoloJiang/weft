@@ -520,6 +520,39 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
         .map_err(e)
 }
 
+/// The user-configured coding-agent command overrides ("aliases"): identity →
+/// command (e.g. `claude` → `cc-claude`). Empty map when none are set.
+#[tauri::command]
+pub async fn get_tool_commands(
+    db: State<'_, Db>,
+) -> R<std::collections::HashMap<String, String>> {
+    repo::get_tool_commands(&db).await.map_err(e)
+}
+
+/// Set or clear (blank/identity command) the alias for one tool. `applyToExisting`
+/// = false pins existing sessions of that tool to their prior command so only new
+/// sessions adopt the alias; = true lets existing sessions pick it up on next run.
+/// Refreshes the process-global override map so spawns see the change immediately.
+#[tauri::command]
+pub async fn set_tool_command(
+    db: State<'_, Db>,
+    tool: String,
+    command: String,
+    apply_to_existing: bool,
+) -> R<()> {
+    if !crate::detect::TOOL_PRIORITY.contains(&tool.as_str()) {
+        return Err(format!(
+            "unknown tool {tool:?}; expected one of {:?}",
+            crate::detect::TOOL_PRIORITY
+        ));
+    }
+    let map = repo::set_tool_command(&db, &tool, &command, apply_to_existing)
+        .await
+        .map_err(e)?;
+    crate::tool_command::set_overrides(map);
+    Ok(())
+}
+
 /// One pending write declaration waiting on the human, with thread context.
 #[derive(serde::Serialize)]
 pub struct WriteTrigger {

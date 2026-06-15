@@ -148,7 +148,7 @@ async fn ensure_base() -> anyhow::Result<String> {
     g.base = None;
     g.child = None;
 
-    let mut child = Command::new("opencode")
+    let mut child = Command::new(crate::tool_command::command_for("opencode"))
         .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
         // Force an unsecured server on our private localhost port: we never set a
         // password, so the user's global OPENCODE_SERVER_PASSWORD (if any) does

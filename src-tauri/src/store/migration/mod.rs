@@ -28,6 +28,8 @@ impl MigratorTrait for Migrator {
             Box::new(M0015ImRoute),
             Box::new(M0016BackupConfig),
             Box::new(M0017SessionStatusReset),
+            Box::new(M0018ThreadLeadCommand),
+            Box::new(M0019SessionCommand),
         ]
     }
 }
@@ -643,5 +645,83 @@ impl MigrationTrait for M0017SessionStatusReset {
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         // Data reconcile only — nothing to reverse.
         Ok(())
+    }
+}
+
+/// Adds the nullable thread.lead_command pin (per-lead command override for the
+/// coding-agent alias feature). NULL = follow the global tool→command map. M0001
+/// reflects the current entity, so a FRESH db already has the column; sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0018ThreadLeadCommand;
+impl MigrationName for M0018ThreadLeadCommand {
+    fn name(&self) -> &str {
+        "m0018_thread_lead_command"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0018ThreadLeadCommand {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(ColumnDef::new(Alias::new("lead_command")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .drop_column(Alias::new("lead_command"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the nullable session.command pin (per-worker command override). Same
+/// semantics and duplicate tolerance as M0018.
+pub struct M0019SessionCommand;
+impl MigrationName for M0019SessionCommand {
+    fn name(&self) -> &str {
+        "m0019_session_command"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0019SessionCommand {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .add_column(ColumnDef::new(Alias::new("command")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .drop_column(Alias::new("command"))
+                    .to_owned(),
+            )
+            .await
     }
 }

@@ -521,6 +521,13 @@ export const en = {
     defaultToolHint: "Default tool for issue leads and new sub-tasks. Each approval card can still override it.",
     noTools: "No coding CLI detected — install codex, claude, or opencode.",
     toolFallback: "{{configured}} is not installed — using {{tool}}.",
+    agentCommands: "Agent commands",
+    agentCommandsHint:
+      "If a CLI is installed under a different name (e.g. claude aliased to cc-claude), set the command Weft should run. Leave blank to use the default name. Resolved on your PATH.",
+    applyToExisting: "Apply to existing sessions",
+    applyToExistingHint:
+      "On: existing issues and sub-tasks also switch to the new command. Off: only sessions created from now on use it; existing ones keep their current command.",
+    save: "Save",
     conservatism: "Automation stance",
     conservatismHint: "How cautious the lead should be while decomposing, dispatching, and retrying work.",
     conservatismLow: "Fast",

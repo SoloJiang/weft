@@ -171,6 +171,7 @@ pub async fn lead_engine(
     let inner = engine::EngineInner {
         thread_id,
         tool: t.lead_tool.clone(),
+        command: t.lead_command.clone(),
         session_id: None,
         cwd,
         extra_args: extra,
@@ -870,6 +871,7 @@ pub(crate) async fn chat_open_worker_impl(
             let inner = engine::EngineInner {
                 thread_id: dir.thread_id,
                 tool: dir.tool.clone(),
+                command: sess.command.clone(),
                 session_id: Some(sess.id),
                 cwd,
                 extra_args: extra,
@@ -975,6 +977,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     let inner = engine::EngineInner {
         thread_id: dir.thread_id,
         tool: sess.tool.clone(),
+        command: sess.command.clone(),
         session_id: Some(sess.id),
         cwd,
         extra_args: extra,
