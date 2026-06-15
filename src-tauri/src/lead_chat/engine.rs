@@ -1027,6 +1027,9 @@ async fn spawn_codex_turn(
     let client = match existing {
         Some(c) if c.is_alive().await => c,
         _ => {
+            // Pre-accept folder trust (like the exec adapter's prepare) so the
+            // app-server's first thread/start doesn't block on codex's trust prompt.
+            crate::codex::ensure_codex_trusted(&cwd);
             let c = crate::codex_app_server::Client::connect_session(&extra_args, &cwd).await?;
             eng.lock().await.codex_client = Some(c.clone());
             c
@@ -1227,6 +1230,11 @@ async fn codex_consumer(
                     "complete"
                 };
                 inner.interrupting = false;
+                // An interrupted/failed turn can leave a tool row whose
+                // item.completed never arrived; finalize it so it stops spinning.
+                let orphans: Vec<(i32, serde_json::Value)> =
+                    inner.tool_rows.drain().map(|(_, v)| v).collect();
+                finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
                 if let Some((id, text, _)) = inner.current.take() {
                     let _ = repo::update_lead_message(
                         &db,

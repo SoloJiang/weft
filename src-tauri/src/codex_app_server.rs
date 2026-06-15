@@ -282,10 +282,15 @@ fn appserver_tool_output(item: &Value) -> String {
 }
 
 fn appserver_tool_is_error(item: &Value) -> bool {
-    if let Some(code) = item["exitCode"].as_i64() {
-        return code != 0;
+    // A declined/canceled approval completes the item without running it — not a
+    // success. Check status first; otherwise a non-zero exit code is an error.
+    if matches!(
+        item["status"].as_str(),
+        Some("failed" | "error" | "declined" | "canceled" | "cancelled")
+    ) {
+        return true;
     }
-    matches!(item["status"].as_str(), Some("failed") | Some("error"))
+    item["exitCode"].as_i64().is_some_and(|c| c != 0)
 }
 
 fn cap_out(s: &str) -> String {
@@ -722,6 +727,14 @@ mod tests {
         match notification_to_event(
             "item/completed",
             &json!({"item":{"id":"call_3","type":"commandExecution","aggregatedOutput":"","exitCode":1,"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert!(items[0].is_error),
+            e => panic!("{e:?}"),
+        }
+        // a declined approval completes without running → error, not complete.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_4","type":"commandExecution","status":"declined"}}),
         ) {
             Some(ChatEvent::ToolResults { items }) => assert!(items[0].is_error),
             e => panic!("{e:?}"),
