@@ -221,10 +221,14 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             Some("error") => Some(ChatEvent::TextDelta {
                 text: crate::lead_chat::proto::error_text_from_item(item),
             }),
-            // Only real tool items open a row; agentMessage/reasoning/plan/webSearch
-            // /other content items are ignored so they don't show as empty rows.
-            // (Item types verified against the codex 0.139.0 app-server JSON schema.)
-            Some("commandExecution" | "fileChange" | "mcpToolCall") => Some(ChatEvent::Assistant {
+            // The tool-call item types (verified against the 0.139.0 ThreadItem
+            // union): exec/edit/MCP plus subagent (collabAgentToolCall) and custom
+            // (dynamicToolCall) calls. Content/lifecycle items (agentMessage,
+            // reasoning, plan, webSearch, …) are ignored so they don't open rows.
+            Some(
+                "commandExecution" | "fileChange" | "mcpToolCall" | "collabAgentToolCall"
+                | "dynamicToolCall",
+            ) => Some(ChatEvent::Assistant {
                 texts: vec![],
                 tools: vec![appserver_tool_call(item)],
             }),
@@ -233,11 +237,12 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
         // agentMessage text already streamed via deltas → no-op; tool items deliver
         // their result here, merged into the running row by item id.
         "item/completed" => match item["type"].as_str() {
-            Some("commandExecution" | "fileChange" | "mcpToolCall") => {
-                Some(ChatEvent::ToolResults {
-                    items: vec![appserver_tool_result(item)],
-                })
-            }
+            Some(
+                "commandExecution" | "fileChange" | "mcpToolCall" | "collabAgentToolCall"
+                | "dynamicToolCall",
+            ) => Some(ChatEvent::ToolResults {
+                items: vec![appserver_tool_result(item)],
+            }),
             // already streamed (agentMessage) or carries no display payload.
             Some("agentMessage" | "userMessage" | "reasoning") | None => None,
             // Other content items (/plan, /review …) don't stream via agentMessage
@@ -459,6 +464,14 @@ pub async fn client() -> anyhow::Result<Client> {
     }
     c.connect().await?;
     Ok(c)
+}
+
+/// Shut down the global client. Call this after a probe `timeout()` cancels a
+/// `client()` mid-handshake: the dropped future may have left `spawn_inner`'s
+/// `Inner` half-initialized, and the next `client()` would reuse that broken
+/// connection — shutting it down forces a clean reconnect instead.
+pub async fn shutdown_global() {
+    cell().shutdown().await;
 }
 
 impl Client {
@@ -1060,21 +1073,31 @@ mod tests {
 
     #[test]
     fn only_real_tool_item_types_open_rows() {
-        // Tool item types are exactly commandExecution / fileChange / mcpToolCall
-        // (verified vs the 0.139.0 schema — there is NO collabToolCall). An unknown
-        // type must not open an empty tool row.
-        for ty in ["commandExecution", "fileChange", "mcpToolCall"] {
-            assert!(matches!(
-                notification_to_event(
-                    "item/started",
-                    &json!({"item":{"id":"c","type":ty,"status":"inProgress"}}),
+        // The tool-call item types per the 0.139.0 ThreadItem union — note the collab
+        // type is `collabAgentToolCall` (NOT the README's `collabToolCall`), and
+        // `dynamicToolCall` is a tool too.
+        for ty in [
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "collabAgentToolCall",
+            "dynamicToolCall",
+        ] {
+            assert!(
+                matches!(
+                    notification_to_event(
+                        "item/started",
+                        &json!({"item":{"id":"c","type":ty,"status":"inProgress"}}),
+                    ),
+                    Some(ChatEvent::Assistant { .. })
                 ),
-                Some(ChatEvent::Assistant { .. })
-            ), "{ty} should open a tool row");
+                "{ty} should open a tool row"
+            );
         }
+        // a content/lifecycle item must NOT open an empty tool row.
         assert!(notification_to_event(
             "item/started",
-            &json!({"item":{"id":"c","type":"collabToolCall","status":"inProgress"}}),
+            &json!({"item":{"id":"c","type":"reasoning","status":"inProgress"}}),
         )
         .is_none());
     }

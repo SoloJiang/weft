@@ -199,7 +199,15 @@ export interface LeadMessage {
 export type LeadChatPush =
   | { type: "message"; thread_id: number; message: LeadMessage }
   | { type: "delta"; thread_id: number; message_id: number; text: string }
-  | { type: "finalize"; thread_id: number; message_id: number; status: string }
+  | {
+      type: "finalize";
+      thread_id: number;
+      message_id: number;
+      status: string;
+      /** Cleaned final text, present only when sentinels were stripped after they
+       *  streamed raw — the row content is replaced so the tags vanish live. */
+      content?: string;
+    }
   | {
       type: "turn";
       thread_id: number;

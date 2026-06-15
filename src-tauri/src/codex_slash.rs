@@ -311,10 +311,12 @@ pub async fn discover_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
     let mut out = builtin_commands();
     // Bound the app-server probe: a wedged helper can stall its request up to the
     // client's 60s timeout, which would freeze the composer palette. On timeout we
-    // simply skip dynamic skills — built-ins + local still populate the list.
-    let fetch = tokio::time::timeout(std::time::Duration::from_secs(4), fetch_skills(Some(cwd)));
-    if let Ok(Ok(skills)) = fetch.await {
-        push_unique(&mut out, skills);
+    // skip dynamic skills (built-ins + local still populate) AND shut the global
+    // client down — the cancelled future may have left it half-handshaked.
+    match tokio::time::timeout(std::time::Duration::from_secs(4), fetch_skills(Some(cwd))).await {
+        Ok(Ok(skills)) => push_unique(&mut out, skills),
+        Ok(Err(_)) => {}
+        Err(_timeout) => crate::codex_app_server::shutdown_global().await,
     }
     push_unique(&mut out, local_skill_commands_for_cwd(cwd));
     out

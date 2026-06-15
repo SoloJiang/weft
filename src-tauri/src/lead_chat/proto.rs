@@ -155,11 +155,14 @@ fn parse_codex(line: &str) -> ChatEvent {
                     text: error_text_from_item(item),
                 },
                 Some("reasoning") => ChatEvent::Other,
-                // Real tool items → rows (started: running; completed: result,
-                // merged by item id). plan/other content items are ignored so they
-                // don't render as empty tool rows. (Item types verified against the
-                // codex 0.139.0 app-server JSON schema; no collab tool type exists.)
-                Some("command_execution" | "file_change" | "mcp_tool_call") => {
+                // Real tool items → rows (started: running; completed: result, merged
+                // by item id). Tool-call types: exec/edit/MCP + subagent + dynamic
+                // (snake_case of the 0.139.0 ThreadItem union). Content items (plan,
+                // reasoning, …) are ignored so they don't render as empty tool rows.
+                Some(
+                    "command_execution" | "file_change" | "mcp_tool_call"
+                    | "collab_agent_tool_call" | "dynamic_tool_call",
+                ) => {
                     if completed {
                         ChatEvent::ToolResults {
                             items: vec![codex_tool_result(item)],

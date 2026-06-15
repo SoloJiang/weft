@@ -234,7 +234,13 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
                 })
                 .collect(),
         ),
-        _ => None,
+        Ok(None) => None, // probe failed → keep the panel's previous list
+        Err(_timeout) => {
+            // Cancelled mid-handshake may leave the global client half-init — reset
+            // it so the next probe reconnects cleanly. Keep the previous list (None).
+            crate::codex_app_server::shutdown_global().await;
+            None
+        }
     };
     SessionMetaSnapshot {
         context_tokens: None,

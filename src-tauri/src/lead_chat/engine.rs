@@ -63,6 +63,11 @@ pub enum Push {
         thread_id: i32,
         message_id: i32,
         status: String,
+        /// Cleaned final content, set only when the streamed row differs from what
+        /// was persisted (codex app-server strips `<weft:*>` sentinels AFTER they
+        /// streamed raw) — the frontend replaces the row text so the tags vanish.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
     Turn {
         thread_id: i32,
@@ -264,6 +269,7 @@ fn emit_finalize(app: &AppHandle, thread_id: i32, message_id: i32, status: &str)
             thread_id,
             message_id,
             status: status.into(),
+            content: None,
         },
     );
 }
@@ -628,12 +634,15 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     };
     let thread_id = inner.thread_id;
     let origin_tag = inner.current_origin_tag.clone();
-    let clean = if status == "complete" {
+    // `stripped` = the cleaned body differs from what streamed (sentinels removed),
+    // so the live row still shows the raw tags and must be replaced, not just status.
+    let (clean, stripped) = if status == "complete" {
         let (clean, sentinels) = super::sentinels::extract_sentinels(&text);
+        let stripped = clean != text;
         apply_lead_sentinels(app, db, inner, thread_id, sentinels).await;
-        clean
+        (clean, stripped)
     } else {
-        text
+        (text, false)
     };
     let _ = repo::update_lead_message(
         db,
@@ -648,6 +657,7 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
             thread_id,
             message_id: id,
             status: status.into(),
+            content: stripped.then(|| clean.clone()),
         },
     );
     if status == "complete" {
@@ -1524,6 +1534,14 @@ async fn codex_consumer(
                                 eprintln!(
                                     "[weft][codex] flush via app-server failed ({e}); trying exec"
                                 );
+                                // Take + shut down the (closing) client first — same as
+                                // the direct-send fallback — so THIS consumer sees it's
+                                // superseded (ptr_eq) and skips cleanup, instead of
+                                // racing spawn_turn and resetting the exec turn.
+                                let stale = eng.lock().await.codex_client.take();
+                                if let Some(c) = stale {
+                                    c.shutdown().await;
+                                }
                                 match spawn_turn(app.clone(), db.clone(), eng.clone(), n.clone())
                                     .await
                                 {
@@ -1611,33 +1629,33 @@ async fn codex_consumer(
                     .unwrap_or_default()
                     .to_string();
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
-                let decision = match registry.auto_decision(thread_id, &dir, &summary) {
-                    Some(d) => d, // dangerous mode / full access / always-allow
+                match registry.auto_decision(thread_id, &dir, &summary) {
+                    // dangerous mode / full access / always-allow: reply inline (fast).
+                    Some(d) => {
+                        let allow = matches!(d, crate::ask::Decision::Allow);
+                        let _ = client
+                            .reply_result(&id, codex_approval_reply(is_perm, allow, requested))
+                            .await;
+                    }
+                    // Needs a human answer: await it in a SIDE TASK so the consumer
+                    // loop keeps draining (TurnEnd / interrupt / cleanup) while the
+                    // Needs-you is open — else a Stop can't be processed until the
+                    // stale card is answered. A late reply to an already-resolved turn
+                    // is harmless (codex ignores it).
                     None => {
                         let (_aid, rx) = registry.request(thread_id, &dir, tool, &summary, &detail);
-                        // Receiver dropped (timeout/cancel) → deny-but-continue (safe).
-                        rx.await.unwrap_or(crate::ask::Decision::Deny)
+                        let client = client.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let allow = matches!(
+                                rx.await.unwrap_or(crate::ask::Decision::Deny),
+                                crate::ask::Decision::Allow
+                            );
+                            let _ = client
+                                .reply_result(&id, codex_approval_reply(is_perm, allow, requested))
+                                .await;
+                        });
                     }
-                };
-                let allow = matches!(decision, crate::ask::Decision::Allow);
-                let result = if is_perm {
-                    // Answered with the granted permissions, NOT a decision (a
-                    // `{decision}` reply silently no-ops the grant). `permissions` is
-                    // a GrantedPermissionProfile OBJECT `{fileSystem?,network?}` —
-                    // identical shape to the requested RequestPermissionProfile, so
-                    // echo it to grant on allow; an empty OBJECT grants nothing on
-                    // deny (an array would fail schema validation). Verified against
-                    // the codex 0.139.0 app-server JSON schema.
-                    let granted = if allow {
-                        requested.unwrap_or_else(|| serde_json::json!({}))
-                    } else {
-                        serde_json::json!({})
-                    };
-                    serde_json::json!({ "permissions": granted })
-                } else {
-                    serde_json::json!({ "decision": if allow { "accept" } else { "decline" } })
-                };
-                let _ = client.reply_result(&id, result).await;
+                }
             }
         }
     }
@@ -1647,6 +1665,24 @@ async fn codex_consumer(
     let still_active = matches!(&eng.lock().await.codex_client, Some(c) if c.ptr_eq(&client));
     if still_active {
         cleanup_disconnected_turn(&app, &db, &eng, "error").await;
+    }
+}
+
+/// The reply payload for an app-server approval, by the user's decision. Permission
+/// asks are answered with the GRANTED permissions (a GrantedPermissionProfile
+/// OBJECT — echo the requested profile on allow, empty object on deny; a
+/// `{decision}` reply would silently no-op the grant). All others take `{decision}`.
+/// Shapes verified against the codex 0.139.0 app-server JSON schema.
+fn codex_approval_reply(is_perm: bool, allow: bool, requested: Option<serde_json::Value>) -> serde_json::Value {
+    if is_perm {
+        let granted = if allow {
+            requested.unwrap_or_else(|| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+        serde_json::json!({ "permissions": granted })
+    } else {
+        serde_json::json!({ "decision": if allow { "accept" } else { "decline" } })
     }
 }
 
@@ -2274,6 +2310,7 @@ fn spawn_reader(
                                         thread_id,
                                         message_id: id,
                                         status: "complete".into(),
+                                        content: None,
                                     },
                                 );
                                 emit_lead_out(
@@ -2372,6 +2409,7 @@ fn spawn_reader(
                                 thread_id,
                                 message_id: id,
                                 status: status.into(),
+                                content: None,
                             },
                         );
                         if status == "complete" {
@@ -2506,6 +2544,7 @@ fn spawn_reader(
                         thread_id: inner.thread_id,
                         message_id: id,
                         status: status.into(),
+                        content: None,
                     },
                 );
                 // 仅 complete 才回流 IM——interrupted/error 的半截不应上桥。
@@ -2591,6 +2630,7 @@ fn spawn_reader(
                         thread_id: inner.thread_id,
                         message_id: id,
                         status: status.into(),
+                        content: None,
                     },
                 );
             }
