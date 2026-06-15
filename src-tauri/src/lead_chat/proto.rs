@@ -155,9 +155,10 @@ fn parse_codex(line: &str) -> ChatEvent {
                     text: error_text_from_item(item),
                 },
                 Some("reasoning") => ChatEvent::Other,
-                // Tool item: started → running row, completed → its result, merged
-                // by item id (like claude's tool_use → tool_result).
-                Some(_) => {
+                // Real tool items → rows (started: running; completed: result,
+                // merged by item id). plan/review/other content items are ignored
+                // so they don't render as empty tool rows.
+                Some("command_execution" | "file_change" | "mcp_tool_call") => {
                     if completed {
                         ChatEvent::ToolResults {
                             items: vec![codex_tool_result(item)],
@@ -169,7 +170,7 @@ fn parse_codex(line: &str) -> ChatEvent {
                         }
                     }
                 }
-                None => ChatEvent::Other,
+                _ => ChatEvent::Other,
             }
         }
         Some("turn.completed") => ChatEvent::TurnEnd {
@@ -270,10 +271,15 @@ fn codex_item_output(item: &Value) -> String {
 /// Whether a completed codex tool item failed: a non-zero `exit_code`
 /// (command_execution) or a failed/error `status`.
 fn codex_item_is_error(item: &Value) -> bool {
-    if let Some(code) = item["exit_code"].as_i64() {
-        return code != 0;
+    // A declined/canceled approval completes the item without running it — not a
+    // success. Check status first; otherwise a non-zero exit code is an error.
+    if matches!(
+        item["status"].as_str(),
+        Some("failed" | "error" | "declined" | "canceled" | "cancelled")
+    ) {
+        return true;
     }
-    matches!(item["status"].as_str(), Some("failed") | Some("error"))
+    item["exit_code"].as_i64().is_some_and(|c| c != 0)
 }
 
 fn parse_opencode(line: &str) -> ChatEvent {
@@ -845,6 +851,43 @@ mod tests {
         ) {
             ChatEvent::ToolResults { items } => assert!(items[0].is_error),
             e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_declined_command_completes_as_error() {
+        // A declined/canceled approval completes the item with exit_code:null but
+        // never ran — must surface as an error, not a (default) success.
+        for status in ["declined", "canceled", "cancelled"] {
+            let l = format!(
+                r#"{{"type":"item.completed","item":{{"id":"i","type":"command_execution","command":"rm -rf /","aggregated_output":"","exit_code":null,"status":"{status}"}}}}"#
+            );
+            match parse_line_for("codex", &l) {
+                ChatEvent::ToolResults { items } => assert!(items[0].is_error, "{status}"),
+                e => panic!("{status}: {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn codex_ignores_non_tool_items() {
+        // plan/review/other content items aren't tool calls — they must not open
+        // an empty tool row (started) or a stray result (completed).
+        for ty in ["plan", "review", "todo_list", "web_search"] {
+            let started = format!(
+                r#"{{"type":"item.started","item":{{"id":"x","type":"{ty}","status":"in_progress"}}}}"#
+            );
+            assert!(
+                matches!(parse_line_for("codex", &started), ChatEvent::Other),
+                "started {ty}"
+            );
+            let completed = format!(
+                r#"{{"type":"item.completed","item":{{"id":"x","type":"{ty}","status":"completed"}}}}"#
+            );
+            assert!(
+                matches!(parse_line_for("codex", &completed), ChatEvent::Other),
+                "completed {ty}"
+            );
         }
     }
 

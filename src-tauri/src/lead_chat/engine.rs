@@ -404,6 +404,20 @@ async fn finalize_orphan_tool_rows(
     }
 }
 
+/// Persisted status for a tool row. A row with output is terminal
+/// (error/complete). A running row streams ONLY if it carries an id to correlate
+/// its later result by — an id-less running row is stored complete so it can't
+/// spin forever (nothing could ever fill it).
+fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'static str {
+    if has_output {
+        if is_error { "error" } else { "complete" }
+    } else if trackable {
+        "streaming"
+    } else {
+        "complete"
+    }
+}
+
 /// Persist a turn's tool calls as `kind:"tool"` rows (running until their result
 /// arrives). Shared by spawn_reader (claude/exec) and codex_consumer (app-server).
 async fn persist_tool_calls(
@@ -416,13 +430,8 @@ async fn persist_tool_calls(
     for call in tools {
         let (sid, turn) = (inner.session_id, inner.turn_id);
         let running = call.output.is_none();
-        let status = if running {
-            "streaming"
-        } else if call.is_error {
-            "error"
-        } else {
-            "complete"
-        };
+        let trackable = running && !call.id.is_empty();
+        let status = tool_row_status(!running, trackable, call.is_error);
         let content = serde_json::json!({
             "name": call.name,
             "summary": call.summary,
@@ -440,7 +449,7 @@ async fn persist_tool_calls(
             Ok(m) => {
                 let row_id = m.id;
                 let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
-                if running && !call_id.is_empty() {
+                if trackable {
                     inner.tool_rows.insert(call_id, (row_id, content));
                 }
             }
@@ -1037,18 +1046,12 @@ async fn spawn_codex_turn(
     };
     let cwd = cwd.to_string_lossy().into_owned();
     let had_native = native.is_some();
-    let thread = match native {
-        Some(t) => t,
-        None => {
-            let t = client.start_thread(&cwd).await?;
-            eng.lock().await.native_id = Some(t.clone());
-            if let Some(sid) = sid {
-                let _ = repo::set_session_native_id(&db, sid, &t).await;
-            } else {
-                let _ = repo::set_lead_native_id(&db, thread_id_i, &t).await;
-            }
-            t
-        }
+    let (thread, freshly_started) = match native {
+        Some(t) => (t, false),
+        // Don't commit the native id yet: if `turn/start` below fails and we fall
+        // back to exec, a None native id lets exec start fresh WITH the system
+        // prompt prepended, instead of resuming an empty thread that never got it.
+        None => (client.start_thread(&cwd).await?, true),
     };
     if !client.is_subscribed(&thread).await {
         // First attach this process: a pre-existing thread is resumed so the
@@ -1072,6 +1075,16 @@ async fn spawn_codex_turn(
     let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
     let turn = client.start_turn(&thread, &first_text).await?;
     client.set_active_turn(&thread, &turn).await;
+    // The turn is in flight, so the thread is real and carries the system prompt:
+    // now it's safe to persist the native id (a later resume reuses this rollout).
+    if freshly_started {
+        eng.lock().await.native_id = Some(thread.clone());
+        if let Some(sid) = sid {
+            let _ = repo::set_session_native_id(&db, sid, &thread).await;
+        } else {
+            let _ = repo::set_lead_native_id(&db, thread_id_i, &thread).await;
+        }
+    }
     Ok(())
 }
 
@@ -1300,6 +1313,10 @@ async fn codex_consumer(
                     },
                 );
                 drop(inner);
+                // This turn is over: drop its active-turn id so a subsequent
+                // interrupt won't target a finished turn (the flush below re-sets
+                // it for the next turn).
+                client.clear_active_turn(&thread).await;
                 // Flush: start the next queued message as a fresh turn on this thread.
                 if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
                     match client.start_turn(&thread, &n.text).await {
@@ -1315,6 +1332,11 @@ async fn codex_consumer(
                 }
             }
             ThreadMsg::Event(_) => {}
+            ThreadMsg::Heartbeat => {
+                // outputDelta from a long-running command: no row change, just keep
+                // the turn alive so the idle watchdog doesn't reap it mid-output.
+                eng.lock().await.clock.last_activity = std::time::Instant::now();
+            }
             ThreadMsg::Approval { id, method, params } => {
                 // Route the app-server's approval request through Weft's Ask Bridge
                 // (the same Needs-you surface the exec path uses), then reply with
@@ -1323,18 +1345,22 @@ async fn codex_consumer(
                     let i = eng.lock().await;
                     (i.thread_id, i.ask_dir.clone())
                 };
-                let (tool, summary) = if method.contains("commandExecution") {
-                    (
-                        "Bash",
-                        params["command"]
-                            .as_str()
-                            .unwrap_or("(command)")
-                            .to_string(),
-                    )
+                // command/cwd may sit at the top level (commandExecution ask) or
+                // nested under `item` (the generic permissions ask) — read both.
+                let cmd = params["command"]
+                    .as_str()
+                    .or_else(|| params["item"]["command"].as_str());
+                let is_cmd = method.contains("commandExecution") || cmd.is_some();
+                let (tool, summary) = if is_cmd {
+                    ("Bash", cmd.unwrap_or("(command)").to_string())
                 } else {
                     ("Edit", "apply file changes".to_string())
                 };
-                let detail = params["cwd"].as_str().unwrap_or_default().to_string();
+                let detail = params["cwd"]
+                    .as_str()
+                    .or_else(|| params["item"]["cwd"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
                 let decision = match registry.auto_decision(thread_id, &dir, &summary) {
                     Some(d) => d, // dangerous mode / full access / always-allow
@@ -1412,9 +1438,19 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
         let thread = inner.native_id.clone();
         let client = inner.codex_client.clone();
         drop(inner);
+        let mut interrupted = false;
         if let (Some(thread), Some(client)) = (thread, client) {
             if let Some(turn) = client.active_turn(&thread).await {
                 let _ = client.interrupt(&thread, &turn).await;
+                interrupted = true;
+            }
+        }
+        // No live app-server turn → this turn fell back to exec; kill the per-turn
+        // child so the reader hits EOF and finalizes the row as interrupted.
+        if !interrupted {
+            let mut inner = eng.lock().await;
+            if let Some(c) = inner.child.as_mut() {
+                let _ = c.kill().await;
             }
         }
         return Ok(());
@@ -2646,6 +2682,17 @@ mod tests {
         assert_eq!(human_dur(7200), "2h");
         assert_eq!(human_dur(1800), "30min");
         assert_eq!(human_dur(45), "45s");
+    }
+
+    #[test]
+    fn tool_row_status_id_less_running_does_not_spin() {
+        // a finished row is terminal …
+        assert_eq!(tool_row_status(true, false, false), "complete");
+        assert_eq!(tool_row_status(true, false, true), "error");
+        // … a running row streams only when it has an id to correlate its result …
+        assert_eq!(tool_row_status(false, true, false), "streaming");
+        // … and an id-less running row is stored complete (never a perpetual spinner).
+        assert_eq!(tool_row_status(false, false, false), "complete");
     }
 
     #[test]

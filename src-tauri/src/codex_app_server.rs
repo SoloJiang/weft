@@ -164,7 +164,9 @@ pub fn turn_id_of(result: &Value) -> Option<String> {
 pub fn is_approval_request(method: &str) -> bool {
     matches!(
         method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
     )
 }
 
@@ -181,24 +183,40 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             .filter(|s| !s.is_empty())
             .map(|s| ChatEvent::TextDelta { text: s.to_string() }),
         "item/started" => match item["type"].as_str() {
-            Some("agentMessage") | Some("userMessage") | Some("reasoning") | None => None,
             Some("error") => Some(ChatEvent::TextDelta {
                 text: crate::lead_chat::proto::error_text_from_item(item),
             }),
-            Some(_) => Some(ChatEvent::Assistant {
+            // Only real tool items open a row; agentMessage/reasoning/plan/review/
+            // other content items are ignored so they don't show as empty rows.
+            Some("commandExecution" | "fileChange" | "mcpToolCall") => Some(ChatEvent::Assistant {
                 texts: vec![],
                 tools: vec![appserver_tool_call(item)],
             }),
+            _ => None,
         },
         // agentMessage text already streamed via deltas → no-op; tool items deliver
         // their result here, merged into the running row by item id.
         "item/completed" => match item["type"].as_str() {
-            Some("agentMessage") | Some("userMessage") | Some("reasoning") | Some("error")
-            | None => None,
-            Some(_) => Some(ChatEvent::ToolResults {
-                items: vec![appserver_tool_result(item)],
-            }),
+            Some("commandExecution" | "fileChange" | "mcpToolCall") => {
+                Some(ChatEvent::ToolResults {
+                    items: vec![appserver_tool_result(item)],
+                })
+            }
+            _ => None,
         },
+        // Top-level failure (auth / usage-limit / context-window …): surface the
+        // message so the turn doesn't end blank, then turn/completed marks it error.
+        "error" => {
+            let text = params["message"]
+                .as_str()
+                .or_else(|| params["error"]["message"].as_str())
+                .or_else(|| params["error"].as_str())
+                .unwrap_or("Codex reported an error.")
+                .trim();
+            (!text.is_empty()).then(|| ChatEvent::TextDelta {
+                text: text.to_string(),
+            })
+        }
         "thread/tokenUsage/updated" => {
             let tu = &params["tokenUsage"];
             tu["last"]["inputTokens"]
@@ -274,11 +292,31 @@ fn appserver_tool_output(item: &Value) -> String {
             return cap_out(&diff);
         }
     }
-    item["output"]
-        .as_str()
-        .or_else(|| item["result"].as_str())
-        .map(cap_out)
-        .unwrap_or_default()
+    // mcpToolCall result / generic output: a plain string, an MCP result object
+    // (`{content:[{text}]}` — what weft's bus/planner tools return), or some other
+    // JSON value. Render the text where possible, else serialize so the expanded
+    // row isn't blank.
+    for key in ["output", "result", "error"] {
+        let v = &item[key];
+        if v.is_null() {
+            continue;
+        }
+        if let Some(s) = v.as_str() {
+            return cap_out(s);
+        }
+        if let Some(content) = v["content"].as_array() {
+            let text = content
+                .iter()
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                return cap_out(&text);
+            }
+        }
+        return cap_out(&v.to_string());
+    }
+    String::new()
 }
 
 fn appserver_tool_is_error(item: &Value) -> bool {
@@ -319,6 +357,10 @@ fn cap_out(s: &str) -> String {
 pub enum ThreadMsg {
     /// A streaming event for the session's timeline.
     Event(ChatEvent),
+    /// A liveness ping (e.g. command output-delta while a long command runs) that
+    /// carries no timeline change — the consumer uses it only to refresh the
+    /// runaway-guard's last-activity clock so a busy command isn't idle-killed.
+    Heartbeat,
     /// An approval ask the session must answer via [`Client::reply_approval`]
     /// (echoing `id`), else the turn hangs. `decision` ∈ accept | acceptForSession
     /// | decline | cancel.
@@ -451,19 +493,25 @@ impl Client {
                 Incoming::Response { id, result } => self.resolve(id, Ok(result)).await,
                 Incoming::Error { id, message, .. } => self.resolve(id, Err(message)).await,
                 Incoming::Notification { method, params } => {
-                    if let (Some(ev), Some(tid)) = (
-                        notification_to_event(&method, &params),
-                        params["threadId"].as_str().map(String::from),
-                    ) {
-                        self.route(&tid, ThreadMsg::Event(ev)).await;
+                    let tid = params["threadId"].as_str().map(String::from);
+                    if let Some(ev) = notification_to_event(&method, &params) {
+                        self.route_resolved(tid.as_deref(), ThreadMsg::Event(ev))
+                            .await;
+                    } else if method.ends_with("/outputDelta") {
+                        // A long command is still producing output; keep the turn
+                        // marked alive so the idle watchdog doesn't kill it.
+                        self.route_resolved(tid.as_deref(), ThreadMsg::Heartbeat)
+                            .await;
                     }
                 }
                 Incoming::ServerRequest { id, method, params } => {
                     if is_approval_request(&method) {
-                        if let Some(tid) = params["threadId"].as_str().map(String::from) {
-                            self.route(&tid, ThreadMsg::Approval { id, method, params })
-                                .await;
-                        }
+                        let tid = params["threadId"].as_str().map(String::from);
+                        self.route_resolved(
+                            tid.as_deref(),
+                            ThreadMsg::Approval { id, method, params },
+                        )
+                        .await;
                     }
                 }
                 Incoming::Other => {}
@@ -481,10 +529,24 @@ impl Client {
         }
     }
 
-    async fn route(&self, thread_id: &str, msg: ThreadMsg) {
+    /// Route to `tid` when present (and subscribed), else — each connection is
+    /// per-session, so it owns a single thread — fall back to that sole thread.
+    /// This keeps thread-less notifications (the id sometimes lives only inside
+    /// `turn`/`item`, not at the top level) reaching the consumer.
+    async fn route_resolved(&self, tid: Option<&str>, msg: ThreadMsg) {
         if let Some(inner) = self.0.lock().await.as_mut() {
-            if let Some(tx) = inner.threads.get(thread_id) {
-                let _ = tx.send(msg);
+            let key: Option<String> = tid
+                .filter(|t| inner.threads.contains_key(*t))
+                .map(String::from)
+                .or_else(|| {
+                    (inner.threads.len() == 1)
+                        .then(|| inner.threads.keys().next().cloned())
+                        .flatten()
+                });
+            if let Some(k) = key {
+                if let Some(tx) = inner.threads.get(&k) {
+                    let _ = tx.send(msg);
+                }
             }
         }
     }
@@ -560,6 +622,15 @@ impl Client {
             inner
                 .active_turn
                 .insert(thread_id.to_string(), turn_id.to_string());
+        }
+    }
+
+    /// Forget a thread's in-flight turn (called at turn end), so a later
+    /// `active_turn` only reports a genuinely live app-server turn — letting
+    /// the interrupt path tell an app-server turn from an exec fallback.
+    pub async fn clear_active_turn(&self, thread_id: &str) {
+        if let Some(inner) = self.0.lock().await.as_mut() {
+            inner.active_turn.remove(thread_id);
         }
     }
 
@@ -778,6 +849,55 @@ mod tests {
             notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none()
         );
         assert!(notification_to_event("turn/started", &json!({"threadId":"t"})).is_none());
+    }
+
+    #[test]
+    fn top_level_error_notification_surfaces_text() {
+        // A turn-level failure (auth / usage-limit / context-window) arrives as a
+        // bare `error` notification — surface it so the turn doesn't end blank.
+        match notification_to_event("error", &json!({"message":"usage limit reached"})) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "usage limit reached"),
+            e => panic!("{e:?}"),
+        }
+        match notification_to_event("error", &json!({"error":{"message":"nested"}})) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "nested"),
+            e => panic!("{e:?}"),
+        }
+        // An empty error message yields nothing (turn/completed still flags error).
+        assert!(notification_to_event("error", &json!({"message":""})).is_none());
+    }
+
+    #[test]
+    fn approval_methods_recognized() {
+        // All three approval asks (command, file-change, generic permissions) route
+        // to the Ask Bridge; ordinary notifications don't.
+        assert!(is_approval_request("item/commandExecution/requestApproval"));
+        assert!(is_approval_request("item/fileChange/requestApproval"));
+        assert!(is_approval_request("item/permissions/requestApproval"));
+        assert!(!is_approval_request("item/completed"));
+    }
+
+    #[test]
+    fn ignores_non_tool_content_items() {
+        // plan/review/todo content items must not open empty tool rows.
+        for ty in ["plan", "review", "todoList", "webSearch"] {
+            assert!(
+                notification_to_event(
+                    "item/started",
+                    &json!({"item":{"id":"x","type":ty,"status":"inProgress"}}),
+                )
+                .is_none(),
+                "{ty}"
+            );
+            assert!(
+                notification_to_event(
+                    "item/completed",
+                    &json!({"item":{"id":"x","type":ty,"status":"completed"}}),
+                )
+                .is_none(),
+                "{ty}"
+            );
+        }
     }
 
     #[test]
