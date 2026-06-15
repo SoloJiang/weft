@@ -20,37 +20,48 @@ function trimUrl(raw: string): string {
     .replace(/[)\]}>'"`.,;]+$/, "");
 }
 
-/** Normalized key for dedup — drop trailing `.git`/slashes, lowercase. */
+/**
+ * Normalized key for dedup — drop trailing `.git`/slashes; lowercase the HOST
+ * only (case-insensitive), keep the repo path's case (case-sensitive git hosts:
+ * `Team/App` and `team/App` are distinct repos).
+ */
 function dedupKey(url: string): string {
-  return url.toLowerCase().replace(/\.git$/, "").replace(/\/+$/, "");
+  const base = url.replace(/\.git$/i, "").replace(/\/+$/, "");
+  const scheme = base.match(/^([a-z][a-z0-9+.-]*:\/\/[^/]*)(\/.*)?$/i);
+  if (scheme) return scheme[1].toLowerCase() + (scheme[2] ?? "");
+  const scp = base.match(/^([^:]*:)(.*)$/); // user@host:  +  path
+  if (scp) return scp[1].toLowerCase() + scp[2];
+  return base.toLowerCase();
 }
 
 /**
- * Extract recognized git URLs from arbitrary pasted text, in first-seen order,
- * deduped. SCP matches that fall inside an already-matched scheme URL (e.g. the
- * `user@host:443/…` slice of `https://user@host:443/…`) are skipped.
+ * Extract recognized git URLs from arbitrary pasted text, in first-seen (paste)
+ * order, deduped. SCP matches that fall inside a scheme URL (e.g. the
+ * `user@host:443/…` slice of `https://user@host:443/…`) are skipped — a scheme
+ * URL always starts before its inner scp slice, so claim-on-lower-start drops it.
  */
 export function parseGitUrls(text: string): string[] {
+  const matches: Array<{ raw: string; start: number; end: number }> = [];
+  for (const m of text.matchAll(SCHEME_URL)) {
+    matches.push({ raw: m[0], start: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+  }
+  for (const m of text.matchAll(SCP_URL)) {
+    matches.push({ raw: m[0], start: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+  }
+  matches.sort((a, b) => a.start - b.start);
+
   const out: string[] = [];
   const seen = new Set<string>();
   const claimed: Array<[number, number]> = [];
-
-  const consider = (raw: string, start: number, end: number) => {
-    if (claimed.some(([s, e]) => start < e && end > s)) return; // overlaps a scheme URL
+  for (const { raw, start, end } of matches) {
+    if (claimed.some(([s, e]) => start < e && end > s)) continue; // inside a claimed URL
     const url = trimUrl(raw);
-    if (!url) return;
+    if (!url) continue;
     claimed.push([start, end]);
     const key = dedupKey(url);
-    if (seen.has(key)) return;
+    if (seen.has(key)) continue;
     seen.add(key);
     out.push(url);
-  };
-
-  for (const m of text.matchAll(SCHEME_URL)) {
-    consider(m[0], m.index ?? 0, (m.index ?? 0) + m[0].length);
-  }
-  for (const m of text.matchAll(SCP_URL)) {
-    consider(m[0], m.index ?? 0, (m.index ?? 0) + m[0].length);
   }
   return out;
 }

@@ -206,6 +206,7 @@ interface Store {
     items: Array<{ url: string; name: string }>,
     dest: string,
     onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+    signal?: AbortSignal,
   ) => Promise<void>;
   createRepo: (name: string, dest: string) => Promise<void>;
   createThread: (title: string, kind: string) => Promise<Thread>;
@@ -690,10 +691,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       items: Array<{ url: string; name: string }>,
       dest: string,
       onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+      signal?: AbortSignal,
     ) => {
       if (activeWorkspaceId == null) return;
-      // Sequential + tolerant: one failed clone doesn't abort the rest.
+      // Sequential + tolerant: one failed clone doesn't abort the rest. `signal`
+      // (set when the dialog is closed/cancelled mid-batch) stops queuing the
+      // next clone — the in-flight one still finishes, but no more are started.
       for (let i = 0; i < items.length; i++) {
+        if (signal?.aborted) break;
         onProgress(i, "cloning");
         try {
           await api.cloneRepo(activeWorkspaceId, items[i].url, dest, items[i].name);
@@ -702,6 +707,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           onProgress(i, "error", String(e));
         }
       }
+      // Refresh even on abort — the clones that already finished are real repos.
       await refreshReposAndMap(activeWorkspaceId);
     },
     [activeWorkspaceId, refreshReposAndMap],

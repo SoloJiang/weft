@@ -135,6 +135,8 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   const [progress, setProgress] = useState<Record<number, { status: RowStatus; error?: string }>>(
     {},
   );
+  // Aborts the in-flight batch when the dialog is closed/cancelled mid-import.
+  const abortRef = useRef<AbortController | null>(null);
 
   // Recognized git URLs parsed live from the paste box (deduped, first-seen order).
   const recognized = useMemo(() => parseGitUrls(url), [url]);
@@ -159,6 +161,12 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   useEffect(() => {
     setProgress((p) => (Object.keys(p).length ? {} : p));
   }, [url]);
+
+  // Closing/cancelling mid-batch aborts the loop so it stops queuing more clones.
+  function handleOpenChange(o: boolean) {
+    if (!o) abortRef.current?.abort();
+    onOpenChange(o);
+  }
 
   const finalName = name.trim() || (mode === "local" ? basename(path) : "");
 
@@ -195,11 +203,20 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
         setProgress(
           Object.fromEntries(items.map((_, i) => [i, { status: "queued" as RowStatus }])),
         );
+        const controller = new AbortController();
+        abortRef.current = controller;
         const errors: Array<string | undefined> = [];
-        await importRepos(items, dest.trim(), (i, status, error) => {
-          setProgress((p) => ({ ...p, [i]: { status, error } }));
-          if (status === "error") errors[i] = error;
-        });
+        await importRepos(
+          items,
+          dest.trim(),
+          (i, status, error) => {
+            setProgress((p) => ({ ...p, [i]: { status, error } }));
+            if (status === "error") errors[i] = error;
+          },
+          controller.signal,
+        );
+        abortRef.current = null;
+        if (controller.signal.aborted) return; // dialog closed mid-import — nothing to report
         const failed = errors.filter(Boolean).length;
         if (failed === 0) {
           if (items.length > 1) toast(t("dialog.importedToast", { count: items.length }));
@@ -240,7 +257,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
           : t("dialog.createRepoCta");
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent title={t("dialog.addRepoTitle")}>
         <div className="mb-4 flex items-center rounded-[var(--radius-md)] bg-bg p-0.5">
           {(["local", "clone", "new"] as RepoMode[]).map((m) => (
@@ -363,7 +380,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
 
           {err && <p className="text-[12px] leading-relaxed text-danger">{err}</p>}
           <div className="flex justify-end gap-2">
-            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+            <Button type="button" variant="ghost" onClick={() => handleOpenChange(false)}>
               {t("common.cancel")}
             </Button>
             <Button type="submit" variant="primary" disabled={!canSubmit}>
