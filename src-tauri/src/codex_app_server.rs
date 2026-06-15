@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -268,8 +269,16 @@ struct Inner {
     threads: HashMap<String, mpsc::UnboundedSender<ThreadMsg>>,
     /// thread_id → the in-flight turn id (needed by turn/interrupt).
     active_turn: HashMap<String, String>,
+    /// Monotonic id of THIS connection instance. The read_loop, writer, and a
+    /// request timeout each remember the epoch they were spawned for and only
+    /// tear down if it still matches — so a stale task from a dead connection
+    /// can't drop a freshly reconnected one (ABA).
+    epoch: u64,
     _child: tokio::process::Child,
 }
+
+/// Hands out a fresh epoch per connection instance (see `Inner::epoch`).
+static CONN_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Handle to the single global `codex app-server` connection.
 #[derive(Clone)]
@@ -298,7 +307,12 @@ pub async fn client() -> anyhow::Result<Client> {
 /// deadlock can't form. Exits when every `write_tx` is dropped (i.e. the `Inner`
 /// is torn down) or stdin errors; either way it tears the connection down so
 /// pending callers fail fast and the next `client()` reconnects.
-async fn write_loop(client: Client, mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn write_loop(
+    client: Client,
+    epoch: u64,
+    mut stdin: ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
     while let Some(buf) = rx.recv().await {
         if stdin.write_all(&buf).await.is_err() || stdin.flush().await.is_err() {
             break; // stdin closed/errored
@@ -306,9 +320,10 @@ async fn write_loop(client: Client, mut stdin: ChildStdin, mut rx: mpsc::Unbound
     }
     // A stdin error with stdout still open would otherwise leave the request
     // mid-write unresolved (its caller waits out the full 60s) and `client()`
-    // reporting "connected" until stdout EOFs. Tear down now so the codex
-    // fallback/reconnect path runs promptly. No-op if already torn down.
-    client.teardown().await;
+    // reporting "connected" until stdout EOFs. Tear down THIS connection now so
+    // the codex fallback/reconnect path runs promptly — scoped by epoch so a
+    // since-reconnected connection is left alone. No-op if already torn down.
+    client.teardown(epoch).await;
 }
 
 impl Client {
@@ -333,21 +348,23 @@ impl Client {
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let epoch = CONN_EPOCH.fetch_add(1, Ordering::Relaxed);
         *g = Some(Inner {
             write_tx,
             next_id: 1,
             pending: HashMap::new(),
             threads: HashMap::new(),
             active_turn: HashMap::new(),
+            epoch,
             _child: child,
         });
         drop(g);
 
         // Writer owns stdin and awaits each write off the lock (see `write_tx`).
-        tauri::async_runtime::spawn(write_loop(self.clone(), stdin, write_rx));
+        tauri::async_runtime::spawn(write_loop(self.clone(), epoch, stdin, write_rx));
 
         let me = self.clone();
-        tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
+        tauri::async_runtime::spawn(async move { me.read_loop(epoch, stdout).await });
 
         // Handshake: initialize (await), then the `initialized` notification.
         self.request(
@@ -361,7 +378,7 @@ impl Client {
 
     /// Demux the server's stdout for the connection's lifetime: correlate replies
     /// by id, route notifications + approval requests to the owning thread.
-    async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
+    async fn read_loop(&self, epoch: u64, stdout: tokio::process::ChildStdout) {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             match classify(&line) {
@@ -387,17 +404,21 @@ impl Client {
             }
         }
         // EOF/crash → drop the connection so the next use reconnects + re-resumes.
-        self.teardown().await;
+        self.teardown(epoch).await;
     }
 
-    /// Drop the live `Inner`: stops the writer (its `write_tx` is gone), fails
-    /// every pending caller at once (their oneshot senders drop → `rx` errors
-    /// instead of waiting out the 60s timeout), and kills the child
-    /// (`kill_on_drop`) so no buffered request is processed late. The next
-    /// `client()` reconnects. Idempotent — safe to call from read_loop, the
-    /// writer, and a request timeout.
-    async fn teardown(&self) {
-        *self.0.lock().await = None;
+    /// Drop the live `Inner` IF it is still the `epoch` instance the caller was
+    /// working with: stops the writer (its `write_tx` is gone), fails every
+    /// pending caller at once (their oneshot senders drop → `rx` errors instead
+    /// of waiting out the 60s timeout), and kills the child (`kill_on_drop`) so
+    /// no buffered request is processed late. The next `client()` reconnects.
+    /// The epoch guard means a stale read_loop/writer/timeout from a dead
+    /// connection can't drop a since-reconnected one (ABA). Idempotent.
+    async fn teardown(&self, epoch: u64) {
+        let mut g = self.0.lock().await;
+        if g.as_ref().is_some_and(|inner| inner.epoch == epoch) {
+            *g = None;
+        }
     }
 
     async fn resolve(&self, id: i64, res: Result<Value, String>) {
@@ -421,8 +442,9 @@ impl Client {
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         // The pending waiter is keyed by `id` inside the block; the timeout path
         // tears the whole connection down rather than removing one entry, so the
-        // id isn't needed out here.
-        let rx = {
+        // id isn't needed out here. Capture the connection epoch so a timeout only
+        // tears down THIS connection, not one that reconnected meanwhile.
+        let (rx, epoch) = {
             let mut g = self.0.lock().await;
             let inner = g
                 .as_mut()
@@ -439,7 +461,7 @@ impl Client {
                 .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
-            rx
+            (rx, inner.epoch)
         };
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
@@ -450,8 +472,9 @@ impl Client {
                 // still-buffered request (notably turn/start) can't be written and
                 // run late after the caller already fell back to exec — which would
                 // execute the same turn twice. Dropping Inner also discards the
-                // queued bytes and kills the child.
-                self.teardown().await;
+                // queued bytes and kills the child. Epoch-scoped so a connection
+                // that reconnected during the wait is left untouched.
+                self.teardown(epoch).await;
                 anyhow::bail!("codex app-server {method}: timed out")
             }
         }

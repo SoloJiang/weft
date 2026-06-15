@@ -769,6 +769,12 @@ pub async fn ensure_running_for_send(
 /// makes `ensure_running_locked` respawn on the next send. `kill_on_drop` would
 /// also reap it, but `start_kill` makes the intent explicit and immediate.
 pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
+    // Orphan the existing reader (mirrors `stop_quiet`): once we kill the child,
+    // its stdout EOFs and the reader wakes; without bumping the generation it
+    // would still see itself as current and process that EOF/buffered output as
+    // the live turn — emitting a spurious stopped/error or clearing the queue of
+    // the freshly respawned process. The generation bump makes it exit instead.
+    inner.generation += 1;
     inner.stdin = None;
     if let Some(mut child) = inner.child.take() {
         let _ = child.start_kill();
