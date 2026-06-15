@@ -68,9 +68,10 @@ export function SessionInfoPanel({
         </button>
       </header>
 
-      {/* scrollbar-gutter keeps the content width stable when the scrollbar
-          appears (e.g. expanding skills), so nothing reflows. */}
-      <div className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+      {/* overflow-y:scroll keeps the (custom, space-taking) scrollbar track
+          permanently reserved, so expanding the skills list never changes the
+          content width — scrollbar-gutter alone wasn't reliably honored here. */}
+      <div className="min-h-0 flex-1 overflow-y-scroll">
         {/* Context */}
         <section className="border-b border-border px-4 py-3">
           <div className="flex items-center">
