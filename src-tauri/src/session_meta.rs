@@ -5,6 +5,13 @@
 
 use crate::lead_chat::proto::McpServer;
 
+/// 会话实际拥有的一个 skill,供会话信息面板展示。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
 /// 一次带外取数的结果。字段对齐前端 `SessionMeta`(snake_case 序列化)。
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SessionMetaSnapshot {
@@ -14,6 +21,10 @@ pub struct SessionMetaSnapshot {
     /// None = 探测失败 / 不可用(前端保留旧 server 行);Some = 权威结果(替换,即使
     /// 为空——会话此刻确实没有 MCP server,该清掉陈旧行)。区分"瞬时失败"与"真的没有"。
     pub mcp_servers: Option<Vec<McpServer>>,
+    /// codex 的真实 skill;None = 没探到(保留旧行),Some = 权威列表。claude 留 None。
+    pub skills: Option<Vec<SkillInfo>>,
+    /// codex 的思考强度(config.toml `model_reasoning_effort`,如 low/medium/high)。
+    pub reasoning_effort: Option<String>,
 }
 
 // ───────────────────────── 纯解析(可单测) ─────────────────────────
@@ -62,6 +73,16 @@ pub fn parse_toml_model(cfg: &str) -> Option<String> {
         .ok()?
         .get("model")?
         .as_str()
+        .map(String::from)
+}
+
+/// codex `config.toml` 顶层 `model_reasoning_effort`(如 low/medium/high/xhigh)。
+pub fn parse_toml_reasoning_effort(cfg: &str) -> Option<String> {
+    toml::from_str::<toml::Value>(cfg)
+        .ok()?
+        .get("model_reasoning_effort")?
+        .as_str()
+        .filter(|s| !s.is_empty())
         .map(String::from)
 }
 
@@ -166,6 +187,10 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
         .as_deref()
         .and_then(parse_toml_model)
         .or_else(|| global_cfg.as_deref().and_then(parse_toml_model));
+    let reasoning_effort = proj_cfg
+        .as_deref()
+        .and_then(parse_toml_reasoning_effort)
+        .or_else(|| global_cfg.as_deref().and_then(parse_toml_reasoning_effort));
     // window:先认显式 `model_context_window` 覆盖(项目 → 全局),再回退 per-model 缓存。
     let window = proj_cfg
         .as_deref()
@@ -192,11 +217,32 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
         }
         _ => None,
     };
+    // best-effort + 10s 上限。probe 成功(Ok(Some))即权威——即使为空也回 Some(vec![])
+    // 让面板清掉旧技能;只有 probe 失败 / 超时(Ok(None) / Err)才回 None 保留旧行。
+    let skills = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        crate::codex_slash::discover_skills_for_cwd(cwd),
+    )
+    .await
+    {
+        Ok(Some(found)) => Some(
+            found
+                .into_iter()
+                .map(|c| SkillInfo {
+                    name: c.name,
+                    description: c.description.unwrap_or_default(),
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
     SessionMetaSnapshot {
         context_tokens: None,
         window,
         model,
         mcp_servers,
+        skills,
+        reasoning_effort,
     }
 }
 
@@ -222,6 +268,9 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnaps
         window,
         model,
         mcp_servers,
+        // opencode 无对等 `skills/list`;留 None。
+        skills: None,
+        reasoning_effort: None,
     }
 }
 
@@ -280,6 +329,17 @@ mod tests {
     #[test]
     fn toml_model_not_confused_by_reasoning_effort() {
         assert_eq!(parse_toml_model("model_reasoning_effort = \"xhigh\"\n"), None);
+    }
+
+    #[test]
+    fn toml_reasoning_effort_parsed() {
+        assert_eq!(
+            parse_toml_reasoning_effort("model = \"gpt-5.5\"\nmodel_reasoning_effort = \"xhigh\"\n")
+                .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(parse_toml_reasoning_effort("model = \"gpt-5.5\"\n"), None);
+        assert_eq!(parse_toml_reasoning_effort("model_reasoning_effort = \"\"\n"), None);
     }
 
     #[test]

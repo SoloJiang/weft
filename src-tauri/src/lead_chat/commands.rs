@@ -195,6 +195,7 @@ pub async fn lead_engine(
         current_origin_tag: None,
         tool_rows: std::collections::HashMap::new(),
         stopped,
+        codex_client: None,
     };
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(lead_key(thread_id), eng))
@@ -873,6 +874,7 @@ pub(crate) async fn chat_open_worker_impl(
                 current_origin_tag: None,
                 tool_rows: std::collections::HashMap::new(),
                 stopped: sess.status == "stopped",
+                codex_client: None,
             };
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
             state.get_or_insert(key, e)
@@ -977,6 +979,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         current_origin_tag: None,
         tool_rows: std::collections::HashMap::new(),
         stopped: sess.status == "stopped",
+        codex_client: None,
     };
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(session_id as i64, e))

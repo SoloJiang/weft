@@ -273,13 +273,14 @@ impl AgentAdapter for OpenCodeAdapter {
 
 // ───────────────────────────── resolver ─────────────────────────────
 
-/// Codex app-server is opt-in because its initialized handshake can initialize
-/// ChatGPT Apps (`/backend-api/wham/apps`) and fail on network/auth state before
-/// a normal Weft turn starts. Exec is the safe default.
+/// Codex app-server is the DEFAULT transport: it streams agent text token-by-token
+/// and carries each session's per-thread bus MCP via its own `-c` spawn args. Set
+/// `WEFT_CODEX_APPSERVER=0` (or false/no/off) to force the exec transport; an
+/// unreachable app-server also falls back to exec per-turn.
 pub(crate) fn codex_prefers_appserver_from_env(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
+        Some("0" | "false" | "no" | "off")
     )
 }
 
@@ -369,15 +370,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_appserver_is_opt_in() {
-        assert!(!codex_prefers_appserver_from_env(None));
-        assert!(!codex_prefers_appserver_from_env(Some("")));
-        assert!(!codex_prefers_appserver_from_env(Some("0")));
-        assert!(!codex_prefers_appserver_from_env(Some("false")));
+    fn codex_appserver_default_on_unless_disabled() {
+        // Default ON: unset / empty / affirmative all prefer app-server.
+        assert!(codex_prefers_appserver_from_env(None));
+        assert!(codex_prefers_appserver_from_env(Some("")));
         assert!(codex_prefers_appserver_from_env(Some("1")));
         assert!(codex_prefers_appserver_from_env(Some("true")));
         assert!(codex_prefers_appserver_from_env(Some("YES")));
-        assert!(codex_prefers_appserver_from_env(Some(" on ")));
+        // Explicit opt-out forces exec.
+        assert!(!codex_prefers_appserver_from_env(Some("0")));
+        assert!(!codex_prefers_appserver_from_env(Some("false")));
+        assert!(!codex_prefers_appserver_from_env(Some(" off ")));
+        assert!(!codex_prefers_appserver_from_env(Some("NO")));
     }
 
     #[test]

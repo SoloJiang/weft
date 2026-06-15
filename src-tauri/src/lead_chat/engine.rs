@@ -410,7 +410,263 @@ async fn finalize_orphan_tool_rows(
     }
 }
 
-async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fallback_status: &str) {
+/// Persisted status for a tool row. A row with output is terminal
+/// (error/complete). A running row streams ONLY if it carries an id to correlate
+/// its later result by — an id-less running row is stored complete so it can't
+/// spin forever (nothing could ever fill it).
+fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'static str {
+    if has_output {
+        if is_error {
+            "error"
+        } else {
+            "complete"
+        }
+    } else if trackable {
+        "streaming"
+    } else {
+        "complete"
+    }
+}
+
+/// Persist a turn's tool calls as `kind:"tool"` rows (running until their result
+/// arrives). Shared by spawn_reader (claude/exec) and codex_consumer (app-server).
+async fn persist_tool_calls(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    tools: Vec<super::proto::ToolCall>,
+) {
+    let thread_id = inner.thread_id;
+    for call in tools {
+        let (sid, turn) = (inner.session_id, inner.turn_id);
+        let running = call.output.is_none();
+        let trackable = running && !call.id.is_empty();
+        let status = tool_row_status(!running, trackable, call.is_error);
+        let content = serde_json::json!({
+            "name": call.name,
+            "summary": call.summary,
+            "input": call.input,
+            "output": call.output.unwrap_or_default(),
+            "is_error": call.is_error,
+        });
+        let content_str = content.to_string();
+        let call_id = call.id;
+        match repo::insert_lead_message(
+            db,
+            thread_id,
+            sid,
+            turn,
+            "assistant",
+            "tool",
+            &content_str,
+            status,
+        )
+        .await
+        {
+            Ok(m) => {
+                let row_id = m.id;
+                let _ = app.emit(
+                    EVENT,
+                    Push::Message {
+                        thread_id,
+                        message: m,
+                    },
+                );
+                if trackable {
+                    inner.tool_rows.insert(call_id, (row_id, content));
+                }
+            }
+            Err(e) => eprintln!("[weft] lead tool row insert failed: {e}"),
+        }
+    }
+}
+
+/// Merge tool results into their running rows (claude tool_result / codex
+/// item.completed); a result for an untracked row is dropped.
+async fn merge_tool_results(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    items: Vec<super::proto::ToolResultItem>,
+) {
+    let thread_id = inner.thread_id;
+    for item in items {
+        let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id) else {
+            continue;
+        };
+        if let Some(obj) = content.as_object_mut() {
+            obj.insert("output".into(), item.output.into());
+            obj.insert("is_error".into(), item.is_error.into());
+        }
+        let status = if item.is_error { "error" } else { "complete" };
+        let content_str = content.to_string();
+        let _ = repo::update_lead_message(db, row_id, &content_str, status).await;
+        let _ = app.emit(
+            EVENT,
+            Push::ToolResult {
+                thread_id,
+                message_id: row_id,
+                content: content_str,
+                status: status.into(),
+            },
+        );
+    }
+}
+
+/// Persist / answer the `<weft:*>` sentinels forked out of a finalized assistant
+/// message — action_card becomes its own row, list_repos triggers a hidden
+/// stdin-style reply. Errors are logged but never abort the stream. Shared by the
+/// exec/claude reader and the codex app-server consumer so both transports render
+/// action cards and answer list_repos.
+async fn apply_lead_sentinels(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    thread_id: i32,
+    sentinels: Vec<super::sentinels::Sentinel>,
+) {
+    for s in sentinels {
+        match s {
+            super::sentinels::Sentinel::ActionCard(json) => {
+                // Reject anything that isn't a JSON object so the UI can rely on
+                // `card.title / actions / …`.
+                match serde_json::from_str::<serde_json::Value>(&json) {
+                    Ok(v) if v.is_object() => {
+                        let (sid, turn) = (inner.session_id, inner.turn_id);
+                        match repo::insert_lead_message(
+                            db,
+                            thread_id,
+                            sid,
+                            turn,
+                            "assistant",
+                            "action_card",
+                            &json,
+                            "complete",
+                        )
+                        .await
+                        {
+                            Ok(m) => {
+                                let _ = app.emit(
+                                    EVENT,
+                                    Push::Message {
+                                        thread_id,
+                                        message: m,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[weft] lead sentinel: insert action_card failed: {e}")
+                            }
+                        }
+                    }
+                    Ok(_) => eprintln!(
+                        "[weft] lead sentinel: action_card payload is not an object — dropped"
+                    ),
+                    Err(e) => eprintln!("[weft] lead sentinel: action_card JSON parse failed: {e}"),
+                }
+            }
+            super::sentinels::Sentinel::ListRepos => {
+                // Look up workspace via the thread row (engine doesn't cache it; one
+                // extra query per call is cheap and avoids a wider refactor).
+                let ws_id = match repo::get_thread(db, thread_id).await {
+                    Ok(Some(t)) => Some(t.workspace_id),
+                    Ok(None) => {
+                        eprintln!(
+                            "[weft] lead sentinel: list_repos — thread {thread_id} not found"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("[weft] lead sentinel: list_repos — get_thread failed: {e}");
+                        None
+                    }
+                };
+                if let Some(workspace_id) = ws_id {
+                    let repos = match repo::list_repos(db, workspace_id).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[weft] lead sentinel: list_repos query failed: {e}");
+                            Vec::new()
+                        }
+                    };
+                    let payload = serde_json::json!({
+                        "repos": repos.iter().map(|r| serde_json::json!({
+                            "id": r.id,
+                            "name": r.name,
+                            "slug": r.slug,
+                            "local_git_path": r.local_git_path,
+                            "base_ref": r.base_ref,
+                        })).collect::<Vec<_>>()
+                    });
+                    let body = match serde_json::to_string(&payload) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!(
+                                "[weft] lead sentinel: serialize list_repos_result failed: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    let reply = format!("<weft:list_repos_result>{body}</weft:list_repos_result>");
+                    // Invisible plumbing: tracked=false keeps this off the timeline;
+                    // the agent reads it as a tool-result-style user turn.
+                    let out = Outgoing {
+                        text: reply,
+                        images: Vec::new(),
+                        tracked: false,
+                        origin_tag: None,
+                    };
+                    queue_hidden_delivery(app, inner, out);
+                }
+            }
+        }
+    }
+}
+
+/// Finalize the open streaming text row (codex app-server): fork `<weft:*>`
+/// sentinels out of the body on a clean finish, persist the cleaned text, close
+/// its IM streaming card, and clear `inner.current`. Called both at a tool
+/// boundary — so post-tool deltas open a NEW row BELOW the tool, keeping inline
+/// tool history in order — and at turn end. No-op when no row is open.
+async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner, status: &str) {
+    let Some((id, text, _)) = inner.current.take() else {
+        return;
+    };
+    let thread_id = inner.thread_id;
+    let origin_tag = inner.current_origin_tag.clone();
+    let clean = if status == "complete" {
+        let (clean, sentinels) = super::sentinels::extract_sentinels(&text);
+        apply_lead_sentinels(app, db, inner, thread_id, sentinels).await;
+        clean
+    } else {
+        text
+    };
+    let _ = repo::update_lead_message(
+        db,
+        id,
+        &serde_json::json!({ "text": clean }).to_string(),
+        status,
+    )
+    .await;
+    let _ = app.emit(
+        EVENT,
+        Push::Finalize {
+            thread_id,
+            message_id: id,
+            status: status.into(),
+        },
+    );
+    if status == "complete" {
+        emit_lead_out(app, thread_id, id, &clean, origin_tag);
+    }
+}
+
+async fn cleanup_disconnected_turn(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    fallback_status: &str,
+) {
     let mut inner = eng.lock().await;
     if !inner.turn.busy
         && inner.current.is_none()
@@ -465,13 +721,7 @@ async fn cleanup_disconnected_turn(app: &AppHandle, db: &Db, eng: &EngineRef, fa
                 emit_finalize(app, thread_id, message_id, status);
             }
             DisconnectedTurnRow::Inserted(message) => {
-                let _ = app.emit(
-                    EVENT,
-                    Push::Message {
-                        thread_id,
-                        message,
-                    },
-                );
+                let _ = app.emit(EVENT, Push::Message { thread_id, message });
             }
         }
     }
@@ -589,14 +839,16 @@ pub struct EngineInner {
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
     pub current_origin_tag: Option<String>,
-    /// Maps an in-flight tool call's id (claude `tool_use_id`) to its persisted
-    /// `kind:"tool"` row id and current content JSON, so the out-of-band tool
-    /// result can merge its output without re-reading the row. Cleared at each
-    /// turn boundary; codex pills never populate it.
+    /// Maps an in-flight tool call's id (claude `tool_use_id` / codex item id) to
+    /// its persisted `kind:"tool"` row id and content JSON, so the out-of-band
+    /// result merges its output without re-reading the row. Cleared per turn.
     pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
     /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
     /// engines; explicit sends/ensure clear this and restart as needed.
     pub stopped: bool,
+    /// Per-session `codex app-server` connection (app-server transport only),
+    /// spawned lazily on the first turn with this session's `-c mcp_servers` args.
+    pub codex_client: Option<crate::codex_app_server::Client>,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -925,18 +1177,12 @@ pub async fn send(
         // Rides the turn (and the queue, if queued) so output frames recover it.
         origin_tag: origin_tag.clone(),
     };
-    // codex (app-server): no resident stdin, no per-turn process — the shared
-    // connection drives the turn after the lock drops. Gated; default stays exec.
-    //
-    // system_prompt is now prepended to a new thread's first turn (codex has no
-    // thread/start prompt field — mirrors the exec adapter). The remaining gap is
-    // MCP: codex app-server MCP is APP-SCOPED (config.toml + config/mcpServer/
-    // reload), so today's per-thread bus URLs (weft_bus / weft_global) can't be
-    // carried by one global app-server without restructuring the bus to a single
-    // thread-routing endpoint. The gate keeps system_prompt.is_empty() and the
-    // path stays behind the off-by-default env flag until that's settled.
-    let is_codex_appserver =
-        inner.tool == "codex" && codex_appserver_enabled() && inner.system_prompt.is_empty();
+    // codex (app-server): a per-session connection drives the turn after the lock
+    // drops (streaming via item/agentMessage/delta). system_prompt is prepended to
+    // a new thread's first turn; per-thread bus MCP rides the connection's own
+    // `-c mcp_servers` spawn args. Falls back to exec if the app-server is
+    // unreachable.
+    let is_codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
     let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
     if direct && !spawn_now && !is_codex_appserver {
         if let Err(e) = write_user(&mut inner, &out).await {
@@ -963,22 +1209,16 @@ pub async fn send(
             return Err(e);
         }
     } else if direct && is_codex_appserver {
-        // Fall back to exec if the app-server can't be reached (old codex, crash):
-        // the thread id is shared with exec's rollout store, so resume is seamless.
-        if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
-            eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
-            if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
-                rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
-                return Err(e);
-            }
+        if let Err(e) = spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await {
+            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+            return Err(e);
         }
     }
     Ok(())
 }
 
-/// Codex app-server transport selector. Default = exec; app-server is opt-in via
-/// `WEFT_CODEX_APPSERVER=1` because its `initialized` handshake may initialize
-/// ChatGPT Apps and fail on network/auth state before a normal Weft turn starts.
+/// Codex app-server transport selector (default ON; `WEFT_CODEX_APPSERVER=0` →
+/// exec). See [`crate::adapters::codex_prefers_appserver`].
 fn codex_appserver_enabled() -> bool {
     crate::adapters::codex_prefers_appserver()
 }
@@ -993,30 +1233,40 @@ async fn spawn_codex_turn(
     eng: EngineRef,
     out: Outgoing,
 ) -> anyhow::Result<()> {
-    let client = crate::codex_app_server::client().await?;
-    let (native, cwd, sid, thread_id_i, system_prompt) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing) = {
         let i = eng.lock().await;
         (
             i.native_id.clone(),
-            i.cwd.to_string_lossy().into_owned(),
+            i.cwd.clone(),
             i.session_id,
             i.thread_id,
             i.system_prompt.clone(),
+            i.extra_args.clone(),
+            i.codex_client.clone(),
         )
     };
-    let had_native = native.is_some();
-    let thread = match native {
-        Some(t) => t,
-        None => {
-            let t = client.start_thread(&cwd).await?;
-            eng.lock().await.native_id = Some(t.clone());
-            if let Some(sid) = sid {
-                let _ = repo::set_session_native_id(&db, sid, &t).await;
-            } else {
-                let _ = repo::set_lead_native_id(&db, thread_id_i, &t).await;
-            }
-            t
+    // Per-session app-server: reuse the engine's connection or spawn one with this
+    // session's `-c mcp_servers` bus flags. Its own process keeps the per-thread
+    // MCP isolated (app-server MCP is app-scoped).
+    let client = match existing {
+        Some(c) if c.is_alive().await => c,
+        _ => {
+            // Pre-accept folder trust (like the exec adapter's prepare) so the
+            // app-server's first thread/start doesn't block on codex's trust prompt.
+            crate::codex::ensure_codex_trusted(&cwd);
+            let c = crate::codex_app_server::Client::connect_session(&extra_args, &cwd).await?;
+            eng.lock().await.codex_client = Some(c.clone());
+            c
         }
+    };
+    let cwd = cwd.to_string_lossy().into_owned();
+    let had_native = native.is_some();
+    let (thread, freshly_started) = match native {
+        Some(t) => (t, false),
+        // Don't commit the native id yet: if `turn/start` below fails and we fall
+        // back to exec, a None native id lets exec start fresh WITH the system
+        // prompt prepended, instead of resuming an empty thread that never got it.
+        None => (client.start_thread(&cwd).await?, true),
     };
     if !client.is_subscribed(&thread).await {
         // First attach this process: a pre-existing thread is resumed so the
@@ -1040,6 +1290,52 @@ async fn spawn_codex_turn(
     let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
     let turn = client.start_turn(&thread, &first_text).await?;
     client.set_active_turn(&thread, &turn).await;
+    // The turn is in flight, so the thread is real and carries the system prompt:
+    // now it's safe to persist the native id (a later resume reuses this rollout).
+    if freshly_started {
+        eng.lock().await.native_id = Some(thread.clone());
+        if let Some(sid) = sid {
+            let _ = repo::set_session_native_id(&db, sid, &thread).await;
+        } else {
+            let _ = repo::set_lead_native_id(&db, thread_id_i, &thread).await;
+        }
+    }
+    // Stop pressed while turn/start was in flight? interrupt() ran before the turn
+    // id existed (no active turn, no exec child), so it was a no-op — honor it now
+    // that the turn is recorded, instead of letting it run despite the user.
+    if eng.lock().await.interrupting {
+        let _ = client.interrupt(&thread, &turn).await;
+    }
+    Ok(())
+}
+
+/// Start a codex turn on the app-server, falling back to exec per-turn if the
+/// app-server can't be reached (the native id is shared with exec's rollout, so
+/// resume is seamless). The caller must have already begun the turn (busy/turn_id).
+async fn spawn_codex_turn_or_exec(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    out: Outgoing,
+) -> anyhow::Result<()> {
+    if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
+        // Stop pressed while the app-server start was pending and it then errored:
+        // don't resurrect the canceled turn on exec — propagate so the caller rolls
+        // it back (otherwise the interrupted turn runs anyway on the fallback).
+        if eng.lock().await.interrupting {
+            return Err(e);
+        }
+        // Tear down the half-started app-server first: thread/start + the consumer
+        // subscription may already be live, and a lingering consumer (single-thread
+        // routing) could finalize/reset the exec fallback turn or break thread-less
+        // routing on the next retry. shutdown() drops the child + closes the consumer.
+        let stale = eng.lock().await.codex_client.take();
+        if let Some(c) = stale {
+            c.shutdown().await;
+        }
+        eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
+        spawn_turn(app, db, eng, out).await?;
+    }
     Ok(())
 }
 
@@ -1127,24 +1423,49 @@ async fn codex_consumer(
                 );
             }
             ThreadMsg::Event(ChatEvent::Assistant { texts: _, tools }) => {
-                // Codex streams text via deltas; only non-text items arrive here,
-                // as transient activity pills.
-                let inner = eng.lock().await;
-                let (thread_id, sid) = (inner.thread_id, inner.session_id);
-                drop(inner);
-                for tool in tools {
-                    let _ = app.emit(
-                        EVENT,
-                        Push::Activity {
-                            thread_id,
-                            session_id: sid,
-                            name: tool.name,
-                            summary: tool.summary,
-                        },
-                    );
+                // Codex streams text via deltas; non-text items are tool calls →
+                // inline `kind:"tool"` rows, filled by their item.completed result.
+                let mut inner = eng.lock().await;
+                inner.clock.last_activity = std::time::Instant::now();
+                // Close any open text row BEFORE the tool row so later deltas open a
+                // fresh row BELOW it — keeps "I'll inspect…" → command → explanation
+                // flows in order instead of stacking post-tool prose above the tool.
+                if !tools.is_empty() {
+                    finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
+                persist_tool_calls(&app, &db, &mut inner, tools).await;
             }
-            ThreadMsg::Event(ChatEvent::TurnEnd { is_error, context_tokens }) => {
+            ThreadMsg::Event(ChatEvent::ToolResults { items }) => {
+                let mut inner = eng.lock().await;
+                merge_tool_results(&app, &db, &mut inner, items).await;
+            }
+            ThreadMsg::Event(ChatEvent::Usage {
+                context_tokens,
+                window,
+            }) => {
+                // app-server's current-context usage (last.inputTokens + window):
+                // the accurate Context-panel value codex exec couldn't give.
+                let mut inner = eng.lock().await;
+                inner.last_context_tokens = Some(context_tokens);
+                if window.is_some() {
+                    inner.last_window = window;
+                }
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Usage {
+                        thread_id,
+                        session_id,
+                        context_tokens,
+                        window: inner.last_window,
+                        model: inner.last_model.clone(),
+                    },
+                );
+            }
+            ThreadMsg::Event(ChatEvent::TurnEnd {
+                is_error,
+                context_tokens,
+            }) => {
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
@@ -1169,25 +1490,16 @@ async fn codex_consumer(
                     "complete"
                 };
                 inner.interrupting = false;
-                if let Some((id, text, _)) = inner.current.take() {
-                    let _ = repo::update_lead_message(
-                        &db,
-                        id,
-                        &serde_json::json!({ "text": text }).to_string(),
-                        status,
-                    )
-                    .await;
-                    let _ = app.emit(
-                        EVENT,
-                        Push::Finalize {
-                            thread_id,
-                            message_id: id,
-                            status: status.into(),
-                        },
-                    );
-                    if status == "complete" {
-                        emit_lead_out(&app, thread_id, id, &text, inner.current_origin_tag.clone());
-                    }
+                // An interrupted/failed turn can leave a tool row whose
+                // item.completed never arrived; finalize it so it stops spinning.
+                let orphans: Vec<(i32, serde_json::Value)> =
+                    inner.tool_rows.drain().map(|(_, v)| v).collect();
+                finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
+                if inner.current.is_some() {
+                    // Finalize the open text row (forks <weft:*> sentinels out on a
+                    // clean finish, closes its IM card) — same helper the tool
+                    // boundary uses, so the final segment is handled identically.
+                    finalize_current_text(&app, &db, &mut inner, status).await;
                 } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
                     &db,
                     thread_id,
@@ -1234,41 +1546,121 @@ async fn codex_consumer(
                     },
                 );
                 drop(inner);
+                // This turn is over: drop its active-turn id so a subsequent
+                // interrupt won't target a finished turn (the flush below re-sets
+                // it for the next turn).
+                client.clear_active_turn(&thread).await;
                 // Flush: start the next queued message as a fresh turn on this thread.
                 if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
                     match client.start_turn(&thread, &n.text).await {
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
                             client.set_active_turn(&thread, &t).await;
+                            // Stop pressed during this flush's start_turn? interrupt()
+                            // had no active turn id to act on (same window as a direct
+                            // send) — honor it now that the turn is recorded.
+                            if eng.lock().await.interrupting {
+                                let _ = client.interrupt(&thread, &t).await;
+                            }
                         }
+                        // App-server died/rejecting between turns: don't drop the
+                        // queued message — fall back to the same exec path a direct
+                        // send uses (native id is shared, so resume is seamless).
                         Err(e) => {
-                            eprintln!("[weft][codex] flush next turn: {e}");
-                            rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                            // A Stop during the failed start: roll the queued turn back
+                            // interrupted instead of resurrecting it on exec.
+                            if eng.lock().await.interrupting {
+                                rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                            } else {
+                                eprintln!(
+                                    "[weft][codex] flush via app-server failed ({e}); trying exec"
+                                );
+                                match spawn_turn(app.clone(), db.clone(), eng.clone(), n.clone())
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        mark_queued_delivered(&app, &db, thread_id, session_id, &n)
+                                            .await;
+                                    }
+                                    Err(e2) => {
+                                        eprintln!("[weft][codex] exec fallback for queued turn failed: {e2}");
+                                        rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
             ThreadMsg::Event(_) => {}
+            ThreadMsg::Heartbeat => {
+                // outputDelta from a long-running command: no row change, just keep
+                // the turn alive so the idle watchdog doesn't reap it mid-output.
+                eng.lock().await.clock.last_activity = std::time::Instant::now();
+            }
             ThreadMsg::Approval { id, method, params } => {
-                // Route the app-server's approval request through Weft's Ask Bridge
-                // (the same Needs-you surface the exec path uses), then reply with
-                // the v2 decision. accept = run, decline = deny but continue.
+                // An approval (command / file-change / permissions) — route to Weft's
+                // Ask Bridge (the same Needs-you the exec path uses), then reply with
+                // the SHAPE that kind wants: permissions `{permissions}` (omitted =
+                // denied), everything else `{decision}`. Elicitation / other server
+                // asks never reach here — they're declined in the read_loop.
+                let is_perm = method.contains("permissions");
                 let (thread_id, dir) = {
                     let i = eng.lock().await;
                     (i.thread_id, i.ask_dir.clone())
                 };
-                let (tool, summary) = if method.contains("commandExecution") {
-                    (
-                        "Bash",
-                        params["command"]
-                            .as_str()
-                            .unwrap_or("(command)")
-                            .to_string(),
-                    )
+                // command/cwd may sit at the top level (commandExecution ask) or
+                // nested under `item` (the generic permissions ask) — read both.
+                let cmd = params["command"]
+                    .as_str()
+                    .or_else(|| params["item"]["command"].as_str());
+                let is_cmd = method.contains("commandExecution") || cmd.is_some();
+                let net = params
+                    .get("networkApprovalContext")
+                    .or_else(|| params["item"].get("networkApprovalContext"))
+                    .filter(|v| !v.is_null());
+                let has_changes = params["changes"]
+                    .as_array()
+                    .or_else(|| params["item"]["changes"].as_array())
+                    .is_some_and(|c| !c.is_empty());
+                // Requested permission profile (also echoed back as the grant on allow).
+                let requested = params
+                    .get("permissions")
+                    .or_else(|| params["item"].get("permissions"))
+                    .or_else(|| params["params"].get("permissions"))
+                    .filter(|v| !v.is_null())
+                    .cloned();
+                // Network FIRST: a network-only ask arrives as a commandExecution
+                // approval (so is_cmd is true) with the command omitted, so the cmd
+                // branch would otherwise mislabel + Always-key it as Bash.
+                let (tool, summary) = if let Some(net) = net {
+                    let host = net["host"]
+                        .as_str()
+                        .or_else(|| net["url"].as_str())
+                        .or_else(|| net["domain"].as_str())
+                        .unwrap_or("network");
+                    ("Network", format!("network access: {host}"))
+                } else if is_cmd {
+                    ("Bash", cmd.unwrap_or("(command)").to_string())
+                } else if has_changes {
+                    // Include the changed path(s): the AskRegistry keys Always rules
+                    // by (thread, dir, summary), so a constant "apply file changes"
+                    // would let one Always blanket-allow every later edit.
+                    ("Edit", codex_change_approval_summary(&params))
                 } else {
-                    ("Edit", "apply file changes".to_string())
+                    // A permission escalation — key it by the REQUESTED scope, else an
+                    // Always for one profile silently grants a later, different one.
+                    let scope = requested
+                        .as_ref()
+                        .map(|v| v.to_string().chars().take(120).collect::<String>())
+                        .unwrap_or_else(|| "(unspecified)".to_string());
+                    ("Permission", format!("permission: {scope}"))
                 };
-                let detail = params["cwd"].as_str().unwrap_or_default().to_string();
+                let detail = params["cwd"]
+                    .as_str()
+                    .or_else(|| params["item"]["cwd"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
                 let decision = match registry.auto_decision(thread_id, &dir, &summary) {
                     Some(d) => d, // dangerous mode / full access / always-allow
@@ -1278,15 +1670,59 @@ async fn codex_consumer(
                         rx.await.unwrap_or(crate::ask::Decision::Deny)
                     }
                 };
-                let verdict = match decision {
-                    crate::ask::Decision::Allow => "accept",
-                    crate::ask::Decision::Deny => "decline",
+                let allow = matches!(decision, crate::ask::Decision::Allow);
+                let result = if is_perm {
+                    // Answered with the granted permissions, NOT a decision (a
+                    // `{decision}` reply silently no-ops the grant). `permissions` is
+                    // a GrantedPermissionProfile OBJECT `{fileSystem?,network?}` —
+                    // identical shape to the requested RequestPermissionProfile, so
+                    // echo it to grant on allow; an empty OBJECT grants nothing on
+                    // deny (an array would fail schema validation). Verified against
+                    // the codex 0.139.0 app-server JSON schema.
+                    let granted = if allow {
+                        requested.unwrap_or_else(|| serde_json::json!({}))
+                    } else {
+                        serde_json::json!({})
+                    };
+                    serde_json::json!({ "permissions": granted })
+                } else {
+                    serde_json::json!({ "decision": if allow { "accept" } else { "decline" } })
                 };
-                let _ = client.reply_approval(&id, verdict).await;
+                let _ = client.reply_result(&id, result).await;
             }
         }
     }
-    cleanup_disconnected_turn(&app, &db, &eng, "error").await;
+    // Only a GENUINE disconnect runs the turn cleanup. If the engine's client was
+    // taken/replaced (the exec-fallback teardown shut us down on purpose), skip it
+    // — else this cleanup races spawn_turn and can kill/stop the fallback turn.
+    let still_active = matches!(&eng.lock().await.codex_client, Some(c) if c.ptr_eq(&client));
+    if still_active {
+        cleanup_disconnected_turn(&app, &db, &eng, "error").await;
+    }
+}
+
+/// Specific Needs-you summary for an app-server file-change approval: the
+/// changed path(s) (top-level or nested under `item`), so each distinct edit
+/// gets its own Always-rule key instead of one blanket "apply file changes".
+fn codex_change_approval_summary(params: &serde_json::Value) -> String {
+    let changes = params["changes"]
+        .as_array()
+        .or_else(|| params["item"]["changes"].as_array());
+    let paths: Vec<&str> = changes
+        .map(|cs| cs.iter().filter_map(|c| c["path"].as_str()).collect())
+        .unwrap_or_default();
+    if paths.is_empty() {
+        return "apply file changes".to_string();
+    }
+    let mut s = format!(
+        "apply file changes: {}",
+        paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+    );
+    let more = paths.len().saturating_sub(3);
+    if more > 0 {
+        s.push_str(&format!(" +{more}"));
+    }
+    s
 }
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
@@ -1344,10 +1780,21 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     // TurnEnd then finalizes the row as `interrupted`.
     if inner.tool == "codex" && codex_appserver_enabled() {
         let thread = inner.native_id.clone();
+        let client = inner.codex_client.clone();
         drop(inner);
-        if let (Some(thread), Ok(client)) = (thread, crate::codex_app_server::client().await) {
+        let mut interrupted = false;
+        if let (Some(thread), Some(client)) = (thread, client) {
             if let Some(turn) = client.active_turn(&thread).await {
                 let _ = client.interrupt(&thread, &turn).await;
+                interrupted = true;
+            }
+        }
+        // No live app-server turn → this turn fell back to exec; kill the per-turn
+        // child so the reader hits EOF and finalizes the row as interrupted.
+        if !interrupted {
+            let mut inner = eng.lock().await;
+            if let Some(c) = inner.child.as_mut() {
+                let _ = c.kill().await;
             }
         }
         return Ok(());
@@ -1482,9 +1929,18 @@ async fn send_hidden_inner(
             Ok(())
         }
         HiddenDelivery::SpawnTurn => {
+            // codex on app-server must stay on app-server even for hidden turns
+            // (bus wakes), else an exec turn and the app-server connection diverge
+            // on the same thread.
+            let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
             drop(inner);
-            if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
+            let res = if codex_appserver {
+                spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await
+            } else {
+                spawn_turn(app.clone(), db.clone(), eng.clone(), out).await
+            };
+            if let Err(e) = res {
                 rollback_failed_turn(app, db, eng, turn_id).await;
                 return Err(e);
             }
@@ -1614,7 +2070,12 @@ pub fn spawn_watchdog(app: AppHandle) {
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
 pub async fn stop_quiet(
     eng: &EngineRef,
-) -> (i32, Option<i32>, Option<(i32, String)>, Vec<(i32, serde_json::Value)>) {
+) -> (
+    i32,
+    Option<i32>,
+    Option<(i32, String)>,
+    Vec<(i32, serde_json::Value)>,
+) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let current = inner.current.take().map(|(id, text, _)| (id, text));
@@ -1627,6 +2088,11 @@ pub async fn stop_quiet(
     inner.generation += 1; // orphan the reader so EOF handling is ours
     if let Some(c) = inner.child.as_mut() {
         let _ = c.kill().await;
+    }
+    // Kill the per-session app-server too (its consumer task exits as the sinks
+    // close); the next send respawns it, picking up refreshed skills/MCP.
+    if let Some(c) = inner.codex_client.take() {
+        c.shutdown().await;
     }
     inner.child = None;
     inner.stdin = None;
@@ -1900,196 +2366,21 @@ fn spawn_reader(
                                 }
                             }
                         }
-                        // Persist / answer sentinels in encounter order. Errors are
-                        // logged but never abort the reader — a malformed card must
-                        // not wedge the chat stream.
-                        for s in sentinels {
-                            match s {
-                                super::sentinels::Sentinel::ActionCard(json) => {
-                                    // Reject anything that isn't a JSON object so the
-                                    // UI can rely on `card.title / actions / …`.
-                                    match serde_json::from_str::<serde_json::Value>(&json) {
-                                        Ok(v) if v.is_object() => {
-                                            let (sid, turn) = (inner.session_id, inner.turn_id);
-                                            match repo::insert_lead_message(
-                                                &db, thread_id, sid, turn,
-                                                "assistant", "action_card", &json, "complete",
-                                            )
-                                            .await
-                                            {
-                                                Ok(m) => {
-                                                    let _ = app.emit(EVENT, Push::Message {
-                                                        thread_id, message: m,
-                                                    });
-                                                }
-                                                Err(e) => eprintln!(
-                                                    "[weft] lead sentinel: insert action_card failed: {e}"
-                                                ),
-                                            }
-                                        }
-                                        Ok(_) => eprintln!(
-                                            "[weft] lead sentinel: action_card payload is not an object — dropped"
-                                        ),
-                                        Err(e) => eprintln!(
-                                            "[weft] lead sentinel: action_card JSON parse failed: {e}"
-                                        ),
-                                    }
-                                }
-                                super::sentinels::Sentinel::ListRepos => {
-                                    // Look up workspace via the thread row (engine
-                                    // doesn't cache it; one extra query per call is
-                                    // cheap and avoids a wider refactor).
-                                    let ws_id = match repo::get_thread(&db, thread_id).await {
-                                        Ok(Some(t)) => Some(t.workspace_id),
-                                        Ok(None) => {
-                                            eprintln!(
-                                                "[weft] lead sentinel: list_repos — thread {thread_id} not found"
-                                            );
-                                            None
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[weft] lead sentinel: list_repos — get_thread failed: {e}"
-                                            );
-                                            None
-                                        }
-                                    };
-                                    if let Some(workspace_id) = ws_id {
-                                        let repos = match repo::list_repos(&db, workspace_id).await
-                                        {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[weft] lead sentinel: list_repos query failed: {e}"
-                                                );
-                                                Vec::new()
-                                            }
-                                        };
-                                        let payload = serde_json::json!({
-                                            "repos": repos.iter().map(|r| serde_json::json!({
-                                                "id": r.id,
-                                                "name": r.name,
-                                                "slug": r.slug,
-                                                "local_git_path": r.local_git_path,
-                                                "base_ref": r.base_ref,
-                                            })).collect::<Vec<_>>()
-                                        });
-                                        let body = match serde_json::to_string(&payload) {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[weft] lead sentinel: serialize list_repos_result failed: {e}"
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                        let reply = format!(
-                                            "<weft:list_repos_result>{body}</weft:list_repos_result>"
-                                        );
-                                        // Invisible plumbing: tracked=false keeps this
-                                        // off the timeline; the agent reads it as a
-                                        // tool-result-style user turn.
-                                        let out = Outgoing {
-                                            text: reply,
-                                            images: Vec::new(),
-                                            tracked: false,
-                                            origin_tag: None,
-                                        };
-                                        queue_hidden_delivery(&app, &mut inner, out);
-                                    }
-                                }
-                            }
-                        }
+                        // Persist / answer sentinels in encounter order (shared with
+                        // the app-server consumer).
+                        apply_lead_sentinels(&app, &db, &mut inner, thread_id, sentinels).await;
                     }
-                    // Codex exec items carry no input/output to expand, so they
-                    // stay transient activity pills; claude/opencode tool calls
-                    // become persisted, expandable `kind:"tool"` rows.
-                    if inner.tool == "codex" {
-                        for tool in tools {
-                            let _ = app.emit(
-                                EVENT,
-                                Push::Activity {
-                                    thread_id,
-                                    session_id: inner.session_id,
-                                    name: tool.name,
-                                    summary: tool.summary,
-                                },
-                            );
-                        }
-                    } else {
-                        for call in tools {
-                            let (sid, turn) = (inner.session_id, inner.turn_id);
-                            // No output yet (claude `tool_use`) → a running row to
-                            // be filled by a later ToolResults; output already
-                            // present (opencode completed) → a final row in one shot.
-                            let running = call.output.is_none();
-                            let status = if running {
-                                "streaming"
-                            } else if call.is_error {
-                                "error"
-                            } else {
-                                "complete"
-                            };
-                            let content = serde_json::json!({
-                                "name": call.name,
-                                "summary": call.summary,
-                                "input": call.input,
-                                "output": call.output.unwrap_or_default(),
-                                "is_error": call.is_error,
-                            });
-                            let content_str = content.to_string();
-                            let call_id = call.id;
-                            match repo::insert_lead_message(
-                                &db, thread_id, sid, turn, "assistant", "tool",
-                                &content_str, status,
-                            )
-                            .await
-                            {
-                                Ok(m) => {
-                                    let row_id = m.id;
-                                    let _ = app.emit(
-                                        EVENT,
-                                        Push::Message { thread_id, message: m },
-                                    );
-                                    if running && !call_id.is_empty() {
-                                        inner.tool_rows.insert(call_id, (row_id, content));
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[weft] lead tool row insert failed: {e}")
-                                }
-                            }
-                        }
-                    }
+                    // Every dialect's tool calls become inline `kind:"tool"` rows.
+                    persist_tool_calls(&app, &db, &mut inner, tools).await;
                 }
                 super::proto::ChatEvent::ToolResults { items } => {
-                    // Fill in the output of running tool rows — claude delivers
-                    // results out-of-band as a `user` turn. A result for a row we
-                    // never tracked is dropped rather than left orphaned.
-                    for item in items {
-                        let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id)
-                        else {
-                            continue;
-                        };
-                        if let Some(obj) = content.as_object_mut() {
-                            obj.insert("output".into(), item.output.into());
-                            obj.insert("is_error".into(), item.is_error.into());
-                        }
-                        let status = if item.is_error { "error" } else { "complete" };
-                        let content_str = content.to_string();
-                        let _ = repo::update_lead_message(&db, row_id, &content_str, status).await;
-                        let _ = app.emit(
-                            EVENT,
-                            Push::ToolResult {
-                                thread_id,
-                                message_id: row_id,
-                                content: content_str,
-                                status: status.into(),
-                            },
-                        );
-                    }
+                    merge_tool_results(&app, &db, &mut inner, items).await;
                 }
-                super::proto::ChatEvent::TurnEnd { is_error, context_tokens } => {
+                super::proto::ChatEvent::Usage { .. } => {}
+                super::proto::ChatEvent::TurnEnd {
+                    is_error,
+                    context_tokens,
+                } => {
                     if let Some(ct) = context_tokens {
                         inner.last_context_tokens = Some(ct);
                         let _ = app.emit(
@@ -2226,6 +2517,13 @@ fn spawn_reader(
                 "complete"
             };
             inner.interrupting = false;
+            // A per-turn process killed/crashed after a tool started but before its
+            // item.completed leaves a streaming tool row no TurnEnd ever drained —
+            // finalize it here too, so it doesn't spin forever in the timeline.
+            let eof_thread_id = inner.thread_id;
+            let orphans: Vec<(i32, serde_json::Value)> =
+                inner.tool_rows.drain().map(|(_, v)| v).collect();
+            finalize_orphan_tool_rows(&app, &db, eof_thread_id, orphans, status).await;
             // A turn that produced ZERO events died on startup (auth, bad args,
             // session lock …) — surface it instead of completing silently.
             if !saw_event && status == "complete" {
@@ -2648,6 +2946,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_change_approval_summary_is_path_specific() {
+        // distinct edits get distinct summaries → distinct AskRegistry Always keys.
+        let a = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path": "src/a.rs", "kind": {"type": "edit"}}]
+        }));
+        let b = codex_change_approval_summary(&serde_json::json!({
+            "item": {"changes": [{"path": "src/b.rs"}]}
+        }));
+        assert_eq!(a, "apply file changes: src/a.rs");
+        assert_eq!(b, "apply file changes: src/b.rs");
+        assert_ne!(a, b);
+        // >3 paths are capped with a +N suffix.
+        let many = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"4"},{"path":"5"}]
+        }));
+        assert_eq!(many, "apply file changes: 1, 2, 3 +2");
+        // no paths → the generic label (still answerable, just not Always-specific).
+        assert_eq!(
+            codex_change_approval_summary(&serde_json::json!({})),
+            "apply file changes"
+        );
+    }
+
+    #[test]
+    fn tool_row_status_id_less_running_does_not_spin() {
+        // a finished row is terminal …
+        assert_eq!(tool_row_status(true, false, false), "complete");
+        assert_eq!(tool_row_status(true, false, true), "error");
+        // … a running row streams only when it has an id to correlate its result …
+        assert_eq!(tool_row_status(false, true, false), "streaming");
+        // … and an id-less running row is stored complete (never a perpetual spinner).
+        assert_eq!(tool_row_status(false, false, false), "complete");
+    }
+
+    #[test]
     fn per_turn_only_accepts_known_per_turn_tools() {
         assert!(!per_turn("claude"));
         assert!(per_turn("codex"));
@@ -2683,6 +3016,7 @@ mod tests {
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
+            codex_client: None,
         }
     }
 
@@ -2824,6 +3158,7 @@ mod tests {
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
+            codex_client: None,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));
