@@ -289,7 +289,16 @@ function TargetEditor({
     }
   }, [meta?.target]);
 
+  // Escape blurs to revert, but blur fires save() synchronously before the
+  // setVal revert commits — so without this flag save() would read the stale
+  // edited `val` and persist the *discarded* branch. Skip the save that the
+  // Escape-triggered blur causes.
+  const skipNextBlur = useRef(false);
   const save = () => {
+    if (skipNextBlur.current) {
+      skipNextBlur.current = false;
+      return;
+    }
     const next = val.trim();
     if (next === (meta?.target ?? "").trim()) return; // unchanged
     lastLoaded.current = next;
@@ -308,6 +317,7 @@ function TargetEditor({
             e.preventDefault();
             (e.target as HTMLInputElement).blur();
           } else if (e.key === "Escape") {
+            skipNextBlur.current = true;
             setVal(meta?.target ?? "");
             (e.target as HTMLInputElement).blur();
           }
