@@ -37,10 +37,15 @@ pub enum HumanAskEvent {
         ask: Ask,
     },
     /// 携带人答的 text：飞书卡片终态要显示答案，而桌面侧作答时桥拿不到
-    /// 文本，必须由事件携带。
+    /// 文本，必须由事件携带。`from`/`question` 供 transcript 结算痕迹消费者
+    /// 把痕迹落到提问 worker 的 transcript（并显示原问题）。
     Answered {
         thread: i32,
         ask_id: u64,
+        /// 提问方向 id（字符串）；"" 为 lead/规划会话。
+        from: String,
+        /// 原问题文本（区别于人答的 `text`）。
+        question: String,
         text: String,
     },
 }
@@ -81,6 +86,9 @@ pub struct BusRegistry {
     wake: Arc<Mutex<Option<Sender<Wake>>>>,
     next_ask_id: Arc<AtomicU64>,
     ask_notify: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<HumanAskEvent>>>>,
+    /// transcript 结算痕迹消费者的通道（与 IM 桥 `ask_notify` 独立的第二订阅，
+    /// 桌面端始终装上）。
+    ask_trail: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<HumanAskEvent>>>>,
 }
 
 fn now() -> u64 {
@@ -119,10 +127,24 @@ impl BusRegistry {
         *self.ask_notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
+    /// Install the transcript-trail consumer's channel (called once at startup,
+    /// independent of the IM bridge's `set_ask_notifier`).
+    pub fn set_ask_trail_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<HumanAskEvent>) {
+        *self.ask_trail.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
     /// 须在持 `inner` 锁内调用，以保证通道顺序与状态迁移一致（事件是
     /// edge-triggered、带 per-ask 身份，Asked/Answered 不可乱序）。锁顺序
     /// 固定 inner → ask_notify；UnboundedSender::send 非阻塞，锁内发送安全。
     fn emit_ask_event(&self, ev: HumanAskEvent) {
+        if let Some(tx) = self
+            .ask_trail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(ev.clone());
+        }
         if let Some(tx) = self
             .ask_notify
             .lock()
@@ -286,21 +308,23 @@ impl BusRegistry {
             let hit = match bus.asks.iter_mut().find(|a| a.id == ask_id && !a.answered) {
                 Some(a) => {
                     a.answered = true;
-                    Some(a.from.clone())
+                    Some((a.from.clone(), a.text.clone()))
                 }
                 None => None,
             };
-            if hit.is_some() {
+            if let Some((from, question)) = &hit {
                 self.emit_ask_event(HumanAskEvent::Answered {
                     thread,
                     ask_id,
+                    from: from.clone(),
+                    question: question.clone(),
                     text: text.to_string(),
                 });
             }
             hit
         };
         match target {
-            Some(dir) => {
+            Some((dir, _question)) => {
                 self.post(thread, HUMAN, &dir, text, "message");
                 true
             }
@@ -465,7 +489,8 @@ mod tests {
         }
         assert!(r.answer_ask(1, id, "minor"));
         assert!(matches!(rx.recv().await.unwrap(),
-            HumanAskEvent::Answered { thread: 1, ask_id, text } if ask_id == id && text == "minor"));
+            HumanAskEvent::Answered { thread: 1, ask_id, from, question, text }
+                if ask_id == id && from == "10" && question == "major or minor?" && text == "minor"));
         // 未命中/重复作答不发事件
         assert!(!r.answer_ask(1, id, "again"));
         assert!(rx.try_recv().is_err());

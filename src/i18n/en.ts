@@ -191,6 +191,8 @@ export const en = {
     send: "Send",
     proposalReady_one: "Proposed {{count}} sub-task",
     proposalReady_other: "Proposed {{count}} sub-tasks",
+    proposalResolved_one: "Reviewed {{count}} sub-task",
+    proposalResolved_other: "Reviewed {{count}} sub-tasks",
     reviewCreate: "Review & create",
     starting: "Starting the lead…",
     stopped: "The lead stopped.",
@@ -662,6 +664,14 @@ export const en = {
     newRepoLabel: "Create new repo",
     cloneRepoLabel: "Clone from URL",
     readOnlyHint: "This card belongs to an older turn.",
+    resolved: "Added {{name}}",
+  },
+  settled: {
+    permissionAllow: "Approved · {{summary}}",
+    permissionDeny: "Denied · {{summary}}",
+    permissionAlways: "Always allowed · {{summary}}",
+    permissionFull: "Full access granted · {{summary}}",
+    askAnswered: "Answered · {{text}} → {{answer}}",
   },
   repoActions: {
     chooseDir: "Choose a folder",

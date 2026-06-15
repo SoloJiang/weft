@@ -36,6 +36,7 @@ pub mod profile;
 mod session_meta;
 mod sidecar;
 pub mod skills;
+mod trail;
 pub mod slug;
 pub mod store;
 mod tools;
@@ -154,6 +155,7 @@ pub fn run() {
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             im::spawn(app.handle().clone());
+            trail::spawn(app.handle().clone());
             backup::scheduler::spawn(backup_svc.clone());
             Ok(())
         })
@@ -194,6 +196,7 @@ pub fn run() {
             commands::pending_asks,
             commands::workspace_needs_counts,
             commands::answer_permission,
+            commands::resolve_action_card,
             commands::set_dangerous_mode,
             commands::set_keep_awake,
             commands::db_encryption_status,

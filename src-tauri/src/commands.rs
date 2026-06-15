@@ -584,7 +584,33 @@ pub async fn deny_write_trigger(
     Ok(())
 }
 
-/// Answer an open ask; the reply lands in the asking direction's bus inbox.
+/// Mark a lead action_card as resolved once its repo flow succeeded, persisting
+/// the settled state into the row so it survives reload (no re-click double-add).
+#[tauri::command]
+pub async fn resolve_action_card(db: State<'_, Db>, message_id: i32, name: String) -> R<()> {
+    if let Some(m) = repo::resolve_action_card(&db, message_id, &name)
+        .await
+        .map_err(e)?
+    {
+        if let Some(app) = crate::APP_HANDLE.get() {
+            use tauri::Emitter;
+            let _ = app.emit(
+                crate::lead_chat::engine::EVENT,
+                crate::lead_chat::engine::Push::ToolResult {
+                    thread_id: m.thread_id,
+                    message_id: m.id,
+                    content: m.content,
+                    status: m.status,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Answer an open ask; the reply lands in the asking direction's bus inbox. The
+/// durable settled-trail row is written by the `trail` consumer off the bus's
+/// resolution event, so every answer path (desktop / remote / IM) is covered.
 #[tauri::command]
 pub fn answer_ask(
     bus: tauri::State<'_, crate::bus::BusRegistry>,

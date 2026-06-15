@@ -13,7 +13,7 @@ pub struct Model {
     pub turn_id: i32,
     /// user | assistant | system
     pub role: String,
-    /// text | tool | command | proposal | approval | worker_event | meta
+    /// text | tool | command | proposal | approval | worker_event | meta | settled
     pub kind: String,
     /// kind-shaped JSON, e.g. {"text": "..."} for kind=text
     pub content: String,

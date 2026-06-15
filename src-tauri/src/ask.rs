@@ -28,9 +28,10 @@ pub enum AskEvent {
     /// 消费侧（桥/命令层）的责任。
     Opened(Ask),
     /// `answer` 是该 ask 的真实判决（Dangerous 释放积压记为 Allow；
-    /// Always/Full 连带覆盖的 ask 记为人答的那个 Answer）。
+    /// Always/Full 连带覆盖的 ask 记为人答的那个 Answer）。携带被解决的 Ask
+    /// 快照，使消费侧（IM 终态卡 / transcript 结算痕迹）无需回查已移除的 open。
     Resolved {
-        id: u64,
+        ask: Ask,
         answer: Answer,
     },
     Cancelled {
@@ -109,11 +110,16 @@ struct Inner {
     dangerous: bool,
     /// IM 桥的通知器：装上后 Ask 开/答/撤事件外发；未装时零开销。
     notify: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
+    /// transcript 结算痕迹消费者（与 IM 桥独立的第二订阅，始终在桌面端装上）。
+    trail: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
 }
 
 impl Inner {
-    /// 事件外发（持锁内调用）：没装通知器时零开销；桥不在线不报错。
+    /// 事件外发（持锁内调用）：两路订阅各自独立，未装的那路零开销、不报错。
     fn emit(&self, ev: AskEvent) {
+        if let Some(tx) = &self.trail {
+            let _ = tx.send(ev.clone());
+        }
         if let Some(tx) = &self.notify {
             let _ = tx.send(ev);
         }
@@ -187,14 +193,13 @@ impl AskRegistry {
         if !on {
             return;
         }
-        let ids: Vec<u64> = g.open.iter().map(|a| a.id).collect();
-        g.open.clear();
-        for id in ids {
-            if let Some(tx) = g.waiters.remove(&id) {
+        let cleared: Vec<Ask> = std::mem::take(&mut g.open);
+        for ask in cleared {
+            if let Some(tx) = g.waiters.remove(&ask.id) {
                 let _ = tx.send(Decision::Allow);
             }
             g.emit(AskEvent::Resolved {
-                id,
+                ask,
                 answer: Answer::Allow,
             });
         }
@@ -246,7 +251,7 @@ impl AskRegistry {
         } else {
             Decision::Allow
         };
-        let covered: Vec<u64> = g
+        let covered: Vec<Ask> = g
             .open
             .iter()
             .filter(|a| {
@@ -262,17 +267,18 @@ impl AskRegistry {
                     _ => false,
                 }
             })
-            .map(|a| a.id)
+            .cloned()
             .collect();
 
-        g.open.retain(|a| !covered.contains(&a.id));
+        let covered_ids: HashSet<u64> = covered.iter().map(|a| a.id).collect();
+        g.open.retain(|a| !covered_ids.contains(&a.id));
         let mut woke = false;
-        for cid in covered {
-            if let Some(tx) = g.waiters.remove(&cid) {
+        for c in covered {
+            if let Some(tx) = g.waiters.remove(&c.id) {
                 woke = tx.send(decision).is_ok() || woke;
             }
             g.emit(AskEvent::Resolved {
-                id: cid,
+                ask: c,
                 answer: ans,
             });
         }
@@ -290,6 +296,13 @@ impl AskRegistry {
         if hit {
             g.emit(AskEvent::Cancelled { id });
         }
+    }
+
+    /// Install the transcript-trail consumer's channel (called once at startup,
+    /// independent of the IM bridge's `set_notifier`). No snapshot: the trail
+    /// only records future resolutions, never replays still-open asks.
+    pub fn set_trail_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<AskEvent>) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).trail = Some(tx);
     }
 
     /// All Asks across threads (for the workspace-wide Needs-you surface).
@@ -391,7 +404,7 @@ mod tests {
         r.answer(id, Answer::Allow);
         assert!(matches!(
             rx.recv().await.unwrap(),
-            AskEvent::Resolved { id: rid, answer: Answer::Allow } if rid == id
+            AskEvent::Resolved { ask, answer: Answer::Allow } if ask.id == id
         ));
         let (id2, _drx2) = r.request(1, "10", "claude", "Run: y", "y");
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id2));
@@ -411,9 +424,9 @@ mod tests {
         r.answer(id1, Answer::Full); // 覆盖 id2
         let mut got = vec![];
         for _ in 0..2 {
-            if let AskEvent::Resolved { id, answer } = rx.recv().await.unwrap() {
+            if let AskEvent::Resolved { ask, answer } = rx.recv().await.unwrap() {
                 assert_eq!(answer, Answer::Full); // 连带覆盖也携带人答的判决
-                got.push(id);
+                got.push(ask.id);
             }
         }
         got.sort();
@@ -432,9 +445,9 @@ mod tests {
         r.set_dangerous(true);
         let mut got = vec![];
         for _ in 0..2 {
-            if let AskEvent::Resolved { id, answer } = rx.recv().await.unwrap() {
+            if let AskEvent::Resolved { ask, answer } = rx.recv().await.unwrap() {
                 assert_eq!(answer, Answer::Allow); // 释放积压记为 Allow
-                got.push(id);
+                got.push(ask.id);
             }
         }
         got.sort();

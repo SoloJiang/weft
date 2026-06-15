@@ -1134,8 +1134,8 @@ async fn consume_ask_event(
                 Err(e) => eprintln!("[weft][im] send perm card: {e}"),
             }
         }
-        crate::ask::AskEvent::Resolved { id, answer } => {
-            if let Some((mid, summary)) = cards.lock().await.take_perm(id) {
+        crate::ask::AskEvent::Resolved { ask, answer } => {
+            if let Some((mid, summary)) = cards.lock().await.take_perm(ask.id) {
                 let card = outbound::resolved_card(&summary, answer.as_str(), IM_LANG);
                 if let Err(e) = ch.patch_card(&mid, card).await {
                     eprintln!("[weft][im] patch resolved card: {e}");
@@ -1201,6 +1201,7 @@ async fn consume_human_event(
             thread,
             ask_id,
             text,
+            ..
         } => {
             if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
                 let card = outbound::human_resolved_card(&text, IM_LANG);

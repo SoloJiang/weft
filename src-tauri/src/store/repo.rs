@@ -736,6 +736,27 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
     Ok(())
 }
 
+/// Stamp an action_card row as resolved (its repo flow succeeded) and return the
+/// updated row, so the settled state survives reload. Merges `{"resolved":
+/// <name>}` into the card's JSON. None if the row is gone.
+pub async fn resolve_action_card(
+    db: &Db,
+    id: i32,
+    name: &str,
+) -> Result<Option<lead_message::Model>> {
+    let Some(m) = lead_message::Entity::find_by_id(id).one(&db.0).await? else {
+        return Ok(None);
+    };
+    let mut v: serde_json::Value =
+        serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("resolved".into(), serde_json::Value::String(name.to_string()));
+    }
+    let mut a: lead_message::ActiveModel = m.into();
+    a.content = Set(v.to_string());
+    Ok(Some(a.update(&db.0).await?))
+}
+
 /// Close rows left `streaming` by a previous app process. Live turn state is
 /// memory-only; after restart these rows can no longer receive deltas, so show
 /// them as interrupted instead of a forever-typing assistant.
@@ -1057,6 +1078,36 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].content, r#"{"text":"hi!"}"#);
         assert_eq!(next_turn_id(&db, 1).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_action_card_persists_resolved_marker() {
+        let db = mem().await;
+        let card = insert_lead_message(
+            &db,
+            1,
+            None,
+            1,
+            "system",
+            "action_card",
+            r#"{"title":"Add a repo","actions":[{"id":"add","label":"Import","kind":"add"}]}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let updated = resolve_action_card(&db, card.id, "weft")
+            .await
+            .unwrap()
+            .expect("card exists");
+        let v: serde_json::Value = serde_json::from_str(&updated.content).unwrap();
+        assert_eq!(v["resolved"], "weft");
+        // existing fields are preserved, not clobbered
+        assert_eq!(v["title"], "Add a repo");
+        // and it survives reload (persisted, not session-local)
+        let all = list_lead_messages(&db, 1).await.unwrap();
+        assert_eq!(all[0].content, updated.content);
+        // a missing row is a no-op
+        assert!(resolve_action_card(&db, 9999, "x").await.unwrap().is_none());
     }
 
     #[tokio::test]

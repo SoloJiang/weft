@@ -18,6 +18,9 @@ export type RepoActionKind = "add" | "new" | "clone";
 export interface RepoActionContext {
   /** When present, the result is posted back to the lead thread. */
   threadId?: number;
+  /** The action_card message id, so a successful flow collapses that card to a
+   *  settled summary (closes the loop; prevents a re-click double-add). */
+  messageId?: number;
   /** Override the active workspace (e.g., when invoked from a card pinned
    *  to a specific workspace). Falls back to the active workspace. */
   preferredWorkspaceId?: number | null;
@@ -86,6 +89,15 @@ export function useRepoActions() {
         }
         const result = await dispatch(inv, wsId, t as Translate);
         if (result.status === "ok") {
+          if (inv.ctx.messageId != null) {
+            // Persist the card's settled state so it survives reload (no
+            // re-click double-add). Best-effort: the repo is already registered.
+            try {
+              await api.resolveActionCard(inv.ctx.messageId, result.name);
+            } catch (err) {
+              console.warn("[weft] action-card resolve persist failed", err);
+            }
+          }
           toast(t("repoActions.addedToast", { name: result.name }));
           try {
             await refreshReposAndMap(wsId);
