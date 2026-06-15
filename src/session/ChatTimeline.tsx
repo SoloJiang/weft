@@ -5,7 +5,13 @@ import { ArrowRight, Check, ChevronRight, Copy, FileText, Sparkles } from "lucid
 import type { LeadMessage, ResolvedProposal } from "../lib/types";
 import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
-import { cleanToolName, compactToolTarget, toolIcon, toolLabelKey } from "./transcriptBits";
+import {
+  cleanToolName,
+  compactToolTarget,
+  toolDoneLabelKey,
+  toolIcon,
+  toolLabelKey,
+} from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
 import type { useRepoActions } from "./useRepoActions";
 
@@ -16,8 +22,8 @@ type EmptyStateMode = "default" | "lead-task" | "lead-repo-guide";
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
  * no jsonl). Structured cards (proposal/approval/worker events) live inline in
  * the flow, where they happened — the conversation IS the console. Tool calls
- * are NOT rows: the one currently running shows as a transient activity line
- * under the stream and disappears when the turn moves on.
+ * are `kind:"tool"` rows, inline and expandable, in the order they ran; the
+ * bottom activity line is only the generic "working" pulse between rows.
  *
  * The lead host wires up runAction/promptText so action_card buttons trigger
  * the real repo flows; worker hosts (Observe/Session) omit them and any
@@ -60,9 +66,8 @@ export function ChatTimeline({
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
 
-  // Tool calls (claude/opencode) render inline as expandable `kind:"tool"` rows;
-  // only `meta` bookkeeping rows are hidden. (Codex tools still arrive as the
-  // transient activity bar below the list.)
+  // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
+  // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
   const visible = messages.filter((m) => m.kind !== "meta");
 
   // Virtuoso's followOutput only fires on item-COUNT changes, so it misses
@@ -276,8 +281,8 @@ function ActivityLine({ name, summary }: { name: string; summary: string }) {
 }
 
 /**
- * A persisted tool call (claude/opencode): a compact collapsed line — icon +
- * tool label + target + a status dot — that expands to show the full input and
+ * A persisted tool call: a low-weight, borderless line (codex-style) — a
+ * state-colored icon + label + target — that expands to show the full input and
  * the tool's output. `status` mirrors the row: "streaming" = running,
  * "complete"/"error" = finished.
  */
@@ -292,45 +297,51 @@ function ToolRow({ m }: { m: LeadMessage }) {
   const running = m.status === "streaming";
   const isError = c.is_error === true || m.status === "error";
   const Icon = toolIcon(name);
-  const labelKey = toolLabelKey(name);
-  const label = labelKey === "session.toolCalling" ? cleanToolName(name) : t(labelKey);
+  // Finished rows read past-tense ("Ran"/"已运行"); a running row stays "Running".
+  const labelKey = running ? toolLabelKey(name) : toolDoneLabelKey(name);
+  const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
+  const label = generic ? cleanToolName(name) : t(labelKey);
   const { target } = compactToolTarget(name, summary);
   const hasDetail = inputText.length > 0 || output.length > 0;
 
   return (
-    <div className="overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface/60">
+    <div>
       <button
         type="button"
         disabled={!hasDetail}
         onClick={() => setOpen((v) => !v)}
         className={cn(
-          "flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[13px]",
-          hasDetail && "hover:bg-surface",
+          "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
+          hasDetail && "hover:bg-surface/60",
         )}
       >
-        <span
+        <Icon
+          size={13}
           className={cn(
-            "h-1.5 w-1.5 shrink-0 rounded-full",
-            running ? "animate-pulse bg-running" : isError ? "bg-danger" : "bg-ink-faint",
+            "shrink-0",
+            running
+              ? "animate-pulse text-running"
+              : isError
+                ? "text-danger"
+                : "text-ink-faint",
           )}
         />
-        <Icon size={14} className="shrink-0 text-ink-faint" />
-        <span className="shrink-0 font-medium text-ink-muted">{label}</span>
+        <span className="shrink-0 text-ink-muted">{label}</span>
         {(target || summary) && (
-          <span className="min-w-0 truncate font-mono text-brand">{target || summary}</span>
+          <span className="min-w-0 truncate font-mono text-ink-faint">{target || summary}</span>
         )}
         {hasDetail && (
           <ChevronRight
-            size={13}
+            size={12}
             className={cn(
-              "ml-auto shrink-0 text-ink-faint transition-transform",
+              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
               open && "rotate-90",
             )}
           />
         )}
       </button>
       {open && hasDetail && (
-        <div className="space-y-2 border-t border-border px-2.5 py-2">
+        <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
           {inputText && <ToolBlock label={t("tool.input")} body={inputText} />}
           {output && (
             <ToolBlock label={t("tool.output")} body={output} tone={isError ? "error" : "default"} />

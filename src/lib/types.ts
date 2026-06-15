@@ -126,6 +126,12 @@ export interface McpServerInfo {
   tools: string[];
 }
 
+/** A skill the running engine actually has (codex), shown in the session panel. */
+export interface EngineSkill {
+  name: string;
+  description: string;
+}
+
 /** Per-session snapshot for the session info panel
  *  (lead 按 thread_id、worker 按 session_id 存)。 */
 export interface SessionMeta {
@@ -133,6 +139,10 @@ export interface SessionMeta {
   window?: number;
   model?: string;
   mcpServers: McpServerInfo[];
+  /** codex 的真实 skill,带外 `session_meta` 填;claude 不填。 */
+  engineSkills?: EngineSkill[];
+  /** codex 的思考强度(low/medium/high/…)。 */
+  reasoningEffort?: string;
 }
 
 /** Band-outside meta for codex/opencode workers (M2), from the `session_meta`
@@ -143,6 +153,10 @@ export interface SessionMetaSnapshot {
   window: number | null;
   model: string | null;
   mcp_servers: { name: string; status: string }[] | null;
+  /** codex 真实 skill;`null` = 没探到(保留旧行),非 null = 权威列表。 */
+  skills: { name: string; description: string }[] | null;
+  /** codex 思考强度;`null` = 未配置。 */
+  reasoning_effort: string | null;
 }
 
 /** One executable verification rung's result (ARCHITECTURE §4.13). */
@@ -185,7 +199,15 @@ export interface LeadMessage {
 export type LeadChatPush =
   | { type: "message"; thread_id: number; message: LeadMessage }
   | { type: "delta"; thread_id: number; message_id: number; text: string }
-  | { type: "finalize"; thread_id: number; message_id: number; status: string }
+  | {
+      type: "finalize";
+      thread_id: number;
+      message_id: number;
+      status: string;
+      /** Cleaned final text, present only when sentinels were stripped after they
+       *  streamed raw — the row content is replaced so the tags vanish live. */
+      content?: string;
+    }
   | {
       type: "turn";
       thread_id: number;

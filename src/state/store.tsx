@@ -1063,7 +1063,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           ...m,
           [p.thread_id]: (m[p.thread_id] ?? []).map((x) =>
             x.id === p.message_id
-              ? { ...x, status: p.status as LeadMessage["status"] }
+              ? {
+                  ...x,
+                  status: p.status as LeadMessage["status"],
+                  // Replace the streamed body when the engine sends cleaned content
+                  // (sentinels stripped post-stream) so the raw tags vanish live.
+                  ...(p.content != null
+                    ? { content: JSON.stringify({ text: p.content }) }
+                    : {}),
+                }
               : x,
           ),
         }));

@@ -56,6 +56,15 @@ pub fn encode_response(id: &Value, result: Value) -> String {
     format!("{}\n", json!({ "id": id, "result": result }))
 }
 
+/// Encode an error reply to a server-initiated request — our "can't satisfy this"
+/// answer to a blocking request we don't support, so the turn doesn't hang.
+pub fn encode_error_response(id: &Value, code: i64, message: &str) -> String {
+    format!(
+        "{}\n",
+        json!({ "id": id, "error": { "code": code, "message": message } })
+    )
+}
+
 // ── the core request builders (params shapes verified against v2 source) ──
 
 /// `initialize` params. capabilities.experimentalApi=false — the core
@@ -164,15 +173,41 @@ pub fn turn_id_of(result: &Value) -> Option<String> {
 pub fn is_approval_request(method: &str) -> bool {
     matches!(
         method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
     )
 }
 
-/// Map a server notification to the engine's `ChatEvent`. Returns `None` for
-/// notifications the streaming pipeline ignores (reasoning, thread/turn
-/// lifecycle markers, hook/skills observability — handled separately in Stage
-/// 4). Mirrors how the exec dialect renders agent text + tool pills.
+/// The in-protocol decline `result` for a non-approval server request, or `None`
+/// when it should get a JSON-RPC error instead. Shapes verified against the codex
+/// 0.139.0 app-server JSON schema: elicitation → `{action:"decline"}` (we can't
+/// collect its `content`); requestUserInput → `{answers:{}}` (no answers).
+pub fn decline_response(method: &str) -> Option<Value> {
+    if is_elicitation_request(method) {
+        Some(json!({ "action": "decline" }))
+    } else if method == "item/tool/requestUserInput" {
+        Some(json!({ "answers": {} }))
+    } else {
+        None
+    }
+}
+
+/// A blocking MCP elicitation (`mcpServer/elicitation/request`): a configured MCP
+/// server asking the user for STRUCTURED input. Weft has no UI to collect that
+/// content, so it's declined (`{action:"decline"}`) rather than routed to a
+/// yes/no Ask Bridge that can't supply the required `content`.
+pub fn is_elicitation_request(method: &str) -> bool {
+    method.ends_with("/elicitation/request")
+}
+
+/// Map a server notification to the engine's `ChatEvent`. Tool items (camelCase:
+/// commandExecution/fileChange/mcpToolCall …) become a running tool row on
+/// `item/started` and its result on `item/completed`; agent text streams via
+/// deltas; `thread/tokenUsage/updated` carries the current-context usage.
 pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> {
+    use crate::lead_chat::proto::ChatEvent;
+    let item = &params["item"];
     match method {
         "item/agentMessage/delta" => {
             params["delta"]
@@ -182,48 +217,190 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                     text: s.to_string(),
                 })
         }
-        "item/started" => {
-            // Non-text items surface as activity pills as soon as they start;
-            // agentMessage waits for its deltas / completion.
-            let item = &params["item"];
-            match item["type"].as_str() {
-                Some("agentMessage") | None => None,
-                Some("reasoning") => None,
-                Some("error") => Some(ChatEvent::TextDelta {
-                    text: crate::lead_chat::proto::error_text_from_item(item),
-                }),
-                Some(kind) => Some(ChatEvent::Assistant {
-                    texts: vec![],
-                    tools: vec![crate::lead_chat::proto::ToolCall::pill(
-                        kind,
-                        item_summary(kind, item),
-                    )],
-                }),
-            }
+        "item/started" => match item["type"].as_str() {
+            Some("error") => Some(ChatEvent::TextDelta {
+                text: crate::lead_chat::proto::error_text_from_item(item),
+            }),
+            // The tool-call item types (verified against the 0.139.0 ThreadItem
+            // union): exec/edit/MCP plus subagent (collabAgentToolCall) and custom
+            // (dynamicToolCall) calls. Content/lifecycle items (agentMessage,
+            // reasoning, plan, webSearch, …) are ignored so they don't open rows.
+            Some(
+                "commandExecution" | "fileChange" | "mcpToolCall" | "collabAgentToolCall"
+                | "dynamicToolCall",
+            ) => Some(ChatEvent::Assistant {
+                texts: vec![],
+                tools: vec![appserver_tool_call(item)],
+            }),
+            _ => None,
+        },
+        // agentMessage text already streamed via deltas → no-op; tool items deliver
+        // their result here, merged into the running row by item id.
+        "item/completed" => match item["type"].as_str() {
+            Some(
+                "commandExecution" | "fileChange" | "mcpToolCall" | "collabAgentToolCall"
+                | "dynamicToolCall",
+            ) => Some(ChatEvent::ToolResults {
+                items: vec![appserver_tool_result(item)],
+            }),
+            // already streamed (agentMessage) or carries no display payload.
+            Some("agentMessage" | "userMessage" | "reasoning") | None => None,
+            // Other content items (/plan, /review …) don't stream via agentMessage
+            // deltas, so surface any text they carry instead of dropping it.
+            Some(_) => crate::lead_chat::proto::codex_content_item_text(item)
+                .map(|text| ChatEvent::TextDelta { text }),
+        },
+        // Top-level failure (auth / usage-limit / context-window …): surface the
+        // message so the turn doesn't end blank, then turn/completed marks it error.
+        "error" => {
+            let text = params["message"]
+                .as_str()
+                .or_else(|| params["error"]["message"].as_str())
+                .or_else(|| params["error"].as_str())
+                .unwrap_or("Codex reported an error.")
+                .trim();
+            (!text.is_empty()).then(|| ChatEvent::TextDelta {
+                text: text.to_string(),
+            })
         }
-        // Final item state. Verified live: an agentMessage's text already arrived
-        // token-by-token via `item/agentMessage/delta`, so re-emitting it here
-        // would double-render — deltas are authoritative. Non-text items showed
-        // their pill on item/started; userMessage/reasoning are ignored. (A
-        // no-delta config would need an item.text fallback at wire-in, but codex
-        // streams deltas in practice.)
-        "item/completed" => None,
+        "thread/tokenUsage/updated" => {
+            let tu = &params["tokenUsage"];
+            tu["last"]["inputTokens"]
+                .as_u64()
+                .map(|ct| ChatEvent::Usage {
+                    context_tokens: ct,
+                    window: tu["modelContextWindow"].as_u64(),
+                })
+        }
         "turn/completed" => Some(ChatEvent::TurnEnd {
             is_error: params["turn"]["status"].as_str() != Some("completed"),
-            context_tokens: None, // codex app-server usage 解析留给后续里程碑
+            context_tokens: None, // 准确上下文走 thread/tokenUsage/updated
         }),
-        _ => None, // thread/started, turn/started, hook/*, skills/changed → Stage 2/4
+        _ => None,
     }
 }
 
-/// A compact, truncated summary string for a non-text item's activity pill.
-fn item_summary(kind: &str, item: &Value) -> String {
-    let s = match kind {
-        "commandExecution" => item["command"].as_str().unwrap_or_default(),
-        "fileChange" => item["changes"][0]["path"].as_str().unwrap_or_default(),
-        _ => "",
-    };
+/// Error text carried on a failed `turn/completed` (auth / quota / context), if
+/// any — surfaced before the TurnEnd so the row shows the real cause instead of a
+/// generic `error_before_output` when the failure is reported only here.
+pub fn turn_error_text(params: &Value) -> Option<String> {
+    let t = &params["turn"];
+    let s = t["error"]["message"]
+        .as_str()
+        .or_else(|| t["error"].as_str())
+        .unwrap_or("")
+        .trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Running `ToolCall` from an app-server `item.started` tool item.
+fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
+    crate::lead_chat::proto::ToolCall {
+        id: item["id"].as_str().unwrap_or_default().to_string(),
+        name: item["type"].as_str().unwrap_or("tool").to_string(),
+        input: appserver_tool_input(item),
+        summary: appserver_tool_summary(item),
+        output: None,
+        is_error: false,
+    }
+}
+
+/// Result of an app-server `item.completed` tool item, keyed by item id.
+fn appserver_tool_result(item: &Value) -> crate::lead_chat::proto::ToolResultItem {
+    crate::lead_chat::proto::ToolResultItem {
+        id: item["id"].as_str().unwrap_or_default().to_string(),
+        output: appserver_tool_output(item),
+        is_error: appserver_tool_is_error(item),
+    }
+}
+
+fn appserver_tool_input(item: &Value) -> Value {
+    let mut obj = serde_json::Map::new();
+    for k in ["command", "cwd", "changes", "server", "tool", "arguments"] {
+        if let Some(v) = item.get(k) {
+            if !v.is_null() {
+                obj.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    // Cap like the exec/claude path: a big MCP `arguments` or `changes` payload
+    // would otherwise bloat the persisted row + its push even though output is
+    // capped. Small inputs pass through unchanged (UI still renders the object).
+    crate::lead_chat::proto::cap_input(Value::Object(obj))
+}
+
+fn appserver_tool_summary(item: &Value) -> String {
+    let s = item["command"]
+        .as_str()
+        .or_else(|| item["tool"].as_str())
+        .or_else(|| item["changes"][0]["path"].as_str())
+        .unwrap_or_default();
     s.chars().take(120).collect()
+}
+
+/// commandExecution → `aggregatedOutput`; fileChange → the per-change diffs;
+/// mcpToolCall → result/output.
+fn appserver_tool_output(item: &Value) -> String {
+    if let Some(s) = item["aggregatedOutput"].as_str() {
+        return cap_out(s);
+    }
+    if let Some(changes) = item["changes"].as_array() {
+        let diff = changes
+            .iter()
+            .filter_map(|c| c["diff"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !diff.is_empty() {
+            return cap_out(&diff);
+        }
+    }
+    // mcpToolCall result / generic output: a plain string, an MCP result object
+    // (`{content:[{text}]}` — what weft's bus/planner tools return), or some other
+    // JSON value. Render the text where possible, else serialize so the expanded
+    // row isn't blank.
+    for key in ["output", "result", "error"] {
+        let v = &item[key];
+        if v.is_null() {
+            continue;
+        }
+        if let Some(s) = v.as_str() {
+            return cap_out(s);
+        }
+        if let Some(content) = v["content"].as_array() {
+            let text = content
+                .iter()
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                return cap_out(&text);
+            }
+        }
+        return cap_out(&v.to_string());
+    }
+    String::new()
+}
+
+fn appserver_tool_is_error(item: &Value) -> bool {
+    // A declined/canceled approval completes the item without running it — not a
+    // success. Check status first; otherwise a non-zero exit code is an error.
+    if matches!(
+        item["status"].as_str(),
+        Some("failed" | "error" | "declined" | "canceled" | "cancelled")
+    ) {
+        return true;
+    }
+    item["exitCode"].as_i64().is_some_and(|c| c != 0)
+}
+
+fn cap_out(s: &str) -> String {
+    const MAX: usize = 16_000;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX).collect();
+    out.push_str("\n… (truncated)");
+    out
 }
 
 // ───────────────────── runtime client (Stage 1.5 — UNWIRED) ─────────────────
@@ -242,6 +419,10 @@ fn item_summary(kind: &str, item: &Value) -> String {
 pub enum ThreadMsg {
     /// A streaming event for the session's timeline.
     Event(ChatEvent),
+    /// A liveness ping (e.g. command output-delta while a long command runs) that
+    /// carries no timeline change — the consumer uses it only to refresh the
+    /// runaway-guard's last-activity clock so a busy command isn't idle-killed.
+    Heartbeat,
     /// An approval ask the session must answer via [`Client::reply_approval`]
     /// (echoing `id`), else the turn hangs. `decision` ∈ accept | acceptForSession
     /// | decline | cancel.
@@ -250,6 +431,10 @@ pub enum ThreadMsg {
         method: String,
         params: Value,
     },
+    /// The server cleared a still-open ask (`serverRequest/resolved`, e.g. on
+    /// interrupt) — the consumer cancels the matching Needs-you card so it doesn't
+    /// linger and send a stale reply when clicked. `request_id` echoes the ask's id.
+    AskResolved { request_id: Value },
 }
 
 struct Inner {
@@ -285,14 +470,85 @@ pub async fn client() -> anyhow::Result<Client> {
     Ok(c)
 }
 
+/// Shut down the global client. Call this after a probe `timeout()` cancels a
+/// `client()` mid-handshake: the dropped future may have left `spawn_inner`'s
+/// `Inner` half-initialized, and the next `client()` would reuse that broken
+/// connection — shutting it down forces a clean reconnect instead.
+pub async fn shutdown_global() {
+    cell().shutdown().await;
+}
+
 impl Client {
+    /// Spawn + handshake a fresh `codex app-server`, injecting `extra_args` (a
+    /// session's `-c mcp_servers...` bus flags) and running in `cwd`. Each session
+    /// gets its OWN process so its per-thread MCP config is isolated — app-server
+    /// MCP is app-scoped, so one shared connection couldn't carry per-thread bus URLs.
+    pub async fn connect_session(
+        extra_args: &[String],
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<Client> {
+        let client = Client(Arc::new(Mutex::new(None)));
+        client.spawn_inner(extra_args, Some(cwd)).await?;
+        Ok(client)
+    }
+
+    /// Whether the connection is still alive (read_loop clears the inner on EOF).
+    pub async fn is_alive(&self) -> bool {
+        self.0.lock().await.is_some()
+    }
+
+    /// Same underlying connection? Lets a consumer tell a genuine disconnect (still
+    /// the engine's active client → run the disconnect cleanup) from an intentional
+    /// teardown/replace (client taken or swapped → skip cleanup, don't clobber the
+    /// exec fallback turn).
+    pub fn ptr_eq(&self, other: &Client) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Decline a non-approval server request so the turn doesn't hang, using the
+    /// `decline_response` shape (or a JSON-RPC error when there's no in-protocol
+    /// decline).
+    async fn decline_server_request(&self, id: &Value, method: &str) {
+        match decline_response(method) {
+            Some(result) => {
+                let _ = self.reply_result(id, result).await;
+            }
+            None => {
+                let mut g = self.0.lock().await;
+                if let Some(inner) = g.as_mut() {
+                    let line = encode_error_response(id, -32601, "unsupported request");
+                    let _ = inner.stdin.write_all(line.as_bytes()).await;
+                    let _ = inner.stdin.flush().await;
+                }
+            }
+        }
+    }
+
+    /// Kill the connection: drops the child (kill_on_drop) and closes the thread
+    /// sinks, so the per-session consumer task exits.
+    pub async fn shutdown(&self) {
+        *self.0.lock().await = None;
+    }
+
     async fn connect(&self) -> anyhow::Result<()> {
+        self.spawn_inner(&[], None).await
+    }
+
+    async fn spawn_inner(
+        &self,
+        extra_args: &[String],
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
         if g.is_some() {
             return Ok(());
         }
-        let mut child = Command::new("codex")
-            .arg("app-server")
+        let mut command = Command::new("codex");
+        command.arg("app-server").arg("--stdio").args(extra_args);
+        if let Some(c) = cwd {
+            command.current_dir(c);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -319,13 +575,23 @@ impl Client {
         let me = self.clone();
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
 
-        // Handshake: initialize (await), then the `initialized` notification.
-        self.request(
-            "initialize",
-            initialize_params("weft", env!("CARGO_PKG_VERSION")),
-        )
-        .await?;
-        self.notify("initialized", None).await?;
+        // Handshake: initialize (await), then the `initialized` notification. If it
+        // wedges/errors (auth/network/version), tear the half-open client down
+        // (drops the child + closes read_loop) so a retry doesn't leak app-server /
+        // MCP processes while the turn falls back to exec.
+        let handshake = async {
+            self.request(
+                "initialize",
+                initialize_params("weft", env!("CARGO_PKG_VERSION")),
+            )
+            .await?;
+            self.notify("initialized", None).await
+        }
+        .await;
+        if let Err(e) = handshake {
+            self.shutdown().await;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -338,19 +604,54 @@ impl Client {
                 Incoming::Response { id, result } => self.resolve(id, Ok(result)).await,
                 Incoming::Error { id, message, .. } => self.resolve(id, Err(message)).await,
                 Incoming::Notification { method, params } => {
-                    if let (Some(ev), Some(tid)) = (
-                        notification_to_event(&method, &params),
-                        params["threadId"].as_str().map(String::from),
-                    ) {
-                        self.route(&tid, ThreadMsg::Event(ev)).await;
+                    let tid = params["threadId"].as_str().map(String::from);
+                    if let Some(ev) = notification_to_event(&method, &params) {
+                        // A failed turn may carry its only error message on
+                        // turn/completed — surface it as text before the TurnEnd so
+                        // the row shows the real cause, not error_before_output.
+                        if method == "turn/completed" {
+                            if let Some(text) = turn_error_text(&params) {
+                                self.route_resolved(
+                                    tid.as_deref(),
+                                    ThreadMsg::Event(
+                                        crate::lead_chat::proto::ChatEvent::TextDelta { text },
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                        self.route_resolved(tid.as_deref(), ThreadMsg::Event(ev))
+                            .await;
+                    } else if method.ends_with("/outputDelta") {
+                        // A long command is still producing output; keep the turn
+                        // marked alive so the idle watchdog doesn't kill it.
+                        self.route_resolved(tid.as_deref(), ThreadMsg::Heartbeat)
+                            .await;
+                    } else if method == "serverRequest/resolved" {
+                        // The server cleared an open ask (e.g. on interrupt) — tell
+                        // the consumer to cancel the matching Needs-you card.
+                        self.route_resolved(
+                            tid.as_deref(),
+                            ThreadMsg::AskResolved { request_id: params["requestId"].clone() },
+                        )
+                        .await;
                     }
                 }
                 Incoming::ServerRequest { id, method, params } => {
+                    // Approvals route to the Ask Bridge (user decides). EVERY other
+                    // server→client request also blocks the turn until answered, but
+                    // it needs interactive content Weft can't collect (elicitation,
+                    // requestUserInput, future kinds) — decline so the turn proceeds
+                    // instead of hanging until a watchdog.
                     if is_approval_request(&method) {
-                        if let Some(tid) = params["threadId"].as_str().map(String::from) {
-                            self.route(&tid, ThreadMsg::Approval { id, method, params })
-                                .await;
-                        }
+                        let tid = params["threadId"].as_str().map(String::from);
+                        self.route_resolved(
+                            tid.as_deref(),
+                            ThreadMsg::Approval { id, method, params },
+                        )
+                        .await;
+                    } else {
+                        self.decline_server_request(&id, &method).await;
                     }
                 }
                 Incoming::Other => {}
@@ -368,10 +669,24 @@ impl Client {
         }
     }
 
-    async fn route(&self, thread_id: &str, msg: ThreadMsg) {
+    /// Route to `tid` when present (and subscribed), else — each connection is
+    /// per-session, so it owns a single thread — fall back to that sole thread.
+    /// This keeps thread-less notifications (the id sometimes lives only inside
+    /// `turn`/`item`, not at the top level) reaching the consumer.
+    async fn route_resolved(&self, tid: Option<&str>, msg: ThreadMsg) {
         if let Some(inner) = self.0.lock().await.as_mut() {
-            if let Some(tx) = inner.threads.get(thread_id) {
-                let _ = tx.send(msg);
+            let key: Option<String> = tid
+                .filter(|t| inner.threads.contains_key(*t))
+                .map(String::from)
+                .or_else(|| {
+                    (inner.threads.len() == 1)
+                        .then(|| inner.threads.keys().next().cloned())
+                        .flatten()
+                });
+            if let Some(k) = key {
+                if let Some(tx) = inner.threads.get(&k) {
+                    let _ = tx.send(msg);
+                }
             }
         }
     }
@@ -450,6 +765,15 @@ impl Client {
         }
     }
 
+    /// Forget a thread's in-flight turn (called at turn end), so a later
+    /// `active_turn` only reports a genuinely live app-server turn — letting
+    /// the interrupt path tell an app-server turn from an exec fallback.
+    pub async fn clear_active_turn(&self, thread_id: &str) {
+        if let Some(inner) = self.0.lock().await.as_mut() {
+            inner.active_turn.remove(thread_id);
+        }
+    }
+
     /// The in-flight turn id for a thread, if any.
     pub async fn active_turn(&self, thread_id: &str) -> Option<String> {
         self.0
@@ -484,16 +808,23 @@ impl Client {
             .await
             .map(|_| ())
     }
-    /// Answer an approval request. `decision` ∈ accept | acceptForSession | decline | cancel.
-    pub async fn reply_approval(&self, id: &Value, decision: &str) -> anyhow::Result<()> {
+    /// Answer a server→client request with a raw `result` payload. Each ask kind
+    /// has its own shape: approval `{decision}`, permissions `{permissions}`,
+    /// elicitation `{action}` — the caller builds the right one.
+    pub async fn reply_result(&self, id: &Value, result: Value) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
         let inner = g
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
-        let line = encode_response(id, json!({ "decision": decision }));
+        let line = encode_response(id, result);
         inner.stdin.write_all(line.as_bytes()).await?;
         inner.stdin.flush().await?;
         Ok(())
+    }
+
+    /// Answer an approval request. `decision` ∈ accept | acceptForSession | decline | cancel.
+    pub async fn reply_approval(&self, id: &Value, decision: &str) -> anyhow::Result<()> {
+        self.reply_result(id, json!({ "decision": decision })).await
     }
 }
 
@@ -568,6 +899,7 @@ mod tests {
 
     #[test]
     fn maps_streaming_notifications_to_events() {
+        // agent text streams token-by-token.
         match notification_to_event(
             "item/agentMessage/delta",
             &json!({"threadId":"t","turnId":"u","itemId":"i","delta":"He"}),
@@ -575,17 +907,71 @@ mod tests {
             Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "He"),
             e => panic!("{e:?}"),
         }
+        // commandExecution started → a running tool row with id + input (camelCase
+        // shape verified live, codex-cli 0.139.0).
         match notification_to_event(
             "item/started",
-            &json!({"item":{"id":"i","type":"commandExecution","command":"npm test"}}),
+            &json!({"item":{"id":"call_1","type":"commandExecution","command":"echo hi","cwd":"/tmp","status":"inProgress"}}),
         ) {
             Some(ChatEvent::Assistant { tools, .. }) => {
                 assert_eq!(tools[0].name, "commandExecution");
-                assert_eq!(tools[0].summary, "npm test");
-                assert!(tools[0].id.is_empty());
+                assert_eq!(tools[0].id, "call_1");
+                assert_eq!(tools[0].summary, "echo hi");
+                assert_eq!(tools[0].input["command"], "echo hi");
+                assert!(tools[0].output.is_none());
             }
             e => panic!("{e:?}"),
         }
+        // commandExecution completed → ToolResults (aggregatedOutput + exitCode).
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_1","type":"commandExecution","aggregatedOutput":"hi\n","exitCode":0,"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => {
+                assert_eq!(items[0].id, "call_1");
+                assert_eq!(items[0].output, "hi\n");
+                assert!(!items[0].is_error);
+            }
+            e => panic!("{e:?}"),
+        }
+        // fileChange completed → its diff(s) as output; non-zero exit / failed = error.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_2","type":"fileChange","changes":[{"path":"/r/x","kind":{"type":"add"},"diff":"hi\n"}],"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert_eq!(items[0].output, "hi\n"),
+            e => panic!("{e:?}"),
+        }
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_3","type":"commandExecution","aggregatedOutput":"","exitCode":1,"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert!(items[0].is_error),
+            e => panic!("{e:?}"),
+        }
+        // a declined approval completes without running → error, not complete.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"call_4","type":"commandExecution","status":"declined"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert!(items[0].is_error),
+            e => panic!("{e:?}"),
+        }
+        // thread/tokenUsage/updated → current context (last.inputTokens) + window.
+        match notification_to_event(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage":{"last":{"inputTokens":18440},"modelContextWindow":258400}}),
+        ) {
+            Some(ChatEvent::Usage {
+                context_tokens,
+                window,
+            }) => {
+                assert_eq!(context_tokens, 18440);
+                assert_eq!(window, Some(258400));
+            }
+            e => panic!("{e:?}"),
+        }
+        // error item → text; agentMessage/userMessage/reasoning + lifecycle ignored.
         match notification_to_event(
             "item/started",
             &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
@@ -593,26 +979,209 @@ mod tests {
             Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "unknown slash command"),
             e => panic!("{e:?}"),
         }
-        // agentMessage text already streamed via deltas — item/completed is a
-        // no-op to avoid double-rendering (verified against live 0.137.0).
         assert!(notification_to_event(
             "item/completed",
             &json!({"item":{"id":"i","type":"agentMessage","text":"done"}}),
         )
         .is_none());
+        assert!(
+            notification_to_event("item/started", &json!({"item":{"type":"userMessage"}}))
+                .is_none()
+        );
         assert!(matches!(
             notification_to_event("turn/completed", &json!({"turn":{"status":"completed"}})),
-            Some(ChatEvent::TurnEnd { is_error: false, .. })
+            Some(ChatEvent::TurnEnd {
+                is_error: false,
+                ..
+            })
         ));
         assert!(matches!(
             notification_to_event("turn/completed", &json!({"turn":{"status":"failed"}})),
             Some(ChatEvent::TurnEnd { is_error: true, .. })
         ));
-        // reasoning + lifecycle markers are ignored
         assert!(
             notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none()
         );
         assert!(notification_to_event("turn/started", &json!({"threadId":"t"})).is_none());
+    }
+
+    #[test]
+    fn appserver_caps_large_tool_input() {
+        // A huge MCP arguments payload must be truncated before it lands in the
+        // persisted row (cap_input collapses an oversized object to a string).
+        let big = "x".repeat(20_000);
+        match notification_to_event(
+            "item/started",
+            &json!({"item":{"id":"m","type":"mcpToolCall","tool":"t","arguments":{"blob":big}}}),
+        ) {
+            Some(ChatEvent::Assistant { tools, .. }) => {
+                let s = tools[0]
+                    .input
+                    .as_str()
+                    .expect("oversized input capped to string");
+                assert!(s.ends_with("… (truncated)"));
+                assert!(s.chars().count() < 17_000);
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_object_result_and_plan_text_render() {
+        // mcpToolCall result is an MCP result object ({content:[{text}]}) — render
+        // its text, not a blank row.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"m","type":"mcpToolCall","result":{"content":[{"type":"text","text":"task #3"}]},"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert_eq!(items[0].output, "task #3"),
+            e => panic!("{e:?}"),
+        }
+        // /plan content item carries text only on completion → surface as text.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"p","type":"plan","text":"1. x","status":"completed"}}),
+        ) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "1. x"),
+            e => panic!("{e:?}"),
+        }
+        // a payload-less plan item still opens no row and surfaces nothing.
+        assert!(notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"p","type":"plan","status":"completed"}}),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn top_level_error_notification_surfaces_text() {
+        // A turn-level failure (auth / usage-limit / context-window) arrives as a
+        // bare `error` notification — surface it so the turn doesn't end blank.
+        match notification_to_event("error", &json!({"message":"usage limit reached"})) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "usage limit reached"),
+            e => panic!("{e:?}"),
+        }
+        match notification_to_event("error", &json!({"error":{"message":"nested"}})) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "nested"),
+            e => panic!("{e:?}"),
+        }
+        // An empty error message yields nothing (turn/completed still flags error).
+        assert!(notification_to_event("error", &json!({"message":""})).is_none());
+    }
+
+    #[test]
+    fn turn_completed_error_message_is_surfaced() {
+        // A failure reported only on turn/completed carries turn.error.message.
+        assert_eq!(
+            turn_error_text(
+                &json!({"turn":{"status":"failed","error":{"message":"context window exceeded"}}})
+            )
+            .as_deref(),
+            Some("context window exceeded")
+        );
+        // A clean turn carries no error text.
+        assert!(turn_error_text(&json!({"turn":{"status":"completed"}})).is_none());
+    }
+
+    #[test]
+    fn only_real_tool_item_types_open_rows() {
+        // The tool-call item types per the 0.139.0 ThreadItem union — note the collab
+        // type is `collabAgentToolCall` (NOT the README's `collabToolCall`), and
+        // `dynamicToolCall` is a tool too.
+        for ty in [
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "collabAgentToolCall",
+            "dynamicToolCall",
+        ] {
+            assert!(
+                matches!(
+                    notification_to_event(
+                        "item/started",
+                        &json!({"item":{"id":"c","type":ty,"status":"inProgress"}}),
+                    ),
+                    Some(ChatEvent::Assistant { .. })
+                ),
+                "{ty} should open a tool row"
+            );
+        }
+        // a content/lifecycle item must NOT open an empty tool row.
+        assert!(notification_to_event(
+            "item/started",
+            &json!({"item":{"id":"c","type":"reasoning","status":"inProgress"}}),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn approval_methods_recognized() {
+        // All three approval asks (command, file-change, generic permissions) route
+        // to the Ask Bridge; ordinary notifications don't.
+        assert!(is_approval_request("item/commandExecution/requestApproval"));
+        assert!(is_approval_request("item/fileChange/requestApproval"));
+        assert!(is_approval_request("item/permissions/requestApproval"));
+        assert!(!is_approval_request("item/completed"));
+    }
+
+    #[test]
+    fn elicitation_is_not_an_approval() {
+        // Elicitation blocks the turn but is NOT an approval: it's declined in the
+        // read_loop (we can't collect its content), not routed to the Ask Bridge.
+        assert!(is_elicitation_request("mcpServer/elicitation/request"));
+        assert!(!is_approval_request("mcpServer/elicitation/request"));
+        // requestUserInput is likewise not an approval → declined generically.
+        assert!(!is_approval_request("item/tool/requestUserInput"));
+        assert!(!is_elicitation_request("item/tool/requestUserInput"));
+    }
+
+    #[test]
+    fn decline_responses_match_schema() {
+        // Verified vs the 0.139.0 app-server JSON schema.
+        assert_eq!(
+            decline_response("mcpServer/elicitation/request"),
+            Some(json!({ "action": "decline" }))
+        );
+        assert_eq!(
+            decline_response("item/tool/requestUserInput"),
+            Some(json!({ "answers": {} }))
+        );
+        // No in-protocol decline for an unknown blocking request → JSON-RPC error.
+        assert_eq!(decline_response("item/tool/call"), None);
+    }
+
+    #[test]
+    fn error_response_encodes_id_and_message() {
+        let v: Value =
+            serde_json::from_str(encode_error_response(&json!("a1"), -32601, "nope").trim())
+                .unwrap();
+        assert_eq!(v["id"], json!("a1"));
+        assert_eq!(v["error"]["code"], -32601);
+        assert_eq!(v["error"]["message"], "nope");
+        assert!(v.get("result").is_none());
+    }
+
+    #[test]
+    fn ignores_non_tool_content_items() {
+        // plan/review/todo content items must not open empty tool rows.
+        for ty in ["plan", "review", "todoList", "webSearch"] {
+            assert!(
+                notification_to_event(
+                    "item/started",
+                    &json!({"item":{"id":"x","type":ty,"status":"inProgress"}}),
+                )
+                .is_none(),
+                "{ty}"
+            );
+            assert!(
+                notification_to_event(
+                    "item/completed",
+                    &json!({"item":{"id":"x","type":ty,"status":"completed"}}),
+                )
+                .is_none(),
+                "{ty}"
+            );
+        }
     }
 
     #[test]

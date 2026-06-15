@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { X, ChevronRight, ChevronDown, RefreshCw } from "lucide-react";
 import type { SessionMeta, EnabledSkill } from "../lib/types";
@@ -28,9 +28,25 @@ export function SessionInfoPanel({
   const win = meta?.window;
   const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
 
+  // Workspace skills (`skills`) ∪ engine skills (`meta.engineSkills`), deduped by
+  // name (workspace wins).
+  const allSkills = useMemo(() => {
+    const byName = new Map<string, { name: string; description: string }>();
+    for (const s of skills) byName.set(s.name, { name: s.name, description: s.description });
+    for (const s of meta?.engineSkills ?? []) {
+      if (!byName.has(s.name)) byName.set(s.name, s);
+    }
+    return [...byName.values()];
+  }, [skills, meta?.engineSkills]);
+
+  // Collapsible skills: a long list (codex exposes dozens) would bury the MCP
+  // section, so default to expanded only when there are few; null = use default.
+  const [skillsOpen, setSkillsOpen] = useState<boolean | null>(null);
+  const skillsExpanded = skillsOpen ?? allSkills.length <= 12;
+
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
-      <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
+      <header className="flex items-center gap-2 border-b border-border px-3 py-2">
         <span className="text-[12px] font-semibold text-ink">{t("sessionInfo.title")}</span>
         {onReload && (
           <button
@@ -52,7 +68,10 @@ export function SessionInfoPanel({
         </button>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      {/* overflow-y:scroll keeps the (custom, space-taking) scrollbar track
+          permanently reserved, so expanding the skills list never changes the
+          content width — scrollbar-gutter alone wasn't reliably honored here. */}
+      <div className="min-h-0 flex-1 overflow-y-scroll">
         {/* Context */}
         <section className="border-b border-border px-4 py-3">
           <div className="flex items-center">
@@ -82,6 +101,7 @@ export function SessionInfoPanel({
             <div className="mt-1.5 truncate font-mono text-[10.5px] text-ink-faint">
               {meta.model}
               {win ? ` · ${Math.round(win / 1000)}k` : ""}
+              {meta.reasoningEffort ? ` · ${meta.reasoningEffort}` : ""}
             </div>
           )}
           {ct == null && !meta?.model && (
@@ -91,24 +111,44 @@ export function SessionInfoPanel({
 
         {/* Skills */}
         <section className="border-b border-border px-4 py-3">
-          <div className="flex items-center">
+          <button
+            type="button"
+            onClick={() => allSkills.length > 0 && setSkillsOpen(!skillsExpanded)}
+            className="flex w-full items-center"
+          >
             <span className="text-[11px] text-ink-faint">{t("sessionInfo.skills")}</span>
-            <span className="ml-auto text-[11px] text-ink-faint">{skills.length}</span>
-          </div>
-          {skills.length > 0 ? (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {skills.map((s) => (
-                <span
-                  key={s.name}
-                  title={s.description}
-                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
-                >
-                  {s.name}
-                </span>
+            <span className="ml-auto text-[11px] text-ink-faint">{allSkills.length}</span>
+            {allSkills.length > 0 &&
+              (skillsExpanded ? (
+                <ChevronDown size={13} className="ml-1 text-ink-faint" />
+              ) : (
+                <ChevronRight size={13} className="ml-1 text-ink-faint" />
               ))}
-            </div>
-          ) : (
+          </button>
+          {allSkills.length === 0 ? (
             <div className="mt-2 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
+          ) : (
+            // grid-rows 0fr→1fr animates the chip wrap open/closed without a fixed
+            // height; the inner overflow-hidden clips (margin included) mid-anim.
+            <div
+              className={`grid transition-[grid-template-rows] duration-200 ease-out ${
+                skillsExpanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
+              }`}
+            >
+              <div className="overflow-hidden">
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {allSkills.map((s) => (
+                    <span
+                      key={s.name}
+                      title={s.description}
+                      className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
+                    >
+                      {s.name}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
           )}
         </section>
 
