@@ -385,6 +385,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                   placeholder="/Users/you/code"
                   onChange={setDest}
                   onPick={() => pickInto(setDest)}
+                  disabled={busy}
                 />
               </Field>
             </>
