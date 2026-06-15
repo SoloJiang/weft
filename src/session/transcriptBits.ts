@@ -47,6 +47,19 @@ export function toolLabelKey(name: string) {
   return "session.toolCalling";
 }
 
+/** Past-tense label for a FINISHED tool row (codex-style "Ran"/"已运行"), vs the
+ *  present-continuous `toolLabelKey` the in-flight activity line uses. */
+export function toolDoneLabelKey(name: string) {
+  const n = name.toLowerCase();
+  if (/(write|edit|apply_patch|patch|file_change|filechange)/.test(n)) return "session.toolEdited";
+  if (/(read|view|cat)/.test(n)) return "session.toolRead";
+  if (/(grep|glob|rg|ripgrep|ls|find|list|search)/.test(n)) return "session.toolSearched";
+  if (/(bash|command|exec_command|shell|run)/.test(n)) return "session.toolRan";
+  if (/(bus_|broadcast|ask_human|announce|interface|inbox|status)/.test(n)) return "session.toolSynced";
+  if (/todo/.test(n)) return "session.toolOrganized";
+  return "session.toolCalled";
+}
+
 /** Squeeze a tool call's target into a compact, scannable fragment. */
 export function compactToolTarget(name: string, summary: string) {
   const raw = summary || name;

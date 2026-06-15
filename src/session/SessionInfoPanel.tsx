@@ -46,7 +46,7 @@ export function SessionInfoPanel({
 
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
-      <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
+      <header className="flex items-center gap-2 border-b border-border px-3 py-2">
         <span className="text-[12px] font-semibold text-ink">{t("sessionInfo.title")}</span>
         {onReload && (
           <button
@@ -68,7 +68,9 @@ export function SessionInfoPanel({
         </button>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      {/* scrollbar-gutter keeps the content width stable when the scrollbar
+          appears (e.g. expanding skills), so nothing reflows. */}
+      <div className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
         {/* Context */}
         <section className="border-b border-border px-4 py-3">
           <div className="flex items-center">
@@ -98,12 +100,7 @@ export function SessionInfoPanel({
             <div className="mt-1.5 truncate font-mono text-[10.5px] text-ink-faint">
               {meta.model}
               {win ? ` · ${Math.round(win / 1000)}k` : ""}
-            </div>
-          )}
-          {meta?.reasoningEffort && (
-            <div className="mt-1 flex items-center gap-1.5 text-[10.5px]">
-              <span className="text-ink-faint">{t("sessionInfo.reasoning")}</span>
-              <span className="font-mono text-ink-muted">{meta.reasoningEffort}</span>
+              {meta.reasoningEffort ? ` · ${meta.reasoningEffort}` : ""}
             </div>
           )}
           {ct == null && !meta?.model && (
@@ -130,19 +127,27 @@ export function SessionInfoPanel({
           {allSkills.length === 0 ? (
             <div className="mt-2 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
           ) : (
-            skillsExpanded && (
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                {allSkills.map((s) => (
-                  <span
-                    key={s.name}
-                    title={s.description}
-                    className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
-                  >
-                    {s.name}
-                  </span>
-                ))}
+            // grid-rows 0fr→1fr animates the chip wrap open/closed without a fixed
+            // height; the inner overflow-hidden clips (margin included) mid-anim.
+            <div
+              className={`grid transition-[grid-template-rows] duration-200 ease-out ${
+                skillsExpanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
+              }`}
+            >
+              <div className="overflow-hidden">
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {allSkills.map((s) => (
+                    <span
+                      key={s.name}
+                      title={s.description}
+                      className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
+                    >
+                      {s.name}
+                    </span>
+                  ))}
+                </div>
               </div>
-            )
+            </div>
           )}
         </section>
 

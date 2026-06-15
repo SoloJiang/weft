@@ -5,7 +5,13 @@ import { ArrowRight, Check, ChevronRight, FileText, Sparkles } from "lucide-reac
 import type { LeadMessage, ResolvedProposal } from "../lib/types";
 import { Markdown } from "../components/Markdown";
 import { cn } from "../lib/cn";
-import { cleanToolName, compactToolTarget, toolIcon, toolLabelKey } from "./transcriptBits";
+import {
+  cleanToolName,
+  compactToolTarget,
+  toolDoneLabelKey,
+  toolIcon,
+  toolLabelKey,
+} from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
 import type { useRepoActions } from "./useRepoActions";
 
@@ -291,8 +297,10 @@ function ToolRow({ m }: { m: LeadMessage }) {
   const running = m.status === "streaming";
   const isError = c.is_error === true || m.status === "error";
   const Icon = toolIcon(name);
-  const labelKey = toolLabelKey(name);
-  const label = labelKey === "session.toolCalling" ? cleanToolName(name) : t(labelKey);
+  // Finished rows read past-tense ("Ran"/"已运行"); a running row stays "Running".
+  const labelKey = running ? toolLabelKey(name) : toolDoneLabelKey(name);
+  const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
+  const label = generic ? cleanToolName(name) : t(labelKey);
   const { target } = compactToolTarget(name, summary);
   const hasDetail = inputText.length > 0 || output.length > 0;
 
