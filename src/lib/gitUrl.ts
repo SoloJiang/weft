@@ -7,10 +7,15 @@
  *   - scp-style:   user@host:org/repo(.git)   (classic `git@github.com:a/b.git`)
  */
 
-// `,` and `;` are excluded from the body so comma/semicolon-separated pastes
-// split even without surrounding whitespace (`a.git,https://…/b.git`).
-const SCHEME_URL = /\b(?:https?|ssh|git):\/\/[^\s<>"'`),;\]]+/gi;
-const SCP_URL = /\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s<>"'`),;\]]+/gi;
+// `,`/`;`/whitespace/wrappers terminate a URL body so separated pastes split.
+// `]` is allowed so bracketed IPv6 hosts (`[::1]`, `[2001:db8::1]`) survive; a
+// trailing `]` wrapper is peeled by trimUrl below.
+const SCHEME_URL = /\b(?:https?|ssh|git):\/\/[^\s<>"'`),;]+/gi;
+const SCP_URL = /\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s<>"'`),;]+/gi;
+// scp-style WITHOUT a user (`host.tld:path`, the `[<user>@]<host>:<path>` form).
+// Require a dotted host AND a `/` in the path so it doesn't swallow tokens like
+// `file.ts:42`.
+const SCP_NOUSER = /\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+:[^\s<>"'`),;]*\/[^\s<>"'`),;]+/gi;
 
 /** Strip wrapping/trailing punctuation a paste often carries around a URL. */
 function trimUrl(raw: string): string {
@@ -26,7 +31,8 @@ function trimUrl(raw: string): string {
  * `Team/App` and `team/App` are distinct repos).
  */
 function dedupKey(url: string): string {
-  const base = url.replace(/\.git$/i, "").replace(/\/+$/, "");
+  // Trim trailing slashes BEFORE `.git` so `repo.git/` and `repo` key the same.
+  const base = url.replace(/\/+$/, "").replace(/\.git$/i, "");
   const scheme = base.match(/^([a-z][a-z0-9+.-]*:\/\/[^/]*)(\/.*)?$/i);
   if (scheme) return scheme[1].toLowerCase() + (scheme[2] ?? "");
   const scp = base.match(/^([^:]*:)(.*)$/); // user@host:  +  path
@@ -46,6 +52,9 @@ export function parseGitUrls(text: string): string[] {
     matches.push({ raw: m[0], start: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
   }
   for (const m of text.matchAll(SCP_URL)) {
+    matches.push({ raw: m[0], start: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+  }
+  for (const m of text.matchAll(SCP_NOUSER)) {
     matches.push({ raw: m[0], start: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
   }
   matches.sort((a, b) => a.start - b.start);
@@ -71,8 +80,8 @@ export function repoNameFromUrl(url: string): string {
   return (
     url
       .trim()
+      .replace(/[\\/]+$/, "") // trim trailing slashes BEFORE `.git` so `repo.git/` → `repo`
       .replace(/\.git$/i, "")
-      .replace(/[\\/]+$/, "")
       .split(/[\\/:]/)
       .filter(Boolean)
       .pop() ?? ""

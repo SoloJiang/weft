@@ -226,6 +226,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
         pending.map((e) => ({ url: e.url, name: e.name })),
         dest.trim(),
         (j, status, error) => {
+          if (abortRef.current !== controller) return; // stale batch — don't touch new state
           const idx = pending[j].idx;
           setProgress((p) => ({ ...p, [idx]: { status, error } }));
           if (status === "error" && error) errors[idx] = error;
