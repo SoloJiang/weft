@@ -202,7 +202,12 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                     items: vec![appserver_tool_result(item)],
                 })
             }
-            _ => None,
+            // already streamed (agentMessage) or carries no display payload.
+            Some("agentMessage" | "userMessage" | "reasoning") | None => None,
+            // Other content items (/plan, /review …) don't stream via agentMessage
+            // deltas, so surface any text they carry instead of dropping it.
+            Some(_) => crate::lead_chat::proto::codex_content_item_text(item)
+                .map(|text| ChatEvent::TextDelta { text }),
         },
         // Top-level failure (auth / usage-limit / context-window …): surface the
         // message so the turn doesn't end blank, then turn/completed marks it error.
@@ -849,6 +854,33 @@ mod tests {
             notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none()
         );
         assert!(notification_to_event("turn/started", &json!({"threadId":"t"})).is_none());
+    }
+
+    #[test]
+    fn mcp_object_result_and_plan_text_render() {
+        // mcpToolCall result is an MCP result object ({content:[{text}]}) — render
+        // its text, not a blank row.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"m","type":"mcpToolCall","result":{"content":[{"type":"text","text":"task #3"}]},"status":"completed"}}),
+        ) {
+            Some(ChatEvent::ToolResults { items }) => assert_eq!(items[0].output, "task #3"),
+            e => panic!("{e:?}"),
+        }
+        // /plan content item carries text only on completion → surface as text.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"p","type":"plan","text":"1. x","status":"completed"}}),
+        ) {
+            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "1. x"),
+            e => panic!("{e:?}"),
+        }
+        // a payload-less plan item still opens no row and surfaces nothing.
+        assert!(notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"p","type":"plan","status":"completed"}}),
+        )
+        .is_none());
     }
 
     #[test]

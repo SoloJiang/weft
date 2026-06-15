@@ -2263,6 +2263,13 @@ fn spawn_reader(
                 "complete"
             };
             inner.interrupting = false;
+            // A per-turn process killed/crashed after a tool started but before its
+            // item.completed leaves a streaming tool row no TurnEnd ever drained —
+            // finalize it here too, so it doesn't spin forever in the timeline.
+            let eof_thread_id = inner.thread_id;
+            let orphans: Vec<(i32, serde_json::Value)> =
+                inner.tool_rows.drain().map(|(_, v)| v).collect();
+            finalize_orphan_tool_rows(&app, &db, eof_thread_id, orphans, status).await;
             // A turn that produced ZERO events died on startup (auth, bad args,
             // session lock …) — surface it instead of completing silently.
             if !saw_event && status == "complete" {

@@ -170,6 +170,13 @@ fn parse_codex(line: &str) -> ChatEvent {
                         }
                     }
                 }
+                // Other content items (/plan, /review …) carry their text only on
+                // completion (exec has no deltas) — surface it so it isn't dropped;
+                // the running half and payload-less items stay Other (no empty row).
+                _ if completed => match codex_content_item_text(item) {
+                    Some(text) => ChatEvent::Assistant { texts: vec![text], tools: vec![] },
+                    None => ChatEvent::Other,
+                },
                 _ => ChatEvent::Other,
             }
         }
@@ -185,6 +192,16 @@ fn parse_codex(line: &str) -> ChatEvent {
         },
         _ => ChatEvent::Other,
     }
+}
+
+/// Display text of a non-tool content item (/plan, /review …): the first
+/// non-empty string field it carries, or None when there's nothing to show.
+/// Shared by the exec and app-server dialects (same field names).
+pub(crate) fn codex_content_item_text(item: &Value) -> Option<String> {
+    ["text", "review", "plan", "message"].iter().find_map(|k| {
+        let s = item[*k].as_str()?.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    })
 }
 
 /// Running `ToolCall` from a codex `item.started` tool item; `output` filled
@@ -248,11 +265,36 @@ fn codex_tool_summary(item: &Value) -> String {
 /// Output text for the expanded row: command stdout / mcp result, or — for a
 /// file_change (no inline diff) — a `kind  path` line per change.
 fn codex_item_output(item: &Value) -> String {
-    if let Some(s) = ["aggregated_output", "unified_diff", "diff", "output", "result"]
+    // command stdout / inline diff are plain strings.
+    if let Some(s) = ["aggregated_output", "unified_diff", "diff"]
         .iter()
         .find_map(|k| item[k].as_str())
     {
         return s.to_string();
+    }
+    // mcp_tool_call output/result: a string, an MCP result object
+    // (`{content:[{text}]}` — what weft's bus/planner tools return), or another
+    // JSON value. Render the text where possible, else serialize so the row
+    // isn't blank when the tool actually returned data.
+    for key in ["output", "result", "error"] {
+        let v = &item[key];
+        if v.is_null() {
+            continue;
+        }
+        if let Some(s) = v.as_str() {
+            return s.to_string();
+        }
+        if let Some(content) = v["content"].as_array() {
+            let text = content
+                .iter()
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        return v.to_string();
     }
     if let Some(changes) = item["changes"].as_array() {
         return changes
@@ -867,6 +909,51 @@ mod tests {
                 e => panic!("{status}: {e:?}"),
             }
         }
+    }
+
+    #[test]
+    fn codex_mcp_object_result_is_serialized() {
+        // Weft's MCP tools return result objects ({content:[{text}]}); the exec row
+        // must render that text (or serialize), not complete with empty output.
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"m","type":"mcp_tool_call","tool":"weft_planner__get_task","result":{"content":[{"type":"text","text":"task #3"}]},"status":"completed"}}"#,
+        ) {
+            ChatEvent::ToolResults { items } => assert_eq!(items[0].output, "task #3"),
+            e => panic!("{e:?}"),
+        }
+        // a non-content object result is serialized rather than dropped.
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"m2","type":"mcp_tool_call","tool":"x","result":{"ok":true},"status":"completed"}}"#,
+        ) {
+            ChatEvent::ToolResults { items } => assert_eq!(items[0].output, r#"{"ok":true}"#),
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_plan_item_surfaces_its_text() {
+        // /plan and /review content items carry text only on completion (no deltas);
+        // surface it as assistant text rather than dropping it.
+        match parse_line_for(
+            "codex",
+            r#"{"type":"item.completed","item":{"id":"p","type":"plan","text":"1. do x\n2. do y","status":"completed"}}"#,
+        ) {
+            ChatEvent::Assistant { texts, tools } => {
+                assert_eq!(texts, vec!["1. do x\n2. do y".to_string()]);
+                assert!(tools.is_empty());
+            }
+            e => panic!("{e:?}"),
+        }
+        // the running half (started) opens no row.
+        assert!(matches!(
+            parse_line_for(
+                "codex",
+                r#"{"type":"item.started","item":{"id":"p","type":"plan","status":"in_progress"}}"#,
+            ),
+            ChatEvent::Other
+        ));
     }
 
     #[test]
