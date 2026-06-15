@@ -436,6 +436,18 @@ function isLastAssistant(m: LeadMessage, all: LeadMessage[]): boolean {
   return false;
 }
 
+// One settled card: a muted, non-interactive one-line summary. Shared by the
+// proposal / action_card collapse and the permission/question settled-trail
+// rows so a resolved interaction reads the same wherever it lands.
+function SettledLine({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-[12px] text-ink-muted">
+      <Check size={13} className="shrink-0 text-ink-faint" />
+      <span className="truncate">{label}</span>
+    </div>
+  );
+}
+
 // The live plan binds to the MOST RECENT proposal row only: a re-propose
 // replaces the stored plan, so older proposal cards are already settled.
 function isLatestProposal(m: LeadMessage, all: LeadMessage[]): boolean {
@@ -482,12 +494,7 @@ function TimelineRow({
     // settled one-line summary — the loop is closed and it can't re-fire.
     const resolvedName = actionsResolved?.[m.id];
     if (resolvedName) {
-      return (
-        <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-[12px] text-ink-muted">
-          <Check size={13} className="shrink-0 text-ink-faint" />
-          <span className="truncate">{t("actionCard.resolved", { name: resolvedName })}</span>
-        </div>
-      );
+      return <SettledLine label={t("actionCard.resolved", { name: resolvedName })} />;
     }
     const parsed = safeParseObj(m.content);
     const title = typeof parsed.title === "string" ? parsed.title : "";
@@ -531,6 +538,31 @@ function TimelineRow({
     );
   }
 
+  if (m.kind === "settled") {
+    // Durable trail left when a permission/question card was answered — the
+    // interactive card itself vanished from its dock; this is its closed record.
+    const v = safeParseObj(m.content);
+    const variant = typeof v.variant === "string" ? v.variant : "";
+    if (variant === "permission") {
+      const summary = typeof v.summary === "string" ? v.summary : "";
+      const answer = typeof v.answer === "string" ? v.answer : "allow";
+      const key =
+        answer === "deny"
+          ? "settled.permissionDeny"
+          : answer === "always"
+            ? "settled.permissionAlways"
+            : answer === "full"
+              ? "settled.permissionFull"
+              : "settled.permissionAllow";
+      return <SettledLine label={t(key, { summary })} />;
+    }
+    if (variant === "ask") {
+      const text = typeof v.text === "string" ? v.text : "";
+      return <SettledLine label={t("settled.askAnswered", { text })} />;
+    }
+    return null;
+  }
+
   if (m.kind === "command") {
     const command = typeof c.command === "string" ? c.command : "";
     const args = typeof c.args === "string" ? c.args.trim() : "";
@@ -557,15 +589,18 @@ function TimelineRow({
     // superseded by a re-propose, or replayed in a worker host with no live
     // plan), it collapses to a settled one-line summary so the interaction
     // closes the loop instead of looping back into the review flow.
+    // Guard on thread identity: selectThread sets activeThreadId before the
+    // getProposal fetch resolves, so `proposal` can briefly belong to the
+    // previously-open thread. Without this match a stale proposed plan could
+    // re-open a settled card on the new thread (confirmProposal would then act
+    // on the wrong plan).
     const open =
-      isLatestProposal(m, all) && proposal != null && proposal.status === "proposed";
+      isLatestProposal(m, all) &&
+      proposal != null &&
+      proposal.thread_id === m.thread_id &&
+      proposal.status === "proposed";
     if (!open) {
-      return (
-        <div className="flex items-center gap-2 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2 text-[12px] text-ink-muted">
-          <Check size={13} className="shrink-0 text-ink-faint" />
-          <span className="truncate">{t("lead.proposalResolved", { count })}</span>
-        </div>
-      );
+      return <SettledLine label={t("lead.proposalResolved", { count })} />;
     }
     return (
       <button

@@ -173,7 +173,8 @@ export interface LeadMessage {
     | "approval"
     | "worker_event"
     | "meta"
-    | "action_card";
+    | "action_card"
+    | "settled";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";

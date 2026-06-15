@@ -584,15 +584,56 @@ pub async fn deny_write_trigger(
     Ok(())
 }
 
-/// Answer an open ask; the reply lands in the asking direction's bus inbox.
+/// Append a settled "card resolved" row to a thread's lead console and push it
+/// live, so an answered permission / question leaves a durable one-line trace in
+/// the transcript instead of just vanishing. Best-effort: a failed insert or a
+/// missing app handle never blocks the answer itself.
+async fn append_settled(db: &Db, thread_id: i32, content: String) {
+    let turn = repo::next_turn_id(db, thread_id)
+        .await
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1);
+    let Ok(m) = repo::insert_lead_message(
+        db, thread_id, None, turn, "system", "settled", &content, "complete",
+    )
+    .await
+    else {
+        return;
+    };
+    if let Some(app) = crate::APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = app.emit(
+            crate::lead_chat::engine::EVENT,
+            crate::lead_chat::engine::Push::Message {
+                thread_id,
+                message: m,
+            },
+        );
+    }
+}
+
+/// Answer an open ask; the reply lands in the asking direction's bus inbox, and
+/// a settled-trail row records the resolved question in the lead console.
 #[tauri::command]
-pub fn answer_ask(
+pub async fn answer_ask(
+    db: State<'_, Db>,
     bus: tauri::State<'_, crate::bus::BusRegistry>,
     thread_id: i32,
     ask_id: u64,
     text: String,
 ) -> R<()> {
+    let question = bus
+        .open_asks(thread_id)
+        .into_iter()
+        .find(|a| a.id == ask_id)
+        .map(|a| a.text);
     if bus.answer_ask(thread_id, ask_id, &text) {
+        if let Some(q) = question {
+            let content = serde_json::json!({ "variant": "ask", "text": q, "answer": text })
+                .to_string();
+            append_settled(&db, thread_id, content).await;
+        }
         Ok(())
     } else {
         Err("that question was already answered or no longer exists".into())
@@ -935,13 +976,24 @@ pub async fn workspace_needs_counts(
 /// Answer a pending permission Ask. `answer` is allow | deny | always | full —
 /// always remembers this action for the task, full grants it full access.
 #[tauri::command]
-pub fn answer_permission(
+pub async fn answer_permission(
+    db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     ask_id: u64,
     answer: String,
 ) -> R<()> {
     let a = crate::ask::Answer::parse(&answer).ok_or("unknown answer")?;
+    let target = asks.get(ask_id);
     if asks.answer(ask_id, a) {
+        if let Some(ask) = target {
+            let content = serde_json::json!({
+                "variant": "permission",
+                "summary": ask.summary,
+                "answer": a.as_str(),
+            })
+            .to_string();
+            append_settled(&db, ask.thread, content).await;
+        }
         Ok(())
     } else {
         Err("that request was already answered or has expired".into())

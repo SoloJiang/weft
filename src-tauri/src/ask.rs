@@ -292,6 +292,18 @@ impl AskRegistry {
         }
     }
 
+    /// A snapshot of one still-open Ask by id (for the settled-trail row the
+    /// answer command records). None once it has been answered or cancelled.
+    pub fn get(&self, id: u64) -> Option<Ask> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+    }
+
     /// All Asks across threads (for the workspace-wide Needs-you surface).
     pub fn open(&self) -> Vec<Ask> {
         self.inner
@@ -323,6 +335,19 @@ mod tests {
         for a in [Answer::Allow, Answer::Deny, Answer::Always, Answer::Full] {
             assert_eq!(Answer::parse(a.as_str()), Some(a));
         }
+    }
+
+    #[tokio::test]
+    async fn get_snapshots_open_ask_then_clears_on_answer() {
+        let r = AskRegistry::new();
+        let (id, _rx) = r.request(7, "10", "claude", "Run: npm test", "npm test");
+        // The answer command reads the ask here to build its settled-trail row.
+        let snap = r.get(id).expect("open ask is snapshot-able");
+        assert_eq!(snap.thread, 7);
+        assert_eq!(snap.summary, "Run: npm test");
+        assert!(r.answer(id, Answer::Allow));
+        // Once resolved there is nothing left to record.
+        assert!(r.get(id).is_none());
     }
 
     #[tokio::test]

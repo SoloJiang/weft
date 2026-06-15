@@ -666,6 +666,13 @@ export const en = {
     readOnlyHint: "This card belongs to an older turn.",
     resolved: "Added {{name}}",
   },
+  settled: {
+    permissionAllow: "Approved · {{summary}}",
+    permissionDeny: "Denied · {{summary}}",
+    permissionAlways: "Always allowed · {{summary}}",
+    permissionFull: "Full access granted · {{summary}}",
+    askAnswered: "Answered · {{text}}",
+  },
   repoActions: {
     chooseDir: "Choose a folder",
     chooseParentDir: "Choose a parent folder",

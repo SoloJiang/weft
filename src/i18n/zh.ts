@@ -644,6 +644,13 @@ export const zh = {
     readOnlyHint: "这张卡片属于较早的轮次。",
     resolved: "已添加 {{name}}",
   },
+  settled: {
+    permissionAllow: "已批准 · {{summary}}",
+    permissionDeny: "已拒绝 · {{summary}}",
+    permissionAlways: "已始终允许 · {{summary}}",
+    permissionFull: "已授予完全访问 · {{summary}}",
+    askAnswered: "已回答 · {{text}}",
+  },
   repoActions: {
     chooseDir: "选择目录",
     chooseParentDir: "选择父目录",
