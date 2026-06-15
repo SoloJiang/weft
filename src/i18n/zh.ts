@@ -218,6 +218,8 @@ export const zh = {
     takeOverTerminal: "在终端接管",
     takeOverTip: "停下引擎并复制接管命令，在你自己的终端继续这段会话",
     takeOverCopied: "接管命令已复制，去你的终端粘贴运行",
+    copyMessage: "复制",
+    copied: "已复制",
   },
   scope: {
     addReposFirst: "请先往这个工作区添加仓库。",
@@ -436,7 +438,7 @@ export const zh = {
     newThreadTitle: "新建 issue",
     newThreadDesc: "一个 issue 就是一条跨仓库推进的工作主线。",
     threadTitle: "标题",
-    threadTitlePlaceholder: "在结算流程加优惠码",
+    threadTitlePlaceholder: "issue 名称",
     threadType: "类型",
     threadTypePlaceholder: "选择类型",
     createThread: "创建 issue",

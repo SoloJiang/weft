@@ -223,6 +223,8 @@ export const en = {
     takeOverTerminal: "Take over in terminal",
     takeOverTip: "Stop the engine and copy the command to continue this session in your own terminal",
     takeOverCopied: "Takeover command copied — paste it in your terminal",
+    copyMessage: "Copy",
+    copied: "Copied",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",
@@ -451,7 +453,7 @@ export const en = {
     newThreadTitle: "New issue",
     newThreadDesc: "An issue is one work line, split across repos.",
     threadTitle: "Title",
-    threadTitlePlaceholder: "Add a discount code to checkout",
+    threadTitlePlaceholder: "Issue name",
     threadType: "Type",
     threadTypePlaceholder: "Choose type",
     createThread: "Create issue",
