@@ -43,7 +43,7 @@ type Translate = (key: string, opts?: Record<string, unknown>) => string;
 
 export function useRepoActions() {
   const { t } = useTranslation();
-  const { activeWorkspaceId, refreshReposAndMap, markActionCardResolved } = useStore();
+  const { activeWorkspaceId, refreshReposAndMap } = useStore();
   const [busy, setBusy] = useState<Record<string, boolean>>({});
 
   const setBusyFor = useCallback((id: string, v: boolean) => {
@@ -90,7 +90,13 @@ export function useRepoActions() {
         const result = await dispatch(inv, wsId, t as Translate);
         if (result.status === "ok") {
           if (inv.ctx.messageId != null) {
-            markActionCardResolved(inv.ctx.messageId, result.name);
+            // Persist the card's settled state so it survives reload (no
+            // re-click double-add). Best-effort: the repo is already registered.
+            try {
+              await api.resolveActionCard(inv.ctx.messageId, result.name);
+            } catch (err) {
+              console.warn("[weft] action-card resolve persist failed", err);
+            }
           }
           toast(t("repoActions.addedToast", { name: result.name }));
           try {
@@ -106,7 +112,7 @@ export function useRepoActions() {
         setBusyFor(inv.actionId, false);
       }
     },
-    [maybePost, markActionCardResolved, refreshReposAndMap, resolveWorkspaceId, setBusyFor, t],
+    [maybePost, refreshReposAndMap, resolveWorkspaceId, setBusyFor, t],
   );
 
   return { run, busy };

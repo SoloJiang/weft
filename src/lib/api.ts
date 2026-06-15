@@ -58,6 +58,8 @@ export const api = {
     invoke<RepoRef>("create_repo", { workspaceId, name, dest }),
   postLeadToolResult: (threadId: number, payload: unknown, lang: string) =>
     invoke<void>("post_lead_tool_result", { threadId, payload, lang }),
+  resolveActionCard: (messageId: number, name: string) =>
+    invoke<void>("resolve_action_card", { messageId, name }),
 
   // Repo map (curator): profiles + cross-repo dependency graph.
   repoGraph: (workspaceId: number) =>

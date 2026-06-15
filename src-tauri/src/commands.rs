@@ -584,18 +584,32 @@ pub async fn deny_write_trigger(
     Ok(())
 }
 
-/// Append a settled "card resolved" row to a thread's lead console and push it
-/// live, so an answered permission / question leaves a durable one-line trace in
-/// the transcript instead of just vanishing. Best-effort: a failed insert or a
-/// missing app handle never blocks the answer itself.
-async fn append_settled(db: &Db, thread_id: i32, content: String) {
+/// Resolve an asking direction id (as carried on an Ask) to its latest worker
+/// session, so a settled-trail row lands in the transcript where the human
+/// actually answered. Returns None for a lead/planning ask (dir "" or non-
+/// numeric) → the row goes to the lead console (session_id NULL).
+async fn session_for_dir(db: &Db, dir: &str) -> Option<i32> {
+    let dir_id: i32 = dir.parse().ok()?;
+    repo::latest_session_for_direction(db, dir_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.id)
+}
+
+/// Append a settled "card resolved" row to a transcript and push it live, so an
+/// answered permission / question leaves a durable one-line trace instead of
+/// just vanishing. `session_id` routes it to the asking worker's chat (Some) or
+/// the lead console (None). Best-effort: a failed insert or a missing app handle
+/// never blocks the answer itself.
+async fn append_settled(db: &Db, thread_id: i32, session_id: Option<i32>, content: String) {
     let turn = repo::next_turn_id(db, thread_id)
         .await
         .unwrap_or(1)
         .saturating_sub(1)
         .max(1);
     let Ok(m) = repo::insert_lead_message(
-        db, thread_id, None, turn, "system", "settled", &content, "complete",
+        db, thread_id, session_id, turn, "system", "settled", &content, "complete",
     )
     .await
     else {
@@ -613,8 +627,32 @@ async fn append_settled(db: &Db, thread_id: i32, content: String) {
     }
 }
 
+/// Mark a lead action_card as resolved once its repo flow succeeded, persisting
+/// the settled state into the row so it survives reload (no re-click double-add).
+#[tauri::command]
+pub async fn resolve_action_card(db: State<'_, Db>, message_id: i32, name: String) -> R<()> {
+    if let Some(m) = repo::resolve_action_card(&db, message_id, &name)
+        .await
+        .map_err(e)?
+    {
+        if let Some(app) = crate::APP_HANDLE.get() {
+            use tauri::Emitter;
+            let _ = app.emit(
+                crate::lead_chat::engine::EVENT,
+                crate::lead_chat::engine::Push::ToolResult {
+                    thread_id: m.thread_id,
+                    message_id: m.id,
+                    content: m.content,
+                    status: m.status,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Answer an open ask; the reply lands in the asking direction's bus inbox, and
-/// a settled-trail row records the resolved question in the lead console.
+/// a settled-trail row records the resolved question in that worker's transcript.
 #[tauri::command]
 pub async fn answer_ask(
     db: State<'_, Db>,
@@ -623,16 +661,16 @@ pub async fn answer_ask(
     ask_id: u64,
     text: String,
 ) -> R<()> {
-    let question = bus
+    let asked = bus
         .open_asks(thread_id)
         .into_iter()
-        .find(|a| a.id == ask_id)
-        .map(|a| a.text);
+        .find(|a| a.id == ask_id);
     if bus.answer_ask(thread_id, ask_id, &text) {
-        if let Some(q) = question {
-            let content = serde_json::json!({ "variant": "ask", "text": q, "answer": text })
+        if let Some(ask) = asked {
+            let session_id = session_for_dir(&db, &ask.from).await;
+            let content = serde_json::json!({ "variant": "ask", "text": ask.text, "answer": text })
                 .to_string();
-            append_settled(&db, thread_id, content).await;
+            append_settled(&db, thread_id, session_id, content).await;
         }
         Ok(())
     } else {
@@ -986,13 +1024,14 @@ pub async fn answer_permission(
     let target = asks.get(ask_id);
     if asks.answer(ask_id, a) {
         if let Some(ask) = target {
+            let session_id = session_for_dir(&db, &ask.dir).await;
             let content = serde_json::json!({
                 "variant": "permission",
                 "summary": ask.summary,
                 "answer": a.as_str(),
             })
             .to_string();
-            append_settled(&db, ask.thread, content).await;
+            append_settled(&db, ask.thread, session_id, content).await;
         }
         Ok(())
     } else {

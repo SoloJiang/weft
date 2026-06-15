@@ -194,6 +194,7 @@ pub fn run() {
             commands::pending_asks,
             commands::workspace_needs_counts,
             commands::answer_permission,
+            commands::resolve_action_card,
             commands::set_dangerous_mode,
             commands::set_keep_awake,
             commands::db_encryption_status,

@@ -31,7 +31,6 @@ export function ChatTimeline({
   proposal,
   runAction,
   actionsBusy,
-  actionsResolved,
   threadId,
   workspaceId,
   promptText,
@@ -49,9 +48,6 @@ export function ChatTimeline({
   /** Lead-only: dispatch a repo action card. Omit → cards render read-only. */
   runAction?: RunAction;
   actionsBusy?: Record<string, boolean>;
-  /** action_card message id → onboarded repo name, once its flow succeeded.
-   *  Collapses the card to a settled summary. */
-  actionsResolved?: Record<number, string>;
   threadId?: number | null;
   workspaceId?: number | null;
   promptText?: (title: string, placeholder?: string) => Promise<string | null>;
@@ -132,7 +128,6 @@ export function ChatTimeline({
               proposal={proposal ?? null}
               runAction={runAction}
               actionsBusy={actionsBusy}
-              actionsResolved={actionsResolved}
               threadId={threadId ?? null}
               workspaceId={workspaceId ?? null}
               promptText={promptText}
@@ -464,7 +459,6 @@ function TimelineRow({
   proposal,
   runAction,
   actionsBusy,
-  actionsResolved,
   threadId,
   workspaceId,
   promptText,
@@ -475,7 +469,6 @@ function TimelineRow({
   onReviewProposal: () => void;
   proposal: ResolvedProposal | null;
   runAction?: RunAction;
-  actionsResolved?: Record<number, string>;
   actionsBusy?: Record<string, boolean>;
   threadId: number | null;
   workspaceId: number | null;
@@ -490,13 +483,13 @@ function TimelineRow({
   }
 
   if (m.kind === "action_card") {
-    // Resolved this session: its repo flow succeeded, so the card collapses to a
-    // settled one-line summary — the loop is closed and it can't re-fire.
-    const resolvedName = actionsResolved?.[m.id];
-    if (resolvedName) {
-      return <SettledLine label={t("actionCard.resolved", { name: resolvedName })} />;
-    }
     const parsed = safeParseObj(m.content);
+    // Resolved (persisted into the row once its repo flow succeeded): collapse to
+    // a settled one-line summary — the loop is closed and it can't re-fire, even
+    // after a reload.
+    if (typeof parsed.resolved === "string" && parsed.resolved) {
+      return <SettledLine label={t("actionCard.resolved", { name: parsed.resolved })} />;
+    }
     const title = typeof parsed.title === "string" ? parsed.title : "";
     const body = typeof parsed.body === "string" ? parsed.body : undefined;
     // runtime-checked sentinel payload from the lead — schema enforced by

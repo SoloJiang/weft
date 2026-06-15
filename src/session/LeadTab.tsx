@@ -53,7 +53,6 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     interruptLead,
     setReviewingProposal,
     proposal,
-    actionCardOutcomes,
     asks,
     skillsDirtyAt,
     markSkillsDirty,
@@ -190,7 +189,6 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
           proposal={proposal}
           runAction={run}
           actionsBusy={actionsBusy}
-          actionsResolved={actionCardOutcomes}
           threadId={activeThreadId}
           workspaceId={activeWorkspaceId}
           promptText={promptText}
