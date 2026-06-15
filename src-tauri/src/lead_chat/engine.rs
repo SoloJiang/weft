@@ -1621,13 +1621,17 @@ async fn codex_consumer(
                 };
                 let allow = matches!(decision, crate::ask::Decision::Allow);
                 let result = if is_perm {
-                    // Answered with the GRANTED permissions (omitted = denied): echo
-                    // the requested set on allow, none on deny — a `{decision}` reply
-                    // would silently no-op an approved permission.
+                    // Answered with the granted permissions, NOT a decision (a
+                    // `{decision}` reply silently no-ops the grant). `permissions` is
+                    // a GrantedPermissionProfile OBJECT `{fileSystem?,network?}` —
+                    // identical shape to the requested RequestPermissionProfile, so
+                    // echo it to grant on allow; an empty OBJECT grants nothing on
+                    // deny (an array would fail schema validation). Verified against
+                    // the codex 0.139.0 app-server JSON schema.
                     let granted = if allow {
-                        requested.unwrap_or_else(|| serde_json::json!([]))
+                        requested.unwrap_or_else(|| serde_json::json!({}))
                     } else {
-                        serde_json::json!([])
+                        serde_json::json!({})
                     };
                     serde_json::json!({ "permissions": granted })
                 } else {

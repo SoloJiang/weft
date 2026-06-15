@@ -156,10 +156,10 @@ fn parse_codex(line: &str) -> ChatEvent {
                 },
                 Some("reasoning") => ChatEvent::Other,
                 // Real tool items → rows (started: running; completed: result,
-                // merged by item id). plan/review/other content items are ignored
-                // so they don't render as empty tool rows. collab_tool_call =
-                // spawn_agent/send_input/wait delegation.
-                Some("command_execution" | "file_change" | "mcp_tool_call" | "collab_tool_call") => {
+                // merged by item id). plan/other content items are ignored so they
+                // don't render as empty tool rows. (Item types verified against the
+                // codex 0.139.0 app-server JSON schema; no collab tool type exists.)
+                Some("command_execution" | "file_change" | "mcp_tool_call") => {
                     if completed {
                         ChatEvent::ToolResults {
                             items: vec![codex_tool_result(item)],

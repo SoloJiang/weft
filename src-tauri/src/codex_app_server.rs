@@ -179,6 +179,20 @@ pub fn is_approval_request(method: &str) -> bool {
     )
 }
 
+/// The in-protocol decline `result` for a non-approval server request, or `None`
+/// when it should get a JSON-RPC error instead. Shapes verified against the codex
+/// 0.139.0 app-server JSON schema: elicitation → `{action:"decline"}` (we can't
+/// collect its `content`); requestUserInput → `{answers:{}}` (no answers).
+pub fn decline_response(method: &str) -> Option<Value> {
+    if is_elicitation_request(method) {
+        Some(json!({ "action": "decline" }))
+    } else if method == "item/tool/requestUserInput" {
+        Some(json!({ "answers": {} }))
+    } else {
+        None
+    }
+}
+
 /// A blocking MCP elicitation (`mcpServer/elicitation/request`): a configured MCP
 /// server asking the user for STRUCTURED input. Weft has no UI to collect that
 /// content, so it's declined (`{action:"decline"}`) rather than routed to a
@@ -207,21 +221,19 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             Some("error") => Some(ChatEvent::TextDelta {
                 text: crate::lead_chat::proto::error_text_from_item(item),
             }),
-            // Only real tool items open a row; agentMessage/reasoning/plan/review/
-            // other content items are ignored so they don't show as empty rows.
-            // collabToolCall = spawn_agent/send_input/wait delegation.
-            Some("commandExecution" | "fileChange" | "mcpToolCall" | "collabToolCall") => {
-                Some(ChatEvent::Assistant {
-                    texts: vec![],
-                    tools: vec![appserver_tool_call(item)],
-                })
-            }
+            // Only real tool items open a row; agentMessage/reasoning/plan/webSearch
+            // /other content items are ignored so they don't show as empty rows.
+            // (Item types verified against the codex 0.139.0 app-server JSON schema.)
+            Some("commandExecution" | "fileChange" | "mcpToolCall") => Some(ChatEvent::Assistant {
+                texts: vec![],
+                tools: vec![appserver_tool_call(item)],
+            }),
             _ => None,
         },
         // agentMessage text already streamed via deltas → no-op; tool items deliver
         // their result here, merged into the running row by item id.
         "item/completed" => match item["type"].as_str() {
-            Some("commandExecution" | "fileChange" | "mcpToolCall" | "collabToolCall") => {
+            Some("commandExecution" | "fileChange" | "mcpToolCall") => {
                 Some(ChatEvent::ToolResults {
                     items: vec![appserver_tool_result(item)],
                 })
@@ -476,18 +488,21 @@ impl Client {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// Decline a non-approval server request so the turn doesn't hang: elicitation
-    /// gets the README's `{action:"decline"}` (we can't collect its content), any
-    /// other unsupported blocking request gets a JSON-RPC error reply.
+    /// Decline a non-approval server request so the turn doesn't hang, using the
+    /// `decline_response` shape (or a JSON-RPC error when there's no in-protocol
+    /// decline).
     async fn decline_server_request(&self, id: &Value, method: &str) {
-        if is_elicitation_request(method) {
-            let _ = self.reply_result(id, json!({ "action": "decline" })).await;
-        } else {
-            let mut g = self.0.lock().await;
-            if let Some(inner) = g.as_mut() {
-                let line = encode_error_response(id, -32601, "unsupported request");
-                let _ = inner.stdin.write_all(line.as_bytes()).await;
-                let _ = inner.stdin.flush().await;
+        match decline_response(method) {
+            Some(result) => {
+                let _ = self.reply_result(id, result).await;
+            }
+            None => {
+                let mut g = self.0.lock().await;
+                if let Some(inner) = g.as_mut() {
+                    let line = encode_error_response(id, -32601, "unsupported request");
+                    let _ = inner.stdin.write_all(line.as_bytes()).await;
+                    let _ = inner.stdin.flush().await;
+                }
             }
         }
     }
@@ -1044,25 +1059,24 @@ mod tests {
     }
 
     #[test]
-    fn collab_tool_call_renders_as_tool_row() {
-        // spawn_agent/send_input/wait delegation must open + close a tool row.
-        match notification_to_event(
+    fn only_real_tool_item_types_open_rows() {
+        // Tool item types are exactly commandExecution / fileChange / mcpToolCall
+        // (verified vs the 0.139.0 schema — there is NO collabToolCall). An unknown
+        // type must not open an empty tool row.
+        for ty in ["commandExecution", "fileChange", "mcpToolCall"] {
+            assert!(matches!(
+                notification_to_event(
+                    "item/started",
+                    &json!({"item":{"id":"c","type":ty,"status":"inProgress"}}),
+                ),
+                Some(ChatEvent::Assistant { .. })
+            ), "{ty} should open a tool row");
+        }
+        assert!(notification_to_event(
             "item/started",
-            &json!({"item":{"id":"c","type":"collabToolCall","tool":"spawn_agent","status":"inProgress"}}),
-        ) {
-            Some(ChatEvent::Assistant { tools, .. }) => {
-                assert_eq!(tools[0].id, "c");
-                assert_eq!(tools[0].name, "collabToolCall");
-            }
-            e => panic!("{e:?}"),
-        }
-        match notification_to_event(
-            "item/completed",
-            &json!({"item":{"id":"c","type":"collabToolCall","status":"completed"}}),
-        ) {
-            Some(ChatEvent::ToolResults { items }) => assert_eq!(items[0].id, "c"),
-            e => panic!("{e:?}"),
-        }
+            &json!({"item":{"id":"c","type":"collabToolCall","status":"inProgress"}}),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1084,6 +1098,21 @@ mod tests {
         // requestUserInput is likewise not an approval → declined generically.
         assert!(!is_approval_request("item/tool/requestUserInput"));
         assert!(!is_elicitation_request("item/tool/requestUserInput"));
+    }
+
+    #[test]
+    fn decline_responses_match_schema() {
+        // Verified vs the 0.139.0 app-server JSON schema.
+        assert_eq!(
+            decline_response("mcpServer/elicitation/request"),
+            Some(json!({ "action": "decline" }))
+        );
+        assert_eq!(
+            decline_response("item/tool/requestUserInput"),
+            Some(json!({ "answers": {} }))
+        );
+        // No in-protocol decline for an unknown blocking request → JSON-RPC error.
+        assert_eq!(decline_response("item/tool/call"), None);
     }
 
     #[test]
