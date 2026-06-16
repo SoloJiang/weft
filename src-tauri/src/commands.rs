@@ -77,7 +77,11 @@ async fn register_repo(
     // default base ref = current branch of the repo
     let base = crate::git::current_branch(p).unwrap_or_else(|_| "main".into());
     // Captured for workspace-level dedup; empty for a local repo with no origin.
-    let remote = crate::git::remote_url(p).unwrap_or_default();
+    // Credentials embedded in an HTTPS remote are redacted so a PAT/password from
+    // .git/config never lands in Weft's DB/backups.
+    let remote = crate::git::remote_url(p)
+        .map(|r| crate::git::redact_remote(&r))
+        .unwrap_or_default();
     // Backfill remotes for repos added before the `remote_url` column existed, so
     // the remote-dedup below can catch a second clone of an already-present origin
     // on upgraded databases. Best-effort, cheap (a handful of repos per workspace).
@@ -85,7 +89,7 @@ async fn register_repo(
         if existing.remote_url.is_empty() {
             if let Some(rem) = crate::git::remote_url(std::path::Path::new(&existing.local_git_path))
             {
-                let _ = repo::set_repo_remote(db, existing.id, &rem).await;
+                let _ = repo::set_repo_remote(db, existing.id, &crate::git::redact_remote(&rem)).await;
             }
         }
     }
@@ -205,7 +209,12 @@ pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<(
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]
 pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
-    repo::ensure_curator_thread(&db, workspace_id).await.map_err(e)
+    // Stamp the curator thread with the user's configured default tool so the
+    // calibration chat is usable for codex/opencode users (not hard-coded claude).
+    let tool = crate::tools::default_tool(&db).await;
+    repo::ensure_curator_thread(&db, workspace_id, &tool)
+        .await
+        .map_err(e)
 }
 
 /// Remove a repo from its workspace: delete Weft's reference, the repo's

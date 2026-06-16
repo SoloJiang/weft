@@ -538,6 +538,24 @@ pub fn remote_url(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Strip credentials from a remote URL before persisting it. For a scheme URL
+/// (`scheme://[user[:pass]@]host/…`) the entire authority userinfo is dropped, so
+/// an embedded password/PAT from `.git/config` never lands in Weft's DB/backups.
+/// scp-style `[user@]host:path` is left as-is (its user is an SSH login, not a
+/// secret). Only the authority is touched — an `@` later in the path survives.
+pub fn redact_remote(url: &str) -> String {
+    let s = url.trim();
+    if let Some(pos) = s.find("://") {
+        let scheme = &s[..pos + 3];
+        let rest = &s[pos + 3..];
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            return format!("{scheme}{}", &rest[at + 1..]);
+        }
+    }
+    s.to_string()
+}
+
 /// Normalized dedup key for a git remote URL, mirroring the frontend
 /// `gitUrlKey` (src/lib/gitUrl.ts) so both sides agree on "same repo": drop a
 /// trailing `.git`/slashes, lowercase the scheme + host only — the repo path
@@ -651,6 +669,29 @@ mod tests {
         assert_eq!(git_url_key("git@GitHub.com:acme/api.git"), s);
         assert_ne!(s, k); // scp and scheme spellings don't unify — and shouldn't here
         assert_eq!(git_url_key(""), "");
+    }
+
+    #[test]
+    fn redact_remote_strips_scheme_credentials_only() {
+        // HTTPS userinfo (user[:token]) is dropped — no secret reaches storage.
+        assert_eq!(
+            redact_remote("https://user:ghp_secret@github.com/acme/app.git"),
+            "https://github.com/acme/app.git"
+        );
+        assert_eq!(
+            redact_remote("https://token@github.com/acme/app"),
+            "https://github.com/acme/app"
+        );
+        assert_eq!(redact_remote("ssh://git@host/acme/app"), "ssh://host/acme/app");
+        // No credentials → unchanged.
+        assert_eq!(
+            redact_remote("https://github.com/acme/app.git"),
+            "https://github.com/acme/app.git"
+        );
+        // scp-style: the `git@` user is an SSH login, not a secret — keep it.
+        assert_eq!(redact_remote("git@github.com:acme/app.git"), "git@github.com:acme/app.git");
+        // An `@` in the PATH (not the authority) is preserved.
+        assert_eq!(redact_remote("https://host/acme/app@v2"), "https://host/acme/app@v2");
     }
 
     #[test]

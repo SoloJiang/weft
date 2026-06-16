@@ -293,7 +293,7 @@ fn curator_thread_key(workspace_id: i32) -> String {
 /// Get-or-create the hidden curator-chat thread for a workspace (mirrors the
 /// Concierge get-or-create). The id is stable (persisted in app_setting); the
 /// thread is `kind="curator"` so board views can filter it out.
-pub async fn ensure_curator_thread(db: &Db, workspace_id: i32) -> Result<i32> {
+pub async fn ensure_curator_thread(db: &Db, workspace_id: i32, lead_tool: &str) -> Result<i32> {
     let key = curator_thread_key(workspace_id);
     if let Some(id) = get_setting(db, &key).await?.and_then(|s| s.parse::<i32>().ok()) {
         if let Some(t) = get_thread(db, id).await? {
@@ -302,7 +302,7 @@ pub async fn ensure_curator_thread(db: &Db, workspace_id: i32) -> Result<i32> {
             }
         }
     }
-    let t = create_thread(db, workspace_id, "Dependency curator", "curator", "claude").await?;
+    let t = create_thread(db, workspace_id, "Dependency curator", "curator", lead_tool).await?;
     set_setting(db, &key, &t.id.to_string()).await?;
     Ok(t.id)
 }
@@ -1500,10 +1500,12 @@ mod tests {
     async fn ensure_curator_thread_is_idempotent_and_kinded() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let a = ensure_curator_thread(&db, ws.id).await.unwrap();
-        let b = ensure_curator_thread(&db, ws.id).await.unwrap();
+        let a = ensure_curator_thread(&db, ws.id, "codex").await.unwrap();
+        let b = ensure_curator_thread(&db, ws.id, "codex").await.unwrap();
         assert_eq!(a, b, "the same curator thread is reused");
-        assert_eq!(get_thread(&db, a).await.unwrap().unwrap().kind, "curator");
+        let t = get_thread(&db, a).await.unwrap().unwrap();
+        assert_eq!(t.kind, "curator");
+        assert_eq!(t.lead_tool, "codex", "uses the provided default tool, not hard-coded claude");
         // a normal issue coexists; the board view filters curator out.
         create_thread(&db, ws.id, "Real issue", "feature", "claude")
             .await

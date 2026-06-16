@@ -1540,9 +1540,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Manually re-run the agent dependency curator, then refresh the map so the
   // newly inferred runtime/infra edges appear. Slow (spawns a read-only agent).
   const reanalyzeDeps = useCallback(async () => {
-    if (activeWorkspaceId == null) return;
-    await api.analyzeWorkspaceDeps(activeWorkspaceId);
-    await refreshRepoMap();
+    const ws = activeWorkspaceId;
+    if (ws == null) return;
+    await api.analyzeWorkspaceDeps(ws);
+    // The analysis can run up to the curator timeout; if the user switched
+    // workspaces meanwhile, don't overwrite the now-current map with ws's graph.
+    if (activeWorkspaceIdRef.current === ws) await refreshRepoMap();
   }, [activeWorkspaceId, refreshRepoMap]);
 
   const editRepoProfile = useCallback(
