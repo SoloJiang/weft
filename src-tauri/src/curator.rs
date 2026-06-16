@@ -154,7 +154,28 @@ pub async fn graph(db: &Db, workspace_id: i32) -> Result<Graph> {
         .iter()
         .flat_map(|(id, rels)| profile::agent_edges(*id, rels, &node_ids))
         .collect();
+    maybe_schedule_backfill(db, workspace_id, &nodes);
     Ok(Graph { nodes, edges })
+}
+
+/// Schedule the one-shot legacy backfill for an upgraded workspace whose rows
+/// carry a non-canonical legacy tier. Called from `graph()` so EVERY read path
+/// (the Tauri repo map AND the planner's MCP `get_repo_map`) covers it, not just
+/// the UI. No-op outside a running app (so unit tests never spawn an agent) and
+/// at most once per workspace per process (so a failed/slow analyzer can't storm).
+fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
+    if crate::APP_HANDLE.get().is_none() {
+        return;
+    }
+    let needs_backfill = nodes
+        .iter()
+        .any(|n| !n.tier.is_empty() && profile::normalize_tier(&n.tier).is_none());
+    if needs_backfill && try_claim_backfill(workspace_id) {
+        let db = db.clone();
+        tauri::async_runtime::spawn(async move {
+            analyze_workspace_coalesced(&db, workspace_id).await;
+        });
+    }
 }
 
 // ─────────────────────────── agent curator ───────────────────────────
@@ -500,7 +521,7 @@ fn backfilled() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
 /// once per workspace per process. The caller schedules a migration pass only on
 /// that first claim, so an unavailable/slow analyzer can't cause a retry storm.
 /// The user can still trigger a fresh pass manually via Analyze deps.
-pub fn try_claim_backfill(workspace_id: i32) -> bool {
+fn try_claim_backfill(workspace_id: i32) -> bool {
     backfilled()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -545,21 +566,30 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
     let stack_json = json_strs(&wire.stack);
     let commit = git::head_commit(Path::new(&repo.local_git_path)).unwrap_or_default();
 
-    let agent_tier = profile::normalize_tier(&wire.tier).unwrap_or_default();
-    // Keep a user-pinned summary/tier; only an upgraded db's non-empty LEGACY role
-    // (service/app/…) migrates to the agent's tier. A valid tier and an
-    // intentional empty ("Other") choice are both preserved. `filter` avoids an
-    // `expect` here (production paths must not panic).
+    let agent_tier = profile::normalize_tier(&wire.tier);
+    // Decide the stored tier/summary/source. `filter` avoids an `expect`
+    // (production paths must not panic).
     let (tier, summary, source) = match prior.as_ref().filter(|_| user_owned) {
+        // User-pinned: keep the summary. Keep the tier when it is already a valid
+        // canonical tier; otherwise adopt the agent's valid tier — this covers
+        // both a legacy migration (service/app/…) and a placeholder whose empty
+        // tier came from a summary-only edit before analysis finished. Only when
+        // the agent also produced no usable tier do we keep the prior value as-is.
         Some(p) => {
-            let tier = if p.role.is_empty() {
-                String::new()
-            } else {
-                profile::normalize_tier(&p.role).unwrap_or(agent_tier)
-            };
+            let tier = profile::normalize_tier(&p.role)
+                .or_else(|| agent_tier.clone())
+                .unwrap_or_else(|| p.role.clone());
             (tier, p.summary.clone(), "user")
         }
-        None => (agent_tier, wire.summary, "agent"),
+        // Agent-owned: a missing or non-canonical top-level tier leaves the prior
+        // profile (or placeholder) intact, rather than persisting an analyzed but
+        // unclassified row that the backfill gate would never retry.
+        None => {
+            let Some(tier) = agent_tier else {
+                return Ok(());
+            };
+            (tier, wire.summary, "agent")
+        }
     };
 
     repo::upsert_repo_profile(
@@ -817,9 +847,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_repo_class_preserves_user_cleared_other() {
-        // A user who corrects a repo to "Other" (empty tier) keeps that choice
-        // across re-analysis; only non-empty legacy values migrate.
+    async fn persist_repo_class_fills_empty_user_tier_from_agent() {
+        // A user-owned row with an EMPTY tier (e.g. a summary-only edit on a
+        // placeholder) adopts the agent's valid tier rather than staying blank;
+        // the user's summary is still preserved.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
@@ -836,7 +867,31 @@ mod tests {
         };
         super::persist_repo_class(&db, &r, wire).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
-        assert_eq!(p.role, "", "user-cleared 'Other' tier is preserved, not migrated");
+        assert_eq!(p.role, "backend", "empty user tier adopts the agent's classification");
+        assert_eq!(p.summary, "mine", "user-pinned summary preserved");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_rejects_invalid_agent_tier() {
+        // A non-canonical agent tier leaves the repo as a placeholder (no row),
+        // rather than persisting an analyzed-but-unclassified row that the
+        // backfill gate would never retry.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "service".into(), // not one of frontend|gateway|backend
+            summary: "agent".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        assert!(
+            repo::get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "invalid agent tier is not persisted as an analyzed row"
+        );
     }
 
     #[tokio::test]

@@ -801,13 +801,21 @@ function TierBadge({ profile }: { profile: RepoProfile }) {
 function TierPicker({ profile }: { profile: RepoProfile }) {
   const { editRepoProfile } = useStore();
   const { t } = useTranslation();
+  const canonical = (TIER_ORDER as readonly string[]).includes(profile.tier);
   return (
     <select
-      value={(TIER_ORDER as readonly string[]).includes(profile.tier) ? profile.tier : ""}
+      value={canonical ? profile.tier : ""}
       onChange={(e) => void editRepoProfile(profile.repo_id, profile.summary, e.currentTarget.value)}
       className="w-full rounded border border-border bg-bg px-1.5 py-1 text-[12.5px] text-ink outline-none focus:border-brand/60"
     >
-      <option value="">{t("repomap.tier_other")}</option>
+      {/* The empty option is a non-selectable placeholder for the unclassified /
+          analyzing state — tier is agent-owned, so the only user picks are the
+          three real tiers (no user-pinnable "Other"). */}
+      {!canonical && (
+        <option value="" disabled>
+          {t("repomap.tier_other")}
+        </option>
+      )}
       {TIER_ORDER.map((tier) => (
         <option key={tier} value={tier}>
           {t(`repomap.tier_${tier}`)}
