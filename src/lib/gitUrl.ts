@@ -56,11 +56,14 @@ export function gitUrlKey(url: string): string {
 
 /**
  * Extract recognized git URLs from arbitrary pasted text, in first-seen (paste)
- * order, deduped. An scp match that is actually the authority of a scheme URL —
- * modeled (`https://user@host:443/…`) or not (`ftp://user@host:21/…`) — is
- * dropped: any scp candidate starting inside a `scheme://…` span is skipped, so
- * an unmodeled-scheme URL recognizes as nothing and the caller's raw fallback
- * can hand git the whole URL instead of a scheme-stripped slice.
+ * order, deduped. A match that is really part of a LARGER single source is
+ * dropped so the caller's raw fallback hands git the whole source untouched:
+ *   - an scp candidate inside a `scheme://…` authority — modeled
+ *     (`https://user@host:443/…`) or not (`ftp://user@host:21/…`);
+ *   - a modeled scheme nested in a custom transport (`ssh://` inside
+ *     `git+ssh://host/repo` — the inner match starts past the span's start);
+ *   - any match that is the address of a remote-helper source, i.e. preceded by
+ *     `::` (`https://…` inside `hg::https://…`).
  */
 export function parseGitUrls(text: string): string[] {
   const schemeSpans: Array<[number, number]> = [];
@@ -85,10 +88,13 @@ export function parseGitUrls(text: string): string[] {
   const claimed: Array<[number, number]> = [];
   for (const { raw, start, end, scp } of matches) {
     if (claimed.some(([s, e]) => start < e && end > s)) continue; // inside a claimed URL
-    // Drop every scp candidate sitting inside a `scheme://…` authority (incl.
-    // schemes we don't model, e.g. ftp://) so we never emit a scheme-stripped
-    // slice; the caller's raw fallback hands the full URL to git instead.
-    if (scp && schemeSpans.some(([s, e]) => start >= s && start < e)) continue;
+    // Inside a `scheme://…` span: an scp candidate (start ≥ span start) is that
+    // scheme's authority; a nested scheme match (start AFTER the span start) is
+    // the inner URL of a custom transport like git+ssh://. Drop either.
+    if (schemeSpans.some(([s, e]) => (scp ? start >= s : s < start) && start < e)) continue;
+    // A match preceded by `::` is a remote-helper address (hg::https://…) — keep
+    // the whole helper source raw rather than emitting its inner URL.
+    if (start >= 2 && text[start - 1] === ":" && text[start - 2] === ":") continue;
     const url = trimUrl(raw);
     if (!url) continue;
     claimed.push([start, end]);
@@ -101,11 +107,16 @@ export function parseGitUrls(text: string): string[] {
 }
 
 // A token that can ONLY be a standalone source — never a fragment of a local
-// path with spaces: a scheme URL (`scheme://…`), an scp/alias colon-path
-// (`[user@]host:org/repo`), or anything the parser already recognizes. Its
-// presence proves whitespace on its line separates sources.
+// path with spaces: a scheme URL (`scheme://…`), an scp/alias colon-path whose
+// path has a `/` (`[user@]host:org/repo`) or ends in `.git` (`host:repo.git`),
+// or anything the parser already recognizes. Its presence proves whitespace on
+// its line separates sources. (A bare `label:` or `file.ts:42` does NOT match.)
 function isHardSource(tok: string): boolean {
-  return tok.includes("://") || /^[^\s:\\]+:[^\s\\]*\/[^\s]*$/.test(tok) || parseGitUrls(tok).length > 0;
+  return (
+    tok.includes("://") ||
+    /^[^\s:\\]+:(?:[^\s\\]*\/[^\s]*|[^\s\\]*\.git)$/i.test(tok) ||
+    parseGitUrls(tok).length > 0
+  );
 }
 
 // A token worth cloning (vs. a prose label like `Repos:` or a markdown bullet
@@ -118,9 +129,10 @@ function looksLikeSource(tok: string): boolean {
 /**
  * Parse a paste box of clone sources into a deduped list, in paste order.
  *
- * Newline always separates sources. Within a line, whitespace/commas separate
- * sources ONLY when the line carries a "hard source" token (a scheme `://…` or
- * scp/alias colon-path) that cannot be a fragment of a spaced path — then the
+ * Newline always separates sources. Within a line, whitespace/commas/semicolons
+ * separate sources ONLY when the line carries a "hard source" token (a scheme
+ * `://…` or scp/alias colon-path) that cannot be a fragment of a spaced path —
+ * then the
  * line is split, source-shaped tokens are kept, and prose (labels like `Repos:`,
  * bullets `-`/`*`) is dropped. A line without that evidence is taken as ONE
  * source, so a local path with spaces (`/Users/me/My Projects/repo`) survives.
@@ -154,7 +166,7 @@ export function parseCloneSources(text: string): string[] {
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (line === "") continue;
-    const tokens = line.split(/[\s,]+/).filter(Boolean);
+    const tokens = line.split(/[\s,;]+/).filter(Boolean);
     if (tokens.length > 1 && tokens.some(isHardSource)) {
       for (const tok of tokens) if (looksLikeSource(tok)) add(tok);
     } else {

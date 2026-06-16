@@ -137,6 +137,10 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   );
   // Aborts the in-flight batch when the dialog is closed/cancelled mid-import.
   const abortRef = useRef<AbortController | null>(null);
+  // Live mirror of the active workspace so an in-flight batch can tell it has
+  // been switched out from under itself (clones target the submit-time one).
+  const wsRef = useRef(activeWorkspaceId);
+  wsRef.current = activeWorkspaceId;
 
   // What we actually clone, parsed live from the paste box (see parseCloneSources:
   // newline/space/comma separated, spaced local paths kept whole, unmodeled
@@ -168,6 +172,13 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   useEffect(() => {
     setProgress((p) => (Object.keys(p).length ? {} : p));
   }, [url, dest, activeWorkspaceId]);
+
+  // Switching workspace mid-batch aborts the in-flight import: its remaining
+  // clones (and any late callbacks) target the submit-time workspace, so they
+  // must not keep writing into a dialog that now reflects a different one.
+  useEffect(() => {
+    abortRef.current?.abort();
+  }, [activeWorkspaceId]);
 
   // Closing/cancelling mid-batch aborts the loop so it stops queuing more clones.
   function handleOpenChange(o: boolean) {
@@ -226,13 +237,17 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
 
     const controller = new AbortController();
     abortRef.current = controller;
+    const submitWs = activeWorkspaceId; // these clones land in this workspace
     const errors: Record<number, string> = {};
     try {
       await importRepos(
         pending.map((e) => ({ url: e.url, name: e.name })),
         dest.trim(),
         (j, status, error) => {
-          if (abortRef.current !== controller) return; // stale batch — don't touch new state
+          // Drop callbacks from a superseded batch (close+reopen) or one whose
+          // workspace was switched away — the AbortController stays "current"
+          // across a workspace change, so guard on the workspace too.
+          if (abortRef.current !== controller || wsRef.current !== submitWs) return;
           const idx = pending[j].idx;
           setProgress((p) => ({ ...p, [idx]: { status, error } }));
           if (status === "error" && error) errors[idx] = error;
@@ -252,6 +267,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     abortRef.current = null;
     setBusy(false);
     if (controller.signal.aborted) return; // dialog was closed mid-import
+    if (wsRef.current !== submitWs) return; // workspace switched — don't toast for the old one
     // Every prior-ok row stays ok and every pending row is now ok or error, so
     // total failed == this run's errors and total ok == recognized − failed.
     const failed = Object.keys(errors).length;
