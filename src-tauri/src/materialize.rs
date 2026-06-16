@@ -163,6 +163,15 @@ pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> 
     if dir.status != "done" {
         anyhow::bail!("worktree can only be deleted for a done task");
     }
+    // Don't yank the cwd out from under a live agent: a human can mark a still-
+    // running task done, but if its worker is mid-turn the persisted session
+    // status is running/starting (set when a turn begins). Force-removing the
+    // worktree then would discard in-flight work — refuse while a turn is active.
+    if let Some(sess) = repo::latest_session_for(db, wt.direction_id, wt.repo_id).await? {
+        if matches!(sess.status.as_str(), "running" | "starting") {
+            anyhow::bail!("cannot delete the worktree while its worker is running");
+        }
+    }
     let path = std::path::Path::new(&wt.path);
     if let Some(r) = entities::repo_ref::Entity::find_by_id(wt.repo_id)
         .one(&db.0)

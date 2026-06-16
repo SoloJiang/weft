@@ -88,9 +88,21 @@ async fn delete_worktree_keeps_branch_and_task() {
         "row preserved on rejection"
     );
 
-    // Mark it done, then the Done-card "delete worktree" action removes just this
-    // worktree.
     repo::set_direction_status(&db, d1.id, "done").await.unwrap();
+
+    // Live-worker guard: even when done, a worker that is mid-turn (session
+    // status running/starting) must not have its cwd force-removed under it.
+    let sess = repo::create_session(&db, d1.id, ra.id, "claude", &path)
+        .await
+        .unwrap();
+    repo::set_session_status(&db, sess.id, "running").await.unwrap();
+    assert!(
+        remove_direction_worktree(&db, wt_id).await.is_err(),
+        "deletion is refused while the worker is running"
+    );
+    assert!(Path::new(&path).exists(), "worktree preserved while worker runs");
+    // Once the turn finishes, the Done-card "delete worktree" action removes it.
+    repo::set_session_status(&db, sess.id, "complete").await.unwrap();
     remove_direction_worktree(&db, wt_id).await.unwrap();
 
     // Directory and DB row are gone...
