@@ -23,13 +23,34 @@ const SCP_NOUSER = /\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+:[^\s<>"'`,;]*\/[^\s<>"'`
 // the no-user `host:21/…`); both start inside this span and must be dropped, or
 // the no-user matcher would feed the backend a scheme-/port-stripped scp slice.
 const ANY_SCHEME_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"'`,;]+/gi;
+// Remote-helper source `<transport>::<address>` (git-clone docs). The address
+// may be scp- or URL-like, so — like ANY_SCHEME_URL — it is used ONLY to exclude
+// matches inside the ADDRESS (`git@host:org/repo` AND its no-user `host:org/repo`
+// slice in `hg::git@host:org/repo`) so the whole helper source stays raw.
+const HELPER_URL = /\b[a-z][a-z0-9+.-]*::[^\s<>"'`,;]+/gi;
 
-/** Strip wrapping/trailing punctuation a paste often carries around a URL. */
+/**
+ * Strip wrapping/trailing punctuation a paste often carries around a source.
+ * A trailing `)`/`]`/`}` is peeled only when it is UNBALANCED — i.e. a wrapper
+ * around the source — so a path that legitimately ends in a bracket survives
+ * (`/tmp/src(foo)` and `file:///tmp/src(foo)` keep their `)`).
+ */
 function trimUrl(raw: string): string {
-  return raw
-    .trim()
-    .replace(/^[-*>\s([{<'"`]+/, "")
-    .replace(/[)\]}>'"`.,;]+$/, "");
+  let s = raw.trim().replace(/^[-*>\s([{<'"`]+/, "");
+  const opener: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  for (;;) {
+    const last = s[s.length - 1];
+    if (!last) break;
+    if (last in opener) {
+      let balance = 0; // openers − closers across the whole source
+      for (const c of s) balance += c === opener[last] ? 1 : c === last ? -1 : 0;
+      if (balance >= 0) break; // matched by an inner opener — part of the path
+    } else if (!"'\"`.,;>".includes(last)) {
+      break; // not a trailing wrapper/punctuation char
+    }
+    s = s.slice(0, -1);
+  }
+  return s;
 }
 
 /**
@@ -62,14 +83,21 @@ export function gitUrlKey(url: string): string {
  *     (`https://user@host:443/…`) or not (`ftp://user@host:21/…`);
  *   - a modeled scheme nested in a custom transport (`ssh://` inside
  *     `git+ssh://host/repo` — the inner match starts past the span's start);
- *   - any match that is the address of a remote-helper source, i.e. preceded by
- *     `::` (`https://…` inside `hg::https://…`).
+ *   - any match inside a remote-helper address (`https://…` or every scp slice
+ *     of `git@host:org/repo` inside `hg::…`).
  */
 export function parseGitUrls(text: string): string[] {
   const schemeSpans: Array<[number, number]> = [];
   for (const m of text.matchAll(ANY_SCHEME_URL)) {
     const s = m.index ?? 0;
     schemeSpans.push([s, s + m[0].length]);
+  }
+  // Exclusion spans covering the ADDRESS of each remote-helper source (after the
+  // `::`), so EVERY match inside it is dropped — not just the slice right after.
+  const helperSpans: Array<[number, number]> = [];
+  for (const m of text.matchAll(HELPER_URL)) {
+    const s = m.index ?? 0;
+    helperSpans.push([s + m[0].indexOf("::") + 2, s + m[0].length]);
   }
   const matches: Array<{ raw: string; start: number; end: number; scp: boolean }> = [];
   for (const m of text.matchAll(SCHEME_URL)) {
@@ -92,9 +120,9 @@ export function parseGitUrls(text: string): string[] {
     // scheme's authority; a nested scheme match (start AFTER the span start) is
     // the inner URL of a custom transport like git+ssh://. Drop either.
     if (schemeSpans.some(([s, e]) => (scp ? start >= s : s < start) && start < e)) continue;
-    // A match preceded by `::` is a remote-helper address (hg::https://…) — keep
-    // the whole helper source raw rather than emitting its inner URL.
-    if (start >= 2 && text[start - 1] === ":" && text[start - 2] === ":") continue;
+    // Any match inside a remote-helper address (hg::git@host:org/repo) — keep the
+    // whole helper source raw rather than emitting its inner URL / scp slice.
+    if (helperSpans.some(([s, e]) => start >= s && start < e)) continue;
     const url = trimUrl(raw);
     if (!url) continue;
     claimed.push([start, end]);
@@ -139,10 +167,13 @@ function looksLikeSource(tok: string): boolean {
  * Newline always separates sources. Within a line, whitespace/commas/semicolons
  * separate sources ONLY when the line carries a "hard source" token (a scheme
  * `://…` or scp/alias colon-path) that cannot be a fragment of a spaced path —
- * then the
- * line is split, source-shaped tokens are kept, and prose (labels like `Repos:`,
- * bullets `-`/`*`) is dropped. A line without that evidence is taken as ONE
- * source, so a local path with spaces (`/Users/me/My Projects/repo`) survives.
+ * then the line is split: hard sources are kept anywhere, a bare path/`.git`
+ * token is kept ONLY as the LAST token (a non-final path token is usually a
+ * fragment of a spaced local path we'd otherwise truncate, or prose), and the
+ * rest (labels like `Repos:`, bullets `-`/`*`, words like `and/or`) is dropped.
+ * A line without that evidence is taken as ONE source, so a local path with
+ * spaces (`/Users/me/My Projects/repo`) survives; spaced paths sharing a line
+ * with a URL aren't supported — put them on their own line.
  *
  * Each kept source is wrapper-trimmed (backticks, bullets, brackets, trailing
  * punctuation), then normalized to its recognized git URL, or kept verbatim
@@ -175,7 +206,11 @@ export function parseCloneSources(text: string): string[] {
     if (line === "") continue;
     const tokens = line.split(/[\s,;]+/).filter(Boolean);
     if (tokens.length > 1 && tokens.some(isHardSource)) {
-      for (const tok of tokens) if (looksLikeSource(tok)) add(tok);
+      tokens.forEach((tok, i) => {
+        // hard sources anywhere; a bare path/.git token only as the LAST token —
+        // a non-final one is likely a spaced-path fragment (don't truncate) or prose.
+        if (isHardSource(tok) || (looksLikeSource(tok) && i === tokens.length - 1)) add(tok);
+      });
     } else {
       add(line);
     }
