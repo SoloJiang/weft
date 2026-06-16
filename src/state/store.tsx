@@ -529,11 +529,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshWorkspaces = useCallback(async () => {
     const ws = await api.listWorkspaces();
     setWorkspaces(ws);
-    setActiveWorkspaceId((cur) => cur ?? ws[0]?.id ?? null);
+    setActiveWorkspaceId((cur) => {
+      // Keep the live selection as long as it still exists.
+      if (cur != null && ws.some((w) => w.id === cur)) return cur;
+      // Cold start / webview reload drops the in-memory selection back to null;
+      // restore the last-used workspace instead of snapping to the first one.
+      // Only fall back to the first when the saved id is gone (deleted) or there
+      // is none yet.
+      const saved = Number(localStorage.getItem("weft-active-workspace"));
+      if (saved && ws.some((w) => w.id === saved)) return saved;
+      return ws[0]?.id ?? null;
+    });
   }, []);
 
   const selectWorkspace = useCallback(async (id: number) => {
     setActiveWorkspaceId(id);
+    // Remember the choice so a relaunch/reload lands here, not on the first one.
+    localStorage.setItem("weft-active-workspace", String(id));
     const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
     setRepos(r);
     setThreads(t);
