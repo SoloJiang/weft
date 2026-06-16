@@ -1,40 +1,46 @@
-//! The deterministic half of the workspace Curator (ARCHITECTURE §4.9, §4.11):
-//! profile each repo from its manifests and reconcile the cross-repo dependency
-//! graph. No agent here — this is the cheap, always-available floor. The
-//! semantic one-liner from an agent curator layers on top later; a user edit
-//! (source = "user") always outranks re-inference.
+//! The workspace Curator (ARCHITECTURE §4.9, §4.11), now a PURE AGENT pipeline.
+//! There is no deterministic manifest engine: a bounded, read-only coding agent
+//! reads each repo deeply, classifies its tier (frontend / gateway / backend),
+//! summarizes it, surfaces monorepo sub-components, and reports the cross-repo
+//! relations it sees. Findings persist on `repo_profile`; the graph is rebuilt
+//! from them. A user edit (source = "user") always outranks re-analysis.
 
 use crate::git;
-use crate::profile::{self, Edge, RepoFacts};
+use crate::profile::{self, AgentRelation, Component, Edge};
 use crate::store::entities::{repo_profile, repo_ref};
 use crate::store::{repo, Db};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
 
-/// A profile as the UI sees it: decoded arrays + repo name + live staleness.
+/// A profile as the UI sees it: decoded fields + repo name + live staleness.
+/// `analyzed` is false for a repo the agent hasn't classified yet (rendered as
+/// an "analyzing" placeholder); such a node has an empty `tier`.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProfileView {
     pub repo_id: i32,
     pub repo_name: String,
-    pub role: String,
+    /// "frontend" | "gateway" | "backend" | "" (unclassified / analyzing).
+    pub tier: String,
     pub stack: Vec<String>,
     pub summary: String,
-    pub published: Vec<String>,
-    pub deps: Vec<String>,
+    /// "agent" | "user" | "" (placeholder).
     pub source: String,
     pub profiled_commit: String,
     pub stale: bool,
+    pub analyzed: bool,
+    pub components: Vec<Component>,
 }
 
-/// The workspace dependency graph: profiled repos + the edges between them.
+/// The workspace dependency graph: every repo (placeholders included) + the
+/// agent-inferred edges between them.
 #[derive(Clone, Debug, Serialize)]
 pub struct Graph {
     pub nodes: Vec<ProfileView>,
     pub edges: Vec<Edge>,
 }
 
-fn json(v: &[String]) -> String {
+fn json_strs(v: &[String]) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "[]".into())
 }
 
@@ -42,73 +48,55 @@ fn arr(s: &str) -> Vec<String> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
-fn facts_of(m: &repo_profile::Model) -> RepoFacts {
-    RepoFacts {
-        role: m.role.clone(),
-        stack: arr(&m.stack),
-        summary: m.summary.clone(),
-        published: arr(&m.published),
-        deps: arr(&m.deps),
-    }
+fn comps(s: &str) -> Vec<Component> {
+    serde_json::from_str(s).unwrap_or_default()
 }
 
-/// Re-infer a repo's facts from disk and persist. Factual fields
-/// (stack/published/deps) always refresh; the opinion fields (summary/role) are
-/// preserved when the user has edited them (source = "user").
-pub async fn profile_repo(db: &Db, repo: &repo_ref::Model) -> Result<repo_profile::Model> {
-    let path = Path::new(&repo.local_git_path);
-    let facts = profile::infer_repo_facts(path);
-    let commit = git::head_commit(path).unwrap_or_default();
-
-    let prior = repo::get_repo_profile(db, repo.id).await?;
-    let user_owned = prior.as_ref().map(|p| p.source == "user").unwrap_or(false);
-    let (role, summary, source) = match &prior {
-        Some(p) if user_owned => (p.role.clone(), p.summary.clone(), "user"),
-        _ => (facts.role.clone(), facts.summary.clone(), "inferred"),
-    };
-
-    repo::upsert_repo_profile(
-        db,
-        repo.id,
-        &role,
-        &json(&facts.stack),
-        &summary,
-        &json(&facts.published),
-        &json(&facts.deps),
-        source,
-        &commit,
-    )
-    .await
-}
-
-/// Apply a user edit to the opinion fields; marks the profile user-owned so
-/// future re-profiling won't clobber it.
+/// Apply a user edit to the opinion fields (one-line summary + tier); marks the
+/// profile user-owned so future re-analysis won't clobber it.
 pub async fn edit_profile(
     db: &Db,
     repo_id: i32,
     summary: &str,
-    role: &str,
+    tier: &str,
 ) -> Result<repo_profile::Model> {
     let existing = repo::get_repo_profile(db, repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no profile for repo {repo_id} yet"))?;
+    // Tolerate any tier string the UI sends; "" clears the classification.
+    let tier = profile::normalize_tier(tier).unwrap_or_default();
     repo::upsert_repo_profile(
         db,
         repo_id,
-        role,
+        &tier,
         &existing.stack,
         summary,
-        &existing.published,
-        &existing.deps,
+        &existing.components,
         "user",
         &existing.profiled_commit,
     )
     .await
 }
 
-fn view_of(repo: &repo_ref::Model, profile: &repo_profile::Model) -> ProfileView {
+/// One repo as the UI sees it. `profile == None` means the agent hasn't analyzed
+/// this repo yet → an "analyzing" placeholder node.
+fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> ProfileView {
+    let Some(p) = profile else {
+        return ProfileView {
+            repo_id: repo.id,
+            repo_name: repo.name.clone(),
+            tier: String::new(),
+            stack: Vec::new(),
+            summary: String::new(),
+            source: String::new(),
+            profiled_commit: String::new(),
+            stale: false,
+            analyzed: false,
+            components: Vec::new(),
+        };
+    };
     let live = git::head_commit(Path::new(&repo.local_git_path)).ok();
-    let stale = match (&live, profile.profiled_commit.as_str()) {
+    let stale = match (&live, p.profiled_commit.as_str()) {
         (Some(_), "") => true,
         (Some(head), at) => head != at,
         (None, _) => false, // can't tell (not a git repo / no commits)
@@ -116,84 +104,65 @@ fn view_of(repo: &repo_ref::Model, profile: &repo_profile::Model) -> ProfileView
     ProfileView {
         repo_id: repo.id,
         repo_name: repo.name.clone(),
-        role: profile.role.clone(),
-        stack: arr(&profile.stack),
-        summary: profile.summary.clone(),
-        published: arr(&profile.published),
-        deps: arr(&profile.deps),
-        source: profile.source.clone(),
-        profiled_commit: profile.profiled_commit.clone(),
+        tier: p.role.clone(),
+        stack: arr(&p.stack),
+        summary: p.summary.clone(),
+        source: p.source.clone(),
+        profiled_commit: p.profiled_commit.clone(),
         stale,
+        analyzed: true,
+        components: comps(&p.components),
     }
 }
 
-/// All profiled repos in a workspace as the UI sees them (unprofiled repos are
-/// omitted; profiling is eager on add, so this is normally every repo).
+/// Every repo in a workspace as the UI sees it, placeholders included (a repo
+/// with no agent profile yet is returned with `analyzed=false`).
 pub async fn list(db: &Db, workspace_id: i32) -> Result<Vec<ProfileView>> {
     let repos = repo::list_repos(db, workspace_id).await?;
     let mut out = Vec::new();
     for r in &repos {
-        if let Some(p) = repo::get_repo_profile(db, r.id).await? {
-            out.push(view_of(r, &p));
-        }
+        let p = repo::get_repo_profile(db, r.id).await?;
+        out.push(view_of(r, p.as_ref()));
     }
     Ok(out)
 }
 
-/// The workspace dependency graph: nodes + edges, computed from stored profiles
-/// (no disk read). Edges are the deterministic manifest floor merged with the
-/// agent curator's inferred relations (service-to-service, infra, …) where
-/// present; manifest edges win on a shared (from, to, via) triple.
+/// The workspace dependency graph: one node per repo (placeholders for repos the
+/// agent hasn't classified yet) and the agent-inferred edges between them. There
+/// is no manifest floor anymore — every edge comes from a stored agent relation
+/// (`agent_edges` already drops self-links, stale targets, and `rejected`
+/// tombstones).
 pub async fn graph(db: &Db, workspace_id: i32) -> Result<Graph> {
     let repos = repo::list_repos(db, workspace_id).await?;
     let mut nodes = Vec::new();
-    let mut facts: Vec<(i32, RepoFacts)> = Vec::new();
-    let mut relations: Vec<(i32, Vec<profile::AgentRelation>)> = Vec::new();
+    let mut relations: Vec<(i32, Vec<AgentRelation>)> = Vec::new();
     for r in &repos {
-        if let Some(p) = repo::get_repo_profile(db, r.id).await? {
-            facts.push((r.id, facts_of(&p)));
+        let p = repo::get_repo_profile(db, r.id).await?;
+        if let Some(pp) = &p {
             // Tolerate malformed/empty JSON: a bad relations blob just means no
             // agent edges for that repo, never a failed graph.
-            relations.push((r.id, serde_json::from_str(&p.relations).unwrap_or_default()));
-            nodes.push(view_of(r, &p));
+            relations.push((r.id, serde_json::from_str(&pp.relations).unwrap_or_default()));
         }
+        nodes.push(view_of(r, p.as_ref()));
     }
     let node_ids: std::collections::HashSet<i32> = nodes.iter().map(|n| n.repo_id).collect();
-    let manifest = profile::compute_edges(&facts);
-    let agent: Vec<profile::Edge> = relations
+    let edges = relations
         .iter()
         .flat_map(|(id, rels)| profile::agent_edges(*id, rels, &node_ids))
-        .collect();
-    // A user removal is a `rejected` tombstone. agent_edges already drops the
-    // agent edge, but a MANIFEST edge for the same (from, to, kind) is recomputed
-    // unconditionally — so apply tombstones to the merged set too, or a removed
-    // `lib` edge would reappear in the map and in briefs.
-    let tombstoned: std::collections::HashSet<(i32, i32, String)> = relations
-        .iter()
-        .flat_map(|(id, rels)| {
-            rels.iter()
-                .filter(|r| r.rejected)
-                .map(move |r| (*id, r.to, r.kind.clone()))
-        })
-        .collect();
-    let edges = profile::merge_edges(manifest, agent)
-        .into_iter()
-        .filter(|e| !tombstoned.contains(&(e.from, e.to, e.kind.clone())))
         .collect();
     Ok(Graph { nodes, edges })
 }
 
 // ─────────────────────────── agent curator ───────────────────────────
 //
-// The semantic layer the deterministic floor (above) only promised: a bounded,
-// read-only agent reads the workspace's repos and reports cross-repo RUNTIME /
-// infra relations manifests can't see (HTTP, gRPC, queues, shared infra). Its
-// findings persist as `repo_profile.relations` and merge into `graph()` as
-// edges tagged `source="agent"`.
+// The whole curator: a bounded, read-only agent classifies each repo's tier and
+// surfaces monorepo sub-components (per-repo deep pass), then reports cross-repo
+// relations (HTTP, gRPC, queues, shared infra, and declared libs). Findings
+// persist on `repo_profile` and rebuild into `graph()`'s nodes + edges.
 
 /// One relation as the curator agent reports it: flat, with an explicit `from`
-/// (the deterministic `AgentRelation` is stored per-producer, so `from` is
-/// implicit there). Lenient: missing fields default.
+/// (the stored `AgentRelation` is per-producer, so `from` is implicit there).
+/// Lenient: missing fields default.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CuratorRelation {
     pub from: i32,
@@ -277,40 +246,101 @@ pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
         .map(|w| w.relations)
 }
 
-const CURATOR_SYSTEM_PROMPT: &str = "You are a read-only repository dependency \
-analyst. You may read code and configuration, but you must never modify, create, \
-or delete files, and never run mutating commands.";
+/// The per-repo deep pass's strict-JSON result. `tier` is required (no serde
+/// default), so a reply without it reads as unparseable and the prior profile is
+/// left intact rather than blanked.
+#[derive(Debug, serde::Deserialize)]
+struct RepoClassWire {
+    tier: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    stack: Vec<String>,
+    #[serde(default)]
+    components: Vec<Component>,
+}
+
+/// Extract the per-repo classification from the agent's free-form reply, same
+/// tolerance as `parse_curator_output`: scan every balanced object, take the LAST
+/// that carries a `tier`. `None` for a timed-out/malformed reply.
+fn parse_repo_class(text: &str) -> Option<RepoClassWire> {
+    json_objects(text)
+        .into_iter()
+        .rev()
+        .find_map(|obj| serde_json::from_str::<RepoClassWire>(obj).ok())
+}
+
+const CURATOR_SYSTEM_PROMPT: &str = "You are a read-only repository analyst. You \
+may read code and configuration as deeply as you need, but you must never modify, \
+create, or delete files, and never run mutating commands.";
 
 const CURATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Prompt listing every profiled repo (id/name/role/path/publishes/summary) and
-/// asking for STRICT JSON cross-repo RUNTIME/infra relations keyed by repo id.
+/// The shared definition of the three architectural tiers, embedded in both the
+/// per-repo classification prompt and the cross-repo relations prompt so the
+/// agent applies one consistent taxonomy.
+const TIER_GUIDE: &str = "Tiers:\n\
+- frontend: user-facing client — web SPA/MPA, mobile, desktop UI, static site.\n\
+- gateway: the MIDDLE layer between frontend and backend — API gateway, BFF \
+(backend-for-frontend), aggregator, edge service, reverse proxy, GraphQL gateway. \
+It mostly orchestrates/forwards to other services rather than owning core domain \
+data.\n\
+- backend: a service that owns domain logic and/or data — REST/gRPC services, \
+workers, batch jobs, databases-of-record, shared libraries that back them.";
+
+/// Per-repo DEEP classification prompt. The agent runs with cwd AT this repo and
+/// is told to read widely (subdirectories, monorepo packages) before emitting one
+/// strict-JSON object: the repo's tier + one-line summary + stack, plus any
+/// monorepo sub-components for the map's "expanded" view.
+fn build_repo_class_prompt(repo_name: &str) -> String {
+    format!(
+        "Analyze the repository at the current working directory (name: {repo_name}) \
+DEEPLY and READ-ONLY. Do NOT stop at the top-level manifest: read the source \
+layout, entry points, configs, and — if this is a monorepo — its packages/apps/\
+services subdirectories, so your classification reflects what the code actually \
+does.\n\n{TIER_GUIDE}\n\nClassify the repository into exactly one top-level tier. \
+If the repo is a monorepo containing two or more deployable/publishable internal \
+packages or services, list each as a component with its own tier; a single-purpose \
+repo has no components.\n\nAs the LAST thing in your reply, output a single JSON \
+object and nothing after it:\n\
+{{\"tier\":\"frontend|gateway|backend\",\"summary\":\"<one line; name the key \
+internal modules if it is a monorepo>\",\"stack\":[\"<language/framework tags>\"],\
+\"components\":[{{\"name\":\"<package/service>\",\"path\":\"<relative path>\",\
+\"tier\":\"frontend|gateway|backend\",\"summary\":\"<one line>\",\
+\"deps\":[\"<sibling component name it depends on>\"]}}]}}\n\
+Rules: pick the single tier that best fits the repo as a whole. `components` is \
+[] unless this is a monorepo with 2+ internal packages/services. `deps` lists only \
+SIBLING components in THIS repo. Keep summaries to one line."
+    )
+}
+
+/// Cross-repo relations prompt: lists every classified repo (id/name/tier/path/
+/// summary) and asks for STRICT JSON relations keyed by repo id — runtime, infra,
+/// AND declared library dependencies (there is no manifest floor, so the agent
+/// reports `lib` edges too).
 fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> String {
     let mut lines = String::new();
     for (r, p) in repos {
+        let tier = if p.role.is_empty() { "unknown" } else { p.role.as_str() };
         lines.push_str(&format!(
-            "- id={} name={:?} role={} path={:?} publishes={:?}\n  summary: {}\n",
-            r.id,
-            r.name,
-            p.role,
-            r.local_git_path,
-            arr(&p.published),
-            p.summary
+            "- id={} name={:?} tier={} path={:?}\n  summary: {}\n",
+            r.id, r.name, tier, r.local_git_path, p.summary
         ));
     }
     format!(
-        "Map how these repositories in one workspace depend on each other at \
-RUNTIME and through shared infrastructure — relationships package manifests do \
-NOT capture: HTTP/REST calls, gRPC, message queues, shared databases/infra, and \
-cross-repo internal imports.\n\nRepositories:\n{lines}\nRead each repo's code and \
-config at its path (READ-ONLY — change nothing). Then, as the LAST thing in your \
-reply, output a single JSON object and nothing after it:\n\
+        "Map how these repositories in one workspace depend on each other — both at \
+RUNTIME / through shared infrastructure (HTTP/REST, gRPC, message queues, shared \
+databases/infra) AND through declared library/package dependencies and cross-repo \
+internal imports.\n\n{TIER_GUIDE}\n\nRepositories:\n{lines}\nRead each repo's code \
+and config at its path (READ-ONLY — change nothing). Then, as the LAST thing in \
+your reply, output a single JSON object and nothing after it:\n\
 {{\"relations\":[{{\"from\":<id>,\"to\":<id>,\"kind\":\"http|grpc|queue|infra|lib\",\
 \"via\":\"<short evidence>\",\"confidence\":<0-100>}}]}}\n\
-Rules: `from` and `to` MUST be ids from the list above and must differ. Only \
+Rules: `from` and `to` MUST be ids from the list above and must differ. Use kind \
+`lib` for a declared package/module dependency, the runtime kinds otherwise. Only \
 include a relation you have concrete evidence for. `via` is a short label (e.g. \
-\"POST /orders\", \"orders-topic\", \"shared postgres\"). If you find none, output \
-{{\"relations\":[]}}."
+\"POST /orders\", \"orders-topic\", \"shared postgres\", \"@acme/api-client\"). If \
+you find none, output {{\"relations\":[]}}."
     )
 }
 
@@ -453,46 +483,116 @@ async fn persist_relations(
     Ok(())
 }
 
-/// Run the agent curator over a workspace: infer cross-repo runtime/infra
-/// relations the manifest floor can't see, and persist them per producer repo.
-/// Best-effort — any failure leaves the existing graph intact. Skipped for a
-/// workspace with fewer than two profiled repos (nothing to relate). The agent
-/// runs read-only with `cwd` at the first repo and the others' absolute paths in
-/// the prompt.
-pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
-    let repos = repo::list_repos(db, workspace_id).await?;
-    let mut profiled: Vec<(repo_ref::Model, repo_profile::Model)> = Vec::new();
-    for r in &repos {
-        if let Some(p) = repo::get_repo_profile(db, r.id).await? {
-            // Only analyze repos whose checkout still exists: a missing first repo
-            // would make `run_agent_once`'s cwd invalid and fail the whole pass,
-            // and the agent can't read a path that isn't there.
-            if Path::new(&r.local_git_path).exists() {
-                profiled.push((r.clone(), p));
-            }
-        }
-    }
-    if profiled.len() < 2 {
-        return Ok(());
-    }
-    let prompt = build_curator_prompt(&profiled);
-    // cwd is a live repo (the list is already filtered to existing paths).
-    let cwd = Path::new(&profiled[0].0.local_git_path).to_path_buf();
-    // Resolve the same effective default coding agent normal threads use, rather
-    // than hard-coding claude (which would no-op for codex/opencode users).
-    let tool = crate::tools::default_tool(db).await;
-    let text = run_agent_once(&tool, &cwd, &prompt).await?;
-    let Some(relations) = parse_curator_output(&text) else {
-        // A timed-out / unparseable reply: leave the existing graph intact rather
-        // than persisting an empty set (which would drop all agent relations).
-        return Ok(());
-    };
-    persist_relations(db, &profiled, &relations).await?;
-    // Refresh any open repo map (mirrors calibrate_edges_tool) so edges inferred
-    // by the background pass appear without a manual reload.
+/// Nudge any open repo map to reload so background-inferred classifications and
+/// edges appear without a manual refresh.
+fn emit_graph_updated(workspace_id: i32) {
     if let Some(app) = crate::APP_HANDLE.get() {
         use tauri::Emitter;
         let _ = app.emit("repo-graph-updated", workspace_id);
+    }
+}
+
+/// Persist one repo's deep-pass classification: tier + stack + summary +
+/// components. Factual fields (stack/components) always refresh; the opinion
+/// fields (tier/summary) are preserved when the user has pinned them
+/// (source = "user"). Component tiers are normalized to the canonical set.
+async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire) -> Result<()> {
+    let prior = repo::get_repo_profile(db, repo.id).await?;
+    let user_owned = prior.as_ref().map(|p| p.source == "user").unwrap_or(false);
+
+    let components: Vec<Component> = wire
+        .components
+        .into_iter()
+        .map(|mut c| {
+            c.tier = profile::normalize_tier(&c.tier).unwrap_or_default();
+            c
+        })
+        .collect();
+    let comps_json = serde_json::to_string(&components).unwrap_or_else(|_| "[]".into());
+    let stack_json = json_strs(&wire.stack);
+    let commit = git::head_commit(Path::new(&repo.local_git_path)).unwrap_or_default();
+
+    let (tier, summary, source) = if user_owned {
+        let p = prior.as_ref().expect("user_owned implies a prior profile");
+        (p.role.clone(), p.summary.clone(), "user")
+    } else {
+        (
+            profile::normalize_tier(&wire.tier).unwrap_or_default(),
+            wire.summary,
+            "agent",
+        )
+    };
+
+    repo::upsert_repo_profile(
+        db, repo.id, &tier, &stack_json, &summary, &comps_json, source, &commit,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Deep, read-only per-repo pass: run the agent with cwd AT the repo, parse its
+/// classification, and persist it. Best-effort — a timed-out/unparseable reply
+/// leaves the prior profile (or placeholder) intact. No-op if the checkout is
+/// gone (the agent can't read a path that isn't there).
+pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
+    let cwd = Path::new(&repo.local_git_path);
+    if !cwd.exists() {
+        return Ok(());
+    }
+    let tool = crate::tools::default_tool(db).await;
+    let prompt = build_repo_class_prompt(&repo.name);
+    let text = run_agent_once(&tool, cwd, &prompt).await?;
+    if let Some(wire) = parse_repo_class(&text) {
+        persist_repo_class(db, repo, wire).await?;
+    }
+    Ok(())
+}
+
+/// Run the agent curator over a workspace (ARCHITECTURE §4.9). Two stages, both
+/// read-only and best-effort:
+///   1. a DEEP per-repo pass classifies each repo's tier + summary + components,
+///      emitting a graph refresh after each so nodes light up progressively;
+///   2. a cross-repo pass (only with ≥2 repos) infers the relations between them.
+/// Any single failure leaves that repo's prior state intact.
+pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
+    let repos = repo::list_repos(db, workspace_id).await?;
+    // Only analyze repos whose checkout still exists on disk.
+    let existing: Vec<repo_ref::Model> = repos
+        .into_iter()
+        .filter(|r| Path::new(&r.local_git_path).exists())
+        .collect();
+    if existing.is_empty() {
+        return Ok(());
+    }
+
+    // Stage 1: deep per-repo classification, progressive.
+    for r in &existing {
+        let _ = profile_repo_agent(db, r).await;
+        emit_graph_updated(workspace_id);
+    }
+
+    // Stage 2: cross-repo relations — needs at least two repos to relate. Reload
+    // the (now classified) profiles so the listing carries tiers/summaries.
+    if existing.len() >= 2 {
+        let mut profiled: Vec<(repo_ref::Model, repo_profile::Model)> = Vec::new();
+        for r in &existing {
+            if let Some(p) = repo::get_repo_profile(db, r.id).await? {
+                profiled.push((r.clone(), p));
+            }
+        }
+        if profiled.len() >= 2 {
+            let prompt = build_curator_prompt(&profiled);
+            let cwd = Path::new(&profiled[0].0.local_git_path).to_path_buf();
+            let tool = crate::tools::default_tool(db).await;
+            // A timed-out / unparseable reply leaves existing relations intact
+            // (never persists an empty set, which would drop all agent edges).
+            if let Ok(text) = run_agent_once(&tool, &cwd, &prompt).await {
+                if let Some(relations) = parse_curator_output(&text) {
+                    persist_relations(db, &profiled, &relations).await?;
+                }
+            }
+        }
+        emit_graph_updated(workspace_id);
     }
     Ok(())
 }
@@ -569,15 +669,15 @@ mod tests {
         Db::connect("sqlite::memory:").await.unwrap()
     }
 
-    /// (db, repo_id, role, stack, summary, published, deps, source, commit)
-    async fn profile(db: &Db, repo_id: i32, published: &str, deps: &str) {
-        repo::upsert_repo_profile(db, repo_id, "service", "[]", "", published, deps, "inferred", "")
+    /// Upsert a minimal agent profile row (tier only) so a repo has a node.
+    async fn profile(db: &Db, repo_id: i32, tier: &str) {
+        repo::upsert_repo_profile(db, repo_id, tier, "[]", "", "[]", "agent", "")
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn graph_merges_manifest_and_agent_edges() {
+    async fn graph_builds_edges_from_agent_relations() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
@@ -586,10 +686,9 @@ mod tests {
         let api = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
             .await
             .unwrap();
-        // Manifest edge: web declares a dep on @acme/api, which api publishes.
-        profile(&db, web.id, "[]", r#"["@acme/api"]"#).await;
-        profile(&db, api.id, r#"["@acme/api"]"#, "[]").await;
-        // Agent edge: web also calls api over HTTP — a relation manifests can't see.
+        profile(&db, web.id, "frontend").await;
+        profile(&db, api.id, "backend").await;
+        // The only edges now come from agent relations (no manifest floor).
         let rels = serde_json::to_string(&vec![AgentRelation {
             to: api.id,
             kind: "http".into(),
@@ -601,21 +700,33 @@ mod tests {
         repo::set_repo_relations(&db, web.id, &rels).await.unwrap();
 
         let g = graph(&db, ws.id).await.unwrap();
-        assert!(
-            g.edges.iter().any(|e| e.from == web.id
-                && e.to == api.id
-                && e.kind == "lib"
-                && e.source == "manifest"),
-            "manifest edge present"
-        );
+        // Nodes carry the agent tier classification.
+        assert!(g.nodes.iter().any(|n| n.repo_id == web.id && n.tier == "frontend" && n.analyzed));
+        assert!(g.nodes.iter().any(|n| n.repo_id == api.id && n.tier == "backend"));
+        assert_eq!(g.edges.len(), 1, "exactly the one agent edge");
         assert!(
             g.edges.iter().any(|e| e.from == web.id
                 && e.to == api.id
                 && e.kind == "http"
                 && e.source == "agent"
                 && e.via == "GET /orders"),
-            "agent http edge merged in"
+            "agent http edge present"
         );
+    }
+
+    #[tokio::test]
+    async fn graph_returns_placeholder_for_unanalyzed_repo() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "fresh", "/tmp/fresh", "main", "")
+            .await
+            .unwrap();
+        // No profile row yet → a placeholder node, not an omission.
+        let g = graph(&db, ws.id).await.unwrap();
+        let node = g.nodes.iter().find(|n| n.repo_id == r.id).expect("placeholder node");
+        assert!(!node.analyzed);
+        assert_eq!(node.tier, "");
+        assert!(g.edges.is_empty());
     }
 
     #[test]
@@ -663,8 +774,8 @@ mod tests {
         let api = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
             .await
             .unwrap();
-        profile(&db, web.id, "[]", "[]").await;
-        profile(&db, api.id, "[]", "[]").await;
+        profile(&db, web.id, "frontend").await;
+        profile(&db, api.id, "backend").await;
         let profiled = vec![
             (
                 web.clone(),
@@ -709,7 +820,7 @@ mod tests {
         let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
             .await
             .unwrap();
-        profile(&db, web.id, "[]", "[]").await;
+        profile(&db, web.id, "frontend").await;
         // Points at a repo id not in this workspace → dropped, no edge.
         let rels = serde_json::to_string(&vec![AgentRelation {
             to: 999,

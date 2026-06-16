@@ -453,34 +453,38 @@ pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profi
         .await?)
 }
 
-/// Insert or update a repo's profile. `stack`/`published`/`deps` are JSON arrays.
+/// Insert or update a repo's profile from the agent curator. `tier` is the
+/// architectural tier ("frontend"|"gateway"|"backend"|""), `stack`/`components`
+/// are JSON arrays. The vestigial `published`/`deps` columns are pinned to "[]".
+/// `relations` are left untouched on update so re-analysis of facts never wipes
+/// the agent's cross-repo findings (and stay "[]" on a fresh row).
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_repo_profile(
     db: &Db,
     repo_id: i32,
-    role: &str,
+    tier: &str,
     stack: &str,
     summary: &str,
-    published: &str,
-    deps: &str,
+    components: &str,
     source: &str,
     profiled_commit: &str,
 ) -> Result<repo_profile::Model> {
     let mut a = match get_repo_profile(db, repo_id).await? {
         Some(m) => m.into(),
-        // New row: agent relations start empty. (On update we leave `relations`
-        // untouched, so deterministic re-profiling never wipes agent findings.)
         None => repo_profile::ActiveModel {
             repo_id: Set(repo_id),
             relations: Set("[]".to_string()),
+            published: Set("[]".to_string()),
+            deps: Set("[]".to_string()),
             ..Default::default()
         },
     };
-    a.role = Set(role.to_string());
+    a.role = Set(tier.to_string());
     a.stack = Set(stack.to_string());
     a.summary = Set(summary.to_string());
-    a.published = Set(published.to_string());
-    a.deps = Set(deps.to_string());
+    a.components = Set(components.to_string());
+    a.published = Set("[]".to_string());
+    a.deps = Set("[]".to_string());
     a.source = Set(source.to_string());
     a.profiled_commit = Set(profiled_commit.to_string());
     Ok(a.save(&db.0).await?.try_into_model()?)
@@ -1421,10 +1425,10 @@ mod tests {
         let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "")
             .await
             .unwrap();
-        upsert_repo_profile(&db, a.id, "service", "[]", "", "[]", "[]", "inferred", "")
+        upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "")
             .await
             .unwrap();
-        upsert_repo_profile(&db, b.id, "service", "[]", "", "[]", "[]", "inferred", "")
+        upsert_repo_profile(&db, b.id, "backend", "[]", "", "[]", "agent", "")
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "T", "feature", "claude")
@@ -1472,7 +1476,7 @@ mod tests {
         let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
             .await
             .unwrap();
-        upsert_repo_profile(&db, web.id, "app", "[]", "", "[]", "[]", "inferred", "")
+        upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "")
             .await
             .unwrap();
         let read = |db: &Db, id| {

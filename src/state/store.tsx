@@ -180,7 +180,7 @@ interface Store {
   deleteRepo: (repoId: number) => Promise<void>;
   /** Open the workspace's curator calibration chat (navigates to its surface). */
   openCuratorChat: () => Promise<void>;
-  editRepoProfile: (repoId: number, summary: string, role: string) => Promise<void>;
+  editRepoProfile: (repoId: number, summary: string, tier: string) => Promise<void>;
 
   /** The active thread's plan proposal (Task → scope), if any. */
   proposal: ResolvedProposal | null;
@@ -1584,8 +1584,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeWorkspaceId, refreshRepoMap]);
 
   const editRepoProfile = useCallback(
-    async (repoId: number, summary: string, role: string) => {
-      await api.updateRepoProfile(repoId, summary, role);
+    async (repoId: number, summary: string, tier: string) => {
+      await api.updateRepoProfile(repoId, summary, tier);
       await refreshRepoMap();
     },
     [refreshRepoMap],

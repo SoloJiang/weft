@@ -4,12 +4,13 @@ import {
   AppWindow,
   Boxes,
   CircleDashed,
-  FileText,
   GitBranch,
+  Layers,
+  Loader2,
   Maximize2,
   MessagesSquare,
   Minus,
-  Package,
+  Network,
   PanelRightClose,
   PanelRightOpen,
   Pencil,
@@ -21,35 +22,72 @@ import {
 } from "lucide-react";
 import type { ComponentType } from "react";
 import { useStore } from "../state/store";
-import type { RepoEdge, RepoProfile } from "../lib/types";
+import type { RepoComponent, RepoEdge, RepoProfile } from "../lib/types";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Button } from "../components/ui/Button";
 import { cn } from "../lib/cn";
 
-const ROLE_ICON: Record<string, ComponentType<LucideProps>> = {
-  service: Server,
-  app: AppWindow,
-  library: Package,
-  infra: Boxes,
-  docs: FileText,
-  unknown: CircleDashed,
+/** The three architectural tiers laid out left→right, plus the catch-all "other"
+ *  band that holds unclassified / still-analyzing repos. */
+const TIER_ORDER = ["frontend", "gateway", "backend"] as const;
+const BANDS = ["frontend", "gateway", "backend", "other"] as const;
+type Band = (typeof BANDS)[number];
+
+const TIER_ICON: Record<string, ComponentType<LucideProps>> = {
+  frontend: AppWindow,
+  gateway: Network,
+  backend: Server,
+  other: CircleDashed,
 };
+
+/** The relation kinds an edge can carry, for the filter toggles. */
+const KINDS = ["lib", "http", "grpc", "queue", "infra"] as const;
+
+const bandOf = (tier: string): Band =>
+  (TIER_ORDER as readonly string[]).includes(tier) ? (tier as Band) : "other";
+
+type ViewMode = "overview" | "expanded";
 
 const NODE_W = 248;
 const NODE_H = 108;
 const COL_GAP = 82;
 const ROW_GAP = 18;
 const PAD = 18;
+// Expanded-container metrics (a repo's monorepo components grouped by tier).
+const EXP_HEADER_H = 60;
+const EXP_TIER_SUB_H = 20;
+const EXP_COMP_H = 40;
 const MIN_Z = 0.35;
 const MAX_Z = 2.5;
 const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));
 
+/** Group a repo's components into tier bands, in tier order then "other". */
+function groupComponents(components: RepoComponent[]): [Band, RepoComponent[]][] {
+  const out: [Band, RepoComponent[]][] = [];
+  for (const band of BANDS) {
+    const inBand = components.filter((c) => bandOf(c.tier) === band);
+    if (inBand.length > 0) out.push([band, inBand]);
+  }
+  return out;
+}
+
+/** The drawn height of a repo node: a fixed card, or a taller container when
+ *  expanded and the repo has monorepo components. */
+function nodeHeight(p: RepoProfile, mode: ViewMode): number {
+  if (mode !== "expanded" || p.components.length === 0) return NODE_H;
+  let h = EXP_HEADER_H + 8;
+  for (const [, comps] of groupComponents(p.components)) {
+    h += EXP_TIER_SUB_H + comps.length * EXP_COMP_H + 6;
+  }
+  return Math.max(h, NODE_H);
+}
+
 /**
  * The repo map as a pan/zoom canvas — the whole Repos surface. Nodes are laid
- * out in columns by dependency depth (foundational libs left, top-level apps
- * right) and carry everything: role, stack, one-line summary, core flag,
- * re-profile. Edges are drawn dependent → dependency. Drag the background to
- * pan, scroll/buttons to zoom, fit to recenter.
+ * out in bands by architectural TIER (frontend → gateway → backend → other),
+ * agent-classified. Switch to the expanded view to break monorepos into their
+ * internal components, grouped by tier. Edges are agent-inferred cross-repo
+ * relations and can be filtered by kind. Drag to pan, scroll/buttons to zoom.
  */
 export function RepoGraph() {
   const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, openCuratorChat } = useStore();
@@ -57,7 +95,28 @@ export function RepoGraph() {
   const { t } = useTranslation();
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [profileOpen, setProfileOpen] = useState(true);
+  const [mode, setMode] = useState<ViewMode>("overview");
+  const [activeKinds, setActiveKinds] = useState<Set<string>>(() => new Set(KINDS));
   const seededSelection = useRef(false);
+
+  const toggleKind = useCallback((kind: string) => {
+    setActiveKinds((prev) => {
+      const next = new Set(prev);
+      if (next.has(kind)) next.delete(kind);
+      else next.add(kind);
+      return next;
+    });
+  }, []);
+
+  // An edge is shown unless its kind has been filtered out (unknown kinds — e.g.
+  // a legacy "dep" — always show so nothing silently vanishes).
+  const visibleEdges = useMemo(
+    () =>
+      repoEdges.filter(
+        (e) => !e.kind || !(KINDS as readonly string[]).includes(e.kind) || activeKinds.has(e.kind),
+      ),
+    [repoEdges, activeKinds],
+  );
 
   // Seed the profile pane once so the repo map starts useful, while still
   // letting the user close the pane afterwards.
@@ -78,43 +137,42 @@ export function RepoGraph() {
   }, [repoProfiles, selectedId]);
 
   const layout = useMemo(() => {
-    const ids = repoProfiles.map((p) => p.repo_id);
-    const depsOf = (id: number) =>
-      repoEdges.filter((e) => e.from === id).map((e) => e.to).filter((to) => ids.includes(to));
-    const memo = new Map<number, number>();
-    const depth = (id: number, seen = new Set<number>()): number => {
-      const m = memo.get(id);
-      if (m != null) return m;
-      if (seen.has(id)) return 0; // cycle guard
-      seen.add(id);
-      const ds = depsOf(id);
-      const d = ds.length === 0 ? 0 : 1 + Math.max(...ds.map((to) => depth(to, seen)));
-      memo.set(id, d);
-      return d;
-    };
-
-    const cols = new Map<number, number[]>();
+    const dependents = (id: number) => repoEdges.filter((e) => e.to === id).length;
+    // Bucket repos into tier bands; within a band, the most-depended-on first.
+    const bands = new Map<Band, RepoProfile[]>();
     for (const p of repoProfiles) {
-      const d = depth(p.repo_id);
-      const arr = cols.get(d) ?? [];
-      arr.push(p.repo_id);
-      cols.set(d, arr);
+      const band = bandOf(p.tier);
+      const arr = bands.get(band) ?? [];
+      arr.push(p);
+      bands.set(band, arr);
     }
-    const maxDepth = Math.max(0, ...[...cols.keys()]);
-    const maxRows = Math.max(1, ...[...cols.values()].map((a) => a.length));
+    for (const arr of bands.values()) {
+      arr.sort((a, b) => dependents(b.repo_id) - dependents(a.repo_id) || a.repo_name.localeCompare(b.repo_name));
+    }
+    const visibleBands = BANDS.filter((b) => (bands.get(b)?.length ?? 0) > 0);
 
-    const pos = new Map<number, { x: number; y: number }>();
-    for (let d = 0; d <= maxDepth; d++) {
-      const col = cols.get(d) ?? [];
-      const offset = ((maxRows - col.length) * (NODE_H + ROW_GAP)) / 2;
-      col.forEach((id, i) => {
-        pos.set(id, { x: PAD + d * (NODE_W + COL_GAP), y: PAD + offset + i * (NODE_H + ROW_GAP) });
-      });
-    }
-    const width = PAD * 2 + (maxDepth + 1) * NODE_W + maxDepth * COL_GAP;
-    const height = PAD * 2 + maxRows * (NODE_H + ROW_GAP) - ROW_GAP;
-    return { pos, width, height };
-  }, [repoProfiles, repoEdges]);
+    const bandHeight = (b: Band) => {
+      const arr = bands.get(b) ?? [];
+      return arr.reduce((sum, p) => sum + nodeHeight(p, mode) + ROW_GAP, 0) - ROW_GAP;
+    };
+    const maxH = Math.max(0, ...visibleBands.map(bandHeight));
+
+    const pos = new Map<number, { x: number; y: number; w: number; h: number }>();
+    visibleBands.forEach((b, col) => {
+      const arr = bands.get(b) ?? [];
+      const x = PAD + col * (NODE_W + COL_GAP);
+      let y = PAD + (maxH - bandHeight(b)) / 2;
+      for (const p of arr) {
+        const h = nodeHeight(p, mode);
+        pos.set(p.repo_id, { x, y, w: NODE_W, h });
+        y += h + ROW_GAP;
+      }
+    });
+
+    const width = Math.max(NODE_W + PAD * 2, PAD * 2 + visibleBands.length * NODE_W + Math.max(0, visibleBands.length - 1) * COL_GAP);
+    const height = PAD * 2 + Math.max(NODE_H, maxH);
+    return { pos, width, height, bands: visibleBands };
+  }, [repoProfiles, repoEdges, mode]);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(1);
@@ -152,8 +210,6 @@ export function RepoGraph() {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       const rect = el.getBoundingClientRect();
-      // zoom proportional to the scroll delta so a trackpad's many small events
-      // stay gentle; clamp the per-event delta so a mouse wheel can't jump.
       const dy = Math.max(-50, Math.min(50, e.deltaY));
       zoomAt(e.clientX - rect.left, e.clientY - rect.top, Math.exp(-dy * 0.0045));
     };
@@ -168,7 +224,6 @@ export function RepoGraph() {
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
-    // let node interactions (re-profile) and the zoom controls through; only the background pans
     if ((e.target as HTMLElement).closest("[data-repo-node], [data-graph-controls]")) return;
     drag.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y };
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -189,6 +244,8 @@ export function RepoGraph() {
     }
   };
 
+  const anyComponents = repoProfiles.some((p) => p.components.length > 0);
+
   return (
     <div className="flex h-full min-h-0 w-full gap-3 bg-bg p-4">
       <div
@@ -199,6 +256,22 @@ export function RepoGraph() {
         onPointerLeave={endDrag}
         className="relative min-w-0 flex-1 cursor-grab select-none overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface/35 [touch-action:none] active:cursor-grabbing"
       >
+        {/* Tier band headers — fixed in canvas space so they track pan/zoom. */}
+        <div
+          className="pointer-events-none absolute left-0 top-0 origin-top-left"
+          style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+        >
+          {layout.bands.map((b, col) => (
+            <div
+              key={b}
+              className="absolute text-[10.5px] font-medium uppercase tracking-wide text-ink-faint"
+              style={{ left: PAD + col * (NODE_W + COL_GAP), top: 0, width: NODE_W }}
+            >
+              {t(`repomap.tier_${b}`, b)}
+            </div>
+          ))}
+        </div>
+
         <div
           className="absolute left-0 top-0 origin-top-left"
           style={{
@@ -209,37 +282,24 @@ export function RepoGraph() {
         >
           <svg className="absolute inset-0" width={layout.width} height={layout.height} fill="none">
             <defs>
-              <marker
-                id="weft-arrow"
-                viewBox="0 0 8 8"
-                refX="6"
-                refY="4"
-                markerWidth="6"
-                markerHeight="6"
-                orient="auto-start-reverse"
-              >
+              <marker id="weft-arrow" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
                 <path d="M0 0 L8 4 L0 8 z" className="fill-border-strong" />
               </marker>
-              <marker
-                id="weft-arrow-active"
-                viewBox="0 0 8 8"
-                refX="6"
-                refY="4"
-                markerWidth="6"
-                markerHeight="6"
-                orient="auto-start-reverse"
-              >
+              <marker id="weft-arrow-active" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
                 <path d="M0 0 L8 4 L0 8 z" className="fill-brand" />
               </marker>
             </defs>
-            {repoEdges.map((e, i) => {
-              const dependent = layout.pos.get(e.from);
-              const dependency = layout.pos.get(e.to);
-              if (!dependent || !dependency) return null;
-              const x1 = dependency.x + NODE_W;
-              const y1 = dependency.y + NODE_H / 2;
-              const x2 = dependent.x;
-              const y2 = dependent.y + NODE_H / 2;
+            {visibleEdges.map((e, i) => {
+              const a = layout.pos.get(e.from);
+              const b = layout.pos.get(e.to);
+              if (!a || !b) return null;
+              // Exit `from` on the side facing `to`, enter `to` on the side facing
+              // `from`; arrow points at the dependency (`to`).
+              const fromLeftOfTo = a.x + a.w / 2 < b.x + b.w / 2;
+              const x1 = fromLeftOfTo ? a.x + a.w : a.x;
+              const x2 = fromLeftOfTo ? b.x : b.x + b.w;
+              const y1 = a.y + a.h / 2;
+              const y2 = b.y + b.h / 2;
               const mx = (x1 + x2) / 2;
               const active = selectedId === e.from || selectedId === e.to;
               return (
@@ -258,90 +318,100 @@ export function RepoGraph() {
           {repoProfiles.map((p) => {
             const pt = layout.pos.get(p.repo_id);
             if (!pt) return null;
-            const Icon = ROLE_ICON[p.role] ?? CircleDashed;
             const dependents = repoEdges.filter((e) => e.to === p.repo_id).length;
-            const core = dependents >= 2;
             const selected = selectedId === p.repo_id;
-            return (
-              <div
+            const onSelect = () => {
+              setSelectedId(p.repo_id);
+              setProfileOpen(true);
+            };
+            const expanded = mode === "expanded" && p.components.length > 0;
+            return expanded ? (
+              <ExpandedNode
                 key={p.repo_id}
-                data-repo-node
-                onClick={() => {
-                  setSelectedId(p.repo_id);
-                  setProfileOpen(true);
-                }}
-                className={cn(
-                  "group absolute flex flex-col gap-2 overflow-hidden rounded-[var(--radius-md)] border bg-surface px-3 py-2.5 text-left transition-[transform,border-color,background-color] hover:-translate-y-px",
-                  selected
-                    ? "border-brand/60 bg-brand-ghost/60"
-                    : core
-                      ? "border-accent/50"
-                      : "border-border hover:border-border-strong",
-                )}
-                style={{ left: pt.x, top: pt.y, width: NODE_W, height: NODE_H }}
-              >
-                <div className="flex items-center gap-1.5">
-                  <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
-                    <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
-                  </span>
-                  <span
-                    title={p.repo_name}
-                    className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink"
-                  >
-                    {p.repo_name}
-                  </span>
-                  {p.stale && (
-                    <span
-                      title={t("repomap.staleTitle")}
-                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-waiting"
-                    />
-                  )}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void reprofileRepo(p.repo_id);
-                    }}
-                    aria-label={t("repomap.reprofile")}
-                    title={t("repomap.reprofile")}
-                    className="grid h-5 w-5 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity hover:bg-brand-ghost hover:text-ink group-hover:opacity-100"
-                  >
-                    <RefreshCw size={11} />
-                  </button>
-                </div>
-
-                <NodeBadges role={p.role} stack={p.stack} core={core} dependents={dependents} />
-
-                <NodeSummary profile={p} />
-              </div>
+                profile={p}
+                pt={pt}
+                selected={selected}
+                onSelect={onSelect}
+                onReprofile={() => void reprofileRepo(p.repo_id)}
+              />
+            ) : (
+              <RepoNode
+                key={p.repo_id}
+                profile={p}
+                pt={pt}
+                selected={selected}
+                dependents={dependents}
+                showPkgs={mode === "expanded"}
+                onSelect={onSelect}
+                onReprofile={() => void reprofileRepo(p.repo_id)}
+              />
             );
           })}
         </div>
 
+        {/* Bottom toolbar: analyze / calibrate / view mode + kind filter / zoom. */}
         <div className="pointer-events-none absolute inset-x-4 bottom-4 flex items-end justify-between gap-3">
-          <div className="pointer-events-none flex items-center gap-2">
-            <button
-              data-graph-controls
-              onClick={() => {
-                if (analyzing) return;
-                setAnalyzing(true);
-                void reanalyzeDeps().finally(() => setAnalyzing(false));
-              }}
-              disabled={analyzing}
-              title={t("repomap.reanalyzeHint")}
-              className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
-            >
-              <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
-              {analyzing ? t("repomap.reanalyzing") : t("repomap.reanalyze")}
-            </button>
-            <button
-              data-graph-controls
-              onClick={() => void openCuratorChat()}
-              title={t("repomap.calibrateHint")}
-              className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink"
-            >
-              <MessagesSquare size={12} />
-              {t("repomap.calibrate")}
-            </button>
+          <div className="pointer-events-none flex flex-col items-start gap-2">
+            <div className="pointer-events-none flex items-center gap-2">
+              <button
+                data-graph-controls
+                onClick={() => {
+                  if (analyzing) return;
+                  setAnalyzing(true);
+                  void reanalyzeDeps().finally(() => setAnalyzing(false));
+                }}
+                disabled={analyzing}
+                title={t("repomap.reanalyzeHint")}
+                className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
+              >
+                <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
+                {analyzing ? t("repomap.reanalyzing") : t("repomap.reanalyze")}
+              </button>
+              <button
+                data-graph-controls
+                onClick={() => void openCuratorChat()}
+                title={t("repomap.calibrateHint")}
+                className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink"
+              >
+                <MessagesSquare size={12} />
+                {t("repomap.calibrate")}
+              </button>
+              {anyComponents && (
+                <div
+                  data-graph-controls
+                  className="pointer-events-auto flex items-center gap-0.5 rounded-[var(--radius-md)] border border-border bg-raised p-0.5 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
+                >
+                  <ModeBtn active={mode === "overview"} onClick={() => setMode("overview")} icon={Boxes}>
+                    {t("repomap.viewOverview")}
+                  </ModeBtn>
+                  <ModeBtn active={mode === "expanded"} onClick={() => setMode("expanded")} icon={Layers}>
+                    {t("repomap.viewExpanded")}
+                  </ModeBtn>
+                </div>
+              )}
+            </div>
+            {repoEdges.length > 0 && (
+              <div
+                data-graph-controls
+                className="pointer-events-auto flex items-center gap-1 rounded-[var(--radius-md)] border border-border bg-raised px-1.5 py-1 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
+              >
+                {KINDS.map((kind) => (
+                  <button
+                    key={kind}
+                    onClick={() => toggleKind(kind)}
+                    title={t("repomap.filterKind", { kind })}
+                    className={cn(
+                      "rounded px-1.5 py-0.5 text-[10px] font-medium uppercase transition-colors",
+                      activeKinds.has(kind)
+                        ? "bg-brand-ghost text-brand"
+                        : "text-ink-faint line-through hover:text-ink-muted",
+                    )}
+                  >
+                    {kind}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
           <div
             data-graph-controls
@@ -385,6 +455,190 @@ export function RepoGraph() {
   );
 }
 
+/** A standard repo node (overview, or expanded mode for a single-component repo). */
+function RepoNode({
+  profile: p,
+  pt,
+  selected,
+  dependents,
+  showPkgs,
+  onSelect,
+  onReprofile,
+}: {
+  profile: RepoProfile;
+  pt: { x: number; y: number; w: number; h: number };
+  selected: boolean;
+  dependents: number;
+  showPkgs: boolean;
+  onSelect: () => void;
+  onReprofile: () => void;
+}) {
+  const { t } = useTranslation();
+  const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
+  const core = dependents >= 2;
+  return (
+    <div
+      data-repo-node
+      onClick={onSelect}
+      className={cn(
+        "group absolute flex flex-col gap-2 overflow-hidden rounded-[var(--radius-md)] border bg-surface px-3 py-2.5 text-left transition-[transform,border-color,background-color] hover:-translate-y-px",
+        selected
+          ? "border-brand/60 bg-brand-ghost/60"
+          : core
+            ? "border-accent/50"
+            : "border-border hover:border-border-strong",
+        !p.analyzed && "border-dashed opacity-80",
+      )}
+      style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
+    >
+      <div className="flex items-center gap-1.5">
+        <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
+          {p.analyzed ? (
+            <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
+          ) : (
+            <Loader2 size={12} className="animate-spin text-ink-faint" />
+          )}
+        </span>
+        <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
+          {p.repo_name}
+        </span>
+        {p.stale && (
+          <span title={t("repomap.staleTitle")} className="h-1.5 w-1.5 shrink-0 rounded-full bg-waiting" />
+        )}
+        {showPkgs && p.components.length > 0 && (
+          <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
+            {t("repomap.pkgCount", { count: p.components.length })}
+          </span>
+        )}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onReprofile();
+          }}
+          aria-label={t("repomap.reprofile")}
+          title={t("repomap.reprofile")}
+          className="grid h-5 w-5 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity hover:bg-brand-ghost hover:text-ink group-hover:opacity-100"
+        >
+          <RefreshCw size={11} />
+        </button>
+      </div>
+
+      {p.analyzed ? (
+        <>
+          <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
+          <NodeSummary profile={p} />
+        </>
+      ) : (
+        <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>
+      )}
+    </div>
+  );
+}
+
+/** A monorepo container (expanded view): the repo's components grouped by tier. */
+function ExpandedNode({
+  profile: p,
+  pt,
+  selected,
+  onSelect,
+  onReprofile,
+}: {
+  profile: RepoProfile;
+  pt: { x: number; y: number; w: number; h: number };
+  selected: boolean;
+  onSelect: () => void;
+  onReprofile: () => void;
+}) {
+  const { t } = useTranslation();
+  const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
+  return (
+    <div
+      data-repo-node
+      onClick={onSelect}
+      className={cn(
+        "group absolute flex flex-col overflow-hidden rounded-[var(--radius-md)] border bg-surface text-left",
+        selected ? "border-brand/60 bg-brand-ghost/40" : "border-border hover:border-border-strong",
+      )}
+      style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
+    >
+      <div className="flex items-center gap-1.5 border-b border-border px-3 py-2">
+        <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
+          <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
+        </span>
+        <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
+          {p.repo_name}
+        </span>
+        <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
+          {t("repomap.pkgCount", { count: p.components.length })}
+        </span>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onReprofile();
+          }}
+          aria-label={t("repomap.reprofile")}
+          title={t("repomap.reprofile")}
+          className="grid h-5 w-5 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity hover:bg-brand-ghost hover:text-ink group-hover:opacity-100"
+        >
+          <RefreshCw size={11} />
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden px-2 py-1.5">
+        {groupComponents(p.components).map(([band, comps]) => {
+          const TierIcon = TIER_ICON[band] ?? CircleDashed;
+          return (
+            <div key={band} className="mb-1">
+              <div className="flex items-center gap-1 px-1 text-[9.5px] font-medium uppercase tracking-wide text-ink-faint">
+                <TierIcon size={9} />
+                {t(`repomap.tier_${band}`, band)}
+              </div>
+              {comps.map((c) => (
+                <div
+                  key={c.name}
+                  title={c.summary || c.name}
+                  className="mt-0.5 flex items-center gap-1.5 rounded border border-border/70 bg-bg px-1.5 py-1"
+                >
+                  <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink">{c.name}</span>
+                  {c.deps.length > 0 && (
+                    <span className="shrink-0 truncate text-[9.5px] text-ink-faint" title={c.deps.join(", ")}>
+                      → {c.deps.join(", ")}
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ModeBtn({
+  active,
+  onClick,
+  icon: Icon,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: ComponentType<LucideProps>;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors",
+        active ? "bg-brand-ghost text-brand" : "text-ink-muted hover:text-ink",
+      )}
+    >
+      <Icon size={12} />
+      {children}
+    </button>
+  );
+}
+
 function RepoProfilePane({
   profile,
   profiles,
@@ -412,7 +666,7 @@ function RepoProfilePane({
     .filter((e) => e.to === profile.repo_id)
     .map((e) => ({ edge: e, repo: profiles.find((p) => p.repo_id === e.from) }))
     .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
-  const Icon = ROLE_ICON[profile.role] ?? CircleDashed;
+  const Icon = TIER_ICON[bandOf(profile.tier)] ?? CircleDashed;
 
   return (
     <aside className="flex w-[320px] shrink-0 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
@@ -423,12 +677,8 @@ function RepoProfilePane({
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <h2 className="truncate font-mono text-[16px] font-semibold text-ink">
-                {profile.repo_name}
-              </h2>
-              <span className="shrink-0 rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-ink-muted">
-                {t(`repomap.role_${profile.role}`, profile.role)}
-              </span>
+              <h2 className="truncate font-mono text-[16px] font-semibold text-ink">{profile.repo_name}</h2>
+              <TierBadge profile={profile} />
             </div>
             {profile.stale && (
               <span className="mt-1 inline-flex text-[11px] text-waiting">{t("repomap.stale")}</span>
@@ -460,24 +710,37 @@ function RepoProfilePane({
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto px-4 py-4">
+        {!profile.analyzed && (
+          <div className="mb-4 flex items-center gap-2 rounded-[var(--radius-md)] border border-dashed border-border bg-bg px-3 py-2 text-[12px] text-ink-faint">
+            <Loader2 size={13} className="animate-spin" />
+            {t("repomap.analyzing")}
+          </div>
+        )}
+
         <ProfileSection title={t("repomap.oneLine")}>
           <NodeSummary profile={profile} />
         </ProfileSection>
 
         <div className="grid grid-cols-2 gap-3">
-          <ProfileSection title={t("repomap.stack")}>
-            <ChipList values={profile.stack} empty={t("repomap.none")} mono />
+          <ProfileSection title={t("repomap.tier")}>
+            <TierPicker profile={profile} />
           </ProfileSection>
           <ProfileSection title={t("repomap.source")}>
             <span className="text-[13px] text-ink-muted">
-              {t(`repomap.source_${profile.source}`, profile.source)}
+              {profile.source ? t(`repomap.source_${profile.source}`, profile.source) : t("repomap.none")}
             </span>
           </ProfileSection>
         </div>
 
-        <ProfileSection title={t("repomap.published")}>
-          <ChipList values={profile.published} empty={t("repomap.none")} mono />
+        <ProfileSection title={t("repomap.stack")}>
+          <ChipList values={profile.stack} empty={t("repomap.none")} mono />
         </ProfileSection>
+
+        {profile.components.length > 0 && (
+          <ProfileSection title={t("repomap.components")}>
+            <ComponentList components={profile.components} />
+          </ProfileSection>
+        )}
 
         <ProfileSection title={t("repomap.dependsOn")}>
           <RepoLinks items={deps} empty={t("repomap.noDeps")} onSelect={onSelect} />
@@ -498,9 +761,7 @@ function RepoProfilePane({
 
       <Dialog open={confirmDelete} onOpenChange={(o) => !deleting && setConfirmDelete(o)}>
         <DialogContent title={t("repomap.deleteRepoTitle", { name: profile.repo_name })}>
-          <p className="text-[13px] leading-relaxed text-ink-muted">
-            {t("repomap.deleteRepoBody")}
-          </p>
+          <p className="text-[13px] leading-relaxed text-ink-muted">{t("repomap.deleteRepoBody")}</p>
           <div className="mt-4 flex justify-end gap-2">
             <Button variant="ghost" disabled={deleting} onClick={() => setConfirmDelete(false)}>
               {t("common.cancel")}
@@ -521,6 +782,64 @@ function RepoProfilePane({
         </DialogContent>
       </Dialog>
     </aside>
+  );
+}
+
+function TierBadge({ profile }: { profile: RepoProfile }) {
+  const { t } = useTranslation();
+  const label = profile.tier
+    ? t(`repomap.tier_${profile.tier}`, profile.tier)
+    : t("repomap.tier_other");
+  return (
+    <span className="shrink-0 rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-ink-muted">
+      {label}
+    </span>
+  );
+}
+
+/** Calibrate a repo's tier (a user pick is pinned, outranking the agent). */
+function TierPicker({ profile }: { profile: RepoProfile }) {
+  const { editRepoProfile } = useStore();
+  const { t } = useTranslation();
+  return (
+    <select
+      value={(TIER_ORDER as readonly string[]).includes(profile.tier) ? profile.tier : ""}
+      onChange={(e) => void editRepoProfile(profile.repo_id, profile.summary, e.currentTarget.value)}
+      className="w-full rounded border border-border bg-bg px-1.5 py-1 text-[12.5px] text-ink outline-none focus:border-brand/60"
+    >
+      <option value="">{t("repomap.tier_other")}</option>
+      {TIER_ORDER.map((tier) => (
+        <option key={tier} value={tier}>
+          {t(`repomap.tier_${tier}`)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function ComponentList({ components }: { components: RepoComponent[] }) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex flex-col gap-1.5">
+      {components.map((c) => {
+        const Icon = TIER_ICON[bandOf(c.tier)] ?? CircleDashed;
+        return (
+          <div key={c.name} className="rounded-[var(--radius-md)] border border-border bg-bg px-2.5 py-2">
+            <div className="flex items-center gap-1.5">
+              <Icon size={11} className="shrink-0 text-ink-faint" />
+              <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">{c.name}</span>
+              <span className="shrink-0 text-[10px] uppercase text-ink-faint">
+                {c.tier ? t(`repomap.tier_${c.tier}`, c.tier) : t("repomap.tier_other")}
+              </span>
+            </div>
+            {c.summary && <p className="mt-0.5 text-[11px] leading-snug text-ink-muted">{c.summary}</p>}
+            {c.deps.length > 0 && (
+              <p className="mt-0.5 text-[10.5px] text-ink-faint">{t("repomap.via", { via: c.deps.join(", ") })}</p>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -545,20 +864,18 @@ function EmptyProfilePane() {
     <aside className="flex w-[320px] shrink-0 flex-col items-center justify-center rounded-[var(--radius-lg)] border border-border bg-surface px-5 text-center">
       <CircleDashed size={22} className="text-ink-faint" />
       <p className="mt-3 text-[13px] font-medium text-ink">{t("repomap.selectRepo")}</p>
-      <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">
-        {t("repomap.selectRepoBody")}
-      </p>
+      <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">{t("repomap.selectRepoBody")}</p>
     </aside>
   );
 }
 
 function NodeBadges({
-  role,
+  tier,
   stack,
   core,
   dependents,
 }: {
-  role: string;
+  tier: string;
   stack: string[];
   core: boolean;
   dependents: number;
@@ -566,12 +883,12 @@ function NodeBadges({
   const { t } = useTranslation();
   const visibleStack = stack.slice(0, 2);
   const hiddenStack = stack.slice(2);
-  const roleLabel = t(`repomap.role_${role}`, role);
+  const tierLabel = tier ? t(`repomap.tier_${tier}`, tier) : t("repomap.tier_other");
 
   return (
     <div className="flex min-h-[20px] min-w-0 items-center gap-1 overflow-hidden">
-      <MiniPill title={roleLabel} rounded>
-        {roleLabel}
+      <MiniPill title={tierLabel} rounded>
+        {tierLabel}
       </MiniPill>
       {visibleStack.map((s) => (
         <MiniPill key={s} title={s} mono>
@@ -620,13 +937,7 @@ function MiniPill({
   );
 }
 
-function ProfileSection({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
+function ProfileSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="mb-4">
       <h3 className="mb-1.5 text-[11px] font-medium uppercase text-ink-faint">{title}</h3>
@@ -678,8 +989,7 @@ function RepoLinks({
           <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">
             {reverse ? `${repo.repo_name}` : repo.repo_name}
           </span>
-          {/* Non-"lib" kinds are agent-inferred runtime/infra links — badge them. */}
-          {edge.kind && edge.kind !== "lib" && (
+          {edge.kind && (
             <span className="shrink-0 rounded bg-brand-ghost px-1.5 py-0.5 text-[10px] font-medium uppercase text-brand">
               {edge.kind}
             </span>
@@ -706,7 +1016,7 @@ function NodeSummary({ profile }: { profile: RepoProfile }) {
     setEditing(false);
     const next = text.trim();
     if (next === profile.summary) return;
-    await editRepoProfile(profile.repo_id, next, profile.role);
+    await editRepoProfile(profile.repo_id, next, profile.tier);
   }
 
   if (editing) {

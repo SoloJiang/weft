@@ -116,12 +116,14 @@ async fn register_repo(
             r = updated;
         }
     }
-    // Eager, deterministic profiling (ARCHITECTURE §4.9): best-effort, never
-    // blocks adding the repo if inference/git hiccups.
-    let _ = crate::curator::profile_repo(db, &r).await;
-    // Fire-and-forget the agent curator over the whole workspace so cross-repo
-    // runtime/infra relations refresh with the new repo. Read-only, coalesced
-    // (a batch add runs one pass), and best-effort — it never blocks the add.
+    // The curator is agent-only now (ARCHITECTURE §4.9): there is no deterministic
+    // profiling on add. The repo shows as an "analyzing" placeholder node until
+    // the read-only agent classifies it below.
+    //
+    // Fire-and-forget the agent curator over the whole workspace so the new repo
+    // gets a deep per-repo classification and cross-repo relations refresh.
+    // Read-only, coalesced (a batch add runs one pass), and best-effort — it
+    // never blocks the add.
     let db_bg = db.clone();
     let ws = r.workspace_id;
     tauri::async_runtime::spawn(async move {
@@ -208,13 +210,16 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
     crate::curator::graph(&db, workspace_id).await.map_err(e)
 }
 
+/// Re-run the deep, read-only agent classification for a single repo (tier +
+/// summary + components). Slow (spawns the agent); the caller refreshes the map
+/// after it resolves.
 #[tauri::command]
 pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     let r = repo::get_repo(&db, repo_id)
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
-    crate::curator::profile_repo(&db, &r).await.map_err(e)?;
+    crate::curator::profile_repo_agent(&db, &r).await.map_err(e)?;
     Ok(())
 }
 
@@ -269,9 +274,9 @@ pub async fn update_repo_profile(
     db: State<'_, Db>,
     repo_id: i32,
     summary: String,
-    role: String,
+    tier: String,
 ) -> R<()> {
-    crate::curator::edit_profile(&db, repo_id, &summary, &role)
+    crate::curator::edit_profile(&db, repo_id, &summary, &tier)
         .await
         .map_err(e)?;
     Ok(())

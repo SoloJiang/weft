@@ -78,8 +78,8 @@ export const api = {
   // Get-or-create the workspace's hidden curator-chat thread; returns its id.
   openCuratorChat: (workspaceId: number) =>
     invoke<number>("open_curator_chat", { workspaceId }),
-  updateRepoProfile: (repoId: number, summary: string, role: string) =>
-    invoke<void>("update_repo_profile", { repoId, summary, role }),
+  updateRepoProfile: (repoId: number, summary: string, tier: string) =>
+    invoke<void>("update_repo_profile", { repoId, summary, tier }),
 
   listThreads: (workspaceId: number) =>
     invoke<Thread[]>("list_threads", { workspaceId }),
