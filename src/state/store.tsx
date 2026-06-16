@@ -1570,11 +1570,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // (the curator thread is in `threads` but hidden from the board/nav lists).
   // Reuses selectThread so it renders exactly like any lead chat.
   const openCuratorChat = useCallback(async () => {
-    if (activeWorkspaceId == null) return;
-    const id = await api.openCuratorChat(activeWorkspaceId);
+    const ws = activeWorkspaceId;
+    if (ws == null) return;
+    const id = await api.openCuratorChat(ws);
+    const list = await api.listThreads(ws);
+    // If the user switched workspaces while these requests were in flight, don't
+    // write ws's thread list or navigate to ws's curator thread in the new view.
+    if (activeWorkspaceIdRef.current !== ws) return;
     // The curator thread may have just been created — sync `threads` so
     // ThreadBoard can find it (it bails to null on a missing active thread).
-    setThreads(await api.listThreads(activeWorkspaceId));
+    setThreads(list);
     await selectThread(id);
   }, [activeWorkspaceId, selectThread]);
 

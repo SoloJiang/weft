@@ -378,27 +378,29 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
 /// Apply one human calibration: validate ids, write a user-sourced relation (or
 /// removal tombstone), then emit `repo-graph-updated` so the repo map refreshes.
 async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
+    const KINDS: [&str; 5] = ["http", "grpc", "queue", "infra", "lib"];
     let from = args.get("from").and_then(|v| v.as_i64()).map(|n| n as i32);
     let to = args.get("to").and_then(|v| v.as_i64()).map(|n| n as i32);
     let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let via = args.get("via").and_then(|v| v.as_str()).unwrap_or("");
-    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("add");
     let (Some(from), Some(to)) = (from, to) else {
         return text_result("from and to repo ids are required".into());
     };
     if from == to {
         return text_result("from and to must be different repos".into());
     }
-    if kind.is_empty() {
-        return text_result("kind is required (http|grpc|queue|infra|lib)".into());
+    // Validate kind against the allowed set: relations are keyed by (to, kind), so
+    // a misspelling like "HTTP" would silently fail to match the visible edge.
+    if !KINDS.contains(&kind) {
+        return text_result("kind must be one of: http, grpc, queue, infra, lib".into());
     }
-    // Validate action server-side: the store treats anything but "remove" as an
-    // add, so a misspelled "remove" would silently pin instead of erroring.
-    if action != "add" && action != "remove" {
-        return text_result(format!(
-            "invalid action {action:?}; use \"add\" or \"remove\""
-        ));
-    }
+    // Action is REQUIRED and must be add|remove. The store treats anything but
+    // "remove" as an add, so a missing/misspelled action must be rejected here
+    // rather than silently pinning the opposite of what the caller intended.
+    let action = match args.get("action").and_then(|v| v.as_str()) {
+        Some(a @ ("add" | "remove")) => a,
+        _ => return text_result("action is required and must be \"add\" or \"remove\"".into()),
+    };
     // Validate the ids belong to THIS curator's workspace, so a stale/hallucinated
     // id can't pin or remove relations on an unrelated workspace's repo.
     let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await else {

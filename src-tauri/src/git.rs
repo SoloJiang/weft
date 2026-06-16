@@ -567,12 +567,17 @@ pub fn git_url_key(url: &str) -> String {
         return String::new();
     }
     // Trim trailing slashes BEFORE `.git` so `repo.git/` and `repo` key the same.
+    // The `is_char_boundary` guard keeps the slice char-safe — a Unicode path
+    // component like `host:éabc` must never panic on a non-ASCII byte boundary.
     let no_slash = url.trim_end_matches('/');
-    let base = if no_slash.len() >= 4 && no_slash[no_slash.len() - 4..].eq_ignore_ascii_case(".git")
-    {
-        &no_slash[..no_slash.len() - 4]
-    } else {
-        no_slash
+    let cut = no_slash.len().checked_sub(4);
+    let base = match cut {
+        Some(i)
+            if no_slash.is_char_boundary(i) && no_slash[i..].eq_ignore_ascii_case(".git") =>
+        {
+            &no_slash[..i]
+        }
+        _ => no_slash,
     };
     // Lowercase the host; keep any userinfo / ssh user (case-sensitive).
     let lower_host = |authority: &str| match authority.rfind('@') {
@@ -669,6 +674,15 @@ mod tests {
         assert_eq!(git_url_key("git@GitHub.com:acme/api.git"), s);
         assert_ne!(s, k); // scp and scheme spellings don't unify — and shouldn't here
         assert_eq!(git_url_key(""), "");
+    }
+
+    #[test]
+    fn git_url_key_handles_unicode_suffix_without_panic() {
+        // A non-ASCII tail whose last 4 bytes aren't a char boundary must not
+        // panic the `.git` strip (regression for byte-slicing).
+        assert_eq!(git_url_key("git@host:éabc"), "git@host:éabc");
+        // A real .git after Unicode still strips cleanly.
+        assert_eq!(git_url_key("https://host/é-repo.git"), "https://host/é-repo");
     }
 
     #[test]

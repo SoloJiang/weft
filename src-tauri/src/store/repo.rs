@@ -510,6 +510,18 @@ pub async fn set_repo_remote(db: &Db, repo_id: i32, remote_url: &str) -> Result<
     Ok(())
 }
 
+/// Repoint a repo at a new local checkout path. Used when remote-dedup matches a
+/// row whose old checkout has gone missing — we keep the fresh clone and update
+/// the row rather than orphaning the user. Returns the updated row; None if gone.
+pub async fn set_repo_path(db: &Db, repo_id: i32, local_git_path: &str) -> Result<Option<repo_ref::Model>> {
+    if let Some(m) = repo_ref::Entity::find_by_id(repo_id).one(&db.0).await? {
+        let mut a: repo_ref::ActiveModel = m.into();
+        a.local_git_path = Set(local_git_path.to_string());
+        return Ok(Some(a.update(&db.0).await?));
+    }
+    Ok(None)
+}
+
 /// Apply one human calibration to a producer repo's relations. `action="add"`
 /// upserts a user-sourced relation for `(to, kind)`; `action="remove"` writes a
 /// user `rejected` tombstone for that pair so the edge disappears and the auto

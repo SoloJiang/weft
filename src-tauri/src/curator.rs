@@ -390,12 +390,15 @@ async fn persist_relations(
                 rejected: false,
             });
     }
-    for (r, p) in profiled {
+    for (r, _) in profiled {
         let fresh = by_from.remove(&r.id).unwrap_or_default();
-        // Merge with this repo's current relations so human calibrations
-        // (`source="user"`) and removal tombstones survive the agent pass.
-        let existing: Vec<crate::profile::AgentRelation> =
-            serde_json::from_str(&p.relations).unwrap_or_default();
+        // Re-read the CURRENT relations (not the pre-run snapshot): the agent run
+        // can take up to ~180s, and a human may have calibrated an edge meanwhile.
+        // Reloading here preserves those user pins/tombstones across the merge.
+        let existing: Vec<crate::profile::AgentRelation> = repo::get_repo_profile(db, r.id)
+            .await?
+            .map(|p| serde_json::from_str(&p.relations).unwrap_or_default())
+            .unwrap_or_default();
         let merged = crate::profile::merge_relations(&existing, &fresh);
         let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
         repo::set_repo_relations(db, r.id, &json).await?;

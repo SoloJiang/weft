@@ -145,12 +145,22 @@ pub async fn clone_repo(
         .map_err(e)?;
     let r = register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await?;
     // If workspace dedup resolved to an EXISTING repo (same remote already
-    // present), the directory we just cloned is redundant and untracked — remove
-    // it rather than leaving an orphan clone on disk.
+    // present at a different path):
     let cloned = std::fs::canonicalize(&path).ok();
     let registered = std::fs::canonicalize(&r.local_git_path).ok();
     if cloned.is_some() && cloned != registered {
-        let _ = std::fs::remove_dir_all(&path);
+        if crate::git::is_git_repo(std::path::Path::new(&r.local_git_path)) {
+            // The existing checkout is live → the new clone is a true duplicate.
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            // The deduped repo's checkout is gone (moved/deleted) → keep the fresh
+            // clone and repoint the row to it instead of orphaning the user.
+            if let Ok(Some(updated)) =
+                repo::set_repo_path(&db, r.id, &path.to_string_lossy()).await
+            {
+                return Ok(updated);
+            }
+        }
     }
     Ok(r)
 }

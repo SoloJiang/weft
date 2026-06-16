@@ -188,7 +188,9 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   // success for repos that never reached the current workspace.
   useEffect(() => {
     setProgress((p) => (Object.keys(p).length ? {} : p));
-  }, [url, dest, activeWorkspaceId, path, localPaths]);
+    // `mode` is a dep too: switching clone↔local must clear stale "ok" rows, or
+    // runBatch would skip those indices and close without adding anything.
+  }, [url, dest, activeWorkspaceId, path, localPaths, mode]);
 
   // Switching workspace mid-batch aborts the in-flight import: its remaining
   // clones (and any late callbacks) target the submit-time workspace, so they
