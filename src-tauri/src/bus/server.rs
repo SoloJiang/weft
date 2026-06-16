@@ -366,7 +366,7 @@ fn curator_specs() -> Value {
 
 async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
     match name {
-        "get_repo_map" => match repo_map_json(db, thread).await {
+        "get_repo_map" => match curator_map_json(db, thread).await {
             Ok(v) => text_result(v),
             Err(e) => text_result(format!("error: {e}")),
         },
@@ -375,23 +375,56 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
     }
 }
 
+/// Like `repo_map_json`, but every node carries its full `local_git_path` — the
+/// curator agent must read each repo to find evidence, and the system-prompt
+/// repo list is capped/truncated, so paths can't be sourced from there alone.
+async fn curator_map_json(db: &Db, thread: i32) -> anyhow::Result<String> {
+    let t = crate::store::repo::get_thread(db, thread)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
+    let g = crate::curator::graph(db, t.workspace_id).await?;
+    let path_of: std::collections::HashMap<i32, String> =
+        crate::store::repo::list_repos(db, t.workspace_id)
+            .await?
+            .into_iter()
+            .map(|r| (r.id, r.local_git_path))
+            .collect();
+    let nodes: Vec<Value> = g
+        .nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "repo_id": n.repo_id,
+                "repo_name": n.repo_name,
+                "role": n.role,
+                "summary": n.summary,
+                "published": n.published,
+                "deps": n.deps,
+                "path": path_of.get(&n.repo_id).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(json!({ "nodes": nodes, "edges": g.edges }).to_string())
+}
+
 /// Apply one human calibration: validate ids, write a user-sourced relation (or
 /// removal tombstone), then emit `repo-graph-updated` so the repo map refreshes.
 async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
-    const KINDS: [&str; 5] = ["http", "grpc", "queue", "infra", "lib"];
-    let from = args.get("from").and_then(|v| v.as_i64()).map(|n| n as i32);
-    let to = args.get("to").and_then(|v| v.as_i64()).map(|n| n as i32);
+    // i32::try_from (not a lossy `as i32`): a huge id like 4294967297 must NOT
+    // wrap to a valid repo id and slip past the workspace membership check.
+    let from = args.get("from").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+    let to = args.get("to").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
     let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let via = args.get("via").and_then(|v| v.as_str()).unwrap_or("");
     let (Some(from), Some(to)) = (from, to) else {
-        return text_result("from and to repo ids are required".into());
+        return text_result("from and to must be valid repo ids from get_repo_map".into());
     };
     if from == to {
         return text_result("from and to must be different repos".into());
     }
     // Validate kind against the allowed set: relations are keyed by (to, kind), so
     // a misspelling like "HTTP" would silently fail to match the visible edge.
-    if !KINDS.contains(&kind) {
+    if !crate::profile::RELATION_KINDS.contains(&kind) {
         return text_result("kind must be one of: http, grpc, queue, infra, lib".into());
     }
     // Action is REQUIRED and must be add|remove. The store treats anything but

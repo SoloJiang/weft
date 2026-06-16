@@ -158,6 +158,10 @@ pub async fn clone_repo(
             if let Ok(Some(updated)) =
                 repo::set_repo_path(&db, r.id, &path.to_string_lossy()).await
             {
+                // register_repo already profiled the (stale) old path, leaving an
+                // empty profile; reprofile from the fresh checkout so the map and
+                // edges are correct without a manual refresh. Best-effort.
+                let _ = crate::curator::profile_repo(&db, &updated).await;
                 return Ok(updated);
             }
         }

@@ -378,12 +378,17 @@ async fn persist_relations(
         if rel.from == rel.to || !ids.contains(&rel.from) || !ids.contains(&rel.to) {
             continue;
         }
+        // Normalize the agent's kind to the canonical lowercase set; drop anything
+        // unrecognized so the graph can't carry an edge calibrate_edges can't match.
+        let Some(kind) = crate::profile::normalize_relation_kind(&rel.kind) else {
+            continue;
+        };
         by_from
             .entry(rel.from)
             .or_default()
             .push(crate::profile::AgentRelation {
                 to: rel.to,
-                kind: rel.kind.clone(),
+                kind,
                 via: rel.via.clone(),
                 confidence: rel.confidence,
                 source: "agent".to_string(),
@@ -417,13 +422,19 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
     let mut profiled: Vec<(repo_ref::Model, repo_profile::Model)> = Vec::new();
     for r in &repos {
         if let Some(p) = repo::get_repo_profile(db, r.id).await? {
-            profiled.push((r.clone(), p));
+            // Only analyze repos whose checkout still exists: a missing first repo
+            // would make `run_agent_once`'s cwd invalid and fail the whole pass,
+            // and the agent can't read a path that isn't there.
+            if Path::new(&r.local_git_path).exists() {
+                profiled.push((r.clone(), p));
+            }
         }
     }
     if profiled.len() < 2 {
         return Ok(());
     }
     let prompt = build_curator_prompt(&profiled);
+    // cwd is a live repo (the list is already filtered to existing paths).
     let cwd = Path::new(&profiled[0].0.local_git_path).to_path_buf();
     // Resolve the same effective default coding agent normal threads use, rather
     // than hard-coding claude (which would no-op for codex/opencode users).

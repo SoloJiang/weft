@@ -42,6 +42,19 @@ pub struct Edge {
     pub confidence: u8,
 }
 
+/// The cross-repo relation kinds the curator may assert. Inferred kinds are
+/// normalized to lowercase and dropped if not in this set, so the stored graph
+/// and `calibrate_edges` (which validates the same set) stay consistent — a
+/// stray `HTTP` can't render unremovably.
+pub const RELATION_KINDS: [&str; 5] = ["http", "grpc", "queue", "infra", "lib"];
+
+/// Lowercase + validate a relation kind against `RELATION_KINDS`. None if it
+/// isn't a recognized kind (caller drops it).
+pub fn normalize_relation_kind(kind: &str) -> Option<String> {
+    let k = kind.trim().to_ascii_lowercase();
+    RELATION_KINDS.contains(&k.as_str()).then_some(k)
+}
+
 /// One agent-inferred outgoing relation: this repo depends on workspace repo
 /// `to` via `kind` (http/grpc/queue/infra/lib), evidenced by `via`. `to` is a
 /// repo_ref id the agent picks from the provided workspace list, so no fuzzy
