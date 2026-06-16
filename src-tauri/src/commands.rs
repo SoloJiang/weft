@@ -466,6 +466,7 @@ pub async fn create_direction(
     repo_id: i32,
     reason: String,
     mandate: Option<String>,
+    base_branch: Option<String>,
 ) -> R<entities::direction::Model> {
     let dir = repo::create_direction(
         &db,
@@ -475,6 +476,7 @@ pub async fn create_direction(
         repo_id,
         &reason,
         mandate.as_deref().unwrap_or("plan+impl"),
+        base_branch.as_deref().unwrap_or(""),
     )
     .await
     .map_err(e)?;

@@ -28,6 +28,9 @@ pub struct ProposedDirection {
     /// Worker mandate: "plan+impl" (default) | "impl-only".
     #[serde(default)]
     pub mandate: String,
+    /// Branch in the target repo to branch the work off; empty = repo default.
+    #[serde(default)]
+    pub base_branch: String,
     /// Human decision on this write declaration: "" (pending) | "approved" | "denied".
     #[serde(default)]
     pub decision: String,
@@ -61,6 +64,7 @@ pub struct ResolvedDirection {
     pub reason: String,
     /// Worker mandate: "plan+impl" | "impl-only".
     pub mandate: String,
+    pub base_branch: String,
     pub decision: String,
 }
 
@@ -80,6 +84,7 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
         },
         reason: dir.reason.clone(),
         mandate: repo::normalize_mandate(&dir.mandate).to_string(),
+        base_branch: dir.base_branch.clone(),
         decision: dir.decision.clone(),
     }
 }
@@ -153,6 +158,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             d.repo.repo_id,
             &d.reason,
             &d.mandate,
+            &d.base_branch,
         )
         .await?;
         materialize::materialize_direction(db, dir.id).await?;
@@ -215,6 +221,7 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         resolved.repo.repo_id,
         &resolved.reason,
         &resolved.mandate,
+        &resolved.base_branch,
     )
     .await?;
     materialize::materialize_direction(db, dir.id).await?;
@@ -313,6 +320,7 @@ mod tests {
             repo: "api".into(),
             reason: "add the discount endpoint".into(),
             mandate: "".into(),
+            base_branch: "".into(),
             decision: "".into(),
         };
         let r = resolve(&d, &repos());
@@ -336,6 +344,7 @@ mod tests {
             repo: "ghost-repo".into(),
             reason: "whatever".into(),
             mandate: "impl-only".into(),
+            base_branch: "".into(),
             decision: "".into(),
         };
         let r = resolve(&d, &repos());
@@ -363,6 +372,7 @@ mod tests {
             repo: "api".into(),
             reason: "r".into(),
             mandate: "plan+impl".into(),
+            base_branch: "".into(),
             decision: "approved".into(),
         };
         let r = resolve(&d, &repos());
@@ -378,6 +388,7 @@ mod tests {
                     repo: "api".into(),
                     reason: "r".into(),
                     mandate: "".into(),
+                    base_branch: "".into(),
                     decision: "".into(),
                 },
                 &repos(),
@@ -388,6 +399,7 @@ mod tests {
                     repo: "api".into(),
                     reason: "r".into(),
                     mandate: "".into(),
+                    base_branch: "".into(),
                     decision: "approved".into(),
                 },
                 &repos(),
@@ -398,6 +410,7 @@ mod tests {
                     repo: "ghost".into(),
                     reason: "r".into(),
                     mandate: "".into(),
+                    base_branch: "".into(),
                     decision: "".into(),
                 },
                 &repos(),
@@ -469,6 +482,7 @@ mod tests {
                     repo: "api".into(),
                     reason: "add discount endpoint".into(),
                     mandate: "impl-only".into(),
+                    base_branch: "".into(),
                     decision: "".into(),
                 },
                 ProposedDirection {
@@ -476,6 +490,7 @@ mod tests {
                     repo: "nope".into(),
                     reason: "n/a".into(),
                     mandate: "".into(),
+                    base_branch: "".into(),
                     decision: "".into(),
                 },
             ],

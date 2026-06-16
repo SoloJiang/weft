@@ -571,6 +571,7 @@ pub async fn create_direction(
     repo_id: i32,
     reason: &str,
     mandate: &str,
+    base_branch: &str,
 ) -> Result<direction::Model> {
     let t = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
@@ -625,6 +626,8 @@ pub async fn create_direction(
         repo_id: Set(repo_id),
         reason: Set(reason.to_string()),
         mandate: Set(normalize_mandate(mandate).to_string()),
+        base_branch: Set(base_branch.trim().to_string()),
+        target_branch: Set(base_branch.trim().to_string()),
         created_at: Set(now()),
         ..Default::default()
     }
@@ -1431,7 +1434,7 @@ mod tests {
             .await
             .unwrap();
         // a direction bound to repo `a`, with a session + worktree
-        let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl")
+        let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl", "")
             .await
             .unwrap();
         let sess = create_session(&db, dir.id, a.id, "claude", "/tmp/a-wt")
@@ -1441,7 +1444,7 @@ mod tests {
             .await
             .unwrap();
         // a direction bound to repo `b` — must SURVIVE the delete of `a`
-        let dir_b = create_direction(&db, t.id, "db", "claude", b.id, "reason", "plan+impl")
+        let dir_b = create_direction(&db, t.id, "db", "claude", b.id, "reason", "plan+impl", "")
             .await
             .unwrap();
 
@@ -1846,6 +1849,7 @@ mod tests {
             repo.id,
             "build the feature",
             "plan+impl",
+            "",
         )
         .await
         .unwrap();
@@ -1893,7 +1897,7 @@ mod tests {
         let thread = create_thread(&db, ws.id, "T", "feature", "claude")
             .await
             .unwrap();
-        let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r", "impl-only")
+        let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r", "impl-only", "")
             .await
             .unwrap();
         // older session (no native), then newer (native captured)
@@ -2018,7 +2022,7 @@ mod tests {
         let old_thread = create_thread(&db, ws.id, "old", "feature", "claude")
             .await
             .unwrap();
-        let dir = create_direction(&db, old_thread.id, "d", "claude", repo.id, "why", "impl-only")
+        let dir = create_direction(&db, old_thread.id, "d", "claude", repo.id, "why", "impl-only", "")
             .await
             .unwrap();
         let old_sess = create_session(&db, dir.id, repo.id, "claude", "/tmp/wt")
@@ -2091,7 +2095,7 @@ mod tests {
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
             .await
             .unwrap();
-        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl")
+        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
 
@@ -2147,15 +2151,15 @@ mod tests {
             .unwrap();
         assert!(rename_thread(&db, t3.id, "Login").await.is_ok());
 
-        let d1 = create_direction(&db, t1.id, "api", "claude", repo.id, "r", "plan+impl")
+        let d1 = create_direction(&db, t1.id, "api", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
-        let d2 = create_direction(&db, t1.id, "ui", "claude", repo.id, "r", "plan+impl")
+        let d2 = create_direction(&db, t1.id, "ui", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
         assert!(rename_direction(&db, d2.id, "api").await.is_err());
         // same direction name under a DIFFERENT thread is fine
-        let d3 = create_direction(&db, t2.id, "main", "claude", repo.id, "r", "plan+impl")
+        let d3 = create_direction(&db, t2.id, "main", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
         assert!(rename_direction(&db, d3.id, "api").await.is_ok());
@@ -2217,5 +2221,48 @@ mod tests {
         let d = add_skill_source(&db, url, Some("main")).await.unwrap();
         assert_ne!(a.id, d.id);
         assert_eq!(list_skill_sources(&db).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_direction_persists_base_and_defaults_target() {
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("weft-cdbase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo_path = root.join("api");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t.t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            Cmd::new("git").args(&args).current_dir(&repo_path).status().unwrap();
+        }
+        std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
+        Cmd::new("git").args(["add", "-A"]).current_dir(&repo_path).status().unwrap();
+        Cmd::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo_path).status().unwrap();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "")
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // A concrete base → stored, and target_branch defaults to it.
+        let d = create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "develop")
+            .await
+            .unwrap();
+        assert_eq!(d.base_branch, "develop");
+        assert_eq!(d.target_branch, "develop", "target defaults to the chosen base");
+
+        // Empty base → both empty (each resolves to the repo default later).
+        let d2 = create_direction(&db, t.id, "y", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        assert_eq!(d2.base_branch, "");
+        assert_eq!(d2.target_branch, "", "empty base leaves target empty (= repo default)");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -57,6 +57,7 @@ async fn m2_acceptance() {
         ra.id,
         "modify repo-a",
         "plan+impl",
+        "",
     )
     .await
     .unwrap();
@@ -68,6 +69,7 @@ async fn m2_acceptance() {
         rb.id,
         "modify repo-b",
         "plan+impl",
+        "",
     )
     .await
     .unwrap();
@@ -91,6 +93,7 @@ async fn m2_acceptance() {
         ra.id,
         "modify repo-a",
         "impl-only",
+        "",
     )
     .await
     .unwrap();

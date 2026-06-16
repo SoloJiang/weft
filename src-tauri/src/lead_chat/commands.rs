@@ -1258,7 +1258,7 @@ mod live_slot_tests {
         let th = repo::create_thread(db, ws.id, "issue", "feature", "codex")
             .await
             .unwrap();
-        let dir = repo::create_direction(db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only")
+        let dir = repo::create_direction(db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only", "")
             .await
             .unwrap();
         let sess = repo::create_session(db, dir.id, repo_ref.id, "codex", "/tmp/wt")
@@ -1335,7 +1335,7 @@ mod live_slot_tests {
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "").await.unwrap();
         let th = repo::create_thread(&db, ws.id, "issue", "feature", "codex").await.unwrap();
-        let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only")
+        let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only", "")
             .await
             .unwrap();
         let sess = repo::create_session(&db, dir.id, repo_ref.id, "codex", "/tmp/wt")

@@ -238,7 +238,7 @@ mod tests {
     }
 
     async fn mk_direction(db: &Db, thread_id: i32, repo_id: i32, name: &str) -> i32 {
-        repo::create_direction(db, thread_id, name, "codex", repo_id, "why", "impl-only")
+        repo::create_direction(db, thread_id, name, "codex", repo_id, "why", "impl-only", "")
             .await
             .unwrap()
             .id

@@ -66,7 +66,7 @@ async fn delete_worktree_keeps_branch_and_task() {
     let t1 = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
         .await
         .unwrap();
-    let d1 = repo::create_direction(&db, t1.id, "da", "claude", ra.id, "modify repo-a", "plan+impl")
+    let d1 = repo::create_direction(&db, t1.id, "da", "claude", ra.id, "modify repo-a", "plan+impl", "")
         .await
         .unwrap();
 
