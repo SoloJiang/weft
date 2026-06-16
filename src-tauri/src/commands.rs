@@ -283,10 +283,12 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
 pub async fn update_repo_profile(
     db: State<'_, Db>,
     repo_id: i32,
-    summary: String,
-    tier: String,
+    summary: Option<String>,
+    tier: Option<String>,
 ) -> R<()> {
-    crate::curator::edit_profile(&db, repo_id, &summary, &tier)
+    // Only the field(s) the user actually changed are `Some`, so editing the
+    // summary doesn't pin the tier and vice versa.
+    crate::curator::edit_profile(&db, repo_id, summary.as_deref(), tier.as_deref())
         .await
         .map_err(e)?;
     Ok(())

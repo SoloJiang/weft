@@ -52,13 +52,35 @@ fn comps(s: &str) -> Vec<Component> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
-/// Apply a user edit to the opinion fields (one-line summary + tier); marks the
-/// profile user-owned so future re-analysis won't clobber it.
+// Summary and tier are independently owned: a user may pin one without pinning
+// the other, so calibrating the tier must not freeze an agent-written summary
+// (and vice versa). The single `source` column encodes which of the two the user
+// owns — "user" (both, also the legacy value), "user_summary", "user_tier", or
+// "agent" (neither) — so no migration is needed.
+fn owns_summary(source: &str) -> bool {
+    matches!(source, "user" | "user_summary")
+}
+fn owns_tier(source: &str) -> bool {
+    matches!(source, "user" | "user_tier")
+}
+fn combine_source(summary_owned: bool, tier_owned: bool) -> &'static str {
+    match (summary_owned, tier_owned) {
+        (true, true) => "user",
+        (true, false) => "user_summary",
+        (false, true) => "user_tier",
+        (false, false) => "agent",
+    }
+}
+
+/// Apply a user calibration to the opinion fields. `summary`/`tier` are each
+/// `Some` only for the field the user actually changed, so editing one pins ONLY
+/// that field's ownership; the other keeps its prior value and ownership and can
+/// still be refreshed by the agent.
 pub async fn edit_profile(
     db: &Db,
     repo_id: i32,
-    summary: &str,
-    tier: &str,
+    summary: Option<&str>,
+    tier: Option<&str>,
 ) -> Result<repo_profile::Model> {
     // Don't resurrect a deleted repo: a stale edit (e.g. an input blur racing
     // delete_repo) must not recreate an orphaned profile row, since repo_profile
@@ -70,21 +92,33 @@ pub async fn edit_profile(
     // row rather than erroring so the human's calibration always persists, with
     // factual fields defaulted until the agent fills them.
     let existing = repo::get_repo_profile(db, repo_id).await?;
+    let prior_source = existing.as_ref().map(|p| p.source.as_str()).unwrap_or("agent");
     let (stack, components, commit) = match &existing {
         Some(p) => (p.stack.clone(), p.components.clone(), p.profiled_commit.clone()),
         None => ("[]".to_string(), "[]".to_string(), String::new()),
     };
-    // A valid tier is canonicalized and an empty string is an intentional "Other"
-    // clear, but a NON-EMPTY legacy value (service/app/… surfaced from an upgraded
-    // row on a summary-only edit) is preserved verbatim — collapsing it to "" here
-    // would mark the row user-"Other" and exclude it from the legacy backfill, so
-    // it would never migrate to a real tier.
-    let tier = match profile::normalize_tier(tier) {
-        Some(t) => t,
-        None if tier.trim().is_empty() => String::new(),
-        None => tier.to_string(),
+
+    let new_summary = match summary {
+        Some(s) => s.to_string(),
+        None => existing.as_ref().map(|p| p.summary.clone()).unwrap_or_default(),
     };
-    repo::upsert_repo_profile(db, repo_id, &tier, &stack, summary, &components, "user", &commit).await
+    // A provided tier is canonicalized; an empty string is an intentional clear,
+    // while a non-empty legacy value (service/app/…) is kept verbatim so it still
+    // qualifies for the legacy backfill. An absent tier keeps the prior value.
+    let new_tier = match tier {
+        Some(t) => match profile::normalize_tier(t) {
+            Some(canon) => canon,
+            None if t.trim().is_empty() => String::new(),
+            None => t.to_string(),
+        },
+        None => existing.as_ref().map(|p| p.role.clone()).unwrap_or_default(),
+    };
+    let source = combine_source(
+        owns_summary(prior_source) || summary.is_some(),
+        owns_tier(prior_source) || tier.is_some(),
+    );
+    repo::upsert_repo_profile(db, repo_id, &new_tier, &stack, &new_summary, &components, source, &commit)
+        .await
 }
 
 /// One repo as the UI sees it. `profile == None` means the agent hasn't analyzed
@@ -561,7 +595,9 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
         return Ok(());
     }
     let prior = repo::get_repo_profile(db, repo.id).await?;
-    let user_owned = prior.as_ref().map(|p| p.source == "user").unwrap_or(false);
+    let prior_source = prior.as_ref().map(|p| p.source.as_str()).unwrap_or("agent");
+    let summary_owned = owns_summary(prior_source);
+    let tier_owned = owns_tier(prior_source);
 
     // Drop nameless components (a malformed sub-object) but keep the rest, so one
     // bad entry never discards the whole classification; normalize their tiers.
@@ -579,38 +615,33 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
     let commit = git::head_commit(Path::new(&repo.local_git_path)).unwrap_or_default();
 
     let agent_tier = profile::normalize_tier(&wire.tier);
-    // Decide the stored tier/summary/source. `filter` avoids an `expect`
-    // (production paths must not panic).
-    let (tier, summary, source) = match prior.as_ref().filter(|_| user_owned) {
-        // User-pinned: keep the summary. Keep the tier when it is already a valid
-        // canonical tier; otherwise adopt the agent's valid tier — this covers
-        // both a legacy migration (service/app/…) and a placeholder whose empty
-        // tier came from a summary-only edit before analysis finished. Only when
-        // the agent also produced no usable tier do we keep the prior value as-is.
-        Some(p) => {
-            let tier = profile::normalize_tier(&p.role)
-                .or_else(|| agent_tier.clone())
-                .unwrap_or_else(|| p.role.clone());
-            // Keep the user's summary only if they actually wrote one; a blank
-            // placeholder summary (e.g. a tier-only calibration before analysis)
-            // is filled by the agent rather than pinned empty forever.
-            let summary = if p.summary.trim().is_empty() {
-                wire.summary
-            } else {
-                p.summary.clone()
-            };
-            (tier, summary, "user")
-        }
-        // Agent-owned: a missing or non-canonical top-level tier leaves the prior
-        // profile (or placeholder) intact, rather than persisting an analyzed but
-        // unclassified row that the backfill gate would never retry.
+
+    // Tier: a user-pinned valid tier is kept; a user-pinned legacy/empty tier
+    // adopts the agent's valid tier (migration / placeholder fill). When the user
+    // doesn't own the tier, require a valid agent tier — a missing/non-canonical
+    // one leaves the prior profile (or placeholder) intact rather than persisting
+    // an analyzed-but-unclassified row the backfill gate would never retry.
+    let tier = match prior.as_ref().filter(|_| tier_owned) {
+        Some(p) => profile::normalize_tier(&p.role)
+            .or_else(|| agent_tier.clone())
+            .unwrap_or_else(|| p.role.clone()),
         None => {
             let Some(tier) = agent_tier else {
                 return Ok(());
             };
-            (tier, wire.summary, "agent")
+            tier
         }
     };
+
+    // Summary: keep a non-empty user-pinned summary; otherwise (not owned, or an
+    // owned-but-blank placeholder) take the agent's.
+    let summary = match prior.as_ref().filter(|_| summary_owned) {
+        Some(p) if !p.summary.trim().is_empty() => p.summary.clone(),
+        _ => wire.summary,
+    };
+
+    // Preserve whichever ownership flags the user still holds.
+    let source = combine_source(summary_owned, tier_owned);
 
     repo::upsert_repo_profile(
         db, repo.id, &tier, &stack_json, &summary, &comps_json, source, &commit,
@@ -813,7 +844,7 @@ mod tests {
             .await
             .unwrap();
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
-        super::edit_profile(&db, r.id, "a web client", "frontend").await.unwrap();
+        super::edit_profile(&db, r.id, Some("a web client"), Some("frontend")).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend");
         assert_eq!(p.summary, "a web client");
@@ -965,9 +996,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_profile_preserves_legacy_tier_on_summary_edit() {
-        // A summary-only edit on an upgraded (legacy-role) row passes the existing
-        // tier back; it must NOT be collapsed to "" (which would block backfill).
+    async fn edit_profile_summary_only_leaves_tier_and_ownership() {
+        // A summary-only edit (tier = None) updates the summary and pins ONLY the
+        // summary; the legacy tier is left untouched (and unowned) so it still
+        // qualifies for the agent's backfill/migration.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
@@ -976,14 +1008,42 @@ mod tests {
         repo::upsert_repo_profile(&db, r.id, "service", "[]", "old", "[]", "agent", "")
             .await
             .unwrap();
-        super::edit_profile(&db, r.id, "new summary", "service").await.unwrap();
+        super::edit_profile(&db, r.id, Some("new summary"), None).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
-        assert_eq!(p.role, "service", "legacy tier preserved on a summary-only edit");
+        assert_eq!(p.role, "service", "tier untouched by a summary-only edit");
         assert_eq!(p.summary, "new summary");
-        // An explicit "Other" clear still empties the tier.
-        super::edit_profile(&db, r.id, "new summary", "").await.unwrap();
+        assert_eq!(p.source, "user_summary", "only the summary is pinned");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_tier_only_does_not_pin_summary() {
+        // Calibrating only the tier pins the tier but NOT the (agent) summary, so a
+        // later agent pass can still refresh the summary.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "agent sum", "[]", "agent", "")
+            .await
+            .unwrap();
+        super::edit_profile(&db, r.id, None, Some("frontend")).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
-        assert_eq!(p.role, "", "explicit Other clears the tier");
+        assert_eq!(p.role, "frontend", "tier pinned");
+        assert_eq!(p.summary, "agent sum", "summary unchanged by a tier-only edit");
+        assert_eq!(p.source, "user_tier", "only the tier is pinned");
+
+        // A later agent pass keeps the pinned tier but refreshes the unpinned summary.
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "fresh agent sum".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend", "user-pinned tier survives re-analysis");
+        assert_eq!(p.summary, "fresh agent sum", "unpinned summary is refreshed");
     }
 
     #[tokio::test]
@@ -1017,7 +1077,7 @@ mod tests {
             .await
             .unwrap();
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
-        assert!(super::edit_profile(&db, r.id, "s", "frontend").await.is_err());
+        assert!(super::edit_profile(&db, r.id, Some("s"), Some("frontend")).await.is_err());
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
     }
 

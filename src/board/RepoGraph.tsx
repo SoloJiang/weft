@@ -46,6 +46,10 @@ const KINDS = ["lib", "http", "grpc", "queue", "infra"] as const;
 const bandOf = (tier: string): Band =>
   (TIER_ORDER as readonly string[]).includes(tier) ? (tier as Band) : "other";
 
+/** Whether the user has pinned the summary (mirrors the backend `source` flags:
+ *  "user" = both fields owned, "user_summary" = just the summary). */
+const ownsSummary = (source: string): boolean => source === "user" || source === "user_summary";
+
 type ViewMode = "overview" | "expanded";
 
 const NODE_W = 248;
@@ -727,7 +731,9 @@ function RepoProfilePane({
           </ProfileSection>
           <ProfileSection title={t("repomap.source")}>
             <span className="text-[13px] text-ink-muted">
-              {profile.source ? t(`repomap.source_${profile.source}`, profile.source) : t("repomap.none")}
+              {profile.source
+                ? t(`repomap.source_${profile.source.startsWith("user") ? "user" : profile.source}`, profile.source)
+                : t("repomap.none")}
             </span>
           </ProfileSection>
         </div>
@@ -799,13 +805,13 @@ function TierBadge({ profile }: { profile: RepoProfile }) {
 
 /** Calibrate a repo's tier (a user pick is pinned, outranking the agent). */
 function TierPicker({ profile }: { profile: RepoProfile }) {
-  const { editRepoProfile } = useStore();
+  const { editRepoTier } = useStore();
   const { t } = useTranslation();
   const canonical = (TIER_ORDER as readonly string[]).includes(profile.tier);
   return (
     <select
       value={canonical ? profile.tier : ""}
-      onChange={(e) => void editRepoProfile(profile.repo_id, profile.summary, e.currentTarget.value)}
+      onChange={(e) => void editRepoTier(profile.repo_id, e.currentTarget.value)}
       className="w-full rounded border border-border bg-bg px-1.5 py-1 text-[12.5px] text-ink outline-none focus:border-brand/60"
     >
       {/* The empty option is a non-selectable placeholder for the unclassified /
@@ -1015,7 +1021,7 @@ function RepoLinks({
 
 /** The node's one-line summary, click-to-edit (correcting it teaches the map). */
 function NodeSummary({ profile }: { profile: RepoProfile }) {
-  const { editRepoProfile } = useStore();
+  const { editRepoSummary } = useStore();
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(profile.summary);
@@ -1024,7 +1030,7 @@ function NodeSummary({ profile }: { profile: RepoProfile }) {
     setEditing(false);
     const next = text.trim();
     if (next === profile.summary) return;
-    await editRepoProfile(profile.repo_id, next, profile.tier);
+    await editRepoSummary(profile.repo_id, next);
   }
 
   if (editing) {
@@ -1070,7 +1076,7 @@ function NodeSummary({ profile }: { profile: RepoProfile }) {
       >
         {profile.summary || t("repomap.addSummary")}
       </span>
-      {profile.source === "user" && (
+      {ownsSummary(profile.source) && (
         <span className="mt-px shrink-0 rounded bg-brand-ghost px-1 py-px text-[9px] font-medium text-brand">
           {t("repomap.yours")}
         </span>
