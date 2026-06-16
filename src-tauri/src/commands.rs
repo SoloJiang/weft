@@ -644,8 +644,13 @@ pub async fn set_tool_command(
             continue;
         }
         if apply_to_existing {
+            // Bounce when THIS engine's effective command changes — covers a
+            // global change (pin already None) AND clearing a stale pin while the
+            // global stayed the same (pin Some(old) → global), which the coarse
+            // `changed` flag misses.
+            let old_eff = crate::tool_command::effective(inner.command.as_deref(), &tool);
             inner.command = None;
-            if changed {
+            if old_eff != new_cmd {
                 inner.pending_command_refresh = true;
             }
         } else if inner.command.is_none() {
@@ -959,11 +964,16 @@ pub async fn session_meta(
     let (Some(wt), Some(dir)) = (wt, dir) else {
         return Ok(Default::default());
     };
-    let native = repo::latest_session_for(&db, direction_id, repo_id)
+    let latest = repo::latest_session_for(&db, direction_id, repo_id)
         .await
-        .map_err(e)?
-        .and_then(|s| s.native_session_id.clone());
-    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref()).await)
+        .map_err(e)?;
+    let native = latest.as_ref().and_then(|s| s.native_session_id.clone());
+    // Probe the binary this session actually runs (per-session pin, else alias).
+    let command = crate::tool_command::effective(
+        latest.as_ref().and_then(|s| s.command.as_deref()),
+        &dir.tool,
+    );
+    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await)
 }
 
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,

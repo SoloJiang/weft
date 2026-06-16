@@ -180,7 +180,7 @@ fn codex_home() -> std::path::PathBuf {
 /// **cwd-aware**:在 worker cwd 下跑 `codex mcp list`(拾取项目级 MCP 配置),model 也
 /// 优先项目级 `<cwd>/.codex/config.toml`、回退全局 `~/.codex/config.toml`。
 /// context_tokens 走 live `turn.completed`,不在这里取。
-async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
+async fn gather_codex(cwd: &str, command: &str) -> SessionMetaSnapshot {
     let proj_cfg = std::fs::read_to_string(std::path::Path::new(cwd).join(".codex/config.toml")).ok();
     let global_cfg = std::fs::read_to_string(codex_home().join("config.toml")).ok();
     let model = proj_cfg
@@ -206,7 +206,7 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
     // `codex mcp list` 成功且输出是数组 → 权威(Some,可空);进程失败 / 输出畸形 / 超时 →
     // None(前端保留旧行,不把"没读懂"当成"没有")。10s 上限 + kill_on_drop:codex 探测
     // 若卡住(网络型 MCP 发现 / stdin 提示)不会无限挂起本次取数,与 opencode 探测的超时对齐。
-    let probe = tokio::process::Command::new(crate::tool_command::command_for("codex"))
+    let probe = tokio::process::Command::new(command)
         .args(["mcp", "list", "--json"])
         .current_dir(cwd)
         .kill_on_drop(true)
@@ -253,7 +253,7 @@ async fn gather_codex(cwd: &str) -> SessionMetaSnapshot {
 }
 
 /// opencode:ro DB(usage + model)+ app-lifetime serve(window + servers)。
-async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnapshot {
+async fn gather_opencode(cwd: &str, native_id: Option<&str>, command: &str) -> SessionMetaSnapshot {
     let (ctx, model_json) = match native_id {
         Some(id) => crate::sidecar::opencode_session_usage(id)
             .await
@@ -267,6 +267,7 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnaps
         cwd,
         provider_id.as_deref(),
         model_id.as_deref(),
+        command,
     )
     .await;
     SessionMetaSnapshot {
@@ -281,10 +282,17 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>) -> SessionMetaSnaps
 }
 
 /// 按 tool 分派。claude 不走这里(返回空)。
-pub async fn gather(tool: &str, cwd: &str, native_id: Option<&str>) -> SessionMetaSnapshot {
+/// `command` is the effective binary for this session (per-session/lead pin, else
+/// the global alias) so MCP/skill probes hit the binary actually driving it.
+pub async fn gather(
+    tool: &str,
+    cwd: &str,
+    native_id: Option<&str>,
+    command: &str,
+) -> SessionMetaSnapshot {
     match tool {
-        "codex" => gather_codex(cwd).await,
-        "opencode" => gather_opencode(cwd, native_id).await,
+        "codex" => gather_codex(cwd, command).await,
+        "opencode" => gather_opencode(cwd, native_id, command).await,
         _ => SessionMetaSnapshot::default(),
     }
 }

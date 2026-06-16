@@ -1115,16 +1115,26 @@ pub async fn send(
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
-    let pending = {
+    // Skill refresh is only ever flagged while idle, so it bounces now. A command
+    // refresh (alias change) can be flagged mid-turn; defer its bounce until the
+    // engine is idle so a follow-up sent during a running turn just queues (never
+    // kills the in-flight turn / clears its rows) — the bounce fires on the next
+    // idle send instead.
+    let (skill_pending, cmd_now) = {
         let g = eng.lock().await;
-        g.pending_skill_refresh || g.pending_command_refresh
+        (
+            g.pending_skill_refresh,
+            g.pending_command_refresh && !g.turn.busy,
+        )
     };
-    if pending {
+    if skill_pending || cmd_now {
         let (tid, _sid, _current, orphans) = stop_quiet(eng).await;
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
-            g.pending_command_refresh = false;
+            if cmd_now {
+                g.pending_command_refresh = false;
+            }
         }
         // The bounce fires from idle, so orphans is normally empty; finalize
         // defensively so a still-open tool row can't outlive the bounce.

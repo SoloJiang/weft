@@ -480,8 +480,15 @@ pub async fn lead_session_meta(
     }
     let cwd = ensure_lead_cwd(thread_id).map_err(|e| e.to_string())?;
     let native = repo::lead_native_id(&db, thread_id).await.ok().flatten();
+    let command = crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool);
     Ok(Some(
-        crate::session_meta::gather(&t.lead_tool, &cwd.to_string_lossy(), native.as_deref()).await,
+        crate::session_meta::gather(
+            &t.lead_tool,
+            &cwd.to_string_lossy(),
+            native.as_deref(),
+            &command,
+        )
+        .await,
     ))
 }
 
@@ -509,7 +516,11 @@ pub async fn discover_slash(
         };
         return Ok(match sess.tool.as_str() {
             "opencode" => merge_local_skill_commands(
-                crate::opencode::discover_commands(&sess.cwd).await,
+                crate::opencode::discover_commands(
+                    &sess.cwd,
+                    &crate::tool_command::effective(sess.command.as_deref(), &sess.tool),
+                )
+                .await,
                 std::path::Path::new(&sess.cwd),
             ),
             "claude" => {
@@ -538,12 +549,13 @@ pub async fn discover_slash(
     // composer still gets a palette before the lead process has emitted init.
     if let Some(tid) = thread_id {
         if let Some(eng) = state.get(lead_key(tid)) {
-            let (live, tool, cwd) = {
+            let (live, tool, cwd, command) = {
                 let inner = eng.lock().await;
                 (
                     inner.slash_commands.clone(),
                     inner.tool.clone(),
                     inner.cwd.clone(),
+                    crate::tool_command::effective(inner.command.as_deref(), &inner.tool),
                 )
             };
             let discovered = match tool.as_str() {
@@ -555,7 +567,8 @@ pub async fn discover_slash(
                 }
                 "claude" => merge_local_skill_commands(live, &cwd),
                 "opencode" => {
-                    let cmds = crate::opencode::discover_commands(&cwd.to_string_lossy()).await;
+                    let cmds =
+                        crate::opencode::discover_commands(&cwd.to_string_lossy(), &command).await;
                     let cmds = if cmds.is_empty() { live } else { cmds };
                     merge_local_skill_commands(cmds, &cwd)
                 }
@@ -579,8 +592,10 @@ pub async fn discover_slash(
                 "opencode" => {
                     let cwd = ensure_lead_cwd(tid).map_err(|e| e.to_string())?;
                     crate::skills::inject_for(&db, t.workspace_id, &cwd).await;
+                    let command =
+                        crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool);
                     merge_local_skill_commands(
-                        crate::opencode::discover_commands(&cwd.to_string_lossy()).await,
+                        crate::opencode::discover_commands(&cwd.to_string_lossy(), &command).await,
                         &cwd,
                     )
                 }
