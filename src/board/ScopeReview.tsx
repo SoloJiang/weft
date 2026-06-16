@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import {
@@ -24,6 +24,7 @@ type ScopeLane =
       repoKnown: boolean;
       direction: ResolvedDirection;
       order: number;
+      dirIndex: number;
     }
   | {
       key: string;
@@ -53,6 +54,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
         repoKnown: entry.known,
         direction,
         order: dirIndex + 1,
+        dirIndex,
       });
     });
     const noneLanes: ScopeLane[] = repos
@@ -156,7 +158,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
 
 function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
   const { t } = useTranslation();
-  const { defaultTool } = useStore();
+  const { defaultTool, setProposalDirectionBase } = useStore();
   const write = lane.role === "write";
   return (
     <motion.div
@@ -228,6 +230,11 @@ function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
               ? t("scope.mandateImpl")
               : t("scope.mandatePlan")}
           </span>
+          <BaseBranchField
+            index={lane.dirIndex}
+            value={lane.direction.base_branch}
+            onSave={setProposalDirectionBase}
+          />
           {index > 0 && (
             <span className="hidden shrink-0 items-center gap-1 rounded-full border border-brand/30 bg-brand-ghost px-2 py-0.5 text-[10.5px] text-brand lg:flex">
               <Clock size={11} />
@@ -254,6 +261,64 @@ function SummaryPill({ tone, label }: { tone: "write" | "none"; label: string })
         )}
       />
       {label}
+    </span>
+  );
+}
+
+function BaseBranchField({
+  index,
+  value,
+  onSave,
+}: {
+  index: number;
+  value: string;
+  onSave: (index: number, base: string) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [val, setVal] = useState(value ?? "");
+  const lastLoaded = useRef(value ?? "");
+  useEffect(() => {
+    if ((value ?? "") !== lastLoaded.current) {
+      lastLoaded.current = value ?? "";
+      setVal(value ?? "");
+    }
+  }, [value]);
+  const skipNextBlur = useRef(false);
+  const save = () => {
+    if (skipNextBlur.current) {
+      skipNextBlur.current = false;
+      return;
+    }
+    const next = val.trim();
+    if (next === (value ?? "").trim()) return;
+    lastLoaded.current = next;
+    void onSave(index, next).catch(() => {});
+  };
+  return (
+    <span
+      className="hidden shrink-0 items-center gap-1 lg:flex"
+      title={t("scope.baseBranchHint")}
+    >
+      <GitBranch size={11} className="text-ink-faint" />
+      <input
+        value={val}
+        onChange={(e) => setVal(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            (e.target as HTMLInputElement).blur();
+          } else if (e.key === "Escape") {
+            skipNextBlur.current = true;
+            setVal(value ?? "");
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        placeholder={t("scope.basePlaceholderDefault")}
+        spellCheck={false}
+        aria-label={t("scope.baseBranch")}
+        className="w-24 min-w-0 rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 font-mono text-[10.5px] text-ink outline-none focus:border-brand"
+      />
     </span>
   );
 }

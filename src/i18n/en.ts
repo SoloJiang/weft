@@ -260,6 +260,9 @@ export const en = {
     confirm_one: "Create {{count}} sub-task",
     confirm_other: "Create {{count}} sub-tasks",
     confirming: "Creating…",
+    baseBranch: "Base branch",
+    baseBranchHint: "Branch the work off this (blank = the repo's default branch)",
+    basePlaceholderDefault: "default branch",
   },
   notify: {
     needsTitle: "Needs you",
