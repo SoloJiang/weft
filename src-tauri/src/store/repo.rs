@@ -683,9 +683,20 @@ pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, 
             .filter(worktree::Column::DirectionId.eq(d.id))
             .all(&db.0)
             .await?;
+        let mut branch_covered = false;
         for w in wts {
+            if w.repo_id == d.repo_id && w.branch == d.branch {
+                branch_covered = true;
+            }
             removed.push((w.repo_id, w.path.clone(), w.branch.clone()));
             worktree::Entity::delete_by_id(w.id).exec(&db.0).await?;
+        }
+        // Zero-accumulation: a direction whose worktree was reclaimed earlier
+        // (the Done-card delete keeps the branch) has no worktree row left, but
+        // its namespaced branch still lives in the canonical repo. Tearing the
+        // thread down must remove that branch too. Empty path = branch-only.
+        if !branch_covered && d.repo_id != 0 && !d.branch.is_empty() {
+            removed.push((d.repo_id, String::new(), d.branch.clone()));
         }
         session::Entity::delete_many()
             .filter(session::Column::DirectionId.eq(d.id))

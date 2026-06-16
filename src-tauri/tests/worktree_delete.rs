@@ -5,10 +5,11 @@
 //!
 //! Lives in its own test binary so the `WEFT_HOME` env it sets can't race the
 //! other worktree tests (integration tests in one file run on parallel threads;
-//! separate files are separate processes).
+//! separate files are separate processes). Everything is asserted in one test
+//! for the same reason — a second env-mutating test in this file would race it.
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use weft::materialize::{materialize_direction, remove_direction_worktree};
+use weft::materialize::{cleanup_worktrees, materialize_direction, remove_direction_worktree};
 use weft::store::{repo, Db};
 
 fn sh(dir: &Path, args: &[&str]) {
@@ -73,7 +74,23 @@ async fn delete_worktree_keeps_branch_and_task() {
     assert!(Path::new(&path).exists(), "worktree materialized on disk");
     assert!(branch_exists(&repo_a, &branch), "branch created");
 
-    // The Done-card "delete worktree" action: remove just this worktree.
+    // Done-only guard: a non-done task (created status defaults to `queued`)
+    // must NOT have its worktree reclaimed — guards a stale confirm dialog after
+    // the task was moved back to working/review.
+    assert!(
+        remove_direction_worktree(&db, wt_id).await.is_err(),
+        "non-done worktree deletion is rejected"
+    );
+    assert!(Path::new(&path).exists(), "worktree preserved on rejection");
+    assert_eq!(
+        repo::list_worktrees(&db, None).await.unwrap().len(),
+        1,
+        "row preserved on rejection"
+    );
+
+    // Mark it done, then the Done-card "delete worktree" action removes just this
+    // worktree.
+    repo::set_direction_status(&db, d1.id, "done").await.unwrap();
     remove_direction_worktree(&db, wt_id).await.unwrap();
 
     // Directory and DB row are gone...
@@ -90,6 +107,15 @@ async fn delete_worktree_keeps_branch_and_task() {
 
     // Idempotent: deleting an already-removed worktree is a no-op, not an error.
     remove_direction_worktree(&db, wt_id).await.unwrap();
+
+    // Zero-accumulation: deleting the whole issue later still tears down the
+    // kept branch, even though no worktree row points at it anymore.
+    let removed = repo::delete_thread_cascade(&db, t1.id).await.unwrap();
+    cleanup_worktrees(&db, &removed).await.unwrap();
+    assert!(
+        !branch_exists(&repo_a, &branch),
+        "kept branch is cleaned when the issue is deleted"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&weft_home);

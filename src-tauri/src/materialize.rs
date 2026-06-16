@@ -123,8 +123,13 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
             .await?
         {
             let repo_path = std::path::Path::new(&r.local_git_path);
-            if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
-                eprintln!("[weft] worktree remove failed for {path}: {e}");
+            // Empty path = branch-only cleanup: this direction's worktree was
+            // already reclaimed (delete-worktree keeps the branch), so there is
+            // no working tree left to remove — only the branch.
+            if !path.is_empty() {
+                if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
+                    eprintln!("[weft] worktree remove failed for {path}: {e}");
+                }
             }
             if let Err(e) = git::delete_branch(repo_path, branch) {
                 eprintln!("[weft] branch delete failed for {branch}: {e}");
@@ -145,17 +150,35 @@ pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> 
         .one(&db.0)
         .await?
     else {
-        return Ok(());
+        return Ok(()); // already gone — idempotent
     };
+    // Done-only: re-read the owning direction so a stale confirm dialog can't
+    // reclaim the worktree of a task that was moved back to working/review (by a
+    // human or the bus) after the dialog opened — that would delete an active
+    // agent's working copy.
+    let dir = entities::direction::Entity::find_by_id(wt.direction_id)
+        .one(&db.0)
+        .await?
+        .context("direction not found")?;
+    if dir.status != "done" {
+        anyhow::bail!("worktree can only be deleted for a done task");
+    }
+    let path = std::path::Path::new(&wt.path);
     if let Some(r) = entities::repo_ref::Entity::find_by_id(wt.repo_id)
         .one(&db.0)
         .await?
     {
         let repo_path = std::path::Path::new(&r.local_git_path);
         // remove_worktree drops the working tree and prunes; it leaves the branch.
-        if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(&wt.path)) {
+        if let Err(e) = git::remove_worktree(repo_path, path) {
             eprintln!("[weft] worktree remove failed for {}: {e}", wt.path);
         }
+    }
+    // Atomic: only drop the row once the directory is actually gone. If removal
+    // failed (repo path missing, locked, …) the directory survives — keep the row
+    // so the card still offers a retry instead of orphaning the directory.
+    if path.exists() {
+        anyhow::bail!("worktree directory could not be removed: {}", wt.path);
     }
     entities::worktree::Entity::delete_by_id(worktree_id)
         .exec(&db.0)
