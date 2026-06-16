@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "weft",
+  "productName": "Weft",
   "version": "0.1.0",
   "identifier": "com.weft.app",
   "build": {

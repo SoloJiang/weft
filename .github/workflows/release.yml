@@ -99,6 +99,56 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+      # Tauri's DMG bundler can't add extra files to the disk image, so rebuild
+      # it with create-dmg to drop in the "damaged" un-quarantine helper next to
+      # the app, then replace the asset tauri-action already uploaded. The DMG is
+      # not an updater artifact, so re-uploading it doesn't affect latest.json.
+      - name: Repackage macOS DMG with the damaged-fix helper
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          ARGS: ${{ matrix.args }}
+        run: |
+          set -euo pipefail
+          brew install create-dmg
+          TRIPLE="${ARGS#--target }"
+          BUNDLE="src-tauri/target/$TRIPLE/release/bundle"
+          APP="$BUNDLE/macos/Weft.app"
+          DMG="$(ls "$BUNDLE"/dmg/*.dmg | head -1)"
+          echo "app: $APP"
+          echo "dmg: $DMG"
+
+          STAGE="$(mktemp -d)"
+          cp -R "$APP" "$STAGE/"
+          cp scripts/weft-macos-fix.command "$STAGE/打不开？双击修复.command"
+          chmod +x "$STAGE/打不开？双击修复.command"
+
+          # create-dmg drives Finder via AppleScript, which can flake on CI; retry.
+          rm -f "$DMG"
+          for attempt in 1 2 3; do
+            if create-dmg \
+              --volname "Weft" \
+              --background "src-tauri/dmg/background.tiff" \
+              --window-size 660 520 \
+              --icon-size 96 \
+              --text-size 13 \
+              --icon "Weft.app" 170 195 \
+              --app-drop-link 490 195 \
+              --icon "打不开？双击修复.command" 330 412 \
+              --no-internet-enable \
+              "$DMG" "$STAGE"; then
+              break
+            fi
+            echo "create-dmg attempt $attempt failed; retrying…"
+            rm -f "$DMG"
+            sleep 5
+          done
+          test -f "$DMG"
+
+          gh release upload "$TAG" "$DMG" --repo "$REPO" --clobber
+
   merge-updater:
     needs: build
     runs-on: ubuntu-latest

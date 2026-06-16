@@ -132,7 +132,7 @@ export function AppTopBar() {
         {navCollapsed && (
           <>
             <img src="/weft-mark.svg" alt="" className="h-[18px] w-[18px]" draggable={false} />
-            <span className="text-[15px] font-semibold tracking-[-0.01em] text-ink">weft</span>
+            <span className="text-[15px] font-semibold tracking-[-0.01em] text-ink">Weft</span>
           </>
         )}
         {inObserve && (
