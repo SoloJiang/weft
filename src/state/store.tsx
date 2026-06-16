@@ -201,6 +201,14 @@ interface Store {
   renameDirection: (directionId: number, name: string) => Promise<void>;
   addRepo: (name: string, path: string) => Promise<void>;
   cloneRepo: (url: string, dest: string, name: string) => Promise<void>;
+  /** Batch clone: each item to `<dest>/<name>`, sequential + tolerant. Reports
+   *  per-item progress; refreshes the repo list once at the end. */
+  importRepos: (
+    items: Array<{ url: string; name: string }>,
+    dest: string,
+    onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+    signal?: AbortSignal,
+  ) => Promise<void>;
   createRepo: (name: string, dest: string) => Promise<void>;
   createThread: (title: string, kind: string) => Promise<Thread>;
   createDirection: (
@@ -275,6 +283,10 @@ export const useStore = () => {
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<number | null>(null);
+  // Live mirror so async tasks (e.g. a slow batch clone) can check the CURRENT
+  // workspace instead of the stale one captured when they started.
+  const activeWorkspaceIdRef = useRef(activeWorkspaceId);
+  activeWorkspaceIdRef.current = activeWorkspaceId;
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
@@ -658,18 +670,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshReposAndMap = useCallback(async (workspaceId?: number) => {
-    const ws = workspaceId ?? activeWorkspaceId;
-    if (ws == null || ws !== activeWorkspaceId) return;
-    setRepos(await api.listRepos(ws));
+    // Compare against the LIVE active workspace (ref), so a refresh for a
+    // workspace the user has since left is dropped instead of overwriting the
+    // current workspace's repo list/map (e.g. after a cancelled batch import).
+    const ws = workspaceId ?? activeWorkspaceIdRef.current;
+    if (ws == null || ws !== activeWorkspaceIdRef.current) return;
+    const list = await api.listRepos(ws);
+    if (ws !== activeWorkspaceIdRef.current) return; // user switched during the fetch
+    setRepos(list);
     // a freshly added repo is eagerly profiled server-side; pull the new map
     try {
       const g = await api.repoGraph(ws);
+      if (ws !== activeWorkspaceIdRef.current) return; // user switched during the fetch
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
     } catch {
       /* ignore */
     }
-  }, [activeWorkspaceId]);
+  }, []);
 
   const addRepo = useCallback(
     async (name: string, path: string) => {
@@ -693,6 +711,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (name: string, dest: string) => {
       if (activeWorkspaceId == null) return;
       await api.createRepo(activeWorkspaceId, name, dest);
+      await refreshReposAndMap(activeWorkspaceId);
+    },
+    [activeWorkspaceId, refreshReposAndMap],
+  );
+
+  const importRepos = useCallback(
+    async (
+      items: Array<{ url: string; name: string }>,
+      dest: string,
+      onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+      signal?: AbortSignal,
+    ) => {
+      if (activeWorkspaceId == null) return;
+      // Sequential + tolerant: one failed clone doesn't abort the rest. `signal`
+      // (set when the dialog is closed/cancelled mid-batch) stops queuing the
+      // next clone — the in-flight one still finishes, but no more are started.
+      for (let i = 0; i < items.length; i++) {
+        if (signal?.aborted) break;
+        onProgress(i, "cloning");
+        try {
+          await api.cloneRepo(activeWorkspaceId, items[i].url, dest, items[i].name);
+          onProgress(i, "ok");
+        } catch (e) {
+          onProgress(i, "error", String(e));
+        }
+      }
+      // Refresh even on abort — the clones that already finished are real repos.
       await refreshReposAndMap(activeWorkspaceId);
     },
     [activeWorkspaceId, refreshReposAndMap],
@@ -1810,6 +1855,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     renameDirection,
     addRepo,
     cloneRepo,
+    importRepos,
     createRepo,
     createThread,
     createDirection,
