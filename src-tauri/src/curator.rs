@@ -60,10 +60,15 @@ pub async fn edit_profile(
     summary: &str,
     tier: &str,
 ) -> Result<repo_profile::Model> {
-    // A repo can be edited while it is still an "analyzing" placeholder with no
-    // profile row yet (the agent-only pipeline creates rows lazily). Upsert one
-    // rather than erroring, so the human's calibration always persists; factual
-    // fields default empty until the agent fills them.
+    // Don't resurrect a deleted repo: a stale edit (e.g. an input blur racing
+    // delete_repo) must not recreate an orphaned profile row, since repo_profile
+    // has no enforced foreign key.
+    if repo::get_repo(db, repo_id).await?.is_none() {
+        return Err(anyhow::anyhow!("repo {repo_id} no longer exists"));
+    }
+    // A repo can be edited while it is still an "analyzing" placeholder; upsert a
+    // row rather than erroring so the human's calibration always persists, with
+    // factual fields defaulted until the agent fills them.
     let existing = repo::get_repo_profile(db, repo_id).await?;
     let (stack, components, commit) = match &existing {
         Some(p) => (p.stack.clone(), p.components.clone(), p.profiled_commit.clone()),
@@ -114,7 +119,11 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
         source: p.source.clone(),
         profiled_commit: p.profiled_commit.clone(),
         stale,
-        analyzed: true,
+        // "Analyzed" means the agent reached a real classification. A row can
+        // exist with an empty/legacy tier — an eager placeholder, a
+        // calibration/summary edit before analysis, or a pre-upgrade row — and
+        // those must still read as "analyzing", not a finished unclassified node.
+        analyzed: profile::normalize_tier(&p.role).is_some(),
         components: comps(&p.components),
     }
 }
@@ -251,7 +260,10 @@ fn json_objects(text: &str) -> Vec<&str> {
                 out.push(&text[i..=e]);
                 i = e + 1;
             }
-            None => break, // unbalanced tail — nothing more to find
+            // An unbalanced `{` (e.g. a stray brace in prose / a code snippet)
+            // must not abort the scan — skip just this `{` and keep looking, so a
+            // valid JSON object later in the reply is still found.
+            None => i += 1,
         }
     }
     out
@@ -962,6 +974,29 @@ mod tests {
             repo::get_repo_profile(&db, r.id).await.unwrap().is_none(),
             "no orphaned profile recreated for a deleted repo"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_profile_rejects_deleted_repo() {
+        // A stale edit after the repo is gone must error, not recreate an orphan.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "gone", "/tmp/gone", "main", "")
+            .await
+            .unwrap();
+        repo::delete_repo_cascade(&db, r.id).await.unwrap();
+        assert!(super::edit_profile(&db, r.id, "s", "frontend").await.is_err());
+        assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_repo_class_skips_stray_brace() {
+        // A stray unmatched `{` in prose before the JSON must not abort parsing.
+        let reply = "Looking at fn main() { ... then the entry point.\n\n\
+            {\"tier\":\"backend\",\"summary\":\"svc\"}";
+        let wire = super::parse_repo_class(reply).expect("found the valid object past the stray brace");
+        assert_eq!(wire.tier, "backend");
+        assert_eq!(wire.summary, "svc");
     }
 
     #[test]

@@ -117,9 +117,12 @@ async fn register_repo(
         }
     }
     // The curator is agent-only now (ARCHITECTURE §4.9): there is no deterministic
-    // profiling on add. The repo shows as an "analyzing" placeholder node until
-    // the read-only agent classifies it below.
-    //
+    // profiling on add. Eagerly create an empty placeholder profile row (tier "",
+    // so it renders as "analyzing" until classified). Creating it HERE — once,
+    // before analysis is spawned — means every later write (the agent pass, a user
+    // edit, a relation calibration) is an UPDATE, so two of them can't race on the
+    // unique `repo_id` insert. Best-effort: a hiccup never blocks the add.
+    let _ = repo::upsert_repo_profile(db, r.id, "", "[]", "", "[]", "agent", "").await;
     // Fire-and-forget the agent curator over the whole workspace so the new repo
     // gets a deep per-repo classification and cross-repo relations refresh.
     // Read-only, coalesced (a batch add runs one pass), and best-effort — it

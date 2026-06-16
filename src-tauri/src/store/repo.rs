@@ -541,6 +541,11 @@ pub async fn calibrate_repo_relation(
     via: &str,
     action: &str,
 ) -> Result<()> {
+    // Don't resurrect a deleted repo (no enforced FK on repo_profile): a stale
+    // calibration after delete_repo is a no-op rather than an orphaned row.
+    if get_repo(db, from_id).await?.is_none() {
+        return Ok(());
+    }
     let p = match get_repo_profile(db, from_id).await? {
         Some(p) => p,
         None => upsert_repo_profile(db, from_id, "", "[]", "", "[]", "agent", "").await?,
