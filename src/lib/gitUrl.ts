@@ -30,25 +30,38 @@ const ANY_SCHEME_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"'`,;]+/gi;
 const HELPER_URL = /\b[a-z][a-z0-9+.-]*::[^\s<>"'`,;]+/gi;
 
 /**
- * Strip wrapping/trailing punctuation a paste often carries around a source.
- * A trailing `)`/`]`/`}` is peeled only when it is UNBALANCED — i.e. a wrapper
- * around the source — so a path that legitimately ends in a bracket survives
- * (`/tmp/src(foo)` and `file:///tmp/src(foo)` keep their `)`).
+ * Strip wrapping/trailing punctuation a paste often carries around a source,
+ * WITHOUT mangling brackets that are part of the source:
+ *   - a `(`/`[`/`{`/`<` is peeled only as half of a pair wrapping the WHOLE token
+ *     (`[https://…]` → `https://…`), so an IPv6 scp host whose `]` sits mid-token
+ *     (`[::1]:repo.git`) keeps its leading `[`;
+ *   - a trailing `)`/`]`/`}` is peeled only when UNBALANCED, so a path ending in
+ *     a balanced bracket survives (`/tmp/src(foo)`, `file:///tmp/src(foo)`).
  */
 function trimUrl(raw: string): string {
-  let s = raw.trim().replace(/^[-*>\s([{<'"`]+/, "");
-  const opener: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
-  for (;;) {
-    const last = s[s.length - 1];
-    if (!last) break;
-    if (last in opener) {
-      let balance = 0; // openers − closers across the whole source
-      for (const c of s) balance += c === opener[last] ? 1 : c === last ? -1 : 0;
-      if (balance >= 0) break; // matched by an inner opener — part of the path
-    } else if (!"'\"`.,;>".includes(last)) {
-      break; // not a trailing wrapper/punctuation char
+  const closerOf: Record<string, string> = { "(": ")", "[": "]", "{": "}", "<": ">" };
+  let s = raw.trim();
+  let prev = "";
+  while (s !== prev) {
+    prev = s;
+    // leading paste noise: bullets, blockquote `>`, quotes, backticks, spaces
+    s = s.replace(/^[-*>\s'"`]+/, "");
+    // a bracket pair wrapping the ENTIRE token
+    const first = s[0];
+    if (first && closerOf[first] && s.endsWith(closerOf[first])) {
+      s = s.slice(1, -1).trim();
+      continue;
     }
-    s = s.slice(0, -1);
+    // trailing paste noise; an UNBALANCED closing bracket (a balanced one is path)
+    const last = s[s.length - 1];
+    if (last && "'\"`.,;>".includes(last)) {
+      s = s.slice(0, -1);
+    } else if (last === ")" || last === "]" || last === "}") {
+      const open = last === ")" ? "(" : last === "]" ? "[" : "{";
+      let balance = 0;
+      for (const c of s) balance += c === open ? 1 : c === last ? -1 : 0;
+      if (balance < 0) s = s.slice(0, -1);
+    }
   }
   return s;
 }
@@ -204,7 +217,12 @@ export function parseCloneSources(text: string): string[] {
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (line === "") continue;
-    const tokens = line.split(/[\s,;]+/).filter(Boolean);
+    // Wrapper-trim each token BEFORE the source-shape checks, or a wrapped source
+    // (`` `gh:org/repo.git` ``) would fail the predicate and be dropped.
+    const tokens = line
+      .split(/[\s,;]+/)
+      .map(trimUrl)
+      .filter(Boolean);
     if (tokens.length > 1 && tokens.some(isHardSource)) {
       tokens.forEach((tok, i) => {
         // hard sources anywhere; a bare path/.git token only as the LAST token —

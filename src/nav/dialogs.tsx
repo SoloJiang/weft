@@ -180,6 +180,11 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     abortRef.current?.abort();
   }, [activeWorkspaceId]);
 
+  // Unmounting mid-batch (e.g. a resize collapses the nav, dropping this dialog
+  // without a Radix onOpenChange) must still abort, or importRepos keeps queuing
+  // clones after the dialog is gone.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
   // Closing/cancelling mid-batch aborts the loop so it stops queuing more clones.
   function handleOpenChange(o: boolean) {
     if (!o) abortRef.current?.abort();
