@@ -1080,7 +1080,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch {
         return;
       }
-      for (const w of wts) {
+      // Skip reclaimed worktrees (exists=false): the directory is gone, so
+      // spawning a worker in it would fail.
+      for (const w of wts.filter((w) => w.exists)) {
         await spawnWorker(directionId, w.repo_id, false);
       }
     },
@@ -1098,7 +1100,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch {
         return;
       }
-      for (const w of wts) {
+      // Skip reclaimed worktrees (exists=false): a resume would drive a worker
+      // into a missing cwd.
+      for (const w of wts.filter((w) => w.exists)) {
         await driveDirection(directionId, w.repo_id, false);
       }
     },
@@ -1440,7 +1444,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const requestSkillReview = useCallback(
     async (directionId: number, opts?: { focus?: boolean }) => {
       const writes = await api.listWorktrees(directionId).catch(() => []);
-      const first = writes[0];
+      // Only a worktree still on disk can be reviewed; a reclaimed one
+      // (exists=false) has no working copy to open.
+      const first = writes.find((w) => w.exists);
       if (!first) return;
       const live = Object.values(sessionsRef.current).find(
         (s) => s.directionId === directionId && s.status !== "exited",

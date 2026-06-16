@@ -103,7 +103,15 @@ async fn delete_worktree_keeps_branch_and_task() {
         "deletion is refused while the worker is running"
     );
     assert!(Path::new(&path).exists(), "worktree preserved while worker runs");
-    // Once the turn finishes, the Done-card "delete worktree" action removes it.
+    // Taken over in the user's own terminal (stopped) is also off-limits — the
+    // human may still be driving that session against this cwd.
+    repo::set_session_status(&db, sess.id, "stopped").await.unwrap();
+    assert!(
+        remove_direction_worktree(&db, wt_id).await.is_err(),
+        "deletion is refused while taken over in a terminal (stopped)"
+    );
+    assert!(Path::new(&path).exists(), "worktree preserved while taken over");
+    // Once the session is finished, the Done-card "delete worktree" action removes it.
     repo::set_session_status(&db, sess.id, "complete").await.unwrap();
     remove_direction_worktree(&db, wt_id).await.unwrap();
 
