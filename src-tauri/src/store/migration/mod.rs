@@ -33,6 +33,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0020SessionCommand),
             Box::new(M0021RepoRemoteUrl),
             Box::new(M0022RepoProfileRelations),
+            Box::new(M0023DirectionBaseBranch),
         ]
     }
 }
@@ -857,6 +858,50 @@ impl MigrationTrait for M0022RepoProfileRelations {
                 Table::alter()
                     .table(Alias::new("repo_profile"))
                     .drop_column(Alias::new("relations"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds direction.base_branch: the ref a worktree branches off (empty = repo
+/// default). M0001 reflects the current entity, so a FRESH db already has it;
+/// sqlite has no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0023DirectionBaseBranch;
+impl MigrationName for M0023DirectionBaseBranch {
+    fn name(&self) -> &str {
+        "m0023_direction_base_branch"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0023DirectionBaseBranch {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("base_branch"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .drop_column(Alias::new("base_branch"))
                     .to_owned(),
             )
             .await
