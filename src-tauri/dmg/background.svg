@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="660" viewBox="0 0 660 660">
+  <rect width="660" height="660" fill="#F4F2EC"/>
+
+  <text x="330" y="132" text-anchor="middle" font-family="-apple-system, 'PingFang SC', 'Helvetica Neue', sans-serif" font-size="23" fill="#2B2B28">① 把 Weft 拖进 Applications 安装</text>
+  <text x="330" y="160" text-anchor="middle" font-family="-apple-system, 'PingFang SC', 'Helvetica Neue', sans-serif" font-size="15" fill="#807E76">Drag Weft into the Applications folder</text>
+
+  <line x1="240" y1="265" x2="416" y2="265" stroke="#2F7D8C" stroke-width="3"/>
+  <path d="M414 256 L432 265 L414 274 Z" fill="#2F7D8C"/>
+
+  <line x1="70" y1="350" x2="590" y2="350" stroke="#DBD8D0" stroke-width="1"/>
+
+  <text x="330" y="394" text-anchor="middle" font-family="-apple-system, 'PingFang SC', 'Helvetica Neue', sans-serif" font-size="19" fill="#2B2B28">② 打开提示『已损坏』？双击下方脚本修复</text>
+  <text x="330" y="420" text-anchor="middle" font-family="-apple-system, 'PingFang SC', 'Helvetica Neue', sans-serif" font-size="13" fill="#807E76">首次被拦截就右键点它 →『打开』  ·  First time blocked: right-click → Open</text>
+</svg>
