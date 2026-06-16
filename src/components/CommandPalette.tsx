@@ -93,13 +93,16 @@ export function CommandPalette() {
   }, [open]);
 
   const commands = useMemo<Command[]>(() => {
-    const issues: Command[] = threads.map((th) => ({
-      key: `issue-${th.id}`,
-      group: t("palette.issue"),
-      label: th.title,
-      icon: <CircleDot size={14} />,
-      run: () => selectThread(th.id),
-    }));
+    // The hidden curator-chat thread is in `threads` but is not a board issue.
+    const issues: Command[] = threads
+      .filter((th) => th.kind !== "curator")
+      .map((th) => ({
+        key: `issue-${th.id}`,
+        group: t("palette.issue"),
+        label: th.title,
+        icon: <CircleDot size={14} />,
+        run: () => selectThread(th.id),
+      }));
     const nav: Command[] = [
       {
         key: "nav-needs",

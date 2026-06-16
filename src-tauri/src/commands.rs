@@ -64,18 +64,69 @@ async fn register_repo(
     name: &str,
     path: &str,
 ) -> R<entities::repo_ref::Model> {
-    if !crate::git::is_git_repo(std::path::Path::new(path)) {
+    let p = std::path::Path::new(path);
+    if !crate::git::is_git_repo(p) {
         return Err("not a git repository".into());
     }
+    // Canonicalize so the same repo reached via a trailing slash, redundant
+    // slashes, or a symlink dedups to one row; fall back to the raw path if
+    // canonicalization fails. (The git probes above use the original path.)
+    let canonical = std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
     // default base ref = current branch of the repo
-    let base =
-        crate::git::current_branch(std::path::Path::new(path)).unwrap_or_else(|_| "main".into());
-    let r = repo::add_repo_ref(db, workspace_id, name, path, &base)
+    let base = crate::git::current_branch(p).unwrap_or_else(|_| "main".into());
+    // Captured for workspace-level dedup; empty for a local repo with no origin.
+    // Credentials embedded in an HTTPS remote are redacted so a PAT/password from
+    // .git/config never lands in Weft's DB/backups.
+    let remote = crate::git::remote_url(p)
+        .map(|r| crate::git::redact_remote(&r))
+        .unwrap_or_default();
+    // Backfill for repos added before this change, so dedup below can match them
+    // on upgraded databases. Best-effort, cheap (a handful of repos per workspace):
+    //   - remote: catch a second clone of an already-present origin;
+    //   - path: canonicalize a non-canonical (symlink/`..`) stored path so a
+    //     local-only repo with no remote still dedups by path.
+    for existing in repo::list_repos(db, workspace_id).await.map_err(e)? {
+        if existing.remote_url.is_empty() {
+            if let Some(rem) = crate::git::remote_url(std::path::Path::new(&existing.local_git_path))
+            {
+                let _ = repo::set_repo_remote(db, existing.id, &crate::git::redact_remote(&rem)).await;
+            }
+        }
+        if let Ok(canon) = std::fs::canonicalize(&existing.local_git_path) {
+            let canon = canon.to_string_lossy();
+            if canon != existing.local_git_path {
+                let _ = repo::set_repo_path(db, existing.id, &canon).await;
+            }
+        }
+    }
+    let mut r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote)
         .await
         .map_err(e)?;
+    // If dedup resolved to an EXISTING row (by remote) at a different path whose
+    // checkout is gone, repoint it to the path the user just gave us — a local add
+    // OR a clone — so we don't keep pointing at a dead checkout and report success.
+    // (A live duplicate keeps the existing row; clone_repo removes the redundant
+    // clone dir in that case.) Done before profiling so facts come from the live path.
+    if r.local_git_path != canonical
+        && !crate::git::is_git_repo(std::path::Path::new(&r.local_git_path))
+    {
+        if let Ok(Some(updated)) = repo::set_repo_path(db, r.id, &canonical).await {
+            r = updated;
+        }
+    }
     // Eager, deterministic profiling (ARCHITECTURE §4.9): best-effort, never
     // blocks adding the repo if inference/git hiccups.
     let _ = crate::curator::profile_repo(db, &r).await;
+    // Fire-and-forget the agent curator over the whole workspace so cross-repo
+    // runtime/infra relations refresh with the new repo. Read-only, coalesced
+    // (a batch add runs one pass), and best-effort — it never blocks the add.
+    let db_bg = db.clone();
+    let ws = r.workspace_id;
+    tauri::async_runtime::spawn(async move {
+        crate::curator::analyze_workspace_coalesced(&db_bg, ws).await;
+    });
     Ok(r)
 }
 
@@ -112,7 +163,18 @@ pub async fn clone_repo(
         .await
         .map_err(|err| err.to_string())?
         .map_err(e)?;
-    register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await
+    let r = register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await?;
+    // If the row points somewhere other than the dir we just cloned, dedup
+    // resolved to a DIFFERENT live repo (a dead-checkout match was already
+    // repointed to this clone inside register_repo, so paths would match here) —
+    // the fresh clone is a redundant duplicate, so remove it rather than leaving
+    // an orphan dir on disk.
+    let cloned = std::fs::canonicalize(&path).ok();
+    let registered = std::fs::canonicalize(&r.local_git_path).ok();
+    if cloned.is_some() && cloned != registered {
+        let _ = std::fs::remove_dir_all(&path);
+    }
+    Ok(r)
 }
 
 /// Create a new git repo at `<dest>/<name>` (init + empty initial commit), then
@@ -156,6 +218,52 @@ pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     Ok(())
 }
 
+/// Manually re-run the agent dependency curator over a workspace (the same
+/// read-only pass that fires after each add). Returns when it completes so the
+/// caller can refresh the graph; coalesced with any in-flight pass.
+#[tauri::command]
+pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
+    crate::curator::analyze_workspace_coalesced(&db, workspace_id).await;
+    Ok(())
+}
+
+/// Get-or-create this workspace's hidden curator-chat thread and return its id,
+/// so the frontend can open its lead-chat surface for dependency calibration.
+#[tauri::command]
+pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
+    // Stamp the curator thread with the user's configured default tool so the
+    // calibration chat is usable for codex/opencode users (not hard-coded claude).
+    let tool = crate::tools::default_tool(&db).await;
+    repo::ensure_curator_thread(&db, workspace_id, &tool)
+        .await
+        .map_err(e)
+}
+
+/// Remove a repo from its workspace: delete Weft's reference, the repo's
+/// profile, the directions bound to it (with their sessions), and its worktrees
+/// (physically removed from git). The user's actual repository at its local path
+/// is NEVER deleted — only Weft's tracking of it.
+#[tauri::command]
+pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
+    // Capture the repo path before the cascade — the repo_ref row is gone after
+    // delete_repo_cascade, so we resolve worktree removal against it first.
+    let repo = repo::get_repo(&db, repo_id)
+        .await
+        .map_err(e)?
+        .ok_or("repo not found")?;
+    let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
+    let repo_path = std::path::Path::new(&repo.local_git_path);
+    for (_repo_id, path, branch) in &removed {
+        if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
+            eprintln!("[weft] worktree remove failed for {path}: {err}");
+        }
+        if let Err(err) = crate::git::delete_branch(repo_path, branch) {
+            eprintln!("[weft] branch delete failed for {branch}: {err}");
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn update_repo_profile(
     db: State<'_, Db>,
@@ -193,6 +301,10 @@ pub async fn rename_thread(
 
 #[tauri::command]
 pub async fn list_threads(db: State<'_, Db>, workspace_id: i32) -> R<Vec<entities::thread::Model>> {
+    // NOTE: the hidden curator-chat thread IS included here — the frontend needs
+    // it in `threads` to render its chat surface (ThreadBoard/LeadTab look the
+    // active thread up in this list). It's filtered from the board cards
+    // (`workspace_overview`) and from the nav/palette thread lists instead.
     repo::list_threads(&db, workspace_id).await.map_err(e)
 }
 
@@ -221,7 +333,12 @@ pub struct ThreadOverview {
 /// so the board can show roll-ups and the repositories each task writes.
 #[tauri::command]
 pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<ThreadOverview>> {
-    let threads = repo::list_threads(&db, workspace_id).await.map_err(e)?;
+    let threads: Vec<_> = repo::list_threads(&db, workspace_id)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
+        .collect();
     let mut out = Vec::new();
     for t in threads {
         let dirs = repo::list_directions(&db, t.id).await.map_err(e)?;
@@ -530,7 +647,12 @@ pub async fn needs_you(
     bus: tauri::State<'_, crate::bus::BusRegistry>,
     workspace_id: i32,
 ) -> R<Vec<NeedItem>> {
-    let threads = repo::list_threads(&db, workspace_id).await.map_err(e)?;
+    let threads: Vec<_> = repo::list_threads(&db, workspace_id)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
+        .collect();
     let mut items: Vec<NeedItem> = Vec::new();
     for t in threads {
         let asks = bus.open_asks(t.id);
@@ -687,7 +809,12 @@ pub struct WriteTrigger {
 /// data behind the Needs-you "approve a write" cards.
 #[tauri::command]
 pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<WriteTrigger>> {
-    let threads = repo::list_threads(&db, workspace_id).await.map_err(e)?;
+    let threads: Vec<_> = repo::list_threads(&db, workspace_id)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
+        .collect();
     let mut out = Vec::new();
     for t in threads {
         for p in crate::planner::pending_writes(&db, t.id).await.map_err(e)? {
@@ -1104,7 +1231,12 @@ pub async fn workspace_needs_counts(
     let open_asks = asks.open();
     let mut out = Vec::new();
     for w in repo::list_workspaces(&db).await.map_err(e)? {
-        let threads = repo::list_threads(&db, w.id).await.map_err(e)?;
+        let threads: Vec<_> = repo::list_threads(&db, w.id)
+            .await
+            .map_err(e)?
+            .into_iter()
+            .filter(|t| t.kind != "curator") // hidden curator chat isn't a board issue
+            .collect();
         let tids: HashSet<i32> = threads.iter().map(|t| t.id).collect();
         let mut count: u32 = 0;
         for t in &threads {

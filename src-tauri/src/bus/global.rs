@@ -273,7 +273,11 @@ async fn list_workspaces(db: &Db) -> anyhow::Result<Value> {
         }
         let count = repo::list_threads(db, w.id)
             .await
-            .map(|v| v.into_iter().filter(|t| t.kind != "concierge").count())
+            .map(|v| {
+                v.into_iter()
+                    .filter(|t| t.kind != "concierge" && t.kind != "curator")
+                    .count()
+            })
             .unwrap_or(0);
         out.push(json!({ "id": w.id, "name": w.name, "issue_count": count }));
     }
@@ -295,7 +299,7 @@ async fn list_issues(db: &Db, ws: Option<i32>) -> anyhow::Result<Value> {
     let mut out = Vec::new();
     for w in workspaces {
         for t in repo::list_threads(db, w).await? {
-            if t.kind == "concierge" {
+            if t.kind == "concierge" || t.kind == "curator" {
                 continue;
             }
             out.push(json!({

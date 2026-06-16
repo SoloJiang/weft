@@ -67,6 +67,17 @@ export const api = {
     invoke<RepoGraph>("repo_graph", { workspaceId }),
   reprofileRepo: (repoId: number) =>
     invoke<void>("reprofile_repo", { repoId }),
+  // Re-run the read-only agent dependency curator over a workspace. Resolves
+  // when the pass completes, so the caller can refresh the graph after.
+  analyzeWorkspaceDeps: (workspaceId: number) =>
+    invoke<void>("analyze_workspace_deps", { workspaceId }),
+  // Remove a repo from its workspace (ref + profile + bound tasks + worktrees).
+  // The user's actual repository on disk is left untouched.
+  deleteRepo: (repoId: number) =>
+    invoke<void>("delete_repo", { repoId }),
+  // Get-or-create the workspace's hidden curator-chat thread; returns its id.
+  openCuratorChat: (workspaceId: number) =>
+    invoke<number>("open_curator_chat", { workspaceId }),
   updateRepoProfile: (repoId: number, summary: string, role: string) =>
     invoke<void>("update_repo_profile", { repoId, summary, role }),
 
@@ -302,6 +313,14 @@ export const api = {
   pickFolder: async (title?: string) => {
     const sel = await openDialog({ directory: true, multiple: false, title });
     return typeof sel === "string" ? sel : null;
+  },
+  // Native multi-folder picker; [] when cancelled. Used to add several local
+  // repos at once (the backend dedupes any already in the workspace).
+  pickFolders: async (title?: string) => {
+    const sel = await openDialog({ directory: true, multiple: true, title });
+    if (Array.isArray(sel)) return sel;
+    if (typeof sel === "string") return [sel];
+    return [];
   },
   // Native multi-file picker; [] when cancelled.
   pickFiles: async (title?: string) => {
