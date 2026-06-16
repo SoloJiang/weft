@@ -9,7 +9,7 @@ import { Select } from "../components/ui/Select";
 import { toast } from "../components/Toast";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
-import { parseGitUrls, repoNameFromUrl } from "../lib/gitUrl";
+import { gitUrlKey, parseGitUrls, repoNameFromUrl } from "../lib/gitUrl";
 import { cn } from "../lib/cn";
 
 export function CreateWorkspaceDialog({ open, onOpenChange }: DProps) {
@@ -138,19 +138,33 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   // Aborts the in-flight batch when the dialog is closed/cancelled mid-import.
   const abortRef = useRef<AbortController | null>(null);
 
-  // Recognized git URLs parsed live from the paste box (deduped, first-seen order).
-  const recognized = useMemo(() => parseGitUrls(url), [url]);
-  // What we actually clone. Fall back to the raw input for a single valid git
-  // source the parser doesn't model (file://, ssh aliases, host:repo, or a local
-  // path — which `git clone` accepts as one argument, spaces and all). A single
-  // LINE is treated as one source so spaced local paths still clone, preserving
-  // the old single-field dialog; multi-line input is a URL batch, so if none
-  // parsed there's nothing to clone.
+  // What we actually clone, parsed live from the paste box, one source per line.
+  // Each non-empty line yields its recognized git URLs (a line may hold several
+  // space-separated URLs); a line the parser doesn't model — a local path
+  // (spaces and all), an ssh alias, an unsupported scheme like ftp://, or a typo
+  // — is kept verbatim so `git clone` (one argument) attempts it and reports
+  // per-row, rather than being silently dropped. Deduped across lines.
   const cloneTargets = useMemo(() => {
-    if (recognized.length > 0) return recognized;
-    const single = url.trim();
-    return single !== "" && !/[\r\n]/.test(single) ? [single] : [];
-  }, [recognized, url]);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const rawLine of url.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (line === "") continue;
+      const urls = parseGitUrls(line);
+      if (urls.length > 0) {
+        for (const u of urls) {
+          const key = gitUrlKey(u);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(u);
+        }
+      } else if (!seen.has(`raw:${line}`)) {
+        seen.add(`raw:${line}`);
+        out.push(line);
+      }
+    }
+    return out;
+  }, [url]);
 
   // Reset on close; default the destination to the configured projects dir.
   useEffect(() => {
@@ -379,10 +393,6 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                     );
                   })}
                 </div>
-              )}
-
-              {cloneTargets.length === 0 && url.trim() !== "" && (
-                <p className="text-[12px] text-ink-faint">{t("dialog.cloneNoneRecognized")}</p>
               )}
 
               <Field label={t("dialog.repoLocation")}>

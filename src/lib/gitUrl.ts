@@ -17,6 +17,12 @@ const SCP_URL = /\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s<>"'`,;]+/gi;
 // Require a dotted host AND a `/` in the path so it doesn't swallow tokens like
 // `file.ts:42`.
 const SCP_NOUSER = /\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+:[^\s<>"'`,;]*\/[^\s<>"'`,;]+/gi;
+// ANY `scheme://…` URL (modeled or not, e.g. ftp://) — used ONLY to exclude scp
+// candidates that are really a scheme URL's authority. A credentialed authority
+// like `ftp://user@host:21/a/b` spawns two scp candidates (`user@host:21/…` and
+// the no-user `host:21/…`); both start inside this span and must be dropped, or
+// the no-user matcher would feed the backend a scheme-/port-stripped scp slice.
+const ANY_SCHEME_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s<>"'`,;]+/gi;
 
 /** Strip wrapping/trailing punctuation a paste often carries around a URL. */
 function trimUrl(raw: string): string {
@@ -31,7 +37,7 @@ function trimUrl(raw: string): string {
  * only (case-insensitive), keep the repo path's case (case-sensitive git hosts:
  * `Team/App` and `team/App` are distinct repos).
  */
-function dedupKey(url: string): string {
+export function gitUrlKey(url: string): string {
   // Trim trailing slashes BEFORE `.git` so `repo.git/` and `repo` key the same.
   const base = url.replace(/\/+$/, "").replace(/\.git$/i, "");
   // Host is case-insensitive; the optional userinfo / SSH user is NOT.
@@ -51,10 +57,17 @@ function dedupKey(url: string): string {
 /**
  * Extract recognized git URLs from arbitrary pasted text, in first-seen (paste)
  * order, deduped. An scp match that is actually the authority of a scheme URL —
- * recognized (`https://user@host:443/…`) or not (`ftp://host:21/…`) — is dropped:
- * it either overlaps a claimed scheme match, or is immediately preceded by `//`.
+ * modeled (`https://user@host:443/…`) or not (`ftp://user@host:21/…`) — is
+ * dropped: any scp candidate starting inside a `scheme://…` span is skipped, so
+ * an unmodeled-scheme URL recognizes as nothing and the caller's raw fallback
+ * can hand git the whole URL instead of a scheme-stripped slice.
  */
 export function parseGitUrls(text: string): string[] {
+  const schemeSpans: Array<[number, number]> = [];
+  for (const m of text.matchAll(ANY_SCHEME_URL)) {
+    const s = m.index ?? 0;
+    schemeSpans.push([s, s + m[0].length]);
+  }
   const matches: Array<{ raw: string; start: number; end: number; scp: boolean }> = [];
   for (const m of text.matchAll(SCHEME_URL)) {
     matches.push({ raw: m[0], start: m.index ?? 0, end: (m.index ?? 0) + m[0].length, scp: false });
@@ -72,13 +85,14 @@ export function parseGitUrls(text: string): string[] {
   const claimed: Array<[number, number]> = [];
   for (const { raw, start, end, scp } of matches) {
     if (claimed.some(([s, e]) => start < e && end > s)) continue; // inside a claimed URL
-    // An scp slice that follows `//` is a scheme URL's authority (incl. schemes
-    // we don't model, e.g. ftp://) — skip it so the raw single-URL fallback wins.
-    if (scp && start >= 2 && text[start - 1] === "/" && text[start - 2] === "/") continue;
+    // Drop every scp candidate sitting inside a `scheme://…` authority (incl.
+    // schemes we don't model, e.g. ftp://) so we never emit a scheme-stripped
+    // slice; the caller's raw fallback hands the full URL to git instead.
+    if (scp && schemeSpans.some(([s, e]) => start >= s && start < e)) continue;
     const url = trimUrl(raw);
     if (!url) continue;
     claimed.push([start, end]);
-    const key = dedupKey(url);
+    const key = gitUrlKey(url);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(url);
