@@ -100,23 +100,41 @@ export function parseGitUrls(text: string): string[] {
   return out;
 }
 
+// A token that can ONLY be a standalone source — never a fragment of a local
+// path with spaces: a scheme URL (`scheme://…`), an scp/alias colon-path
+// (`[user@]host:org/repo`), or anything the parser already recognizes. Its
+// presence proves whitespace on its line separates sources.
+function isHardSource(tok: string): boolean {
+  return tok.includes("://") || /^[^\s:\\]+:[^\s\\]*\/[^\s]*$/.test(tok) || parseGitUrls(tok).length > 0;
+}
+
+// A token worth cloning (vs. a prose label like `Repos:` or a markdown bullet
+// `-`/`*` to drop when a line is split): a hard source, a path (has `/` or `\`),
+// or a bare `name.git`.
+function looksLikeSource(tok: string): boolean {
+  return isHardSource(tok) || /[/\\]/.test(tok) || /\.git$/i.test(tok);
+}
+
 /**
  * Parse a paste box of clone sources into a deduped list, in paste order.
  *
- * Newline is the canonical separator. Within a line, spaces/commas also separate
- * sources — but ONLY when every token contains a `:` (as every URL, scp address,
- * and ssh alias does); otherwise the line is taken as one source so a local path
- * with spaces (`/Users/me/My Projects/repo`) or a Windows drive path stays
- * intact. Each resulting source is normalized to its recognized git URL when the
- * parser models it, or kept verbatim (local path, ssh alias `gh:org/repo`,
- * `ftp://…`, a typo) so `git clone` can attempt it and report per-row instead of
- * being silently dropped.
+ * Newline always separates sources. Within a line, whitespace/commas separate
+ * sources ONLY when the line carries a "hard source" token (a scheme `://…` or
+ * scp/alias colon-path) that cannot be a fragment of a spaced path — then the
+ * line is split, source-shaped tokens are kept, and prose (labels like `Repos:`,
+ * bullets `-`/`*`) is dropped. A line without that evidence is taken as ONE
+ * source, so a local path with spaces (`/Users/me/My Projects/repo`) survives.
+ *
+ * Each kept source is wrapper-trimmed (backticks, bullets, brackets, trailing
+ * punctuation), then normalized to its recognized git URL, or kept verbatim
+ * (local path, ssh alias `gh:org/repo`, `ftp://…`, a typo) so `git clone` can
+ * attempt it and report per-row — never silently dropped.
  */
 export function parseCloneSources(text: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
-  const add = (src: string) => {
-    const urls = parseGitUrls(src);
+  const add = (token: string) => {
+    const urls = parseGitUrls(token);
     if (urls.length > 0) {
       for (const u of urls) {
         const key = gitUrlKey(u);
@@ -126,17 +144,19 @@ export function parseCloneSources(text: string): string[] {
       }
       return;
     }
-    const key = `raw:${src}`;
+    const raw = trimUrl(token);
+    if (raw === "") return;
+    const key = `raw:${raw}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push(src);
+    out.push(raw);
   };
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (line === "") continue;
     const tokens = line.split(/[\s,]+/).filter(Boolean);
-    if (tokens.length > 1 && tokens.every((tok) => tok.includes(":"))) {
-      for (const tok of tokens) add(tok);
+    if (tokens.length > 1 && tokens.some(isHardSource)) {
+      for (const tok of tokens) if (looksLikeSource(tok)) add(tok);
     } else {
       add(line);
     }
