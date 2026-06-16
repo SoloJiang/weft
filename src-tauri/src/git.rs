@@ -123,6 +123,46 @@ fn resolve_target_ref(worktree: &Path, target: &str) -> String {
     resolve_base_ref(worktree, "")
 }
 
+/// The remote's default branch *name* (origin/HEAD's target, `origin/` stripped),
+/// or None when no remote-tracking HEAD is set locally (no remote, or a repo added
+/// by path that was never cloned / `git remote set-head`). Local-only; no network.
+fn remote_default_branch(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let name = s.strip_prefix("origin/").unwrap_or(&s).to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The default BASE branch *name* for a NEW worktree (and the value captured as a
+/// repo's base_ref at add time): the live remote default (origin/HEAD) when the
+/// repo has one, else the recorded `base_ref` if it's a real branch, else
+/// main → master → "main". Unlike `default_target_branch` (which prefers the
+/// recorded base_ref first), this trusts the live remote default over a possibly
+/// stale recorded branch — a repo added while on a feature branch still bases new
+/// work off the remote's real default. Returns a bare branch name (no `origin/`).
+pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
+    if let Some(name) = remote_default_branch(repo) {
+        return name;
+    }
+    let b = base_ref.trim();
+    if !b.is_empty() && b != "HEAD" {
+        return b.strip_prefix("origin/").unwrap_or(b).to_string();
+    }
+    for c in ["main", "master"] {
+        if ref_resolves(repo, c) {
+            return c.to_string();
+        }
+    }
+    "main".to_string()
+}
+
 /// PR-style diff (files + patch + the ref compared against) of a worktree
 /// against a target branch: the task's own changes relative to where it
 /// branched off the target's latest *remote* state (merge-base with
@@ -133,21 +173,8 @@ pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<Ta
     // Normalize so a remote-prefixed input (e.g. the `origin/main` the UI shows)
     // fetches as `main` rather than failing on `git fetch origin origin/main`.
     let target = normalize_target(target);
-    if fetch && !target.is_empty() && target != "HEAD" {
-        // Explicit destination refspec so the branch lands in
-        // refs/remotes/origin/<target> regardless of the clone's configured
-        // remote.origin.fetch — a --single-branch clone otherwise drops an
-        // unmapped branch in FETCH_HEAD only, and resolve_target_ref would
-        // miss origin/<target> and silently fall back to the default branch.
-        // Best-effort (offline / no remote / branch absent must not abort the
-        // diff); GIT_TERMINAL_PROMPT=0 makes a credential-needing fetch fail
-        // fast instead of hanging on a prompt.
-        let refspec = format!("+{target}:refs/remotes/origin/{target}");
-        let _ = Command::new("git")
-            .args(["fetch", "--quiet", "origin", &refspec])
-            .current_dir(worktree_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output();
+    if fetch {
+        fetch_origin_branch(worktree_path, &target);
     }
     let resolved = resolve_target_ref(worktree_path, &target);
     // PR-style base = merge-base(resolved, HEAD). If it fails (unrelated
@@ -190,6 +217,57 @@ pub fn add_worktree(
             .context("worktree add (existing branch)")?;
     }
     Ok(worktree_path.to_path_buf())
+}
+
+/// Best-effort fetch of one branch from origin into refs/remotes/origin/<branch>.
+/// Explicit destination refspec so the branch lands in remote-tracking refs even
+/// under a `--single-branch` clone's narrowed remote.origin.fetch; GIT_TERMINAL_PROMPT=0
+/// fails fast instead of hanging on a credential prompt. Errors are ignored —
+/// offline / no remote / missing branch must never block the caller. `dir` may be
+/// the canonical repo or any of its worktrees.
+pub fn fetch_origin_branch(dir: &Path, branch: &str) {
+    let b = normalize_target(branch);
+    if b.is_empty() || b == "HEAD" {
+        return;
+    }
+    let refspec = format!("+{b}:refs/remotes/origin/{b}");
+    let _ = Command::new("git")
+        .args(["fetch", "--quiet", "origin", &refspec])
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+}
+
+/// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
+/// branches the new worktree off the FRESH `origin/<base_name>` when available
+/// (else local `<base_name>`, else the default-branch fallback chain). Returns the
+/// created path and Some(true) if it branched off the synced remote ref, Some(false)
+/// if it fell back to a local ref (offline / no remote — a "couldn't sync" signal),
+/// or None if an existing path / branch was reused. Reuses `resolve_target_ref`
+/// (same "prefer fresh remote" resolution as the diff target).
+pub fn add_worktree_synced(
+    repo: &Path,
+    branch: &str,
+    worktree_path: &Path,
+    base_name: &str,
+) -> Result<(PathBuf, Option<bool>)> {
+    if worktree_path.exists() {
+        return Ok((worktree_path.to_path_buf(), None));
+    }
+    fetch_origin_branch(repo, base_name);
+    let resolved = resolve_target_ref(repo, base_name);
+    let synced = resolved.starts_with("origin/");
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let path_str = worktree_path.to_string_lossy().to_string();
+    let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &resolved]);
+    if res.is_err() {
+        git(repo, &["worktree", "add", &path_str, branch])
+            .context("worktree add (existing branch)")?;
+        return Ok((worktree_path.to_path_buf(), None));
+    }
+    Ok((worktree_path.to_path_buf(), Some(synced)))
 }
 
 /// Remove a worktree and prune. (Used by M2 worktree lifecycle management.)
@@ -969,5 +1047,86 @@ mod tests {
         let refs2 = vec!["fix/login/old".to_string()];
         let n2 = choose_branch_name_from_refs("fix", "login", &refs2);
         assert_eq!(n2, "fix/login-2");
+    }
+
+    #[test]
+    fn default_base_branch_prefers_remote_default_then_base_ref() {
+        // origin whose default HEAD is `develop` (not the initial branch).
+        let origin = tmp("dbb-origin");
+        init_repo(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d"]).unwrap();
+        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/develop"]).unwrap();
+        let clone = tmp("dbb-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        // The clone's origin/HEAD → origin/develop; the live remote default wins
+        // over a stale recorded base_ref ("main").
+        assert_eq!(default_base_branch(&clone, "main"), "develop");
+
+        // A repo with no remote falls back to the recorded base_ref...
+        let local = tmp("dbb-local");
+        init_repo(&local).unwrap();
+        assert_eq!(default_base_branch(&local, "trunk"), "trunk");
+        // ...and an empty/HEAD base_ref detects main/master, never returns "HEAD".
+        let det = default_base_branch(&local, "");
+        assert!(det == "main" || det == "master", "got {det}");
+        assert_ne!(default_base_branch(&local, "HEAD"), "HEAD");
+
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn add_worktree_synced_branches_off_fresh_origin() {
+        // origin with develop ahead of main by one commit.
+        let origin = tmp("aws-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        std::fs::write(origin.join("d.txt"), "d\n").unwrap();
+        git(&origin, &["add", "-A"]).unwrap();
+        git(&origin, &["commit", "-q", "-m", "develop work"]).unwrap();
+        let dev_commit = git(&origin, &["rev-parse", "HEAD"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        // single-branch clone (main only) → origin/develop absent until fetched.
+        let clone = tmp("aws-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", "--single-branch", "--branch", &main,
+              &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(!ref_resolves(&clone, "origin/develop"), "precondition");
+
+        let wt = tmp("aws-wt");
+        let (_, synced) = add_worktree_synced(&clone, "feat/x", &wt, "develop").unwrap();
+        assert_eq!(synced, Some(true), "branched off the synced origin/develop");
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), dev_commit);
+
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_falls_back_to_local_when_offline() {
+        // No remote → fetch is a no-op, branch off the local base, signal Some(false).
+        let repo = tmp("aws-offline");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let wt = tmp("aws-offline-wt");
+        let (_, synced) = add_worktree_synced(&repo, "feat/y", &wt, &base).unwrap();
+        assert_eq!(synced, Some(false), "offline → branched off local");
+        assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 }
