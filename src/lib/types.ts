@@ -84,6 +84,8 @@ export interface Direction {
   status: string;
   /** worker mandate: "plan+impl" (plans its direction first) | "impl-only". */
   mandate: string;
+  /** the ref the work branch was created off; "" = the repo's default branch. */
+  base_branch: string;
   created_at: string;
 }
 
@@ -372,6 +374,7 @@ export interface ProposedDirection {
   repo: string;
   reason: string;
   mandate?: string;
+  base_branch?: string;
   decision?: string;
 }
 export interface Proposal {
@@ -391,6 +394,8 @@ export interface ResolvedDirection {
   reason: string;
   /** "plan+impl" | "impl-only" */
   mandate: string;
+  /** the chosen base branch; "" = the repo's default branch. */
+  base_branch: string;
   decision: string;
 }
 export interface ResolvedProposal {

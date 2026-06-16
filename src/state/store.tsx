@@ -187,6 +187,7 @@ interface Store {
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: () => Promise<void>;
+  setProposalDirectionBase: (index: number, base: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
@@ -1663,6 +1664,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     for (const id of ids) void dispatchDirection(id);
   }, [activeThreadId, loadThreadChildren, dispatchDirection]);
 
+  const setProposalDirectionBase = useCallback(
+    async (index: number, base: string) => {
+      if (activeThreadId == null || !proposal) return;
+      // Rebuild the stored Proposal from the resolved view, overriding one base.
+      const next: Proposal = {
+        rationale: proposal.rationale,
+        directions: proposal.directions.map((d, i) => ({
+          name: d.name,
+          tool: "", // legacy field; ignored by the backend
+          repo: d.repo.repo_name,
+          reason: d.reason,
+          mandate: d.mandate,
+          decision: d.decision,
+          base_branch: i === index ? base.trim() : (d.base_branch ?? ""),
+        })),
+      };
+      await api.saveProposal(activeThreadId, next);
+      await refreshProposal(activeThreadId);
+    },
+    [activeThreadId, proposal, refreshProposal],
+  );
+
   const answerAsk = useCallback(
     async (item: NeedItem, text: string) => {
       if (!text.trim()) return;
@@ -1984,6 +2007,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshProposal,
     saveProposal,
     confirmProposal,
+    setProposalDirectionBase,
     overview,
     refreshOverview,
     selectWorkspace,
