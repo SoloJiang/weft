@@ -842,6 +842,11 @@ pub struct EngineInner {
     /// Set on idle when skills changed; the next send silently restarts the
     /// resident process so it picks up newly-injected skills. UI never sees it.
     pub pending_skill_refresh: bool,
+    /// Set when the tool's command override (alias) changed under this live
+    /// engine; the next send silently bounces the resident process / codex client
+    /// so it respawns from the new command. Like `pending_skill_refresh`, invisible
+    /// to the UI.
+    pub pending_command_refresh: bool,
     /// 会话信息面板的最近快照,供 lead_state / session_for 重挂回填(claude:init
     /// 解析出 mcp/model/window,turn 结束更新 context_tokens)。
     pub last_context_tokens: Option<u64>,
@@ -1110,10 +1115,17 @@ pub async fn send(
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
-    let pending = { eng.lock().await.pending_skill_refresh };
+    let pending = {
+        let g = eng.lock().await;
+        g.pending_skill_refresh || g.pending_command_refresh
+    };
     if pending {
         let (tid, _sid, _current, orphans) = stop_quiet(eng).await;
-        eng.lock().await.pending_skill_refresh = false;
+        {
+            let mut g = eng.lock().await;
+            g.pending_skill_refresh = false;
+            g.pending_command_refresh = false;
+        }
         // The bounce fires from idle, so orphans is normally empty; finalize
         // defensively so a still-open tool row can't outlive the bounce.
         finalize_orphan_tool_rows(app, db, tid, orphans, "interrupted").await;
@@ -3084,6 +3096,7 @@ mod tests {
             interrupting: false,
             generation: 0,
             pending_skill_refresh: false,
+            pending_command_refresh: false,
             last_context_tokens: None,
             last_model: None,
             last_window: None,
@@ -3227,6 +3240,7 @@ mod tests {
             interrupting: false,
             generation: 0,
             pending_skill_refresh: false,
+            pending_command_refresh: false,
             last_context_tokens: None,
             last_model: None,
             last_window: None,

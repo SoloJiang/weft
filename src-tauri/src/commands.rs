@@ -619,12 +619,18 @@ pub async fn set_tool_command(
     let (map, prev) = repo::set_tool_command(&db, &tool, &command, apply_to_existing)
         .await
         .map_err(e)?;
+    let new_cmd = map.get(&tool).cloned().unwrap_or_else(|| tool.clone());
     crate::tool_command::set_overrides(map);
+    let changed = new_cmd != prev;
 
     // Sync live engines so the reconcile applies WITHOUT closing/reopening the
     // session (their `command` was captured when the engine was built). Mirror the
-    // DB: apply-to-existing clears pins (follow new global); opt-out freezes
-    // currently un-pinned engines of this tool to their prior command.
+    // DB: apply-to-existing clears pins (follow new global) and, when the command
+    // actually changed, flags a silent resident bounce so the open session's next
+    // send respawns from the new binary (a Claude child / codex client spawned
+    // from the old command would otherwise outlive the change). Opt-out freezes
+    // currently un-pinned engines to their prior command — which is what their
+    // resident process is already running, so no bounce is needed.
     use tauri::Manager;
     let engines: Vec<crate::lead_chat::engine::EngineRef> = app
         .state::<crate::lead_chat::engine::LeadChatState>()
@@ -639,8 +645,23 @@ pub async fn set_tool_command(
         }
         if apply_to_existing {
             inner.command = None;
+            if changed {
+                inner.pending_command_refresh = true;
+            }
         } else if inner.command.is_none() {
             inner.command = Some(prev.clone());
+        }
+    }
+
+    // Recycle the GLOBAL discovery helpers spawned from the old binary so the
+    // command palette / session metadata reconnect with the new command. These
+    // are app-scoped (not per-session), so recycle whenever the effective command
+    // changed, regardless of apply-to-existing.
+    if changed {
+        match tool.as_str() {
+            "opencode" => crate::opencode::shutdown().await,
+            "codex" => crate::codex_app_server::shutdown_global().await,
+            _ => {}
         }
     }
     Ok(())

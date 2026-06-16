@@ -31,6 +31,19 @@ fn serve() -> Arc<Mutex<Serve>> {
         .clone()
 }
 
+/// Shut down the cached `opencode serve` helper so the next discovery respawns
+/// it. Called when the user's opencode command override (alias) changes — the
+/// running helper was launched from the old binary and would otherwise keep
+/// serving its command palette / metadata until it died.
+pub async fn shutdown() {
+    let s = serve();
+    let mut g = s.lock().await;
+    if let Some(mut c) = g.child.take() {
+        let _ = c.kill().await;
+    }
+    g.base = None;
+}
+
 /// Discover slash commands for `cwd`, or an empty list on any failure (opencode
 /// not installed, serve won't start, endpoint error). Discovery is best-effort
 /// and must never block the composer.
