@@ -119,11 +119,18 @@ function isHardSource(tok: string): boolean {
   );
 }
 
-// A token worth cloning (vs. a prose label like `Repos:` or a markdown bullet
-// `-`/`*` to drop when a line is split): a hard source, a path (has `/` or `\`),
-// or a bare `name.git`.
+// A real filesystem path — absolute, `./`/`../` relative, `~/` home, a Windows
+// drive (`C:\`/`C:/`), or a `\\` UNC path. A bare slash-bearing word like
+// `and/or` or `docs/setup` is NOT a path — that's prose.
+function isPathLike(tok: string): boolean {
+  return /^(\/|\.\.?\/|~\/|[A-Za-z]:[\\/]|\\\\)/.test(tok);
+}
+
+// A token worth cloning (vs. a prose label like `Repos:`, a slashed word like
+// `and/or`, or a markdown bullet `-`/`*` to drop when a line is split): a hard
+// source, a real path, or a bare `name.git`.
 function looksLikeSource(tok: string): boolean {
-  return isHardSource(tok) || /[/\\]/.test(tok) || /\.git$/i.test(tok);
+  return isHardSource(tok) || isPathLike(tok) || /\.git$/i.test(tok);
 }
 
 /**
