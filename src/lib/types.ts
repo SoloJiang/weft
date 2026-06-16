@@ -51,6 +51,19 @@ export interface WorktreeDiff {
   patch: string;
 }
 
+/** "vs target" diff: like WorktreeDiff, plus the ref actually compared against
+ *  and the per-task target editor's current/default values (one round-trip). */
+export interface TargetDiff {
+  files: FileDiff[];
+  patch: string;
+  /** Ref compared against, e.g. "origin/main". */
+  resolved: string;
+  /** Stored per-task target branch ("" = using the default). */
+  target: string;
+  /** Effective default (the repo's base branch), shown as the placeholder. */
+  default_branch: string;
+}
+
 /** Normalized observe-mode transcript event (from the tool's own sidecar). */
 export type NormEvent =
   | { kind: "message"; role: "user" | "assistant"; text: string; ts: string }

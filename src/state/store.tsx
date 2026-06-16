@@ -235,8 +235,15 @@ interface Store {
   checkingDirections: Record<number, boolean>;
   verifyDirection: (directionId: number) => Promise<void>;
   /** Review-agent rung: on-demand pre-PR self-review verdict + in-flight set. */
-  /** Run the global review skill inside the direction's own session. */
-  requestSkillReview: (directionId: number) => Promise<void>;
+  /**
+   * Run the global review skill inside the direction's own session.
+   * `focus` surfaces the worker conversation so the human watches the review
+   * command land (manual trigger); auto-review leaves it headless.
+   */
+  requestSkillReview: (
+    directionId: number,
+    opts?: { focus?: boolean },
+  ) => Promise<void>;
   /** The configured review skill ("" = auto-detect superpowers'). */
   reviewSkill: string;
   setReviewSkill: (s: string) => void;
@@ -1325,20 +1332,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [reviewSkill, leadSlash, workerSlash]);
 
   const requestSkillReview = useCallback(
-    async (directionId: number) => {
+    async (directionId: number, opts?: { focus?: boolean }) => {
       const writes = await api.listWorktrees(directionId).catch(() => []);
       const first = writes[0];
       if (!first) return;
-      let sess = Object.values(sessionsRef.current).find(
+      const live = Object.values(sessionsRef.current).find(
         (s) => s.directionId === directionId && s.status !== "exited",
       );
-      if (!sess) {
-        await driveDirection(directionId, first.repo_id, false);
-        sess = Object.values(sessionsRef.current).find(
-          (s) => s.directionId === directionId && s.status !== "exited",
-        );
-      }
-      if (!sess) return;
+      // Manual trigger: open the worker conversation up front so the human lands
+      // in the session and watches the review command get inserted. Auto-review
+      // (opts undefined) stays headless — it only surfaces the post-fix state.
+      if (opts?.focus) openWorker(directionId, live?.repoId ?? first.repo_id);
+      // driveDirection returns the (possibly freshly-resumed) session id directly;
+      // sessionsRef won't reflect a new session until React re-renders, so reuse
+      // that id rather than re-scanning the ref (which could miss the just-created
+      // session and drop the review command, stranding the user in an idle view).
+      const sessionId =
+        live?.info.session_id ??
+        (await driveDirection(directionId, first.repo_id, false));
+      if (sessionId == null) return;
       // Review-then-repair: the skill reviews, the same agent fixes what it
       // found and re-verifies — the human only sees the post-fix state.
       const directive =
@@ -1346,9 +1358,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           ? "review 结束后，直接修复发现的问题并重新跑检查自验，然后简要汇报。"
           : "After the review, fix the findings directly, re-run the checks to verify, then report briefly.";
       const cmd = `/${resolveReviewSkill()} ${directive}`;
-      await api.chatSend(sess.info.session_id, cmd);
+      await api.chatSend(sessionId, cmd);
     },
-    [driveDirection, resolveReviewSkill],
+    [driveDirection, openWorker, resolveReviewSkill],
   );
 
   // Automation-first: a task flowing into "review" triggers the review skill
@@ -1564,6 +1576,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (activeWorkspaceId != null) void selectWorkspace(activeWorkspaceId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeWorkspaceId]);
+
+  // Reset a thread's sub-view (lead tab, in-flight proposal review) only when the
+  // active thread actually CHANGES. This lives in the store — not in ThreadBoard —
+  // so it survives the board unmounting/remounting as the worker overlay opens and
+  // closes; otherwise every "back" out of a worker snapped to the lead chat. Paths
+  // that set the thread directly (e.g. opening a Needs-you ask) are covered too.
+  const prevThreadRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (activeThreadId === prevThreadRef.current) return;
+    prevThreadRef.current = activeThreadId;
+    if (activeThreadId != null) {
+      setThreadTab("lead");
+      setReviewingProposal(false);
+    }
+  }, [activeThreadId]);
 
   // Needs-you: poll workspace-wide, plus a push refresh when the coordinator
   // signals a new ask (needs-you://changed). Poll is the safety net; the event

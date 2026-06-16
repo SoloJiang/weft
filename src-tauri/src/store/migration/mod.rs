@@ -28,8 +28,9 @@ impl MigratorTrait for Migrator {
             Box::new(M0015ImRoute),
             Box::new(M0016BackupConfig),
             Box::new(M0017SessionStatusReset),
-            Box::new(M0018ThreadLeadCommand),
-            Box::new(M0019SessionCommand),
+            Box::new(M0018DirectionTargetBranch),
+            Box::new(M0019ThreadLeadCommand),
+            Box::new(M0020SessionCommand),
         ]
     }
 }
@@ -648,18 +649,62 @@ impl MigrationTrait for M0017SessionStatusReset {
     }
 }
 
+/// Per-task (direction) target branch for the diff panel's "vs target" mode.
+/// Empty = use the repo's default branch (repo_ref.base_ref). Tolerate a
+/// duplicate column so re-running against a hand-patched db is a no-op.
+pub struct M0018DirectionTargetBranch;
+impl MigrationName for M0018DirectionTargetBranch {
+    fn name(&self) -> &str {
+        "m0018_direction_target_branch"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0018DirectionTargetBranch {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("target_branch"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .drop_column(Alias::new("target_branch"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 /// Adds the nullable thread.lead_command pin (per-lead command override for the
 /// coding-agent alias feature). NULL = follow the global tool→command map. M0001
 /// reflects the current entity, so a FRESH db already has the column; sqlite has
 /// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
-pub struct M0018ThreadLeadCommand;
-impl MigrationName for M0018ThreadLeadCommand {
+pub struct M0019ThreadLeadCommand;
+impl MigrationName for M0019ThreadLeadCommand {
     fn name(&self) -> &str {
-        "m0018_thread_lead_command"
+        "m0019_thread_lead_command"
     }
 }
 #[async_trait::async_trait]
-impl MigrationTrait for M0018ThreadLeadCommand {
+impl MigrationTrait for M0019ThreadLeadCommand {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let r = manager
             .alter_table(
@@ -689,15 +734,15 @@ impl MigrationTrait for M0018ThreadLeadCommand {
 }
 
 /// Adds the nullable session.command pin (per-worker command override). Same
-/// semantics and duplicate tolerance as M0018.
-pub struct M0019SessionCommand;
-impl MigrationName for M0019SessionCommand {
+/// semantics and duplicate tolerance as M0019.
+pub struct M0020SessionCommand;
+impl MigrationName for M0020SessionCommand {
     fn name(&self) -> &str {
-        "m0019_session_command"
+        "m0020_session_command"
     }
 }
 #[async_trait::async_trait]
-impl MigrationTrait for M0019SessionCommand {
+impl MigrationTrait for M0020SessionCommand {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let r = manager
             .alter_table(
