@@ -231,6 +231,8 @@ interface Store {
     reason: string,
   ) => Promise<void>;
   deleteThread: (threadId: number) => Promise<void>;
+  /** Delete a finished task's worktree (directory + record); keeps the branch. */
+  deleteWorktree: (worktreeId: number, directionId: number) => Promise<void>;
 
   viewing: { directionId: number; repoId: number; diff?: boolean } | null;
   viewDirection: (directionId: number, repoId: number, opts?: { diff?: boolean }) => void;
@@ -806,6 +808,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeWorkspaceId],
   );
 
+  // Reclaim one finished task's worktree directory; the branch, row, and card
+  // stay. The backend keeps the row (its record that Weft made this branch) and
+  // just removes the directory, so mirror that by flipping the row's `exists` to
+  // false — the card hides the Delete item and disables the now-defunct worktree's
+  // actions, without losing the provenance.
+  const deleteWorktree = useCallback(
+    async (worktreeId: number, directionId: number) => {
+      await api.deleteWorktree(worktreeId);
+      setWorktrees((m) => {
+        const cur = m[directionId];
+        if (!cur) return m;
+        return {
+          ...m,
+          [directionId]: cur.map((w) =>
+            w.id === worktreeId ? { ...w, exists: false } : w,
+          ),
+        };
+      });
+    },
+    [],
+  );
+
   // ALL workers run on the chat engine — one product-native conversation UI
   // per vendor dialect (claude stream-json, codex exec --json, opencode run
   // --format json). Escape hatches per tool: codex app deep link, terminal
@@ -1056,7 +1080,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch {
         return;
       }
-      for (const w of wts) {
+      // Skip reclaimed worktrees (exists=false): the directory is gone, so
+      // spawning a worker in it would fail.
+      for (const w of wts.filter((w) => w.exists)) {
         await spawnWorker(directionId, w.repo_id, false);
       }
     },
@@ -1074,7 +1100,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch {
         return;
       }
-      for (const w of wts) {
+      // Skip reclaimed worktrees (exists=false): a resume would drive a worker
+      // into a missing cwd.
+      for (const w of wts.filter((w) => w.exists)) {
         await driveDirection(directionId, w.repo_id, false);
       }
     },
@@ -1416,7 +1444,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const requestSkillReview = useCallback(
     async (directionId: number, opts?: { focus?: boolean }) => {
       const writes = await api.listWorktrees(directionId).catch(() => []);
-      const first = writes[0];
+      // Only a worktree still on disk can be reviewed; a reclaimed one
+      // (exists=false) has no working copy to open.
+      const first = writes.find((w) => w.exists);
       if (!first) return;
       const live = Object.values(sessionsRef.current).find(
         (s) => s.directionId === directionId && s.status !== "exited",
@@ -1961,6 +1991,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     createThread,
     createDirection,
     deleteThread,
+    deleteWorktree,
     viewing,
     viewDirection,
     driveDirection,

@@ -9,6 +9,7 @@ import { Select } from "../components/ui/Select";
 import { toast } from "../components/Toast";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
+import type { Worktree } from "../lib/types";
 import { parseCloneSources, repoNameFromUrl } from "../lib/gitUrl";
 import { cn } from "../lib/cn";
 
@@ -771,6 +772,75 @@ export function RenameDialog({
             </Button>
           </div>
         </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Confirm-only destructive dialog for deleting a finished task's worktree. Open
+ *  state is driven by `worktree` (null = closed); the last shown worktree is kept
+ *  in a ref so the text stays put through the close transition. */
+export function DeleteWorktreeDialog({
+  worktree,
+  onOpenChange,
+  onConfirm,
+}: {
+  worktree: Worktree | null;
+  onOpenChange: (o: boolean) => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const shownRef = useRef(worktree);
+  if (worktree) shownRef.current = worktree;
+  const wasOpen = useRef(false);
+  const open = worktree != null;
+  useEffect(() => {
+    if (open && !wasOpen.current) {
+      setBusy(false);
+      setErr(null);
+    }
+    wasOpen.current = open;
+  }, [open]);
+  const wt = shownRef.current;
+
+  async function confirm() {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onConfirm();
+      onOpenChange(false);
+    } catch (e) {
+      setErr(t("error.deleteWorktreeFailed"));
+      if (import.meta.env.DEV) console.error("delete worktree failed:", String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent title={t("thread.deleteWorktreeTitle")}>
+        <div className="flex flex-col gap-4">
+          <p className="text-[13px] leading-relaxed text-ink-muted">
+            {wt ? t("thread.deleteWorktreeBody", { path: wt.path, branch: wt.branch }) : ""}
+          </p>
+          {err && <p className="text-[12px] text-danger">{err}</p>}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={busy}
+              onClick={() => onOpenChange(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button type="button" variant="danger" disabled={busy} onClick={() => void confirm()}>
+              {t("thread.deleteWorktreeConfirm")}
+            </Button>
+          </div>
+        </div>
       </DialogContent>
     </Dialog>
   );

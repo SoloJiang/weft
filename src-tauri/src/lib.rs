@@ -202,6 +202,7 @@ pub fn run() {
             commands::verify_direction,
             commands::create_direction,
             commands::list_worktrees,
+            commands::delete_worktree,
             commands::repo_diff,
             commands::delete_thread,
             commands::rename_workspace,

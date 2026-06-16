@@ -134,6 +134,64 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
     Ok(())
 }
 
+/// Reclaim one direction's worktree on its own: remove the working-copy directory
+/// but KEEP the branch, the worktree row, and the direction. Used by the Done-card
+/// "delete worktree" action — the user is freeing disk for a finished task, not
+/// tearing the direction down. The row is deliberately retained as the record that
+/// Weft created this branch here: it lets `delete_thread`'s cascade still clean the
+/// branch later (zero-accumulation) and drives the `exists=false` state the board
+/// uses to disable the now-defunct worktree's actions. Idempotent: a missing row,
+/// or an already-removed directory, is a no-op.
+pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> {
+    use sea_orm::EntityTrait;
+    let Some(wt) = entities::worktree::Entity::find_by_id(worktree_id)
+        .one(&db.0)
+        .await?
+    else {
+        return Ok(()); // already gone — idempotent
+    };
+    // Done-only: re-read the owning direction so a stale confirm dialog can't
+    // reclaim the worktree of a task that was moved back to working/review (by a
+    // human or the bus) after the dialog opened — that would delete an active
+    // agent's working copy.
+    let dir = entities::direction::Entity::find_by_id(wt.direction_id)
+        .one(&db.0)
+        .await?
+        .context("direction not found")?;
+    if dir.status != "done" {
+        anyhow::bail!("worktree can only be deleted for a done task");
+    }
+    // Don't yank the cwd out from under a session that still owns it. A human can
+    // mark a task done while its worker is mid-turn (running/starting) or while it
+    // has been taken over in their own terminal (stopped — the takeover/runaway
+    // state per lead_chat::engine, where a human may still be driving it).
+    // Force-removing the worktree then would discard in-flight work or break the
+    // live terminal session, so refuse.
+    if let Some(sess) = repo::latest_session_for(db, wt.direction_id, wt.repo_id).await? {
+        if matches!(sess.status.as_str(), "running" | "starting" | "stopped") {
+            anyhow::bail!("cannot delete the worktree while its worker is active");
+        }
+    }
+    let path = std::path::Path::new(&wt.path);
+    if let Some(r) = entities::repo_ref::Entity::find_by_id(wt.repo_id)
+        .one(&db.0)
+        .await?
+    {
+        let repo_path = std::path::Path::new(&r.local_git_path);
+        // remove_worktree drops the working tree and prunes; it leaves the branch.
+        if let Err(e) = git::remove_worktree(repo_path, path) {
+            eprintln!("[weft] worktree remove failed for {}: {e}", wt.path);
+        }
+    }
+    // Surface a failed removal instead of silently "succeeding": if the directory
+    // survives (repo path missing, locked, …) the row's `exists` stays true, so the
+    // card keeps offering a retry rather than showing a phantom reclaim.
+    if path.exists() {
+        anyhow::bail!("worktree directory could not be removed: {}", wt.path);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

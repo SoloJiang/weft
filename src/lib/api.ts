@@ -117,6 +117,9 @@ export const api = {
 
   listWorktrees: (directionId: number) =>
     invoke<Worktree[]>("list_worktrees", { directionId }),
+  // Delete one finished task's worktree (directory + record); keeps the branch.
+  deleteWorktree: (worktreeId: number) =>
+    invoke<void>("delete_worktree", { worktreeId }),
 
   // Lead chat engine: weft-owned conversation (headless stream-json claude).
   leadSend: (

@@ -898,6 +898,13 @@ pub(crate) async fn chat_open_worker_impl(
         .await?
         .ok_or_else(|| anyhow::anyhow!("direction not found"))?;
     let cwd = std::path::PathBuf::from(&wt.path);
+    // A worktree row can outlive its directory (reclaimed via the Done-card
+    // delete, or removed out of band). Never spawn a worker in a missing cwd —
+    // this is the chokepoint every driver (card, revive, redispatch, review)
+    // funnels through, so the guard covers them all.
+    if !cwd.exists() {
+        anyhow::bail!("worktree directory no longer exists for that direction+repo");
+    }
 
     // Resume an earlier conversation when this slot already captured one.
     let prior = repo::latest_session_for(db, direction_id, repo_id).await?;

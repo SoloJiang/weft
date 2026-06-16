@@ -15,16 +15,17 @@ import {
   Pencil,
   ScanEye,
   TerminalSquare,
+  Trash2,
   X,
 } from "lucide-react";
 import { useStore } from "../state/store";
-import type { Direction, RepoChecks, SessionStatus } from "../lib/types";
+import type { Direction, RepoChecks, SessionStatus, Worktree } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { StatusDot } from "../components/ui/StatusChip";
 import { Tooltip } from "../components/ui/Tooltip";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ScopeReview } from "./ScopeReview";
-import { RenameDialog } from "../nav/dialogs";
+import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
 
@@ -189,9 +190,15 @@ function DirectionCard({
     checksByDirection,
     requestSkillReview,
     openNeeds,
+    deleteWorktree,
   } = useStore();
   const { t } = useTranslation();
+  const [wtToDelete, setWtToDelete] = useState<Worktree | null>(null);
   const writes = worktreesByDirection[direction.id] ?? [];
+  // Only worktrees whose directory is still on disk back live actions. A row can
+  // outlive its directory (reclaimed via the Done-card delete, or removed out of
+  // band), and opening a session / diff against a missing cwd just breaks.
+  const liveWrites = writes.filter((w) => w.exists);
   const checks = checksByDirection[direction.id];
 
   const allChecks = (checks ?? []).flatMap((rc) => rc.checks);
@@ -200,7 +207,7 @@ function DirectionCard({
   const hasNeed =
     needs.some((n) => n.direction_id === direction.id) ||
     asks.some((a) => a.dir === String(direction.id));
-  const firstWrite = writes[0];
+  const firstWrite = liveWrites[0];
 
   const testsKind =
     failed > 0 ? "fail" : allChecks.length > 0 && passed === allChecks.length ? "pass" : "pend";
@@ -214,6 +221,7 @@ function DirectionCard({
   const canRunReview = direction.status === "review";
 
   return (
+    <>
     <motion.div
       layout
       className={cn(
@@ -271,7 +279,12 @@ function DirectionCard({
                 : t("thread.testsPending")
             }
           />
-          <ProvenanceMenu direction={direction} writes={writes} checks={checks} />
+          <ProvenanceMenu
+            direction={direction}
+            writes={writes}
+            checks={checks}
+            onDeleteWorktree={setWtToDelete}
+          />
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {canRunReview && (
@@ -279,7 +292,7 @@ function DirectionCard({
               <button
                 type="button"
                 onClick={() => void requestSkillReview(direction.id, { focus: true })}
-                disabled={writes.length === 0}
+                disabled={liveWrites.length === 0}
                 aria-label={t("thread.review")}
                 className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-muted outline-none transition-colors hover:bg-brand-ghost hover:text-ink disabled:opacity-40"
               >
@@ -303,6 +316,16 @@ function DirectionCard({
         </div>
       </div>
     </motion.div>
+    <DeleteWorktreeDialog
+      worktree={wtToDelete}
+      onOpenChange={(o) => {
+        if (!o) setWtToDelete(null);
+      }}
+      onConfirm={async () => {
+        if (wtToDelete) await deleteWorktree(wtToDelete.id, direction.id);
+      }}
+    />
+    </>
   );
 }
 
@@ -316,10 +339,12 @@ function ProvenanceMenu({
   direction,
   writes,
   checks,
+  onDeleteWorktree,
 }: {
   direction: Direction;
-  writes: { id: number; repo_id: number; branch: string; path: string }[];
+  writes: Worktree[];
   checks?: RepoChecks[];
+  onDeleteWorktree: (w: Worktree) => void;
 }) {
   const { t } = useTranslation();
   const { repos, sessions, viewDirection } = useStore();
@@ -362,14 +387,35 @@ function ProvenanceMenu({
               const name = repo?.name ?? `repo ${w.repo_id}`;
               return (
                 <div key={w.id} className="pb-0.5">
-                  {/* Repo header → open this repo's session. */}
+                  {/* Repo header → open this repo's session (only while the
+                      worktree directory is live; a reclaimed/removed one can't). */}
                   <DM.Item
-                    onSelect={() => viewDirection(direction.id, w.repo_id)}
-                    className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[12px] text-ink outline-none data-[highlighted]:bg-brand-ghost"
+                    onSelect={(e) => {
+                      if (!w.exists) {
+                        e.preventDefault();
+                        return;
+                      }
+                      viewDirection(direction.id, w.repo_id);
+                    }}
+                    className={cn(
+                      "flex items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[12px] outline-none",
+                      w.exists
+                        ? "cursor-pointer text-ink data-[highlighted]:bg-brand-ghost"
+                        : "cursor-default text-ink-faint",
+                    )}
                   >
-                    <TerminalSquare size={12} className="shrink-0 text-brand" />
+                    <TerminalSquare
+                      size={12}
+                      className={cn("shrink-0", w.exists ? "text-brand" : "text-ink-faint")}
+                    />
                     <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
-                    {sess && <StatusDot status={sess.status as SessionStatus} />}
+                    {w.exists ? (
+                      sess && <StatusDot status={sess.status as SessionStatus} />
+                    ) : (
+                      <span className="shrink-0 text-[10px] text-ink-faint">
+                        {t("thread.worktreeRemoved")}
+                      </span>
+                    )}
                   </DM.Item>
                   {/* Branch → copy. */}
                   <DM.Item
@@ -405,6 +451,20 @@ function ProvenanceMenu({
                       <Copy size={11} className="shrink-0 text-ink-faint" />
                     )}
                   </DM.Item>
+                  {/* Reclaim a finished task's worktree. Done-only (its work is
+                      settled) and only while the directory is still on disk. */}
+                  {direction.status === "done" && w.exists && (
+                    <DM.Item
+                      title={t("thread.deleteWorktree")}
+                      onSelect={() => onDeleteWorktree(w)}
+                      className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] py-1 pl-7 pr-2 text-[11px] text-danger outline-none data-[highlighted]:bg-[oklch(0.64_0.2_25/0.12)] data-[highlighted]:text-danger"
+                    >
+                      <Trash2 size={11} className="shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">
+                        {t("thread.deleteWorktree")}
+                      </span>
+                    </DM.Item>
+                  )}
                 </div>
               );
             })

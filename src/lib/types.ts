@@ -94,6 +94,8 @@ export interface Worktree {
   branch: string;
   path: string;
   created_at: string;
+  /** Whether the worktree directory is still present on disk (backend-checked). */
+  exists: boolean;
 }
 
 export interface SessionInfo {

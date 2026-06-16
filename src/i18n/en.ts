@@ -167,6 +167,12 @@ export const en = {
     dropHere: "Drop to move here",
     setStatus: "Set status",
     renameTask: "Rename sub-task",
+    deleteWorktree: "Delete worktree",
+    deleteWorktreeTitle: "Delete worktree?",
+    deleteWorktreeBody:
+      "This removes the worktree directory at {{path}}. The branch {{branch}} is kept. Any uncommitted changes in the worktree will be lost.",
+    deleteWorktreeConfirm: "Delete",
+    worktreeRemoved: "Removed",
     discussTitle: "Talk to the lead to plan this issue",
     discussBody:
       "Describe what you want in the conversation on the right. The lead reads your repos, proposes how to split the work, and you confirm it into sub-tasks here.",
@@ -701,6 +707,7 @@ export const en = {
     renameDuplicate: "Another item already uses that name.",
     renameEmpty: "Name cannot be empty.",
     renameFailed: "Rename failed. Please try again.",
+    deleteWorktreeFailed: "Couldn't delete the worktree. Please try again.",
   },
   kind: {
     feature: "Feature",
