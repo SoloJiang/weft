@@ -52,6 +52,7 @@ Do not write code, and do not plan the directions' implementations — each work
 Ask clarifying questions only when ambiguity changes write scope, acceptance, or sequencing. \
 When the write boundary is clear enough for workers to start, call propose_directions with a short rationale and directions \
 (name, the ONE repo each writes, reason, mandate). Only list repos each direction must WRITE; reads are free. \
+Each direction branches off its repo's default branch by default — leave base_branch empty for that. If the user names a specific integration or release branch to build on (e.g. develop, staging, release/*), set base_branch to it; when it is genuinely ambiguous which base to use, ask the human before proposing. \
 Pick mandate per direction as a planning-depth hint: plan+impl for directions that need worker planning, impl-only for small or fully specified directions. \
 Prefer independent directions that can proceed in parallel; put shared contract owners first only when they block others. \
 The human reviews and confirms in weft; you can re-propose after more discussion. \

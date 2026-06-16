@@ -354,6 +354,16 @@ mod tests {
     }
 
     #[test]
+    fn proposal_parses_base_branch_and_defaults_empty() {
+        let p: Proposal = serde_json::from_str(
+            r#"{ "directions": [ { "name": "a", "repo": "api", "base_branch": "develop" }, { "name": "b", "repo": "api" } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(p.directions[0].base_branch, "develop");
+        assert_eq!(p.directions[1].base_branch, "", "absent base_branch defaults to empty");
+    }
+
+    #[test]
     fn proposal_parses_with_missing_and_legacy_fields() {
         // Legacy proposals carried a "tool" per direction; serde must ignore it.
         let p: Proposal =

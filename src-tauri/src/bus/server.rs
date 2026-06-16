@@ -563,7 +563,9 @@ fn planner_specs() -> Value {
                     "repo": str_prop(),
                     "reason": str_prop(),
                     "mandate": { "type": "string", "enum": ["plan+impl", "impl-only"],
-                        "description": "Granularity of the role: plan+impl (default) — the worker plans its own direction first, then builds; impl-only — the direction is small/fully specified, the worker builds straight away. Do NOT write the direction's implementation plan yourself; that is the worker's job." }
+                        "description": "Granularity of the role: plan+impl (default) — the worker plans its own direction first, then builds; impl-only — the direction is small/fully specified, the worker builds straight away. Do NOT write the direction's implementation plan yourself; that is the worker's job." },
+                    "base_branch": { "type": "string",
+                        "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." }
                 }, "required": ["name", "repo", "reason"] } }
             }, "required": ["directions"] }
         }
