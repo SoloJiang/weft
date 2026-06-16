@@ -23,6 +23,11 @@ pub struct Model {
     pub source: String,
     /// Short HEAD sha when last profiled (empty if unknown).
     pub profiled_commit: String,
+    /// JSON array of `profile::AgentRelation` — the agent curator's inferred
+    /// cross-repo relations (service-to-service, infra, …). "[]" until analyzed.
+    /// Preserved across deterministic re-profiling, which only refreshes facts.
+    #[sea_orm(default_value = "[]")]
+    pub relations: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

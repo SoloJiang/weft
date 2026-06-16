@@ -57,6 +57,9 @@ export function WorkspaceNav() {
     renamingWsId != null ? workspaces.find((w) => w.id === renamingWsId) ?? null : null;
   const renamingThread =
     renamingThreadId != null ? threads.find((th) => th.id === renamingThreadId) ?? null : null;
+  // The hidden curator-chat thread is in `threads` (so its chat can render) but
+  // is not a board issue — keep it out of the nav list.
+  const issueThreads = threads.filter((th) => th.kind !== "curator");
   const { t } = useTranslation();
   // Any OTHER workspace waiting on the human → flag it on the switcher.
   const otherNeeds = workspaces.some(
@@ -180,13 +183,13 @@ export function WorkspaceNav() {
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
-            {threads.length === 0 ? (
+            {issueThreads.length === 0 ? (
               <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-ink-faint">
                 {t("nav.noThreads")}
               </p>
             ) : (
               <ul className="flex flex-col gap-0.5">
-                {threads.map((t) => (
+                {issueThreads.map((t) => (
                   <ThreadRow key={t.id} thread={t} onRename={setRenamingThreadId} />
                 ))}
               </ul>

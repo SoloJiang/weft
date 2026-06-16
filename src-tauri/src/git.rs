@@ -528,6 +528,56 @@ pub fn current_branch(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// The repo's `origin` remote URL, if one is configured. None for a freshly
+/// `git init`-ed local repo (no origin) or any git error — callers treat that
+/// as "no remote identity, dedup by path only".
+pub fn remote_url(repo: &Path) -> Option<String> {
+    git(repo, &["remote", "get-url", "origin"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Normalized dedup key for a git remote URL, mirroring the frontend
+/// `gitUrlKey` (src/lib/gitUrl.ts) so both sides agree on "same repo": drop a
+/// trailing `.git`/slashes, lowercase the scheme + host only — the repo path
+/// stays case-sensitive (git hosts treat `Team/App` and `team/App` as distinct).
+/// Empty in → empty out.
+pub fn git_url_key(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return String::new();
+    }
+    // Trim trailing slashes BEFORE `.git` so `repo.git/` and `repo` key the same.
+    let no_slash = url.trim_end_matches('/');
+    let base = if no_slash.len() >= 4 && no_slash[no_slash.len() - 4..].eq_ignore_ascii_case(".git")
+    {
+        &no_slash[..no_slash.len() - 4]
+    } else {
+        no_slash
+    };
+    // Lowercase the host; keep any userinfo / ssh user (case-sensitive).
+    let lower_host = |authority: &str| match authority.rfind('@') {
+        Some(at) => format!("{}{}", &authority[..=at], authority[at + 1..].to_lowercase()),
+        None => authority.to_lowercase(),
+    };
+    // scheme URL: `scheme://authority[/path]`.
+    if let Some(pos) = base.find("://") {
+        let scheme = &base[..pos + 3];
+        let rest = &base[pos + 3..];
+        let (authority, path) = match rest.find('/') {
+            Some(s) => (&rest[..s], &rest[s..]),
+            None => (rest, ""),
+        };
+        return format!("{}{}{}", scheme.to_lowercase(), lower_host(authority), path);
+    }
+    // scp-style: `[user@]host:path` (split on the first colon).
+    if let Some(colon) = base.find(':') {
+        return format!("{}:{}", lower_host(&base[..colon]), &base[colon + 1..]);
+    }
+    base.to_lowercase()
+}
+
 /// Short HEAD commit sha; used to stamp a repo profile and detect staleness.
 pub fn head_commit(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--short", "HEAD"])
@@ -585,6 +635,39 @@ mod tests {
         let p = std::env::temp_dir().join(format!("weft-git-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    #[test]
+    fn git_url_key_normalizes_host_and_dotgit() {
+        // Host is case-insensitive; trailing `.git`/slashes are dropped — so all
+        // these spellings of the same remote collapse to one dedup key.
+        let k = git_url_key("https://github.com/acme/app");
+        assert_eq!(git_url_key("https://GitHub.com/acme/app.git"), k);
+        assert_eq!(git_url_key("https://github.com/acme/app.git/"), k);
+        // The repo path stays case-sensitive (git hosts treat these as distinct).
+        assert_ne!(git_url_key("https://github.com/Acme/App"), git_url_key("https://github.com/acme/app"));
+        // scp form `[user@]host:path`: host lowercased, ssh user + path kept.
+        let s = git_url_key("git@github.com:acme/api");
+        assert_eq!(git_url_key("git@GitHub.com:acme/api.git"), s);
+        assert_ne!(s, k); // scp and scheme spellings don't unify — and shouldn't here
+        assert_eq!(git_url_key(""), "");
+    }
+
+    #[test]
+    fn remote_url_reads_origin_or_none() {
+        let repo = tmp("remote");
+        init_repo(&repo).unwrap();
+        assert_eq!(remote_url(&repo), None, "a fresh repo has no origin");
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://github.com/acme/app.git"],
+        )
+        .unwrap();
+        assert_eq!(
+            remote_url(&repo).as_deref(),
+            Some("https://github.com/acme/app.git")
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

@@ -52,6 +52,10 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
             post(handle_planner).get(get_not_allowed),
         )
         .route(
+            "/curator/:thread/mcp",
+            post(handle_curator).get(get_not_allowed),
+        )
+        .route(
             "/global/mcp",
             post(crate::bus::global::handle_global).get(get_not_allowed),
         )
@@ -301,6 +305,108 @@ async fn handle_planner(
         _ => json!({}),
     };
     sse(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+/// MCP for the workspace curator chat: read the dependency graph and apply human
+/// calibrations to it. Mirrors `handle_planner`; identity (the curator thread)
+/// comes from the URL path.
+async fn handle_curator(
+    Path(thread): Path<i32>,
+    State(db): State<Db>,
+    Json(req): Json<Value>,
+) -> Response {
+    let id = match req.get("id") {
+        Some(v) => v.clone(),
+        None => return StatusCode::ACCEPTED.into_response(),
+    };
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let result: Value = match method {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": { "listChanged": false } },
+            "serverInfo": { "name": "weft_curator", "version": "1.0.0" }
+        }),
+        "tools/list" => json!({ "tools": curator_specs() }),
+        "tools/call" => {
+            let name = req
+                .pointer("/params/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args = req
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            call_curator(&db, thread, name, &args).await
+        }
+        _ => json!({}),
+    };
+    sse(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn curator_specs() -> Value {
+    json!([
+        {
+            "name": "get_repo_map",
+            "description": "Read the workspace repos and their current dependency edges (ids, roles, summaries, published interfaces). Use the ids when calling calibrate_edges.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "calibrate_edges",
+            "description": "Add or remove ONE cross-repo dependency edge after inspecting the code (READ-ONLY — never modify files). `from`/`to` are repo ids from get_repo_map and MUST differ. `kind` ∈ http|grpc|queue|infra|lib. `action` ∈ add|remove. `via` is a short evidence label (e.g. \"POST /orders\"). Human-set edges are pinned and survive automatic re-analysis; removals are remembered so the agent won't re-add them.",
+            "inputSchema": { "type": "object", "properties": {
+                "from": { "type": "integer" },
+                "to": { "type": "integer" },
+                "kind": { "type": "string" },
+                "via": { "type": "string" },
+                "action": { "type": "string", "enum": ["add", "remove"] }
+            }, "required": ["from", "to", "kind", "action"] }
+        }
+    ])
+}
+
+async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
+    match name {
+        "get_repo_map" => match repo_map_json(db, thread).await {
+            Ok(v) => text_result(v),
+            Err(e) => text_result(format!("error: {e}")),
+        },
+        "calibrate_edges" => calibrate_edges_tool(db, thread, args).await,
+        _ => text_result(format!("unknown tool {name}")),
+    }
+}
+
+/// Apply one human calibration: validate ids, write a user-sourced relation (or
+/// removal tombstone), then emit `repo-graph-updated` so the repo map refreshes.
+async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
+    let from = args.get("from").and_then(|v| v.as_i64()).map(|n| n as i32);
+    let to = args.get("to").and_then(|v| v.as_i64()).map(|n| n as i32);
+    let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let via = args.get("via").and_then(|v| v.as_str()).unwrap_or("");
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("add");
+    let (Some(from), Some(to)) = (from, to) else {
+        return text_result("from and to repo ids are required".into());
+    };
+    if from == to {
+        return text_result("from and to must be different repos".into());
+    }
+    if kind.is_empty() {
+        return text_result("kind is required (http|grpc|queue|infra|lib)".into());
+    }
+    match crate::store::repo::calibrate_repo_relation(db, from, to, kind, via, action).await {
+        Ok(()) => {
+            // Live-refresh the repo map for this curator thread's workspace.
+            if let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await {
+                if let Some(app) = crate::APP_HANDLE.get() {
+                    use tauri::Emitter;
+                    let _ = app.emit("repo-graph-updated", t.workspace_id);
+                }
+            }
+            text_result(format!(
+                "{action} {kind} edge {from}->{to} (pinned to your calibration)"
+            ))
+        }
+        Err(e) => text_result(format!("error: {e}")),
+    }
 }
 
 async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {

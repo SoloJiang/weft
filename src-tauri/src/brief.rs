@@ -96,6 +96,19 @@ pub fn format_seed_message(d: &BriefData) -> String {
     s
 }
 
+/// The verb for a contract line, by edge kind. The deterministic manifest edge
+/// ("lib", and any untagged legacy edge) keeps the original "depends on"; the
+/// agent curator's runtime/infra kinds get a verb that says what the link is.
+fn relation_verb(kind: &str) -> &'static str {
+    match kind {
+        "http" => "calls over HTTP",
+        "grpc" => "calls over gRPC",
+        "queue" => "exchanges messages with",
+        "infra" => "shares infrastructure with",
+        _ => "depends on",
+    }
+}
+
 /// Gather a direction's brief from the DB + the curator's dependency graph.
 pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
     use sea_orm::EntityTrait;
@@ -140,20 +153,24 @@ pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
         })
         .collect();
 
-    // contracts: any edge touching a write repo
+    // contracts: any edge touching a write repo. The verb reflects the edge
+    // kind so an agent-inferred runtime call reads differently from a declared
+    // package dependency; the manifest "lib" kind keeps the original "depends on".
     let mut contracts = Vec::new();
     for e in &graph.edges {
         let from_w = write_ids.contains(&e.from);
         let to_w = write_ids.contains(&e.to);
+        let verb = relation_verb(&e.kind);
         if to_w && !from_w {
             contracts.push(format!(
-                "{} depends on your {} (via {}) — keep that interface stable, or announce the change on the bus.",
-                name_of(e.from), name_of(e.to), e.via
+                "{} {} your {} (via {}) — keep that interface stable, or announce the change on the bus.",
+                name_of(e.from), verb, name_of(e.to), e.via
             ));
         } else if from_w && !to_w {
             contracts.push(format!(
-                "Your {} depends on {} (via {}) — read it for the contract; don't edit it.",
+                "Your {} {} {} (via {}) — read it for the contract; don't edit it.",
                 name_of(e.from),
+                verb,
                 name_of(e.to),
                 e.via
             ));

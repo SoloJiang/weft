@@ -19,6 +19,10 @@ fn planner_url(base: &str, thread: i32) -> String {
     format!("{base}/planner/{thread}/mcp")
 }
 
+fn curator_url(base: &str, thread: i32) -> String {
+    format!("{base}/curator/{thread}/mcp")
+}
+
 fn global_url(base: &str) -> String {
     format!("{base}/global/mcp")
 }
@@ -147,6 +151,17 @@ pub fn inject_planner(base: &str, thread: i32, tool: &str, cwd: &Path) -> Inject
         "weft_planner",
         "planner",
         &planner_url(base, thread),
+        tool,
+        cwd,
+    )
+}
+
+/// The curator chat's MCP (get_repo_map + calibrate_edges), per curator thread.
+pub fn inject_curator(base: &str, thread: i32, tool: &str, cwd: &Path) -> Injection {
+    inject_mcp(
+        "weft_curator",
+        "curator",
+        &curator_url(base, thread),
         tool,
         cwd,
     )

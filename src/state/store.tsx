@@ -176,6 +176,10 @@ interface Store {
   refreshRepoMap: () => Promise<void>;
   refreshReposAndMap: (workspaceId?: number) => Promise<void>;
   reprofileRepo: (repoId: number) => Promise<void>;
+  reanalyzeDeps: () => Promise<void>;
+  deleteRepo: (repoId: number) => Promise<void>;
+  /** Open the workspace's curator calibration chat (navigates to its surface). */
+  openCuratorChat: () => Promise<void>;
   editRepoProfile: (repoId: number, summary: string, role: string) => Promise<void>;
 
   /** The active thread's plan proposal (Task → scope), if any. */
@@ -200,6 +204,14 @@ interface Store {
   renameThread: (threadId: number, title: string) => Promise<void>;
   renameDirection: (directionId: number, name: string) => Promise<void>;
   addRepo: (name: string, path: string) => Promise<void>;
+  /** Batch add of existing local repos, sequential + tolerant. Reports per-item
+   *  progress; refreshes the repo list once at the end. Duplicates are deduped
+   *  silently by the backend (same path / remote already in the workspace). */
+  addRepos: (
+    items: Array<{ name: string; path: string }>,
+    onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+    signal?: AbortSignal,
+  ) => Promise<void>;
   cloneRepo: (url: string, dest: string, name: string) => Promise<void>;
   /** Batch clone: each item to `<dest>/<name>`, sequential + tolerant. Reports
    *  per-item progress; refreshes the repo list once at the end. */
@@ -693,6 +705,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (name: string, path: string) => {
       if (activeWorkspaceId == null) return;
       await api.addRepoRef(activeWorkspaceId, name, path);
+      await refreshReposAndMap(activeWorkspaceId);
+    },
+    [activeWorkspaceId, refreshReposAndMap],
+  );
+
+  const addRepos = useCallback(
+    async (
+      items: Array<{ name: string; path: string }>,
+      onProgress: (index: number, status: "cloning" | "ok" | "error", error?: string) => void,
+      signal?: AbortSignal,
+    ) => {
+      if (activeWorkspaceId == null) return;
+      // Sequential + tolerant, mirroring importRepos: a non-git path (or any
+      // failure) reports per-row and doesn't abort the rest. Backend dedups
+      // already-present repos silently, so re-adds are harmless no-ops.
+      for (let i = 0; i < items.length; i++) {
+        if (signal?.aborted) break;
+        onProgress(i, "cloning");
+        try {
+          await api.addRepoRef(activeWorkspaceId, items[i].name, items[i].path);
+          onProgress(i, "ok");
+        } catch (e) {
+          onProgress(i, "error", String(e));
+        }
+      }
       await refreshReposAndMap(activeWorkspaceId);
     },
     [activeWorkspaceId, refreshReposAndMap],
@@ -1500,6 +1537,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refreshRepoMap],
   );
 
+  // Manually re-run the agent dependency curator, then refresh the map so the
+  // newly inferred runtime/infra edges appear. Slow (spawns a read-only agent).
+  const reanalyzeDeps = useCallback(async () => {
+    if (activeWorkspaceId == null) return;
+    await api.analyzeWorkspaceDeps(activeWorkspaceId);
+    await refreshRepoMap();
+  }, [activeWorkspaceId, refreshRepoMap]);
+
   const editRepoProfile = useCallback(
     async (repoId: number, summary: string, role: string) => {
       await api.updateRepoProfile(repoId, summary, role);
@@ -1507,6 +1552,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [refreshRepoMap],
   );
+
+  // Remove a repo from the workspace (ref + profile + bound tasks + worktrees);
+  // the user's repo on disk is untouched. Refreshes the repo list + map after.
+  const deleteRepo = useCallback(
+    async (repoId: number) => {
+      await api.deleteRepo(repoId);
+      if (activeWorkspaceId != null) await refreshReposAndMap(activeWorkspaceId);
+    },
+    [activeWorkspaceId, refreshReposAndMap],
+  );
+
+  // Open the workspace's hidden curator chat by navigating to its chat surface
+  // (the curator thread is in `threads` but hidden from the board/nav lists).
+  // Reuses selectThread so it renders exactly like any lead chat.
+  const openCuratorChat = useCallback(async () => {
+    if (activeWorkspaceId == null) return;
+    const id = await api.openCuratorChat(activeWorkspaceId);
+    // The curator thread may have just been created — sync `threads` so
+    // ThreadBoard can find it (it bails to null on a missing active thread).
+    setThreads(await api.listThreads(activeWorkspaceId));
+    await selectThread(id);
+  }, [activeWorkspaceId, selectThread]);
 
   const refreshProposal = useCallback(async (threadId: number) => {
     try {
@@ -1658,6 +1725,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       void unChanged.then((f) => f());
     };
   }, [activeWorkspaceId, refreshNeeds]);
+
+  // Live-refresh the repo map when the curator calibrates an edge (or the auto
+  // pass finishes) for the active workspace.
+  useEffect(() => {
+    const un = listen<number>("repo-graph-updated", (e) => {
+      if (e.payload === activeWorkspaceId) void refreshRepoMap();
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [activeWorkspaceId, refreshRepoMap]);
 
   // While an issue is open, keep its proposal fresh (the lead re-proposes over
   // the chat engine; the timeline card is the anchor, this state feeds the
@@ -1837,6 +1915,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshRepoMap,
     refreshReposAndMap,
     reprofileRepo,
+    reanalyzeDeps,
+    deleteRepo,
+    openCuratorChat,
     editRepoProfile,
     proposal,
     refreshProposal,
@@ -1854,6 +1935,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     renameThread,
     renameDirection,
     addRepo,
+    addRepos,
     cloneRepo,
     importRepos,
     createRepo,

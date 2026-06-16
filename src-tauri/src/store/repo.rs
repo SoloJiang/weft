@@ -285,26 +285,63 @@ pub async fn set_tool_command(
 /// Workspace container used by per-IM-conversation Concierge threads.
 pub const K_CONCIERGE_WORKSPACE: &str = "concierge.workspace_id";
 
+/// app_setting key holding a workspace's hidden curator-chat thread id.
+fn curator_thread_key(workspace_id: i32) -> String {
+    format!("curator.thread.{workspace_id}")
+}
+
+/// Get-or-create the hidden curator-chat thread for a workspace (mirrors the
+/// Concierge get-or-create). The id is stable (persisted in app_setting); the
+/// thread is `kind="curator"` so board views can filter it out.
+pub async fn ensure_curator_thread(db: &Db, workspace_id: i32) -> Result<i32> {
+    let key = curator_thread_key(workspace_id);
+    if let Some(id) = get_setting(db, &key).await?.and_then(|s| s.parse::<i32>().ok()) {
+        if let Some(t) = get_thread(db, id).await? {
+            if t.kind == "curator" {
+                return Ok(id);
+            }
+        }
+    }
+    let t = create_thread(db, workspace_id, "Dependency curator", "curator", "claude").await?;
+    set_setting(db, &key, &t.id.to_string()).await?;
+    Ok(t.id)
+}
+
+/// Register a repo in a workspace. Idempotent at the workspace level: if a repo
+/// with the same local path OR the same `origin` remote (compared via
+/// `git::git_url_key`) is already present, the existing row is returned and
+/// nothing is inserted — so re-adding or re-pasting the same repo is a silent
+/// no-op, and the same remote cloned at two paths isn't duplicated. Dedup is
+/// scoped to the workspace; the same repo in two workspaces is intentional.
 pub async fn add_repo_ref(
     db: &Db,
     workspace_id: i32,
     name: &str,
     local_git_path: &str,
     base_ref: &str,
+    remote_url: &str,
 ) -> Result<repo_ref::Model> {
-    let existing: Vec<String> = repo_ref::Entity::find()
+    let existing = repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
         .all(&db.0)
-        .await?
-        .into_iter()
-        .map(|r| r.slug)
-        .collect();
+        .await?;
+    // Same-repo dedup: identical local path, or a non-empty remote normalizing to
+    // the same key (an empty key never matches, so local-only repos stay distinct).
+    let key = crate::git::git_url_key(remote_url);
+    if let Some(dup) = existing.iter().find(|r| {
+        r.local_git_path == local_git_path
+            || (!key.is_empty() && crate::git::git_url_key(&r.remote_url) == key)
+    }) {
+        return Ok(dup.clone());
+    }
+    let slugs: Vec<String> = existing.into_iter().map(|r| r.slug).collect();
     let m = repo_ref::ActiveModel {
         workspace_id: Set(workspace_id),
         name: Set(name.to_string()),
-        slug: Set(unique_slug(name, &existing)),
+        slug: Set(unique_slug(name, &slugs)),
         local_git_path: Set(local_git_path.to_string()),
         base_ref: Set(base_ref.to_string()),
+        remote_url: Set(remote_url.to_string()),
         ..Default::default()
     };
     Ok(m.insert(&db.0).await?)
@@ -431,8 +468,11 @@ pub async fn upsert_repo_profile(
 ) -> Result<repo_profile::Model> {
     let mut a = match get_repo_profile(db, repo_id).await? {
         Some(m) => m.into(),
+        // New row: agent relations start empty. (On update we leave `relations`
+        // untouched, so deterministic re-profiling never wipes agent findings.)
         None => repo_profile::ActiveModel {
             repo_id: Set(repo_id),
+            relations: Set("[]".to_string()),
             ..Default::default()
         },
     };
@@ -444,6 +484,50 @@ pub async fn upsert_repo_profile(
     a.source = Set(source.to_string());
     a.profiled_commit = Set(profiled_commit.to_string());
     Ok(a.save(&db.0).await?.try_into_model()?)
+}
+
+/// Persist the agent curator's inferred relations (JSON array of
+/// `profile::AgentRelation`) for a repo, leaving its deterministic facts intact.
+/// No-op if the repo has no profile row yet (profiling is eager on add).
+pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Result<()> {
+    if let Some(m) = get_repo_profile(db, repo_id).await? {
+        let mut a: repo_profile::ActiveModel = m.into();
+        a.relations = Set(relations.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// Apply one human calibration to a producer repo's relations. `action="add"`
+/// upserts a user-sourced relation for `(to, kind)`; `action="remove"` writes a
+/// user `rejected` tombstone for that pair so the edge disappears and the auto
+/// pass won't resurrect it. Replaces any prior entry for the same `(to, kind)`.
+/// No-op if the repo has no profile row yet.
+pub async fn calibrate_repo_relation(
+    db: &Db,
+    from_id: i32,
+    to_id: i32,
+    kind: &str,
+    via: &str,
+    action: &str,
+) -> Result<()> {
+    let Some(p) = get_repo_profile(db, from_id).await? else {
+        return Ok(());
+    };
+    let mut rels: Vec<crate::profile::AgentRelation> =
+        serde_json::from_str(&p.relations).unwrap_or_default();
+    // One entry per (to, kind): drop any prior one, then add the calibration.
+    rels.retain(|r| !(r.to == to_id && r.kind == kind));
+    rels.push(crate::profile::AgentRelation {
+        to: to_id,
+        kind: kind.to_string(),
+        via: via.to_string(),
+        confidence: 100,
+        source: "user".to_string(),
+        rejected: action == "remove",
+    });
+    let json = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
+    set_repo_relations(db, from_id, &json).await
 }
 
 pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::Model>> {
@@ -668,6 +752,52 @@ pub async fn worktree_for(
         .filter(worktree::Column::RepoId.eq(repo_id))
         .one(&db.0)
         .await?)
+}
+
+/// Remove a repo from a workspace and all Weft state derived from it: its
+/// profile, the directions bound to it (a direction has one write repo) with
+/// their sessions, and its worktree rows. Returns the worktrees (repo_id, path,
+/// branch) the caller must physically `git worktree remove` — DB rows are gone
+/// after this. NEVER touches the user's actual repo directory at `local_git_path`.
+pub async fn delete_repo_cascade(db: &Db, repo_id: i32) -> Result<Vec<(i32, String, String)>> {
+    // Worktrees registered for this repo (each direction's worktree is keyed to
+    // its write repo, so this covers the bound directions' worktrees too).
+    let removed: Vec<(i32, String, String)> = worktree::Entity::find()
+        .filter(worktree::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|w| (w.repo_id, w.path, w.branch))
+        .collect();
+    // Sessions of the directions bound to this repo, plus any keyed to the repo.
+    let dirs = direction::Entity::find()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?;
+    for d in &dirs {
+        session::Entity::delete_many()
+            .filter(session::Column::DirectionId.eq(d.id))
+            .exec(&db.0)
+            .await?;
+    }
+    session::Entity::delete_many()
+        .filter(session::Column::RepoId.eq(repo_id))
+        .exec(&db.0)
+        .await?;
+    worktree::Entity::delete_many()
+        .filter(worktree::Column::RepoId.eq(repo_id))
+        .exec(&db.0)
+        .await?;
+    direction::Entity::delete_many()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .exec(&db.0)
+        .await?;
+    repo_profile::Entity::delete_many()
+        .filter(repo_profile::Column::RepoId.eq(repo_id))
+        .exec(&db.0)
+        .await?;
+    repo_ref::Entity::delete_by_id(repo_id).exec(&db.0).await?;
+    Ok(removed)
 }
 
 /// Delete a thread and everything under it. Returns the worktree paths that the
@@ -1175,6 +1305,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_repo_ref_dedupes_by_path_and_remote_within_workspace() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        let a = add_repo_ref(
+            &db,
+            ws.id,
+            "web-app",
+            "/code/web",
+            "main",
+            "https://github.com/acme/web.git",
+        )
+        .await
+        .unwrap();
+
+        // Same local path (any name/remote) → returns the existing row, no insert.
+        let same_path = add_repo_ref(&db, ws.id, "renamed", "/code/web", "main", "")
+            .await
+            .unwrap();
+        assert_eq!(same_path.id, a.id, "same path must not create a second repo");
+
+        // Same remote (normalized: host-case + .git differ), DIFFERENT path — e.g.
+        // the same GitHub repo cloned elsewhere → deduped to the first row.
+        let same_remote = add_repo_ref(
+            &db,
+            ws.id,
+            "web-2",
+            "/elsewhere/web",
+            "main",
+            "https://GitHub.com/acme/web",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            same_remote.id, a.id,
+            "same remote (normalized) must dedup across paths"
+        );
+
+        // A genuinely different repo → a new row.
+        let other = add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            "/code/api",
+            "main",
+            "https://github.com/acme/api.git",
+        )
+        .await
+        .unwrap();
+        assert_ne!(other.id, a.id);
+
+        // Two local repos with NO remote and different paths both exist — an empty
+        // remote key must never collapse distinct repos.
+        let l1 = add_repo_ref(&db, ws.id, "local-1", "/code/l1", "main", "")
+            .await
+            .unwrap();
+        let l2 = add_repo_ref(&db, ws.id, "local-2", "/code/l2", "main", "")
+            .await
+            .unwrap();
+        assert_ne!(l1.id, l2.id, "empty remote must not collapse distinct repos");
+
+        // Dedup is workspace-scoped: the same repo in another workspace is allowed.
+        let ws2 = create_workspace(&db, "ws2").await.unwrap();
+        let elsewhere = add_repo_ref(
+            &db,
+            ws2.id,
+            "web-app",
+            "/code/web",
+            "main",
+            "https://github.com/acme/web.git",
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            elsewhere.id, a.id,
+            "same repo in another workspace is a distinct row"
+        );
+
+        // ws holds exactly: a, other, l1, l2 (same_path + same_remote deduped).
+        assert_eq!(list_repos(&db, ws.id).await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn delete_repo_cascade_removes_repo_and_its_deps_only() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "")
+            .await
+            .unwrap();
+        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "")
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, a.id, "service", "[]", "", "[]", "[]", "inferred", "")
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, b.id, "service", "[]", "", "[]", "[]", "inferred", "")
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude")
+            .await
+            .unwrap();
+        // a direction bound to repo `a`, with a session + worktree
+        let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl")
+            .await
+            .unwrap();
+        let sess = create_session(&db, dir.id, a.id, "claude", "/tmp/a-wt")
+            .await
+            .unwrap();
+        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt")
+            .await
+            .unwrap();
+        // a direction bound to repo `b` — must SURVIVE the delete of `a`
+        let dir_b = create_direction(&db, t.id, "db", "claude", b.id, "reason", "plan+impl")
+            .await
+            .unwrap();
+
+        let removed = delete_repo_cascade(&db, a.id).await.unwrap();
+        // returns repo `a`'s worktree(s) for the caller to physically remove
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].1, "/tmp/a-wt");
+
+        // repo `a` + its profile/direction/session/worktree are gone…
+        assert!(get_repo(&db, a.id).await.unwrap().is_none());
+        assert!(get_repo_profile(&db, a.id).await.unwrap().is_none());
+        assert!(get_direction(&db, dir.id).await.unwrap().is_none());
+        assert!(get_session(&db, sess.id).await.unwrap().is_none());
+        assert!(list_worktrees(&db, Some(dir.id)).await.unwrap().is_empty());
+        // …while repo `b` and the direction bound to it are untouched.
+        assert!(get_repo(&db, b.id).await.unwrap().is_some());
+        assert!(get_repo_profile(&db, b.id).await.unwrap().is_some());
+        assert!(get_direction(&db, dir_b.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn calibrate_repo_relation_adds_user_edge_then_tombstones_removal() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+            .await
+            .unwrap();
+        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, web.id, "app", "[]", "", "[]", "[]", "inferred", "")
+            .await
+            .unwrap();
+        let read = |db: &Db, id| {
+            let db = db.clone();
+            async move {
+                let p = get_repo_profile(&db, id).await.unwrap().unwrap();
+                serde_json::from_str::<Vec<crate::profile::AgentRelation>>(&p.relations).unwrap()
+            }
+        };
+
+        // add → one user-sourced relation for the pair
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "Pricing.Quote", "add")
+            .await
+            .unwrap();
+        let rels = read(&db, web.id).await;
+        assert_eq!(rels.len(), 1);
+        assert_eq!((rels[0].to, rels[0].kind.as_str()), (api.id, "grpc"));
+        assert_eq!(rels[0].source, "user");
+        assert!(!rels[0].rejected);
+
+        // remove the same pair+kind → a single user tombstone (not two rows)
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "", "remove")
+            .await
+            .unwrap();
+        let rels = read(&db, web.id).await;
+        assert_eq!(rels.len(), 1);
+        assert!(rels[0].rejected, "removal writes a tombstone");
+        assert_eq!(rels[0].source, "user");
+
+        // a repo with no profile is a no-op (must not panic)
+        calibrate_repo_relation(&db, 9999, api.id, "http", "x", "add")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_curator_thread_is_idempotent_and_kinded() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let a = ensure_curator_thread(&db, ws.id).await.unwrap();
+        let b = ensure_curator_thread(&db, ws.id).await.unwrap();
+        assert_eq!(a, b, "the same curator thread is reused");
+        assert_eq!(get_thread(&db, a).await.unwrap().unwrap().kind, "curator");
+        // a normal issue coexists; the board view filters curator out.
+        create_thread(&db, ws.id, "Real issue", "feature", "claude")
+            .await
+            .unwrap();
+        let board: Vec<_> = list_threads(&db, ws.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind != "curator")
+            .collect();
+        assert!(board.iter().all(|t| t.kind != "curator"));
+        assert!(board.iter().any(|t| t.kind == "feature"));
+    }
+
+    #[tokio::test]
     async fn lead_message_roundtrip() {
         let db = mem().await;
         let m = insert_lead_message(
@@ -1474,7 +1806,7 @@ mod tests {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
         assert_eq!(ws.slug, "demo-ws");
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
@@ -1529,7 +1861,7 @@ mod tests {
     async fn latest_session_for_returns_newest_with_native() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
             .await
             .unwrap();
         let thread = create_thread(&db, ws.id, "T", "feature", "claude")
@@ -1655,7 +1987,7 @@ mod tests {
     async fn apply_to_existing_false_pins_old_sessions_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "w").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "").await.unwrap();
         // An existing claude lead + worker, created before any alias.
         let old_thread = create_thread(&db, ws.id, "old", "feature", "claude")
             .await
@@ -1727,7 +2059,7 @@ mod tests {
     async fn rename_updates_display_name_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
@@ -1772,7 +2104,7 @@ mod tests {
         assert!(rename_workspace(&db, ws_b.id, "Alpha").await.is_err());
         assert!(rename_workspace(&db, ws_a.id, "Alpha").await.is_ok());
 
-        let repo = add_repo_ref(&db, ws_a.id, "web-app", "/tmp/x", "main")
+        let repo = add_repo_ref(&db, ws_a.id, "web-app", "/tmp/x", "main", "")
             .await
             .unwrap();
         let t1 = create_thread(&db, ws_a.id, "Login", "feature", "claude")

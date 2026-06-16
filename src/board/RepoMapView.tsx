@@ -29,11 +29,7 @@ export function RepoMapView({ embedded = false }: { embedded?: boolean }) {
 
   if (embedded) return body;
 
-  return (
-    <section className="flex min-w-0 flex-1 flex-col bg-bg">
-      {body}
-    </section>
-  );
+  return <section className="flex min-w-0 flex-1 flex-col bg-bg">{body}</section>;
 }
 
 type PromptState = {
