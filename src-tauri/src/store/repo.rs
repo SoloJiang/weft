@@ -530,7 +530,9 @@ pub async fn set_repo_path(db: &Db, repo_id: i32, local_git_path: &str) -> Resul
 /// upserts a user-sourced relation for `(to, kind)`; `action="remove"` writes a
 /// user `rejected` tombstone for that pair so the edge disappears and the auto
 /// pass won't resurrect it. Replaces any prior entry for the same `(to, kind)`.
-/// No-op if the repo has no profile row yet.
+/// Creates a minimal profile row if the producer has none yet (an "analyzing"
+/// placeholder), so a human calibration persists instead of silently no-op'ing;
+/// the pinned relation is `source="user"` and survives later agent passes.
 pub async fn calibrate_repo_relation(
     db: &Db,
     from_id: i32,
@@ -539,8 +541,9 @@ pub async fn calibrate_repo_relation(
     via: &str,
     action: &str,
 ) -> Result<()> {
-    let Some(p) = get_repo_profile(db, from_id).await? else {
-        return Ok(());
+    let p = match get_repo_profile(db, from_id).await? {
+        Some(p) => p,
+        None => upsert_repo_profile(db, from_id, "", "[]", "", "[]", "agent", "").await?,
     };
     let mut rels: Vec<crate::profile::AgentRelation> =
         serde_json::from_str(&p.relations).unwrap_or_default();
@@ -1506,10 +1509,18 @@ mod tests {
         assert!(rels[0].rejected, "removal writes a tombstone");
         assert_eq!(rels[0].source, "user");
 
-        // a repo with no profile is a no-op (must not panic)
-        calibrate_repo_relation(&db, 9999, api.id, "http", "x", "add")
+        // a producer with no profile row yet (an "analyzing" placeholder) gets a
+        // minimal row created so the calibration persists instead of vanishing.
+        let lib = add_repo_ref(&db, ws.id, "lib", "/tmp/lib", "main", "")
             .await
             .unwrap();
+        assert!(get_repo_profile(&db, lib.id).await.unwrap().is_none());
+        calibrate_repo_relation(&db, lib.id, api.id, "http", "GET /x", "add")
+            .await
+            .unwrap();
+        let rels = read(&db, lib.id).await;
+        assert_eq!(rels.len(), 1, "calibration on a placeholder persists");
+        assert_eq!((rels[0].to, rels[0].kind.as_str(), rels[0].source.as_str()), (api.id, "http", "user"));
     }
 
     #[tokio::test]

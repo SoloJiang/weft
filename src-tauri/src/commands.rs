@@ -207,7 +207,24 @@ pub async fn list_repo_profiles(
 
 #[tauri::command]
 pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curator::Graph> {
-    crate::curator::graph(&db, workspace_id).await.map_err(e)
+    let graph = crate::curator::graph(&db, workspace_id).await.map_err(e)?;
+    // Upgraded workspaces: rows written by the old static profiler carry a legacy
+    // role (service/app/…) and no agent relations, so without the manifest floor
+    // the map/planner would show no edges until the user manually runs Analyze.
+    // Schedule a one-off coalesced agent pass to migrate them. Bounded: a tier
+    // that's empty (placeholder) or already valid doesn't trigger, so this never
+    // loops on repos the agent leaves unclassified.
+    let needs_backfill = graph
+        .nodes
+        .iter()
+        .any(|n| !n.tier.is_empty() && crate::profile::normalize_tier(&n.tier).is_none());
+    if needs_backfill {
+        let db_bg = db.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            crate::curator::analyze_workspace_coalesced(&db_bg, workspace_id).await;
+        });
+    }
+    Ok(graph)
 }
 
 /// Re-run the deep, read-only agent classification for a single repo (tier +

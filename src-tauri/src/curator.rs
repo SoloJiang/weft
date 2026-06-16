@@ -60,22 +60,18 @@ pub async fn edit_profile(
     summary: &str,
     tier: &str,
 ) -> Result<repo_profile::Model> {
-    let existing = repo::get_repo_profile(db, repo_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no profile for repo {repo_id} yet"))?;
+    // A repo can be edited while it is still an "analyzing" placeholder with no
+    // profile row yet (the agent-only pipeline creates rows lazily). Upsert one
+    // rather than erroring, so the human's calibration always persists; factual
+    // fields default empty until the agent fills them.
+    let existing = repo::get_repo_profile(db, repo_id).await?;
+    let (stack, components, commit) = match &existing {
+        Some(p) => (p.stack.clone(), p.components.clone(), p.profiled_commit.clone()),
+        None => ("[]".to_string(), "[]".to_string(), String::new()),
+    };
     // Tolerate any tier string the UI sends; "" clears the classification.
     let tier = profile::normalize_tier(tier).unwrap_or_default();
-    repo::upsert_repo_profile(
-        db,
-        repo_id,
-        &tier,
-        &existing.stack,
-        summary,
-        &existing.components,
-        "user",
-        &existing.profiled_commit,
-    )
-    .await
+    repo::upsert_repo_profile(db, repo_id, &tier, &stack, summary, &components, "user", &commit).await
 }
 
 /// One repo as the UI sees it. `profile == None` means the agent hasn't analyzed
@@ -512,15 +508,17 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
     let stack_json = json_strs(&wire.stack);
     let commit = git::head_commit(Path::new(&repo.local_git_path)).unwrap_or_default();
 
+    let agent_tier = profile::normalize_tier(&wire.tier).unwrap_or_default();
     let (tier, summary, source) = if user_owned {
         let p = prior.as_ref().expect("user_owned implies a prior profile");
-        (p.role.clone(), p.summary.clone(), "user")
+        // Keep the user's pinned summary, but only keep their pinned tier if it
+        // is valid under the new taxonomy: an upgraded db may carry a legacy role
+        // (service/app/…) on a user-owned row, which must migrate to the agent's
+        // tier rather than stick as an invalid value forever.
+        let tier = profile::normalize_tier(&p.role).unwrap_or(agent_tier);
+        (tier, p.summary.clone(), "user")
     } else {
-        (
-            profile::normalize_tier(&wire.tier).unwrap_or_default(),
-            wire.summary,
-            "agent",
-        )
+        (agent_tier, wire.summary, "agent")
     };
 
     repo::upsert_repo_profile(
@@ -712,6 +710,69 @@ mod tests {
                 && e.via == "GET /orders"),
             "agent http edge present"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_profile_creates_row_for_placeholder() {
+        // A repo can be calibrated while it is still an unanalyzed placeholder
+        // (no profile row). The edit must upsert one, not error.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "")
+            .await
+            .unwrap();
+        assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
+        super::edit_profile(&db, r.id, "a web client", "frontend").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.summary, "a web client");
+        assert_eq!(p.source, "user");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_migrates_legacy_user_role() {
+        // An upgraded db may carry a legacy role on a user-owned row; the agent
+        // pass keeps the user's summary but migrates the invalid tier.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "service", "[]", "mine", "[]", "user", "")
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "agent summary".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "backend", "legacy 'service' migrated to a real tier");
+        assert_eq!(p.summary, "mine", "user-pinned summary preserved");
+        assert_eq!(p.source, "user");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_keeps_valid_user_tier() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "gateway", "[]", "mine", "[]", "user", "")
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "agent".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "gateway", "a valid user-pinned tier is not overwritten");
     }
 
     #[tokio::test]
