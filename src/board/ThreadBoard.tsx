@@ -195,6 +195,10 @@ function DirectionCard({
   const { t } = useTranslation();
   const [wtToDelete, setWtToDelete] = useState<Worktree | null>(null);
   const writes = worktreesByDirection[direction.id] ?? [];
+  // Only worktrees whose directory is still on disk back live actions. A row can
+  // outlive its directory (reclaimed via the Done-card delete, or removed out of
+  // band), and opening a session / diff against a missing cwd just breaks.
+  const liveWrites = writes.filter((w) => w.exists);
   const checks = checksByDirection[direction.id];
 
   const allChecks = (checks ?? []).flatMap((rc) => rc.checks);
@@ -203,7 +207,7 @@ function DirectionCard({
   const hasNeed =
     needs.some((n) => n.direction_id === direction.id) ||
     asks.some((a) => a.dir === String(direction.id));
-  const firstWrite = writes[0];
+  const firstWrite = liveWrites[0];
 
   const testsKind =
     failed > 0 ? "fail" : allChecks.length > 0 && passed === allChecks.length ? "pass" : "pend";
@@ -288,7 +292,7 @@ function DirectionCard({
               <button
                 type="button"
                 onClick={() => void requestSkillReview(direction.id, { focus: true })}
-                disabled={writes.length === 0}
+                disabled={liveWrites.length === 0}
                 aria-label={t("thread.review")}
                 className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-muted outline-none transition-colors hover:bg-brand-ghost hover:text-ink disabled:opacity-40"
               >
@@ -383,14 +387,35 @@ function ProvenanceMenu({
               const name = repo?.name ?? `repo ${w.repo_id}`;
               return (
                 <div key={w.id} className="pb-0.5">
-                  {/* Repo header → open this repo's session. */}
+                  {/* Repo header → open this repo's session (only while the
+                      worktree directory is live; a reclaimed/removed one can't). */}
                   <DM.Item
-                    onSelect={() => viewDirection(direction.id, w.repo_id)}
-                    className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[12px] text-ink outline-none data-[highlighted]:bg-brand-ghost"
+                    onSelect={(e) => {
+                      if (!w.exists) {
+                        e.preventDefault();
+                        return;
+                      }
+                      viewDirection(direction.id, w.repo_id);
+                    }}
+                    className={cn(
+                      "flex items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[12px] outline-none",
+                      w.exists
+                        ? "cursor-pointer text-ink data-[highlighted]:bg-brand-ghost"
+                        : "cursor-default text-ink-faint",
+                    )}
                   >
-                    <TerminalSquare size={12} className="shrink-0 text-brand" />
+                    <TerminalSquare
+                      size={12}
+                      className={cn("shrink-0", w.exists ? "text-brand" : "text-ink-faint")}
+                    />
                     <span className="min-w-0 flex-1 truncate font-medium">{name}</span>
-                    {sess && <StatusDot status={sess.status as SessionStatus} />}
+                    {w.exists ? (
+                      sess && <StatusDot status={sess.status as SessionStatus} />
+                    ) : (
+                      <span className="shrink-0 text-[10px] text-ink-faint">
+                        {t("thread.worktreeRemoved")}
+                      </span>
+                    )}
                   </DM.Item>
                   {/* Branch → copy. */}
                   <DM.Item

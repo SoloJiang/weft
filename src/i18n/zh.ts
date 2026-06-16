@@ -169,6 +169,7 @@ export const zh = {
     deleteWorktreeBody:
       "将删除位于 {{path}} 的 worktree 目录。分支 {{branch}} 会保留。worktree 中任何未提交的改动都会丢失。",
     deleteWorktreeConfirm: "删除",
+    worktreeRemoved: "已删除",
     discussTitle: "和 lead 聊聊来规划这个 issue",
     discussBody:
       "在右侧的对话里描述你想要什么。lead 会读取你的仓库、提议如何拆分工作，你在这里确认成子任务。",

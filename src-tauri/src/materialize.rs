@@ -123,13 +123,8 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
             .await?
         {
             let repo_path = std::path::Path::new(&r.local_git_path);
-            // Empty path = branch-only cleanup: this direction's worktree was
-            // already reclaimed (delete-worktree keeps the branch), so there is
-            // no working tree left to remove — only the branch.
-            if !path.is_empty() {
-                if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
-                    eprintln!("[weft] worktree remove failed for {path}: {e}");
-                }
+            if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
+                eprintln!("[weft] worktree remove failed for {path}: {e}");
             }
             if let Err(e) = git::delete_branch(repo_path, branch) {
                 eprintln!("[weft] branch delete failed for {branch}: {e}");
@@ -139,11 +134,14 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
     Ok(())
 }
 
-/// Delete one direction's worktree on its own: remove the working-copy directory
-/// and drop its DB row, but KEEP the branch and the direction record. Used by the
-/// Done-card "delete worktree" action — the user is reclaiming disk for a finished
-/// task, not tearing the direction down, so (unlike `cleanup_worktrees`) nothing
-/// else is touched. Idempotent: a missing row is a no-op.
+/// Reclaim one direction's worktree on its own: remove the working-copy directory
+/// but KEEP the branch, the worktree row, and the direction. Used by the Done-card
+/// "delete worktree" action — the user is freeing disk for a finished task, not
+/// tearing the direction down. The row is deliberately retained as the record that
+/// Weft created this branch here: it lets `delete_thread`'s cascade still clean the
+/// branch later (zero-accumulation) and drives the `exists=false` state the board
+/// uses to disable the now-defunct worktree's actions. Idempotent: a missing row,
+/// or an already-removed directory, is a no-op.
 pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> {
     use sea_orm::EntityTrait;
     let Some(wt) = entities::worktree::Entity::find_by_id(worktree_id)
@@ -183,15 +181,12 @@ pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> 
             eprintln!("[weft] worktree remove failed for {}: {e}", wt.path);
         }
     }
-    // Atomic: only drop the row once the directory is actually gone. If removal
-    // failed (repo path missing, locked, …) the directory survives — keep the row
-    // so the card still offers a retry instead of orphaning the directory.
+    // Surface a failed removal instead of silently "succeeding": if the directory
+    // survives (repo path missing, locked, …) the row's `exists` stays true, so the
+    // card keeps offering a retry rather than showing a phantom reclaim.
     if path.exists() {
         anyhow::bail!("worktree directory could not be removed: {}", wt.path);
     }
-    entities::worktree::Entity::delete_by_id(worktree_id)
-        .exec(&db.0)
-        .await?;
     Ok(())
 }
 

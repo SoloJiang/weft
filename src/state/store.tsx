@@ -771,15 +771,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeWorkspaceId],
   );
 
-  // Remove one finished task's worktree from disk; the branch and card stay. The
-  // backend drops the row, so mirror that locally by dropping it from the map.
+  // Reclaim one finished task's worktree directory; the branch, row, and card
+  // stay. The backend keeps the row (its record that Weft made this branch) and
+  // just removes the directory, so mirror that by flipping the row's `exists` to
+  // false — the card hides the Delete item and disables the now-defunct worktree's
+  // actions, without losing the provenance.
   const deleteWorktree = useCallback(
     async (worktreeId: number, directionId: number) => {
       await api.deleteWorktree(worktreeId);
       setWorktrees((m) => {
         const cur = m[directionId];
         if (!cur) return m;
-        return { ...m, [directionId]: cur.filter((w) => w.id !== worktreeId) };
+        return {
+          ...m,
+          [directionId]: cur.map((w) =>
+            w.id === worktreeId ? { ...w, exists: false } : w,
+          ),
+        };
       });
     },
     [],

@@ -1,7 +1,9 @@
-//! A finished (Done) task can have its worktree deleted on its own: the
-//! working-copy directory and the DB row go away, but the branch and the task
-//! (direction) record survive. This is distinct from `delete_thread`'s cascade
-//! teardown, which also force-deletes the branch (zero-accumulation).
+//! A finished (Done) task can have its worktree reclaimed on its own: the
+//! working-copy directory is removed, but the branch, the worktree row (kept as
+//! the record that Weft created this branch), and the task survive. This is
+//! distinct from `delete_thread`'s cascade teardown, which also force-deletes the
+//! branch (zero-accumulation) — and which still cleans the kept branch via the
+//! retained row afterwards.
 //!
 //! Lives in its own test binary so the `WEFT_HOME` env it sets can't race the
 //! other worktree tests (integration tests in one file run on parallel threads;
@@ -105,23 +107,26 @@ async fn delete_worktree_keeps_branch_and_task() {
     repo::set_session_status(&db, sess.id, "complete").await.unwrap();
     remove_direction_worktree(&db, wt_id).await.unwrap();
 
-    // Directory and DB row are gone...
+    // The directory is gone...
     assert!(!Path::new(&path).exists(), "worktree dir removed from disk");
-    assert!(
-        repo::list_worktrees(&db, None).await.unwrap().is_empty(),
-        "worktree row removed"
+    // ...but the row is KEPT as the create-record (so the branch can still be
+    // cleaned on teardown, and the board can mark it defunct via `exists`)...
+    assert_eq!(
+        repo::list_worktrees(&db, None).await.unwrap().len(),
+        1,
+        "worktree row kept as the create-record"
     );
-    // ...but the branch is kept (the distinguishing behavior vs cascade delete)...
+    // ...the branch is kept (the distinguishing behavior vs cascade delete)...
     assert!(branch_exists(&repo_a, &branch), "branch is kept");
     // ...and the task (direction) record survives so the Done card stays.
     let dirs = repo::list_directions(&db, t1.id).await.unwrap();
     assert!(dirs.iter().any(|d| d.id == d1.id), "task card survives");
 
-    // Idempotent: deleting an already-removed worktree is a no-op, not an error.
+    // Idempotent: reclaiming an already-removed directory is a no-op, not an error.
     remove_direction_worktree(&db, wt_id).await.unwrap();
 
-    // Zero-accumulation: deleting the whole issue later still tears down the
-    // kept branch, even though no worktree row points at it anymore.
+    // Zero-accumulation: deleting the whole issue later still tears down the kept
+    // branch — the retained row is exactly what lets the cascade find it.
     let removed = repo::delete_thread_cascade(&db, t1.id).await.unwrap();
     cleanup_worktrees(&db, &removed).await.unwrap();
     assert!(
