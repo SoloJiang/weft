@@ -218,7 +218,9 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
         .nodes
         .iter()
         .any(|n| !n.tier.is_empty() && crate::profile::normalize_tier(&n.tier).is_none());
-    if needs_backfill {
+    // Claim the one-shot guard so a failed/slow migration doesn't re-queue a pass
+    // on every map refresh (repo_graph fires on each `repo-graph-updated` event).
+    if needs_backfill && crate::curator::try_claim_backfill(workspace_id) {
         let db_bg = db.inner().clone();
         tauri::async_runtime::spawn(async move {
             crate::curator::analyze_workspace_coalesced(&db_bg, workspace_id).await;

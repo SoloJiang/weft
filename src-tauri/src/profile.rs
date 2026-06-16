@@ -79,6 +79,9 @@ pub struct AgentRelation {
 /// expanded view can draw intra-repo edges without another agent round.
 #[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Component {
+    /// `serde(default)` so one component object missing `name` doesn't make the
+    /// whole per-repo classification unparseable — the caller drops nameless ones.
+    #[serde(default)]
     pub name: String,
     /// Path relative to the repo root (e.g. "packages/api", "apps/web").
     #[serde(default)]

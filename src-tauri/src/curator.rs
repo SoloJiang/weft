@@ -479,6 +479,26 @@ async fn persist_relations(
     Ok(())
 }
 
+/// Workspaces whose one-shot legacy backfill has already been attempted this
+/// session, so a failed/timed-out migration (which leaves the legacy tier in
+/// place) doesn't re-queue an agent pass on every `repo_graph` read.
+fn backfilled() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Claim the one-shot legacy backfill for a workspace: returns `true` exactly
+/// once per workspace per process. The caller schedules a migration pass only on
+/// that first claim, so an unavailable/slow analyzer can't cause a retry storm.
+/// The user can still trigger a fresh pass manually via Analyze deps.
+pub fn try_claim_backfill(workspace_id: i32) -> bool {
+    backfilled()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(workspace_id)
+}
+
 /// Nudge any open repo map to reload so background-inferred classifications and
 /// edges appear without a manual refresh.
 fn emit_graph_updated(workspace_id: i32) {
@@ -496,9 +516,12 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
     let prior = repo::get_repo_profile(db, repo.id).await?;
     let user_owned = prior.as_ref().map(|p| p.source == "user").unwrap_or(false);
 
+    // Drop nameless components (a malformed sub-object) but keep the rest, so one
+    // bad entry never discards the whole classification; normalize their tiers.
     let components: Vec<Component> = wire
         .components
         .into_iter()
+        .filter(|c| !c.name.trim().is_empty())
         .map(|mut c| {
             c.tier = profile::normalize_tier(&c.tier).unwrap_or_default();
             c
@@ -509,16 +532,20 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
     let commit = git::head_commit(Path::new(&repo.local_git_path)).unwrap_or_default();
 
     let agent_tier = profile::normalize_tier(&wire.tier).unwrap_or_default();
-    let (tier, summary, source) = if user_owned {
-        let p = prior.as_ref().expect("user_owned implies a prior profile");
-        // Keep the user's pinned summary, but only keep their pinned tier if it
-        // is valid under the new taxonomy: an upgraded db may carry a legacy role
-        // (service/app/…) on a user-owned row, which must migrate to the agent's
-        // tier rather than stick as an invalid value forever.
-        let tier = profile::normalize_tier(&p.role).unwrap_or(agent_tier);
-        (tier, p.summary.clone(), "user")
-    } else {
-        (agent_tier, wire.summary, "agent")
+    // Keep a user-pinned summary/tier; only an upgraded db's non-empty LEGACY role
+    // (service/app/…) migrates to the agent's tier. A valid tier and an
+    // intentional empty ("Other") choice are both preserved. `filter` avoids an
+    // `expect` here (production paths must not panic).
+    let (tier, summary, source) = match prior.as_ref().filter(|_| user_owned) {
+        Some(p) => {
+            let tier = if p.role.is_empty() {
+                String::new()
+            } else {
+                profile::normalize_tier(&p.role).unwrap_or(agent_tier)
+            };
+            (tier, p.summary.clone(), "user")
+        }
+        None => (agent_tier, wire.summary, "agent"),
     };
 
     repo::upsert_repo_profile(
@@ -773,6 +800,64 @@ mod tests {
         super::persist_repo_class(&db, &r, wire).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "gateway", "a valid user-pinned tier is not overwritten");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_preserves_user_cleared_other() {
+        // A user who corrects a repo to "Other" (empty tier) keeps that choice
+        // across re-analysis; only non-empty legacy values migrate.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "", "[]", "mine", "[]", "user", "")
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "agent".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "", "user-cleared 'Other' tier is preserved, not migrated");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_drops_nameless_components() {
+        // A malformed (nameless) sub-component is dropped, but the rest of the
+        // classification still persists.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "mono", "/tmp/mono", "main", "")
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "monorepo".into(),
+            stack: vec![],
+            components: vec![
+                Component { name: "api".into(), tier: "backend".into(), ..Default::default() },
+                Component { name: "".into(), tier: "frontend".into(), ..Default::default() },
+            ],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "backend");
+        let comps: Vec<Component> = serde_json::from_str(&p.components).unwrap();
+        assert_eq!(comps.len(), 1, "the nameless component is dropped");
+        assert_eq!(comps[0].name, "api");
+    }
+
+    #[test]
+    fn parse_repo_class_tolerates_nameless_component() {
+        // One component missing `name` must not make the whole reply unparseable.
+        let reply = r#"{"tier":"backend","summary":"s","components":[{"name":"api"},{"tier":"frontend"}]}"#;
+        let wire = super::parse_repo_class(reply).expect("parsed despite a nameless component");
+        assert_eq!(wire.tier, "backend");
+        assert_eq!(wire.components.len(), 2);
     }
 
     #[tokio::test]
