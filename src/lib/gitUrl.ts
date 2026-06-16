@@ -100,6 +100,50 @@ export function parseGitUrls(text: string): string[] {
   return out;
 }
 
+/**
+ * Parse a paste box of clone sources into a deduped list, in paste order.
+ *
+ * Newline is the canonical separator. Within a line, spaces/commas also separate
+ * sources — but ONLY when every token contains a `:` (as every URL, scp address,
+ * and ssh alias does); otherwise the line is taken as one source so a local path
+ * with spaces (`/Users/me/My Projects/repo`) or a Windows drive path stays
+ * intact. Each resulting source is normalized to its recognized git URL when the
+ * parser models it, or kept verbatim (local path, ssh alias `gh:org/repo`,
+ * `ftp://…`, a typo) so `git clone` can attempt it and report per-row instead of
+ * being silently dropped.
+ */
+export function parseCloneSources(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (src: string) => {
+    const urls = parseGitUrls(src);
+    if (urls.length > 0) {
+      for (const u of urls) {
+        const key = gitUrlKey(u);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(u);
+      }
+      return;
+    }
+    const key = `raw:${src}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(src);
+  };
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === "") continue;
+    const tokens = line.split(/[\s,]+/).filter(Boolean);
+    if (tokens.length > 1 && tokens.every((tok) => tok.includes(":"))) {
+      for (const tok of tokens) add(tok);
+    } else {
+      add(line);
+    }
+  }
+  return out;
+}
+
 /** Derive a repo folder name from a git URL (basename, sans `.git`). */
 export function repoNameFromUrl(url: string): string {
   return (

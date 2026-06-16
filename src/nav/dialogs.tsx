@@ -9,7 +9,7 @@ import { Select } from "../components/ui/Select";
 import { toast } from "../components/Toast";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
-import { gitUrlKey, parseGitUrls, repoNameFromUrl } from "../lib/gitUrl";
+import { parseCloneSources, repoNameFromUrl } from "../lib/gitUrl";
 import { cn } from "../lib/cn";
 
 export function CreateWorkspaceDialog({ open, onOpenChange }: DProps) {
@@ -138,33 +138,10 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   // Aborts the in-flight batch when the dialog is closed/cancelled mid-import.
   const abortRef = useRef<AbortController | null>(null);
 
-  // What we actually clone, parsed live from the paste box, one source per line.
-  // Each non-empty line yields its recognized git URLs (a line may hold several
-  // space-separated URLs); a line the parser doesn't model — a local path
-  // (spaces and all), an ssh alias, an unsupported scheme like ftp://, or a typo
-  // — is kept verbatim so `git clone` (one argument) attempts it and reports
-  // per-row, rather than being silently dropped. Deduped across lines.
-  const cloneTargets = useMemo(() => {
-    const out: string[] = [];
-    const seen = new Set<string>();
-    for (const rawLine of url.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (line === "") continue;
-      const urls = parseGitUrls(line);
-      if (urls.length > 0) {
-        for (const u of urls) {
-          const key = gitUrlKey(u);
-          if (seen.has(key)) continue;
-          seen.add(key);
-          out.push(u);
-        }
-      } else if (!seen.has(`raw:${line}`)) {
-        seen.add(`raw:${line}`);
-        out.push(line);
-      }
-    }
-    return out;
-  }, [url]);
+  // What we actually clone, parsed live from the paste box (see parseCloneSources:
+  // newline/space/comma separated, spaced local paths kept whole, unmodeled
+  // sources passed verbatim to git for per-row status, deduped).
+  const cloneTargets = useMemo(() => parseCloneSources(url), [url]);
 
   // Reset on close; default the destination to the configured projects dir.
   useEffect(() => {
