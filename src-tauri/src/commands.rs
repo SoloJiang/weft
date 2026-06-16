@@ -74,8 +74,10 @@ async fn register_repo(
     let canonical = std::fs::canonicalize(p)
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
-    // default base ref = current branch of the repo
-    let base = crate::git::current_branch(p).unwrap_or_else(|_| "main".into());
+    // Default base ref = the repo's real default branch: the remote's default
+    // (origin/HEAD) when there is one, else the locally checked-out branch. So a
+    // repo added while on a feature branch still records the true default as base.
+    let base = crate::git::default_base_branch(p, &crate::git::current_branch(p).unwrap_or_default());
     // Captured for workspace-level dedup; empty for a local repo with no origin.
     // Credentials embedded in an HTTPS remote are redacted so a PAT/password from
     // .git/config never lands in Weft's DB/backups.
