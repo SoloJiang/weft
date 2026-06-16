@@ -82,14 +82,22 @@ async fn register_repo(
     let remote = crate::git::remote_url(p)
         .map(|r| crate::git::redact_remote(&r))
         .unwrap_or_default();
-    // Backfill remotes for repos added before the `remote_url` column existed, so
-    // the remote-dedup below can catch a second clone of an already-present origin
-    // on upgraded databases. Best-effort, cheap (a handful of repos per workspace).
+    // Backfill for repos added before this change, so dedup below can match them
+    // on upgraded databases. Best-effort, cheap (a handful of repos per workspace):
+    //   - remote: catch a second clone of an already-present origin;
+    //   - path: canonicalize a non-canonical (symlink/`..`) stored path so a
+    //     local-only repo with no remote still dedups by path.
     for existing in repo::list_repos(db, workspace_id).await.map_err(e)? {
         if existing.remote_url.is_empty() {
             if let Some(rem) = crate::git::remote_url(std::path::Path::new(&existing.local_git_path))
             {
                 let _ = repo::set_repo_remote(db, existing.id, &crate::git::redact_remote(&rem)).await;
+            }
+        }
+        if let Ok(canon) = std::fs::canonicalize(&existing.local_git_path) {
+            let canon = canon.to_string_lossy();
+            if canon != existing.local_git_path {
+                let _ = repo::set_repo_path(db, existing.id, &canon).await;
             }
         }
     }

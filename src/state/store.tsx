@@ -1507,13 +1507,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshRepoMap = useCallback(async () => {
-    if (activeWorkspaceId == null) {
+    const ws = activeWorkspaceId;
+    if (ws == null) {
       setRepoProfiles([]);
       setRepoEdges([]);
       return;
     }
     try {
-      const g = await api.repoGraph(activeWorkspaceId);
+      const g = await api.repoGraph(ws);
+      // Guard against a workspace switch during the fetch (e.g. a late
+      // repo-graph-updated event for the old workspace): don't write ws's graph
+      // into a now-different active view.
+      if (activeWorkspaceIdRef.current !== ws) return;
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
     } catch {
@@ -1562,8 +1567,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (repoId: number) => {
       await api.deleteRepo(repoId);
       if (activeWorkspaceId != null) await refreshReposAndMap(activeWorkspaceId);
+      // delete_repo cascades directions/sessions/worktrees bound to the repo
+      // across threads — refresh the board overview and the open thread's children
+      // so stale task cards (now pointing at deleted rows) don't linger and open
+      // blank worker views or failed diff/session fetches.
+      await refreshOverview();
+      if (activeThreadId != null) await loadThreadChildren(activeThreadId);
     },
-    [activeWorkspaceId, refreshReposAndMap],
+    [activeWorkspaceId, refreshReposAndMap, refreshOverview, activeThreadId, loadThreadChildren],
   );
 
   // Open the workspace's hidden curator chat by navigating to its chat surface

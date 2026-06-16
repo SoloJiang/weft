@@ -164,10 +164,23 @@ pub async fn graph(db: &Db, workspace_id: i32) -> Result<Graph> {
         .iter()
         .flat_map(|(id, rels)| profile::agent_edges(*id, rels, &node_ids))
         .collect();
-    Ok(Graph {
-        nodes,
-        edges: profile::merge_edges(manifest, agent),
-    })
+    // A user removal is a `rejected` tombstone. agent_edges already drops the
+    // agent edge, but a MANIFEST edge for the same (from, to, kind) is recomputed
+    // unconditionally — so apply tombstones to the merged set too, or a removed
+    // `lib` edge would reappear in the map and in briefs.
+    let tombstoned: std::collections::HashSet<(i32, i32, String)> = relations
+        .iter()
+        .flat_map(|(id, rels)| {
+            rels.iter()
+                .filter(|r| r.rejected)
+                .map(move |r| (*id, r.to, r.kind.clone()))
+        })
+        .collect();
+    let edges = profile::merge_edges(manifest, agent)
+        .into_iter()
+        .filter(|e| !tombstoned.contains(&(e.from, e.to, e.kind.clone())))
+        .collect();
+    Ok(Graph { nodes, edges })
 }
 
 // ─────────────────────────── agent curator ───────────────────────────
@@ -300,10 +313,21 @@ async fn run_agent_once(tool: &str, cwd: &Path, prompt: &str) -> Result<String> 
     // repo — silently trusting it (bypassing the tool's own onboarding) would be
     // wrong. The analysis is read-only and best-effort; if the tool needs trust
     // and doesn't have it, the run simply yields nothing and the graph is intact.
+    //
+    // Enforce read-only at the TOOL level, not just via the prompt: this runs in
+    // the user's real checkout, so a model that decides to edit must be stopped by
+    // the sandbox. Codex defaults to workspace-write (can edit) — pin read-only;
+    // claude runs in plan mode (no edits). opencode has no portable flag here, so
+    // it falls back to the prompt's read-only instruction (best-effort).
+    let read_only: Vec<String> = match tool {
+        "codex" => vec!["--sandbox".into(), "read-only".into()],
+        "claude" => vec!["--permission-mode".into(), "plan".into()],
+        _ => vec![],
+    };
     let ctx = AdapterContext {
         cwd,
         system_prompt: CURATOR_SYSTEM_PROMPT,
-        extra_args: &[],
+        extra_args: &read_only,
         native_id: None,
         message: prompt,
         slash_commands: &[],

@@ -439,6 +439,11 @@ async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
     let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await else {
         return text_result("curator thread not found".into());
     };
+    // Only the hidden curator thread may calibrate — reject a direct call to this
+    // route with a normal feature thread id (it would bypass the chat boundary).
+    if t.kind != "curator" {
+        return text_result("calibrate_edges is only available in the curator chat".into());
+    }
     let ws_ids: std::collections::HashSet<i32> = crate::store::repo::list_repos(db, t.workspace_id)
         .await
         .unwrap_or_default()
