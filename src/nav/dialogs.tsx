@@ -123,7 +123,7 @@ function StatusDot({ status }: { status: RowStatus }) {
 }
 
 export function AddRepoDialog({ open, onOpenChange }: DProps) {
-  const { addRepo, importRepos, createRepo, projectsDir } = useStore();
+  const { addRepo, importRepos, createRepo, projectsDir, activeWorkspaceId } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<RepoMode>("local");
   const [path, setPath] = useState(""); // local
@@ -140,13 +140,16 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
 
   // Recognized git URLs parsed live from the paste box (deduped, first-seen order).
   const recognized = useMemo(() => parseGitUrls(url), [url]);
-  // What we actually clone. Fall back to the raw single line for valid git inputs
-  // the parser doesn't model (file://, ssh aliases, local paths, host:repo),
-  // preserving the old single-URL dialog — but only when it's one token.
+  // What we actually clone. Fall back to the raw input for a single valid git
+  // source the parser doesn't model (file://, ssh aliases, host:repo, or a local
+  // path — which `git clone` accepts as one argument, spaces and all). A single
+  // LINE is treated as one source so spaced local paths still clone, preserving
+  // the old single-field dialog; multi-line input is a URL batch, so if none
+  // parsed there's nothing to clone.
   const cloneTargets = useMemo(() => {
     if (recognized.length > 0) return recognized;
     const single = url.trim();
-    return single !== "" && !/\s/.test(single) ? [single] : [];
+    return single !== "" && !/[\r\n]/.test(single) ? [single] : [];
   }, [recognized, url]);
 
   // Reset on close; default the destination to the configured projects dir.
@@ -166,11 +169,14 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     }
   }, [open, projectsDir]);
 
-  // Clear stale per-row status when the URLs OR the destination change — a new
-  // dest means the prior successes aren't there, so they must re-clone too.
+  // Clear stale per-row status when the URLs, the destination, OR the active
+  // workspace change. A new dest means the prior successes aren't there; a new
+  // workspace means the prior successes landed elsewhere — in both cases the
+  // "ok" rows must re-clone, or a retry would silently skip them and toast
+  // success for repos that never reached the current workspace.
   useEffect(() => {
     setProgress((p) => (Object.keys(p).length ? {} : p));
-  }, [url, dest]);
+  }, [url, dest, activeWorkspaceId]);
 
   // Closing/cancelling mid-batch aborts the loop so it stops queuing more clones.
   function handleOpenChange(o: boolean) {
