@@ -498,6 +498,18 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
     Ok(())
 }
 
+/// Set a repo's captured `origin` remote URL. Used to backfill rows added before
+/// the `remote_url` column existed, so workspace remote-dedup can match them.
+/// No-op if the repo is gone.
+pub async fn set_repo_remote(db: &Db, repo_id: i32, remote_url: &str) -> Result<()> {
+    if let Some(m) = repo_ref::Entity::find_by_id(repo_id).one(&db.0).await? {
+        let mut a: repo_ref::ActiveModel = m.into();
+        a.remote_url = Set(remote_url.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// Apply one human calibration to a producer repo's relations. `action="add"`
 /// upserts a user-sourced relation for `(to, kind)`; `action="remove"` writes a
 /// user `rejected` tombstone for that pair so the edge disappears and the auto

@@ -195,7 +195,8 @@ pub struct CuratorRelation {
 
 #[derive(Debug, serde::Deserialize)]
 struct CuratorWire {
-    #[serde(default)]
+    // Required (no serde default): a reply without a `relations` array is treated
+    // as unparseable, so a malformed/timed-out turn never reads as "no relations".
     relations: Vec<CuratorRelation>,
 }
 
@@ -236,12 +237,13 @@ fn first_json_object(text: &str) -> Option<&str> {
 }
 
 /// Extract the curator agent's relations from its free-form reply (tolerant of
-/// markdown fences / surrounding prose). Empty when nothing parseable.
-pub fn parse_curator_output(text: &str) -> Vec<CuratorRelation> {
-    first_json_object(text)
-        .and_then(|j| serde_json::from_str::<CuratorWire>(j).ok())
-        .map(|w| w.relations)
-        .unwrap_or_default()
+/// markdown fences / surrounding prose). Returns `None` when no JSON object with
+/// a `relations` array is found — i.e. a timed-out or malformed reply — so the
+/// caller can leave the existing graph intact instead of wiping it. `Some([])`
+/// is an explicit "no relations".
+pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
+    let obj = first_json_object(text)?;
+    serde_json::from_str::<CuratorWire>(obj).ok().map(|w| w.relations)
 }
 
 const CURATOR_SYSTEM_PROMPT: &str = "You are a read-only repository dependency \
@@ -249,12 +251,6 @@ analyst. You may read code and configuration, but you must never modify, create,
 or delete files, and never run mutating commands.";
 
 const CURATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// The tool identity the curator agent runs as. The actual command honors any
-/// `tool_command` alias the user configured; "claude" is the default identity.
-fn curator_tool() -> String {
-    "claude".to_string()
-}
 
 /// Prompt listing every profiled repo (id/name/role/path/publishes/summary) and
 /// asking for STRICT JSON cross-repo RUNTIME/infra relations keyed by repo id.
@@ -299,7 +295,11 @@ async fn run_agent_once(tool: &str, cwd: &Path, prompt: &str) -> Result<String> 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let adapter = adapter_for(tool).ok_or_else(|| anyhow::anyhow!("unknown tool {tool}"))?;
-    adapter.prepare(cwd);
+    // NB: deliberately do NOT call adapter.prepare(cwd) here. prepare() writes the
+    // tool's folder-trust config, and this one-shot runs in the user's CANONICAL
+    // repo — silently trusting it (bypassing the tool's own onboarding) would be
+    // wrong. The analysis is read-only and best-effort; if the tool needs trust
+    // and doesn't have it, the run simply yields nothing and the graph is intact.
     let ctx = AdapterContext {
         cwd,
         system_prompt: CURATOR_SYSTEM_PROMPT,
@@ -422,15 +422,38 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
     }
     let prompt = build_curator_prompt(&profiled);
     let cwd = Path::new(&profiled[0].0.local_git_path).to_path_buf();
-    let text = run_agent_once(&curator_tool(), &cwd, &prompt).await?;
-    let relations = parse_curator_output(&text);
-    persist_relations(db, &profiled, &relations).await
+    // Resolve the same effective default coding agent normal threads use, rather
+    // than hard-coding claude (which would no-op for codex/opencode users).
+    let tool = crate::tools::default_tool(db).await;
+    let text = run_agent_once(&tool, &cwd, &prompt).await?;
+    let Some(relations) = parse_curator_output(&text) else {
+        // A timed-out / unparseable reply: leave the existing graph intact rather
+        // than persisting an empty set (which would drop all agent relations).
+        return Ok(());
+    };
+    persist_relations(db, &profiled, &relations).await?;
+    // Refresh any open repo map (mirrors calibrate_edges_tool) so edges inferred
+    // by the background pass appear without a manual reload.
+    if let Some(app) = crate::APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = app.emit("repo-graph-updated", workspace_id);
+    }
+    Ok(())
 }
 
 /// Workspaces with an analysis pass currently running, so a batch add (which
 /// registers repos one-by-one) coalesces into a single workspace pass instead
 /// of spawning one agent per repo.
 fn analyzing() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Workspaces for which an add/analyze request arrived WHILE a pass was already
+/// running. The running pass captured its repo list before that request, so it
+/// reruns once when it finishes to pick up the newly-added repos.
+fn pending_reanalyze() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
     static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
         std::sync::OnceLock::new();
     S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
@@ -454,14 +477,30 @@ impl Drop for InFlightGuard {
 /// intended to be spawned fire-and-forget after a repo is added so the agent
 /// graph refreshes without blocking the add.
 pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32) {
-    let _guard = {
+    {
         let mut g = analyzing().lock().unwrap_or_else(|e| e.into_inner());
         if !g.insert(workspace_id) {
-            return; // a pass is already running for this workspace
+            // A pass is already running; remember that a newer one was requested
+            // so the running pass reruns once and picks up repos added since.
+            pending_reanalyze()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(workspace_id);
+            return;
         }
-        InFlightGuard(workspace_id)
-    };
-    let _ = analyze_workspace(db, workspace_id).await;
+    }
+    let _guard = InFlightGuard(workspace_id);
+    loop {
+        let _ = analyze_workspace(db, workspace_id).await;
+        // Rerun once if an add/analyze landed mid-pass (its repos weren't in scope).
+        let again = pending_reanalyze()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&workspace_id);
+        if !again {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -527,7 +566,7 @@ mod tests {
     fn parse_curator_output_extracts_json_from_fenced_prose() {
         let reply = "Here is the analysis:\n```json\n{\"relations\":[{\"from\":1,\"to\":2,\
             \"kind\":\"http\",\"via\":\"GET /orders\",\"confidence\":80}]}\n```\nDone.";
-        let rels = super::parse_curator_output(reply);
+        let rels = super::parse_curator_output(reply).expect("parsed a relations object");
         assert_eq!(rels.len(), 1);
         assert_eq!((rels[0].from, rels[0].to), (1, 2));
         assert_eq!(rels[0].kind, "http");
@@ -536,11 +575,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_curator_output_is_empty_on_garbage() {
-        assert!(super::parse_curator_output("no json here").is_empty());
-        assert!(super::parse_curator_output("").is_empty());
-        // A JSON object without a relations array yields nothing, not an error.
-        assert!(super::parse_curator_output(r#"{"notes":"none found"}"#).is_empty());
+    fn parse_curator_output_distinguishes_unparseable_from_explicit_empty() {
+        // Unparseable / timed-out replies → None (caller must NOT wipe the graph).
+        assert!(super::parse_curator_output("no json here").is_none());
+        assert!(super::parse_curator_output("").is_none());
+        // An object without a `relations` array is treated as unparseable too.
+        assert!(super::parse_curator_output(r#"{"notes":"none found"}"#).is_none());
+        // An explicit empty relations array → Some([]) (a real "found nothing").
+        let explicit = super::parse_curator_output(r#"{"relations":[]}"#);
+        assert!(explicit.is_some_and(|v| v.is_empty()));
     }
 
     #[tokio::test]

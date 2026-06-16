@@ -78,6 +78,17 @@ async fn register_repo(
     let base = crate::git::current_branch(p).unwrap_or_else(|_| "main".into());
     // Captured for workspace-level dedup; empty for a local repo with no origin.
     let remote = crate::git::remote_url(p).unwrap_or_default();
+    // Backfill remotes for repos added before the `remote_url` column existed, so
+    // the remote-dedup below can catch a second clone of an already-present origin
+    // on upgraded databases. Best-effort, cheap (a handful of repos per workspace).
+    for existing in repo::list_repos(db, workspace_id).await.map_err(e)? {
+        if existing.remote_url.is_empty() {
+            if let Some(rem) = crate::git::remote_url(std::path::Path::new(&existing.local_git_path))
+            {
+                let _ = repo::set_repo_remote(db, existing.id, &rem).await;
+            }
+        }
+    }
     let r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote)
         .await
         .map_err(e)?;
@@ -128,7 +139,16 @@ pub async fn clone_repo(
         .await
         .map_err(|err| err.to_string())?
         .map_err(e)?;
-    register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await
+    let r = register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await?;
+    // If workspace dedup resolved to an EXISTING repo (same remote already
+    // present), the directory we just cloned is redundant and untracked — remove
+    // it rather than leaving an orphan clone on disk.
+    let cloned = std::fs::canonicalize(&path).ok();
+    let registered = std::fs::canonicalize(&r.local_git_path).ok();
+    if cloned.is_some() && cloned != registered {
+        let _ = std::fs::remove_dir_all(&path);
+    }
+    Ok(r)
 }
 
 /// Create a new git repo at `<dest>/<name>` (init + empty initial commit), then

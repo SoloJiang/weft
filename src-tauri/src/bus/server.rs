@@ -392,14 +392,35 @@ async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
     if kind.is_empty() {
         return text_result("kind is required (http|grpc|queue|infra|lib)".into());
     }
+    // Validate action server-side: the store treats anything but "remove" as an
+    // add, so a misspelled "remove" would silently pin instead of erroring.
+    if action != "add" && action != "remove" {
+        return text_result(format!(
+            "invalid action {action:?}; use \"add\" or \"remove\""
+        ));
+    }
+    // Validate the ids belong to THIS curator's workspace, so a stale/hallucinated
+    // id can't pin or remove relations on an unrelated workspace's repo.
+    let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await else {
+        return text_result("curator thread not found".into());
+    };
+    let ws_ids: std::collections::HashSet<i32> = crate::store::repo::list_repos(db, t.workspace_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    if !ws_ids.contains(&from) || !ws_ids.contains(&to) {
+        return text_result(
+            "from/to must be repo ids in this workspace (use get_repo_map)".into(),
+        );
+    }
     match crate::store::repo::calibrate_repo_relation(db, from, to, kind, via, action).await {
         Ok(()) => {
             // Live-refresh the repo map for this curator thread's workspace.
-            if let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await {
-                if let Some(app) = crate::APP_HANDLE.get() {
-                    use tauri::Emitter;
-                    let _ = app.emit("repo-graph-updated", t.workspace_id);
-                }
+            if let Some(app) = crate::APP_HANDLE.get() {
+                use tauri::Emitter;
+                let _ = app.emit("repo-graph-updated", t.workspace_id);
             }
             text_result(format!(
                 "{action} {kind} edge {from}->{to} (pinned to your calibration)"
