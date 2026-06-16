@@ -7,6 +7,7 @@ import {
   FileText,
   GitBranch,
   Maximize2,
+  MessagesSquare,
   Minus,
   Package,
   PanelRightClose,
@@ -15,11 +16,14 @@ import {
   Plus,
   RefreshCw,
   Server,
+  Trash2,
   type LucideProps,
 } from "lucide-react";
 import type { ComponentType } from "react";
 import { useStore } from "../state/store";
-import type { RepoProfile } from "../lib/types";
+import type { RepoEdge, RepoProfile } from "../lib/types";
+import { Dialog, DialogContent } from "../components/ui/Dialog";
+import { Button } from "../components/ui/Button";
 import { cn } from "../lib/cn";
 
 const ROLE_ICON: Record<string, ComponentType<LucideProps>> = {
@@ -48,7 +52,8 @@ const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));
  * pan, scroll/buttons to zoom, fit to recenter.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reprofileRepo } = useStore();
+  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, openCuratorChat } = useStore();
+  const [analyzing, setAnalyzing] = useState(false);
   const { t } = useTranslation();
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [profileOpen, setProfileOpen] = useState(true);
@@ -312,7 +317,32 @@ export function RepoGraph() {
           })}
         </div>
 
-        <div className="pointer-events-none absolute inset-x-4 bottom-4 flex items-end justify-end gap-3">
+        <div className="pointer-events-none absolute inset-x-4 bottom-4 flex items-end justify-between gap-3">
+          <div className="pointer-events-none flex items-center gap-2">
+            <button
+              data-graph-controls
+              onClick={() => {
+                if (analyzing) return;
+                setAnalyzing(true);
+                void reanalyzeDeps().finally(() => setAnalyzing(false));
+              }}
+              disabled={analyzing}
+              title={t("repomap.reanalyzeHint")}
+              className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
+            >
+              <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
+              {analyzing ? t("repomap.reanalyzing") : t("repomap.reanalyze")}
+            </button>
+            <button
+              data-graph-controls
+              onClick={() => void openCuratorChat()}
+              title={t("repomap.calibrateHint")}
+              className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink"
+            >
+              <MessagesSquare size={12} />
+              {t("repomap.calibrate")}
+            </button>
+          </div>
           <div
             data-graph-controls
             className="pointer-events-auto flex items-center gap-0.5 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
@@ -364,22 +394,24 @@ function RepoProfilePane({
 }: {
   profile?: RepoProfile;
   profiles: RepoProfile[];
-  edges: { from: number; to: number; via: string }[];
+  edges: RepoEdge[];
   onSelect: (id: number) => void;
   onCollapse: () => void;
 }) {
   const { t } = useTranslation();
-  const { reprofileRepo } = useStore();
+  const { reprofileRepo, deleteRepo } = useStore();
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   if (!profile) return <EmptyProfilePane />;
 
   const deps = edges
     .filter((e) => e.from === profile.repo_id)
     .map((e) => ({ edge: e, repo: profiles.find((p) => p.repo_id === e.to) }))
-    .filter((x): x is { edge: { from: number; to: number; via: string }; repo: RepoProfile } => !!x.repo);
+    .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
   const usedBy = edges
     .filter((e) => e.to === profile.repo_id)
     .map((e) => ({ edge: e, repo: profiles.find((p) => p.repo_id === e.from) }))
-    .filter((x): x is { edge: { from: number; to: number; via: string }; repo: RepoProfile } => !!x.repo);
+    .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
   const Icon = ROLE_ICON[profile.role] ?? CircleDashed;
 
   return (
@@ -408,6 +440,13 @@ function RepoProfilePane({
             className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
           >
             <RefreshCw size={14} />
+          </button>
+          <button
+            onClick={() => setConfirmDelete(true)}
+            title={t("repomap.deleteRepo")}
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-danger/10 hover:text-danger"
+          >
+            <Trash2 size={14} />
           </button>
           <button
             onClick={onCollapse}
@@ -456,6 +495,31 @@ function RepoProfilePane({
           </div>
         )}
       </div>
+
+      <Dialog open={confirmDelete} onOpenChange={(o) => !deleting && setConfirmDelete(o)}>
+        <DialogContent title={t("repomap.deleteRepoTitle", { name: profile.repo_name })}>
+          <p className="text-[13px] leading-relaxed text-ink-muted">
+            {t("repomap.deleteRepoBody")}
+          </p>
+          <div className="mt-4 flex justify-end gap-2">
+            <Button variant="ghost" disabled={deleting} onClick={() => setConfirmDelete(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="danger"
+              disabled={deleting}
+              onClick={() => {
+                setDeleting(true);
+                void deleteRepo(profile.repo_id)
+                  .then(() => setConfirmDelete(false))
+                  .finally(() => setDeleting(false));
+              }}
+            >
+              {deleting ? t("repomap.deleting") : t("repomap.deleteRepoConfirm")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </aside>
   );
 }
@@ -596,7 +660,7 @@ function RepoLinks({
   onSelect,
   reverse,
 }: {
-  items: { repo: RepoProfile; edge: { via: string } }[];
+  items: { repo: RepoProfile; edge: { via: string; kind?: string } }[];
   empty: string;
   onSelect: (id: number) => void;
   reverse?: boolean;
@@ -614,6 +678,12 @@ function RepoLinks({
           <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">
             {reverse ? `${repo.repo_name}` : repo.repo_name}
           </span>
+          {/* Non-"lib" kinds are agent-inferred runtime/infra links — badge them. */}
+          {edge.kind && edge.kind !== "lib" && (
+            <span className="shrink-0 rounded bg-brand-ghost px-1.5 py-0.5 text-[10px] font-medium uppercase text-brand">
+              {edge.kind}
+            </span>
+          )}
           {edge.via && (
             <span className="max-w-[120px] truncate text-[11px] text-ink-faint">
               {t("repomap.via", { via: edge.via })}

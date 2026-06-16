@@ -528,6 +528,79 @@ pub fn current_branch(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// The repo's `origin` remote URL, if one is configured. None for a freshly
+/// `git init`-ed local repo (no origin) or any git error — callers treat that
+/// as "no remote identity, dedup by path only".
+pub fn remote_url(repo: &Path) -> Option<String> {
+    git(repo, &["remote", "get-url", "origin"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Strip credentials from a remote URL before persisting it. For a scheme URL
+/// (`scheme://[user[:pass]@]host/…`) the entire authority userinfo is dropped, so
+/// an embedded password/PAT from `.git/config` never lands in Weft's DB/backups.
+/// scp-style `[user@]host:path` is left as-is (its user is an SSH login, not a
+/// secret). Only the authority is touched — an `@` later in the path survives.
+pub fn redact_remote(url: &str) -> String {
+    let s = url.trim();
+    if let Some(pos) = s.find("://") {
+        let scheme = &s[..pos + 3];
+        let rest = &s[pos + 3..];
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            return format!("{scheme}{}", &rest[at + 1..]);
+        }
+    }
+    s.to_string()
+}
+
+/// Normalized dedup key for a git remote URL, mirroring the frontend
+/// `gitUrlKey` (src/lib/gitUrl.ts) so both sides agree on "same repo": drop a
+/// trailing `.git`/slashes, lowercase the scheme + host only — the repo path
+/// stays case-sensitive (git hosts treat `Team/App` and `team/App` as distinct).
+/// Empty in → empty out.
+pub fn git_url_key(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return String::new();
+    }
+    // Trim trailing slashes BEFORE `.git` so `repo.git/` and `repo` key the same.
+    // The `is_char_boundary` guard keeps the slice char-safe — a Unicode path
+    // component like `host:éabc` must never panic on a non-ASCII byte boundary.
+    let no_slash = url.trim_end_matches('/');
+    let cut = no_slash.len().checked_sub(4);
+    let base = match cut {
+        Some(i)
+            if no_slash.is_char_boundary(i) && no_slash[i..].eq_ignore_ascii_case(".git") =>
+        {
+            &no_slash[..i]
+        }
+        _ => no_slash,
+    };
+    // Lowercase the host; keep any userinfo / ssh user (case-sensitive).
+    let lower_host = |authority: &str| match authority.rfind('@') {
+        Some(at) => format!("{}{}", &authority[..=at], authority[at + 1..].to_lowercase()),
+        None => authority.to_lowercase(),
+    };
+    // scheme URL: `scheme://authority[/path]`.
+    if let Some(pos) = base.find("://") {
+        let scheme = &base[..pos + 3];
+        let rest = &base[pos + 3..];
+        let (authority, path) = match rest.find('/') {
+            Some(s) => (&rest[..s], &rest[s..]),
+            None => (rest, ""),
+        };
+        return format!("{}{}{}", scheme.to_lowercase(), lower_host(authority), path);
+    }
+    // scp-style: `[user@]host:path` (split on the first colon).
+    if let Some(colon) = base.find(':') {
+        return format!("{}:{}", lower_host(&base[..colon]), &base[colon + 1..]);
+    }
+    base.to_lowercase()
+}
+
 /// Short HEAD commit sha; used to stamp a repo profile and detect staleness.
 pub fn head_commit(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--short", "HEAD"])
@@ -585,6 +658,71 @@ mod tests {
         let p = std::env::temp_dir().join(format!("weft-git-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    #[test]
+    fn git_url_key_normalizes_host_and_dotgit() {
+        // Host is case-insensitive; trailing `.git`/slashes are dropped — so all
+        // these spellings of the same remote collapse to one dedup key.
+        let k = git_url_key("https://github.com/acme/app");
+        assert_eq!(git_url_key("https://GitHub.com/acme/app.git"), k);
+        assert_eq!(git_url_key("https://github.com/acme/app.git/"), k);
+        // The repo path stays case-sensitive (git hosts treat these as distinct).
+        assert_ne!(git_url_key("https://github.com/Acme/App"), git_url_key("https://github.com/acme/app"));
+        // scp form `[user@]host:path`: host lowercased, ssh user + path kept.
+        let s = git_url_key("git@github.com:acme/api");
+        assert_eq!(git_url_key("git@GitHub.com:acme/api.git"), s);
+        assert_ne!(s, k); // scp and scheme spellings don't unify — and shouldn't here
+        assert_eq!(git_url_key(""), "");
+    }
+
+    #[test]
+    fn git_url_key_handles_unicode_suffix_without_panic() {
+        // A non-ASCII tail whose last 4 bytes aren't a char boundary must not
+        // panic the `.git` strip (regression for byte-slicing).
+        assert_eq!(git_url_key("git@host:éabc"), "git@host:éabc");
+        // A real .git after Unicode still strips cleanly.
+        assert_eq!(git_url_key("https://host/é-repo.git"), "https://host/é-repo");
+    }
+
+    #[test]
+    fn redact_remote_strips_scheme_credentials_only() {
+        // HTTPS userinfo (user[:token]) is dropped — no secret reaches storage.
+        assert_eq!(
+            redact_remote("https://user:ghp_secret@github.com/acme/app.git"),
+            "https://github.com/acme/app.git"
+        );
+        assert_eq!(
+            redact_remote("https://token@github.com/acme/app"),
+            "https://github.com/acme/app"
+        );
+        assert_eq!(redact_remote("ssh://git@host/acme/app"), "ssh://host/acme/app");
+        // No credentials → unchanged.
+        assert_eq!(
+            redact_remote("https://github.com/acme/app.git"),
+            "https://github.com/acme/app.git"
+        );
+        // scp-style: the `git@` user is an SSH login, not a secret — keep it.
+        assert_eq!(redact_remote("git@github.com:acme/app.git"), "git@github.com:acme/app.git");
+        // An `@` in the PATH (not the authority) is preserved.
+        assert_eq!(redact_remote("https://host/acme/app@v2"), "https://host/acme/app@v2");
+    }
+
+    #[test]
+    fn remote_url_reads_origin_or_none() {
+        let repo = tmp("remote");
+        init_repo(&repo).unwrap();
+        assert_eq!(remote_url(&repo), None, "a fresh repo has no origin");
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://github.com/acme/app.git"],
+        )
+        .unwrap();
+        assert_eq!(
+            remote_url(&repo).as_deref(),
+            Some("https://github.com/acme/app.git")
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

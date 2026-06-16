@@ -17,6 +17,10 @@ export interface RepoRef {
   slug: string;
   local_git_path: string;
   base_ref: string;
+  /** Captured `origin` remote URL ("" for a local repo with no origin). Lets the
+   *  add dialog pre-flag pasted URLs already in the workspace; the backend is the
+   *  authority for dedup. */
+  remote_url: string;
 }
 
 /** One effective skill/rule for a repo, tagged with the layer it comes from
@@ -346,6 +350,13 @@ export interface RepoEdge {
   from: number;
   to: number;
   via: string;
+  /** Relationship kind: "lib" (declared package dep) | "http" | "grpc" | "queue"
+   *  | "infra". Optional for backward compat with pre-curator payloads. */
+  kind?: string;
+  /** "manifest" (deterministic) | "agent" (inferred) | "user". */
+  source?: string;
+  /** Confidence 0–100; manifest edges are 100. */
+  confidence?: number;
 }
 
 export interface RepoGraph {

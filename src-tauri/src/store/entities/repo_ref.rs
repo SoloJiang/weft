@@ -10,6 +10,11 @@ pub struct Model {
     pub slug: String,
     pub local_git_path: String,
     pub base_ref: String,
+    /// The raw `origin` remote URL captured at add/clone time (empty for a local
+    /// repo with no origin). Compared via `git::git_url_key` for workspace-level
+    /// dedup so the same remote cloned at two paths isn't added twice.
+    #[sea_orm(default_value = "")]
+    pub remote_url: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

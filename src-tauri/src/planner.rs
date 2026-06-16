@@ -453,7 +453,7 @@ mod tests {
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main")
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "")
             .await
             .unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")

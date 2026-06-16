@@ -124,10 +124,11 @@ function StatusDot({ status }: { status: RowStatus }) {
 }
 
 export function AddRepoDialog({ open, onOpenChange }: DProps) {
-  const { addRepo, importRepos, createRepo, projectsDir, activeWorkspaceId } = useStore();
+  const { addRepos, importRepos, createRepo, projectsDir, activeWorkspaceId } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<RepoMode>("local");
-  const [path, setPath] = useState(""); // local
+  const [path, setPath] = useState(""); // local — a single typed path
+  const [localPaths, setLocalPaths] = useState<string[]>([]); // local — multi-picked folders
   const [url, setUrl] = useState(""); // clone — one or many pasted URLs
   const [dest, setDest] = useState(""); // clone/new parent
   const [name, setName] = useState(""); // local name / single-clone override / new name
@@ -148,11 +149,27 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   // sources passed verbatim to git for per-row status, deduped).
   const cloneTargets = useMemo(() => parseCloneSources(url), [url]);
 
+  // Local repos to add: the multi-picked folders plus any single typed path,
+  // deduped in pick-then-type order. Duplicates already in the workspace are
+  // deduped again by the backend, so re-picking is harmless.
+  const localTargets = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const p of [...localPaths, path]) {
+      const v = p.trim();
+      if (!v || seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+    }
+    return out;
+  }, [localPaths, path]);
+
   // Reset on close; default the destination to the configured projects dir.
   useEffect(() => {
     if (!open) {
       setMode("local");
       setPath("");
+      setLocalPaths([]);
       setUrl("");
       setDest("");
       setName("");
@@ -172,7 +189,9 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   // success for repos that never reached the current workspace.
   useEffect(() => {
     setProgress((p) => (Object.keys(p).length ? {} : p));
-  }, [url, dest, activeWorkspaceId]);
+    // `mode` is a dep too: switching clone↔local must clear stale "ok" rows, or
+    // runBatch would skip those indices and close without adding anything.
+  }, [url, dest, activeWorkspaceId, path, localPaths, mode]);
 
   // Switching workspace mid-batch aborts the in-flight import: its remaining
   // clones (and any late callbacks) target the submit-time workspace, so they
@@ -192,71 +211,58 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     onOpenChange(o);
   }
 
-  const finalName = name.trim() || (mode === "local" ? basename(path) : "");
-
   const canSubmit =
     !busy &&
     (mode === "local"
-      ? !!path.trim()
+      ? localTargets.length >= 1
       : mode === "clone"
         ? cloneTargets.length >= 1 && !!dest.trim()
         : !!name.trim() && !!dest.trim());
 
-  async function submit() {
-    if (!canSubmit) return;
-    setBusy(true);
-    setErr(null);
-
-    if (mode === "local" || mode === "new") {
-      try {
-        if (mode === "local") await addRepo(finalName || "repo", path.trim());
-        else await createRepo(finalName || "repo", dest.trim());
-        onOpenChange(false);
-      } catch (e) {
-        setErr(String(e));
-      } finally {
-        setBusy(false);
-      }
-      return;
-    }
-
-    // clone — one or many recognized URLs, each into <dest>/<name>. Skip rows
-    // already cloned this session so a retry re-runs only failures (re-cloning a
-    // success would collide with its existing folder). Indices stay aligned to
-    // `recognized` so the status list maps correctly.
-    const entries = cloneTargets.map((u, idx) => ({
-      idx,
-      url: u,
-      name:
-        cloneTargets.length === 1 ? name.trim() || repoNameFromUrl(u) || "repo" : repoNameFromUrl(u) || "repo",
-    }));
-    const pending = entries.filter((e) => progress[e.idx]?.status !== "ok");
-    if (pending.length === 0) {
+  // Shared sequential-batch harness for clone & local-add. `targets` is the full
+  // ordered set (for indexing + count); `run` does the work for the not-yet-ok
+  // rows and reports status by ORIGINAL index. Skips already-ok rows so a retry
+  // re-runs only failures. Honors mid-batch abort + workspace switch (rows land
+  // in the submit-time workspace), then toasts / sets the final summary via the
+  // mode-specific `report` strings.
+  async function runBatch(
+    targets: string[],
+    report: {
+      toast: (count: number) => string;
+      failOne: string;
+      summary: (ok: number, failed: number) => string;
+    },
+    run: (
+      pendingIdx: number[],
+      onProgress: (originalIdx: number, status: RowStatus, error?: string) => void,
+      signal: AbortSignal,
+    ) => Promise<void>,
+  ) {
+    const pendingIdx = targets.map((_, i) => i).filter((i) => progress[i]?.status !== "ok");
+    if (pendingIdx.length === 0) {
       onOpenChange(false);
       return;
     }
     setProgress((p) => {
       const next = { ...p };
-      for (const e of pending) next[e.idx] = { status: "queued" };
+      for (const i of pendingIdx) next[i] = { status: "queued" };
       return next;
     });
 
     const controller = new AbortController();
     abortRef.current = controller;
-    const submitWs = activeWorkspaceId; // these clones land in this workspace
+    const submitWs = activeWorkspaceId; // these rows land in this workspace
     const errors: Record<number, string> = {};
     try {
-      await importRepos(
-        pending.map((e) => ({ url: e.url, name: e.name })),
-        dest.trim(),
-        (j, status, error) => {
+      await run(
+        pendingIdx,
+        (originalIdx, status, error) => {
           // Drop callbacks from a superseded batch (close+reopen) or one whose
           // workspace was switched away — the AbortController stays "current"
           // across a workspace change, so guard on the workspace too.
           if (abortRef.current !== controller || wsRef.current !== submitWs) return;
-          const idx = pending[j].idx;
-          setProgress((p) => ({ ...p, [idx]: { status, error } }));
-          if (status === "error" && error) errors[idx] = error;
+          setProgress((p) => ({ ...p, [originalIdx]: { status, error } }));
+          if (status === "error" && error) errors[originalIdx] = error;
         },
         controller.signal,
       );
@@ -272,19 +278,76 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     if (abortRef.current !== controller) return;
     abortRef.current = null;
     setBusy(false);
-    if (controller.signal.aborted) return; // dialog was closed mid-import
+    if (controller.signal.aborted) return; // dialog was closed mid-batch
     if (wsRef.current !== submitWs) return; // workspace switched — don't toast for the old one
-    // Every prior-ok row stays ok and every pending row is now ok or error, so
-    // total failed == this run's errors and total ok == recognized − failed.
     const failed = Object.keys(errors).length;
     if (failed === 0) {
-      if (entries.length > 1) toast(t("dialog.importedToast", { count: entries.length }));
+      if (targets.length > 1) toast(report.toast(targets.length));
       onOpenChange(false);
-    } else if (entries.length === 1) {
-      setErr(Object.values(errors)[0] ?? t("dialog.importFailed"));
+    } else if (targets.length === 1) {
+      setErr(Object.values(errors)[0] ?? report.failOne);
     } else {
-      setErr(t("dialog.importSummary", { ok: entries.length - failed, failed }));
+      setErr(report.summary(targets.length - failed, failed));
     }
+  }
+
+  async function submit() {
+    if (!canSubmit) return;
+    setBusy(true);
+    setErr(null);
+
+    if (mode === "new") {
+      try {
+        await createRepo(name.trim() || "repo", dest.trim());
+        onOpenChange(false);
+      } catch (e) {
+        setErr(String(e));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
+    if (mode === "local") {
+      // Name override only with a single target (mirrors clone); multi-picks
+      // derive each name from its folder basename.
+      const nameFor = (p: string) =>
+        localTargets.length === 1 ? name.trim() || basename(p) || "repo" : basename(p) || "repo";
+      await runBatch(
+        localTargets,
+        {
+          toast: (count) => t("dialog.addedToast", { count }),
+          failOne: t("dialog.addFailed"),
+          summary: (ok, failed) => t("dialog.addSummary", { ok, failed }),
+        },
+        (pendingIdx, onProgress, signal) =>
+          addRepos(
+            pendingIdx.map((i) => ({ name: nameFor(localTargets[i]), path: localTargets[i] })),
+            (j, status, error) => onProgress(pendingIdx[j], status, error),
+            signal,
+          ),
+      );
+      return;
+    }
+
+    // clone — one or many recognized URLs, each into <dest>/<name>.
+    const nameFor = (u: string) =>
+      cloneTargets.length === 1 ? name.trim() || repoNameFromUrl(u) || "repo" : repoNameFromUrl(u) || "repo";
+    await runBatch(
+      cloneTargets,
+      {
+        toast: (count) => t("dialog.importedToast", { count }),
+        failOne: t("dialog.importFailed"),
+        summary: (ok, failed) => t("dialog.importSummary", { ok, failed }),
+      },
+      (pendingIdx, onProgress, signal) =>
+        importRepos(
+          pendingIdx.map((i) => ({ url: cloneTargets[i], name: nameFor(cloneTargets[i]) })),
+          dest.trim(),
+          (j, status, error) => onProgress(pendingIdx[j], status, error),
+          signal,
+        ),
+    );
   }
 
   async function pickInto(setter: (v: string) => void, derive?: (v: string) => void) {
@@ -294,11 +357,24 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     if (derive) derive(d);
   }
 
+  // Local multi-pick: append the chosen folders to the picked list (deduped).
+  async function pickLocalFolders() {
+    const dirs = await api.pickFolders(t("dialog.addRepoTitle"));
+    if (dirs.length === 0) return;
+    setLocalPaths((prev) => {
+      const out = [...prev];
+      for (const d of dirs) if (!out.includes(d)) out.push(d);
+      return out;
+    });
+  }
+
   const cta =
     mode === "local"
       ? busy
-        ? t("dialog.creating")
-        : t("dialog.addRepo")
+        ? t("dialog.adding")
+        : localTargets.length > 1
+          ? t("dialog.addReposCta", { count: localTargets.length })
+          : t("dialog.addRepo")
       : mode === "clone"
         ? busy
           ? t("dialog.cloning")
@@ -341,15 +417,60 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
           className="flex flex-col gap-4"
         >
           {mode === "local" && (
-            <Field label={t("dialog.repoPath")}>
-              <PathInput
-                value={path}
-                placeholder="/Users/you/code/web-app"
-                onChange={setPath}
-                onPick={() => pickInto(setPath)}
-                disabled={busy}
-              />
-            </Field>
+            <>
+              <Field label={t("dialog.repoPath")} hint={t("dialog.localPickHint")}>
+                <PathInput
+                  value={path}
+                  placeholder="/Users/you/code/web-app"
+                  onChange={setPath}
+                  onPick={pickLocalFolders}
+                  disabled={busy}
+                />
+              </Field>
+
+              {localTargets.length >= 2 && (
+                <div className="flex max-h-48 flex-col gap-0.5 overflow-y-auto rounded-[var(--radius-md)] border border-border bg-bg/50 p-2">
+                  <div className="px-1 pb-1 text-[11px] text-ink-faint">
+                    {t("dialog.localRecognized", { count: localTargets.length })}
+                  </div>
+                  {/* Iterate the actual add set so every counted row is shown; the
+                      map index IS the batch's progress index (see runBatch). */}
+                  {localTargets.map((p, i) => {
+                    const row = progress[i];
+                    const status: RowStatus = row?.status ?? "queued";
+                    return (
+                      <div key={p} className="flex items-center gap-2 px-1 py-0.5 text-[12px]">
+                        <StatusDot status={status} />
+                        <span className="shrink-0 font-medium text-ink">{basename(p) || "repo"}</span>
+                        <span
+                          className={cn(
+                            "min-w-0 flex-1 truncate font-mono text-[11px]",
+                            status === "error" ? "text-danger" : "text-ink-faint",
+                          )}
+                          title={row?.error || p}
+                        >
+                          {row?.error || p}
+                        </span>
+                        {!busy && (
+                          <button
+                            type="button"
+                            aria-label={t("dialog.removeRow")}
+                            onClick={() => {
+                              // The typed path lives in `path`; picked folders in `localPaths`.
+                              if (p === path.trim()) setPath("");
+                              else setLocalPaths((prev) => prev.filter((x) => x !== p));
+                            }}
+                            className="shrink-0 text-ink-faint transition-colors hover:text-ink"
+                          >
+                            <X size={13} />
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
           )}
 
           {mode === "clone" && (
@@ -418,13 +539,15 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
             </Field>
           )}
 
-          {(mode === "local" ||
-            mode === "new" ||
+          {(mode === "new" ||
+            (mode === "local" && localTargets.length === 1) ||
             (mode === "clone" && cloneTargets.length === 1)) && (
             <Field label={t("dialog.repoName")}>
               <Input
                 autoFocus={mode === "new"}
-                placeholder={mode === "local" ? basename(path) || "web-app" : "web-app"}
+                placeholder={
+                  mode === "local" ? basename(localTargets[0] ?? "") || "web-app" : "web-app"
+                }
                 value={name}
                 onChange={(e) => setName(e.currentTarget.value)}
                 disabled={busy}

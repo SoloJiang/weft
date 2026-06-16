@@ -24,11 +24,118 @@ pub struct RepoFacts {
 }
 
 /// A directed dependency edge: `from` consumes `to`, evidenced by `via`.
+///
+/// `kind`/`source`/`confidence` are `serde(default)` so payloads written before
+/// they existed still deserialize. Manifest edges (deterministic floor) are
+/// `kind="lib"`, `source="manifest"`, `confidence=100`; the agent curator adds
+/// richer kinds (`http`/`grpc`/`queue`/`infra`) tagged `source="agent"`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Edge {
     pub from: i32,
     pub to: i32,
     pub via: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub confidence: u8,
+}
+
+/// The cross-repo relation kinds the curator may assert. Inferred kinds are
+/// normalized to lowercase and dropped if not in this set, so the stored graph
+/// and `calibrate_edges` (which validates the same set) stay consistent — a
+/// stray `HTTP` can't render unremovably.
+pub const RELATION_KINDS: [&str; 5] = ["http", "grpc", "queue", "infra", "lib"];
+
+/// Lowercase + validate a relation kind against `RELATION_KINDS`. None if it
+/// isn't a recognized kind (caller drops it).
+pub fn normalize_relation_kind(kind: &str) -> Option<String> {
+    let k = kind.trim().to_ascii_lowercase();
+    RELATION_KINDS.contains(&k.as_str()).then_some(k)
+}
+
+/// One agent-inferred outgoing relation: this repo depends on workspace repo
+/// `to` via `kind` (http/grpc/queue/infra/lib), evidenced by `via`. `to` is a
+/// repo_ref id the agent picks from the provided workspace list, so no fuzzy
+/// resolution is needed. Persisted as a JSON array on the producer's profile.
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct AgentRelation {
+    pub to: i32,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub via: String,
+    #[serde(default)]
+    pub confidence: u8,
+    /// "agent" (inferred) | "user" (human calibration — pinned). Empty == agent.
+    #[serde(default)]
+    pub source: String,
+    /// A human-removed edge: kept as a tombstone so the auto pass won't
+    /// resurrect it, and emits no graph edge.
+    #[serde(default)]
+    pub rejected: bool,
+}
+
+/// Turn one repo's stored agent relations into edges, dropping self-links, any
+/// `to` that is not a current workspace node (a stale id from a repo since
+/// removed), and `rejected` tombstones. Empty `kind` falls back to "dep"; each
+/// edge carries its relation's `source` (empty treated as "agent").
+pub fn agent_edges(
+    from_id: i32,
+    relations: &[AgentRelation],
+    nodes: &std::collections::HashSet<i32>,
+) -> Vec<Edge> {
+    relations
+        .iter()
+        .filter(|r| !r.rejected && r.to != from_id && nodes.contains(&r.to))
+        .map(|r| Edge {
+            from: from_id,
+            to: r.to,
+            via: r.via.clone(),
+            kind: if r.kind.is_empty() { "dep".into() } else { r.kind.clone() },
+            source: if r.source.is_empty() { "agent".into() } else { r.source.clone() },
+            confidence: r.confidence,
+        })
+        .collect()
+}
+
+/// Merge a repo's current relations with a fresh agent pass: keep every
+/// user-sourced relation (including `rejected` tombstones), drop old agent
+/// relations, and add fresh agent relations EXCEPT any a user tombstone rejects
+/// for the same (to, kind) — so a human-removed edge is never resurrected.
+pub fn merge_relations(existing: &[AgentRelation], fresh_agent: &[AgentRelation]) -> Vec<AgentRelation> {
+    let mut out: Vec<AgentRelation> =
+        existing.iter().filter(|r| r.source == "user").cloned().collect();
+    let tombstoned: std::collections::HashSet<(i32, String)> = out
+        .iter()
+        .filter(|r| r.rejected)
+        .map(|r| (r.to, r.kind.clone()))
+        .collect();
+    for r in fresh_agent {
+        if !tombstoned.contains(&(r.to, r.kind.clone())) {
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
+/// Union manifest + agent edges, deduped by (from, to, via, kind): a manifest
+/// edge (a declared fact) wins over an agent edge for the SAME triple+kind, but a
+/// different relationship between the same pair survives — including one that
+/// happens to reuse the same `via` label with a different kind (e.g. a manifest
+/// `lib` edge via `@acme/api` and a pinned `http` edge via `@acme/api`).
+pub fn merge_edges(manifest: Vec<Edge>, agent: Vec<Edge>) -> Vec<Edge> {
+    let key = |e: &Edge| (e.from, e.to, e.via.clone(), e.kind.clone());
+    let mut seen: std::collections::HashSet<(i32, i32, String, String)> =
+        manifest.iter().map(key).collect();
+    let mut out = manifest;
+    for e in agent {
+        if seen.insert(key(&e)) {
+            out.push(e);
+        }
+    }
+    out
 }
 
 fn read(dir: &Path, rel: &str) -> Option<String> {
@@ -726,6 +833,9 @@ pub fn compute_edges(repos: &[(i32, RepoFacts)]) -> Vec<Edge> {
                     from: *from_id,
                     to: *to_id,
                     via: via.clone(),
+                    kind: "lib".into(),
+                    source: "manifest".into(),
+                    confidence: 100,
                 });
             }
         }
@@ -1054,5 +1164,164 @@ mod tests {
         // a depends on serde (external) + itself; nothing in the workspace.
         let edges = super::compute_edges(&[(1, a), (2, b)]);
         assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn manifest_edges_are_tagged_lib_manifest_full_confidence() {
+        let web = RepoFacts {
+            deps: vec!["@acme/api-client".into()],
+            ..Default::default()
+        };
+        let api = RepoFacts {
+            published: vec!["@acme/api-client".into()],
+            ..Default::default()
+        };
+        let edges = super::compute_edges(&[(1, web), (2, api)]);
+        assert_eq!(edges.len(), 1);
+        // A declared manifest dependency is a fact: kind=lib, source=manifest, 100.
+        assert_eq!(edges[0].kind, "lib");
+        assert_eq!(edges[0].source, "manifest");
+        assert_eq!(edges[0].confidence, 100);
+    }
+
+    #[test]
+    fn edge_deserializes_legacy_three_field_json() {
+        // Payloads written before kind/source/confidence existed still parse, so
+        // an upgraded build reads pre-existing data without a migration.
+        let e: super::Edge = serde_json::from_str(r#"{"from":1,"to":2,"via":"x"}"#).unwrap();
+        assert_eq!((e.from, e.to, e.via.as_str()), (1, 2, "x"));
+        assert_eq!(e.kind, "");
+        assert_eq!(e.source, "");
+        assert_eq!(e.confidence, 0);
+    }
+
+    fn rel(to: i32, kind: &str, via: &str, confidence: u8) -> super::AgentRelation {
+        super::AgentRelation {
+            to,
+            kind: kind.into(),
+            via: via.into(),
+            confidence,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn agent_edges_drop_self_and_stale_targets() {
+        let nodes: std::collections::HashSet<i32> = [1, 2, 3].into_iter().collect();
+        let relations = vec![
+            rel(2, "http", "GET /orders", 80), // kept
+            rel(1, "http", "self call", 90),   // dropped: self-edge
+            rel(9, "grpc", "Pricing.Quote", 70), // dropped: 9 not a node
+        ];
+        let edges = super::agent_edges(1, &relations, &nodes);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, 1);
+        assert_eq!(edges[0].to, 2);
+        assert_eq!(edges[0].kind, "http");
+        assert_eq!(edges[0].source, "agent");
+        assert_eq!(edges[0].confidence, 80);
+    }
+
+    #[test]
+    fn agent_edges_skip_rejected_and_carry_source() {
+        let nodes: std::collections::HashSet<i32> = [1, 2].into_iter().collect();
+        let relations = vec![
+            super::AgentRelation {
+                to: 2,
+                kind: "http".into(),
+                via: "GET /x".into(),
+                confidence: 80,
+                source: "user".into(),
+                rejected: false,
+            },
+            super::AgentRelation {
+                to: 2,
+                kind: "grpc".into(),
+                via: "Q".into(),
+                confidence: 50,
+                source: "user".into(),
+                rejected: true, // a human-removed edge → no graph edge
+            },
+        ];
+        let edges = super::agent_edges(1, &relations, &nodes);
+        assert_eq!(edges.len(), 1, "rejected relation produces no edge");
+        assert_eq!(edges[0].source, "user", "user-confirmed source flows to the edge");
+        assert_eq!(edges[0].kind, "http");
+    }
+
+    #[test]
+    fn merge_relations_keeps_user_replaces_agent_honors_tombstone() {
+        let existing = vec![
+            super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 90, source: "user".into(), rejected: false },
+            super::AgentRelation { to: 3, kind: "http".into(), via: "old".into(), confidence: 40, source: "user".into(), rejected: true },
+            super::AgentRelation { to: 4, kind: "lib".into(), via: "stale-agent".into(), confidence: 100, source: "agent".into(), rejected: false },
+        ];
+        let fresh_agent = vec![
+            super::AgentRelation { to: 3, kind: "http".into(), via: "re-found".into(), confidence: 70, source: "agent".into(), rejected: false },
+            super::AgentRelation { to: 5, kind: "grpc".into(), via: "new".into(), confidence: 60, source: "agent".into(), rejected: false },
+        ];
+        let merged = super::merge_relations(&existing, &fresh_agent);
+        assert!(merged.iter().any(|r| r.to == 2 && r.source == "user" && !r.rejected), "user edge survives");
+        assert!(merged.iter().any(|r| r.to == 3 && r.rejected), "tombstone survives");
+        assert!(!merged.iter().any(|r| r.to == 3 && !r.rejected), "tombstoned edge not resurrected");
+        assert!(!merged.iter().any(|r| r.to == 4), "stale agent edge dropped");
+        assert!(merged.iter().any(|r| r.to == 5 && r.source == "agent"), "new agent edge added");
+    }
+
+    #[test]
+    fn merge_edges_prefers_manifest_and_keeps_distinct_kinds() {
+        let manifest = vec![super::Edge {
+            from: 1,
+            to: 2,
+            via: "@acme/api-client".into(),
+            kind: "lib".into(),
+            source: "manifest".into(),
+            confidence: 100,
+        }];
+        let agent = vec![
+            // Same (from,to,via) as a manifest edge → manifest wins, agent dropped.
+            super::Edge {
+                from: 1,
+                to: 2,
+                via: "@acme/api-client".into(),
+                kind: "lib".into(),
+                source: "agent".into(),
+                confidence: 50,
+            },
+            // A genuinely different relationship (runtime HTTP) → kept.
+            super::Edge {
+                from: 1,
+                to: 2,
+                via: "GET /orders".into(),
+                kind: "http".into(),
+                source: "agent".into(),
+                confidence: 80,
+            },
+            // Same (from,to,via) as the manifest lib edge but a DIFFERENT kind →
+            // kept (kind is part of the dedup key); the runtime call shouldn't be
+            // swallowed just because it reuses the package identifier as evidence.
+            super::Edge {
+                from: 1,
+                to: 2,
+                via: "@acme/api-client".into(),
+                kind: "http".into(),
+                source: "user".into(),
+                confidence: 100,
+            },
+        ];
+        let merged = super::merge_edges(manifest, agent);
+        assert_eq!(merged.len(), 3);
+        // The (1,2,@acme/api-client,lib) edge is the manifest one.
+        let lib = merged
+            .iter()
+            .find(|e| e.via == "@acme/api-client" && e.kind == "lib")
+            .unwrap();
+        assert_eq!(lib.source, "manifest");
+        assert_eq!(lib.confidence, 100);
+        assert!(merged.iter().any(|e| e.kind == "http" && e.via == "GET /orders"));
+        // The same-via http edge survives alongside the manifest lib edge.
+        assert!(merged
+            .iter()
+            .any(|e| e.kind == "http" && e.via == "@acme/api-client" && e.source == "user"));
     }
 }

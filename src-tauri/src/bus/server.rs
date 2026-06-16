@@ -52,6 +52,10 @@ pub fn router(bus: BusRegistry, db: Db, asks: AskRegistry) -> Router {
             post(handle_planner).get(get_not_allowed),
         )
         .route(
+            "/curator/:thread/mcp",
+            post(handle_curator).get(get_not_allowed),
+        )
+        .route(
             "/global/mcp",
             post(crate::bus::global::handle_global).get(get_not_allowed),
         )
@@ -301,6 +305,169 @@ async fn handle_planner(
         _ => json!({}),
     };
     sse(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+/// MCP for the workspace curator chat: read the dependency graph and apply human
+/// calibrations to it. Mirrors `handle_planner`; identity (the curator thread)
+/// comes from the URL path.
+async fn handle_curator(
+    Path(thread): Path<i32>,
+    State(db): State<Db>,
+    Json(req): Json<Value>,
+) -> Response {
+    let id = match req.get("id") {
+        Some(v) => v.clone(),
+        None => return StatusCode::ACCEPTED.into_response(),
+    };
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let result: Value = match method {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": { "listChanged": false } },
+            "serverInfo": { "name": "weft_curator", "version": "1.0.0" }
+        }),
+        "tools/list" => json!({ "tools": curator_specs() }),
+        "tools/call" => {
+            let name = req
+                .pointer("/params/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args = req
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            call_curator(&db, thread, name, &args).await
+        }
+        _ => json!({}),
+    };
+    sse(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn curator_specs() -> Value {
+    json!([
+        {
+            "name": "get_repo_map",
+            "description": "Read the workspace repos and their current dependency edges (ids, roles, summaries, published interfaces). Use the ids when calling calibrate_edges.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "calibrate_edges",
+            "description": "Add or remove ONE cross-repo dependency edge after inspecting the code (READ-ONLY — never modify files). `from`/`to` are repo ids from get_repo_map and MUST differ. `kind` ∈ http|grpc|queue|infra|lib. `action` ∈ add|remove. `via` is a short evidence label (e.g. \"POST /orders\"). Human-set edges are pinned and survive automatic re-analysis; removals are remembered so the agent won't re-add them.",
+            "inputSchema": { "type": "object", "properties": {
+                "from": { "type": "integer" },
+                "to": { "type": "integer" },
+                "kind": { "type": "string" },
+                "via": { "type": "string" },
+                "action": { "type": "string", "enum": ["add", "remove"] }
+            }, "required": ["from", "to", "kind", "action"] }
+        }
+    ])
+}
+
+async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
+    match name {
+        "get_repo_map" => match curator_map_json(db, thread).await {
+            Ok(v) => text_result(v),
+            Err(e) => text_result(format!("error: {e}")),
+        },
+        "calibrate_edges" => calibrate_edges_tool(db, thread, args).await,
+        _ => text_result(format!("unknown tool {name}")),
+    }
+}
+
+/// Like `repo_map_json`, but every node carries its full `local_git_path` — the
+/// curator agent must read each repo to find evidence, and the system-prompt
+/// repo list is capped/truncated, so paths can't be sourced from there alone.
+async fn curator_map_json(db: &Db, thread: i32) -> anyhow::Result<String> {
+    let t = crate::store::repo::get_thread(db, thread)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
+    let g = crate::curator::graph(db, t.workspace_id).await?;
+    let path_of: std::collections::HashMap<i32, String> =
+        crate::store::repo::list_repos(db, t.workspace_id)
+            .await?
+            .into_iter()
+            .map(|r| (r.id, r.local_git_path))
+            .collect();
+    let nodes: Vec<Value> = g
+        .nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "repo_id": n.repo_id,
+                "repo_name": n.repo_name,
+                "role": n.role,
+                "summary": n.summary,
+                "published": n.published,
+                "deps": n.deps,
+                "path": path_of.get(&n.repo_id).cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(json!({ "nodes": nodes, "edges": g.edges }).to_string())
+}
+
+/// Apply one human calibration: validate ids, write a user-sourced relation (or
+/// removal tombstone), then emit `repo-graph-updated` so the repo map refreshes.
+async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
+    // i32::try_from (not a lossy `as i32`): a huge id like 4294967297 must NOT
+    // wrap to a valid repo id and slip past the workspace membership check.
+    let from = args.get("from").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+    let to = args.get("to").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+    let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let via = args.get("via").and_then(|v| v.as_str()).unwrap_or("");
+    let (Some(from), Some(to)) = (from, to) else {
+        return text_result("from and to must be valid repo ids from get_repo_map".into());
+    };
+    if from == to {
+        return text_result("from and to must be different repos".into());
+    }
+    // Validate kind against the allowed set: relations are keyed by (to, kind), so
+    // a misspelling like "HTTP" would silently fail to match the visible edge.
+    if !crate::profile::RELATION_KINDS.contains(&kind) {
+        return text_result("kind must be one of: http, grpc, queue, infra, lib".into());
+    }
+    // Action is REQUIRED and must be add|remove. The store treats anything but
+    // "remove" as an add, so a missing/misspelled action must be rejected here
+    // rather than silently pinning the opposite of what the caller intended.
+    let action = match args.get("action").and_then(|v| v.as_str()) {
+        Some(a @ ("add" | "remove")) => a,
+        _ => return text_result("action is required and must be \"add\" or \"remove\"".into()),
+    };
+    // Validate the ids belong to THIS curator's workspace, so a stale/hallucinated
+    // id can't pin or remove relations on an unrelated workspace's repo.
+    let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await else {
+        return text_result("curator thread not found".into());
+    };
+    // Only the hidden curator thread may calibrate — reject a direct call to this
+    // route with a normal feature thread id (it would bypass the chat boundary).
+    if t.kind != "curator" {
+        return text_result("calibrate_edges is only available in the curator chat".into());
+    }
+    let ws_ids: std::collections::HashSet<i32> = crate::store::repo::list_repos(db, t.workspace_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    if !ws_ids.contains(&from) || !ws_ids.contains(&to) {
+        return text_result(
+            "from/to must be repo ids in this workspace (use get_repo_map)".into(),
+        );
+    }
+    match crate::store::repo::calibrate_repo_relation(db, from, to, kind, via, action).await {
+        Ok(()) => {
+            // Live-refresh the repo map for this curator thread's workspace.
+            if let Some(app) = crate::APP_HANDLE.get() {
+                use tauri::Emitter;
+                let _ = app.emit("repo-graph-updated", t.workspace_id);
+            }
+            text_result(format!(
+                "{action} {kind} edge {from}->{to} (pinned to your calibration)"
+            ))
+        }
+        Err(e) => text_result(format!("error: {e}")),
+    }
 }
 
 async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {

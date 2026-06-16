@@ -90,13 +90,18 @@ export function FirstRunOnboarding() {
   }
 
   async function pickRepo() {
-    const picked = await api.pickFolder(t("dialog.addRepoTitle"));
-    if (!picked) return;
+    const picked = await api.pickFolders(t("dialog.addRepoTitle"));
+    if (picked.length === 0) return;
     setRepos((current) => {
-      const result = addPendingRepo(current, picked);
-      if (!result.added) setErr(t("onboarding.repoDuplicate"));
-      else setErr(null);
-      return result.repos;
+      let next = current;
+      let anyDuplicate = false;
+      for (const p of picked) {
+        const result = addPendingRepo(next, p);
+        if (!result.added) anyDuplicate = true;
+        next = result.repos;
+      }
+      setErr(anyDuplicate ? t("onboarding.repoDuplicate") : null);
+      return next;
     });
   }
 

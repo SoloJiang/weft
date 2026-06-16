@@ -31,6 +31,8 @@ impl MigratorTrait for Migrator {
             Box::new(M0018DirectionTargetBranch),
             Box::new(M0019ThreadLeadCommand),
             Box::new(M0020SessionCommand),
+            Box::new(M0021RepoRemoteUrl),
+            Box::new(M0022RepoProfileRelations),
         ]
     }
 }
@@ -765,6 +767,96 @@ impl MigrationTrait for M0020SessionCommand {
                 Table::alter()
                     .table(Alias::new("session"))
                     .drop_column(Alias::new("command"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the captured `origin` remote URL to repo_ref, for workspace-level git
+/// dedup. M0001 reflects the current entity, so a FRESH db already has it; this
+/// only matters for older dbs, and sqlite has no ADD COLUMN IF NOT EXISTS so the
+/// duplicate is tolerated.
+pub struct M0021RepoRemoteUrl;
+impl MigrationName for M0021RepoRemoteUrl {
+    fn name(&self) -> &str {
+        "m0021_repo_remote_url"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0021RepoRemoteUrl {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_ref"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("remote_url"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_ref"))
+                    .drop_column(Alias::new("remote_url"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the agent curator's inferred cross-repo relations (JSON) to repo_profile.
+/// M0002 reflects the current entity, so a FRESH db already has it; this only
+/// matters for older dbs, and sqlite has no ADD COLUMN IF NOT EXISTS so the
+/// duplicate is tolerated.
+pub struct M0022RepoProfileRelations;
+impl MigrationName for M0022RepoProfileRelations {
+    fn name(&self) -> &str {
+        "m0022_repo_profile_relations"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0022RepoProfileRelations {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("relations"))
+                            .string()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("relations"))
                     .to_owned(),
             )
             .await

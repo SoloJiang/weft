@@ -109,6 +109,25 @@ Style: short markdown bullets or numbered lists; mention issue_id when citing an
     format!("{}{}", body, lang_directive(lang))
 }
 
+/// System prompt for the workspace Curator chat (`t.kind == "curator"`). It maps
+/// how the workspace's repos depend on each other at runtime and through shared
+/// infrastructure, and applies the human's calibrations to the graph. Read-only
+/// on disk; it never modifies files or proposes issue directions.
+pub fn curator_prompt() -> &'static str {
+    "You are weft's dependency Curator for this workspace. You map how the repos \
+depend on each other at RUNTIME and through shared infrastructure — relationships \
+package manifests don't capture (HTTP/REST, gRPC, message queues, shared \
+databases/infra). You may READ code and config but must NEVER modify, create, or \
+delete files.\n\n\
+Workflow: call get_repo_map to see the repos (with ids) and the current edges. \
+When the human confirms or corrects a relationship, inspect the relevant repos to \
+find concrete evidence, then call calibrate_edges with action \"add\" or \"remove\" \
+for exactly that edge (from/to are repo ids that must differ). Explain the \
+evidence you found in plain language. Human-set edges are pinned and survive \
+automatic re-analysis; removals are remembered. Make one calibrate_edges call per \
+edge. Do not propose issue directions or write any files."
+}
+
 /// Get-or-create the lead's engine for a thread: scratch cwd, planner MCP +
 /// ask bridge injections, conversational lead prompt as the system prompt.
 /// Mirrors the retired PTY `plan_with_lead` wiring (spec §2).
@@ -135,6 +154,7 @@ pub async fn lead_engine(
     let cwd = ensure_lead_cwd(thread_id)?;
     let base = app.state::<crate::BusBase>().0.clone();
     let is_concierge = t.kind == "concierge";
+    let is_curator = t.kind == "curator";
     let ask = crate::bus::inject::inject_ask_hook(&base, thread_id, "lead", &t.lead_tool, &cwd);
     crate::skills::inject_for(db, t.workspace_id, &cwd).await;
     let mut extra = ask.args;
@@ -142,6 +162,15 @@ pub async fn lead_engine(
         // Concierge is the IM-scoped global helper, not a thread participant: it
         // gets weft_global, never the per-thread bus.
         extra.extend(crate::bus::inject::inject_global(&base, &t.lead_tool, &cwd).args);
+    } else if is_curator {
+        // The curator chat gets its own MCP (get_repo_map + calibrate_edges) and
+        // the thread bus under the LEAD identity (for streaming), but NOT the
+        // planner — it calibrates the dependency graph, it doesn't propose issue
+        // directions.
+        extra.extend(crate::bus::inject::inject_curator(&base, thread_id, &t.lead_tool, &cwd).args);
+        extra.extend(
+            crate::bus::inject::inject(&base, thread_id, crate::bus::LEAD, &t.lead_tool, &cwd).args,
+        );
     } else {
         // A per-issue lead gets the planner (read-only scope planning) AND the
         // thread bus under the LEAD identity, so workers can message it and it
@@ -154,6 +183,10 @@ pub async fn lead_engine(
     }
     let system_prompt = if is_concierge {
         concierge_prompt(lang)
+    } else if is_curator {
+        let repo_state =
+            crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
+        format!("{}{}\n\n{}", curator_prompt(), lang_directive(lang), repo_state)
     } else {
         let repo_state =
             crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
@@ -1212,7 +1245,7 @@ mod live_slot_tests {
     // returning (thread_id, direction_id, repo_id, session_id).
     async fn fixture(db: &Db) -> (i32, i32, i32, i32) {
         let ws = repo::create_workspace(db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-slot-fake", "main")
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-slot-fake", "main", "")
             .await
             .unwrap();
         let th = repo::create_thread(db, ws.id, "issue", "feature", "codex")
@@ -1293,7 +1326,7 @@ mod live_slot_tests {
     async fn busy_worker_without_worktree_is_skipped() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "").await.unwrap();
         let th = repo::create_thread(&db, ws.id, "issue", "feature", "codex").await.unwrap();
         let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only")
             .await
