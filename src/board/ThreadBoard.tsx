@@ -15,16 +15,17 @@ import {
   Pencil,
   ScanEye,
   TerminalSquare,
+  Trash2,
   X,
 } from "lucide-react";
 import { useStore } from "../state/store";
-import type { Direction, RepoChecks, SessionStatus } from "../lib/types";
+import type { Direction, RepoChecks, SessionStatus, Worktree } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { StatusDot } from "../components/ui/StatusChip";
 import { Tooltip } from "../components/ui/Tooltip";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ScopeReview } from "./ScopeReview";
-import { RenameDialog } from "../nav/dialogs";
+import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
 
@@ -189,8 +190,10 @@ function DirectionCard({
     checksByDirection,
     requestSkillReview,
     openNeeds,
+    deleteWorktree,
   } = useStore();
   const { t } = useTranslation();
+  const [wtToDelete, setWtToDelete] = useState<Worktree | null>(null);
   const writes = worktreesByDirection[direction.id] ?? [];
   const checks = checksByDirection[direction.id];
 
@@ -214,6 +217,7 @@ function DirectionCard({
   const canRunReview = direction.status === "review";
 
   return (
+    <>
     <motion.div
       layout
       className={cn(
@@ -271,7 +275,12 @@ function DirectionCard({
                 : t("thread.testsPending")
             }
           />
-          <ProvenanceMenu direction={direction} writes={writes} checks={checks} />
+          <ProvenanceMenu
+            direction={direction}
+            writes={writes}
+            checks={checks}
+            onDeleteWorktree={setWtToDelete}
+          />
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {canRunReview && (
@@ -303,6 +312,16 @@ function DirectionCard({
         </div>
       </div>
     </motion.div>
+    <DeleteWorktreeDialog
+      worktree={wtToDelete}
+      onOpenChange={(o) => {
+        if (!o) setWtToDelete(null);
+      }}
+      onConfirm={async () => {
+        if (wtToDelete) await deleteWorktree(wtToDelete.id, direction.id);
+      }}
+    />
+    </>
   );
 }
 
@@ -316,10 +335,12 @@ function ProvenanceMenu({
   direction,
   writes,
   checks,
+  onDeleteWorktree,
 }: {
   direction: Direction;
-  writes: { id: number; repo_id: number; branch: string; path: string }[];
+  writes: Worktree[];
   checks?: RepoChecks[];
+  onDeleteWorktree: (w: Worktree) => void;
 }) {
   const { t } = useTranslation();
   const { repos, sessions, viewDirection } = useStore();
@@ -405,6 +426,20 @@ function ProvenanceMenu({
                       <Copy size={11} className="shrink-0 text-ink-faint" />
                     )}
                   </DM.Item>
+                  {/* Reclaim a finished task's worktree. Done-only (its work is
+                      settled) and only while the directory is still on disk. */}
+                  {direction.status === "done" && w.exists && (
+                    <DM.Item
+                      title={t("thread.deleteWorktree")}
+                      onSelect={() => onDeleteWorktree(w)}
+                      className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] py-1 pl-7 pr-2 text-[11px] text-danger outline-none data-[highlighted]:bg-[oklch(0.64_0.2_25/0.12)] data-[highlighted]:text-danger"
+                    >
+                      <Trash2 size={11} className="shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">
+                        {t("thread.deleteWorktree")}
+                      </span>
+                    </DM.Item>
+                  )}
                 </div>
               );
             })

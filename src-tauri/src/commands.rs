@@ -472,12 +472,38 @@ pub async fn read_transcript(cwd: String, tool: String) -> R<Vec<crate::sidecar:
     Ok(crate::sidecar::read_transcript(std::path::Path::new(&cwd), &tool).await)
 }
 
+/// A worktree row plus whether its directory is still present on disk. The board
+/// uses `exists` to offer "delete worktree" only when there's actually a directory
+/// to reclaim — a row can outlive its directory if it was removed out-of-band.
+#[derive(serde::Serialize)]
+pub struct WorktreeView {
+    #[serde(flatten)]
+    inner: entities::worktree::Model,
+    exists: bool,
+}
+
 #[tauri::command]
 pub async fn list_worktrees(
     db: State<'_, Db>,
     direction_id: Option<i32>,
-) -> R<Vec<entities::worktree::Model>> {
-    repo::list_worktrees(&db, direction_id).await.map_err(e)
+) -> R<Vec<WorktreeView>> {
+    let rows = repo::list_worktrees(&db, direction_id).await.map_err(e)?;
+    Ok(rows
+        .into_iter()
+        .map(|w| {
+            let exists = std::path::Path::new(&w.path).exists();
+            WorktreeView { inner: w, exists }
+        })
+        .collect())
+}
+
+/// Delete a single finished task's worktree (directory + DB row), keeping the
+/// branch and the task. See `materialize::remove_direction_worktree`.
+#[tauri::command]
+pub async fn delete_worktree(db: State<'_, Db>, worktree_id: i32) -> R<()> {
+    materialize::remove_direction_worktree(&db, worktree_id)
+        .await
+        .map_err(e)
 }
 
 #[tauri::command]

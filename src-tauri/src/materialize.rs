@@ -134,6 +134,35 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
     Ok(())
 }
 
+/// Delete one direction's worktree on its own: remove the working-copy directory
+/// and drop its DB row, but KEEP the branch and the direction record. Used by the
+/// Done-card "delete worktree" action — the user is reclaiming disk for a finished
+/// task, not tearing the direction down, so (unlike `cleanup_worktrees`) nothing
+/// else is touched. Idempotent: a missing row is a no-op.
+pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> {
+    use sea_orm::EntityTrait;
+    let Some(wt) = entities::worktree::Entity::find_by_id(worktree_id)
+        .one(&db.0)
+        .await?
+    else {
+        return Ok(());
+    };
+    if let Some(r) = entities::repo_ref::Entity::find_by_id(wt.repo_id)
+        .one(&db.0)
+        .await?
+    {
+        let repo_path = std::path::Path::new(&r.local_git_path);
+        // remove_worktree drops the working tree and prunes; it leaves the branch.
+        if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(&wt.path)) {
+            eprintln!("[weft] worktree remove failed for {}: {e}", wt.path);
+        }
+    }
+    entities::worktree::Entity::delete_by_id(worktree_id)
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -219,6 +219,8 @@ interface Store {
     reason: string,
   ) => Promise<void>;
   deleteThread: (threadId: number) => Promise<void>;
+  /** Delete a finished task's worktree (directory + record); keeps the branch. */
+  deleteWorktree: (worktreeId: number, directionId: number) => Promise<void>;
 
   viewing: { directionId: number; repoId: number; diff?: boolean } | null;
   viewDirection: (directionId: number, repoId: number, opts?: { diff?: boolean }) => void;
@@ -767,6 +769,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setActiveThreadId((cur) => (cur === threadId ? null : cur));
     },
     [activeWorkspaceId],
+  );
+
+  // Remove one finished task's worktree from disk; the branch and card stay. The
+  // backend drops the row, so mirror that locally by dropping it from the map.
+  const deleteWorktree = useCallback(
+    async (worktreeId: number, directionId: number) => {
+      await api.deleteWorktree(worktreeId);
+      setWorktrees((m) => {
+        const cur = m[directionId];
+        if (!cur) return m;
+        return { ...m, [directionId]: cur.filter((w) => w.id !== worktreeId) };
+      });
+    },
+    [],
   );
 
   // ALL workers run on the chat engine — one product-native conversation UI
@@ -1860,6 +1876,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     createThread,
     createDirection,
     deleteThread,
+    deleteWorktree,
     viewing,
     viewDirection,
     driveDirection,
