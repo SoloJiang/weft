@@ -591,7 +591,15 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
             let tier = profile::normalize_tier(&p.role)
                 .or_else(|| agent_tier.clone())
                 .unwrap_or_else(|| p.role.clone());
-            (tier, p.summary.clone(), "user")
+            // Keep the user's summary only if they actually wrote one; a blank
+            // placeholder summary (e.g. a tier-only calibration before analysis)
+            // is filled by the agent rather than pinned empty forever.
+            let summary = if p.summary.trim().is_empty() {
+                wire.summary
+            } else {
+                p.summary.clone()
+            };
+            (tier, summary, "user")
         }
         // Agent-owned: a missing or non-canonical top-level tier leaves the prior
         // profile (or placeholder) intact, rather than persisting an analyzed but
@@ -881,6 +889,30 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend", "empty user tier adopts the agent's classification");
         assert_eq!(p.summary, "mine", "user-pinned summary preserved");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_fills_blank_user_summary() {
+        // A tier-only calibration pins source="user" with a blank summary; the
+        // agent's real summary should fill it rather than stay blank forever.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "user", "")
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "agent summary".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "backend", "user-pinned tier kept");
+        assert_eq!(p.summary, "agent summary", "blank user summary filled by the agent");
     }
 
     #[tokio::test]
