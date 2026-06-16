@@ -59,8 +59,8 @@ export const en = {
     layer_personal: "personal",
     layer_repo: "repo",
     layer_team: "team",
-    "layer_weft-global": "weft · global",
-    "layer_weft-workspace": "weft · workspace",
+    "layer_weft-global": "Weft · global",
+    "layer_weft-workspace": "Weft · workspace",
     loading: "Reading config…",
     empty: "No skills or rules found.",
     noRepos: "Add repos to this workspace first.",
@@ -78,7 +78,7 @@ export const en = {
     emptyTitleHas: "No issues yet",
     emptyTitleNoWs: "No workspace",
     emptyBodyHas:
-      "An issue is one work line you split across repos. Start one and weft plans the scope, dispatches agents, and surfaces what needs you.",
+      "An issue is one work line you split across repos. Start one and Weft plans the scope, dispatches agents, and surfaces what needs you.",
     emptyBodyNoWs: "Create a workspace to begin.",
   },
   onboarding: {

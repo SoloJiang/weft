@@ -59,8 +59,8 @@ export const zh = {
     layer_personal: "个人",
     layer_repo: "仓库",
     layer_team: "团队",
-    "layer_weft-global": "weft · 全局",
-    "layer_weft-workspace": "weft · 本工作区",
+    "layer_weft-global": "Weft · 全局",
+    "layer_weft-workspace": "Weft · 本工作区",
     loading: "读取配置…",
     empty: "未发现 skill 或 rule。",
     noRepos: "请先往这个工作区添加仓库。",
@@ -77,7 +77,7 @@ export const zh = {
     emptyTitleHas: "还没有 issue",
     emptyTitleNoWs: "无工作区",
     emptyBodyHas:
-      "一个 issue 就是一条工作主线，可以拆到多个仓库同时推进。新建后，weft 会规划改动范围、派发 agent 去干活，需要你拍板的事会主动送到你面前。",
+      "一个 issue 就是一条工作主线，可以拆到多个仓库同时推进。新建后，Weft 会规划改动范围、派发 agent 去干活，需要你拍板的事会主动送到你面前。",
     emptyBodyNoWs: "先创建一个工作区。",
   },
   onboarding: {

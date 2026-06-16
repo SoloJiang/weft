@@ -75,7 +75,7 @@ export function WorkspaceNav() {
             className="flex min-w-0 select-none items-center gap-1.5 rounded-[var(--radius-sm)] px-1 py-0.5 transition-colors hover:bg-brand-ghost"
           >
             <img src="/weft-mark.svg" alt="" className="h-[18px] w-[18px]" draggable={false} />
-            <span className="truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">weft</span>
+            <span className="truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">Weft</span>
           </button>
           <button
             type="button"

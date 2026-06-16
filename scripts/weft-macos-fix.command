@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# weft — 修复 macOS “已损坏，无法打开” / Fix the macOS “is damaged” error
+# Weft — 修复 macOS “已损坏，无法打开” / Fix the macOS “is damaged” error
 #
-# 为什么会这样：weft 的 mac 版还没做 Apple 公证(notarization)，从网上
+# 为什么会这样：Weft 的 mac 版还没做 Apple 公证(notarization)，从网上
 # 下载后会被 macOS 打上隔离标记(quarantine)，于是报“已损坏”。本脚本只是
 # 去掉这个隔离标记，不会改动 app 本身。
 #
@@ -11,15 +11,15 @@
 # that flag — it does not modify the app.
 #
 # 用法 / Usage:
-#   1. 先把 weft 拖进“应用程序”(Applications)。
-#      Drag weft into Applications first.
+#   1. 先把 Weft 拖进“应用程序”(Applications)。
+#      Drag Weft into Applications first.
 #   2. 双击本文件。若提示“无法打开”，右键 → 打开 → 打开。
 #      Double-click this file. If blocked, right-click → Open → Open.
 
-APP_NAME="weft.app"
+APP_NAME="Weft.app"
 
 echo "──────────────────────────────────────────────"
-echo "  weft — 解除 macOS 隔离 / un-quarantine"
+echo "  Weft — 解除 macOS 隔离 / un-quarantine"
 echo "──────────────────────────────────────────────"
 echo
 
@@ -66,8 +66,8 @@ fi
 
 echo
 if [ "$STATUS" -eq 0 ]; then
-  echo "✓ 完成！现在可以正常双击打开 weft 了。"
-  echo "✓ Done — you can open weft normally now."
+  echo "✓ 完成！现在可以正常双击打开 Weft 了。"
+  echo "✓ Done — you can open Weft normally now."
 else
   echo "✗ 失败。可在终端手动运行： xattr -cr \"$TARGET\""
   echo "✗ Failed. Run manually in Terminal: xattr -cr \"$TARGET\""
