@@ -23,6 +23,10 @@ use crate::session_meta::{find_model_context, parse_opencode_mcp};
 struct Serve {
     base: Option<String>,
     child: Option<tokio::process::Child>,
+    /// The command this serve was spawned from. A serve started from a different
+    /// command (a pinned session's binary vs. the global alias) must be restarted
+    /// so discovery reflects the binary actually driving the session.
+    command: String,
 }
 
 fn serve() -> Arc<Mutex<Serve>> {
@@ -31,11 +35,25 @@ fn serve() -> Arc<Mutex<Serve>> {
         .clone()
 }
 
+/// Shut down the cached `opencode serve` helper so the next discovery respawns
+/// it. Called when the user's opencode command override (alias) changes — the
+/// running helper was launched from the old binary and would otherwise keep
+/// serving its command palette / metadata until it died.
+pub async fn shutdown() {
+    let s = serve();
+    let mut g = s.lock().await;
+    if let Some(mut c) = g.child.take() {
+        let _ = c.kill().await;
+    }
+    g.base = None;
+    g.command.clear();
+}
+
 /// Discover slash commands for `cwd`, or an empty list on any failure (opencode
 /// not installed, serve won't start, endpoint error). Discovery is best-effort
 /// and must never block the composer.
-pub async fn discover_commands(cwd: &str) -> Vec<SlashCmd> {
-    match discover_inner(cwd).await {
+pub async fn discover_commands(cwd: &str, command: &str) -> Vec<SlashCmd> {
+    match discover_inner(cwd, command).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[weft][opencode] discover commands: {e}");
@@ -44,8 +62,8 @@ pub async fn discover_commands(cwd: &str) -> Vec<SlashCmd> {
     }
 }
 
-async fn discover_inner(cwd: &str) -> anyhow::Result<Vec<SlashCmd>> {
-    let base = ensure_base().await?;
+async fn discover_inner(cwd: &str, command: &str) -> anyhow::Result<Vec<SlashCmd>> {
+    let base = ensure_base(command).await?;
     let arr: Vec<serde_json::Value> = reqwest::Client::new()
         .get(format!("{base}/command"))
         .query(&[("directory", cwd)])
@@ -81,8 +99,9 @@ pub async fn server_window_and_mcp(
     cwd: &str,
     provider_id: Option<&str>,
     model_id: Option<&str>,
+    command: &str,
 ) -> (Option<u64>, Option<Vec<McpServer>>) {
-    let Ok(base) = ensure_base().await else {
+    let Ok(base) = ensure_base(command).await else {
         return (None, None);
     };
     let client = reqwest::Client::new();
@@ -135,20 +154,25 @@ async fn fetch_model_window(
 }
 
 /// Return the base URL of a live serve, (re)spawning if the prior one died.
-async fn ensure_base() -> anyhow::Result<String> {
+async fn ensure_base(command: &str) -> anyhow::Result<String> {
     let s = serve();
     let mut g = s.lock().await;
 
-    // Reuse the running server if its child is still alive.
-    if let (Some(base), Some(child)) = (g.base.clone(), g.child.as_mut()) {
-        if matches!(child.try_wait(), Ok(None)) {
-            return Ok(base);
+    // Reuse the running server only if it was spawned from the SAME command and
+    // its child is still alive; a pin/alias change re-serves from the new binary.
+    if g.command == command {
+        if let (Some(base), Some(child)) = (g.base.clone(), g.child.as_mut()) {
+            if matches!(child.try_wait(), Ok(None)) {
+                return Ok(base);
+            }
         }
     }
+    if let Some(mut c) = g.child.take() {
+        let _ = c.kill().await;
+    }
     g.base = None;
-    g.child = None;
 
-    let mut child = Command::new("opencode")
+    let mut child = Command::new(command)
         .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
         // Force an unsecured server on our private localhost port: we never set a
         // password, so the user's global OPENCODE_SERVER_PASSWORD (if any) does
@@ -169,6 +193,7 @@ async fn ensure_base() -> anyhow::Result<String> {
 
     g.base = Some(base.clone());
     g.child = Some(child);
+    g.command = command.to_string();
     Ok(base)
 }
 

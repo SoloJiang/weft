@@ -512,6 +512,13 @@ export const zh = {
     defaultToolHint: "issue 的 lead 与新子任务的默认工具；批准时可在卡片上逐条覆盖。",
     noTools: "未检测到编程 CLI，请先安装 codex / claude / opencode。",
     toolFallback: "{{configured}} 未安装，当前生效 {{tool}}。",
+    agentCommands: "Agent 命令",
+    agentCommandsHint:
+      "若某个 CLI 以别名安装（例如 claude 被 alias 成 cc-claude），可在此设置 Weft 实际运行的命令。留空则使用默认名称，按 PATH 解析。",
+    applyToExisting: "应用到已有会话",
+    applyToExistingHint:
+      "开启：已有 issue 与子任务也切换到新命令。关闭：仅之后新建的会话生效，已有会话保留各自当前命令。",
+    save: "保存",
     conservatism: "自动化尺度",
     conservatismHint: "控制 lead 自动拆解、派发和重试时的保守程度。",
     conservatismLow: "积极",

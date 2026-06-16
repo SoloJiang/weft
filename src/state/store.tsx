@@ -118,6 +118,7 @@ interface Store {
   /** detect_tools result, loaded once at startup (for tool pickers). */
   installedTools: ToolStatus[];
   refreshInstalledTools: () => Promise<void>;
+  refreshDefaultTool: () => Promise<void>;
   /** Dangerous mode: agents skip all permission prompts (global). */
   dangerousMode: boolean;
   setDangerousMode: (on: boolean) => void;
@@ -332,6 +333,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshInstalledTools = useCallback(async () => {
     try {
       setInstalledTools(await api.detectTools());
+    } catch {
+      // Pure-vite dev without the Tauri backend.
+    }
+  }, []);
+  // Re-resolve the effective default tool — saving an alias can change it (a
+  // configured tool that was falling back becomes available, or vice versa), so
+  // the picker and Needs-you approvals must not keep a stale value.
+  const refreshDefaultTool = useCallback(async () => {
+    try {
+      const info = await api.getDefaultTool();
+      setDefaultToolState(info.tool);
+      setConfiguredTool(info.configured);
     } catch {
       // Pure-vite dev without the Tauri backend.
     }
@@ -1749,6 +1762,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     configuredTool,
     installedTools,
     refreshInstalledTools,
+    refreshDefaultTool,
     dangerousMode,
     setDangerousMode,
     dangerNudge,

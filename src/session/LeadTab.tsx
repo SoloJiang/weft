@@ -211,7 +211,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
             if (!st.native_id) return false;
             await api.leadStop(activeThreadId);
             await navigator.clipboard.writeText(
-              resumeCommand(leadTool, st.cwd, st.native_id),
+              resumeCommand(leadTool, st.cwd, st.native_id, st.command),
             );
             return true;
           }}

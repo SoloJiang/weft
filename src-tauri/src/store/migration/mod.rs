@@ -29,6 +29,8 @@ impl MigratorTrait for Migrator {
             Box::new(M0016BackupConfig),
             Box::new(M0017SessionStatusReset),
             Box::new(M0018DirectionTargetBranch),
+            Box::new(M0019ThreadLeadCommand),
+            Box::new(M0020SessionCommand),
         ]
     }
 }
@@ -685,6 +687,84 @@ impl MigrationTrait for M0018DirectionTargetBranch {
                 Table::alter()
                     .table(Alias::new("direction"))
                     .drop_column(Alias::new("target_branch"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the nullable thread.lead_command pin (per-lead command override for the
+/// coding-agent alias feature). NULL = follow the global tool→command map. M0001
+/// reflects the current entity, so a FRESH db already has the column; sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0019ThreadLeadCommand;
+impl MigrationName for M0019ThreadLeadCommand {
+    fn name(&self) -> &str {
+        "m0019_thread_lead_command"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0019ThreadLeadCommand {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(ColumnDef::new(Alias::new("lead_command")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .drop_column(Alias::new("lead_command"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the nullable session.command pin (per-worker command override). Same
+/// semantics and duplicate tolerance as M0019.
+pub struct M0020SessionCommand;
+impl MigrationName for M0020SessionCommand {
+    fn name(&self) -> &str {
+        "m0020_session_command"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0020SessionCommand {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .add_column(ColumnDef::new(Alias::new("command")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .drop_column(Alias::new("command"))
                     .to_owned(),
             )
             .await

@@ -589,6 +589,89 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
         .map_err(e)
 }
 
+/// The user-configured coding-agent command overrides ("aliases"): identity →
+/// command (e.g. `claude` → `cc-claude`). Empty map when none are set.
+#[tauri::command]
+pub async fn get_tool_commands(
+    db: State<'_, Db>,
+) -> R<std::collections::HashMap<String, String>> {
+    repo::get_tool_commands(&db).await.map_err(e)
+}
+
+/// Set or clear (blank/identity command) the alias for one tool. `applyToExisting`
+/// = false pins existing sessions of that tool to their prior command so only new
+/// sessions adopt the alias; = true lets existing sessions pick it up on next run.
+/// Refreshes the process-global override map so spawns see the change immediately.
+#[tauri::command]
+pub async fn set_tool_command(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    tool: String,
+    command: String,
+    apply_to_existing: bool,
+) -> R<()> {
+    if !crate::detect::TOOL_PRIORITY.contains(&tool.as_str()) {
+        return Err(format!(
+            "unknown tool {tool:?}; expected one of {:?}",
+            crate::detect::TOOL_PRIORITY
+        ));
+    }
+    let (map, prev) = repo::set_tool_command(&db, &tool, &command, apply_to_existing)
+        .await
+        .map_err(e)?;
+    let new_cmd = map.get(&tool).cloned().unwrap_or_else(|| tool.clone());
+    crate::tool_command::set_overrides(map);
+    let changed = new_cmd != prev;
+
+    // Sync live engines so the reconcile applies WITHOUT closing/reopening the
+    // session (their `command` was captured when the engine was built). Mirror the
+    // DB: apply-to-existing clears pins (follow new global) and, when the command
+    // actually changed, flags a silent resident bounce so the open session's next
+    // send respawns from the new binary (a Claude child / codex client spawned
+    // from the old command would otherwise outlive the change). Opt-out freezes
+    // currently un-pinned engines to their prior command — which is what their
+    // resident process is already running, so no bounce is needed.
+    use tauri::Manager;
+    let engines: Vec<crate::lead_chat::engine::EngineRef> = app
+        .state::<crate::lead_chat::engine::LeadChatState>()
+        .0
+        .iter()
+        .map(|r| r.value().clone())
+        .collect();
+    for eng in engines {
+        let mut inner = eng.lock().await;
+        if inner.tool != tool {
+            continue;
+        }
+        if apply_to_existing {
+            // Bounce when THIS engine's effective command changes — covers a
+            // global change (pin already None) AND clearing a stale pin while the
+            // global stayed the same (pin Some(old) → global), which the coarse
+            // `changed` flag misses.
+            let old_eff = crate::tool_command::effective(inner.command.as_deref(), &tool);
+            inner.command = None;
+            if old_eff != new_cmd {
+                inner.pending_command_refresh = true;
+            }
+        } else if inner.command.is_none() {
+            inner.command = Some(prev.clone());
+        }
+    }
+
+    // Recycle the GLOBAL discovery helpers spawned from the old binary so the
+    // command palette / session metadata reconnect with the new command. These
+    // are app-scoped (not per-session), so recycle whenever the effective command
+    // changed, regardless of apply-to-existing.
+    if changed {
+        match tool.as_str() {
+            "opencode" => crate::opencode::shutdown().await,
+            "codex" => crate::codex_app_server::shutdown_global().await,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// One pending write declaration waiting on the human, with thread context.
 #[derive(serde::Serialize)]
 pub struct WriteTrigger {
@@ -788,6 +871,9 @@ pub struct ObserveRef {
     pub worktree: String,
     pub branch: String,
     pub tool: String,
+    /// Effective binary for the resume command (configured alias / per-session
+    /// pin, else the tool identity).
+    pub command: String,
     pub session_id: Option<i32>,
     pub native_id: Option<String>,
     pub status: Option<String>,
@@ -843,10 +929,15 @@ pub async fn session_for(
         }
         None => (None, None, None, vec![], vec![]),
     };
+    let command = crate::tool_command::effective(
+        latest.as_ref().and_then(|s| s.command.as_deref()),
+        &dir.tool,
+    );
     Ok(Some(ObserveRef {
         worktree: wt.path,
         branch: wt.branch,
         tool: dir.tool,
+        command,
         session_id: latest.as_ref().map(|s| s.id),
         native_id: latest.as_ref().and_then(|s| s.native_session_id.clone()),
         status: latest.as_ref().map(|s| s.status.clone()),
@@ -873,11 +964,16 @@ pub async fn session_meta(
     let (Some(wt), Some(dir)) = (wt, dir) else {
         return Ok(Default::default());
     };
-    let native = repo::latest_session_for(&db, direction_id, repo_id)
+    let latest = repo::latest_session_for(&db, direction_id, repo_id)
         .await
-        .map_err(e)?
-        .and_then(|s| s.native_session_id.clone());
-    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref()).await)
+        .map_err(e)?;
+    let native = latest.as_ref().and_then(|s| s.native_session_id.clone());
+    // Probe the binary this session actually runs (per-session pin, else alias).
+    let command = crate::tool_command::effective(
+        latest.as_ref().and_then(|s| s.command.as_deref()),
+        &dir.tool,
+    );
+    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await)
 }
 
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,

@@ -39,6 +39,7 @@ pub mod skills;
 mod trail;
 pub mod slug;
 pub mod store;
+mod tool_command;
 mod tools;
 
 /// The bus server's base URL, e.g. "http://127.0.0.1:54321".
@@ -80,6 +81,16 @@ pub fn run() {
     // Open the DB synchronously before building the app.
     let db = tauri::async_runtime::block_on(async { store::Db::open_default().await })
         .unwrap_or_else(|e| fatal("open weft.db", e));
+
+    // Load user-configured coding-agent command overrides ("aliases", e.g.
+    // `claude` → `cc-claude`) into the process-global map so every later spawn —
+    // for new and existing sessions alike — resolves the real binary.
+    {
+        let map = tauri::async_runtime::block_on(async {
+            store::repo::get_tool_commands(&db).await.unwrap_or_default()
+        });
+        tool_command::set_overrides(map);
+    }
 
     // App-level backup handle: scheduler + on-exit + commands all share it.
     let backup_svc = backup::BackupService::new(
@@ -239,6 +250,8 @@ pub fn run() {
             tools::detect_tools,
             commands::get_default_tool,
             commands::set_default_tool,
+            commands::get_tool_commands,
+            commands::set_tool_command,
             commands::list_skill_sources,
             commands::add_skill_source,
             commands::remove_skill_source,

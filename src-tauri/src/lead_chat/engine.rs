@@ -810,6 +810,10 @@ pub struct EngineInner {
     pub thread_id: i32,
     /// claude | codex | opencode — selects the wire dialect + process model.
     pub tool: String,
+    /// Per-session command pin (from thread.lead_command / session.command).
+    /// None = resolve the spawn binary from the global tool→command override map;
+    /// Some = this session was frozen to a specific command (alias opt-out).
+    pub command: Option<String>,
     /// Chat-mode worker session; None for the lead.
     pub session_id: Option<i32>,
     pub cwd: std::path::PathBuf,
@@ -838,6 +842,11 @@ pub struct EngineInner {
     /// Set on idle when skills changed; the next send silently restarts the
     /// resident process so it picks up newly-injected skills. UI never sees it.
     pub pending_skill_refresh: bool,
+    /// Set when the tool's command override (alias) changed under this live
+    /// engine; the next send silently bounces the resident process / codex client
+    /// so it respawns from the new command. Like `pending_skill_refresh`, invisible
+    /// to the UI.
+    pub pending_command_refresh: bool,
     /// 会话信息面板的最近快照,供 lead_state / session_for 重挂回填(claude:init
     /// 解析出 mcp/model/window,turn 结束更新 context_tokens)。
     pub last_context_tokens: Option<u64>,
@@ -969,7 +978,10 @@ async fn ensure_running_locked(
         }
     }
     crate::claude::ensure_trusted(&inner.cwd);
-    let mut child = Command::new("claude")
+    // Resolve the actual binary: a per-session pin, else the global override for
+    // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
+    let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
+    let mut child = Command::new(&program)
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .stdin(std::process::Stdio::piped())
@@ -1103,10 +1115,27 @@ pub async fn send(
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
-    let pending = { eng.lock().await.pending_skill_refresh };
-    if pending {
+    // Skill refresh is only ever flagged while idle, so it bounces now. A command
+    // refresh (alias change) can be flagged mid-turn; defer its bounce until the
+    // engine is idle so a follow-up sent during a running turn just queues (never
+    // kills the in-flight turn / clears its rows) — the bounce fires on the next
+    // idle send instead.
+    let (skill_pending, cmd_now) = {
+        let g = eng.lock().await;
+        (
+            g.pending_skill_refresh,
+            g.pending_command_refresh && !g.turn.busy,
+        )
+    };
+    if skill_pending || cmd_now {
         let (tid, _sid, _current, orphans) = stop_quiet(eng).await;
-        eng.lock().await.pending_skill_refresh = false;
+        {
+            let mut g = eng.lock().await;
+            g.pending_skill_refresh = false;
+            if cmd_now {
+                g.pending_command_refresh = false;
+            }
+        }
         // The bounce fires from idle, so orphans is normally empty; finalize
         // defensively so a still-open tool row can't outlive the bounce.
         finalize_orphan_tool_rows(app, db, tid, orphans, "interrupted").await;
@@ -1243,7 +1272,7 @@ async fn spawn_codex_turn(
     eng: EngineRef,
     out: Outgoing,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
         let i = eng.lock().await;
         (
             i.native_id.clone(),
@@ -1253,6 +1282,10 @@ async fn spawn_codex_turn(
             i.system_prompt.clone(),
             i.extra_args.clone(),
             i.codex_client.clone(),
+            // Effective codex binary for THIS session: a per-session pin wins over
+            // the global override, so a pinned (opt-out) codex session keeps its
+            // command even on the default app-server transport.
+            crate::tool_command::effective(i.command.as_deref(), &i.tool),
         )
     };
     // Per-session app-server: reuse the engine's connection or spawn one with this
@@ -1264,7 +1297,9 @@ async fn spawn_codex_turn(
             // Pre-accept folder trust (like the exec adapter's prepare) so the
             // app-server's first thread/start doesn't block on codex's trust prompt.
             crate::codex::ensure_codex_trusted(&cwd);
-            let c = crate::codex_app_server::Client::connect_session(&extra_args, &cwd).await?;
+            let c =
+                crate::codex_app_server::Client::connect_session(&program, &extra_args, &cwd)
+                    .await?;
             eng.lock().await.codex_client = Some(c.clone());
             c
         }
@@ -1790,7 +1825,7 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
     let adapter = crate::adapters::adapter_for(&inner.tool)
         .ok_or_else(|| anyhow::anyhow!("unknown per-turn lead tool {}", inner.tool))?;
     adapter.prepare(&inner.cwd);
-    let (program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
+    let (_program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
         cwd: &inner.cwd,
         system_prompt: &inner.system_prompt,
         extra_args: &inner.extra_args,
@@ -1798,6 +1833,9 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
         message: &out.text,
         slash_commands: &inner.slash_commands,
     })?;
+    // The adapter's program is the tool identity; resolve it through the
+    // per-session pin / global override map so an aliased binary is spawned.
+    let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
     let mut child = Command::new(&program)
         .args(&args)
         .current_dir(&inner.cwd)
@@ -3051,6 +3089,7 @@ mod tests {
         EngineInner {
             thread_id: 1,
             tool: tool.into(),
+            command: None,
             session_id: None,
             cwd: "/tmp".into(),
             extra_args: vec![],
@@ -3067,6 +3106,7 @@ mod tests {
             interrupting: false,
             generation: 0,
             pending_skill_refresh: false,
+            pending_command_refresh: false,
             last_context_tokens: None,
             last_model: None,
             last_window: None,
@@ -3193,6 +3233,7 @@ mod tests {
         let mut inner = EngineInner {
             thread_id: 1,
             tool: "claude".into(),
+            command: None,
             session_id: None,
             cwd: "/tmp".into(),
             extra_args: vec!["--mcp-config".into(), "x".into()],
@@ -3209,6 +3250,7 @@ mod tests {
             interrupting: false,
             generation: 0,
             pending_skill_refresh: false,
+            pending_command_refresh: false,
             last_context_tokens: None,
             last_model: None,
             last_window: None,

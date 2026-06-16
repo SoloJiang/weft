@@ -8,8 +8,10 @@ use super::Db;
 use crate::slug::unique_slug;
 use anyhow::Result;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TryIntoModel,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    TryIntoModel,
 };
+use std::collections::HashMap;
 
 fn now() -> String {
     // RFC3339 without pulling chrono: seconds since epoch is enough for ordering.
@@ -203,6 +205,81 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
         .exec(&db.0)
         .await?;
     Ok(())
+}
+
+/// The user-configured coding-agent command overrides (identity → command),
+/// parsed from the `tool_commands` app_setting. Empty when none are set.
+pub async fn get_tool_commands(db: &Db) -> Result<HashMap<String, String>> {
+    let raw = get_setting(db, crate::tool_command::K_TOOL_COMMANDS).await?;
+    Ok(raw
+        .as_deref()
+        .map(crate::tool_command::parse_overrides)
+        .unwrap_or_default())
+}
+
+/// Set (or clear, when `command` is blank / equals the identity) the override for
+/// one tool, and reconcile existing sessions of that tool:
+///
+/// - `apply_to_existing = true`: CLEAR any per-session pins for this tool so all
+///   existing sessions follow the (new) global command — also the only path to
+///   un-pin rows frozen by an earlier opt-out, including when clearing an alias.
+/// - `apply_to_existing = false`: PIN un-pinned existing sessions to their prior
+///   effective command, so only sessions created from here on adopt the alias.
+///
+/// Returns `(override map, prior effective command)`. The prior command is what
+/// callers freeze live in-memory engines to when pinning (the DB pin only takes
+/// effect when an engine is rebuilt).
+pub async fn set_tool_command(
+    db: &Db,
+    tool: &str,
+    command: &str,
+    apply_to_existing: bool,
+) -> Result<(HashMap<String, String>, String)> {
+    let mut map = get_tool_commands(db).await?;
+    let command = command.trim();
+    // The command existing sessions resolve to TODAY (before this change).
+    let prev = map.get(tool).cloned().unwrap_or_else(|| tool.to_string());
+
+    if apply_to_existing {
+        thread::Entity::update_many()
+            .col_expr(thread::Column::LeadCommand, Expr::value(Option::<String>::None))
+            .filter(thread::Column::LeadTool.eq(tool))
+            .filter(thread::Column::LeadCommand.is_not_null())
+            .exec(&db.0)
+            .await?;
+        session::Entity::update_many()
+            .col_expr(session::Column::Command, Expr::value(Option::<String>::None))
+            .filter(session::Column::Tool.eq(tool))
+            .filter(session::Column::Command.is_not_null())
+            .exec(&db.0)
+            .await?;
+    } else {
+        thread::Entity::update_many()
+            .col_expr(thread::Column::LeadCommand, Expr::value(prev.clone()))
+            .filter(thread::Column::LeadTool.eq(tool))
+            .filter(thread::Column::LeadCommand.is_null())
+            .exec(&db.0)
+            .await?;
+        session::Entity::update_many()
+            .col_expr(session::Column::Command, Expr::value(prev.clone()))
+            .filter(session::Column::Tool.eq(tool))
+            .filter(session::Column::Command.is_null())
+            .exec(&db.0)
+            .await?;
+    }
+
+    if command.is_empty() || command == tool {
+        map.remove(tool);
+    } else {
+        map.insert(tool.to_string(), command.to_string());
+    }
+    set_setting(
+        db,
+        crate::tool_command::K_TOOL_COMMANDS,
+        &crate::tool_command::to_json(&map),
+    )
+    .await?;
+    Ok((map, prev))
 }
 
 /// Workspace container used by per-IM-conversation Concierge threads.
@@ -678,15 +755,16 @@ pub async fn set_session_status(db: &Db, session_id: i32, status: &str) -> Resul
 /// Generic over the connection so the migration (`SchemaManagerConnection`) and
 /// tests (`DatabaseConnection`) share one implementation.
 pub async fn reset_stale_running_sessions<C: sea_orm::ConnectionTrait>(conn: &C) -> Result<()> {
-    for s in session::Entity::find()
-        .filter(session::Column::Status.is_in(["running", "starting"]))
-        .all(conn)
-        .await?
-    {
-        let mut a: session::ActiveModel = s.into();
-        a.status = Set("idle".to_string());
-        a.update(conn).await?;
-    }
+    // Raw UPDATE rather than `Entity::find()`: this runs inside M0017, which
+    // executes BEFORE later migrations add columns (e.g. session.command in
+    // M0019). Loading the full entity model would SELECT a column that does not
+    // exist yet on an upgrading DB and fail the migration. A column-explicit
+    // statement stays correct regardless of which columns the entity later gains.
+    conn.execute(sea_orm::Statement::from_string(
+        conn.get_database_backend(),
+        "UPDATE session SET status = 'idle' WHERE status IN ('running', 'starting')",
+    ))
+    .await?;
     Ok(())
 }
 
@@ -1546,6 +1624,102 @@ mod tests {
         assert_eq!(
             get_setting(&db, "default_tool").await.unwrap(),
             Some("claude".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_commands_roundtrip_and_clear() {
+        let db = mem().await;
+        assert!(get_tool_commands(&db).await.unwrap().is_empty());
+
+        // Setting an alias persists it (apply_to_existing irrelevant with no rows).
+        set_tool_command(&db, "claude", "cc-claude", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_tool_commands(&db).await.unwrap().get("claude").map(String::as_str),
+            Some("cc-claude")
+        );
+
+        // Clearing (blank) removes the entry; identity value also clears.
+        set_tool_command(&db, "claude", "  ", true).await.unwrap();
+        assert!(get_tool_commands(&db).await.unwrap().is_empty());
+        set_tool_command(&db, "claude", "cc-claude", true)
+            .await
+            .unwrap();
+        set_tool_command(&db, "claude", "claude", true).await.unwrap();
+        assert!(get_tool_commands(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_to_existing_false_pins_old_sessions_only() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main").await.unwrap();
+        // An existing claude lead + worker, created before any alias.
+        let old_thread = create_thread(&db, ws.id, "old", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = create_direction(&db, old_thread.id, "d", "claude", repo.id, "why", "impl-only")
+            .await
+            .unwrap();
+        let old_sess = create_session(&db, dir.id, repo.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        assert_eq!(old_thread.lead_command, None);
+        assert_eq!(old_sess.command, None);
+
+        // Configure the alias but EXCLUDE existing sessions.
+        set_tool_command(&db, "claude", "cc-claude", false)
+            .await
+            .unwrap();
+
+        // Old lead + worker are pinned to their prior command ("claude").
+        let pinned_thread = get_thread(&db, old_thread.id).await.unwrap().unwrap();
+        assert_eq!(pinned_thread.lead_command.as_deref(), Some("claude"));
+        let pinned_sess = get_session(&db, old_sess.id).await.unwrap().unwrap();
+        assert_eq!(pinned_sess.command.as_deref(), Some("claude"));
+
+        // A NEW thread/worker created after the change is NOT pinned (NULL), so it
+        // follows the global override and spawns cc-claude.
+        let new_thread = create_thread(&db, ws.id, "new", "feature", "claude")
+            .await
+            .unwrap();
+        assert_eq!(new_thread.lead_command, None);
+
+        // A different tool's rows are untouched by a claude alias.
+        let codex_thread = create_thread(&db, ws.id, "cx", "feature", "codex")
+            .await
+            .unwrap();
+        set_tool_command(&db, "claude", "cc-claude-2", false)
+            .await
+            .unwrap();
+        let codex_after = get_thread(&db, codex_thread.id).await.unwrap().unwrap();
+        assert_eq!(codex_after.lead_command, None);
+    }
+
+    #[tokio::test]
+    async fn apply_to_existing_true_clears_pins_so_rows_follow_global() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let old_thread = create_thread(&db, ws.id, "old", "feature", "claude")
+            .await
+            .unwrap();
+        // First an opt-out pins the existing lead.
+        set_tool_command(&db, "claude", "cc-claude", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_thread(&db, old_thread.id).await.unwrap().unwrap().lead_command.as_deref(),
+            Some("claude")
+        );
+        // A later apply-to-existing clears the pin so the row follows the global map.
+        set_tool_command(&db, "claude", "cc-claude", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_thread(&db, old_thread.id).await.unwrap().unwrap().lead_command,
+            None
         );
     }
 

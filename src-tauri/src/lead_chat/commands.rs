@@ -37,6 +37,10 @@ pub struct SessionInfo {
     pub worktree: String,
     pub branch: String,
     pub tool: String,
+    /// Effective binary for terminal takeover (resume command): the per-session
+    /// pin / global alias, else the tool identity. Lets "Copy resume command"
+    /// produce the actual CLI (e.g. `cc-claude`) for an aliased session.
+    pub command: String,
     pub resumed: bool,
     pub native_id: Option<String>,
 }
@@ -171,6 +175,7 @@ pub async fn lead_engine(
     let inner = engine::EngineInner {
         thread_id,
         tool: t.lead_tool.clone(),
+        command: t.lead_command.clone(),
         session_id: None,
         cwd,
         extra_args: extra,
@@ -187,6 +192,7 @@ pub async fn lead_engine(
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        pending_command_refresh: false,
         last_context_tokens: None,
         last_model: None,
         last_window: None,
@@ -284,6 +290,9 @@ pub struct LeadStateInfo {
     pub state: String,
     pub queued: usize,
     pub native_id: Option<String>,
+    /// Effective binary for the lead's resume command (per-thread pin / alias,
+    /// else identity). Empty only when the thread row is missing.
+    pub command: String,
     pub slash_commands: Vec<crate::lead_chat::proto::SlashCmd>,
     pub cwd: String,
     // —— 会话信息面板回填(常驻面板重挂不空白)——
@@ -405,6 +414,12 @@ pub async fn lead_state(
             state: "stopped".into(),
             queued: 0,
             native_id: repo::lead_native_id(&db, thread_id).await.ok().flatten(),
+            command: repo::get_thread(&db, thread_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool))
+                .unwrap_or_default(),
             slash_commands: vec![],
             cwd: crate::paths::weft_home()
                 .map(|h| {
@@ -429,10 +444,12 @@ pub async fn lead_state(
                 .unwrap_or(false);
             // codex app-server leads are childless when idle but alive via the client.
             let alive = lead_alive(child_alive, i.codex_client.is_some());
+            let command = crate::tool_command::effective(i.command.as_deref(), &i.tool);
             Ok(LeadStateInfo {
                 state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
                 queued: i.turn.queue.len(),
                 native_id: i.native_id.clone(),
+                command,
                 slash_commands: i.slash_commands.clone(),
                 cwd: i.cwd.to_string_lossy().into_owned(),
                 context_tokens: i.last_context_tokens,
@@ -463,8 +480,15 @@ pub async fn lead_session_meta(
     }
     let cwd = ensure_lead_cwd(thread_id).map_err(|e| e.to_string())?;
     let native = repo::lead_native_id(&db, thread_id).await.ok().flatten();
+    let command = crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool);
     Ok(Some(
-        crate::session_meta::gather(&t.lead_tool, &cwd.to_string_lossy(), native.as_deref()).await,
+        crate::session_meta::gather(
+            &t.lead_tool,
+            &cwd.to_string_lossy(),
+            native.as_deref(),
+            &command,
+        )
+        .await,
     ))
 }
 
@@ -492,7 +516,11 @@ pub async fn discover_slash(
         };
         return Ok(match sess.tool.as_str() {
             "opencode" => merge_local_skill_commands(
-                crate::opencode::discover_commands(&sess.cwd).await,
+                crate::opencode::discover_commands(
+                    &sess.cwd,
+                    &crate::tool_command::effective(sess.command.as_deref(), &sess.tool),
+                )
+                .await,
                 std::path::Path::new(&sess.cwd),
             ),
             "claude" => {
@@ -521,12 +549,13 @@ pub async fn discover_slash(
     // composer still gets a palette before the lead process has emitted init.
     if let Some(tid) = thread_id {
         if let Some(eng) = state.get(lead_key(tid)) {
-            let (live, tool, cwd) = {
+            let (live, tool, cwd, command) = {
                 let inner = eng.lock().await;
                 (
                     inner.slash_commands.clone(),
                     inner.tool.clone(),
                     inner.cwd.clone(),
+                    crate::tool_command::effective(inner.command.as_deref(), &inner.tool),
                 )
             };
             let discovered = match tool.as_str() {
@@ -538,7 +567,8 @@ pub async fn discover_slash(
                 }
                 "claude" => merge_local_skill_commands(live, &cwd),
                 "opencode" => {
-                    let cmds = crate::opencode::discover_commands(&cwd.to_string_lossy()).await;
+                    let cmds =
+                        crate::opencode::discover_commands(&cwd.to_string_lossy(), &command).await;
                     let cmds = if cmds.is_empty() { live } else { cmds };
                     merge_local_skill_commands(cmds, &cwd)
                 }
@@ -562,8 +592,10 @@ pub async fn discover_slash(
                 "opencode" => {
                     let cwd = ensure_lead_cwd(tid).map_err(|e| e.to_string())?;
                     crate::skills::inject_for(&db, t.workspace_id, &cwd).await;
+                    let command =
+                        crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool);
                     merge_local_skill_commands(
-                        crate::opencode::discover_commands(&cwd.to_string_lossy()).await,
+                        crate::opencode::discover_commands(&cwd.to_string_lossy(), &command).await,
                         &cwd,
                     )
                 }
@@ -705,6 +737,7 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
         let Ok(Some(wt)) = repo::worktree_for(db, sess.direction_id, sess.repo_id).await else {
             continue;
         };
+        let command = crate::tool_command::effective(sess.command.as_deref(), &sess.tool);
         out.push(LiveWorkerSlot {
             info: SessionInfo {
                 session_id: sess.id,
@@ -712,6 +745,7 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
                 worktree: wt.path,
                 branch: wt.branch,
                 tool: sess.tool,
+                command,
                 resumed: sess.native_session_id.is_some(),
                 native_id: sess.native_session_id,
             },
@@ -870,6 +904,7 @@ pub(crate) async fn chat_open_worker_impl(
             let inner = engine::EngineInner {
                 thread_id: dir.thread_id,
                 tool: dir.tool.clone(),
+                command: sess.command.clone(),
                 session_id: Some(sess.id),
                 cwd,
                 extra_args: extra,
@@ -886,6 +921,7 @@ pub(crate) async fn chat_open_worker_impl(
                 interrupting: false,
                 generation: 0,
                 pending_skill_refresh: false,
+                pending_command_refresh: false,
                 last_context_tokens: None,
                 last_model: None,
                 last_window: None,
@@ -925,12 +961,14 @@ pub(crate) async fn chat_open_worker_impl(
         let _ = repo::set_direction_status(db, direction_id, phase).await;
     }
 
+    let command = crate::tool_command::effective(sess.command.as_deref(), &dir.tool);
     Ok(SessionInfo {
         session_id: sess.id,
         repo: wt.path.clone(),
         worktree: wt.path,
         branch: wt.branch,
         tool: dir.tool,
+        command,
         resumed,
         native_id: native,
     })
@@ -975,6 +1013,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     let inner = engine::EngineInner {
         thread_id: dir.thread_id,
         tool: sess.tool.clone(),
+        command: sess.command.clone(),
         session_id: Some(sess.id),
         cwd,
         extra_args: extra,
@@ -991,6 +1030,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         interrupting: false,
         generation: 0,
         pending_skill_refresh: false,
+        pending_command_refresh: false,
         last_context_tokens: None,
         last_model: None,
         last_window: None,

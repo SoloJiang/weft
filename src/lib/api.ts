@@ -216,6 +216,13 @@ export const api = {
   detectTools: () => invoke<ToolStatus[]>("detect_tools"),
   getDefaultTool: () => invoke<DefaultToolInfo>("get_default_tool"),
   setDefaultTool: (tool: string) => invoke<void>("set_default_tool", { tool }),
+  // Per-tool command overrides ("aliases", e.g. claude → cc-claude): identity →
+  // command. Empty map when none configured.
+  getToolCommands: () => invoke<Record<string, string>>("get_tool_commands"),
+  // applyToExisting=false pins existing sessions of `tool` to their prior command
+  // so only new sessions adopt the alias; true lets them adopt it on next run.
+  setToolCommand: (tool: string, command: string, applyToExisting: boolean) =>
+    invoke<void>("set_tool_command", { tool, command, applyToExisting }),
   // Dangerous mode (global): every agent's tool asks auto-allow.
   setDangerousMode: (on: boolean) => invoke<void>("set_dangerous_mode", { on }),
   // Keep-awake: prevent system idle sleep while any session is running.

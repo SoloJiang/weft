@@ -24,7 +24,10 @@ const TOOLS: [&str; 3] = ["codex", "claude", "opencode"];
 fn probe(tool: &str) -> ToolStatus {
     use crate::detect::ToolDiagnostic as Diag;
     let mut diagnostics = Vec::new();
-    let Some(path) = crate::detect::resolve_tool_path(tool) else {
+    // Probe the user-configured command (alias) for this identity, so Settings
+    // reports install status for the binary sessions actually spawn.
+    let command = crate::tool_command::command_for(tool);
+    let Some(path) = crate::detect::resolve_tool_path(&command) else {
         diagnostics.push(Diag::missing_target(tool));
         return ToolStatus {
             tool: tool.into(),

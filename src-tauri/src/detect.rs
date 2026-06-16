@@ -215,9 +215,13 @@ pub(crate) fn pick_default_tool(user: Option<&str>, installed: impl Fn(&str) -> 
 }
 
 /// Resolve the effective default tool against the real PATH (and the Codex
-/// app-bundle fallback), honoring the user's explicit choice when present.
+/// app-bundle fallback), honoring the user's explicit choice when present. A
+/// tool counts as installed when its configured command (alias) resolves, so an
+/// aliased CLI is eligible as the default.
 pub fn resolve_default_tool(user: Option<&str>) -> String {
-    pick_default_tool(user, |t| resolve_tool_path(t).is_some())
+    pick_default_tool(user, |t| {
+        resolve_tool_path(&crate::tool_command::command_for(t)).is_some()
+    })
 }
 
 fn codex_app_bundle_paths() -> Vec<std::path::PathBuf> {
