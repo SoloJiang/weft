@@ -213,50 +213,68 @@ struct CuratorWire {
     relations: Vec<CuratorRelation>,
 }
 
-/// The first balanced `{...}` substring, scanning string literals so braces
-/// inside strings don't fool the depth counter. None if there's no object —
-/// lets us pull the JSON out of a reply wrapped in prose or ```json fences.
-fn first_json_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    for i in start..bytes.len() {
-        let c = bytes[i] as char;
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_str = false;
-            }
+/// Every balanced top-level `{...}` substring, in order. Byte-scans for the ASCII
+/// structural chars (`{ } " \`) — which never collide with UTF-8 continuation
+/// bytes — and is string-literal aware, so braces inside strings (and earlier
+/// prose/config objects) don't fool the depth counter.
+fn json_objects(text: &str) -> Vec<&str> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'{' {
+            i += 1;
             continue;
         }
-        match c {
-            '"' => in_str = true,
-            '{' => depth += 1,
-            '}' => {
+        let (mut depth, mut in_str, mut escaped) = (0usize, false, false);
+        let mut end = None;
+        let mut j = i;
+        while j < b.len() {
+            let c = b[j];
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == b'\\' {
+                    escaped = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+            } else if c == b'"' {
+                in_str = true;
+            } else if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(&text[start..=i]);
+                    end = Some(j);
+                    break;
                 }
             }
-            _ => {}
+            j += 1;
+        }
+        match end {
+            Some(e) => {
+                out.push(&text[i..=e]);
+                i = e + 1;
+            }
+            None => break, // unbalanced tail — nothing more to find
         }
     }
-    None
+    out
 }
 
 /// Extract the curator agent's relations from its free-form reply (tolerant of
-/// markdown fences / surrounding prose). Returns `None` when no JSON object with
-/// a `relations` array is found — i.e. a timed-out or malformed reply — so the
-/// caller can leave the existing graph intact instead of wiping it. `Some([])`
-/// is an explicit "no relations".
+/// markdown fences / surrounding prose). Scans EVERY balanced object and returns
+/// the LAST that deserializes as a relations payload — the prompt asks for the
+/// JSON as the final thing, and an earlier prose/config `{...}` must not hide it.
+/// `None` when no object has a `relations` array (timed-out/malformed reply) so
+/// the caller leaves the graph intact; `Some([])` is an explicit "no relations".
 pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
-    let obj = first_json_object(text)?;
-    serde_json::from_str::<CuratorWire>(obj).ok().map(|w| w.relations)
+    json_objects(text)
+        .into_iter()
+        .rev()
+        .find_map(|obj| serde_json::from_str::<CuratorWire>(obj).ok())
+        .map(|w| w.relations)
 }
 
 const CURATOR_SYSTEM_PROMPT: &str = "You are a read-only repository dependency \
@@ -622,6 +640,17 @@ mod tests {
         // An explicit empty relations array → Some([]) (a real "found nothing").
         let explicit = super::parse_curator_output(r#"{"relations":[]}"#);
         assert!(explicit.is_some_and(|v| v.is_empty()));
+    }
+
+    #[test]
+    fn parse_curator_output_skips_earlier_non_result_objects() {
+        // A prose/config object appears BEFORE the real relations object; the
+        // earlier brace block must not hide the valid result later in the reply.
+        let reply = "I looked at the config `{\"port\": 8080}` and traced the call.\n\n\
+            {\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"GET /x\",\"confidence\":70}]}";
+        let rels = super::parse_curator_output(reply).expect("found the later relations object");
+        assert_eq!(rels.len(), 1);
+        assert_eq!((rels[0].from, rels[0].to, rels[0].kind.as_str()), (1, 2, "http"));
     }
 
     #[tokio::test]

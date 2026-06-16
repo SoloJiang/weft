@@ -120,16 +120,18 @@ pub fn merge_relations(existing: &[AgentRelation], fresh_agent: &[AgentRelation]
     out
 }
 
-/// Union manifest + agent edges, deduped by (from, to, via): a manifest edge
-/// (a declared fact) wins over an agent edge for the same triple, but distinct
-/// relationships between the same pair (e.g. a runtime HTTP call vs a declared
-/// package dep) both survive.
+/// Union manifest + agent edges, deduped by (from, to, via, kind): a manifest
+/// edge (a declared fact) wins over an agent edge for the SAME triple+kind, but a
+/// different relationship between the same pair survives — including one that
+/// happens to reuse the same `via` label with a different kind (e.g. a manifest
+/// `lib` edge via `@acme/api` and a pinned `http` edge via `@acme/api`).
 pub fn merge_edges(manifest: Vec<Edge>, agent: Vec<Edge>) -> Vec<Edge> {
-    let mut seen: std::collections::HashSet<(i32, i32, String)> =
-        manifest.iter().map(|e| (e.from, e.to, e.via.clone())).collect();
+    let key = |e: &Edge| (e.from, e.to, e.via.clone(), e.kind.clone());
+    let mut seen: std::collections::HashSet<(i32, i32, String, String)> =
+        manifest.iter().map(key).collect();
     let mut out = manifest;
     for e in agent {
-        if seen.insert((e.from, e.to, e.via.clone())) {
+        if seen.insert(key(&e)) {
             out.push(e);
         }
     }
@@ -1295,13 +1297,31 @@ mod tests {
                 source: "agent".into(),
                 confidence: 80,
             },
+            // Same (from,to,via) as the manifest lib edge but a DIFFERENT kind →
+            // kept (kind is part of the dedup key); the runtime call shouldn't be
+            // swallowed just because it reuses the package identifier as evidence.
+            super::Edge {
+                from: 1,
+                to: 2,
+                via: "@acme/api-client".into(),
+                kind: "http".into(),
+                source: "user".into(),
+                confidence: 100,
+            },
         ];
         let merged = super::merge_edges(manifest, agent);
-        assert_eq!(merged.len(), 2);
-        // The surviving (1,2,@acme/api-client) edge is the manifest one.
-        let lib = merged.iter().find(|e| e.via == "@acme/api-client").unwrap();
+        assert_eq!(merged.len(), 3);
+        // The (1,2,@acme/api-client,lib) edge is the manifest one.
+        let lib = merged
+            .iter()
+            .find(|e| e.via == "@acme/api-client" && e.kind == "lib")
+            .unwrap();
         assert_eq!(lib.source, "manifest");
         assert_eq!(lib.confidence, 100);
-        assert!(merged.iter().any(|e| e.kind == "http" && e.source == "agent"));
+        assert!(merged.iter().any(|e| e.kind == "http" && e.via == "GET /orders"));
+        // The same-via http edge survives alongside the manifest lib edge.
+        assert!(merged
+            .iter()
+            .any(|e| e.kind == "http" && e.via == "@acme/api-client" && e.source == "user"));
     }
 }

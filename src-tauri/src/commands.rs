@@ -101,9 +101,21 @@ async fn register_repo(
             }
         }
     }
-    let r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote)
+    let mut r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote)
         .await
         .map_err(e)?;
+    // If dedup resolved to an EXISTING row (by remote) at a different path whose
+    // checkout is gone, repoint it to the path the user just gave us — a local add
+    // OR a clone — so we don't keep pointing at a dead checkout and report success.
+    // (A live duplicate keeps the existing row; clone_repo removes the redundant
+    // clone dir in that case.) Done before profiling so facts come from the live path.
+    if r.local_git_path != canonical
+        && !crate::git::is_git_repo(std::path::Path::new(&r.local_git_path))
+    {
+        if let Ok(Some(updated)) = repo::set_repo_path(db, r.id, &canonical).await {
+            r = updated;
+        }
+    }
     // Eager, deterministic profiling (ARCHITECTURE §4.9): best-effort, never
     // blocks adding the repo if inference/git hiccups.
     let _ = crate::curator::profile_repo(db, &r).await;
@@ -152,27 +164,15 @@ pub async fn clone_repo(
         .map_err(|err| err.to_string())?
         .map_err(e)?;
     let r = register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await?;
-    // If workspace dedup resolved to an EXISTING repo (same remote already
-    // present at a different path):
+    // If the row points somewhere other than the dir we just cloned, dedup
+    // resolved to a DIFFERENT live repo (a dead-checkout match was already
+    // repointed to this clone inside register_repo, so paths would match here) —
+    // the fresh clone is a redundant duplicate, so remove it rather than leaving
+    // an orphan dir on disk.
     let cloned = std::fs::canonicalize(&path).ok();
     let registered = std::fs::canonicalize(&r.local_git_path).ok();
     if cloned.is_some() && cloned != registered {
-        if crate::git::is_git_repo(std::path::Path::new(&r.local_git_path)) {
-            // The existing checkout is live → the new clone is a true duplicate.
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            // The deduped repo's checkout is gone (moved/deleted) → keep the fresh
-            // clone and repoint the row to it instead of orphaning the user.
-            if let Ok(Some(updated)) =
-                repo::set_repo_path(&db, r.id, &path.to_string_lossy()).await
-            {
-                // register_repo already profiled the (stale) old path, leaving an
-                // empty profile; reprofile from the fresh checkout so the map and
-                // edges are correct without a manual refresh. Best-effort.
-                let _ = crate::curator::profile_repo(&db, &updated).await;
-                return Ok(updated);
-            }
-        }
+        let _ = std::fs::remove_dir_all(&path);
     }
     Ok(r)
 }
