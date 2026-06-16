@@ -69,8 +69,16 @@ pub async fn edit_profile(
         Some(p) => (p.stack.clone(), p.components.clone(), p.profiled_commit.clone()),
         None => ("[]".to_string(), "[]".to_string(), String::new()),
     };
-    // Tolerate any tier string the UI sends; "" clears the classification.
-    let tier = profile::normalize_tier(tier).unwrap_or_default();
+    // A valid tier is canonicalized and an empty string is an intentional "Other"
+    // clear, but a NON-EMPTY legacy value (service/app/… surfaced from an upgraded
+    // row on a summary-only edit) is preserved verbatim — collapsing it to "" here
+    // would mark the row user-"Other" and exclude it from the legacy backfill, so
+    // it would never migrate to a real tier.
+    let tier = match profile::normalize_tier(tier) {
+        Some(t) => t,
+        None if tier.trim().is_empty() => String::new(),
+        None => tier.to_string(),
+    };
     repo::upsert_repo_profile(db, repo_id, &tier, &stack, summary, &components, "user", &commit).await
 }
 
@@ -513,6 +521,12 @@ fn emit_graph_updated(workspace_id: i32) {
 /// fields (tier/summary) are preserved when the user has pinned them
 /// (source = "user"). Component tiers are normalized to the canonical set.
 async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire) -> Result<()> {
+    // The per-repo agent pass can run for minutes; if the repo was removed
+    // meanwhile, the captured `repo_ref` is stale. Skip rather than recreate an
+    // orphaned profile row (repo_profile has no enforced foreign key).
+    if repo::get_repo(db, repo.id).await?.is_none() {
+        return Ok(());
+    }
     let prior = repo::get_repo_profile(db, repo.id).await?;
     let user_owned = prior.as_ref().map(|p| p.source == "user").unwrap_or(false);
 
@@ -849,6 +863,50 @@ mod tests {
         let comps: Vec<Component> = serde_json::from_str(&p.components).unwrap();
         assert_eq!(comps.len(), 1, "the nameless component is dropped");
         assert_eq!(comps[0].name, "api");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_preserves_legacy_tier_on_summary_edit() {
+        // A summary-only edit on an upgraded (legacy-role) row passes the existing
+        // tier back; it must NOT be collapsed to "" (which would block backfill).
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "service", "[]", "old", "[]", "agent", "")
+            .await
+            .unwrap();
+        super::edit_profile(&db, r.id, "new summary", "service").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "service", "legacy tier preserved on a summary-only edit");
+        assert_eq!(p.summary, "new summary");
+        // An explicit "Other" clear still empties the tier.
+        super::edit_profile(&db, r.id, "new summary", "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "", "explicit Other clears the tier");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_skips_deleted_repo() {
+        // A repo removed mid-pass must not get an orphaned profile recreated.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "gone", "/tmp/gone", "main", "")
+            .await
+            .unwrap();
+        repo::delete_repo_cascade(&db, r.id).await.unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "s".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        assert!(
+            repo::get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "no orphaned profile recreated for a deleted repo"
+        );
     }
 
     #[test]
