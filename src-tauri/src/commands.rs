@@ -221,15 +221,16 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
 }
 
 /// Re-run the deep, read-only agent classification for a single repo (tier +
-/// summary + components). Slow (spawns the agent); the caller refreshes the map
-/// after it resolves.
+/// summary + components), then refresh the workspace's cross-repo relations so
+/// the stored edges reflect the repo's changed dependencies. Slow (spawns the
+/// agent); the caller refreshes the map after it resolves.
 #[tauri::command]
 pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     let r = repo::get_repo(&db, repo_id)
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
-    crate::curator::profile_repo_agent(&db, &r).await.map_err(e)?;
+    crate::curator::reprofile_repo(&db, &r).await.map_err(e)?;
     Ok(())
 }
 

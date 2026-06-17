@@ -616,32 +616,38 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
 
     let agent_tier = profile::normalize_tier(&wire.tier);
 
-    // Tier: a user-pinned valid tier is kept; a user-pinned legacy/empty tier
-    // adopts the agent's valid tier (migration / placeholder fill). When the user
-    // doesn't own the tier, require a valid agent tier — a missing/non-canonical
-    // one leaves the prior profile (or placeholder) intact rather than persisting
-    // an analyzed-but-unclassified row the backfill gate would never retry.
-    let tier = match prior.as_ref().filter(|_| tier_owned) {
-        Some(p) => profile::normalize_tier(&p.role)
-            .or_else(|| agent_tier.clone())
-            .unwrap_or_else(|| p.role.clone()),
+    // Tier: a user-pinned valid tier is kept (still owned); a user-pinned
+    // legacy/empty tier adopts the agent's valid tier (no longer owned — it's the
+    // agent's value now). When the user doesn't own the tier, require a valid
+    // agent tier — a missing/non-canonical one leaves the prior profile (or
+    // placeholder) intact rather than persisting an analyzed-but-unclassified row.
+    let (tier, tier_still_owned) = match prior.as_ref().filter(|_| tier_owned) {
+        Some(p) => match profile::normalize_tier(&p.role) {
+            Some(valid) => (valid, true),
+            None => match agent_tier.clone() {
+                Some(a) => (a, false),
+                None => (p.role.clone(), true), // legacy kept, still pending migration
+            },
+        },
         None => {
             let Some(tier) = agent_tier else {
                 return Ok(());
             };
-            tier
+            (tier, false)
         }
     };
 
-    // Summary: keep a non-empty user-pinned summary; otherwise (not owned, or an
-    // owned-but-blank placeholder) take the agent's.
-    let summary = match prior.as_ref().filter(|_| summary_owned) {
-        Some(p) if !p.summary.trim().is_empty() => p.summary.clone(),
-        _ => wire.summary,
+    // Summary: keep a non-empty user-pinned summary (still owned); otherwise take
+    // the agent's (no longer owned — covers an unowned field and an owned-but-blank
+    // placeholder).
+    let (summary, summary_still_owned) = match prior.as_ref().filter(|_| summary_owned) {
+        Some(p) if !p.summary.trim().is_empty() => (p.summary.clone(), true),
+        _ => (wire.summary, false),
     };
 
-    // Preserve whichever ownership flags the user still holds.
-    let source = combine_source(summary_owned, tier_owned);
+    // Persist only the ownership the user STILL holds: a field whose value was
+    // taken from the agent is no longer user-pinned, so a later pass can refresh it.
+    let source = combine_source(summary_still_owned, tier_still_owned);
 
     repo::upsert_repo_profile(
         db, repo.id, &tier, &stack_json, &summary, &comps_json, source, &commit,
@@ -685,36 +691,75 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
         return Ok(());
     }
 
-    // Stage 1: deep per-repo classification, progressive.
+    // Stage 1: deep per-repo classification, progressive. Skip a repo that's
+    // already classified (canonical tier) AND unchanged since (profiled_commit ==
+    // HEAD) — re-running the minutes-long agent for every unchanged checkout when
+    // a single repo is added would stall a large workspace for a long time.
     for r in &existing {
+        if !needs_classification(db, r).await {
+            continue;
+        }
         let _ = profile_repo_agent(db, r).await;
         emit_graph_updated(workspace_id);
     }
 
-    // Stage 2: cross-repo relations — needs at least two repos to relate. Reload
-    // the (now classified) profiles so the listing carries tiers/summaries.
-    if existing.len() >= 2 {
-        let mut profiled: Vec<(repo_ref::Model, repo_profile::Model)> = Vec::new();
-        for r in &existing {
-            if let Some(p) = repo::get_repo_profile(db, r.id).await? {
-                profiled.push((r.clone(), p));
-            }
-        }
-        if profiled.len() >= 2 {
-            let prompt = build_curator_prompt(&profiled);
-            let cwd = Path::new(&profiled[0].0.local_git_path).to_path_buf();
-            let tool = crate::tools::default_tool(db).await;
-            // A timed-out / unparseable reply leaves existing relations intact
-            // (never persists an empty set, which would drop all agent edges).
-            if let Ok(text) = run_agent_once(&tool, &cwd, &prompt).await {
-                if let Some(relations) = parse_curator_output(&text) {
-                    persist_relations(db, &profiled, &relations).await?;
-                }
-            }
-        }
-        emit_graph_updated(workspace_id);
+    // Stage 2: cross-repo relations — needs at least two repos to relate.
+    analyze_relations(db, workspace_id).await
+}
+
+/// Whether a repo needs the deep classifier on an automatic pass: a repo with no
+/// profile, no canonical tier yet, or whose HEAD moved since it was last profiled
+/// (a stale classification). An unchanged, already-classified repo is skipped.
+async fn needs_classification(db: &Db, repo: &repo_ref::Model) -> bool {
+    let Ok(Some(p)) = repo::get_repo_profile(db, repo.id).await else {
+        return true;
+    };
+    if profile::normalize_tier(&p.role).is_none() {
+        return true; // unclassified / legacy → (re)classify
     }
+    match git::head_commit(Path::new(&repo.local_git_path)) {
+        Ok(head) => head != p.profiled_commit, // changed since last profiled
+        Err(_) => false, // can't tell HEAD (not a git repo) → don't churn
+    }
+}
+
+/// The cross-repo relations pass: reload the (classified) profiles, infer the
+/// runtime/infra/lib relations between them, and persist. Needs ≥2 profiled
+/// repos. A timed-out / unparseable reply leaves existing relations intact
+/// (never persists an empty set, which would drop all agent edges).
+async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
+    let repos = repo::list_repos(db, workspace_id).await?;
+    let mut profiled: Vec<(repo_ref::Model, repo_profile::Model)> = Vec::new();
+    for r in &repos {
+        if !Path::new(&r.local_git_path).exists() {
+            continue;
+        }
+        if let Some(p) = repo::get_repo_profile(db, r.id).await? {
+            profiled.push((r.clone(), p));
+        }
+    }
+    if profiled.len() < 2 {
+        return Ok(());
+    }
+    let prompt = build_curator_prompt(&profiled);
+    let cwd = Path::new(&profiled[0].0.local_git_path).to_path_buf();
+    let tool = crate::tools::default_tool(db).await;
+    if let Ok(text) = run_agent_once(&tool, &cwd, &prompt).await {
+        if let Some(relations) = parse_curator_output(&text) {
+            persist_relations(db, &profiled, &relations).await?;
+        }
+    }
+    emit_graph_updated(workspace_id);
     Ok(())
+}
+
+/// Re-profile a single repo on an explicit user action: force the deep classifier
+/// (no unchanged-skip), then refresh the workspace's cross-repo relations so the
+/// stored edges (and the stale badge) reflect the repo's changed dependencies.
+pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
+    profile_repo_agent(db, repo).await?;
+    emit_graph_updated(repo.workspace_id);
+    analyze_relations(db, repo.workspace_id).await
 }
 
 /// Workspaces with an analysis pass currently running, so a batch add (which
@@ -873,7 +918,8 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend", "legacy 'service' migrated to a real tier");
         assert_eq!(p.summary, "mine", "user-pinned summary preserved");
-        assert_eq!(p.source, "user");
+        // Tier ownership dropped (it's the agent's value now); summary still owned.
+        assert_eq!(p.source, "user_summary");
     }
 
     #[tokio::test]
@@ -920,6 +966,36 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend", "empty user tier adopts the agent's classification");
         assert_eq!(p.summary, "mine", "user-pinned summary preserved");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_drops_ownership_for_agent_filled_field() {
+        // A user-owned row whose tier was filled by the agent must NOT stay
+        // tier-pinned, so a later pass can refresh it.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        // source "user" = both owned, but tier is empty (legacy/placeholder).
+        repo::upsert_repo_profile(&db, r.id, "", "[]", "mine", "[]", "user", "")
+            .await
+            .unwrap();
+        let mk = |tier: &str| super::RepoClassWire {
+            tier: tier.into(),
+            summary: "agent".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, mk("backend")).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "backend", "empty tier adopts the agent's");
+        assert_eq!(p.source, "user_summary", "tier ownership dropped, summary kept");
+        // A second pass now refreshes the (no-longer-owned) tier.
+        super::persist_repo_class(&db, &r, mk("frontend")).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend", "agent-filled tier is refreshable");
+        assert_eq!(p.summary, "mine", "user summary still pinned");
     }
 
     #[tokio::test]
