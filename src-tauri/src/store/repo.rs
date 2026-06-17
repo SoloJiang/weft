@@ -453,34 +453,38 @@ pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profi
         .await?)
 }
 
-/// Insert or update a repo's profile. `stack`/`published`/`deps` are JSON arrays.
+/// Insert or update a repo's profile from the agent curator. `tier` is the
+/// architectural tier ("frontend"|"gateway"|"backend"|""), `stack`/`components`
+/// are JSON arrays. The vestigial `published`/`deps` columns are pinned to "[]".
+/// `relations` are left untouched on update so re-analysis of facts never wipes
+/// the agent's cross-repo findings (and stay "[]" on a fresh row).
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_repo_profile(
     db: &Db,
     repo_id: i32,
-    role: &str,
+    tier: &str,
     stack: &str,
     summary: &str,
-    published: &str,
-    deps: &str,
+    components: &str,
     source: &str,
     profiled_commit: &str,
 ) -> Result<repo_profile::Model> {
     let mut a = match get_repo_profile(db, repo_id).await? {
         Some(m) => m.into(),
-        // New row: agent relations start empty. (On update we leave `relations`
-        // untouched, so deterministic re-profiling never wipes agent findings.)
         None => repo_profile::ActiveModel {
             repo_id: Set(repo_id),
             relations: Set("[]".to_string()),
+            published: Set("[]".to_string()),
+            deps: Set("[]".to_string()),
             ..Default::default()
         },
     };
-    a.role = Set(role.to_string());
+    a.role = Set(tier.to_string());
     a.stack = Set(stack.to_string());
     a.summary = Set(summary.to_string());
-    a.published = Set(published.to_string());
-    a.deps = Set(deps.to_string());
+    a.components = Set(components.to_string());
+    a.published = Set("[]".to_string());
+    a.deps = Set("[]".to_string());
     a.source = Set(source.to_string());
     a.profiled_commit = Set(profiled_commit.to_string());
     Ok(a.save(&db.0).await?.try_into_model()?)
@@ -526,7 +530,9 @@ pub async fn set_repo_path(db: &Db, repo_id: i32, local_git_path: &str) -> Resul
 /// upserts a user-sourced relation for `(to, kind)`; `action="remove"` writes a
 /// user `rejected` tombstone for that pair so the edge disappears and the auto
 /// pass won't resurrect it. Replaces any prior entry for the same `(to, kind)`.
-/// No-op if the repo has no profile row yet.
+/// Creates a minimal profile row if the producer has none yet (an "analyzing"
+/// placeholder), so a human calibration persists instead of silently no-op'ing;
+/// the pinned relation is `source="user"` and survives later agent passes.
 pub async fn calibrate_repo_relation(
     db: &Db,
     from_id: i32,
@@ -535,13 +541,30 @@ pub async fn calibrate_repo_relation(
     via: &str,
     action: &str,
 ) -> Result<()> {
-    let Some(p) = get_repo_profile(db, from_id).await? else {
+    // Don't resurrect a deleted repo (no enforced FK on repo_profile): a stale
+    // calibration after delete_repo is a no-op rather than an orphaned row.
+    if get_repo(db, from_id).await?.is_none() {
         return Ok(());
+    }
+    let p = match get_repo_profile(db, from_id).await? {
+        Some(p) => p,
+        None => upsert_repo_profile(db, from_id, "", "[]", "", "[]", "agent", "").await?,
     };
     let mut rels: Vec<crate::profile::AgentRelation> =
         serde_json::from_str(&p.relations).unwrap_or_default();
-    // One entry per (to, kind): drop any prior one, then add the calibration.
-    rels.retain(|r| !(r.to == to_id && r.kind == kind));
+    // Replace the entry this calibration targets. With a `via`, replace only the
+    // SAME-evidence (to, kind, via) entry so a distinct edge isn't erased. A
+    // REMOVE with no `via` is a "drop this whole dependency kind": clear every
+    // (to, kind) entry immediately so the visible agent edges go away now, not
+    // just on a later relation pass.
+    let broad_remove = action == "remove" && via.is_empty();
+    rels.retain(|r| {
+        if broad_remove {
+            !(r.to == to_id && r.kind == kind)
+        } else {
+            !(r.to == to_id && r.kind == kind && r.via == via)
+        }
+    });
     rels.push(crate::profile::AgentRelation {
         to: to_id,
         kind: kind.to_string(),
@@ -1435,10 +1458,10 @@ mod tests {
         let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "")
             .await
             .unwrap();
-        upsert_repo_profile(&db, a.id, "service", "[]", "", "[]", "[]", "inferred", "")
+        upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "")
             .await
             .unwrap();
-        upsert_repo_profile(&db, b.id, "service", "[]", "", "[]", "[]", "inferred", "")
+        upsert_repo_profile(&db, b.id, "backend", "[]", "", "[]", "agent", "")
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "T", "feature", "claude")
@@ -1486,7 +1509,7 @@ mod tests {
         let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
             .await
             .unwrap();
-        upsert_repo_profile(&db, web.id, "app", "[]", "", "[]", "[]", "inferred", "")
+        upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "")
             .await
             .unwrap();
         let read = |db: &Db, id| {
@@ -1507,8 +1530,8 @@ mod tests {
         assert_eq!(rels[0].source, "user");
         assert!(!rels[0].rejected);
 
-        // remove the same pair+kind → a single user tombstone (not two rows)
-        calibrate_repo_relation(&db, web.id, api.id, "grpc", "", "remove")
+        // remove the SAME (to, kind, via) → replaces it with a single tombstone.
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "Pricing.Quote", "remove")
             .await
             .unwrap();
         let rels = read(&db, web.id).await;
@@ -1516,10 +1539,26 @@ mod tests {
         assert!(rels[0].rejected, "removal writes a tombstone");
         assert_eq!(rels[0].source, "user");
 
-        // a repo with no profile is a no-op (must not panic)
-        calibrate_repo_relation(&db, 9999, api.id, "http", "x", "add")
+        // A distinct edge (same to/kind, different via) is a SEPARATE entry — it
+        // doesn't replace the tombstone above.
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "Other.Call", "add")
             .await
             .unwrap();
+        let rels = read(&db, web.id).await;
+        assert_eq!(rels.len(), 2, "distinct via is a separate calibration");
+
+        // a producer with no profile row yet (an "analyzing" placeholder) gets a
+        // minimal row created so the calibration persists instead of vanishing.
+        let lib = add_repo_ref(&db, ws.id, "lib", "/tmp/lib", "main", "")
+            .await
+            .unwrap();
+        assert!(get_repo_profile(&db, lib.id).await.unwrap().is_none());
+        calibrate_repo_relation(&db, lib.id, api.id, "http", "GET /x", "add")
+            .await
+            .unwrap();
+        let rels = read(&db, lib.id).await;
+        assert_eq!(rels.len(), 1, "calibration on a placeholder persists");
+        assert_eq!((rels[0].to, rels[0].kind.as_str(), rels[0].source.as_str()), (api.id, "http", "user"));
     }
 
     #[tokio::test]

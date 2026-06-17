@@ -333,18 +333,34 @@ export interface BusMsg {
   kind: string;
 }
 
-/** The curator's profile of one repo, as the UI sees it (ARCHITECTURE §4.9). */
+/** One monorepo sub-component the agent surfaced, for the map's expanded view. */
+export interface RepoComponent {
+  name: string;
+  path: string;
+  /** frontend | gateway | backend | "" (unclassified). */
+  tier: string;
+  summary: string;
+  /** Names of sibling components (same repo) this one depends on. */
+  deps: string[];
+}
+
+/** The curator's profile of one repo, as the UI sees it (ARCHITECTURE §4.9).
+ *  The curator is agent-only: `tier` comes from the deep per-repo pass and is ""
+ *  (with `analyzed=false`) until the agent classifies the repo. */
 export interface RepoProfile {
   repo_id: number;
   repo_name: string;
-  role: string; // service | app | library | infra | docs | unknown
+  /** frontend | gateway | backend | "" (unclassified / analyzing). */
+  tier: string;
   stack: string[];
   summary: string;
-  published: string[];
-  deps: string[];
-  source: string; // inferred | user
+  source: string; // agent | user | "" (placeholder)
   profiled_commit: string;
   stale: boolean;
+  /** false = the agent hasn't classified this repo yet (placeholder node). */
+  analyzed: boolean;
+  /** Monorepo sub-components (empty for a single-purpose repo). */
+  components: RepoComponent[];
 }
 
 /** A directed dependency edge: `from` consumes `to`, evidenced by `via`. */
@@ -355,9 +371,9 @@ export interface RepoEdge {
   /** Relationship kind: "lib" (declared package dep) | "http" | "grpc" | "queue"
    *  | "infra". Optional for backward compat with pre-curator payloads. */
   kind?: string;
-  /** "manifest" (deterministic) | "agent" (inferred) | "user". */
+  /** "agent" (inferred) | "user" (human-pinned). */
   source?: string;
-  /** Confidence 0–100; manifest edges are 100. */
+  /** Confidence 0–100. */
   confidence?: number;
 }
 

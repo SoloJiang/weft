@@ -396,10 +396,10 @@ async fn curator_map_json(db: &Db, thread: i32) -> anyhow::Result<String> {
             json!({
                 "repo_id": n.repo_id,
                 "repo_name": n.repo_name,
-                "role": n.role,
+                "tier": n.tier,
+                "stack": n.stack,
                 "summary": n.summary,
-                "published": n.published,
-                "deps": n.deps,
+                "components": n.components,
                 "path": path_of.get(&n.repo_id).cloned().unwrap_or_default(),
             })
         })
