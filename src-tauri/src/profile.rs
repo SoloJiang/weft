@@ -121,30 +121,34 @@ pub fn agent_edges(
 
 /// Merge a repo's current relations with a fresh agent pass: keep every
 /// user-sourced relation (including `rejected` tombstones), drop old agent
-/// relations, and add fresh agent relations EXCEPT:
-///   - any matching a user `rejected` tombstone by (to, kind) — a human removed
-///     that dependency, so it's not resurrected; and
-///   - any matching a positive user pin by the EXACT (to, kind, via) — so the
-///     same edge isn't stored twice, while a DISTINCT relationship between the
-///     same repos (different `via`/evidence) still survives.
+/// relations, and add fresh agent relations EXCEPT any whose (to, kind[, via]) a
+/// user already owns. Both tombstones and positive pins are scoped to `via` when
+/// the user supplied one — so removing one false edge (e.g. `GET /orders`) or
+/// pinning a real one doesn't hide a DISTINCT relationship of the same kind
+/// between the same repos (e.g. `POST /payments`). A user relation with an empty
+/// `via` applies broadly to (to, kind), matching how edges are keyed when no
+/// evidence is recorded.
 pub fn merge_relations(existing: &[AgentRelation], fresh_agent: &[AgentRelation]) -> Vec<AgentRelation> {
+    use std::collections::HashSet;
     let mut out: Vec<AgentRelation> =
         existing.iter().filter(|r| r.source == "user").cloned().collect();
-    let tombstoned: std::collections::HashSet<(i32, String)> = out
+    // (to, kind) for user relations with no via → suppress that whole kind.
+    let owned_kind: HashSet<(i32, String)> = out
         .iter()
-        .filter(|r| r.rejected)
+        .filter(|r| r.via.is_empty())
         .map(|r| (r.to, r.kind.clone()))
         .collect();
-    let pinned: std::collections::HashSet<(i32, String, String)> = out
+    // (to, kind, via) for user relations with specific evidence → suppress only
+    // that exact edge.
+    let owned_exact: HashSet<(i32, String, String)> = out
         .iter()
-        .filter(|r| !r.rejected)
+        .filter(|r| !r.via.is_empty())
         .map(|r| (r.to, r.kind.clone(), r.via.clone()))
         .collect();
     for r in fresh_agent {
-        if tombstoned.contains(&(r.to, r.kind.clone())) {
-            continue;
-        }
-        if pinned.contains(&(r.to, r.kind.clone(), r.via.clone())) {
+        if owned_kind.contains(&(r.to, r.kind.clone()))
+            || owned_exact.contains(&(r.to, r.kind.clone(), r.via.clone()))
+        {
             continue;
         }
         out.push(r.clone());
@@ -239,15 +243,19 @@ mod tests {
     fn merge_relations_keeps_user_replaces_agent_honors_tombstone() {
         let existing = vec![
             super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 90, source: "user".into(), rejected: false },
-            super::AgentRelation { to: 3, kind: "http".into(), via: "old".into(), confidence: 40, source: "user".into(), rejected: true },
+            // A via-scoped tombstone: the user removed exactly the "GET /orders" edge.
+            super::AgentRelation { to: 3, kind: "http".into(), via: "GET /orders".into(), confidence: 40, source: "user".into(), rejected: true },
             super::AgentRelation { to: 4, kind: "lib".into(), via: "stale-agent".into(), confidence: 100, source: "agent".into(), rejected: false },
         ];
         let fresh_agent = vec![
-            super::AgentRelation { to: 3, kind: "http".into(), via: "re-found".into(), confidence: 70, source: "agent".into(), rejected: false },
+            // Re-found the exact removed edge → suppressed by the tombstone.
+            super::AgentRelation { to: 3, kind: "http".into(), via: "GET /orders".into(), confidence: 70, source: "agent".into(), rejected: false },
+            // A DISTINCT edge to the same repo (different via) → NOT hidden by the tombstone.
+            super::AgentRelation { to: 3, kind: "http".into(), via: "POST /payments".into(), confidence: 70, source: "agent".into(), rejected: false },
             super::AgentRelation { to: 5, kind: "grpc".into(), via: "new".into(), confidence: 60, source: "agent".into(), rejected: false },
             // EXACT duplicate of the user pin (same to/kind/via) → suppressed.
             super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 80, source: "agent".into(), rejected: false },
-            // DISTINCT relationship to the same repo (different via) → kept.
+            // DISTINCT relationship to the pinned repo (different via) → kept.
             super::AgentRelation { to: 2, kind: "http".into(), via: "GET /orders".into(), confidence: 80, source: "agent".into(), rejected: false },
         ];
         let merged = super::merge_relations(&existing, &fresh_agent);
@@ -262,7 +270,14 @@ mod tests {
             "a distinct agent edge to the same repo survives next to a user pin",
         );
         assert!(merged.iter().any(|r| r.to == 3 && r.rejected), "tombstone survives");
-        assert!(!merged.iter().any(|r| r.to == 3 && !r.rejected), "tombstoned edge not resurrected");
+        assert!(
+            !merged.iter().any(|r| r.to == 3 && !r.rejected && r.via == "GET /orders"),
+            "the exact tombstoned edge is not resurrected",
+        );
+        assert!(
+            merged.iter().any(|r| r.to == 3 && r.via == "POST /payments" && r.source == "agent"),
+            "a distinct edge of the same kind is not hidden by a via-scoped tombstone",
+        );
         assert!(!merged.iter().any(|r| r.to == 4), "stale agent edge dropped");
         assert!(merged.iter().any(|r| r.to == 5 && r.source == "agent"), "new agent edge added");
     }

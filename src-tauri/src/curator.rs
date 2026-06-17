@@ -211,12 +211,14 @@ fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
         return;
     }
     // A node needs the agent if its tier isn't canonical — a non-empty legacy
-    // value (service/app/…) OR an empty tier left by an old "Other"/summary-only
-    // edit. Exclude a FRESH eager placeholder (source="agent" + empty tier): the
-    // add that created it already scheduled a pass, so this read shouldn't re-queue.
-    let needs_backfill = nodes.iter().any(|n| {
-        profile::normalize_tier(&n.tier).is_none() && !(n.source == "agent" && n.tier.is_empty())
-    });
+    // value (service/app/…), an empty tier from an old "Other"/summary-only edit,
+    // OR a placeholder whose add-time pass never finished (e.g. the app exited or
+    // the tool failed mid-run). The one-shot `try_claim_backfill` guard + the
+    // coalescer make scheduling this at most one (deduped) pass per session, so
+    // including fresh placeholders just rides along with the add's own pass.
+    let needs_backfill = nodes
+        .iter()
+        .any(|n| profile::normalize_tier(&n.tier).is_none());
     if needs_backfill && try_claim_backfill(workspace_id) {
         let db = db.clone();
         tauri::async_runtime::spawn(async move {
@@ -345,36 +347,36 @@ pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
 
 /// The per-repo deep pass's strict-JSON result. `tier` is required (no serde
 /// default), so a reply without it reads as unparseable and the prior profile is
-/// left intact rather than blanked. `path`/`deps` capture COMPONENT-only fields so
-/// a nested component object — which `json_objects` may scan into when a truncated
-/// top-level object is missing its closing brace — can be rejected; a repo
-/// classification has neither (`name` alone is ambiguous: a repo reply may carry
-/// its own name).
+/// left intact rather than blanked. `name` captures a stray `name` key: the
+/// repo-level schema has no `name`, but a COMPONENT does, so an object with one is
+/// a nested component that `json_objects` scanned into (a truncated top-level
+/// object missing its brace) and is rejected. We choose this over a `path`/`deps`
+/// discriminator because the failure mode is SAFE — a misclassified object leaves
+/// the placeholder for retry, rather than persisting a component's tier/summary as
+/// the whole repo (which `needs_classification` would then skip).
 #[derive(Debug, serde::Deserialize)]
 struct RepoClassWire {
     tier: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     summary: String,
     #[serde(default)]
     stack: Vec<String>,
     #[serde(default)]
     components: Vec<Component>,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    deps: Option<Vec<String>>,
 }
 
 /// Extract the per-repo classification from the agent's free-form reply, same
 /// tolerance as `parse_curator_output`: scan every balanced object, take the LAST
-/// that carries a `tier` and is NOT a component object (those carry `path`/`deps`).
+/// that carries a `tier` and is NOT a component object (those carry a `name`).
 /// `None` for a timed-out/malformed reply.
 fn parse_repo_class(text: &str) -> Option<RepoClassWire> {
     json_objects(text)
         .into_iter()
         .rev()
         .filter_map(|obj| serde_json::from_str::<RepoClassWire>(obj).ok())
-        .find(|w| w.path.is_none() && w.deps.is_none())
+        .find(|w| w.name.is_none())
 }
 
 const CURATOR_SYSTEM_PROMPT: &str = "You are a read-only repository analyst. You \
@@ -870,26 +872,20 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     Ok(())
 }
 
-/// A RELATION-only refresh, serialized against any in-flight workspace pass via
-/// the same per-workspace lock so two relation agents never overwrite each other.
-/// Unlike a full coalesced pass it does NOT re-run the per-repo classifier.
-async fn refresh_relations_serial(db: &Db, workspace_id: i32) {
-    let gate = pass_gate(workspace_id);
-    let _g = gate.lock.lock().await;
-    let _ = analyze_relations(db, workspace_id).await;
-}
-
 /// Re-profile a single repo on an explicit user action: force the deep classifier
-/// for just this repo, then a serialized relation-only refresh. We deliberately do
-/// NOT route this through the full coalescer: if the forced classify above timed
-/// out (leaving `profiled_commit` unchanged), the workspace pass would see the repo
-/// as still needing classification and run the minutes-long agent a SECOND time
-/// before returning. A relation-only refresh avoids that double timeout while
-/// still serializing so it can't clobber a concurrent background pass's edges.
+/// for just this repo, then refresh the workspace's cross-repo relations. The
+/// WHOLE operation holds the per-workspace `pass_gate` lock, so it is serialized
+/// against any background workspace pass — a concurrent pass can't classify the
+/// same repo in parallel and have its older result overwrite this forced one, and
+/// the relation refresh can't run two agents at once. We classify directly (not
+/// via the full coalescer) so a failed/timed-out forced classify isn't immediately
+/// retried by the workspace pass's stage-1 (which would block for two timeouts).
 pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
+    let gate = pass_gate(repo.workspace_id);
+    let _g = gate.lock.lock().await;
     profile_repo_agent(db, repo).await?;
     emit_graph_updated(repo.workspace_id);
-    refresh_relations_serial(db, repo.workspace_id).await;
+    let _ = analyze_relations(db, repo.workspace_id).await;
     Ok(())
 }
 
@@ -1023,8 +1019,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
             stack: vec![],
@@ -1049,8 +1044,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1075,8 +1069,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1102,8 +1095,7 @@ mod tests {
             .await
             .unwrap();
         let mk = |tier: &str| super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: tier.into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1134,8 +1126,7 @@ mod tests {
             .await
             .unwrap(); // eager placeholder, blank summary
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "".into(),
             stack: vec![],
@@ -1160,8 +1151,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "".into(), // agent omitted it
             stack: vec![],
@@ -1185,8 +1175,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
             stack: vec![],
@@ -1209,8 +1198,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "service".into(), // not one of frontend|gateway|backend
             summary: "agent".into(),
             stack: vec![],
@@ -1233,8 +1221,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "monorepo".into(),
             stack: vec![],
@@ -1291,8 +1278,7 @@ mod tests {
 
         // A later agent pass keeps the pinned tier but refreshes the unpinned summary.
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "fresh agent sum".into(),
             stack: vec![],
@@ -1314,8 +1300,7 @@ mod tests {
             .unwrap();
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
         let wire = super::RepoClassWire {
-            path: None,
-            deps: None,
+            name: None,
             tier: "backend".into(),
             summary: "s".into(),
             stack: vec![],
@@ -1344,15 +1329,17 @@ mod tests {
     #[test]
     fn parse_repo_class_rejects_component_object() {
         // A truncated top-level object missing its closing brace lets json_objects
-        // scan into the nested component; that component (it has `path`) must NOT
-        // be accepted as the repo's classification.
-        let reply = "{\"tier\":\"backend\",\"summary\":\"svc\",\"components\":[\
+        // scan into the nested component; a component carries `name`, so it must NOT
+        // be accepted — including a minimal one with no path/deps. Rejecting leaves
+        // the placeholder for retry (the safe failure).
+        let with_path = "{\"tier\":\"backend\",\"summary\":\"svc\",\"components\":[\
             {\"name\":\"api\",\"path\":\"packages/api\",\"tier\":\"frontend\",\"summary\":\"web\"}]";
-        // The only balanced object here is the component → rejected → None.
-        assert!(super::parse_repo_class(reply).is_none());
-        // A well-formed reply still parses, even one that carries its own `name`
-        // (a repo classification has no `path`/`deps`).
-        let ok = "{\"name\":\"myrepo\",\"tier\":\"backend\",\"summary\":\"svc\"}";
+        assert!(super::parse_repo_class(with_path).is_none());
+        let minimal = "{\"tier\":\"backend\",\"summary\":\"svc\",\"components\":[\
+            {\"name\":\"api\",\"tier\":\"frontend\",\"summary\":\"web\"}]";
+        assert!(super::parse_repo_class(minimal).is_none());
+        // A well-formed repo reply (no top-level `name`) still parses.
+        let ok = "{\"tier\":\"backend\",\"summary\":\"svc\"}";
         assert_eq!(super::parse_repo_class(ok).unwrap().tier, "backend");
     }
 
