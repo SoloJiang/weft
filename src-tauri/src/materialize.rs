@@ -100,18 +100,25 @@ pub async fn materialize_direction(
     git::git_exclude(repo_path, ".worktrees/");
     // Branch off the chosen base (or the repo's live default branch), syncing
     // origin first so the worktree starts from the latest remote state.
-    let base = if dir.base_branch.trim().is_empty() {
-        git::default_base_branch(repo_path, &repo_ref.base_ref)
-    } else {
+    let explicit = !dir.base_branch.trim().is_empty();
+    let base = if explicit {
         dir.base_branch.trim().to_string()
+    } else {
+        git::default_base_branch(repo_path, &repo_ref.base_ref)
     };
-    let (_, synced) = git::add_worktree_synced(repo_path, &dir.branch, &path, &base)
+    let (_, synced) = git::add_worktree_synced(repo_path, &dir.branch, &path, &base, explicit)
         .with_context(|| format!("worktree for repo {}", repo_ref.name))?;
     if synced == Some(false) {
         eprintln!(
             "[weft] materialize {}: origin sync unavailable — branched off local {base}",
             dir.branch
         );
+    }
+    // Keep the diff "vs target" consistent with the branch we actually based off:
+    // when the direction has no explicit target yet, pin it to the resolved base
+    // (otherwise an empty target would resolve via a possibly-stale repo base_ref).
+    if dir.target_branch.trim().is_empty() {
+        repo::set_direction_target_branch(db, direction_id, &base).await?;
     }
     let rec = repo::record_worktree(
         db,
@@ -263,6 +270,54 @@ mod tests {
         assert_ne!(reloc, worktree_dirname_for(Some(Path::new("/custom/other")), r, d));
         // An unresolvable home falls back to the release root.
         assert_eq!(worktree_dirname_for(None, r, d), "weft");
+    }
+
+    #[tokio::test]
+    async fn materialize_pins_empty_target_to_resolved_base() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-mat-tgt-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let g = |a: &[&str]| { Cmd::new("git").args(a).current_dir(&origin).status().unwrap(); };
+        g(&["init", "-q"]); g(&["config","user.email","t@t.t"]); g(&["config","user.name","t"]);
+        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
+        g(&["add","-A"]); g(&["commit","-q","-m","init"]);
+        let main = crate::git::current_branch(&origin).unwrap();
+
+        let clone = root.join("clone");
+        Cmd::new("git").args(["clone","-q",&origin.to_string_lossy(),&clone.to_string_lossy()])
+            .current_dir(&root).status().unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // Register with a STALE base_ref (a feature branch that isn't the remote default).
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), "stale-feature", "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // Empty base_branch → both base_branch and target_branch start empty.
+        let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "")
+            .await.unwrap();
+        assert_eq!(dir.target_branch, "");
+
+        materialize_direction(&db, dir.id).await.unwrap();
+        let after = repo::get_direction(&db, dir.id).await.unwrap().unwrap();
+        assert_eq!(after.target_branch, main,
+            "empty target pinned to the resolved remote default, not the stale base_ref");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 
     #[tokio::test]

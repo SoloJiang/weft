@@ -222,41 +222,58 @@ pub fn add_worktree(
 /// Best-effort fetch of one branch from origin into refs/remotes/origin/<branch>.
 /// Explicit destination refspec so the branch lands in remote-tracking refs even
 /// under a `--single-branch` clone's narrowed remote.origin.fetch; GIT_TERMINAL_PROMPT=0
-/// fails fast instead of hanging on a credential prompt. Errors are ignored —
-/// offline / no remote / missing branch must never block the caller. `dir` may be
-/// the canonical repo or any of its worktrees.
-pub fn fetch_origin_branch(dir: &Path, branch: &str) {
+/// fails fast instead of hanging on a credential prompt. Returns true when the fetch
+/// actually succeeded (the remote was reachable and returned data), false otherwise —
+/// callers use this to distinguish "freshly synced" from "stale ref already present".
+/// `dir` may be the canonical repo or any of its worktrees.
+pub fn fetch_origin_branch(dir: &Path, branch: &str) -> bool {
     let b = normalize_target(branch);
     if b.is_empty() || b == "HEAD" {
-        return;
+        return false;
     }
     let refspec = format!("+{b}:refs/remotes/origin/{b}");
-    let _ = Command::new("git")
+    Command::new("git")
         .args(["fetch", "--quiet", "origin", &refspec])
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output();
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
-/// branches the new worktree off the FRESH `origin/<base_name>` when available
-/// (else local `<base_name>`, else the default-branch fallback chain). Returns the
-/// created path and Some(true) if it branched off the synced remote ref, Some(false)
-/// if it fell back to a local ref (offline / no remote — a "couldn't sync" signal),
-/// or None if an existing path / branch was reused. Reuses `resolve_target_ref`
-/// (same "prefer fresh remote" resolution as the diff target).
+/// branches the new worktree off the FRESH `origin/<base_name>`. Returns the path and
+/// Some(true) only when it branched off origin AND the fetch that refreshed it
+/// succeeded (truly fresh); Some(false) when it fell back to a stale-origin/local ref
+/// (a "couldn't sync" signal); None when an existing path/branch was reused.
+/// `require_resolvable` = the base was an explicit user/lead choice: if it resolves to
+/// neither `origin/<base>` nor local `<base>` (even after fetch), return an error
+/// rather than silently using the repo default. When false (empty/default base), fall
+/// back through the default-branch chain so the worktree is still created.
 pub fn add_worktree_synced(
     repo: &Path,
     branch: &str,
     worktree_path: &Path,
     base_name: &str,
+    require_resolvable: bool,
 ) -> Result<(PathBuf, Option<bool>)> {
     if worktree_path.exists() {
         return Ok((worktree_path.to_path_buf(), None));
     }
-    fetch_origin_branch(repo, base_name);
-    let resolved = resolve_target_ref(repo, base_name);
-    let synced = resolved.starts_with("origin/");
+    let fetched = fetch_origin_branch(repo, base_name);
+    let t = normalize_target(base_name);
+    let remote = format!("origin/{t}");
+    let resolved = if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &remote) {
+        remote.clone()
+    } else if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &t) {
+        t.clone()
+    } else if require_resolvable {
+        bail!("base branch {base_name:?} not found locally or on origin (after fetch)");
+    } else {
+        resolve_base_ref(repo, &t)
+    };
+    // Fresh only if we branched off the remote ref AND the fetch actually succeeded.
+    let synced = resolved.starts_with("origin/") && fetched;
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -1105,7 +1122,7 @@ mod tests {
         assert!(!ref_resolves(&clone, "origin/develop"), "precondition");
 
         let wt = tmp("aws-wt");
-        let (_, synced) = add_worktree_synced(&clone, "feat/x", &wt, "develop").unwrap();
+        let (_, synced) = add_worktree_synced(&clone, "feat/x", &wt, "develop", false).unwrap();
         assert_eq!(synced, Some(true), "branched off the synced origin/develop");
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), dev_commit);
 
@@ -1122,9 +1139,60 @@ mod tests {
         init_repo(&repo).unwrap();
         let base = current_branch(&repo).unwrap();
         let wt = tmp("aws-offline-wt");
-        let (_, synced) = add_worktree_synced(&repo, "feat/y", &wt, &base).unwrap();
+        let (_, synced) = add_worktree_synced(&repo, "feat/y", &wt, &base, false).unwrap();
         assert_eq!(synced, Some(false), "offline → branched off local");
         assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_stale_origin_without_fetch_is_not_synced() {
+        // Clone has origin/main, then break the remote so fetch fails — the stale
+        // origin ref still resolves, but we must NOT report it as freshly synced.
+        let origin = tmp("stale-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        let clone = tmp("stale-clone");
+        git(&std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        assert!(ref_resolves(&clone, &format!("origin/{main}")), "precondition: origin ref present");
+        // Break the remote so the fetch inside add_worktree_synced fails.
+        git(&clone, &["remote", "set-url", "origin", "/nonexistent/repo.git"]).unwrap();
+        let wt = tmp("stale-wt");
+        let (_, synced) = add_worktree_synced(&clone, "feat/s", &wt, &main, false).unwrap();
+        assert_eq!(synced, Some(false), "stale origin + failed fetch must not be 'synced'");
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_explicit_unresolvable_base_errors() {
+        // An explicit base that resolves to neither origin/<base> nor local must error
+        // (require_resolvable=true), instead of silently using the repo default.
+        let repo = tmp("explicit-bad");
+        init_repo(&repo).unwrap();
+        let wt = tmp("explicit-bad-wt");
+        let res = add_worktree_synced(&repo, "feat/e", &wt, "no-such-branch-xyz", true);
+        assert!(res.is_err(), "explicit unresolvable base must error");
+        assert!(!wt.exists(), "no worktree created on error");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_empty_default_base_is_lenient() {
+        // The default/empty path (require_resolvable=false) still falls back and creates,
+        // even if the passed name doesn't resolve.
+        let repo = tmp("lenient");
+        init_repo(&repo).unwrap();
+        let wt = tmp("lenient-wt");
+        let (_, synced) = add_worktree_synced(&repo, "feat/l", &wt, "no-such-default", false).unwrap();
+        assert_eq!(synced, Some(false));
+        assert!(wt.join(".git").exists(), "default path still creates a worktree");
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
