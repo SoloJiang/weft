@@ -666,6 +666,16 @@ async fn persist_repo_class(
         _ => (agent_summary, false),
     };
 
+    // A classification with no usable summary (the agent omitted it and there was
+    // no prior/user summary to fall back to) is incomplete: like a missing tier,
+    // leave the placeholder/prior intact rather than persisting a canonical tier +
+    // commit that `needs_classification` would then skip, stranding a blank node.
+    // (A non-empty value here is either user-pinned or agent-provided, so this only
+    // catches truly empty results.)
+    if summary.trim().is_empty() {
+        return Ok(());
+    }
+
     // Persist only the ownership the user STILL holds: a field whose value was
     // taken from the agent is no longer user-pinned, so a later pass can refresh it.
     let source = combine_source(summary_still_owned, tier_still_owned);
@@ -1022,6 +1032,31 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "agent-filled tier is refreshable");
         assert_eq!(p.summary, "mine", "user summary still pinned");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_rejects_blank_summary_classification() {
+        // A truncated reply (tier but no summary) on a fresh placeholder with no
+        // prior summary is incomplete: leave the placeholder for retry rather than
+        // saving a canonical tier that needs_classification would skip forever.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap(); // eager placeholder, blank summary
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire, "abc").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "", "incomplete classification not persisted — stays a placeholder");
+        assert_eq!(p.summary, "");
     }
 
     #[tokio::test]
