@@ -552,8 +552,10 @@ pub async fn calibrate_repo_relation(
     };
     let mut rels: Vec<crate::profile::AgentRelation> =
         serde_json::from_str(&p.relations).unwrap_or_default();
-    // One entry per (to, kind): drop any prior one, then add the calibration.
-    rels.retain(|r| !(r.to == to_id && r.kind == kind));
+    // One entry per (to, kind, via): replace only the SAME-evidence entry, so a
+    // calibration of a distinct edge (same to/kind, different via) doesn't erase a
+    // prior pin/tombstone — `merge_relations` keys on `via` too.
+    rels.retain(|r| !(r.to == to_id && r.kind == kind && r.via == via));
     rels.push(crate::profile::AgentRelation {
         to: to_id,
         kind: kind.to_string(),
@@ -1505,14 +1507,22 @@ mod tests {
         assert_eq!(rels[0].source, "user");
         assert!(!rels[0].rejected);
 
-        // remove the same pair+kind → a single user tombstone (not two rows)
-        calibrate_repo_relation(&db, web.id, api.id, "grpc", "", "remove")
+        // remove the SAME (to, kind, via) → replaces it with a single tombstone.
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "Pricing.Quote", "remove")
             .await
             .unwrap();
         let rels = read(&db, web.id).await;
         assert_eq!(rels.len(), 1);
         assert!(rels[0].rejected, "removal writes a tombstone");
         assert_eq!(rels[0].source, "user");
+
+        // A distinct edge (same to/kind, different via) is a SEPARATE entry — it
+        // doesn't replace the tombstone above.
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "Other.Call", "add")
+            .await
+            .unwrap();
+        let rels = read(&db, web.id).await;
+        assert_eq!(rels.len(), 2, "distinct via is a separate calibration");
 
         // a producer with no profile row yet (an "analyzing" placeholder) gets a
         // minimal row created so the calibration persists instead of vanishing.

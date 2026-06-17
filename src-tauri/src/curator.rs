@@ -672,8 +672,20 @@ async fn persist_repo_class(
             c
         })
         .collect();
-    let comps_json = serde_json::to_string(&components).unwrap_or_else(|_| "[]".into());
-    let stack_json = json_strs(&wire.stack);
+    // Don't let a partial reply (one that omitted the factual fields) erase
+    // existing facts: when the agent returns no components/stack, keep the prior
+    // ones rather than overwriting with [] (which `needs_classification` would
+    // then treat as fresh, skipping the repo).
+    let comps_json = if components.is_empty() {
+        prior.as_ref().map(|p| p.components.clone()).unwrap_or_else(|| "[]".into())
+    } else {
+        serde_json::to_string(&components).unwrap_or_else(|_| "[]".into())
+    };
+    let stack_json = if wire.stack.is_empty() {
+        prior.as_ref().map(|p| p.stack.clone()).unwrap_or_else(|| "[]".into())
+    } else {
+        json_strs(&wire.stack)
+    };
 
     let agent_tier = profile::normalize_tier(&wire.tier);
     // A truncated reply may omit the summary; fall back to the prior summary
@@ -830,6 +842,22 @@ fn common_ancestor(paths: &[&str]) -> Option<std::path::PathBuf> {
     Some(out)
 }
 
+/// Whether a directory is too broad to safely sandbox a read-only scan in — i.e.
+/// it IS the user's home directory or an ancestor of it (`/`, `/home`, `/Users`,
+/// `~`). Running there would let the tool read unrelated private files, so the
+/// caller falls back to a single repo instead.
+fn is_too_broad(dir: &Path) -> bool {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    match home {
+        // `dir` is too broad when home is the same dir or nested under it.
+        Some(h) => h.starts_with(dir),
+        // Without a known home, be conservative: anything shallow is suspect.
+        None => dir.components().count() < 4,
+    }
+}
+
 /// The cross-repo relations pass: reload the (classified) profiles, infer the
 /// runtime/infra/lib relations between them, and persist. Needs ≥2 profiled
 /// repos. A timed-out / unparseable reply leaves existing relations intact
@@ -857,10 +885,13 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     // Run from the repos' common-ancestor directory, not just the first repo, so a
     // sandboxed tool (codex read-only) can actually read EVERY repo's path — the
     // sandbox is scoped to cwd, and a sibling repo outside it would be unreadable,
-    // so cross-repo edges would be missed. Falls back to the first repo when there
-    // is no meaningful shared ancestor.
+    // so cross-repo edges would be missed. But REFUSE a too-broad ancestor (the
+    // home directory or above): the read-only sandbox would then expose unrelated
+    // private files under it. In that case fall back to the first repo (codex may
+    // miss some cross-repo file reads, but it never reads outside a repo).
     let paths: Vec<&str> = profiled.iter().map(|(r, _)| r.local_git_path.as_str()).collect();
     let cwd = common_ancestor(&paths)
+        .filter(|anc| !is_too_broad(anc))
         .unwrap_or_else(|| Path::new(&profiled[0].0.local_git_path).to_path_buf());
     let tool = crate::tools::default_tool(db).await;
     if let Ok(text) = run_agent_once(&tool, &cwd, &prompt).await {
@@ -1110,6 +1141,35 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "agent-filled tier is refreshable");
         assert_eq!(p.summary, "mine", "user summary still pinned");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_preserves_facts_on_partial_reply() {
+        // A partial reply (tier only, no stack/components/summary) must not erase
+        // the repo's existing stack/components/summary.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(
+            &db, r.id, "backend", r#"["rust"]"#, "old summary",
+            r#"[{"name":"api","tier":"backend"}]"#, "agent", "",
+        )
+        .await
+        .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            name: None,
+            summary: "".into(),
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.stack, r#"["rust"]"#, "prior stack preserved");
+        assert!(p.components.contains("api"), "prior components preserved");
+        assert_eq!(p.summary, "old summary", "prior summary preserved");
     }
 
     #[tokio::test]
