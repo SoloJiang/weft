@@ -140,17 +140,23 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The default BASE branch *name* for a NEW worktree (and the value captured as a
-/// repo's base_ref at add time): the live remote default (origin/HEAD) when the
-/// repo has one, else the recorded `base_ref` if it's a real branch AND it still
-/// resolves locally or as `origin/<base>`, else main → master → "main". Unlike
-/// `default_target_branch` (which prefers the recorded base_ref first), this
-/// trusts the live remote default over a possibly stale recorded branch — a repo
-/// added while on a feature branch still bases new work off the remote's real
-/// default. Returns a bare branch name (no `origin/`).
+/// The default BASE branch name for a NEW worktree (and the value captured as a
+/// repo's base_ref at add time). Precedence: (1) the remote's default (origin/HEAD)
+/// if it still resolves; (2) the conventional integration branch main/master
+/// (local or origin/) — a repo added on a feature branch without origin/HEAD must
+/// not default to that feature branch; (3) the recorded `base_ref` if it resolves
+/// (non-standard repos, e.g. a "trunk"/"develop" default with no origin/HEAD and no
+/// main/master); (4) "main". Returns a bare branch name (no `origin/`).
 pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     if let Some(name) = remote_default_branch(repo) {
-        return name;
+        if ref_resolves(repo, &name) || ref_resolves(repo, &format!("origin/{name}")) {
+            return name;
+        }
+    }
+    for c in ["main", "master"] {
+        if ref_resolves(repo, c) || ref_resolves(repo, &format!("origin/{c}")) {
+            return c.to_string();
+        }
     }
     let b = base_ref.trim();
     let b = b.strip_prefix("origin/").unwrap_or(b);
@@ -159,11 +165,6 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
         && (ref_resolves(repo, b) || ref_resolves(repo, &format!("origin/{b}")))
     {
         return b.to_string();
-    }
-    for c in ["main", "master"] {
-        if ref_resolves(repo, c) {
-            return c.to_string();
-        }
     }
     "main".to_string()
 }
@@ -1105,6 +1106,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
         let _ = std::fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn default_base_branch_falls_through_stale_origin_head() {
+        // origin/HEAD points at a branch that no longer resolves → must NOT be returned.
+        let origin = tmp("dbb-stale-origin");
+        init_repo(&origin).unwrap();
+        let clone = tmp("dbb-stale-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        // Point origin/HEAD at a dangling remote branch.
+        git(&clone, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]).unwrap();
+        assert!(!ref_resolves(&clone, "origin/gone"), "precondition: dangling origin/HEAD target");
+        let got = default_base_branch(&clone, "");
+        assert_ne!(got, "gone", "stale origin/HEAD must not be used");
+        assert!(ref_resolves(&clone, &got) || got == "main", "falls through to a real default, got {got}");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn default_base_branch_prefers_main_over_recorded_feature_branch() {
+        // No remote (no origin/HEAD). On a feature branch with main present, a blank
+        // base must default to main, NOT the recorded feature branch.
+        let repo = tmp("dbb-feature");
+        init_repo(&repo).unwrap();
+        let def = current_branch(&repo).unwrap(); // main or master
+        git(&repo, &["checkout", "-q", "-b", "feature-x"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "f"]).unwrap();
+        // base_ref recorded as the feature branch (what register_repo would capture here).
+        let got = default_base_branch(&repo, "feature-x");
+        assert_eq!(got, def, "must prefer the integration branch over a recorded feature branch");
+        assert_ne!(got, "feature-x");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

@@ -151,13 +151,14 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         if d.decision == "approved" || d.decision == "denied" {
             continue; // already handled via per-card approve/deny
         }
-        // Resumable/idempotent: a prior confirm attempt that failed on a later
-        // direction may have already created this lane; skip it so a retry doesn't
-        // duplicate tasks/worktrees (mirrors approve_direction's fast path).
-        if existing
+        // Resumable/idempotent: a prior confirm attempt that failed on a later lane
+        // may have already created this one. Skip re-creating it, but STILL return its
+        // id so the frontend dispatches a worker for it (mirrors approve_direction).
+        if let Some(x) = existing
             .iter()
-            .any(|x| x.name == d.name && x.repo_id == d.repo.repo_id)
+            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id)
         {
+            created.push(x.id);
             continue;
         }
         let dir = repo::create_direction(
@@ -709,6 +710,39 @@ mod tests {
         // already-created lane.
         let _second = confirm(&db, t.id).await.unwrap();
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "no duplicate direction on re-confirm");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_retry_returns_existing_id_for_dispatch() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-redispatch-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let proposal = Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        let first = confirm(&db, t.id).await.unwrap();
+        assert_eq!(first.len(), 1);
+        let id = first[0];
+        // A retry must STILL return that id (so the frontend dispatches a worker for it),
+        // without creating a duplicate.
+        let second = confirm(&db, t.id).await.unwrap();
+        assert_eq!(second, vec![id], "retry returns the existing id for dispatch");
+        assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "no duplicate");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
