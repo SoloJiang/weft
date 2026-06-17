@@ -307,6 +307,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
   const [worktreesByDirection, setWorktrees] = useState<Record<number, Worktree[]>>({});
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  // Live mirror so async tasks can check the CURRENT active thread instead of
+  // the stale one captured when they started (mirrors activeWorkspaceIdRef).
+  const activeThreadIdRef = useRef(activeThreadId);
+  activeThreadIdRef.current = activeThreadId;
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
   const [checksByDirection, setChecksByDirection] = useState<Record<number, RepoChecks[]>>({});
   const [checkingDirections, setCheckingDirections] = useState<Record<number, boolean>>({});
@@ -1680,7 +1684,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const p = pendingBaseSave.current
         .catch(() => {})
         .then(() => api.setProposalDirectionBase(tid, index, base.trim()))
-        .then(() => refreshProposal(tid));
+        .then(() => {
+          // Don't let a save that completes after a thread switch overwrite the
+          // global proposal with the old thread's data.
+          if (activeThreadIdRef.current === tid) {
+            return refreshProposal(tid);
+          }
+        });
       pendingBaseSave.current = p;
       return p;
     },
