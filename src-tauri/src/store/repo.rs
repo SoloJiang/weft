@@ -561,6 +561,17 @@ pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::M
         .await?)
 }
 
+/// Delete a direction row (and any worktree rows referencing it). Used to roll back
+/// a half-created direction when materialize fails, so a corrected retry starts clean.
+pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
+    worktree::Entity::delete_many()
+        .filter(worktree::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
+    direction::Entity::delete_by_id(direction_id).exec(&db.0).await?;
+    Ok(())
+}
+
 /// Create a direction bound to exactly one write repo + a reason (scope rework,
 /// spec Part 1). The worktree is materialized separately by `materialize`.
 pub async fn create_direction(

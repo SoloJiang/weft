@@ -161,7 +161,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             &d.base_branch,
         )
         .await?;
-        materialize::materialize_direction(db, dir.id).await?;
+        if let Err(err) = materialize::materialize_direction(db, dir.id).await {
+            let _ = repo::delete_direction(db, dir.id).await;
+            return Err(err);
+        }
         created.push(dir.id);
     }
     if let Some(p) = repo::get_plan(db, thread_id).await? {
@@ -224,7 +227,12 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         &resolved.base_branch,
     )
     .await?;
-    materialize::materialize_direction(db, dir.id).await?;
+    if let Err(err) = materialize::materialize_direction(db, dir.id).await {
+        // Roll back the just-created row so a corrected retry starts clean and
+        // doesn't hit the idempotent fast-path with a worktree-less task.
+        let _ = repo::delete_direction(db, dir.id).await;
+        return Err(err);
+    }
     proposal.directions[index].decision = "approved".to_string();
     persist_decision(db, thread_id, &proposal, &plan).await?;
     Ok(dir.id)
@@ -246,6 +254,24 @@ pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(St
     let info = (pd.name.clone(), pd.repo.clone());
     persist_decision(db, thread_id, &proposal, &plan).await?;
     Ok(info)
+}
+
+/// Set one proposed direction's base branch in the stored proposal, by index.
+/// Targeted read-modify-write that preserves the plan's status + created_at, so
+/// concurrent edits to different directions don't clobber and a confirmed plan is
+/// never downgraded back to "proposed".
+pub async fn set_direction_base(db: &Db, thread_id: i32, index: usize, base: &str) -> Result<()> {
+    let plan = repo::get_plan(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no proposal for thread {thread_id}"))?;
+    let mut proposal: Proposal = serde_json::from_str(&plan.proposal).unwrap_or_default();
+    let pd = proposal
+        .directions
+        .get_mut(index)
+        .ok_or_else(|| anyhow::anyhow!("direction index {index} out of range"))?;
+    pd.base_branch = base.trim().to_string();
+    persist_decision(db, thread_id, &proposal, &plan).await?;
+    Ok(())
 }
 
 async fn persist_decision(
@@ -576,6 +602,73 @@ mod tests {
         // Cleanup.
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn set_direction_base_targeted_keeps_status() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-setbase-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let proposal = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        // Simulate a confirmed plan, then a targeted base edit must NOT downgrade status.
+        let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        repo::upsert_plan(&db, t.id, &plan.proposal, "confirmed", &plan.created_at).await.unwrap();
+        set_direction_base(&db, t.id, 1, "develop").await.unwrap();
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "confirmed", "targeted base edit must not downgrade status");
+        let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
+        assert_eq!(parsed.directions[1].base_branch, "develop");
+        assert_eq!(parsed.directions[0].base_branch, "", "other directions untouched");
+        // Out-of-range index errors.
+        assert!(set_direction_base(&db, t.id, 9, "x").await.is_err());
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn approve_with_bad_explicit_base_rolls_back() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-rollback-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api"); // local repo, only the default branch, no remote
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // An explicit base that does not exist locally or on a remote.
+        let proposal = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"impl-only".into(), base_branch:"no-such-xyz".into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        let res = approve_direction(&db, t.id, 0, "codex").await;
+        assert!(res.is_err(), "approve with an unresolvable explicit base must error");
+        assert!(repo::list_directions(&db, t.id).await.unwrap().is_empty(),
+            "failed approve must leave NO orphan direction row");
+        // Proposal still pending (decision not set).
+        let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let parsed: Proposal = serde_json::from_str(&plan.proposal).unwrap();
+        assert_eq!(parsed.directions[0].decision, "", "decision stays unset after a failed approve");
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

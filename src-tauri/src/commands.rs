@@ -402,6 +402,19 @@ pub async fn save_proposal(
         .map_err(e)
 }
 
+/// Set one proposed direction's base branch in the stored proposal (targeted; keeps status).
+#[tauri::command]
+pub async fn set_proposal_direction_base(
+    db: State<'_, Db>,
+    thread_id: i32,
+    index: usize,
+    base: String,
+) -> R<()> {
+    crate::planner::set_direction_base(&db, thread_id, index, &base)
+        .await
+        .map_err(e)
+}
+
 /// Confirm the stored proposal: create its directions + materialize worktrees.
 #[tauri::command]
 pub async fn confirm_proposal(db: State<'_, Db>, thread_id: i32) -> R<Vec<i32>> {

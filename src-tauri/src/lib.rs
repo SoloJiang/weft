@@ -197,6 +197,7 @@ pub fn run() {
             commands::set_direction_target_branch,
             commands::get_proposal,
             commands::save_proposal,
+            commands::set_proposal_direction_base,
             commands::confirm_proposal,
             commands::preview_brief,
             commands::verify_direction,
