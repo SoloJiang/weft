@@ -396,8 +396,11 @@ export const en = {
     reanalyze: "Analyze deps",
     reanalyzing: "Analyzing…",
     reanalyzeHint: "Re-run the agent to classify each repo's tier and infer cross-repo links (read-only)",
-    calibrate: "Calibrate",
-    calibrateHint: "Chat with the curator to correct the dependency graph; your edits are pinned",
+    curatorTitle: "Curator",
+    curatorSubtitle: "Calibrate cross-repo dependencies",
+    curatorLoading: "Opening curator…",
+    expandCurator: "Open curator",
+    collapseCurator: "Collapse curator",
     deleteRepo: "Remove from workspace",
     deleteRepoTitle: "Remove {{name}}?",
     deleteRepoBody:

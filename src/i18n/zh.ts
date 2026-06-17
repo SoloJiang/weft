@@ -381,8 +381,11 @@ export const zh = {
     reanalyze: "分析依赖",
     reanalyzing: "分析中…",
     reanalyzeHint: "重新运行 agent，为每个仓库判定层级并推断跨仓关系（只读）",
-    calibrate: "校准",
-    calibrateHint: "与依赖管家对话，校正依赖图；你的修改会被固定保留",
+    curatorTitle: "依赖助手",
+    curatorSubtitle: "校准仓库间依赖",
+    curatorLoading: "正在打开依赖助手…",
+    expandCurator: "打开依赖助手",
+    collapseCurator: "收起依赖助手",
     deleteRepo: "从工作区移除",
     deleteRepoTitle: "移除 {{name}}？",
     deleteRepoBody:

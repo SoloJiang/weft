@@ -36,7 +36,15 @@ const LOCAL_SLASH = [
  * event, and structured cards sit inline in the timeline. The engine survives
  * restarts (resume) so history is always here and the composer always works.
  */
-export function LeadTab({ onReview }: { onReview: () => void }) {
+export function LeadTab({
+  onReview,
+  threadId,
+  compact = false,
+}: {
+  onReview: () => void;
+  threadId?: number;
+  compact?: boolean;
+}) {
   const {
     activeThreadId,
     activeWorkspaceId,
@@ -61,10 +69,16 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
   const [promptState, setPromptState] = useState<PromptState | null>(null);
-  const [rail, setRail] = useState<"info" | "none">("info");
+  const [rail, setRail] = useState<"info" | "none">(compact ? "none" : "info");
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
   // The lead's working dir — resolves relative file paths it mentions in chat.
   const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
+
+  // The thread this chat renders. Defaults to the globally-active thread (the
+  // ThreadBoard usage); the embedded curator panel passes its own thread id so
+  // it renders without touching navigation. All lead store slices are keyed by
+  // thread id, so only the source of the id changes.
+  const tid = threadId ?? activeThreadId;
 
   const promptText = (title: string, placeholder?: string) =>
     new Promise<string | null>((resolve) =>
@@ -79,8 +93,8 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   );
 
   useEffect(() => {
-    if (activeThreadId != null) void loadLeadChat(activeThreadId);
-  }, [activeThreadId, loadLeadChat]);
+    if (tid != null) void loadLeadChat(tid);
+  }, [tid, loadLeadChat]);
 
   // Enabled skills for the panel (workspace-level). Re-fetch when skills change.
   useEffect(() => {
@@ -94,30 +108,30 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   // 非-claude lead 的带外 meta(model/window/MCP server)。claude lead 命令返回 null →
   // 不并入(事件流 init/usage 已填,别被空快照覆盖)。开页 + turn 结束 + 重载各拉一次。
   useEffect(() => {
-    if (activeThreadId == null) return;
+    if (tid == null) return;
     // 按 turn state 触发,running/idle 都会跑;用 alive 丢弃被取代的旧请求,避免
     // running 期请求晚于 idle 期返回而用旧 meta 盖掉新值(也防 thread 切换串台)。
     let alive = true;
     void api
-      .leadSessionMeta(activeThreadId)
+      .leadSessionMeta(tid)
       .then((s) => {
-        if (alive && s) mergeLeadMeta(activeThreadId, s);
+        if (alive && s) mergeLeadMeta(tid, s);
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [activeThreadId, leadTurn[activeThreadId ?? -1]?.state, skillsDirtyAt, mergeLeadMeta]);
+  }, [tid, leadTurn[tid ?? -1]?.state, skillsDirtyAt, mergeLeadMeta]);
 
   useEffect(() => {
     // Drop the previous thread's cwd immediately — otherwise a relative file
     // ref clicked during the fetch window would resolve against the old lead
     // workspace. Undefined cwd fails safe (relative paths report not-found).
     setLeadCwd(undefined);
-    if (activeThreadId == null) return;
+    if (tid == null) return;
     let alive = true;
     void api
-      .leadState(activeThreadId)
+      .leadState(tid)
       .then((st) => {
         if (alive) setLeadCwd(st.cwd);
       })
@@ -125,19 +139,19 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
     return () => {
       alive = false;
     };
-  }, [activeThreadId]);
+  }, [tid]);
 
-  if (activeThreadId == null) return null;
+  if (tid == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
-  const msgs = (leadMessages[activeThreadId] ?? []).filter((m) => m.session_id == null);
-  const turn = leadTurn[activeThreadId] ?? { state: "stopped" as const, queued: 0 };
+  const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
+  const turn = leadTurn[tid] ?? { state: "stopped" as const, queued: 0 };
   // The lead engine runs the thread's lead_tool (not always claude).
-  const leadTool = threads.find((th) => th.id === activeThreadId)?.lead_tool ?? "claude";
+  const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
 
   // 重载会话:重拉 skills + 标记静默 re-spawn(claude 下条消息拾取新 MCP/skill)。
   const onReload = () => {
     markSkillsDirty();
-    void api.flagLeadSkillRefresh(activeThreadId);
+    void api.flagLeadSkillRefresh(tid);
   };
 
   const onLocalSlash = (name: string) => {
@@ -147,7 +161,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
       actionId: `local-${item.kind}-${Date.now()}`,
       kind: item.kind,
       ctx: {
-        threadId: activeThreadId,
+        threadId: tid,
         preferredWorkspaceId: activeWorkspaceId,
       },
       promptText,
@@ -157,31 +171,33 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
   return (
     <div className="flex min-h-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
-        <header className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2">
-          <span className="mr-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-[11px] font-medium text-ink-muted">
-            <ToolIcon tool={leadTool} size={12} />
-            {toolFullName(leadTool)}
-          </span>
-          <button
-            onClick={() => setRail((r) => (r === "info" ? "none" : "info"))}
-            title={t("sessionInfo.title")}
-            aria-label={t("sessionInfo.title")}
-            className={`grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border transition-colors ${
-              rail === "info"
-                ? "border-brand bg-brand-ghost text-brand"
-                : "border-border text-ink-muted hover:bg-surface hover:text-ink"
-            }`}
-          >
-            <Info size={13} />
-          </button>
-        </header>
+        {!compact && (
+          <header className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2">
+            <span className="mr-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-[11px] font-medium text-ink-muted">
+              <ToolIcon tool={leadTool} size={12} />
+              {toolFullName(leadTool)}
+            </span>
+            <button
+              onClick={() => setRail((r) => (r === "info" ? "none" : "info"))}
+              title={t("sessionInfo.title")}
+              aria-label={t("sessionInfo.title")}
+              className={`grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border transition-colors ${
+                rail === "info"
+                  ? "border-brand bg-brand-ghost text-brand"
+                  : "border-border text-ink-muted hover:bg-surface hover:text-ink"
+              }`}
+            >
+              <Info size={13} />
+            </button>
+          </header>
+        )}
         <PermissionBar
-          asks={asks.filter((a) => a.thread === activeThreadId && (a.dir === "lead" || a.dir === ""))}
+          asks={asks.filter((a) => a.thread === tid && (a.dir === "lead" || a.dir === ""))}
         />
         <ChatTimeline
           messages={msgs}
           busy={turn.state === "busy"}
-          activity={leadActivity[activeThreadId]}
+          activity={leadActivity[tid]}
           onReviewProposal={() => {
             setReviewingProposal(true);
             onReview();
@@ -189,27 +205,27 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
           proposal={proposal}
           runAction={run}
           actionsBusy={actionsBusy}
-          threadId={activeThreadId}
+          threadId={tid}
           workspaceId={activeWorkspaceId}
           promptText={promptText}
           cwd={leadCwd}
           emptyState={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
         />
         <ChatComposer
-          slashCommands={leadSlash[activeThreadId] ?? []}
+          slashCommands={leadSlash[tid] ?? []}
           localSlash={localSlash}
           onLocalSlash={onLocalSlash}
           busy={turn.state === "busy"}
           queued={turn.queued}
           onSend={(text, images, files) =>
-            sendLeadChat(activeThreadId, text, images, files)
+            sendLeadChat(tid, text, images, files)
           }
-          onStop={() => void interruptLead(activeThreadId)}
-          onNeedSlashCommands={() => discoverLeadSlash(activeThreadId)}
+          onStop={() => void interruptLead(tid)}
+          onNeedSlashCommands={() => discoverLeadSlash(tid)}
           onTakeOver={async () => {
-            const st = await api.leadState(activeThreadId);
+            const st = await api.leadState(tid);
             if (!st.native_id) return false;
-            await api.leadStop(activeThreadId);
+            await api.leadStop(tid);
             await navigator.clipboard.writeText(
               resumeCommand(leadTool, st.cwd, st.native_id, st.command),
             );
@@ -267,7 +283,7 @@ export function LeadTab({ onReview }: { onReview: () => void }) {
 
       {rail === "info" && (
         <SessionInfoPanel
-          meta={leadMeta[activeThreadId]}
+          meta={leadMeta[tid]}
           skills={skills}
           onClose={() => setRail("none")}
           onReload={onReload}
