@@ -230,11 +230,15 @@ fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
 
 /// One relation as the curator agent reports it: flat, with an explicit `from`
 /// (the stored `AgentRelation` is per-producer, so `from` is implicit there).
-/// Lenient: missing fields default.
+/// Lenient: missing fields default. `from`/`to` are optional so one malformed row
+/// (missing an endpoint) is dropped by `persist_relations` rather than rejecting
+/// the entire reply — this agent pass is the only source of cross-repo edges.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CuratorRelation {
-    pub from: i32,
-    pub to: i32,
+    #[serde(default)]
+    pub from: Option<i32>,
+    #[serde(default)]
+    pub to: Option<i32>,
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
@@ -518,7 +522,12 @@ async fn persist_relations(
     let ids: HashSet<i32> = profiled.iter().map(|(r, _)| r.id).collect();
     let mut by_from: HashMap<i32, Vec<crate::profile::AgentRelation>> = HashMap::new();
     for rel in relations {
-        if rel.from == rel.to || !ids.contains(&rel.from) || !ids.contains(&rel.to) {
+        // Drop a malformed row (missing endpoint, self-edge, or unknown repo)
+        // without discarding the rest of the pass.
+        let (Some(from), Some(to)) = (rel.from, rel.to) else {
+            continue;
+        };
+        if from == to || !ids.contains(&from) || !ids.contains(&to) {
             continue;
         }
         // Normalize the agent's kind to the canonical lowercase set; drop anything
@@ -527,10 +536,10 @@ async fn persist_relations(
             continue;
         };
         by_from
-            .entry(rel.from)
+            .entry(from)
             .or_default()
             .push(crate::profile::AgentRelation {
-                to: rel.to,
+                to,
                 kind,
                 via: rel.via.clone(),
                 confidence: rel.confidence,
@@ -587,7 +596,12 @@ fn emit_graph_updated(workspace_id: i32) {
 /// components. Factual fields (stack/components) always refresh; the opinion
 /// fields (tier/summary) are preserved when the user has pinned them
 /// (source = "user"). Component tiers are normalized to the canonical set.
-async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire) -> Result<()> {
+async fn persist_repo_class(
+    db: &Db,
+    repo: &repo_ref::Model,
+    wire: RepoClassWire,
+    commit: &str,
+) -> Result<()> {
     // The per-repo agent pass can run for minutes; if the repo was removed
     // meanwhile, the captured `repo_ref` is stale. Skip rather than recreate an
     // orphaned profile row (repo_profile has no enforced foreign key).
@@ -612,9 +626,15 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
         .collect();
     let comps_json = serde_json::to_string(&components).unwrap_or_else(|_| "[]".into());
     let stack_json = json_strs(&wire.stack);
-    let commit = git::head_commit(Path::new(&repo.local_git_path)).unwrap_or_default();
 
     let agent_tier = profile::normalize_tier(&wire.tier);
+    // A truncated reply may omit the summary; fall back to the prior summary
+    // rather than blanking an existing one (and then skipping the repo forever).
+    let agent_summary = if wire.summary.trim().is_empty() {
+        prior.as_ref().map(|p| p.summary.clone()).unwrap_or_default()
+    } else {
+        wire.summary
+    };
 
     // Tier: a user-pinned valid tier is kept (still owned); a user-pinned
     // legacy/empty tier adopts the agent's valid tier (no longer owned — it's the
@@ -639,10 +659,11 @@ async fn persist_repo_class(db: &Db, repo: &repo_ref::Model, wire: RepoClassWire
 
     // Summary: keep a non-empty user-pinned summary (still owned); otherwise take
     // the agent's (no longer owned — covers an unowned field and an owned-but-blank
-    // placeholder).
+    // placeholder). `agent_summary` already falls back to the prior value when the
+    // agent omitted it.
     let (summary, summary_still_owned) = match prior.as_ref().filter(|_| summary_owned) {
         Some(p) if !p.summary.trim().is_empty() => (p.summary.clone(), true),
-        _ => (wire.summary, false),
+        _ => (agent_summary, false),
     };
 
     // Persist only the ownership the user STILL holds: a field whose value was
@@ -667,9 +688,14 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     }
     let tool = crate::tools::default_tool(db).await;
     let prompt = build_repo_class_prompt(&repo.name);
+    // Capture HEAD BEFORE the (minutes-long) run so the stored `profiled_commit`
+    // reflects the tree the agent actually classified. If the checkout advances
+    // during the run, a later pass sees HEAD != profiled_commit and reclassifies,
+    // instead of saving the new SHA against a stale classification.
+    let head_before = git::head_commit(cwd).unwrap_or_default();
     let text = run_agent_once(&tool, cwd, &prompt).await?;
     if let Some(wire) = parse_repo_class(&text) {
-        persist_repo_class(db, repo, wire).await?;
+        persist_repo_class(db, repo, wire, &head_before).await?;
     }
     Ok(())
 }
@@ -914,7 +940,7 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend", "legacy 'service' migrated to a real tier");
         assert_eq!(p.summary, "mine", "user-pinned summary preserved");
@@ -938,7 +964,7 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "gateway", "a valid user-pinned tier is not overwritten");
     }
@@ -962,7 +988,7 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend", "empty user tier adopts the agent's classification");
         assert_eq!(p.summary, "mine", "user-pinned summary preserved");
@@ -987,15 +1013,38 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, mk("backend")).await.unwrap();
+        super::persist_repo_class(&db, &r, mk("backend"), "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend", "empty tier adopts the agent's");
         assert_eq!(p.source, "user_summary", "tier ownership dropped, summary kept");
         // A second pass now refreshes the (no-longer-owned) tier.
-        super::persist_repo_class(&db, &r, mk("frontend")).await.unwrap();
+        super::persist_repo_class(&db, &r, mk("frontend"), "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "agent-filled tier is refreshable");
         assert_eq!(p.summary, "mine", "user summary still pinned");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_keeps_prior_summary_when_agent_omits() {
+        // A truncated reply (tier but no summary) must not blank an existing
+        // summary, or needs_classification would skip it forever.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "prior summary", "[]", "agent", "")
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            summary: "".into(), // agent omitted it
+            stack: vec![],
+            components: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.summary, "prior summary", "blank agent summary keeps the prior one");
     }
 
     #[tokio::test]
@@ -1016,7 +1065,7 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend", "user-pinned tier kept");
         assert_eq!(p.summary, "agent summary", "blank user summary filled by the agent");
@@ -1038,7 +1087,7 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
             repo::get_repo_profile(&db, r.id).await.unwrap().is_none(),
             "invalid agent tier is not persisted as an analyzed row"
@@ -1063,7 +1112,7 @@ mod tests {
                 Component { name: "".into(), tier: "frontend".into(), ..Default::default() },
             ],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend");
         let comps: Vec<Component> = serde_json::from_str(&p.components).unwrap();
@@ -1116,7 +1165,7 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "user-pinned tier survives re-analysis");
         assert_eq!(p.summary, "fresh agent sum", "unpinned summary is refreshed");
@@ -1137,7 +1186,7 @@ mod tests {
             stack: vec![],
             components: vec![],
         };
-        super::persist_repo_class(&db, &r, wire).await.unwrap();
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
             repo::get_repo_profile(&db, r.id).await.unwrap().is_none(),
             "no orphaned profile recreated for a deleted repo"
@@ -1197,7 +1246,7 @@ mod tests {
             \"kind\":\"http\",\"via\":\"GET /orders\",\"confidence\":80}]}\n```\nDone.";
         let rels = super::parse_curator_output(reply).expect("parsed a relations object");
         assert_eq!(rels.len(), 1);
-        assert_eq!((rels[0].from, rels[0].to), (1, 2));
+        assert_eq!((rels[0].from, rels[0].to), (Some(1), Some(2)));
         assert_eq!(rels[0].kind, "http");
         assert_eq!(rels[0].via, "GET /orders");
         assert_eq!(rels[0].confidence, 80);
@@ -1223,7 +1272,7 @@ mod tests {
             {\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"GET /x\",\"confidence\":70}]}";
         let rels = super::parse_curator_output(reply).expect("found the later relations object");
         assert_eq!(rels.len(), 1);
-        assert_eq!((rels[0].from, rels[0].to, rels[0].kind.as_str()), (1, 2, "http"));
+        assert_eq!((rels[0].from, rels[0].to, rels[0].kind.as_str()), (Some(1), Some(2), "http"));
     }
 
     #[tokio::test]
@@ -1248,9 +1297,9 @@ mod tests {
                 repo::get_repo_profile(&db, api.id).await.unwrap().unwrap(),
             ),
         ];
-        let mk = |from, to, via: &str| super::CuratorRelation {
-            from,
-            to,
+        let mk = |from: i32, to: i32, via: &str| super::CuratorRelation {
+            from: Some(from),
+            to: Some(to),
             kind: "http".into(),
             via: via.into(),
             confidence: 70,
@@ -1260,6 +1309,15 @@ mod tests {
             mk(web.id, web.id, "self"),   // dropped: self-edge
             mk(web.id, 999, "ghost-to"),  // dropped: unknown target
             mk(999, api.id, "ghost-from"), // dropped: unknown producer
+            // dropped: malformed row missing an endpoint, but the valid one above
+            // must still persist.
+            super::CuratorRelation {
+                from: Some(web.id),
+                to: None,
+                kind: "http".into(),
+                via: "no-target".into(),
+                confidence: 50,
+            },
         ];
         super::persist_relations(&db, &profiled, &rels).await.unwrap();
 
