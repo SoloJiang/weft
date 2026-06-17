@@ -202,17 +202,21 @@ pub async fn graph(db: &Db, workspace_id: i32) -> Result<Graph> {
 }
 
 /// Schedule the one-shot legacy backfill for an upgraded workspace whose rows
-/// carry a non-canonical legacy tier. Called from `graph()` so EVERY read path
-/// (the Tauri repo map AND the planner's MCP `get_repo_map`) covers it, not just
-/// the UI. No-op outside a running app (so unit tests never spawn an agent) and
-/// at most once per workspace per process (so a failed/slow analyzer can't storm).
+/// lack a canonical tier. Called from `graph()` so EVERY read path (the Tauri repo
+/// map AND the planner's MCP `get_repo_map`) covers it, not just the UI. No-op
+/// outside a running app (so unit tests never spawn an agent) and at most once per
+/// workspace per process (so a failed/slow analyzer can't storm).
 fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
     if crate::APP_HANDLE.get().is_none() {
         return;
     }
-    let needs_backfill = nodes
-        .iter()
-        .any(|n| !n.tier.is_empty() && profile::normalize_tier(&n.tier).is_none());
+    // A node needs the agent if its tier isn't canonical — a non-empty legacy
+    // value (service/app/…) OR an empty tier left by an old "Other"/summary-only
+    // edit. Exclude a FRESH eager placeholder (source="agent" + empty tier): the
+    // add that created it already scheduled a pass, so this read shouldn't re-queue.
+    let needs_backfill = nodes.iter().any(|n| {
+        profile::normalize_tier(&n.tier).is_none() && !(n.source == "agent" && n.tier.is_empty())
+    });
     if needs_backfill && try_claim_backfill(workspace_id) {
         let db = db.clone();
         tauri::async_runtime::spawn(async move {
@@ -243,8 +247,26 @@ pub struct CuratorRelation {
     pub kind: String,
     #[serde(default)]
     pub via: String,
-    #[serde(default)]
+    // Lenient: an agent may emit a float (0.8), a word ("high"), or an
+    // out-of-range number; coerce/clamp to 0-100 instead of rejecting the whole
+    // `relations` payload over one bad value.
+    #[serde(default, deserialize_with = "lenient_confidence")]
     pub confidence: u8,
+}
+
+/// Coerce a relation's `confidence` from whatever shape the agent emitted (int,
+/// float, numeric string, or garbage) to a clamped 0-100 `u8`, defaulting to 0.
+fn lenient_confidence<'de, D>(d: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let n = match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(num) => num.as_f64().unwrap_or(0.0),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    Ok(n.clamp(0.0, 100.0).round() as u8)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -323,33 +345,36 @@ pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
 
 /// The per-repo deep pass's strict-JSON result. `tier` is required (no serde
 /// default), so a reply without it reads as unparseable and the prior profile is
-/// left intact rather than blanked. `name` captures a stray `name` field so a
-/// nested COMPONENT object (which has one; a repo classification does not) can be
-/// rejected — `json_objects` may scan into a component when a truncated top-level
-/// object is missing its closing brace.
+/// left intact rather than blanked. `path`/`deps` capture COMPONENT-only fields so
+/// a nested component object — which `json_objects` may scan into when a truncated
+/// top-level object is missing its closing brace — can be rejected; a repo
+/// classification has neither (`name` alone is ambiguous: a repo reply may carry
+/// its own name).
 #[derive(Debug, serde::Deserialize)]
 struct RepoClassWire {
     tier: String,
-    #[serde(default)]
-    name: Option<String>,
     #[serde(default)]
     summary: String,
     #[serde(default)]
     stack: Vec<String>,
     #[serde(default)]
     components: Vec<Component>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    deps: Option<Vec<String>>,
 }
 
 /// Extract the per-repo classification from the agent's free-form reply, same
 /// tolerance as `parse_curator_output`: scan every balanced object, take the LAST
-/// that carries a `tier` and is NOT a component object (those have a `name`).
+/// that carries a `tier` and is NOT a component object (those carry `path`/`deps`).
 /// `None` for a timed-out/malformed reply.
 fn parse_repo_class(text: &str) -> Option<RepoClassWire> {
     json_objects(text)
         .into_iter()
         .rev()
         .filter_map(|obj| serde_json::from_str::<RepoClassWire>(obj).ok())
-        .find(|w| w.name.is_none())
+        .find(|w| w.path.is_none() && w.deps.is_none())
 }
 
 const CURATOR_SYSTEM_PROMPT: &str = "You are a read-only repository analyst. You \
@@ -845,17 +870,26 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     Ok(())
 }
 
+/// A RELATION-only refresh, serialized against any in-flight workspace pass via
+/// the same per-workspace lock so two relation agents never overwrite each other.
+/// Unlike a full coalesced pass it does NOT re-run the per-repo classifier.
+async fn refresh_relations_serial(db: &Db, workspace_id: i32) {
+    let gate = pass_gate(workspace_id);
+    let _g = gate.lock.lock().await;
+    let _ = analyze_relations(db, workspace_id).await;
+}
+
 /// Re-profile a single repo on an explicit user action: force the deep classifier
-/// (no unchanged-skip), then refresh the workspace's cross-repo relations. The
-/// relation refresh goes through the workspace coalescer (NOT a direct
-/// `analyze_relations`) so it can't run a second relation agent concurrently with
-/// a background pass and have the older one overwrite the newer edge set.
+/// for just this repo, then a serialized relation-only refresh. We deliberately do
+/// NOT route this through the full coalescer: if the forced classify above timed
+/// out (leaving `profiled_commit` unchanged), the workspace pass would see the repo
+/// as still needing classification and run the minutes-long agent a SECOND time
+/// before returning. A relation-only refresh avoids that double timeout while
+/// still serializing so it can't clobber a concurrent background pass's edges.
 pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     profile_repo_agent(db, repo).await?;
     emit_graph_updated(repo.workspace_id);
-    // The just-classified repo now matches its HEAD, so the coalesced pass skips
-    // re-classifying it and effectively just refreshes relations — serialized.
-    analyze_workspace_coalesced(db, repo.workspace_id).await;
+    refresh_relations_serial(db, repo.workspace_id).await;
     Ok(())
 }
 
@@ -989,7 +1023,8 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
             stack: vec![],
@@ -1014,7 +1049,8 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1039,7 +1075,8 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1065,7 +1102,8 @@ mod tests {
             .await
             .unwrap();
         let mk = |tier: &str| super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: tier.into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1096,7 +1134,8 @@ mod tests {
             .await
             .unwrap(); // eager placeholder, blank summary
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "".into(),
             stack: vec![],
@@ -1121,7 +1160,8 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "".into(), // agent omitted it
             stack: vec![],
@@ -1145,7 +1185,8 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
             stack: vec![],
@@ -1168,7 +1209,8 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "service".into(), // not one of frontend|gateway|backend
             summary: "agent".into(),
             stack: vec![],
@@ -1191,7 +1233,8 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "monorepo".into(),
             stack: vec![],
@@ -1248,7 +1291,8 @@ mod tests {
 
         // A later agent pass keeps the pinned tier but refreshes the unpinned summary.
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "fresh agent sum".into(),
             stack: vec![],
@@ -1270,7 +1314,8 @@ mod tests {
             .unwrap();
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
         let wire = super::RepoClassWire {
-            name: None,
+            path: None,
+            deps: None,
             tier: "backend".into(),
             summary: "s".into(),
             stack: vec![],
@@ -1299,16 +1344,29 @@ mod tests {
     #[test]
     fn parse_repo_class_rejects_component_object() {
         // A truncated top-level object missing its closing brace lets json_objects
-        // scan into the nested component; that component (it has a `name`) must NOT
+        // scan into the nested component; that component (it has `path`) must NOT
         // be accepted as the repo's classification.
         let reply = "{\"tier\":\"backend\",\"summary\":\"svc\",\"components\":[\
             {\"name\":\"api\",\"path\":\"packages/api\",\"tier\":\"frontend\",\"summary\":\"web\"}]";
         // The only balanced object here is the component → rejected → None.
         assert!(super::parse_repo_class(reply).is_none());
-        // A well-formed reply still parses (and its components are ignored at the
-        // top level).
-        let ok = "{\"tier\":\"backend\",\"summary\":\"svc\"}";
+        // A well-formed reply still parses, even one that carries its own `name`
+        // (a repo classification has no `path`/`deps`).
+        let ok = "{\"name\":\"myrepo\",\"tier\":\"backend\",\"summary\":\"svc\"}";
         assert_eq!(super::parse_repo_class(ok).unwrap().tier, "backend");
+    }
+
+    #[test]
+    fn parse_curator_output_tolerates_bad_confidence() {
+        // A float / word / out-of-range confidence on one row must not reject the
+        // whole relations payload.
+        let reply = r#"{"relations":[{"from":1,"to":2,"kind":"http","via":"x","confidence":"high"},
+            {"from":1,"to":3,"kind":"grpc","via":"y","confidence":0.8},
+            {"from":1,"to":4,"kind":"lib","via":"z","confidence":250}]}"#;
+        let rels = super::parse_curator_output(reply).expect("parsed despite bad confidence");
+        assert_eq!(rels.len(), 3);
+        assert_eq!(rels[0].confidence, 0); // "high" → 0
+        assert_eq!(rels[2].confidence, 100); // 250 clamped
     }
 
     #[test]
