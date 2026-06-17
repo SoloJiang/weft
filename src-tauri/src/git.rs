@@ -142,18 +142,23 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
 
 /// The default BASE branch *name* for a NEW worktree (and the value captured as a
 /// repo's base_ref at add time): the live remote default (origin/HEAD) when the
-/// repo has one, else the recorded `base_ref` if it's a real branch, else
-/// main → master → "main". Unlike `default_target_branch` (which prefers the
-/// recorded base_ref first), this trusts the live remote default over a possibly
-/// stale recorded branch — a repo added while on a feature branch still bases new
-/// work off the remote's real default. Returns a bare branch name (no `origin/`).
+/// repo has one, else the recorded `base_ref` if it's a real branch AND it still
+/// resolves locally or as `origin/<base>`, else main → master → "main". Unlike
+/// `default_target_branch` (which prefers the recorded base_ref first), this
+/// trusts the live remote default over a possibly stale recorded branch — a repo
+/// added while on a feature branch still bases new work off the remote's real
+/// default. Returns a bare branch name (no `origin/`).
 pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     if let Some(name) = remote_default_branch(repo) {
         return name;
     }
     let b = base_ref.trim();
-    if !b.is_empty() && b != "HEAD" {
-        return b.strip_prefix("origin/").unwrap_or(b).to_string();
+    let b = b.strip_prefix("origin/").unwrap_or(b);
+    if !b.is_empty()
+        && b != "HEAD"
+        && (ref_resolves(repo, b) || ref_resolves(repo, &format!("origin/{b}")))
+    {
+        return b.to_string();
     }
     for c in ["main", "master"] {
         if ref_resolves(repo, c) {
@@ -1084,10 +1089,14 @@ mod tests {
         // over a stale recorded base_ref ("main").
         assert_eq!(default_base_branch(&clone, "main"), "develop");
 
-        // A repo with no remote falls back to the recorded base_ref...
+        // A repo with no remote falls back to the recorded base_ref only if it RESOLVES...
         let local = tmp("dbb-local");
         init_repo(&local).unwrap();
-        assert_eq!(default_base_branch(&local, "trunk"), "trunk");
+        let cur = current_branch(&local).unwrap();
+        assert_eq!(default_base_branch(&local, &cur), cur);
+        // ...and falls through to main/master when the recorded base no longer exists.
+        let fell = default_base_branch(&local, "deleted-xyz");
+        assert!(fell == "main" || fell == "master", "stale base_ref must fall through, got {fell}");
         // ...and an empty/HEAD base_ref detects main/master, never returns "HEAD".
         let det = default_base_branch(&local, "");
         assert!(det == "main" || det == "master", "got {det}");
