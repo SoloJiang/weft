@@ -323,10 +323,15 @@ pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
 
 /// The per-repo deep pass's strict-JSON result. `tier` is required (no serde
 /// default), so a reply without it reads as unparseable and the prior profile is
-/// left intact rather than blanked.
+/// left intact rather than blanked. `name` captures a stray `name` field so a
+/// nested COMPONENT object (which has one; a repo classification does not) can be
+/// rejected — `json_objects` may scan into a component when a truncated top-level
+/// object is missing its closing brace.
 #[derive(Debug, serde::Deserialize)]
 struct RepoClassWire {
     tier: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     summary: String,
     #[serde(default)]
@@ -337,12 +342,14 @@ struct RepoClassWire {
 
 /// Extract the per-repo classification from the agent's free-form reply, same
 /// tolerance as `parse_curator_output`: scan every balanced object, take the LAST
-/// that carries a `tier`. `None` for a timed-out/malformed reply.
+/// that carries a `tier` and is NOT a component object (those have a `name`).
+/// `None` for a timed-out/malformed reply.
 fn parse_repo_class(text: &str) -> Option<RepoClassWire> {
     json_objects(text)
         .into_iter()
         .rev()
-        .find_map(|obj| serde_json::from_str::<RepoClassWire>(obj).ok())
+        .filter_map(|obj| serde_json::from_str::<RepoClassWire>(obj).ok())
+        .find(|w| w.name.is_none())
 }
 
 const CURATOR_SYSTEM_PROMPT: &str = "You are a read-only repository analyst. You \
@@ -768,6 +775,29 @@ async fn needs_classification(db: &Db, repo: &repo_ref::Model) -> bool {
     }
 }
 
+/// The deepest directory that contains every given path, or `None` when there is
+/// no meaningful shared ancestor (different roots, or only the filesystem root).
+/// Used as the relation pass's cwd so a sandboxed tool can read all repos.
+fn common_ancestor(paths: &[&str]) -> Option<std::path::PathBuf> {
+    let first = paths.first()?;
+    let mut common: Vec<std::path::Component> = Path::new(first).components().collect();
+    for p in &paths[1..] {
+        let comps: Vec<std::path::Component> = Path::new(p).components().collect();
+        let n = common.iter().zip(comps.iter()).take_while(|(a, b)| a == b).count();
+        common.truncate(n);
+    }
+    // Require at least a root + one named segment (e.g. "/home"): bare "/" or no
+    // common prefix is too broad / meaningless, so fall back to a single repo.
+    if common.len() < 2 {
+        return None;
+    }
+    let mut out = std::path::PathBuf::new();
+    for c in &common {
+        out.push(c.as_os_str());
+    }
+    Some(out)
+}
+
 /// The cross-repo relations pass: reload the (classified) profiles, infer the
 /// runtime/infra/lib relations between them, and persist. Needs ≥2 profiled
 /// repos. A timed-out / unparseable reply leaves existing relations intact
@@ -792,7 +822,14 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
         return Ok(());
     }
     let prompt = build_curator_prompt(&profiled);
-    let cwd = Path::new(&profiled[0].0.local_git_path).to_path_buf();
+    // Run from the repos' common-ancestor directory, not just the first repo, so a
+    // sandboxed tool (codex read-only) can actually read EVERY repo's path — the
+    // sandbox is scoped to cwd, and a sibling repo outside it would be unreadable,
+    // so cross-repo edges would be missed. Falls back to the first repo when there
+    // is no meaningful shared ancestor.
+    let paths: Vec<&str> = profiled.iter().map(|(r, _)| r.local_git_path.as_str()).collect();
+    let cwd = common_ancestor(&paths)
+        .unwrap_or_else(|| Path::new(&profiled[0].0.local_git_path).to_path_buf());
     let tool = crate::tools::default_tool(db).await;
     if let Ok(text) = run_agent_once(&tool, &cwd, &prompt).await {
         if let Some(relations) = parse_curator_output(&text) {
@@ -947,6 +984,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
             stack: vec![],
@@ -971,6 +1009,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "agent".into(),
             stack: vec![],
@@ -995,6 +1034,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1020,6 +1060,7 @@ mod tests {
             .await
             .unwrap();
         let mk = |tier: &str| super::RepoClassWire {
+            name: None,
             tier: tier.into(),
             summary: "agent".into(),
             stack: vec![],
@@ -1050,6 +1091,7 @@ mod tests {
             .await
             .unwrap(); // eager placeholder, blank summary
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "".into(),
             stack: vec![],
@@ -1074,6 +1116,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "".into(), // agent omitted it
             stack: vec![],
@@ -1097,6 +1140,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
             stack: vec![],
@@ -1119,6 +1163,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "service".into(), // not one of frontend|gateway|backend
             summary: "agent".into(),
             stack: vec![],
@@ -1141,6 +1186,7 @@ mod tests {
             .await
             .unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "monorepo".into(),
             stack: vec![],
@@ -1197,6 +1243,7 @@ mod tests {
 
         // A later agent pass keeps the pinned tier but refreshes the unpinned summary.
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "fresh agent sum".into(),
             stack: vec![],
@@ -1218,6 +1265,7 @@ mod tests {
             .unwrap();
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
         let wire = super::RepoClassWire {
+            name: None,
             tier: "backend".into(),
             summary: "s".into(),
             stack: vec![],
@@ -1241,6 +1289,35 @@ mod tests {
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
         assert!(super::edit_profile(&db, r.id, Some("s"), Some("frontend")).await.is_err());
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_repo_class_rejects_component_object() {
+        // A truncated top-level object missing its closing brace lets json_objects
+        // scan into the nested component; that component (it has a `name`) must NOT
+        // be accepted as the repo's classification.
+        let reply = "{\"tier\":\"backend\",\"summary\":\"svc\",\"components\":[\
+            {\"name\":\"api\",\"path\":\"packages/api\",\"tier\":\"frontend\",\"summary\":\"web\"}]";
+        // The only balanced object here is the component → rejected → None.
+        assert!(super::parse_repo_class(reply).is_none());
+        // A well-formed reply still parses (and its components are ignored at the
+        // top level).
+        let ok = "{\"tier\":\"backend\",\"summary\":\"svc\"}";
+        assert_eq!(super::parse_repo_class(ok).unwrap().tier, "backend");
+    }
+
+    #[test]
+    fn common_ancestor_finds_shared_dir_or_none() {
+        assert_eq!(
+            super::common_ancestor(&["/home/u/ws/web", "/home/u/ws/api"]),
+            Some(std::path::PathBuf::from("/home/u/ws"))
+        );
+        assert_eq!(
+            super::common_ancestor(&["/home/u/web", "/home/u/api", "/home/u/web/sub"]),
+            Some(std::path::PathBuf::from("/home/u"))
+        );
+        // No meaningful shared ancestor (only the root) → None.
+        assert_eq!(super::common_ancestor(&["/a/x", "/b/y"]), None);
     }
 
     #[test]
