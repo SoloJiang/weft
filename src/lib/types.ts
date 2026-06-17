@@ -486,6 +486,8 @@ export interface WriteTrigger {
   name: string;
   repo_name: string;
   reason: string;
+  /** the lead's chosen base branch for this write; "" = the repo's default branch. */
+  base_branch: string;
 }
 
 /** An open agent→human question, aggregated workspace-wide for "Needs you". */

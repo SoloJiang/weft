@@ -833,6 +833,7 @@ pub struct WriteTrigger {
     pub name: String,
     pub repo_name: String,
     pub reason: String,
+    pub base_branch: String,
 }
 
 /// Every pending write declaration across the workspace's threads — the
@@ -855,6 +856,7 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
                 name: p.name,
                 repo_name: p.repo_name,
                 reason: p.reason,
+                base_branch: p.base_branch,
             });
         }
     }

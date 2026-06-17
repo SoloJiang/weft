@@ -267,6 +267,7 @@ pub struct PendingWrite {
     pub name: String,
     pub repo_name: String,
     pub reason: String,
+    pub base_branch: String,
 }
 
 /// The pending write declarations for a thread (known repo + undecided).
@@ -287,6 +288,7 @@ pub async fn pending_writes(db: &Db, thread_id: i32) -> Result<Vec<PendingWrite>
                 name: d.name.clone(),
                 repo_name: d.repo.repo_name.clone(),
                 reason: d.reason.clone(),
+                base_branch: d.base_branch.clone(),
             });
         }
     }
@@ -574,6 +576,44 @@ mod tests {
         // Cleanup.
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn pending_writes_carry_base_branch() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-pwbase-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "")
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![ProposedDirection {
+                name: "Payments".into(),
+                repo: "api".into(),
+                reason: "add endpoint".into(),
+                mandate: "".into(),
+                base_branch: "develop".into(),
+                decision: "".into(),
+            }],
+        };
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        let pending = pending_writes(&db, t.id).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].base_branch, "develop", "base_branch flows into PendingWrite");
+
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
