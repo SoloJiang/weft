@@ -817,65 +817,48 @@ pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     Ok(())
 }
 
-/// Workspaces with an analysis pass currently running, so a batch add (which
-/// registers repos one-by-one) coalesces into a single workspace pass instead
-/// of spawning one agent per repo.
-fn analyzing() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+/// Per-workspace serialization for analysis passes: an async lock (two passes for
+/// one workspace never overlap) plus a `dirty` flag so a request that lands while
+/// a pass is running coalesces into one rerun instead of a parallel pass.
+#[derive(Clone)]
+struct PassGate {
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn pass_gate(workspace_id: i32) -> PassGate {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, PassGate>>> =
         std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    let map = M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(workspace_id)
+        .or_insert_with(|| PassGate {
+            lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+        .clone()
 }
 
-/// Workspaces for which an add/analyze request arrived WHILE a pass was already
-/// running. The running pass captured its repo list before that request, so it
-/// reruns once when it finishes to pick up the newly-added repos.
-fn pending_reanalyze() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-/// Clears a workspace's in-flight marker on drop, so the slot is freed even if
-/// the analysis pass panics (otherwise the workspace would be wedged — its
-/// marker stuck and every future pass a no-op).
-struct InFlightGuard(i32);
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        analyzing()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
-    }
-}
-
-/// `analyze_workspace`, but a no-op if a pass for this workspace is already in
-/// flight. Best-effort and self-clearing (via the Drop guard, even on panic);
-/// intended to be spawned fire-and-forget after a repo is added so the agent
-/// graph refreshes without blocking the add.
+/// Run an analysis pass for a workspace, SERIALIZED (two never overlap, so a
+/// background pass and a manual reprofile/analyze can't clobber each other's
+/// relations) and AWAITABLE (returns only once this request's work has actually
+/// completed — callers can refresh the map afterwards and see fresh edges).
+///
+/// Coalescing: every caller marks the workspace `dirty` and then takes the lock.
+/// The lock holder drains — it reruns while `dirty` was set during its run — so a
+/// batch add (many requests) collapses into ~one pass, while a request that lands
+/// mid-pass is still covered before any waiter is released. Spawn it
+/// fire-and-forget when you don't want to block (e.g. after adding a repo).
 pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32) {
-    {
-        let mut g = analyzing().lock().unwrap_or_else(|e| e.into_inner());
-        if !g.insert(workspace_id) {
-            // A pass is already running; remember that a newer one was requested
-            // so the running pass reruns once and picks up repos added since.
-            pending_reanalyze()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(workspace_id);
-            return;
-        }
-    }
-    let _guard = InFlightGuard(workspace_id);
-    loop {
+    use std::sync::atomic::Ordering;
+    let gate = pass_gate(workspace_id);
+    gate.dirty.store(true, Ordering::SeqCst);
+    let _g = gate.lock.lock().await;
+    // Drain: run until no new request landed during the previous run. The holder
+    // covers waiters' requests, so once it exits they acquire the lock, find
+    // `dirty` already cleared, and return immediately — having awaited completion.
+    while gate.dirty.swap(false, Ordering::SeqCst) {
         let _ = analyze_workspace(db, workspace_id).await;
-        // Rerun once if an add/analyze landed mid-pass (its repos weren't in scope).
-        let again = pending_reanalyze()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&workspace_id);
-        if !again {
-            break;
-        }
     }
 }
 

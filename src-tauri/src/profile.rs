@@ -121,18 +121,16 @@ pub fn agent_edges(
 
 /// Merge a repo's current relations with a fresh agent pass: keep every
 /// user-sourced relation (including `rejected` tombstones), drop old agent
-/// relations, and add fresh agent relations EXCEPT any a user tombstone rejects
-/// for the same (to, kind) — so a human-removed edge is never resurrected.
+/// relations, and add fresh agent relations EXCEPT any whose (to, kind) a user
+/// already owns — a tombstone (so a human-removed edge isn't resurrected) OR a
+/// positive pin (so the same edge isn't stored twice and rendered as a duplicate).
 pub fn merge_relations(existing: &[AgentRelation], fresh_agent: &[AgentRelation]) -> Vec<AgentRelation> {
     let mut out: Vec<AgentRelation> =
         existing.iter().filter(|r| r.source == "user").cloned().collect();
-    let tombstoned: std::collections::HashSet<(i32, String)> = out
-        .iter()
-        .filter(|r| r.rejected)
-        .map(|r| (r.to, r.kind.clone()))
-        .collect();
+    let user_owned: std::collections::HashSet<(i32, String)> =
+        out.iter().map(|r| (r.to, r.kind.clone())).collect();
     for r in fresh_agent {
-        if !tombstoned.contains(&(r.to, r.kind.clone())) {
+        if !user_owned.contains(&(r.to, r.kind.clone())) {
             out.push(r.clone());
         }
     }
@@ -232,9 +230,16 @@ mod tests {
         let fresh_agent = vec![
             super::AgentRelation { to: 3, kind: "http".into(), via: "re-found".into(), confidence: 70, source: "agent".into(), rejected: false },
             super::AgentRelation { to: 5, kind: "grpc".into(), via: "new".into(), confidence: 60, source: "agent".into(), rejected: false },
+            // Same (to, kind) as the user's positive pin → must NOT be duplicated.
+            super::AgentRelation { to: 2, kind: "http".into(), via: "agent-dup".into(), confidence: 80, source: "agent".into(), rejected: false },
         ];
         let merged = super::merge_relations(&existing, &fresh_agent);
         assert!(merged.iter().any(|r| r.to == 2 && r.source == "user" && !r.rejected), "user edge survives");
+        assert_eq!(
+            merged.iter().filter(|r| r.to == 2 && r.kind == "http").count(),
+            1,
+            "agent edge matching a user pin is not duplicated"
+        );
         assert!(merged.iter().any(|r| r.to == 3 && r.rejected), "tombstone survives");
         assert!(!merged.iter().any(|r| r.to == 3 && !r.rejected), "tombstoned edge not resurrected");
         assert!(!merged.iter().any(|r| r.to == 4), "stale agent edge dropped");
