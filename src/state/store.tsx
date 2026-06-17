@@ -1654,8 +1654,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeThreadId, refreshProposal],
   );
 
+  // In-flight base-branch save, so confirm/approve can flush it before acting on
+  // the proposal (the field saves on blur fire-and-forget; a fast Create/Approve
+  // click must not race the save → stale base + status clobber).
+  const pendingBaseSave = useRef<Promise<unknown>>(Promise.resolve());
+
   const confirmProposal = useCallback(async () => {
     if (activeThreadId == null) return;
+    await pendingBaseSave.current.catch(() => {});
     const ids = await api.confirmProposal(activeThreadId);
     setProposal(null);
     setReviewingProposal(false);
@@ -1665,8 +1671,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeThreadId, loadThreadChildren, dispatchDirection]);
 
   const setProposalDirectionBase = useCallback(
-    async (index: number, base: string) => {
-      if (activeThreadId == null || !proposal) return;
+    (index: number, base: string): Promise<void> => {
+      if (activeThreadId == null || !proposal) return Promise.resolve();
       // Rebuild the stored Proposal from the resolved view, overriding one base.
       const next: Proposal = {
         rationale: proposal.rationale,
@@ -1680,8 +1686,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           base_branch: i === index ? base.trim() : (d.base_branch ?? ""),
         })),
       };
-      await api.saveProposal(activeThreadId, next);
-      await refreshProposal(activeThreadId);
+      const p = (async () => {
+        await api.saveProposal(activeThreadId, next);
+        await refreshProposal(activeThreadId);
+      })();
+      pendingBaseSave.current = p;
+      return p;
     },
     [activeThreadId, proposal, refreshProposal],
   );
@@ -1702,6 +1712,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
+      await pendingBaseSave.current.catch(() => {});
       try {
         const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool ?? defaultTool);
         void dispatchDirection(dirId);
