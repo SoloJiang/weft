@@ -443,7 +443,16 @@ async fn run_agent_once(tool: &str, cwd: &Path, prompt: &str) -> Result<String> 
     // claude runs in plan mode (no edits). opencode has no portable flag here, so
     // it falls back to the prompt's read-only instruction (best-effort).
     let read_only: Vec<String> = match tool {
-        "codex" => vec!["--sandbox".into(), "read-only".into()],
+        // `--ask-for-approval never` keeps this headless one-shot non-interactive:
+        // with read-only + no approvals, codex can't prompt (it would hang with no
+        // stdin until the timeout when it tries `rg`/`git` under an interactive
+        // policy) and can't escalate out of the sandbox.
+        "codex" => vec![
+            "--sandbox".into(),
+            "read-only".into(),
+            "--ask-for-approval".into(),
+            "never".into(),
+        ],
         "claude" => vec!["--permission-mode".into(), "plan".into()],
         _ => vec![],
     };
@@ -771,7 +780,12 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
             continue;
         }
         if let Some(p) = repo::get_repo_profile(db, r.id).await? {
-            profiled.push((r.clone(), p));
+            // Only relate ANALYZED repos (canonical tier). A placeholder/legacy row
+            // gives the agent a blank node, and including it could let an explicit
+            // empty relation set wipe the analyzed repos' existing edges.
+            if profile::normalize_tier(&p.role).is_some() {
+                profiled.push((r.clone(), p));
+            }
         }
     }
     if profiled.len() < 2 {
@@ -790,12 +804,17 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
 }
 
 /// Re-profile a single repo on an explicit user action: force the deep classifier
-/// (no unchanged-skip), then refresh the workspace's cross-repo relations so the
-/// stored edges (and the stale badge) reflect the repo's changed dependencies.
+/// (no unchanged-skip), then refresh the workspace's cross-repo relations. The
+/// relation refresh goes through the workspace coalescer (NOT a direct
+/// `analyze_relations`) so it can't run a second relation agent concurrently with
+/// a background pass and have the older one overwrite the newer edge set.
 pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     profile_repo_agent(db, repo).await?;
     emit_graph_updated(repo.workspace_id);
-    analyze_relations(db, repo.workspace_id).await
+    // The just-classified repo now matches its HEAD, so the coalesced pass skips
+    // re-classifying it and effectively just refreshes relations — serialized.
+    analyze_workspace_coalesced(db, repo.workspace_id).await;
+    Ok(())
 }
 
 /// Workspaces with an analysis pass currently running, so a batch add (which
