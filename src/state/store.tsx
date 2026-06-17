@@ -347,9 +347,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [curatorPanelOpen, setCuratorPanelOpenState] = useState(true);
   const [curatorPanelWidth, setCuratorPanelWidthState] = useState(CURATOR_WIDTH_DEFAULT);
-  // Coalesce curator-thread creation: StrictMode double-mounts and the backend
-  // get-or-create is not atomic, so two concurrent ensures could create dupes.
-  const ensuringCuratorRef = useRef(false);
+  // Coalesce curator-thread creation per workspace: StrictMode double-mounts and
+  // the backend get-or-create is not atomic, so concurrent ensures for the SAME
+  // workspace could create dupes. Keyed by ws so switching to another workspace
+  // mid-flight still ensures that one (a single boolean would drop it).
+  const ensuringCuratorRef = useRef<Set<number>>(new Set());
   // Snapshot of the view that was active when the user opened Settings, so
   // the back arrow restores it instead of dropping them on the board.
   const prevHomeRef = useRef<{
@@ -1667,8 +1669,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // (CuratorPanel), so unlike a normal lead chat we never selectThread.
   const ensureCuratorThread = useCallback(async () => {
     const ws = activeWorkspaceId;
-    if (ws == null || ensuringCuratorRef.current) return;
-    ensuringCuratorRef.current = true;
+    if (ws == null || ensuringCuratorRef.current.has(ws)) return;
+    ensuringCuratorRef.current.add(ws);
     try {
       const id = await api.openCuratorChat(ws); // get-or-create; returns the id
       const list = await api.listThreads(ws);
@@ -1679,7 +1681,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setThreads(list);
       setCuratorThreadId(id);
     } finally {
-      ensuringCuratorRef.current = false;
+      ensuringCuratorRef.current.delete(ws);
     }
   }, [activeWorkspaceId]);
 
