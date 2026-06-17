@@ -154,6 +154,31 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
     Ok(())
 }
 
+/// Fully tear down a direction created during a confirm that then failed:
+/// remove each of its worktrees (working copy + namespaced branch) and delete the
+/// direction + worktree rows. Used to keep confirm atomic — a failed batch leaves
+/// no partial worktrees/branches behind. Best-effort on the git side (a missing
+/// path/branch is fine); the row delete is authoritative.
+pub async fn rollback_direction(db: &Db, direction_id: i32) -> Result<()> {
+    use sea_orm::EntityTrait;
+    for w in repo::list_worktrees(db, Some(direction_id)).await? {
+        if let Some(r) = entities::repo_ref::Entity::find_by_id(w.repo_id)
+            .one(&db.0)
+            .await?
+        {
+            let repo_path = std::path::Path::new(&r.local_git_path);
+            if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(&w.path)) {
+                eprintln!("[weft] rollback worktree remove failed for {}: {e}", w.path);
+            }
+            if let Err(e) = git::delete_branch(repo_path, &w.branch) {
+                eprintln!("[weft] rollback branch delete failed for {}: {e}", w.branch);
+            }
+        }
+    }
+    repo::delete_direction(db, direction_id).await?;
+    Ok(())
+}
+
 /// Reclaim one direction's worktree on its own: remove the working-copy directory
 /// but KEEP the branch, the worktree row, and the direction. Used by the Done-card
 /// "delete worktree" action — the user is freeing disk for a finished task, not

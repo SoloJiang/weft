@@ -13,6 +13,13 @@ use crate::store::{repo, Db};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Deserialize a JSON string OR null into a String (null/absent → ""). The lead
+/// tool may emit `base_branch: null` for "use the repo default"; without this,
+/// serde rejects the whole Proposal and `call_planner` drops every direction.
+fn de_string_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 /// One proposed work line: the ONE repo it writes (by name), and the required
 /// reason it must change. Reads are unmanaged — agents read any repo freely
 /// (scope rework, spec Part 1). The tool is no longer part of the proposal;
@@ -29,7 +36,8 @@ pub struct ProposedDirection {
     #[serde(default)]
     pub mandate: String,
     /// Branch in the target repo to branch the work off; empty = repo default.
-    #[serde(default)]
+    /// `#[serde(default)]` covers a missing key; `deserialize_with` covers `null`.
+    #[serde(default, deserialize_with = "de_string_or_null")]
     pub base_branch: String,
     /// Human decision on this write declaration: "" (pending) | "approved" | "denied".
     #[serde(default)]
@@ -137,13 +145,28 @@ pub struct ResolvedProposal {
 /// Confirm the stored proposal: create each direction with its known-repo scope
 /// and materialize its worktrees. Marks the plan confirmed. Unknown repo names
 /// are skipped (they never resolved to a worktree-able repo).
+///
+/// Atomic: if ANY lane fails to create or materialize, ALL lanes created in this
+/// attempt are rolled back (worktree on disk + branch + DB rows) and the error is
+/// returned. A corrected retry therefore always starts clean — no partial state
+/// survives for it to accidentally reuse.
+///
+/// Idempotent on a fully-confirmed plan: if the plan is already "confirmed" the
+/// existing direction ids are returned without re-creating anything (covers the
+/// dispatch-retry case where the frontend calls confirm again to redispatch workers).
 pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     let resolved = get_resolved(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
-    let mut created = Vec::new();
+    // Idempotent fast-path: the plan was already fully confirmed in a prior call.
+    // Return the existing ids so the caller can (re-)dispatch workers without
+    // re-creating anything.
+    if resolved.status == "confirmed" {
+        let existing = repo::list_directions(db, thread_id).await?;
+        return Ok(existing.into_iter().map(|d| d.id).collect());
+    }
+    let mut created: Vec<i32> = Vec::new();
     let tool = crate::tools::default_tool(db).await;
-    let existing = repo::list_directions(db, thread_id).await?;
     for d in &resolved.directions {
         if !d.repo.known {
             continue; // unknown repo name never resolved to a worktree-able repo
@@ -151,17 +174,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         if d.decision == "approved" || d.decision == "denied" {
             continue; // already handled via per-card approve/deny
         }
-        // Resumable/idempotent: a prior confirm attempt that failed on a later lane
-        // may have already created this one. Skip re-creating it, but STILL return its
-        // id so the frontend dispatches a worker for it (mirrors approve_direction).
-        if let Some(x) = existing
-            .iter()
-            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id)
-        {
-            created.push(x.id);
-            continue;
-        }
-        let dir = repo::create_direction(
+        let dir = match repo::create_direction(
             db,
             thread_id,
             &d.name,
@@ -171,9 +184,24 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             &d.mandate,
             &d.base_branch,
         )
-        .await?;
+        .await
+        {
+            Ok(dir) => dir,
+            Err(err) => {
+                // Atomic: tear down everything created in this attempt.
+                for &id in &created {
+                    let _ = materialize::rollback_direction(db, id).await;
+                }
+                return Err(err);
+            }
+        };
         if let Err(err) = materialize::materialize_direction(db, dir.id).await {
+            // The failing lane has no worktree yet; drop its row, then roll back
+            // the earlier (materialized) lanes so a corrected retry starts clean.
             let _ = repo::delete_direction(db, dir.id).await;
+            for &id in &created {
+                let _ = materialize::rollback_direction(db, id).await;
+            }
             return Err(err);
         }
         created.push(dir.id);
@@ -743,6 +771,51 @@ mod tests {
         let second = confirm(&db, t.id).await.unwrap();
         assert_eq!(second, vec![id], "retry returns the existing id for dispatch");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "no duplicate");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[test]
+    fn proposal_parses_null_base_branch_as_empty() {
+        let p: Proposal = serde_json::from_str(
+            r#"{ "directions": [ { "name":"a", "repo":"api", "base_branch": null } ] }"#,
+        ).unwrap();
+        assert_eq!(p.directions.len(), 1, "null base_branch must NOT drop the proposal");
+        assert_eq!(p.directions[0].base_branch, "");
+    }
+
+    #[tokio::test]
+    async fn confirm_is_atomic_rolls_back_all_on_failure() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-atomic-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // Lane A: default base (ok). Lane B: bad explicit base → materialize fails.
+        let proposal = Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"no-such-xyz".into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        let res = confirm(&db, t.id).await;
+        assert!(res.is_err(), "confirm must fail on the bad lane");
+        assert!(repo::list_directions(&db, t.id).await.unwrap().is_empty(),
+            "atomic: NO directions remain after a failed confirm (lane A rolled back too)");
+        // Fix B's base and retry → both lanes created cleanly, no duplicates.
+        set_direction_base(&db, t.id, 1, "").await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids.len(), 2, "retry creates both lanes");
+        assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 2, "exactly two, no duplicates");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
