@@ -116,12 +116,21 @@ async fn register_repo(
             r = updated;
         }
     }
-    // Eager, deterministic profiling (ARCHITECTURE §4.9): best-effort, never
-    // blocks adding the repo if inference/git hiccups.
-    let _ = crate::curator::profile_repo(db, &r).await;
-    // Fire-and-forget the agent curator over the whole workspace so cross-repo
-    // runtime/infra relations refresh with the new repo. Read-only, coalesced
-    // (a batch add runs one pass), and best-effort — it never blocks the add.
+    // The curator is agent-only now (ARCHITECTURE §4.9): there is no deterministic
+    // profiling on add. Eagerly create an empty placeholder profile row (tier "",
+    // so it renders as "analyzing" until classified) ONLY when one doesn't already
+    // exist — `register_repo` is also reached by a duplicate add/clone where `r` is
+    // an existing row, and clobbering its tier/summary/stack would lose data.
+    // Creating it here, before analysis is spawned, also means every later write
+    // (agent pass, user edit, calibration) is an UPDATE, so two can't race on the
+    // unique `repo_id` insert. Best-effort: a hiccup never blocks the add.
+    if matches!(repo::get_repo_profile(db, r.id).await, Ok(None)) {
+        let _ = repo::upsert_repo_profile(db, r.id, "", "[]", "", "[]", "agent", "").await;
+    }
+    // Fire-and-forget the agent curator over the whole workspace so the new repo
+    // gets a deep per-repo classification and cross-repo relations refresh.
+    // Read-only, coalesced (a batch add runs one pass), and best-effort — it
+    // never blocks the add.
     let db_bg = db.clone();
     let ws = r.workspace_id;
     tauri::async_runtime::spawn(async move {
@@ -205,16 +214,23 @@ pub async fn list_repo_profiles(
 
 #[tauri::command]
 pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curator::Graph> {
+    // `curator::graph` itself schedules the one-shot legacy backfill for upgraded
+    // workspaces, so every read path (this command and the planner's MCP
+    // `get_repo_map`) is covered.
     crate::curator::graph(&db, workspace_id).await.map_err(e)
 }
 
+/// Re-run the deep, read-only agent classification for a single repo (tier +
+/// summary + components), then refresh the workspace's cross-repo relations so
+/// the stored edges reflect the repo's changed dependencies. Slow (spawns the
+/// agent); the caller refreshes the map after it resolves.
 #[tauri::command]
 pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     let r = repo::get_repo(&db, repo_id)
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
-    crate::curator::profile_repo(&db, &r).await.map_err(e)?;
+    crate::curator::reprofile_repo(&db, &r).await.map_err(e)?;
     Ok(())
 }
 
@@ -268,10 +284,12 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
 pub async fn update_repo_profile(
     db: State<'_, Db>,
     repo_id: i32,
-    summary: String,
-    role: String,
+    summary: Option<String>,
+    tier: Option<String>,
 ) -> R<()> {
-    crate::curator::edit_profile(&db, repo_id, &summary, &role)
+    // Only the field(s) the user actually changed are `Some`, so editing the
+    // summary doesn't pin the tier and vice versa.
+    crate::curator::edit_profile(&db, repo_id, summary.as_deref(), tier.as_deref())
         .await
         .map_err(e)?;
     Ok(())

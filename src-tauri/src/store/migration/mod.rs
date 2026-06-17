@@ -33,6 +33,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0020SessionCommand),
             Box::new(M0021RepoRemoteUrl),
             Box::new(M0022RepoProfileRelations),
+            Box::new(M0023RepoProfileComponents),
         ]
     }
 }
@@ -857,6 +858,51 @@ impl MigrationTrait for M0022RepoProfileRelations {
                 Table::alter()
                     .table(Alias::new("repo_profile"))
                     .drop_column(Alias::new("relations"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the per-repo deep agent pass's monorepo sub-components (JSON) to
+/// repo_profile, powering the repo map's "expanded" view. M0002 reflects the
+/// current entity, so a FRESH db already has it; this only matters for older
+/// dbs, and sqlite has no ADD COLUMN IF NOT EXISTS so the duplicate is tolerated.
+pub struct M0023RepoProfileComponents;
+impl MigrationName for M0023RepoProfileComponents {
+    fn name(&self) -> &str {
+        "m0023_repo_profile_components"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0023RepoProfileComponents {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("components"))
+                            .string()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("components"))
                     .to_owned(),
             )
             .await
