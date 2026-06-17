@@ -361,10 +361,12 @@ struct RepoClassWire {
     name: Option<String>,
     #[serde(default)]
     summary: String,
+    // `Option` so persistence can tell an OMITTED factual field (a partial reply —
+    // keep the prior value) from an explicit empty array (clear the prior value).
     #[serde(default)]
-    stack: Vec<String>,
+    stack: Option<Vec<String>>,
     #[serde(default)]
-    components: Vec<Component>,
+    components: Option<Vec<Component>>,
 }
 
 /// Extract the per-repo classification from the agent's free-form reply, same
@@ -661,30 +663,28 @@ async fn persist_repo_class(
     let summary_owned = owns_summary(prior_source);
     let tier_owned = owns_tier(prior_source);
 
-    // Drop nameless components (a malformed sub-object) but keep the rest, so one
-    // bad entry never discards the whole classification; normalize their tiers.
-    let components: Vec<Component> = wire
-        .components
-        .into_iter()
-        .filter(|c| !c.name.trim().is_empty())
-        .map(|mut c| {
-            c.tier = profile::normalize_tier(&c.tier).unwrap_or_default();
-            c
-        })
-        .collect();
-    // Don't let a partial reply (one that omitted the factual fields) erase
-    // existing facts: when the agent returns no components/stack, keep the prior
-    // ones rather than overwriting with [] (which `needs_classification` would
-    // then treat as fresh, skipping the repo).
-    let comps_json = if components.is_empty() {
-        prior.as_ref().map(|p| p.components.clone()).unwrap_or_else(|| "[]".into())
-    } else {
-        serde_json::to_string(&components).unwrap_or_else(|_| "[]".into())
+    // Factual fields: an OMITTED field (None — a partial reply) keeps the prior
+    // value so it isn't erased; an explicit array (Some, even empty) is persisted,
+    // so a real later reply CAN clear stale facts. Nameless components are dropped
+    // (a malformed sub-object) while the rest of the list is kept; their tiers are
+    // normalized.
+    let comps_json = match wire.components {
+        Some(cs) => {
+            let filtered: Vec<Component> = cs
+                .into_iter()
+                .filter(|c| !c.name.trim().is_empty())
+                .map(|mut c| {
+                    c.tier = profile::normalize_tier(&c.tier).unwrap_or_default();
+                    c
+                })
+                .collect();
+            serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".into())
+        }
+        None => prior.as_ref().map(|p| p.components.clone()).unwrap_or_else(|| "[]".into()),
     };
-    let stack_json = if wire.stack.is_empty() {
-        prior.as_ref().map(|p| p.stack.clone()).unwrap_or_else(|| "[]".into())
-    } else {
-        json_strs(&wire.stack)
+    let stack_json = match &wire.stack {
+        Some(s) => json_strs(s),
+        None => prior.as_ref().map(|p| p.stack.clone()).unwrap_or_else(|| "[]".into()),
     };
 
     let agent_tier = profile::normalize_tier(&wire.tier);
@@ -1053,8 +1053,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1078,8 +1078,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "agent".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1103,8 +1103,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "agent".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1129,8 +1129,8 @@ mod tests {
             name: None,
             tier: tier.into(),
             summary: "agent".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, mk("backend"), "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1162,14 +1162,42 @@ mod tests {
             tier: "backend".into(),
             name: None,
             summary: "".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.stack, r#"["rust"]"#, "prior stack preserved");
         assert!(p.components.contains("api"), "prior components preserved");
         assert_eq!(p.summary, "old summary", "prior summary preserved");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_explicit_empty_clears_facts() {
+        // An EXPLICIT empty components/stack (Some([])) clears prior facts — distinct
+        // from an omitted field (None), which preserves them.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(
+            &db, r.id, "backend", r#"["rust"]"#, "old",
+            r#"[{"name":"api","tier":"backend"}]"#, "agent", "",
+        )
+        .await
+        .unwrap();
+        let wire = super::RepoClassWire {
+            tier: "backend".into(),
+            name: None,
+            summary: "now monolith".into(),
+            stack: Some(vec![]),
+            components: Some(vec![]),
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.stack, "[]", "explicit empty stack clears prior");
+        assert_eq!(p.components, "[]", "explicit empty components clears prior");
     }
 
     #[tokio::test]
@@ -1189,8 +1217,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "abc").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1214,8 +1242,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "".into(), // agent omitted it
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1238,8 +1266,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "agent summary".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1261,8 +1289,8 @@ mod tests {
             name: None,
             tier: "service".into(), // not one of frontend|gateway|backend
             summary: "agent".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
@@ -1284,11 +1312,11 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "monorepo".into(),
-            stack: vec![],
-            components: vec![
+            stack: None,
+            components: Some(vec![
                 Component { name: "api".into(), tier: "backend".into(), ..Default::default() },
                 Component { name: "".into(), tier: "frontend".into(), ..Default::default() },
-            ],
+            ]),
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1341,8 +1369,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "fresh agent sum".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1363,8 +1391,8 @@ mod tests {
             name: None,
             tier: "backend".into(),
             summary: "s".into(),
-            stack: vec![],
-            components: vec![],
+            stack: None,
+            components: None,
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
@@ -1446,7 +1474,7 @@ mod tests {
         let reply = r#"{"tier":"backend","summary":"s","components":[{"name":"api"},{"tier":"frontend"}]}"#;
         let wire = super::parse_repo_class(reply).expect("parsed despite a nameless component");
         assert_eq!(wire.tier, "backend");
-        assert_eq!(wire.components.len(), 2);
+        assert_eq!(wire.components.unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -552,10 +552,19 @@ pub async fn calibrate_repo_relation(
     };
     let mut rels: Vec<crate::profile::AgentRelation> =
         serde_json::from_str(&p.relations).unwrap_or_default();
-    // One entry per (to, kind, via): replace only the SAME-evidence entry, so a
-    // calibration of a distinct edge (same to/kind, different via) doesn't erase a
-    // prior pin/tombstone — `merge_relations` keys on `via` too.
-    rels.retain(|r| !(r.to == to_id && r.kind == kind && r.via == via));
+    // Replace the entry this calibration targets. With a `via`, replace only the
+    // SAME-evidence (to, kind, via) entry so a distinct edge isn't erased. A
+    // REMOVE with no `via` is a "drop this whole dependency kind": clear every
+    // (to, kind) entry immediately so the visible agent edges go away now, not
+    // just on a later relation pass.
+    let broad_remove = action == "remove" && via.is_empty();
+    rels.retain(|r| {
+        if broad_remove {
+            !(r.to == to_id && r.kind == kind)
+        } else {
+            !(r.to == to_id && r.kind == kind && r.via == via)
+        }
+    });
     rels.push(crate::profile::AgentRelation {
         to: to_id,
         kind: kind.to_string(),
