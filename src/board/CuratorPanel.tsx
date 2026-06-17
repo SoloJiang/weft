@@ -68,7 +68,7 @@ export function CuratorPanel() {
           <PanelRightClose size={14} />
         </button>
       </header>
-      <div className="min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 flex-col">
         {curatorThreadId != null ? (
           <LeadTab threadId={curatorThreadId} compact onReview={() => {}} />
         ) : (

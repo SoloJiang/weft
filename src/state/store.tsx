@@ -347,6 +347,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [curatorPanelOpen, setCuratorPanelOpenState] = useState(true);
   const [curatorPanelWidth, setCuratorPanelWidthState] = useState(CURATOR_WIDTH_DEFAULT);
+  // Coalesce curator-thread creation: StrictMode double-mounts and the backend
+  // get-or-create is not atomic, so two concurrent ensures could create dupes.
+  const ensuringCuratorRef = useRef(false);
   // Snapshot of the view that was active when the user opened Settings, so
   // the back arrow restores it instead of dropping them on the board.
   const prevHomeRef = useRef<{
@@ -563,6 +566,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const selectWorkspace = useCallback(async (id: number) => {
     setActiveWorkspaceId(id);
+    // Clear the old workspace's repo map first so the curator panel (gated on
+    // repoProfiles.length >= 2) can't mount from stale, other-workspace profiles
+    // during the switch and ensure a thread for the wrong workspace.
+    setRepoProfiles([]);
+    setRepoEdges([]);
     // Remember the choice so a relaunch/reload lands here, not on the first one.
     localStorage.setItem("weft-active-workspace", String(id));
     // Curator panel: drop the previous workspace's thread id and load this
@@ -585,8 +593,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setViewing(null);
     setShowNeeds(false);
     setHomeTab("board");
-    setRepoProfiles([]);
-    setRepoEdges([]);
     setProposal(null);
     setOverview([]);
   }, []);
@@ -1661,15 +1667,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // (CuratorPanel), so unlike a normal lead chat we never selectThread.
   const ensureCuratorThread = useCallback(async () => {
     const ws = activeWorkspaceId;
-    if (ws == null) return;
-    const id = await api.openCuratorChat(ws); // get-or-create; returns the id
-    const list = await api.listThreads(ws);
-    // Bail if the user switched workspaces while these requests were in flight.
-    if (activeWorkspaceIdRef.current !== ws) return;
-    // The curator thread may have just been created — sync `threads` so the
-    // embedded LeadTab can resolve its lead_tool.
-    setThreads(list);
-    setCuratorThreadId(id);
+    if (ws == null || ensuringCuratorRef.current) return;
+    ensuringCuratorRef.current = true;
+    try {
+      const id = await api.openCuratorChat(ws); // get-or-create; returns the id
+      const list = await api.listThreads(ws);
+      // Bail if the user switched workspaces while these requests were in flight.
+      if (activeWorkspaceIdRef.current !== ws) return;
+      // The curator thread may have just been created — sync `threads` so the
+      // embedded LeadTab can resolve its lead_tool.
+      setThreads(list);
+      setCuratorThreadId(id);
+    } finally {
+      ensuringCuratorRef.current = false;
+    }
   }, [activeWorkspaceId]);
 
   const setCuratorPanelOpen = useCallback((open: boolean) => {
