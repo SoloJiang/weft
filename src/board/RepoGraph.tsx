@@ -8,7 +8,6 @@ import {
   Layers,
   Loader2,
   Maximize2,
-  MessagesSquare,
   Minus,
   Network,
   PanelRightClose,
@@ -94,7 +93,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * relations and can be filtered by kind. Drag to pan, scroll/buttons to zoom.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, openCuratorChat } = useStore();
+  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps } = useStore();
   const [analyzing, setAnalyzing] = useState(false);
   const { t } = useTranslation();
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -370,15 +369,6 @@ export function RepoGraph() {
               >
                 <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
                 {analyzing ? t("repomap.reanalyzing") : t("repomap.reanalyze")}
-              </button>
-              <button
-                data-graph-controls
-                onClick={() => void openCuratorChat()}
-                title={t("repomap.calibrateHint")}
-                className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink"
-              >
-                <MessagesSquare size={12} />
-                {t("repomap.calibrate")}
               </button>
               {anyComponents && (
                 <div
