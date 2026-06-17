@@ -294,9 +294,16 @@ function BaseBranchField({
       return;
     }
     const next = val.trim();
-    if (next === (value ?? "").trim()) return;
-    lastLoaded.current = next;
-    void onSave(index, next).catch(() => {});
+    if (next === (value ?? "").trim()) return; // unchanged
+    void onSave(index, next)
+      .then(() => {
+        lastLoaded.current = next; // mark loaded only after the save actually lands
+      })
+      .catch(() => {
+        // Save failed — revert the field to the persisted value so the UI doesn't
+        // show an unsaved base that confirm/approve would ignore.
+        setVal(value ?? "");
+      });
   };
   return (
     <span
