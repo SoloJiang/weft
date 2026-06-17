@@ -1727,14 +1727,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const confirmProposal = useCallback(async () => {
     if (activeThreadId == null) return;
-    await pendingBaseSave.current.catch(() => {});
+    // Flush any in-flight base-branch save before materializing. If it REJECTED
+    // (e.g. a re-propose moved the lane, or a DB error), the backend still holds the
+    // old base — refresh the proposal to the real state and abort rather than
+    // materializing from a stale base. Consume the promise so a retry isn't blocked
+    // by the settled rejection.
+    const pending = pendingBaseSave.current;
+    pendingBaseSave.current = Promise.resolve();
+    try {
+      await pending;
+    } catch {
+      await refreshProposal(activeThreadId);
+      return;
+    }
     const ids = await api.confirmProposal(activeThreadId);
     setProposal(null);
     setReviewingProposal(false);
     await loadThreadChildren(activeThreadId);
     // Automation-first: dispatch every new task's worker immediately.
     for (const id of ids) void dispatchDirection(id);
-  }, [activeThreadId, loadThreadChildren, dispatchDirection]);
+  }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
 
   const setProposalDirectionBase = useCallback(
     (index: number, name: string, repo: string, base: string): Promise<void> => {
