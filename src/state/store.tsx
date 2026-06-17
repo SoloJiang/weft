@@ -196,7 +196,7 @@ interface Store {
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: () => Promise<void>;
-  setProposalDirectionBase: (index: number, base: string) => Promise<void>;
+  setProposalDirectionBase: (index: number, name: string, repo: string, base: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
@@ -1737,7 +1737,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeThreadId, loadThreadChildren, dispatchDirection]);
 
   const setProposalDirectionBase = useCallback(
-    (index: number, base: string): Promise<void> => {
+    (index: number, name: string, repo: string, base: string): Promise<void> => {
       if (activeThreadId == null) return Promise.resolve();
       const tid = activeThreadId;
       // Serialize onto any in-flight base save (chain, don't replace) and use the
@@ -1745,7 +1745,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // no status downgrade. confirm/approve await pendingBaseSave before acting.
       const p = pendingBaseSave.current
         .catch(() => {})
-        .then(() => api.setProposalDirectionBase(tid, index, base.trim()))
+        .then(() => api.setProposalDirectionBase(tid, index, name, repo, base.trim()))
         .then(() => {
           // Don't let a save that completes after a thread switch overwrite the
           // global proposal with the old thread's data.

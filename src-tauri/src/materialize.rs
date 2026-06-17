@@ -114,21 +114,40 @@ pub async fn materialize_direction(
             dir.branch
         );
     }
-    // Keep the diff "vs target" consistent with the branch we actually based off:
-    // when the direction has no explicit target yet, pin it to the resolved base
-    // (otherwise an empty target would resolve via a possibly-stale repo base_ref).
-    if dir.target_branch.trim().is_empty() {
-        repo::set_direction_target_branch(db, direction_id, &base).await?;
+    // synced.is_some() => we just CREATED the worktree this call; any failure in the
+    // post-add DB steps must tear it down (working copy + namespaced branch) so a
+    // failed materialize never leaks an orphan worktree/branch (which would also make
+    // a retry pick a suffixed branch). synced==None means we reused an existing
+    // checkout — leave it untouched.
+    let created = synced.is_some();
+    let finish = async {
+        // Keep the diff "vs target" consistent with the branch we actually based off:
+        // when the direction has no explicit target yet, pin it to the resolved base
+        // (otherwise an empty target would resolve via a possibly-stale repo base_ref).
+        if dir.target_branch.trim().is_empty() {
+            repo::set_direction_target_branch(db, direction_id, &base).await?;
+        }
+        let rec = repo::record_worktree(
+            db,
+            repo_ref.id,
+            direction_id,
+            &dir.branch,
+            &path.to_string_lossy(),
+        )
+        .await?;
+        Ok::<entities::worktree::Model, anyhow::Error>(rec)
     }
-    let rec = repo::record_worktree(
-        db,
-        repo_ref.id,
-        direction_id,
-        &dir.branch,
-        &path.to_string_lossy(),
-    )
-    .await?;
-    Ok(vec![rec])
+    .await;
+    match finish {
+        Ok(rec) => Ok(vec![rec]),
+        Err(err) => {
+            if created {
+                let _ = git::remove_worktree(repo_path, &path);
+                let _ = git::delete_branch(repo_path, &dir.branch);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Physically remove worktrees and their namespaced branches (called during

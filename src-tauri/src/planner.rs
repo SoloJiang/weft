@@ -299,7 +299,19 @@ pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(St
 /// Targeted read-modify-write that preserves the plan's status + created_at, so
 /// concurrent edits to different directions don't clobber and a confirmed plan is
 /// never downgraded back to "proposed".
-pub async fn set_direction_base(db: &Db, thread_id: i32, index: usize, base: &str) -> Result<()> {
+///
+/// `expected_name` and `expected_repo` are the lane identity the caller edited:
+/// if the lead re-proposed while the blur-save was in flight, the direction at
+/// `index` may now belong to a DIFFERENT lane — we verify and reject rather than
+/// silently overwriting the wrong lane.
+pub async fn set_direction_base(
+    db: &Db,
+    thread_id: i32,
+    index: usize,
+    expected_name: &str,
+    expected_repo: &str,
+    base: &str,
+) -> Result<()> {
     let plan = repo::get_plan(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal for thread {thread_id}"))?;
@@ -308,6 +320,11 @@ pub async fn set_direction_base(db: &Db, thread_id: i32, index: usize, base: &st
         .directions
         .get_mut(index)
         .ok_or_else(|| anyhow::anyhow!("direction index {index} out of range"))?;
+    // Verify the lane still has the identity the client edited — a re-propose may
+    // have replaced the proposal and shifted what sits at this index.
+    if pd.name != expected_name || pd.repo != expected_repo {
+        anyhow::bail!("proposal lane at index {index} changed (re-proposed); base not applied");
+    }
     pd.base_branch = base.trim().to_string();
     persist_decision(db, thread_id, &proposal, &plan).await?;
     Ok(())
@@ -668,14 +685,14 @@ mod tests {
         // Simulate a confirmed plan, then a targeted base edit must NOT downgrade status.
         let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
         repo::upsert_plan(&db, t.id, &plan.proposal, "confirmed", &plan.created_at).await.unwrap();
-        set_direction_base(&db, t.id, 1, "develop").await.unwrap();
+        set_direction_base(&db, t.id, 1, "B", "api", "develop").await.unwrap();
         let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
         assert_eq!(after.status, "confirmed", "targeted base edit must not downgrade status");
         let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
         assert_eq!(parsed.directions[1].base_branch, "develop");
         assert_eq!(parsed.directions[0].base_branch, "", "other directions untouched");
         // Out-of-range index errors.
-        assert!(set_direction_base(&db, t.id, 9, "x").await.is_err());
+        assert!(set_direction_base(&db, t.id, 9, "Z", "api", "x").await.is_err());
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
@@ -812,12 +829,43 @@ mod tests {
         assert!(repo::list_directions(&db, t.id).await.unwrap().is_empty(),
             "atomic: NO directions remain after a failed confirm (lane A rolled back too)");
         // Fix B's base and retry → both lanes created cleanly, no duplicates.
-        set_direction_base(&db, t.id, 1, "").await.unwrap();
+        set_direction_base(&db, t.id, 1, "B", "api", "").await.unwrap();
         let ids = confirm(&db, t.id).await.unwrap();
         assert_eq!(ids.len(), 2, "retry creates both lanes");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 2, "exactly two, no duplicates");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn set_direction_base_rejects_stale_lane_identity() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-laneid-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let proposal = Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        // Correct identity → applies.
+        set_direction_base(&db, t.id, 0, "A", "api", "develop").await.unwrap();
+        let p1: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
+        assert_eq!(p1.directions[0].base_branch, "develop");
+        // Wrong identity (lane changed under the index) → error, no write.
+        assert!(set_direction_base(&db, t.id, 0, "B", "api", "main").await.is_err());
+        let p2: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
+        assert_eq!(p2.directions[0].base_branch, "develop", "stale-identity save must not overwrite");
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

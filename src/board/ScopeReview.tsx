@@ -232,6 +232,8 @@ function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
           </span>
           <BaseBranchField
             index={lane.dirIndex}
+            name={lane.direction.name}
+            repo={lane.repoName}
             value={lane.direction.base_branch}
             disabled={!!lane.direction.decision}
             onSave={setProposalDirectionBase}
@@ -268,14 +270,18 @@ function SummaryPill({ tone, label }: { tone: "write" | "none"; label: string })
 
 function BaseBranchField({
   index,
+  name,
+  repo,
   value,
   disabled,
   onSave,
 }: {
   index: number;
+  name: string;
+  repo: string;
   value: string;
   disabled: boolean;
-  onSave: (index: number, base: string) => Promise<void>;
+  onSave: (index: number, name: string, repo: string, base: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
   const [val, setVal] = useState(value ?? "");
@@ -295,7 +301,7 @@ function BaseBranchField({
     }
     const next = val.trim();
     if (next === (value ?? "").trim()) return; // unchanged
-    void onSave(index, next)
+    void onSave(index, name, repo, next)
       .then(() => {
         lastLoaded.current = next; // mark loaded only after the save actually lands
       })

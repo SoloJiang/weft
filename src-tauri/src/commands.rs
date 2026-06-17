@@ -422,14 +422,18 @@ pub async fn save_proposal(
 }
 
 /// Set one proposed direction's base branch in the stored proposal (targeted; keeps status).
+/// `name` and `repo` are the lane identity the frontend edited — rejected if the
+/// proposal was replaced under the index (re-propose while a blur-save was in flight).
 #[tauri::command]
 pub async fn set_proposal_direction_base(
     db: State<'_, Db>,
     thread_id: i32,
     index: usize,
+    name: String,
+    repo: String,
     base: String,
 ) -> R<()> {
-    crate::planner::set_direction_base(&db, thread_id, index, &base)
+    crate::planner::set_direction_base(&db, thread_id, index, &name, &repo, &base)
         .await
         .map_err(e)
 }
