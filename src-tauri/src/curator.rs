@@ -454,11 +454,16 @@ async fn run_agent_once(tool: &str, cwd: &Path, prompt: &str) -> Result<String> 
         // with read-only + no approvals, codex can't prompt (it would hang with no
         // stdin until the timeout when it tries `rg`/`git` under an interactive
         // policy) and can't escalate out of the sandbox.
+        // `--skip-git-repo-check`: the cross-repo relation pass runs from the
+        // repos' common-ancestor dir, which usually isn't itself a git repo, and
+        // `codex exec` otherwise refuses to start outside one. Harmless for the
+        // per-repo pass (already inside a repo).
         "codex" => vec![
             "--sandbox".into(),
             "read-only".into(),
             "--ask-for-approval".into(),
             "never".into(),
+            "--skip-git-repo-check".into(),
         ],
         "claude" => vec!["--permission-mode".into(), "plan".into()],
         _ => vec![],

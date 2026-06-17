@@ -121,18 +121,33 @@ pub fn agent_edges(
 
 /// Merge a repo's current relations with a fresh agent pass: keep every
 /// user-sourced relation (including `rejected` tombstones), drop old agent
-/// relations, and add fresh agent relations EXCEPT any whose (to, kind) a user
-/// already owns — a tombstone (so a human-removed edge isn't resurrected) OR a
-/// positive pin (so the same edge isn't stored twice and rendered as a duplicate).
+/// relations, and add fresh agent relations EXCEPT:
+///   - any matching a user `rejected` tombstone by (to, kind) — a human removed
+///     that dependency, so it's not resurrected; and
+///   - any matching a positive user pin by the EXACT (to, kind, via) — so the
+///     same edge isn't stored twice, while a DISTINCT relationship between the
+///     same repos (different `via`/evidence) still survives.
 pub fn merge_relations(existing: &[AgentRelation], fresh_agent: &[AgentRelation]) -> Vec<AgentRelation> {
     let mut out: Vec<AgentRelation> =
         existing.iter().filter(|r| r.source == "user").cloned().collect();
-    let user_owned: std::collections::HashSet<(i32, String)> =
-        out.iter().map(|r| (r.to, r.kind.clone())).collect();
+    let tombstoned: std::collections::HashSet<(i32, String)> = out
+        .iter()
+        .filter(|r| r.rejected)
+        .map(|r| (r.to, r.kind.clone()))
+        .collect();
+    let pinned: std::collections::HashSet<(i32, String, String)> = out
+        .iter()
+        .filter(|r| !r.rejected)
+        .map(|r| (r.to, r.kind.clone(), r.via.clone()))
+        .collect();
     for r in fresh_agent {
-        if !user_owned.contains(&(r.to, r.kind.clone())) {
-            out.push(r.clone());
+        if tombstoned.contains(&(r.to, r.kind.clone())) {
+            continue;
         }
+        if pinned.contains(&(r.to, r.kind.clone(), r.via.clone())) {
+            continue;
+        }
+        out.push(r.clone());
     }
     out
 }
@@ -230,15 +245,21 @@ mod tests {
         let fresh_agent = vec![
             super::AgentRelation { to: 3, kind: "http".into(), via: "re-found".into(), confidence: 70, source: "agent".into(), rejected: false },
             super::AgentRelation { to: 5, kind: "grpc".into(), via: "new".into(), confidence: 60, source: "agent".into(), rejected: false },
-            // Same (to, kind) as the user's positive pin → must NOT be duplicated.
-            super::AgentRelation { to: 2, kind: "http".into(), via: "agent-dup".into(), confidence: 80, source: "agent".into(), rejected: false },
+            // EXACT duplicate of the user pin (same to/kind/via) → suppressed.
+            super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 80, source: "agent".into(), rejected: false },
+            // DISTINCT relationship to the same repo (different via) → kept.
+            super::AgentRelation { to: 2, kind: "http".into(), via: "GET /orders".into(), confidence: 80, source: "agent".into(), rejected: false },
         ];
         let merged = super::merge_relations(&existing, &fresh_agent);
-        assert!(merged.iter().any(|r| r.to == 2 && r.source == "user" && !r.rejected), "user edge survives");
+        assert!(merged.iter().any(|r| r.to == 2 && r.source == "user" && r.via == "POST /pay"), "user edge survives");
         assert_eq!(
-            merged.iter().filter(|r| r.to == 2 && r.kind == "http").count(),
+            merged.iter().filter(|r| r.to == 2 && r.kind == "http" && r.via == "POST /pay").count(),
             1,
-            "agent edge matching a user pin is not duplicated"
+            "exact-duplicate agent edge is not stored twice",
+        );
+        assert!(
+            merged.iter().any(|r| r.to == 2 && r.kind == "http" && r.via == "GET /orders" && r.source == "agent"),
+            "a distinct agent edge to the same repo survives next to a user pin",
         );
         assert!(merged.iter().any(|r| r.to == 3 && r.rejected), "tombstone survives");
         assert!(!merged.iter().any(|r| r.to == 3 && !r.rejected), "tombstoned edge not resurrected");
