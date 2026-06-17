@@ -75,8 +75,9 @@ async fn register_repo(
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
     // Default base ref = the repo's real default branch: the remote's default
-    // (origin/HEAD) when there is one, else the locally checked-out branch. So a
-    // repo added while on a feature branch still records the true default as base.
+    // (origin/HEAD), else the conventional integration branch (main/master), else
+    // the locally checked-out branch. So a repo added while on a feature branch
+    // records the integration branch as base, not that feature branch.
     let base = crate::git::default_base_branch(p, &crate::git::current_branch(p).unwrap_or_default());
     // Captured for workspace-level dedup; empty for a local repo with no origin.
     // Credentials embedded in an HTTPS remote are redacted so a PAT/password from
