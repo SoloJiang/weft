@@ -233,6 +233,7 @@ function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
           <BaseBranchField
             index={lane.dirIndex}
             value={lane.direction.base_branch}
+            disabled={!!lane.direction.decision}
             onSave={setProposalDirectionBase}
           />
           {index > 0 && (
@@ -268,10 +269,12 @@ function SummaryPill({ tone, label }: { tone: "write" | "none"; label: string })
 function BaseBranchField({
   index,
   value,
+  disabled,
   onSave,
 }: {
   index: number;
   value: string;
+  disabled: boolean;
   onSave: (index: number, base: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
@@ -285,6 +288,7 @@ function BaseBranchField({
   }, [value]);
   const skipNextBlur = useRef(false);
   const save = () => {
+    if (disabled) return;
     if (skipNextBlur.current) {
       skipNextBlur.current = false;
       return;
@@ -296,12 +300,13 @@ function BaseBranchField({
   };
   return (
     <span
-      className="hidden shrink-0 items-center gap-1 lg:flex"
+      className="flex shrink-0 items-center gap-1"
       title={t("scope.baseBranchHint")}
     >
       <GitBranch size={11} className="text-ink-faint" />
       <input
         value={val}
+        disabled={disabled}
         onChange={(e) => setVal(e.target.value)}
         onBlur={save}
         onKeyDown={(e) => {
@@ -317,7 +322,7 @@ function BaseBranchField({
         placeholder={t("scope.basePlaceholderDefault")}
         spellCheck={false}
         aria-label={t("scope.baseBranch")}
-        className="w-24 min-w-0 rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 font-mono text-[10.5px] text-ink outline-none focus:border-brand"
+        className="w-24 min-w-0 rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 font-mono text-[10.5px] text-ink outline-none focus:border-brand disabled:cursor-not-allowed disabled:opacity-50"
       />
     </span>
   );

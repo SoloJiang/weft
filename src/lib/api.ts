@@ -106,6 +106,8 @@ export const api = {
     invoke<void>("save_proposal", { threadId, proposal }),
   confirmProposal: (threadId: number) =>
     invoke<number[]>("confirm_proposal", { threadId }),
+  setProposalDirectionBase: (threadId: number, index: number, base: string) =>
+    invoke<void>("set_proposal_direction_base", { threadId, index, base }),
   createDirection: (
     threadId: number,
     name: string,

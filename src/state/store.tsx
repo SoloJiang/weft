@@ -1672,28 +1672,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const setProposalDirectionBase = useCallback(
     (index: number, base: string): Promise<void> => {
-      if (activeThreadId == null || !proposal) return Promise.resolve();
-      // Rebuild the stored Proposal from the resolved view, overriding one base.
-      const next: Proposal = {
-        rationale: proposal.rationale,
-        directions: proposal.directions.map((d, i) => ({
-          name: d.name,
-          tool: "", // legacy field; ignored by the backend
-          repo: d.repo.repo_name,
-          reason: d.reason,
-          mandate: d.mandate,
-          decision: d.decision,
-          base_branch: i === index ? base.trim() : (d.base_branch ?? ""),
-        })),
-      };
-      const p = (async () => {
-        await api.saveProposal(activeThreadId, next);
-        await refreshProposal(activeThreadId);
-      })();
+      if (activeThreadId == null) return Promise.resolve();
+      const tid = activeThreadId;
+      // Serialize onto any in-flight base save (chain, don't replace) and use the
+      // targeted server-side setter — no whole-proposal rebuild from stale state,
+      // no status downgrade. confirm/approve await pendingBaseSave before acting.
+      const p = pendingBaseSave.current
+        .catch(() => {})
+        .then(() => api.setProposalDirectionBase(tid, index, base.trim()))
+        .then(() => refreshProposal(tid));
       pendingBaseSave.current = p;
       return p;
     },
-    [activeThreadId, proposal, refreshProposal],
+    [activeThreadId, refreshProposal],
   );
 
   const answerAsk = useCallback(
