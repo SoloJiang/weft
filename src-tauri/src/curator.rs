@@ -819,6 +819,16 @@ async fn needs_classification(db: &Db, repo: &repo_ref::Model) -> bool {
     }
 }
 
+/// Whether a profile row is a COMPLETED deep classification rather than a bare
+/// placeholder or a user-picked-tier-only node: it needs a canonical tier AND a
+/// non-blank summary. `persist_repo_class` refuses to persist a classification
+/// with an empty summary, so a non-blank summary marks a real deep pass (or a
+/// user-pinned one — also real signal); a tier-only placeholder has a blank one.
+/// Only such repos take part in the cross-repo relation pass.
+fn is_fully_profiled(p: &repo_profile::Model) -> bool {
+    profile::normalize_tier(&p.role).is_some() && !p.summary.trim().is_empty()
+}
+
 /// The deepest directory that contains every given path, or `None` when there is
 /// no meaningful shared ancestor (different roots, or only the filesystem root).
 /// Used as the relation pass's cwd so a sandboxed tool can read all repos.
@@ -870,10 +880,14 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
             continue;
         }
         if let Some(p) = repo::get_repo_profile(db, r.id).await? {
-            // Only relate ANALYZED repos (canonical tier). A placeholder/legacy row
-            // gives the agent a blank node, and including it could let an explicit
-            // empty relation set wipe the analyzed repos' existing edges.
-            if profile::normalize_tier(&p.role).is_some() {
+            // Only relate FULLY-PROFILED repos. A canonical tier ALONE isn't enough:
+            // a user can pick a tier on a still-analyzing placeholder, and if the
+            // deep classifier then fails/times out the row keeps that canonical tier
+            // but a blank summary/stack/components. Feeding such a blank node to the
+            // relation agent — and letting it reach the ≥2 threshold — lets a
+            // degraded prompt return an explicit empty set, which `merge_relations`
+            // turns into "drop every agent edge", wiping the OTHER repos' real edges.
+            if is_fully_profiled(&p) {
                 profiled.push((r.clone(), p));
             }
         }
@@ -1018,6 +1032,40 @@ mod tests {
                 && e.via == "GET /orders"),
             "agent http edge present"
         );
+    }
+
+    #[tokio::test]
+    async fn is_fully_profiled_requires_tier_and_summary() {
+        // The cross-repo relation pass must include only completed deep profiles:
+        // a canonical tier alone (e.g. a user-picked tier on a placeholder whose
+        // deep classifier never finished) is NOT enough, because that blank node
+        // can let a degraded prompt wipe the other repos' edges.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "")
+            .await
+            .unwrap();
+
+        // Canonical tier but blank summary (tier-only placeholder) → excluded.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "user_tier", "")
+            .await
+            .unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert!(!super::is_fully_profiled(&p), "tier-only placeholder excluded");
+
+        // Non-canonical (legacy) tier with a summary → excluded.
+        repo::upsert_repo_profile(&db, r.id, "service", "[]", "s", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert!(!super::is_fully_profiled(&p), "legacy tier excluded");
+
+        // Canonical tier AND a non-blank summary → included.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "an api", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert!(super::is_fully_profiled(&p), "completed deep profile included");
     }
 
     #[tokio::test]
