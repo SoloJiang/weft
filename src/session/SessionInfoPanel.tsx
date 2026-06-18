@@ -49,11 +49,10 @@ export function SessionInfoPanel({
   const skillsExpanded = skillsOpen ?? allSkills.length <= 12;
 
   // Newest-first; the panel shows the top 3 and folds the rest behind a toggle.
+  // direction.created_at is a Unix-seconds string (store `now()`), not RFC3339 —
+  // new Date("1718700000") is Invalid Date, so parse numerically (ISO fallback).
   const sortedSubtasks = useMemo(
-    () =>
-      [...(subtasks ?? [])].sort(
-        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-      ),
+    () => [...(subtasks ?? [])].sort((a, b) => subtaskTime(b.created_at) - subtaskTime(a.created_at)),
     [subtasks],
   );
   const [subtasksOpen, setSubtasksOpen] = useState(false);
@@ -242,6 +241,15 @@ export function SessionInfoPanel({
       </div>
     </aside>
   );
+}
+
+/** created_at → epoch for ordering. Store writes Unix seconds as a string;
+ * tolerate an ISO value too. Unparseable → 0 (sinks to the bottom). */
+function subtaskTime(createdAt: string): number {
+  const secs = Number(createdAt);
+  if (Number.isFinite(secs)) return secs;
+  const ms = Date.parse(createdAt);
+  return Number.isNaN(ms) ? 0 : ms;
 }
 
 /** Lifecycle status → dot color, mirroring the board columns. */
