@@ -49,10 +49,18 @@ export function SessionInfoPanel({
   const skillsExpanded = skillsOpen ?? allSkills.length <= 12;
 
   // Newest-first; the panel shows the top 3 and folds the rest behind a toggle.
-  // direction.created_at is a Unix-seconds string (store `now()`), not RFC3339 —
-  // new Date("1718700000") is Invalid Date, so parse numerically (ISO fallback).
+  // created_at is a Unix-seconds string (store `now()`), not RFC3339 — new
+  // Date("1718700000") is Invalid Date, so parse numerically (ISO fallback).
+  // Whole-second granularity + batch dispatch (planner::confirm) means a
+  // proposal's directions share one timestamp, so break ties on descending id
+  // (autoincrement → higher = inserted later = newer); otherwise the stable
+  // sort keeps list_directions' ascending-id order and hides the newest.
   const sortedSubtasks = useMemo(
-    () => [...(subtasks ?? [])].sort((a, b) => subtaskTime(b.created_at) - subtaskTime(a.created_at)),
+    () =>
+      [...(subtasks ?? [])].sort((a, b) => {
+        const dt = subtaskTime(b.created_at) - subtaskTime(a.created_at);
+        return dt !== 0 ? dt : b.id - a.id;
+      }),
     [subtasks],
   );
   const [subtasksOpen, setSubtasksOpen] = useState(false);
