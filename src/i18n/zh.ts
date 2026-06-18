@@ -353,6 +353,9 @@ export const zh = {
     mcp: "MCP",
     servers_other: "{{count}} 个 server",
     tools_other: "{{count}} 个 tool",
+    subtasks: "子任务",
+    moreSubtasks_other: "展开剩余 {{count}} 个",
+    showLess: "收起",
   },
   observe: {
     answerPlaceholder: "输入回复，回车发送",

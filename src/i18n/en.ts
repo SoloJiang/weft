@@ -366,6 +366,10 @@ export const en = {
     servers_other: "{{count}} servers",
     tools_one: "{{count}} tool",
     tools_other: "{{count}} tools",
+    subtasks: "Sub-tasks",
+    moreSubtasks_one: "Show {{count}} more",
+    moreSubtasks_other: "Show {{count}} more",
+    showLess: "Show less",
   },
   observe: {
     answerPlaceholder: "Type a reply, press Enter",
