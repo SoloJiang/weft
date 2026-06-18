@@ -54,6 +54,7 @@ export function LeadTab({
     leadSlash,
     leadActivity,
     leadMeta,
+    directionsByThread,
     repos,
     loadLeadChat,
     discoverLeadSlash,
@@ -285,6 +286,7 @@ export function LeadTab({
         <SessionInfoPanel
           meta={leadMeta[tid]}
           skills={skills}
+          subtasks={directionsByThread[tid]}
           onClose={() => setRail("none")}
           onReload={onReload}
           busy={turn.state === "busy"}
