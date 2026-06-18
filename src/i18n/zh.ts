@@ -351,10 +351,9 @@ export const zh = {
     reasoning: "思考强度",
     skills: "Skills",
     mcp: "MCP",
-    servers_other: "{{count}} 个 server",
     tools_other: "{{count}} 个 tool",
     subtasks: "子任务",
-    moreSubtasks_other: "展开剩余 {{count}} 个",
+    showMore_other: "展开剩余 {{count}} 个",
     showLess: "收起",
   },
   observe: {

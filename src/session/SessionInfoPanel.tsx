@@ -1,13 +1,15 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { X, ChevronRight, ChevronDown, RefreshCw } from "lucide-react";
 import type { SessionMeta, EnabledSkill, Direction } from "../lib/types";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 
 /**
- * 常驻右栏「会话信息」:Context(token + %,不含花费)、Skills、MCP(server + 状态,
- * claude 可展开看 tool;codex/opencode 只列 server)。纯展示——数据由 store 的
- * leadMeta/workerMeta + workspaceSkills 喂;和 diff 互斥由宿主的 rail 状态驱动。
+ * 常驻右栏「会话信息」:Context(token + %,不含花费)、Sub-tasks、Skills、MCP。
+ * Skills/MCP/Sub-tasks 共享同一套渐进披露(<Section> 折叠头 + <OverflowList>
+ * head+show-more):Skills/MCP 头可整段折叠,Sub-tasks 头常驻(最相关,不可隐藏);
+ * 三者都用同一个 head + "Show N more" 控件封长列表。纯展示——数据由 store 的
+ * leadMeta/workerMeta + workspaceSkills + directionsByThread 喂。
  */
 export function SessionInfoPanel({
   meta,
@@ -43,12 +45,7 @@ export function SessionInfoPanel({
     return [...byName.values()];
   }, [skills, meta?.engineSkills]);
 
-  // Collapsible skills: a long list (codex exposes dozens) would bury the MCP
-  // section, so default to expanded only when there are few; null = use default.
-  const [skillsOpen, setSkillsOpen] = useState<boolean | null>(null);
-  const skillsExpanded = skillsOpen ?? allSkills.length <= 12;
-
-  // Newest-first; the panel shows the top 3 and folds the rest behind a toggle.
+  // Newest-first; the overflow list shows the head and folds the rest.
   // created_at is a Unix-seconds string (store `now()`), not RFC3339 — new
   // Date("1718700000") is Invalid Date, so parse numerically (ISO fallback).
   // Whole-second granularity + batch dispatch (planner::confirm) means a
@@ -63,8 +60,8 @@ export function SessionInfoPanel({
       }),
     [subtasks],
   );
-  const [subtasksOpen, setSubtasksOpen] = useState(false);
-  const SUBTASK_HEAD = 3;
+
+  const servers = meta?.mcpServers ?? [];
 
   return (
     <aside className="flex h-full w-[270px] shrink-0 flex-col overflow-hidden border-l border-border bg-bg">
@@ -91,10 +88,10 @@ export function SessionInfoPanel({
       </header>
 
       {/* overflow-y:scroll keeps the (custom, space-taking) scrollbar track
-          permanently reserved, so expanding the skills list never changes the
-          content width — scrollbar-gutter alone wasn't reliably honored here. */}
+          permanently reserved, so expanding a list never changes the content
+          width — scrollbar-gutter alone wasn't reliably honored here. */}
       <div className="min-h-0 flex-1 overflow-y-scroll">
-        {/* Context */}
+        {/* Context — stats, not a list; keeps its own bespoke layout. */}
         <section className="border-b border-border px-4 py-3">
           <div className="flex items-center">
             <span className="text-[11px] text-ink-faint">{t("sessionInfo.context")}</span>
@@ -131,123 +128,176 @@ export function SessionInfoPanel({
           )}
         </section>
 
-        {/* Sub-tasks — created directions for this thread, newest first. Only the
-            lead passes them; the top 3 stay visible, the rest fold away. */}
+        {/* Sub-tasks — created directions, newest first. Lead-only. The header
+            stays put (most task-relevant → not hideable); the list caps at 3. */}
         {sortedSubtasks.length > 0 && (
-          <section className="border-b border-border px-4 py-3">
-            <div className="flex items-center">
-              <span className="text-[11px] text-ink-faint">{t("sessionInfo.subtasks")}</span>
-              <span className="ml-auto text-[11px] text-ink-faint">{sortedSubtasks.length}</span>
-            </div>
-            <div className="mt-1.5 flex flex-col gap-0.5">
-              {sortedSubtasks.slice(0, SUBTASK_HEAD).map((d) => (
-                <SubtaskRow key={d.id} direction={d} />
-              ))}
-            </div>
-            {sortedSubtasks.length > SUBTASK_HEAD && (
-              <>
-                {/* grid-rows 0fr→1fr animates the overflow open/closed; the inner
-                    overflow-hidden clips the rows mid-anim. */}
-                <div
-                  className={`grid transition-[grid-template-rows] duration-200 ease-out ${
-                    subtasksOpen ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
-                  }`}
-                >
-                  <div className="overflow-hidden">
-                    <div className="flex flex-col gap-0.5 pt-0.5">
-                      {sortedSubtasks.slice(SUBTASK_HEAD).map((d) => (
-                        <SubtaskRow key={d.id} direction={d} />
-                      ))}
-                    </div>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setSubtasksOpen((v) => !v)}
-                  className="mt-1.5 flex w-full items-center gap-1 px-1.5 text-[11px] text-ink-faint transition-colors hover:text-ink"
-                >
-                  {subtasksOpen ? (
-                    <>
-                      <ChevronDown size={13} />
-                      {t("sessionInfo.showLess")}
-                    </>
-                  ) : (
-                    <>
-                      <ChevronRight size={13} />
-                      {t("sessionInfo.moreSubtasks", {
-                        count: sortedSubtasks.length - SUBTASK_HEAD,
-                      })}
-                    </>
-                  )}
-                </button>
-              </>
-            )}
-          </section>
+          <Section title={t("sessionInfo.subtasks")} count={sortedSubtasks.length}>
+            <OverflowList
+              items={sortedSubtasks}
+              head={3}
+              layout="rows"
+              renderItem={(d) => <SubtaskRow key={d.id} direction={d} />}
+            />
+          </Section>
         )}
 
-        {/* Skills */}
-        <section className="border-b border-border px-4 py-3">
-          <button
-            type="button"
-            onClick={() => allSkills.length > 0 && setSkillsOpen(!skillsExpanded)}
-            className="flex w-full items-center"
-          >
-            <span className="text-[11px] text-ink-faint">{t("sessionInfo.skills")}</span>
-            <span className="ml-auto text-[11px] text-ink-faint">{allSkills.length}</span>
-            {allSkills.length > 0 &&
-              (skillsExpanded ? (
-                <ChevronDown size={13} className="ml-1 text-ink-faint" />
-              ) : (
-                <ChevronRight size={13} className="ml-1 text-ink-faint" />
-              ))}
-          </button>
+        {/* Skills — collapsible; chips cap at 10 (chips are dense). */}
+        <Section
+          title={t("sessionInfo.skills")}
+          count={allSkills.length}
+          collapsible={allSkills.length > 0}
+        >
           {allSkills.length === 0 ? (
-            <div className="mt-2 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
+            <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
           ) : (
-            // grid-rows 0fr→1fr animates the chip wrap open/closed without a fixed
-            // height; the inner overflow-hidden clips (margin included) mid-anim.
-            <div
-              className={`grid transition-[grid-template-rows] duration-200 ease-out ${
-                skillsExpanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
-              }`}
-            >
-              <div className="overflow-hidden">
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {allSkills.map((s) => (
-                    <span
-                      key={s.name}
-                      title={s.description}
-                      className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
-                    >
-                      {s.name}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            </div>
+            <OverflowList
+              items={allSkills}
+              head={10}
+              layout="wrap"
+              renderItem={(s) => (
+                <span
+                  key={s.name}
+                  title={s.description}
+                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
+                >
+                  {s.name}
+                </span>
+              )}
+            />
           )}
-        </section>
+        </Section>
 
-        {/* MCP */}
-        <section className="px-4 py-3">
-          <div className="flex items-center">
-            <span className="text-[11px] text-ink-faint">{t("sessionInfo.mcp")}</span>
-            <span className="ml-auto text-[11px] text-ink-faint">
-              {t("sessionInfo.servers", { count: meta?.mcpServers.length ?? 0 })}
-            </span>
-          </div>
-          {meta && meta.mcpServers.length > 0 ? (
-            <div className="mt-1.5 flex flex-col gap-0.5">
-              {meta.mcpServers.map((s) => (
+        {/* MCP — collapsible; servers cap at 3, each row expands its tools. */}
+        <Section title={t("sessionInfo.mcp")} count={servers.length} collapsible={servers.length > 0}>
+          {servers.length > 0 ? (
+            <OverflowList
+              items={servers}
+              head={3}
+              layout="rows"
+              renderItem={(s) => (
                 <McpRow key={s.name} name={s.name} status={s.status} tools={s.tools} />
-              ))}
-            </div>
+              )}
+            />
           ) : (
             <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
           )}
-        </section>
+        </Section>
       </div>
     </aside>
+  );
+}
+
+/**
+ * A panel section: label + count header over a body. When `collapsible`, the
+ * header is a button that folds the whole body (chevron, grid-rows animation);
+ * otherwise it's a static label and the body always shows. Default expanded.
+ */
+function Section({
+  title,
+  count,
+  collapsible = false,
+  children,
+}: {
+  title: string;
+  count?: number;
+  collapsible?: boolean;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(true);
+  const header = (
+    <>
+      <span className="text-[11px] text-ink-faint">{title}</span>
+      {count != null && <span className="ml-auto text-[11px] text-ink-faint">{count}</span>}
+      {collapsible &&
+        (open ? (
+          <ChevronDown size={13} className="ml-1 text-ink-faint" />
+        ) : (
+          <ChevronRight size={13} className="ml-1 text-ink-faint" />
+        ))}
+    </>
+  );
+  return (
+    <section className="border-b border-border px-4 py-3">
+      {collapsible ? (
+        <button type="button" onClick={() => setOpen((v) => !v)} className="flex w-full items-center">
+          {header}
+        </button>
+      ) : (
+        <div className="flex items-center">{header}</div>
+      )}
+      {collapsible ? (
+        // grid-rows 0fr→1fr animates the body open/closed; inner overflow-hidden
+        // clips it (margins included) mid-anim.
+        <div
+          className={`grid transition-[grid-template-rows] duration-200 ease-out ${
+            open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
+          }`}
+        >
+          <div className="overflow-hidden">{children}</div>
+        </div>
+      ) : (
+        children
+      )}
+    </section>
+  );
+}
+
+/**
+ * Shows the first `head` items, then folds the rest behind a shared
+ * "Show N more / Show less" toggle (grid-rows animation). `layout` picks the
+ * container: stacked rows or wrapping chips.
+ */
+function OverflowList<T>({
+  items,
+  head,
+  layout,
+  renderItem,
+}: {
+  items: T[];
+  head: number;
+  layout: "rows" | "wrap";
+  renderItem: (item: T) => ReactNode;
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const container = layout === "wrap" ? "flex flex-wrap gap-1.5" : "flex flex-col gap-0.5";
+  const rest = items.slice(head);
+  return (
+    <>
+      <div className={`mt-1.5 ${container}`}>{items.slice(0, head).map(renderItem)}</div>
+      {rest.length > 0 && (
+        <>
+          <div
+            className={`grid transition-[grid-template-rows] duration-200 ease-out ${
+              open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
+            }`}
+          >
+            <div className="overflow-hidden">
+              <div className={`${container} ${layout === "wrap" ? "mt-1.5" : "pt-0.5"}`}>
+                {rest.map(renderItem)}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="mt-1.5 flex w-full items-center gap-1 px-1.5 text-[11px] text-ink-faint transition-colors hover:text-ink"
+          >
+            {open ? (
+              <>
+                <ChevronDown size={13} />
+                {t("sessionInfo.showLess")}
+              </>
+            ) : (
+              <>
+                <ChevronRight size={13} />
+                {t("sessionInfo.showMore", { count: rest.length })}
+              </>
+            )}
+          </button>
+        </>
+      )}
+    </>
   );
 }
 
@@ -274,6 +324,8 @@ function subtaskDot(status: string): string {
   }
 }
 
+// Display-only row (not interactive → no hover affordance): tool icon, name,
+// status dot.
 function SubtaskRow({ direction }: { direction: Direction }) {
   return (
     <div className="flex items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1">
@@ -292,6 +344,8 @@ function SubtaskRow({ direction }: { direction: Direction }) {
   );
 }
 
+// Interactive row (click toggles the nested tool list → hover affordance):
+// status dot, name, tool count.
 function McpRow({ name, status, tools }: { name: string; status: string; tools: string[] }) {
   const [open, setOpen] = useState(true); // 默认展开
   const { t } = useTranslation();
