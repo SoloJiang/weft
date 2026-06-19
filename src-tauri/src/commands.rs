@@ -651,6 +651,141 @@ pub async fn repo_diff(db: State<'_, Db>, worktree_id: i32) -> R<crate::git::Dif
         .ok_or("worktree not found")?;
     crate::git::repo_diff(std::path::Path::new(&w.path)).map_err(e)
 }
+/// Worktree file tree response, including a truncation flag when the directory
+/// is too large to render efficiently.
+#[derive(serde::Serialize)]
+pub struct FileTree {
+    pub nodes: Vec<FileNode>,
+    pub truncated: bool,
+    pub total: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct FileNode {
+    pub path: String,
+    pub name: String,
+    pub kind: FileNodeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<FileNode>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileNodeKind {
+    File,
+    Directory,
+}
+
+const FILE_TREE_MAX_DEPTH: usize = 8;
+const FILE_TREE_MAX_NODES: usize = 5000;
+
+/// Directories that are usually large and uninteresting for code review.
+fn is_skipped_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".turbo"
+            | "coverage"
+            | ".coverage"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+    )
+}
+
+fn read_dir_tree(
+    path: &std::path::Path,
+    depth: usize,
+    counter: &mut usize,
+) -> R<(Vec<FileNode>, bool)> {
+    if *counter >= FILE_TREE_MAX_NODES {
+        return Ok((Vec::new(), true));
+    }
+    if depth == 0 {
+        // Reached the depth limit. If this directory has any entries, report
+        // truncation so the UI doesn't show a non-empty folder as empty.
+        let has_entries = std::fs::read_dir(path)
+            .map_err(e)?
+            .next()
+            .is_some();
+        return Ok((Vec::new(), has_entries));
+    }
+
+    // Collect up to the remaining budget so we never sort an unbounded list.
+    let mut entries = Vec::with_capacity(256);
+    let mut truncated = false;
+    for entry in std::fs::read_dir(path).map_err(e)? {
+        let entry = entry.map_err(e)?;
+        if *counter + entries.len() >= FILE_TREE_MAX_NODES {
+            truncated = true;
+            break;
+        }
+        entries.push(entry);
+    }
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    let mut nodes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if *counter >= FILE_TREE_MAX_NODES {
+            truncated = true;
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry_path = entry.path();
+        let path_str = entry_path.to_string_lossy().into_owned();
+        // Use symlink_metadata so we don't follow symlinks into directories
+        // outside the worktree. Symlinks are shown as files and not recursed.
+        let metadata = match std::fs::symlink_metadata(&entry_path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        if metadata.is_dir() {
+            if is_skipped_dir(&name) {
+                continue;
+            }
+            *counter += 1;
+            let (children, child_truncated) =
+                read_dir_tree(&entry_path, depth - 1, counter)?;
+            truncated = truncated || child_truncated;
+            nodes.push(FileNode {
+                path: path_str,
+                name,
+                kind: FileNodeKind::Directory,
+                children: Some(children),
+            });
+        } else {
+            *counter += 1;
+            nodes.push(FileNode {
+                path: path_str,
+                name,
+                kind: FileNodeKind::File,
+                children: None,
+            });
+        }
+    }
+    Ok((nodes, truncated))
+}
+
+/// The worktree file tree for the Files panel: a recursive snapshot of the
+/// worktree's directory structure, excluding build/output dirs and `.git`.
+#[tauri::command]
+pub fn list_worktree_files(cwd: String) -> R<FileTree> {
+    let mut counter = 0;
+    let (nodes, truncated) = read_dir_tree(std::path::Path::new(&cwd), FILE_TREE_MAX_DEPTH, &mut counter)?;
+    Ok(FileTree {
+        nodes,
+        truncated,
+        total: counter,
+    })
+}
+
+
 
 #[tauri::command]
 pub async fn delete_thread(db: State<'_, Db>, thread_id: i32) -> R<()> {

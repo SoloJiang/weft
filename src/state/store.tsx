@@ -243,8 +243,17 @@ interface Store {
   /** Delete a finished task's worktree (directory + record); keeps the branch. */
   deleteWorktree: (worktreeId: number, directionId: number) => Promise<void>;
 
-  viewing: { directionId: number; repoId: number; diff?: boolean } | null;
-  viewDirection: (directionId: number, repoId: number, opts?: { diff?: boolean }) => void;
+  viewing: {
+    directionId: number;
+    repoId: number;
+    /** Which side panel to open when entering the session view. */
+    sidePanel?: "diff" | "files";
+  } | null;
+  viewDirection: (
+    directionId: number,
+    repoId: number,
+    opts?: { sidePanel?: "diff" | "files" },
+  ) => void;
   driveDirection: (
     directionId: number,
     repoId: number,
@@ -333,7 +342,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [viewing, setViewing] = useState<{
     directionId: number;
     repoId: number;
-    diff?: boolean;
+    sidePanel?: "diff" | "files";
   } | null>(null);
   const [messages, setMessages] = useState<BusMsg[]>([]);
   const [needs, setNeeds] = useState<NeedItem[]>([]);
@@ -357,7 +366,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const prevHomeRef = useRef<{
     homeTab: HomeTab;
     activeThreadId: number | null;
-    viewing: { directionId: number; repoId: number; diff?: boolean } | null;
+    viewing: { directionId: number; repoId: number; sidePanel?: "diff" | "files" } | null;
     showNeeds: boolean;
   } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
@@ -922,8 +931,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const viewDirection = useCallback(
-    (directionId: number, repoId: number, opts?: { diff?: boolean }) => {
-      setViewing({ directionId, repoId, diff: opts?.diff });
+    (directionId: number, repoId: number, opts?: { sidePanel?: "diff" | "files" }) => {
+      setViewing({ directionId, repoId, sidePanel: opts?.sidePanel });
       setShowNeeds(false);
       setHomeTab("board");
     },

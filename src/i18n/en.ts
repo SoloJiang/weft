@@ -155,6 +155,7 @@ export const en = {
     provenanceTip: "Repos, work branches & check results",
     copyBranch: "Copy branch",
     copyPath: "Copy worktree path",
+    browseFiles: "Browse files",
     copiesCount_one: "{{count}} copy",
     copiesCount_other: "{{count}} copies",
     colRunning: "In progress",
@@ -349,6 +350,13 @@ export const en = {
     askSubmit: "Send",
     askContext: "About this change in `{{path}}`:",
     askContextLine: "About this change in `{{path}}` (line {{side}}{{n}}):",
+  },
+  files: {
+    tab: "Files",
+    empty: "This worktree is empty.",
+    loading: "Loading files…",
+    refresh: "Refresh file tree",
+    truncated: "Directory too large; some entries are hidden.",
   },
   sessionInfo: {
     title: "Session",
