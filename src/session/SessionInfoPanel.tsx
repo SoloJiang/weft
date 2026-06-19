@@ -131,7 +131,11 @@ export function SessionInfoPanel({
         {/* Sub-tasks — created directions, newest first. Lead-only. The header
             stays put (most task-relevant → not hideable); the list caps at 3. */}
         {sortedSubtasks.length > 0 && (
-          <Section title={t("sessionInfo.subtasks")} count={sortedSubtasks.length}>
+          // Stable keys keep each section's disclosure state attached to itself:
+          // these same-type <Section> siblings would otherwise reconcile by
+          // position, so inserting Sub-tasks (0→≥1 live) would migrate Skills'
+          // and MCP's useState to the wrong section.
+          <Section key="subtasks" title={t("sessionInfo.subtasks")} count={sortedSubtasks.length}>
             <OverflowList
               items={sortedSubtasks}
               head={3}
@@ -143,6 +147,7 @@ export function SessionInfoPanel({
 
         {/* Skills — collapsible; chips cap at 10 (chips are dense). */}
         <Section
+          key="skills"
           title={t("sessionInfo.skills")}
           count={allSkills.length}
           collapsible={allSkills.length > 0}
@@ -168,7 +173,7 @@ export function SessionInfoPanel({
         </Section>
 
         {/* MCP — collapsible; servers cap at 3, each row expands its tools. */}
-        <Section title={t("sessionInfo.mcp")} count={servers.length} collapsible={servers.length > 0}>
+        <Section key="mcp" title={t("sessionInfo.mcp")} count={servers.length} collapsible={servers.length > 0}>
           {servers.length > 0 ? (
             <OverflowList
               items={servers}
@@ -233,7 +238,11 @@ function Section({
             open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
           }`}
         >
-          <div className="overflow-hidden">{children}</div>
+          {/* `inert` when collapsed: body stays mounted for the animation but
+              leaves the tab order / a11y tree (clipped content isn't focusable). */}
+          <div className="overflow-hidden" inert={!open}>
+            {children}
+          </div>
         </div>
       ) : (
         children
@@ -272,7 +281,10 @@ function OverflowList<T>({
               open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
             }`}
           >
-            <div className="overflow-hidden">
+            {/* `inert` when closed: the rows stay mounted (for the collapse
+                animation) but leave the tab order / a11y tree, so keyboard users
+                can't focus hidden interactive rows (e.g. MCP server buttons). */}
+            <div className="overflow-hidden" inert={!open}>
               <div className={`${container} ${layout === "wrap" ? "mt-1.5" : "pt-0.5"}`}>
                 {rest.map(renderItem)}
               </div>
