@@ -252,7 +252,22 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         // a re-proposal that changes the base can't silently re-base a live (possibly
         // worker-occupied) worktree. Surface the conflict rather than approving with a
         // mismatched base. (Same base → idempotent reuse.)
-        if existing.base_branch.trim() != resolved.base_branch.trim() {
+        // Compare EFFECTIVE bases (empty → repo default, origin/ stripped) so a
+        // re-proposal that merely spells out the same default isn't treated as a
+        // rebase conflict. Only a real change of branch-off point is rejected.
+        let repo_ref = repo::get_repo(db, resolved.repo.repo_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("repo {} not found", resolved.repo.repo_id))?;
+        let repo_path = std::path::Path::new(&repo_ref.local_git_path);
+        let effective = |b: &str| -> String {
+            let b = b.trim();
+            if b.is_empty() {
+                crate::git::default_base_branch(repo_path, &repo_ref.base_ref)
+            } else {
+                b.strip_prefix("origin/").unwrap_or(b).to_string()
+            }
+        };
+        if effective(&existing.base_branch) != effective(&resolved.base_branch) {
             anyhow::bail!(
                 "direction {:?} already exists with base {:?}; delete the sub-task to recreate it from {:?}",
                 resolved.name,
@@ -913,6 +928,39 @@ mod tests {
         save_proposal(&db, t.id, &mk("")).await.unwrap();
         let id3 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         assert_eq!(id3, id, "same base → idempotent reuse returns the existing id");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn approve_allows_reproposed_default_spelled_out() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-eff-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        let def = crate::git::current_branch(&repo_path).unwrap(); // repo default (main/master)
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &def, "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
+        ]};
+        // First approve with empty base → materializes off the default.
+        save_proposal(&db, t.id, &mk("")).await.unwrap();
+        let id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // Re-propose spelling out the SAME default branch → effective bases match →
+        // idempotent reuse, NOT a conflict error.
+        save_proposal(&db, t.id, &mk(&def)).await.unwrap();
+        let id2 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        assert_eq!(id2, id, "same effective base (default spelled out) must reuse, not error");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");

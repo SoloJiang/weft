@@ -252,6 +252,16 @@ pub fn fetch_origin_branch(dir: &Path, branch: &str) -> bool {
 /// Some(true) only when it branched off origin AND the fetch that refreshed it
 /// succeeded (truly fresh); Some(false) when it fell back to a stale-origin/local ref
 /// (a "couldn't sync" signal); None when an existing path/branch was reused.
+/// Outcome of `add_worktree_synced`. `created_checkout`/`created_branch` drive
+/// rollback: remove the checkout when WE created it; delete the branch only when WE
+/// created it (a pre-existing branch reused by the fallback must survive).
+pub struct WorktreeAdd {
+    pub path: PathBuf,
+    pub created_checkout: bool,
+    pub created_branch: bool,
+    pub synced: bool,
+}
+
 /// `require_resolvable` = the base was an explicit user/lead choice: if it resolves to
 /// neither `origin/<base>` nor local `<base>` (even after fetch), return an error
 /// rather than silently using the repo default. When false (empty/default base), fall
@@ -262,9 +272,14 @@ pub fn add_worktree_synced(
     worktree_path: &Path,
     base_name: &str,
     require_resolvable: bool,
-) -> Result<(PathBuf, Option<bool>)> {
+) -> Result<WorktreeAdd> {
     if worktree_path.exists() {
-        return Ok((worktree_path.to_path_buf(), None));
+        return Ok(WorktreeAdd {
+            path: worktree_path.to_path_buf(),
+            created_checkout: false,
+            created_branch: false,
+            synced: false,
+        });
     }
     let fetched = fetch_origin_branch(repo, base_name);
     let t = normalize_target(base_name);
@@ -286,11 +301,22 @@ pub fn add_worktree_synced(
     let path_str = worktree_path.to_string_lossy().to_string();
     let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &resolved]);
     if res.is_err() {
+        // Branch likely already exists: check it out into a new worktree dir.
         git(repo, &["worktree", "add", &path_str, branch])
             .context("worktree add (existing branch)")?;
-        return Ok((worktree_path.to_path_buf(), None));
+        return Ok(WorktreeAdd {
+            path: worktree_path.to_path_buf(),
+            created_checkout: true,
+            created_branch: false,
+            synced: false,
+        });
     }
-    Ok((worktree_path.to_path_buf(), Some(synced)))
+    Ok(WorktreeAdd {
+        path: worktree_path.to_path_buf(),
+        created_checkout: true,
+        created_branch: true,
+        synced,
+    })
 }
 
 /// Remove a worktree and prune. (Used by M2 worktree lifecycle management.)
@@ -1165,8 +1191,9 @@ mod tests {
         assert!(!ref_resolves(&clone, "origin/develop"), "precondition");
 
         let wt = tmp("aws-wt");
-        let (_, synced) = add_worktree_synced(&clone, "feat/x", &wt, "develop", false).unwrap();
-        assert_eq!(synced, Some(true), "branched off the synced origin/develop");
+        let add = add_worktree_synced(&clone, "feat/x", &wt, "develop", false).unwrap();
+        assert!(add.synced, "branched off the synced origin/develop");
+        assert!(add.created_branch, "a new branch was created");
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), dev_commit);
 
         let _ = remove_worktree(&clone, &wt);
@@ -1182,8 +1209,8 @@ mod tests {
         init_repo(&repo).unwrap();
         let base = current_branch(&repo).unwrap();
         let wt = tmp("aws-offline-wt");
-        let (_, synced) = add_worktree_synced(&repo, "feat/y", &wt, &base, false).unwrap();
-        assert_eq!(synced, Some(false), "offline → branched off local");
+        let add = add_worktree_synced(&repo, "feat/y", &wt, &base, false).unwrap();
+        assert!(!add.synced, "offline → branched off local");
         assert!(wt.join(".git").exists());
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
@@ -1204,8 +1231,8 @@ mod tests {
         // Break the remote so the fetch inside add_worktree_synced fails.
         git(&clone, &["remote", "set-url", "origin", "/nonexistent/repo.git"]).unwrap();
         let wt = tmp("stale-wt");
-        let (_, synced) = add_worktree_synced(&clone, "feat/s", &wt, &main, false).unwrap();
-        assert_eq!(synced, Some(false), "stale origin + failed fetch must not be 'synced'");
+        let add = add_worktree_synced(&clone, "feat/s", &wt, &main, false).unwrap();
+        assert!(!add.synced, "stale origin + failed fetch must not be 'synced'");
         let _ = remove_worktree(&clone, &wt);
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
@@ -1227,14 +1254,31 @@ mod tests {
     }
 
     #[test]
+    fn add_worktree_synced_existing_branch_creates_checkout_not_branch() {
+        let repo = tmp("aws-existing-branch");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        // Pre-create the branch so `worktree add -b <branch>` fails and falls back.
+        git(&repo, &["branch", "feat/exists"]).unwrap();
+        let wt = tmp("aws-existing-branch-wt");
+        let add = add_worktree_synced(&repo, "feat/exists", &wt, &base, false).unwrap();
+        assert!(add.created_checkout, "the fallback created a new checkout dir");
+        assert!(!add.created_branch, "the branch pre-existed; we did not create it");
+        assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
     fn add_worktree_synced_empty_default_base_is_lenient() {
         // The default/empty path (require_resolvable=false) still falls back and creates,
         // even if the passed name doesn't resolve.
         let repo = tmp("lenient");
         init_repo(&repo).unwrap();
         let wt = tmp("lenient-wt");
-        let (_, synced) = add_worktree_synced(&repo, "feat/l", &wt, "no-such-default", false).unwrap();
-        assert_eq!(synced, Some(false));
+        let add = add_worktree_synced(&repo, "feat/l", &wt, "no-such-default", false).unwrap();
+        assert!(!add.synced);
         assert!(wt.join(".git").exists(), "default path still creates a worktree");
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);

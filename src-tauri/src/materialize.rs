@@ -106,20 +106,14 @@ pub async fn materialize_direction(
     } else {
         git::default_base_branch(repo_path, &repo_ref.base_ref)
     };
-    let (_, synced) = git::add_worktree_synced(repo_path, &dir.branch, &path, &base, explicit)
+    let add = git::add_worktree_synced(repo_path, &dir.branch, &path, &base, explicit)
         .with_context(|| format!("worktree for repo {}", repo_ref.name))?;
-    if synced == Some(false) {
+    if add.created_branch && !add.synced {
         eprintln!(
             "[weft] materialize {}: origin sync unavailable — branched off local {base}",
             dir.branch
         );
     }
-    // synced.is_some() => we just CREATED the worktree this call; any failure in the
-    // post-add DB steps must tear it down (working copy + namespaced branch) so a
-    // failed materialize never leaks an orphan worktree/branch (which would also make
-    // a retry pick a suffixed branch). synced==None means we reused an existing
-    // checkout — leave it untouched.
-    let created = synced.is_some();
     let finish = async {
         // Keep the diff "vs target" consistent with the branch we actually based off:
         // when the direction has no explicit target yet, pin it to the resolved base
@@ -141,8 +135,12 @@ pub async fn materialize_direction(
     match finish {
         Ok(rec) => Ok(vec![rec]),
         Err(err) => {
-            if created {
+            // Remove the checkout we created (if any); delete the branch ONLY if we
+            // created it — a pre-existing branch reused by the fallback must survive.
+            if add.created_checkout {
                 let _ = git::remove_worktree(repo_path, &path);
+            }
+            if add.created_branch {
                 let _ = git::delete_branch(repo_path, &dir.branch);
             }
             Err(err)
