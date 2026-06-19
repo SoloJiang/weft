@@ -78,6 +78,9 @@ async fn register_repo(
     // (origin/HEAD), else the conventional integration branch (main/master), else
     // the locally checked-out branch. So a repo added while on a feature branch
     // records the integration branch as base, not that feature branch.
+    // Refresh the cached origin/HEAD first so a renamed default branch (master→main)
+    // is reflected immediately at registration time.
+    crate::git::refresh_remote_head(p);
     let base = crate::git::default_base_branch(p, &crate::git::current_branch(p).unwrap_or_default());
     // Captured for workspace-level dedup; empty for a local repo with no origin.
     // Credentials embedded in an HTTPS remote are redacted so a PAT/password from

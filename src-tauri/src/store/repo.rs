@@ -760,6 +760,24 @@ pub async fn set_direction_target_branch(
     Ok(())
 }
 
+/// Persist a direction's base branch (the immutable ref its worktree was branched
+/// off). Set once at materialize for the default-base case; not user-editable after.
+pub async fn set_direction_base_branch(
+    db: &Db,
+    direction_id: i32,
+    base: &str,
+) -> Result<()> {
+    if let Some(d) = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+    {
+        let mut a: direction::ActiveModel = d.into();
+        a.base_branch = Set(base.trim().to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// The single write repo bound to a direction (scope rework). None if the
 /// direction has no repo set (repo_id = 0) or the repo row is gone.
 pub async fn direction_repo_of(db: &Db, direction_id: i32) -> Result<Option<repo_ref::Model>> {

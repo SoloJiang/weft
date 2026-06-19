@@ -169,6 +169,18 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     "main".to_string()
 }
 
+/// Best-effort refresh of the cached refs/remotes/origin/HEAD to match the remote's
+/// CURRENT default branch (a normal fetch does NOT update it). `git remote set-head
+/// origin --auto` queries the remote; GIT_TERMINAL_PROMPT=0 fails fast offline and the
+/// error is ignored. Call before trusting origin/HEAD as the live default.
+pub fn refresh_remote_head(repo: &Path) {
+    let _ = Command::new("git")
+        .args(["remote", "set-head", "origin", "--auto"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output();
+}
+
 /// PR-style diff (files + patch + the ref compared against) of a worktree
 /// against a target branch: the task's own changes relative to where it
 /// branched off the target's latest *remote* state (merge-base with
@@ -1283,5 +1295,25 @@ mod tests {
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn refresh_remote_head_updates_stale_default() {
+        let origin = tmp("rrh-origin");
+        init_repo(&origin).unwrap();
+        let initial = current_branch(&origin).unwrap();
+        let clone = tmp("rrh-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        assert_eq!(default_base_branch(&clone, ""), initial, "clone default = origin's initial default");
+        // Move origin's default to a NEW branch.
+        git(&origin, &["checkout", "-q", "-b", "newdefault"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "x"]).unwrap();
+        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/newdefault"]).unwrap();
+        git(&clone, &["fetch", "-q", "origin"]).unwrap(); // fetch the branch, but this does NOT move origin/HEAD
+        assert_eq!(default_base_branch(&clone, ""), initial, "cached origin/HEAD is stale before refresh");
+        refresh_remote_head(&clone);
+        assert_eq!(default_base_branch(&clone, ""), "newdefault", "refreshed origin/HEAD → live default");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
     }
 }
