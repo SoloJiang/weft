@@ -80,8 +80,8 @@ async fn register_repo(
     // records the integration branch as base, not that feature branch.
     // Refresh the cached origin/HEAD first so a renamed default branch (master→main)
     // is reflected immediately at registration time.
-    crate::git::refresh_remote_head(p);
-    let base = crate::git::default_base_branch(p, &crate::git::current_branch(p).unwrap_or_default());
+    let base = crate::git::live_default_branch(p)
+        .unwrap_or_else(|| crate::git::default_base_branch(p, &crate::git::current_branch(p).unwrap_or_default()));
     // Captured for workspace-level dedup; empty for a local repo with no origin.
     // Credentials embedded in an HTTPS remote are redacted so a PAT/password from
     // .git/config never lands in Weft's DB/backups.

@@ -104,10 +104,9 @@ pub async fn materialize_direction(
     let base = if explicit {
         dir.base_branch.trim().to_string()
     } else {
-        // Refresh the cached origin/HEAD so "the default" reflects the remote's
-        // CURRENT default branch (a normal fetch doesn't move it).
-        git::refresh_remote_head(repo_path);
-        git::default_base_branch(repo_path, &repo_ref.base_ref)
+        // Authoritative live default (works for narrowed clones); cached fallback offline.
+        git::live_default_branch(repo_path)
+            .unwrap_or_else(|| git::default_base_branch(repo_path, &repo_ref.base_ref))
     };
     let add = git::add_worktree_synced(repo_path, &dir.branch, &path, &base, explicit)
         .with_context(|| format!("worktree for repo {}", repo_ref.name))?;

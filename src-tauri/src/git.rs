@@ -169,16 +169,34 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     "main".to_string()
 }
 
-/// Best-effort refresh of the cached refs/remotes/origin/HEAD to match the remote's
-/// CURRENT default branch (a normal fetch does NOT update it). `git remote set-head
-/// origin --auto` queries the remote; GIT_TERMINAL_PROMPT=0 fails fast offline and the
-/// error is ignored. Call before trusting origin/HEAD as the live default.
-pub fn refresh_remote_head(repo: &Path) {
-    let _ = Command::new("git")
-        .args(["remote", "set-head", "origin", "--auto"])
+/// The remote's CURRENT default branch name via `git ls-remote --symref origin HEAD`
+/// — queries the remote directly, so it works even for narrowed/single-branch clones
+/// where the default moved to an unfetched branch (unlike `git remote set-head --auto`,
+/// which needs the ref already fetched). None offline / no remote / parse miss.
+/// GIT_TERMINAL_PROMPT=0 fails fast instead of prompting.
+pub fn live_default_branch(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output();
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    // First line looks like: "ref: refs/heads/<branch>\tHEAD"
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("ref: ") {
+            if let Some(refname) = rest.split_whitespace().next() {
+                let name = refname.strip_prefix("refs/heads/").unwrap_or(refname);
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// PR-style diff (files + patch + the ref compared against) of a worktree
@@ -285,6 +303,22 @@ pub fn add_worktree_synced(
     base_name: &str,
     require_resolvable: bool,
 ) -> Result<WorktreeAdd> {
+    let fetched = fetch_origin_branch(repo, base_name);
+    let t = normalize_target(base_name);
+    let remote = format!("origin/{t}");
+    let resolved_opt = if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &remote) {
+        Some(remote.clone())
+    } else if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &t) {
+        Some(t.clone())
+    } else {
+        None
+    };
+    // An explicit base must resolve — even when we're about to reuse an existing
+    // checkout — so a misspelled explicit base can't be silently accepted via an
+    // orphan path.
+    if require_resolvable && resolved_opt.is_none() {
+        bail!("base branch {base_name:?} not found locally or on origin (after fetch)");
+    }
     if worktree_path.exists() {
         return Ok(WorktreeAdd {
             path: worktree_path.to_path_buf(),
@@ -293,18 +327,7 @@ pub fn add_worktree_synced(
             synced: false,
         });
     }
-    let fetched = fetch_origin_branch(repo, base_name);
-    let t = normalize_target(base_name);
-    let remote = format!("origin/{t}");
-    let resolved = if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &remote) {
-        remote.clone()
-    } else if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &t) {
-        t.clone()
-    } else if require_resolvable {
-        bail!("base branch {base_name:?} not found locally or on origin (after fetch)");
-    } else {
-        resolve_base_ref(repo, &t)
-    };
+    let resolved = resolved_opt.unwrap_or_else(|| resolve_base_ref(repo, &t));
     // Fresh only if we branched off the remote ref AND the fetch actually succeeded.
     let synced = resolved.starts_with("origin/") && fetched;
     if let Some(parent) = worktree_path.parent() {
@@ -1298,22 +1321,37 @@ mod tests {
     }
 
     #[test]
-    fn refresh_remote_head_updates_stale_default() {
-        let origin = tmp("rrh-origin");
+    fn live_default_branch_reads_remote_head_even_when_unfetched() {
+        // origin default moved to `develop`; a single-branch clone of main hasn't
+        // fetched develop, but ls-remote --symref still reports the live default.
+        let origin = tmp("ldb-origin");
         init_repo(&origin).unwrap();
-        let initial = current_branch(&origin).unwrap();
-        let clone = tmp("rrh-clone");
-        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
-        assert_eq!(default_base_branch(&clone, ""), initial, "clone default = origin's initial default");
-        // Move origin's default to a NEW branch.
-        git(&origin, &["checkout", "-q", "-b", "newdefault"]).unwrap();
-        git(&origin, &["commit", "-q", "--allow-empty", "-m", "x"]).unwrap();
-        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/newdefault"]).unwrap();
-        git(&clone, &["fetch", "-q", "origin"]).unwrap(); // fetch the branch, but this does NOT move origin/HEAD
-        assert_eq!(default_base_branch(&clone, ""), initial, "cached origin/HEAD is stale before refresh");
-        refresh_remote_head(&clone);
-        assert_eq!(default_base_branch(&clone, ""), "newdefault", "refreshed origin/HEAD → live default");
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d"]).unwrap();
+        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/develop"]).unwrap();
+        let clone = tmp("ldb-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", "--single-branch", "--branch", &main,
+            &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        assert!(!ref_resolves(&clone, "origin/develop"), "precondition: develop not fetched");
+        assert_eq!(live_default_branch(&clone).as_deref(), Some("develop"),
+            "ls-remote --symref reports the live remote default without a local ref");
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
     }
+
+    #[test]
+    fn add_worktree_synced_validates_explicit_base_even_when_path_exists() {
+        let repo = tmp("aws-orphan");
+        init_repo(&repo).unwrap();
+        let wt = tmp("aws-orphan-wt");
+        std::fs::create_dir_all(&wt).unwrap(); // simulate an orphan worktree dir (no DB row)
+        // Explicit (require_resolvable=true) misspelled base must error even though the
+        // path already exists — not silently reuse the orphan.
+        let res = add_worktree_synced(&repo, "feat/x", &wt, "no-such-xyz", true);
+        assert!(res.is_err(), "explicit unresolvable base must error before reusing an existing path");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
 }
