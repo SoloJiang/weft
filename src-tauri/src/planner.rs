@@ -248,6 +248,18 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         .iter()
         .find(|d| d.name == resolved.name && d.repo_id == resolved.repo.repo_id)
     {
+        // The existing direction's worktree is already branched off its stored base;
+        // a re-proposal that changes the base can't silently re-base a live (possibly
+        // worker-occupied) worktree. Surface the conflict rather than approving with a
+        // mismatched base. (Same base → idempotent reuse.)
+        if existing.base_branch.trim() != resolved.base_branch.trim() {
+            anyhow::bail!(
+                "direction {:?} already exists with base {:?}; delete the sub-task to recreate it from {:?}",
+                resolved.name,
+                existing.base_branch,
+                resolved.base_branch
+            );
+        }
         // Already created (e.g. the lead re-proposed and the decision was reset).
         // Idempotent: don't create a second direction/worktree.
         let id = existing.id;
@@ -866,6 +878,43 @@ mod tests {
         assert!(set_direction_base(&db, t.id, 0, "B", "api", "main").await.is_err());
         let p2: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
         assert_eq!(p2.directions[0].base_branch, "develop", "stale-identity save must not overwrite");
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn approve_rejects_base_change_on_existing_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-basechg-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
+        ]};
+        // First approve with empty base → creates + materializes (base ""→default).
+        save_proposal(&db, t.id, &mk("")).await.unwrap();
+        let id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // Re-propose the same name/repo with a DIFFERENT base, re-approve → must ERROR
+        // (can't re-base the already-materialized worktree).
+        save_proposal(&db, t.id, &mk("develop")).await.unwrap();
+        let res = approve_direction(&db, t.id, 0, "codex").await;
+        assert!(res.is_err(), "approving a re-proposed direction with a changed base must error");
+        assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "no second direction created");
+        // Re-approve with the SAME (empty) base → idempotent reuse, no error.
+        save_proposal(&db, t.id, &mk("")).await.unwrap();
+        let id3 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        assert_eq!(id3, id, "same base → idempotent reuse returns the existing id");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
