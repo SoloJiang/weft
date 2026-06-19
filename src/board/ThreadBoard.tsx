@@ -7,6 +7,7 @@ import {
   ChevronDown,
   Copy,
   FolderGit2,
+  FolderTree,
   GitBranch,
   GitCompare,
   Layers,
@@ -307,7 +308,9 @@ function DirectionCard({
             title={firstWrite ? undefined : t("thread.noWriteCopy")}
             onClick={() =>
               firstWrite &&
-              viewDirection(direction.id, firstWrite.repo_id, { diff: action.diff })
+              viewDirection(direction.id, firstWrite.repo_id, {
+                sidePanel: action.diff ? "diff" : undefined,
+              })
             }
           >
             {action.diff ? <GitCompare size={13} /> : <TerminalSquare size={13} />}
@@ -451,6 +454,19 @@ function ProvenanceMenu({
                       <Copy size={11} className="shrink-0 text-ink-faint" />
                     )}
                   </DM.Item>
+                  {/* Browse this worktree's files. */}
+                  {w.exists && (
+                    <DM.Item
+                      onSelect={(e) => {
+                        e.preventDefault();
+                        viewDirection(direction.id, w.repo_id, { sidePanel: "files" });
+                      }}
+                      className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] py-1 pl-7 pr-2 text-[11px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
+                    >
+                      <FolderTree size={11} className="shrink-0 text-ink-faint" />
+                      <span className="min-w-0 flex-1 truncate">{t("thread.browseFiles")}</span>
+                    </DM.Item>
+                  )}
                   {/* Reclaim a finished task's worktree. Done-only (its work is
                       settled) and only while the directory is still on disk. */}
                   {direction.status === "done" && w.exists && (

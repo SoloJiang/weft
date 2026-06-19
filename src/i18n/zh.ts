@@ -153,6 +153,7 @@ export const zh = {
     provenanceTip: "仓库、工作分支与检查结果",
     copyBranch: "复制分支",
     copyPath: "复制工作副本路径",
+    browseFiles: "浏览文件",
     copiesCount: "{{count}} 个副本",
     colRunning: "进行中",
     colNeeds: "待你处理",
@@ -338,6 +339,13 @@ export const zh = {
     askSubmit: "发送",
     askContext: "关于 `{{path}}` 这处改动：",
     askContextLine: "关于 `{{path}}`（第 {{side}}{{n}} 行）这处改动：",
+  },
+  files: {
+    tab: "文件",
+    empty: "该 worktree 为空。",
+    loading: "加载文件中…",
+    truncated: "目录太大，部分条目已隐藏。",
+    refresh: "刷新文件树",
   },
   sessionInfo: {
     title: "会话信息",
