@@ -25,6 +25,7 @@ import { useStore } from "../state/store";
 import type { RepoComponent, RepoEdge, RepoProfile } from "../lib/types";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Button } from "../components/ui/Button";
+import { Select } from "../components/ui/Select";
 import { cn } from "../lib/cn";
 
 /** The three architectural tiers laid out left→right, plus the catch-all "other"
@@ -906,25 +907,18 @@ function TierPicker({ profile }: { profile: RepoProfile }) {
   const { t } = useTranslation();
   const canonical = (TIER_ORDER as readonly string[]).includes(profile.tier);
   return (
-    <select
-      value={canonical ? profile.tier : ""}
-      onChange={(e) => void editRepoTier(profile.repo_id, e.currentTarget.value)}
-      className="w-full max-w-[180px] rounded border border-border bg-bg px-1.5 py-1 text-[12.5px] text-ink outline-none focus:border-brand/60"
-    >
-      {/* The empty option is a non-selectable placeholder for the unclassified /
-          analyzing state — tier is agent-owned, so the only user picks are the
-          three real tiers (no user-pinnable "Other"). */}
-      {!canonical && (
-        <option value="" disabled>
-          {t("repomap.tier_other")}
-        </option>
-      )}
-      {TIER_ORDER.map((tier) => (
-        <option key={tier} value={tier}>
-          {t(`repomap.tier_${tier}`)}
-        </option>
-      ))}
-    </select>
+    // The shared Radix/shadcn Select gives a properly-sized trigger (h-8). Tier is
+    // agent-owned, so the only user picks are the three real tiers; an empty value
+    // (an unclassified placeholder) falls back to the "未分类" placeholder text.
+    <div className="max-w-[200px]">
+      <Select
+        value={canonical ? profile.tier : ""}
+        onValueChange={(v) => void editRepoTier(profile.repo_id, v)}
+        options={TIER_ORDER.map((tier) => ({ value: tier, label: t(`repomap.tier_${tier}`) }))}
+        ariaLabel={t("repomap.tier")}
+        placeholder={t("repomap.tier_other")}
+      />
+    </div>
   );
 }
 
