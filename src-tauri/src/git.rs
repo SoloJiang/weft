@@ -247,14 +247,11 @@ pub fn fetch_origin_branch(dir: &Path, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
-/// branches the new worktree off the FRESH `origin/<base_name>`. Returns the path and
-/// Some(true) only when it branched off origin AND the fetch that refreshed it
-/// succeeded (truly fresh); Some(false) when it fell back to a stale-origin/local ref
-/// (a "couldn't sync" signal); None when an existing path/branch was reused.
 /// Outcome of `add_worktree_synced`. `created_checkout`/`created_branch` drive
 /// rollback: remove the checkout when WE created it; delete the branch only when WE
-/// created it (a pre-existing branch reused by the fallback must survive).
+/// created it (a pre-existing branch reused by the fallback must survive). `synced`
+/// is true only when it branched off a freshly-fetched `origin/<base>` (false = a
+/// local/stale ref, an existing-branch checkout, or a reused path).
 pub struct WorktreeAdd {
     pub path: PathBuf,
     pub created_checkout: bool,
@@ -262,10 +259,13 @@ pub struct WorktreeAdd {
     pub synced: bool,
 }
 
-/// `require_resolvable` = the base was an explicit user/lead choice: if it resolves to
-/// neither `origin/<base>` nor local `<base>` (even after fetch), return an error
-/// rather than silently using the repo default. When false (empty/default base), fall
-/// back through the default-branch chain so the worktree is still created.
+/// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
+/// branches the new worktree off the FRESH `origin/<base_name>` when possible (see
+/// `WorktreeAdd` for what it reports). `require_resolvable` = the base was an explicit
+/// user/lead choice: if it resolves to neither `origin/<base>` nor local `<base>`
+/// (even after fetch), return an error rather than silently using the repo default.
+/// When false (empty/default base), fall back through the default-branch chain so the
+/// worktree is still created.
 pub fn add_worktree_synced(
     repo: &Path,
     branch: &str,
