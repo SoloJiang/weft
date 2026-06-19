@@ -20,6 +20,7 @@ import {
   type LucideProps,
 } from "lucide-react";
 import type { ComponentType } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useStore } from "../state/store";
 import type { RepoComponent, RepoEdge, RepoProfile } from "../lib/types";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
@@ -496,9 +497,6 @@ function RepoNode({
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
-        {p.stale && (
-          <span title={t("repomap.staleTitle")} className="h-1.5 w-1.5 shrink-0 rounded-full bg-waiting" />
-        )}
         {showPkgs && p.components.length > 0 && (
           <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
             {t("repomap.pkgCount", { count: p.components.length })}
@@ -633,6 +631,119 @@ function ModeBtn({
   );
 }
 
+/** Subscribe to a repo's live analysis stream (started/delta/done/failed),
+ *  seeded from the profile's persisted run-state. Returns the live phase + the
+ *  accumulated transcript so the detail panel can show the process as it runs. */
+function useAnalysisStream(profile?: RepoProfile) {
+  const repoId = profile?.repo_id;
+  const seedPhase = profile?.analysis_state ?? "idle";
+  const seedError = profile?.analysis_error ?? null;
+  const [phase, setPhase] = useState<string>(seedPhase);
+  const [transcript, setTranscript] = useState("");
+  const [error, setError] = useState<string | null>(seedError);
+  useEffect(() => {
+    // Re-seed from the (possibly refreshed) profile whenever the selected repo or
+    // its persisted state changes — a `done` graph refresh lands here and flips
+    // the panel from transcript back to the classified fields.
+    setPhase(seedPhase);
+    setError(seedError);
+    setTranscript("");
+    if (repoId == null) return;
+    const un = listen<{ repoId: number; phase: string; text?: string; error?: string }>(
+      "repo-analysis",
+      (e) => {
+        if (e.payload.repoId !== repoId) return;
+        const p = e.payload;
+        if (p.phase === "started") {
+          setPhase("running");
+          setTranscript("");
+          setError(null);
+        } else if (p.phase === "delta") {
+          setPhase("running");
+          if (p.text) setTranscript((prev) => prev + p.text);
+        } else if (p.phase === "done") {
+          setPhase("idle"); // the graph refresh brings the classified fields
+        } else if (p.phase === "failed") {
+          setPhase("failed");
+          setError(p.error ?? null);
+        }
+      },
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [repoId, seedPhase, seedError]);
+  return { phase, transcript, error };
+}
+
+/** Running state: the agent's process streamed live into the panel. */
+function AnalyzingTranscript({ text }: { text: string }) {
+  const { t } = useTranslation();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text]);
+  return (
+    <div className="flex h-full flex-col gap-2 px-4 py-4">
+      <div className="flex items-center gap-2 text-[12px] font-medium text-brand">
+        <Loader2 size={13} className="animate-spin" />
+        {t("repomap.analyzing")}
+      </div>
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-auto rounded-[var(--radius-md)] border border-border bg-bg p-3"
+      >
+        {text ? (
+          <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink-muted">
+            {text}
+          </pre>
+        ) : (
+          <p className="text-[11.5px] text-ink-faint">{t("repomap.analyzingHint")}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Failed state: the error + a manual retry (never a silent eternal spinner). */
+function AnalysisFailed({ error, onRetry }: { error: string | null; onRetry: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+      <div className="text-[13px] font-medium text-danger">{t("repomap.analysisFailed")}</div>
+      {error && (
+        <pre className="max-h-32 w-full overflow-auto whitespace-pre-wrap break-words rounded-[var(--radius-md)] border border-border bg-bg p-2 text-left font-mono text-[11px] text-ink-faint">
+          {error}
+        </pre>
+      )}
+      <button
+        onClick={onRetry}
+        className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-3 py-1.5 text-[12px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
+      >
+        <RefreshCw size={12} /> {t("repomap.retryAnalysis")}
+      </button>
+    </div>
+  );
+}
+
+/** Idle + never-analyzed (rare; auto-analysis usually covers this): offer a run. */
+function AnalysisIdle({ onAnalyze }: { onAnalyze: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-ink-faint">
+      <CircleDashed size={22} />
+      <p className="text-[12px]">{t("repomap.notAnalyzed")}</p>
+      <button
+        onClick={onAnalyze}
+        className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-3 py-1.5 text-[12px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
+      >
+        <RefreshCw size={12} /> {t("repomap.analyze")}
+      </button>
+    </div>
+  );
+}
+
 function RepoProfilePane({
   profile,
   profiles,
@@ -650,6 +761,8 @@ function RepoProfilePane({
   const { reprofileRepo, deleteRepo } = useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Always call the hook (rules of hooks) — it no-ops when there's no profile.
+  const stream = useAnalysisStream(profile);
   if (!profile) return <EmptyProfilePane />;
 
   const deps = edges
@@ -674,9 +787,6 @@ function RepoProfilePane({
               <h2 className="truncate font-mono text-[16px] font-semibold text-ink">{profile.repo_name}</h2>
               <TierBadge profile={profile} />
             </div>
-            {profile.stale && (
-              <span className="mt-1 inline-flex text-[11px] text-waiting">{t("repomap.stale")}</span>
-            )}
           </div>
           <button
             onClick={() => void reprofileRepo(profile.repo_id)}
@@ -703,55 +813,52 @@ function RepoProfilePane({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto px-4 py-4">
-        {!profile.analyzed && (
-          <div className="mb-4 flex items-center gap-2 rounded-[var(--radius-md)] border border-dashed border-border bg-bg px-3 py-2 text-[12px] text-ink-faint">
-            <Loader2 size={13} className="animate-spin" />
-            {t("repomap.analyzing")}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {/* Render precedence: a running (re-)analysis shows the live process even
+            when the repo is already analyzed; then failed; then the classified
+            fields; then the rare idle-unanalyzed affordance. */}
+        {stream.phase === "running" ? (
+          <AnalyzingTranscript text={stream.transcript} />
+        ) : stream.phase === "failed" ? (
+          <AnalysisFailed error={stream.error} onRetry={() => void reprofileRepo(profile.repo_id)} />
+        ) : profile.analyzed ? (
+          <div className="h-full overflow-auto px-4 py-4">
+            <ProfileSection title={t("repomap.oneLine")}>
+              <NodeSummary profile={profile} />
+            </ProfileSection>
+
+            <ProfileSection title={t("repomap.tier")}>
+              <TierPicker profile={profile} />
+            </ProfileSection>
+
+            <ProfileSection title={t("repomap.stack")}>
+              <ChipList values={profile.stack} empty={t("repomap.none")} mono />
+            </ProfileSection>
+
+            {profile.components.length > 0 && (
+              <ProfileSection title={t("repomap.components")}>
+                <ComponentList components={profile.components} />
+              </ProfileSection>
+            )}
+
+            <ProfileSection title={t("repomap.dependsOn")}>
+              <RepoLinks items={deps} empty={t("repomap.noDeps")} onSelect={onSelect} />
+            </ProfileSection>
+
+            <ProfileSection title={t("repomap.usedBy")}>
+              <RepoLinks items={usedBy} empty={t("repomap.noUsedBy")} onSelect={onSelect} reverse />
+            </ProfileSection>
+
+            {profile.profiled_commit && (
+              <div className="mt-4 flex items-center gap-1.5 text-[11px] text-ink-faint">
+                <GitBranch size={12} />
+                <span>{t("repomap.profiledAt")}</span>
+                <span className="font-mono">{profile.profiled_commit.slice(0, 8)}</span>
+              </div>
+            )}
           </div>
-        )}
-
-        <ProfileSection title={t("repomap.oneLine")}>
-          <NodeSummary profile={profile} />
-        </ProfileSection>
-
-        <div className="grid grid-cols-2 gap-3">
-          <ProfileSection title={t("repomap.tier")}>
-            <TierPicker profile={profile} />
-          </ProfileSection>
-          <ProfileSection title={t("repomap.source")}>
-            <span className="text-[13px] text-ink-muted">
-              {profile.source
-                ? t(`repomap.source_${profile.source.startsWith("user") ? "user" : profile.source}`, profile.source)
-                : t("repomap.none")}
-            </span>
-          </ProfileSection>
-        </div>
-
-        <ProfileSection title={t("repomap.stack")}>
-          <ChipList values={profile.stack} empty={t("repomap.none")} mono />
-        </ProfileSection>
-
-        {profile.components.length > 0 && (
-          <ProfileSection title={t("repomap.components")}>
-            <ComponentList components={profile.components} />
-          </ProfileSection>
-        )}
-
-        <ProfileSection title={t("repomap.dependsOn")}>
-          <RepoLinks items={deps} empty={t("repomap.noDeps")} onSelect={onSelect} />
-        </ProfileSection>
-
-        <ProfileSection title={t("repomap.usedBy")}>
-          <RepoLinks items={usedBy} empty={t("repomap.noUsedBy")} onSelect={onSelect} reverse />
-        </ProfileSection>
-
-        {profile.profiled_commit && (
-          <div className="mt-4 flex items-center gap-1.5 text-[11px] text-ink-faint">
-            <GitBranch size={12} />
-            <span>{t("repomap.profiledAt")}</span>
-            <span className="font-mono">{profile.profiled_commit.slice(0, 8)}</span>
-          </div>
+        ) : (
+          <AnalysisIdle onAnalyze={() => void reprofileRepo(profile.repo_id)} />
         )}
       </div>
 
@@ -802,7 +909,7 @@ function TierPicker({ profile }: { profile: RepoProfile }) {
     <select
       value={canonical ? profile.tier : ""}
       onChange={(e) => void editRepoTier(profile.repo_id, e.currentTarget.value)}
-      className="w-full rounded border border-border bg-bg px-1.5 py-1 text-[12.5px] text-ink outline-none focus:border-brand/60"
+      className="w-full max-w-[180px] rounded border border-border bg-bg px-1.5 py-1 text-[12.5px] text-ink outline-none focus:border-brand/60"
     >
       {/* The empty option is a non-selectable placeholder for the unclassified /
           analyzing state — tier is agent-owned, so the only user picks are the

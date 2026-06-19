@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
 
-/// A profile as the UI sees it: decoded fields + repo name + live staleness.
+/// A profile as the UI sees it: decoded fields + repo name.
 /// `analyzed` is false for a repo the agent hasn't classified yet (rendered as
 /// an "analyzing" placeholder); such a node has an empty `tier`.
 #[derive(Clone, Debug, Serialize)]
@@ -27,9 +27,16 @@ pub struct ProfileView {
     /// "agent" | "user" | "" (placeholder).
     pub source: String,
     pub profiled_commit: String,
-    pub stale: bool,
     pub analyzed: bool,
     pub components: Vec<Component>,
+    /// Live analysis lifecycle from the run-state registry: "idle" | "running" |
+    /// "failed". Distinct from `analyzed` (which reflects a persisted canonical
+    /// tier): a repo can be `analyzed=false` while idle (never started), running,
+    /// or failed — the UI renders each differently instead of one eternal spinner.
+    pub analysis_state: String,
+    /// The error from the last failed analysis (only set when `analysis_state ==
+    /// "failed"`), surfaced in the detail panel alongside a manual retry.
+    pub analysis_error: Option<String>,
 }
 
 /// The workspace dependency graph: every repo (placeholders included) + the
@@ -133,16 +140,11 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
             summary: String::new(),
             source: String::new(),
             profiled_commit: String::new(),
-            stale: false,
             analyzed: false,
             components: Vec::new(),
+            analysis_state: run_phase(repo.id).to_string(),
+            analysis_error: run_error(repo.id),
         };
-    };
-    let live = git::head_commit(Path::new(&repo.local_git_path)).ok();
-    let stale = match (&live, p.profiled_commit.as_str()) {
-        (Some(_), "") => true,
-        (Some(head), at) => head != at,
-        (None, _) => false, // can't tell (not a git repo / no commits)
     };
     ProfileView {
         repo_id: repo.id,
@@ -152,13 +154,14 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
         summary: p.summary.clone(),
         source: p.source.clone(),
         profiled_commit: p.profiled_commit.clone(),
-        stale,
         // "Analyzed" means the agent reached a real classification. A row can
         // exist with an empty/legacy tier — an eager placeholder, a
         // calibration/summary edit before analysis, or a pre-upgrade row — and
         // those must still read as "analyzing", not a finished unclassified node.
         analyzed: profile::normalize_tier(&p.role).is_some(),
         components: comps(&p.components),
+        analysis_state: run_phase(repo.id).to_string(),
+        analysis_error: run_error(repo.id),
     }
 }
 
@@ -387,6 +390,28 @@ create, or delete files, and never run mutating commands.";
 
 const CURATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Read-only sandbox args for a `codex exec` curator run.
+///
+/// Codex `exec` no longer accepts `--ask-for-approval` (removed from the `exec`
+/// subcommand in current CLIs — passing it makes codex exit at arg-parse with
+/// `unexpected argument`, which silently stranded every analysis). The
+/// non-interactive "never prompt" intent is now expressed via the
+/// `approval_policy` config override; `exec` is non-interactive anyway, so with a
+/// read-only sandbox it can neither prompt nor escalate.
+///
+/// `--skip-git-repo-check`: the cross-repo relation pass runs from the repos'
+/// common-ancestor dir, which usually isn't itself a git repo, and `codex exec`
+/// otherwise refuses to start outside one. Harmless for the per-repo pass.
+fn codex_exec_read_only_args() -> Vec<String> {
+    vec![
+        "--sandbox".into(),
+        "read-only".into(),
+        "-c".into(),
+        "approval_policy=\"never\"".into(),
+        "--skip-git-repo-check".into(),
+    ]
+}
+
 /// The shared definition of the three architectural tiers, embedded in both the
 /// per-repo classification prompt and the cross-repo relations prompt so the
 /// agent applies one consistent taxonomy.
@@ -439,29 +464,136 @@ fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> Str
         ));
     }
     format!(
-        "Map how these repositories in one workspace depend on each other — both at \
-RUNTIME / through shared infrastructure (HTTP/REST, gRPC, message queues, shared \
-databases/infra) AND through declared library/package dependencies and cross-repo \
-internal imports.\n\n{TIER_GUIDE}\n\nRepositories:\n{lines}\nRead each repo's code \
-and config at its path (READ-ONLY — change nothing). Then, as the LAST thing in \
-your reply, output a single JSON object and nothing after it:\n\
+        "Map how these repositories in one workspace depend on each other. \
+Dependencies come in two flavors and BOTH matter equally:\n\
+- CODE (declared): one repo imports another's package/module — kind `lib`.\n\
+- BUSINESS / RUNTIME: one repo CONSUMES another's running surface — calls its \
+HTTP/REST or gRPC API, publishes to or consumes a queue/topic it owns, or reads a \
+database/infra it owns — kinds `http`/`grpc`/`queue`/`infra`. A runtime dependency \
+is REAL even when the two repos share NO code: e.g. a frontend that calls a \
+backend's REST endpoint depends on that backend, with no package dependency at \
+all.\n\
+To find the runtime/business edges (the easy-to-miss ones), CORRELATE a consumer's \
+OUTBOUND calls — fetch / HTTP client usage, base URLs or service hosts in config / \
+env, gRPC stubs, queue publishes — against another repo's EXPOSED surface — its \
+routes / handlers, gRPC service definitions, queue consumers, DB schemas. The \
+consumer is `from`, the producer it talks to is `to`. Use the tier flow as a prior: \
+a frontend almost always depends on the gateway/backend that serves its data, and a \
+gateway on the backends it aggregates — assert such an edge whenever the code \
+supports it, even with no shared package.\n\n\
+{TIER_GUIDE}\n\nRepositories:\n{lines}\nRead each repo's code and config at its \
+path (READ-ONLY — change nothing). Then, as the LAST thing in your reply, output a \
+single JSON object and nothing after it:\n\
 {{\"relations\":[{{\"from\":<id>,\"to\":<id>,\"kind\":\"http|grpc|queue|infra|lib\",\
 \"via\":\"<short evidence>\",\"confidence\":<0-100>}}]}}\n\
 Rules: `from` and `to` MUST be ids from the list above and must differ. Use kind \
-`lib` for a declared package/module dependency, the runtime kinds otherwise. Only \
-include a relation you have concrete evidence for. `via` is a short label (e.g. \
-\"POST /orders\", \"orders-topic\", \"shared postgres\", \"@acme/api-client\"). If \
-you find none, output {{\"relations\":[]}}."
+`lib` for a declared package/module dependency, the runtime kinds otherwise. \
+Include a relation when you have concrete evidence — for a runtime edge that means a \
+matching endpoint / topic / host / contract across the two repos, NOT necessarily a \
+shared import. `via` is a short label (e.g. \"POST /orders\", \"orders-topic\", \
+\"shared postgres\", \"@acme/api-client\"). If you find none, output \
+{{\"relations\":[]}}."
     )
 }
 
-/// Run the resolved coding agent once over `cwd`, read-only, feeding `prompt`,
-/// and return its final assistant text. Reuses the per-tool adapter for argv +
-/// line parsing (claude reads stdin as a stream-json envelope; per-turn tools
-/// carry the message on argv). Best-effort and bounded by `CURATOR_TIMEOUT`: a
-/// timeout or early exit returns whatever text was collected. We never write
-/// files, persist a session, or emit UI events.
-async fn run_agent_once(tool: &str, cwd: &Path, prompt: &str) -> Result<String> {
+/// A streaming chunk from a curator agent run, forwarded to the caller's sink so
+/// the analysis process can stream into the UI.
+enum AnalysisEvent<'a> {
+    /// A piece of assistant text — a token delta on the app-server transport, or
+    /// the full message at completion on the exec transport.
+    Delta(&'a str),
+}
+
+/// Run the resolved agent once over `cwd`, read-only, streaming text chunks to
+/// `on_event` and returning the final assistant text. codex prefers the
+/// app-server transport (token-by-token deltas, the same transport the chat
+/// engine uses); on ANY app-server failure — or for a non-codex tool, or when
+/// app-server is disabled — it falls back to `codex exec`/claude with corrected
+/// read-only args. Best-effort, bounded by `CURATOR_TIMEOUT`; never writes files.
+async fn run_streaming_agent<F: FnMut(AnalysisEvent)>(
+    tool: &str,
+    cwd: &Path,
+    prompt: &str,
+    on_event: &mut F,
+) -> Result<String> {
+    if tool == "codex" && crate::adapters::codex_prefers_appserver() {
+        match run_codex_appserver(cwd, prompt, on_event).await {
+            Ok(text) => return Ok(text),
+            Err(e) => {
+                eprintln!("[weft][curator] app-server unavailable ({e}) — exec fallback");
+            }
+        }
+    }
+    run_exec(tool, cwd, prompt, on_event).await
+}
+
+/// codex app-server transport: spawn a per-run app-server in `cwd` with read-only
+/// config overrides, start one thread + turn, and stream the agent's text deltas
+/// to `on_event` while accumulating the final reply. Auto-declines any approval
+/// ask so the turn can't hang. Mirrors the engine's app-server path but is
+/// ephemeral — no weft thread row, no persistence.
+async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
+    cwd: &Path,
+    prompt: &str,
+    on_event: &mut F,
+) -> Result<String> {
+    use crate::codex_app_server::{Client, ThreadMsg};
+    use crate::lead_chat::proto::ChatEvent;
+    // Pre-accept folder trust so the first thread/start doesn't block on codex's
+    // trust prompt (the engine's app-server path does the same).
+    crate::codex::ensure_codex_trusted(cwd);
+    let program = crate::tool_command::command_for("codex");
+    // app-server has no per-turn CLI flags; the read-only + never-prompt policy is
+    // applied as config overrides at spawn (the exec args' equivalent).
+    let read_only = [
+        "-c".to_string(),
+        "sandbox_mode=\"read-only\"".to_string(),
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
+    ];
+    let client = Client::connect_session(&program, &read_only, cwd).await?;
+    let cwd_s = cwd.to_string_lossy().into_owned();
+    let thread = client.start_thread(&cwd_s).await?;
+    let mut rx = client.subscribe(&thread).await;
+    // codex has no thread/start system-prompt field, so prepend it to the turn
+    // (exactly as the exec adapter and the engine's first-turn text do).
+    let full = format!("{CURATOR_SYSTEM_PROMPT}\n\n{prompt}");
+    let turn = client.start_turn(&thread, &full).await?;
+    client.set_active_turn(&thread, &turn).await;
+    let mut texts: Vec<String> = Vec::new();
+    let mut deltas = String::new();
+    let collect = async {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
+                    on_event(AnalysisEvent::Delta(&text));
+                    deltas.push_str(&text);
+                }
+                ThreadMsg::Event(ChatEvent::Assistant { texts: t, .. }) => texts.extend(t),
+                ThreadMsg::Event(ChatEvent::TurnEnd { .. }) => break,
+                ThreadMsg::Approval { id, .. } => {
+                    let _ = client.reply_approval(&id, "decline").await;
+                }
+                _ => {}
+            }
+        }
+    };
+    let _ = tokio::time::timeout(CURATOR_TIMEOUT, collect).await;
+    client.shutdown().await;
+    Ok(if texts.is_empty() { deltas } else { texts.join("\n") })
+}
+
+/// Exec transport (codex/claude/opencode): spawn a one-shot per-turn child,
+/// read-only, feeding `prompt` and streaming text to `on_event`. Reuses the
+/// per-tool adapter for argv + line parsing (claude reads stdin as a stream-json
+/// envelope; per-turn tools carry the message on argv). Bounded by
+/// `CURATOR_TIMEOUT`: a timeout or early exit returns whatever was collected.
+async fn run_exec<F: FnMut(AnalysisEvent)>(
+    tool: &str,
+    cwd: &Path,
+    prompt: &str,
+    on_event: &mut F,
+) -> Result<String> {
     use crate::adapters::{adapter_for, AdapterContext};
     use crate::lead_chat::proto::ChatEvent;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -479,21 +611,7 @@ async fn run_agent_once(tool: &str, cwd: &Path, prompt: &str) -> Result<String> 
     // claude runs in plan mode (no edits). opencode has no portable flag here, so
     // it falls back to the prompt's read-only instruction (best-effort).
     let read_only: Vec<String> = match tool {
-        // `--ask-for-approval never` keeps this headless one-shot non-interactive:
-        // with read-only + no approvals, codex can't prompt (it would hang with no
-        // stdin until the timeout when it tries `rg`/`git` under an interactive
-        // policy) and can't escalate out of the sandbox.
-        // `--skip-git-repo-check`: the cross-repo relation pass runs from the
-        // repos' common-ancestor dir, which usually isn't itself a git repo, and
-        // `codex exec` otherwise refuses to start outside one. Harmless for the
-        // per-repo pass (already inside a repo).
-        "codex" => vec![
-            "--sandbox".into(),
-            "read-only".into(),
-            "--ask-for-approval".into(),
-            "never".into(),
-            "--skip-git-repo-check".into(),
-        ],
+        "codex" => codex_exec_read_only_args(),
         "claude" => vec!["--permission-mode".into(), "plan".into()],
         _ => vec![],
     };
@@ -538,8 +656,16 @@ async fn run_agent_once(tool: &str, cwd: &Path, prompt: &str) -> Result<String> 
     let collect = async {
         while let Some(line) = reader.next_line().await? {
             match adapter.parse_line(&line) {
-                ChatEvent::Assistant { texts: t, .. } => texts.extend(t),
-                ChatEvent::TextDelta { text } => deltas.push_str(&text),
+                ChatEvent::Assistant { texts: t, .. } => {
+                    for s in &t {
+                        on_event(AnalysisEvent::Delta(s));
+                    }
+                    texts.extend(t);
+                }
+                ChatEvent::TextDelta { text } => {
+                    on_event(AnalysisEvent::Delta(&text));
+                    deltas.push_str(&text);
+                }
                 ChatEvent::TurnEnd { .. } => break,
                 _ => {}
             }
@@ -639,6 +765,91 @@ fn emit_graph_updated(workspace_id: i32) {
     if let Some(app) = crate::APP_HANDLE.get() {
         use tauri::Emitter;
         let _ = app.emit("repo-graph-updated", workspace_id);
+    }
+}
+
+// ─────────────────────── per-repo analysis run state ───────────────────────
+//
+// An honest, in-memory lifecycle for each repo's classification pass, so the UI
+// can tell "actively running" from "failed" from "never analyzed" — instead of
+// the old derived-only "analyzing" placeholder that could silently strand a repo
+// forever when a pass failed. Lives only for the process; on restart a repo with
+// no canonical tier is simply re-analyzed.
+
+#[derive(Clone)]
+struct RunInfo {
+    /// "running" | "failed". Absence in the map == "idle".
+    phase: &'static str,
+    error: Option<String>,
+}
+
+fn run_states() -> &'static std::sync::Mutex<std::collections::HashMap<i32, RunInfo>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, RunInfo>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn run_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<i32, RunInfo>> {
+    run_states().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Mark a repo's analysis as running. Returns `false` if it was ALREADY running,
+/// so a manual reprofile racing the background pass can't double-spawn the agent.
+fn run_begin(id: i32) -> bool {
+    let mut g = run_lock();
+    if matches!(g.get(&id), Some(r) if r.phase == "running") {
+        return false;
+    }
+    g.insert(id, RunInfo { phase: "running", error: None });
+    true
+}
+
+/// Analysis finished successfully: the persisted canonical tier now drives the
+/// `analyzed` state, so the transient run entry is dropped (→ "idle").
+fn run_finish_ok(id: i32) {
+    run_lock().remove(&id);
+}
+
+/// Analysis failed/timed out: keep a visible `failed` entry with the error, so
+/// the detail panel shows it + a manual retry instead of a silent spinner.
+fn run_finish_err(id: i32, error: String) {
+    run_lock().insert(id, RunInfo { phase: "failed", error: Some(error) });
+}
+
+fn run_phase(id: i32) -> &'static str {
+    run_lock().get(&id).map(|r| r.phase).unwrap_or("idle")
+}
+
+fn run_error(id: i32) -> Option<String> {
+    run_lock().get(&id).and_then(|r| r.error.clone())
+}
+
+#[cfg(test)]
+fn run_state_clear_all_for_test() {
+    run_lock().clear();
+}
+
+/// Emit one analysis lifecycle/stream event for a repo so an open detail panel
+/// can render the live transcript + status. No-op outside a running app.
+fn emit_repo_analysis(
+    workspace_id: i32,
+    repo_id: i32,
+    phase: &str,
+    text: Option<&str>,
+    error: Option<&str>,
+) {
+    if let Some(app) = crate::APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "repo-analysis",
+            serde_json::json!({
+                "workspaceId": workspace_id,
+                "repoId": repo_id,
+                "phase": phase,
+                "text": text,
+                "error": error,
+            }),
+        );
     }
 }
 
@@ -747,15 +958,24 @@ async fn persist_repo_class(
     Ok(())
 }
 
-/// Deep, read-only per-repo pass: run the agent with cwd AT the repo, parse its
-/// classification, and persist it. Best-effort — a timed-out/unparseable reply
-/// leaves the prior profile (or placeholder) intact. No-op if the checkout is
-/// gone (the agent can't read a path that isn't there).
+/// Deep, read-only per-repo pass: run the agent with cwd AT the repo, STREAM its
+/// process into the repo's detail panel, parse its classification, and persist it.
+/// Tracks an honest run-state (running → done/failed) so a failed pass surfaces an
+/// error + manual retry instead of an eternal "analyzing" placeholder. Best-effort
+/// — a timed-out/unparseable reply leaves the prior profile (or placeholder)
+/// intact. No-op if the checkout is gone, or if this repo is already analyzing.
 pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     let cwd = Path::new(&repo.local_git_path);
     if !cwd.exists() {
         return Ok(());
     }
+    // Dedupe: a manual reprofile racing the background pass must not double-spawn
+    // the agent for the same repo.
+    if !run_begin(repo.id) {
+        return Ok(());
+    }
+    let (ws, rid) = (repo.workspace_id, repo.id);
+    emit_repo_analysis(ws, rid, "started", None, None);
     let tool = crate::tools::default_tool(db).await;
     let prompt = build_repo_class_prompt(&repo.name);
     // Capture HEAD BEFORE the (minutes-long) run so the stored `profiled_commit`
@@ -763,9 +983,32 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     // during the run, a later pass sees HEAD != profiled_commit and reclassifies,
     // instead of saving the new SHA against a stale classification.
     let head_before = git::head_commit(cwd).unwrap_or_default();
-    let text = run_agent_once(&tool, cwd, &prompt).await?;
-    if let Some(wire) = parse_repo_class(&text) {
-        persist_repo_class(db, repo, wire, &head_before).await?;
+    let res = run_streaming_agent(&tool, cwd, &prompt, &mut |ev| match ev {
+        AnalysisEvent::Delta(t) => emit_repo_analysis(ws, rid, "delta", Some(t), None),
+    })
+    .await;
+    // Persistence runs inside the result so a persist/DB error still FINALIZES the
+    // run-state (as failed, retryable) — never propagate via `?` and strand the
+    // repo at a leaked "running" (the very stuck-state this whole change kills).
+    let outcome = match res {
+        Ok(text) => match parse_repo_class(&text) {
+            Some(wire) => persist_repo_class(db, repo, wire, &head_before).await,
+            None => Ok(()), // unparseable reply: leave the prior profile, clear to idle
+        },
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Ok(()) => {
+            run_finish_ok(rid);
+            emit_repo_analysis(ws, rid, "done", None, None);
+        }
+        Err(e) => {
+            // Surface the failure (visible + retryable) instead of silently leaving
+            // the placeholder to read as a perpetual "analyzing".
+            let msg = e.to_string();
+            run_finish_err(rid, msg.clone());
+            emit_repo_analysis(ws, rid, "failed", None, Some(&msg));
+        }
     }
     Ok(())
 }
@@ -792,6 +1035,13 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
     // HEAD) — re-running the minutes-long agent for every unchanged checkout when
     // a single repo is added would stall a large workspace for a long time.
     for r in &existing {
+        // A FAILED repo is not auto-retried: this auto-pass runs on every graph()
+        // read, so retrying here would storm a persistently-failing repo. It keeps
+        // its visible `failed` state until the user hits 重新分析 (reprofile_repo,
+        // which clears the failed entry and forces a fresh run).
+        if run_phase(r.id) == "failed" {
+            continue;
+        }
         if !needs_classification(db, r).await {
             continue;
         }
@@ -908,7 +1158,9 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
         .filter(|anc| !is_too_broad(anc))
         .unwrap_or_else(|| Path::new(&profiled[0].0.local_git_path).to_path_buf());
     let tool = crate::tools::default_tool(db).await;
-    if let Ok(text) = run_agent_once(&tool, &cwd, &prompt).await {
+    // The relations pass is workspace-level, not tied to one repo's detail panel,
+    // so its stream is discarded — it shares the runner only for the transport fix.
+    if let Ok(text) = run_streaming_agent(&tool, &cwd, &prompt, &mut |_| {}).await {
         if let Some(relations) = parse_curator_output(&text) {
             persist_relations(db, &profiled, &relations).await?;
         }
@@ -928,6 +1180,10 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
 pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     let gate = pass_gate(repo.workspace_id);
     let _g = gate.lock.lock().await;
+    // Clear any prior `failed` run-state so this explicit retry actually runs:
+    // `run_begin` only blocks a still-`running` repo, but auto-passes skip `failed`
+    // ones — the user pressing 重新分析 is the sanctioned way to retry one.
+    run_finish_ok(repo.id);
     profile_repo_agent(db, repo).await?;
     emit_graph_updated(repo.workspace_id);
     let _ = analyze_relations(db, repo.workspace_id).await;
@@ -987,6 +1243,56 @@ mod tests {
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[test]
+    fn codex_exec_read_only_args_drop_ask_for_approval() {
+        // Regression: current codex `exec` rejects `--ask-for-approval`, which made
+        // every analysis spawn exit at arg-parse and stranded repos at "分析中".
+        let a = super::codex_exec_read_only_args();
+        assert!(
+            !a.iter().any(|s| s == "--ask-for-approval"),
+            "codex exec no longer accepts --ask-for-approval"
+        );
+        assert!(
+            a.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"),
+            "read-only sandbox preserved"
+        );
+        assert!(
+            a.iter().any(|s| s.starts_with("approval_policy")),
+            "never-prompt expressed via approval_policy config override"
+        );
+        assert!(a.iter().any(|s| s == "--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn run_state_transitions_and_dedupe() {
+        super::run_state_clear_all_for_test();
+        assert!(super::run_begin(101), "first begin starts it");
+        assert!(!super::run_begin(101), "second begin deduped while running");
+        assert_eq!(super::run_phase(101), "running");
+        super::run_finish_err(101, "boom".into());
+        assert_eq!(super::run_phase(101), "failed");
+        assert_eq!(super::run_error(101).as_deref(), Some("boom"));
+        assert!(super::run_begin(101), "a failed repo can be restarted");
+        super::run_finish_ok(101);
+        assert_eq!(super::run_phase(101), "idle");
+        assert_eq!(super::run_error(101), None);
+    }
+
+    #[tokio::test]
+    async fn view_surfaces_failed_analysis_state() {
+        super::run_state_clear_all_for_test();
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "")
+            .await
+            .unwrap();
+        super::run_finish_err(r.id, "codex failed".into());
+        let views = super::list(&db, ws.id).await.unwrap();
+        let v = views.iter().find(|v| v.repo_id == r.id).unwrap();
+        assert_eq!(v.analysis_state, "failed");
+        assert_eq!(v.analysis_error.as_deref(), Some("codex failed"));
     }
 
     /// Upsert a minimal agent profile row (tier only) so a repo has a node.
