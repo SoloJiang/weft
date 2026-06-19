@@ -562,6 +562,7 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
     client.set_active_turn(&thread, &turn).await;
     let mut texts: Vec<String> = Vec::new();
     let mut deltas = String::new();
+    let mut turn_failed = false;
     let collect = async {
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -570,7 +571,10 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
                     deltas.push_str(&text);
                 }
                 ThreadMsg::Event(ChatEvent::Assistant { texts: t, .. }) => texts.extend(t),
-                ThreadMsg::Event(ChatEvent::TurnEnd { .. }) => break,
+                ThreadMsg::Event(ChatEvent::TurnEnd { is_error, .. }) => {
+                    turn_failed = is_error;
+                    break;
+                }
                 ThreadMsg::Approval { id, .. } => {
                     let _ = client.reply_approval(&id, "decline").await;
                 }
@@ -578,9 +582,19 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
             }
         }
     };
-    let _ = tokio::time::timeout(CURATOR_TIMEOUT, collect).await;
+    let completed = tokio::time::timeout(CURATOR_TIMEOUT, collect).await.is_ok();
     client.shutdown().await;
-    Ok(if texts.is_empty() { deltas } else { texts.join("\n") })
+    let text = if texts.is_empty() { deltas } else { texts.join("\n") };
+    // A turn that ENDED in error (auth/quota/context), never finished (timeout), or
+    // produced no text at all is a transport failure — surface it as `Err` so
+    // `run_streaming_agent` can fall back to exec, instead of feeding empty/partial
+    // text downstream as if the app-server had succeeded.
+    if turn_failed || !completed || text.trim().is_empty() {
+        anyhow::bail!(
+            "codex app-server turn did not produce a usable reply (error={turn_failed}, completed={completed})"
+        );
+    }
+    Ok(text)
 }
 
 /// Exec transport (codex/claude/opencode): spawn a one-shot per-turn child,
@@ -824,6 +838,16 @@ fn run_error(id: i32) -> Option<String> {
     run_lock().get(&id).and_then(|r| r.error.clone())
 }
 
+/// Whether an analysis run that produced NO parseable classification should be
+/// surfaced as a FAILURE (visible + retryable) rather than silently cleared to
+/// idle. It's a failure only when the repo has no usable prior classification to
+/// preserve: a fresh placeholder that got nothing back genuinely failed, while a
+/// re-analysis that returns garbage over an already-classified repo keeps its
+/// prior result and is not a failure.
+fn unclassified_run_failed(had_prior_classification: bool) -> bool {
+    !had_prior_classification
+}
+
 #[cfg(test)]
 fn run_state_clear_all_for_test() {
     run_lock().clear();
@@ -993,7 +1017,24 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     let outcome = match res {
         Ok(text) => match parse_repo_class(&text) {
             Some(wire) => persist_repo_class(db, repo, wire, &head_before).await,
-            None => Ok(()), // unparseable reply: leave the prior profile, clear to idle
+            // The agent finished but produced no usable classification. If the repo
+            // already has a good prior classification (a re-analysis that returned
+            // garbage), keep it and clear to idle so its fields still show. But a
+            // placeholder with no prior result is a real failure the user should
+            // see + retry, not a silent "done" that reads as "not analyzed yet".
+            None => {
+                let had_prior = repo::get_repo_profile(db, repo.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| profile::normalize_tier(&p.role).is_some())
+                    .unwrap_or(false);
+                if unclassified_run_failed(had_prior) {
+                    Err(anyhow::anyhow!("analyzer returned no usable classification"))
+                } else {
+                    Ok(())
+                }
+            }
         },
         Err(e) => Err(e),
     };
@@ -1278,6 +1319,15 @@ mod tests {
         super::run_finish_ok(101);
         assert_eq!(super::run_phase(101), "idle");
         assert_eq!(super::run_error(101), None);
+    }
+
+    #[test]
+    fn unclassified_run_is_failure_only_without_prior() {
+        // A finished run that yields no classification: a fresh placeholder failed
+        // (must show + be retryable), but a garbage re-analysis over an already-
+        // classified repo keeps the prior result and is NOT a failure.
+        assert!(super::unclassified_run_failed(false), "no prior → failure");
+        assert!(!super::unclassified_run_failed(true), "prior classification preserved → not a failure");
     }
 
     #[tokio::test]
