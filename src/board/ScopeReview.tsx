@@ -127,7 +127,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
             </div>
             <div className="flex flex-col gap-2">
               {lanes.map((lane, index) => (
-                <ScopeLaneRow key={lane.key} lane={lane} index={index} />
+                <ScopeLaneRow key={lane.key} lane={lane} index={index} confirming={confirming} />
               ))}
             </div>
           </div>
@@ -156,7 +156,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
   );
 }
 
-function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
+function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: number; confirming: boolean }) {
   const { t } = useTranslation();
   const { defaultTool, setProposalDirectionBase } = useStore();
   const write = lane.role === "write";
@@ -235,7 +235,7 @@ function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
             name={lane.direction.name}
             repo={lane.repoName}
             value={lane.direction.base_branch}
-            disabled={!!lane.direction.decision}
+            disabled={confirming || !!lane.direction.decision}
             onSave={setProposalDirectionBase}
           />
           {index > 0 && (

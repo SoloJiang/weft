@@ -1784,10 +1784,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const approveWriteTrigger = useCallback(
     async (item: WriteTrigger, tool?: string) => {
+      // Flush any in-flight base-branch save first. If it REJECTED (re-propose moved
+      // the lane, or a DB error), the backend still holds the old base — refresh the
+      // active proposal and abort rather than approving from a stale base. Mirrors
+      // confirmProposal. Consume the promise so a retry isn't blocked.
+      const pending = pendingBaseSave.current;
+      pendingBaseSave.current = Promise.resolve();
+      try {
+        await pending;
+      } catch {
+        if (activeThreadId != null) await refreshProposal(activeThreadId);
+        return;
+      }
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
-      await pendingBaseSave.current.catch(() => {});
       try {
         const dirId = await api.approveWriteTrigger(item.thread_id, item.index, tool ?? defaultTool);
         void dispatchDirection(dirId);
@@ -1795,7 +1806,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         await refreshNeeds();
       }
     },
-    [dispatchDirection, refreshNeeds, defaultTool],
+    [dispatchDirection, refreshNeeds, defaultTool, activeThreadId, refreshProposal],
   );
 
   const denyWriteTrigger = useCallback(
