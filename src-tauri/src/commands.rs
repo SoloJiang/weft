@@ -731,12 +731,20 @@ fn read_dir_tree(
 
     let mut nodes = Vec::with_capacity(entries.len());
     for entry in entries {
+        if *counter >= FILE_TREE_MAX_NODES {
+            truncated = true;
+            break;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let entry_path = entry.path();
         let path_str = entry_path.to_string_lossy().into_owned();
         // Use symlink_metadata so we don't follow symlinks into directories
         // outside the worktree. Symlinks are shown as files and not recursed.
-        let metadata = std::fs::symlink_metadata(&entry_path).map_err(e)?;
+        let metadata = match std::fs::symlink_metadata(&entry_path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.to_string()),
+        };
         if metadata.is_dir() {
             if is_skipped_dir(&name) {
                 continue;

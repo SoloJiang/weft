@@ -25,9 +25,15 @@ Use TypeScript for frontend code and Rust 2021 for backend code. Keep modules fo
 
 Rust production paths deny `unwrap`, `expect`, and `panic`; return `Result` and surface errors clearly. Avoid adding embedded terminal/TUI dependencies; Weft renders its own chat UI and uses terminal takeover only as an escape hatch.
 
+- Prefer a single enum/discriminated field over multiple booleans for mutually exclusive UI state (e.g. `sidePanel?: "diff" | "files"`).
+- When porting external UI components, install their underlying primitives and re-skin with the project's design tokens; remove unused exports after porting.
+- Edits to command/handler registries are high-risk; diff the surrounding lines to ensure adjacent entries were not dropped.
+
 ## Testing Guidelines
 
 Backend logic is covered with Rust unit tests next to modules and integration tests under `src-tauri/tests/`. Add tests for store migrations, worktree behavior, chat protocol parsing, planner scope, bus behavior, and verification logic when those areas change. Frontend changes should at minimum pass `npm run build`.
+
+- Recursive filesystem commands need tests for symlink containment, large-directory truncation, and skipped artifact directories.
 
 ## Commit & Pull Request Guidelines
 
@@ -68,3 +74,6 @@ Flag a thread as blocking when it touches behavior correctness, store migrations
 ## Architecture & Configuration Notes
 
 Do not write cross-repo wiring into canonical repositories. Use temporary launch flags, worktree-local ignored files, or Weft-managed state. Current delivery reaches reviewable worktree diffs with pre-PR checks; PR creation, CI/CD observation, and deployment orchestration are roadmap work.
+
+- Use isolated workspaces for feature work to keep unrelated changes out of the main checkout.
+- Distinguish user-facing path tokens (which may carry line/column suffixes or be relative) from verbatim filesystem paths; provide dedicated openers when the UI already holds resolved absolute paths.

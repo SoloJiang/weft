@@ -328,4 +328,3 @@ export function FileTreeNodes({ nodes }: FileTreeNodeProps) {
     ),
   );
 }
-
