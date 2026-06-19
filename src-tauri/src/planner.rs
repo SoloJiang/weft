@@ -97,6 +97,49 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
     }
 }
 
+// ---- Direction reuse reconciliation ----
+
+/// Decide whether a re-proposal can reuse an already-materialized direction of the
+/// same name+repo, or must be rejected (the worktree is branched off a fixed base; a
+/// live worktree can't be re-based). `existing.base_branch` is the immutable
+/// branch-off base recorded at materialize: "" means a legacy row (materialized
+/// before base tracking) whose true base is unknown. Compares EFFECTIVE bases —
+/// empty resolves via the LIVE remote default (cached fallback), non-empty strips
+/// `origin/`. Ok(()) = safe to reuse; Err = reject (delete + recreate).
+fn reconcile_reuse(
+    existing: &crate::store::entities::direction::Model,
+    proposed_base: &str,
+    repo_path: &std::path::Path,
+    base_ref: &str,
+) -> Result<()> {
+    let effective = |b: &str| -> String {
+        let b = b.trim();
+        if b.is_empty() {
+            crate::git::live_default_branch(repo_path)
+                .unwrap_or_else(|| crate::git::default_base_branch(repo_path, base_ref))
+        } else {
+            b.strip_prefix("origin/").unwrap_or(b).to_string()
+        }
+    };
+    // Legacy row: true base unknown → reuse only if the re-proposal is also default.
+    if existing.base_branch.trim().is_empty() {
+        if !proposed_base.trim().is_empty() {
+            anyhow::bail!(
+                "direction {:?} predates base tracking (unknown branch-off base); delete the sub-task to recreate it from {:?}",
+                existing.name, proposed_base
+            );
+        }
+        return Ok(());
+    }
+    if effective(&existing.base_branch) != effective(proposed_base) {
+        anyhow::bail!(
+            "direction {:?} already exists with base {:?}; delete the sub-task to recreate it from {:?}",
+            existing.name, existing.base_branch, proposed_base
+        );
+    }
+    Ok(())
+}
+
 // ---- DB orchestration ----
 
 fn now() -> String {
@@ -167,12 +210,35 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     }
     let mut created: Vec<i32> = Vec::new();
     let tool = crate::tools::default_tool(db).await;
+    // Snapshot existing directions ONCE before the loop so freshly-created lanes in
+    // this pass are not accidentally matched (each lane is created exactly once).
+    let existing_dirs = repo::list_directions(db, thread_id).await?;
     for d in &resolved.directions {
         if !d.repo.known {
             continue; // unknown repo name never resolved to a worktree-able repo
         }
         if d.decision == "approved" || d.decision == "denied" {
             continue; // already handled via per-card approve/deny
+        }
+        // A lane may already be materialized (e.g. approved via Needs-you, then the
+        // lead re-proposed it resetting the decision to ""). Reuse the same-base lane
+        // (and still return its id for dispatch) or reject a base change — never
+        // create a duplicate direction/worktree.
+        if let Some(ex) = existing_dirs
+            .iter()
+            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id)
+        {
+            let repo_ref = repo::get_repo(db, d.repo.repo_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("repo {} not found", d.repo.repo_id))?;
+            reconcile_reuse(
+                ex,
+                &d.base_branch,
+                std::path::Path::new(&repo_ref.local_git_path),
+                &repo_ref.base_ref,
+            )?;
+            created.push(ex.id);
+            continue;
         }
         let dir = match repo::create_direction(
             db,
@@ -252,29 +318,18 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         // a re-proposal that changes the base can't silently re-base a live (possibly
         // worker-occupied) worktree. Surface the conflict rather than approving with a
         // mismatched base. (Same base → idempotent reuse.)
-        // Compare EFFECTIVE bases (empty → repo default, origin/ stripped) so a
-        // re-proposal that merely spells out the same default isn't treated as a
-        // rebase conflict. Only a real change of branch-off point is rejected.
+        // Also handles legacy rows (base_branch == "") where the true base is unknown:
+        // those may only be reused when the re-proposal is also default (empty base).
+        // Uses the LIVE remote default for comparison (not the cached origin/HEAD).
         let repo_ref = repo::get_repo(db, resolved.repo.repo_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("repo {} not found", resolved.repo.repo_id))?;
-        let repo_path = std::path::Path::new(&repo_ref.local_git_path);
-        let effective = |b: &str| -> String {
-            let b = b.trim();
-            if b.is_empty() {
-                crate::git::default_base_branch(repo_path, &repo_ref.base_ref)
-            } else {
-                b.strip_prefix("origin/").unwrap_or(b).to_string()
-            }
-        };
-        if effective(&existing.base_branch) != effective(&resolved.base_branch) {
-            anyhow::bail!(
-                "direction {:?} already exists with base {:?}; delete the sub-task to recreate it from {:?}",
-                resolved.name,
-                existing.base_branch,
-                resolved.base_branch
-            );
-        }
+        reconcile_reuse(
+            existing,
+            &resolved.base_branch,
+            std::path::Path::new(&repo_ref.local_git_path),
+            &repo_ref.base_ref,
+        )?;
         // Already created (e.g. the lead re-proposed and the decision was reset).
         // Idempotent: don't create a second direction/worktree.
         let id = existing.id;
@@ -961,6 +1016,74 @@ mod tests {
         save_proposal(&db, t.id, &mk(&def)).await.unwrap();
         let id2 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         assert_eq!(id2, id, "same effective base (default spelled out) must reuse, not error");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_reuses_existing_approved_lane_no_duplicate() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-reuse-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+        ]};
+        // Approve A via the Needs-you path (creates + materializes).
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let approved_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // Lead re-proposes the SAME lane (decision resets to ""), then user clicks Create.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "confirm must NOT duplicate the approved lane");
+        assert!(ids.contains(&approved_id), "confirm returns the existing lane id for dispatch");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn approve_rejects_base_specific_reproposal_of_legacy_empty_base() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-legacy-base-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &mk("")).await.unwrap();
+        let id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // Simulate a LEGACY row: blank out the recorded base (as the migration would for
+        // a pre-PR materialized direction).
+        repo::set_direction_base_branch(&db, id, "").await.unwrap();
+        // A base-specific re-proposal can't be verified against an unknown legacy base → reject.
+        save_proposal(&db, t.id, &mk("develop")).await.unwrap();
+        assert!(approve_direction(&db, t.id, 0, "codex").await.is_err(),
+            "base-specific re-proposal of a legacy empty-base direction must be rejected");
+        // A default (empty) re-proposal is allowed to reuse.
+        save_proposal(&db, t.id, &mk("")).await.unwrap();
+        assert_eq!(approve_direction(&db, t.id, 0, "codex").await.unwrap(), id, "empty re-proposal reuses the legacy lane");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
