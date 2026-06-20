@@ -48,6 +48,48 @@ const KINDS = ["lib", "http", "grpc", "queue", "infra"] as const;
 const bandOf = (tier: string): Band =>
   (TIER_ORDER as readonly string[]).includes(tier) ? (tier as Band) : "other";
 
+// ─────────────────── repo analysis display status ───────────────────
+// A repo's analysis lifecycle as ONE discriminant the canvas cards and the
+// detail pane both render from — a single source of truth instead of each spot
+// re-deriving the `analyzed` / `analysis_state` booleans. `phase` is the live
+// stream (detail pane only); cards omit it and never see "running". Distinct
+// from the raw `profile.analysis_state` ("idle"/"running"/"failed"): this folds
+// in `analyzed` to split a classified repo ("analyzed") from an unfinished
+// placeholder ("pending"). See CLAUDE.md "discriminated state, exhaustive map".
+
+type AnalysisView = "running" | "failed" | "analyzed" | "pending";
+
+function analysisView(p: RepoProfile, phase?: string): AnalysisView {
+  if (phase === "running") return "running";
+  if (p.analysis_state === "failed") return "failed";
+  if (p.analyzed) return "analyzed";
+  return "pending";
+}
+
+/** Status-driven border accent for a card. Selection/importance are separate
+ *  axes layered on top via `cn` (see `cardFrame`). Keyed by the discriminant, so
+ *  a new view forces a new entry — exhaustive by construction. */
+const CARD_STATUS_FRAME: Record<AnalysisView, string> = {
+  failed: "border-danger/40",
+  running: "border-dashed opacity-80",
+  pending: "border-dashed opacity-80",
+  analyzed: "",
+};
+
+/** Selection/importance axis for a card border — orthogonal to analysis status. */
+function cardFrame(selected: boolean, core: boolean): string {
+  if (selected) return "border-brand/60 bg-brand-ghost/60";
+  if (core) return "border-accent/50";
+  return "border-border hover:border-border-strong";
+}
+
+/** Border for an expanded (monorepo) card: selection wins, then a failed run. */
+function expandedFrame(selected: boolean, view: AnalysisView): string {
+  if (selected) return "border-brand/60 bg-brand-ghost/40";
+  if (view === "failed") return "border-danger/40";
+  return "border-border hover:border-border-strong";
+}
+
 /** Whether the user has pinned the summary (mirrors the backend `source` flags:
  *  "user" = both fields owned, "user_summary" = just the summary). */
 const ownsSummary = (source: string): boolean => source === "user" || source === "user_summary";
@@ -453,6 +495,48 @@ export function RepoGraph() {
 }
 
 /** A standard repo node (overview, or expanded mode for a single-component repo). */
+/** The status glyph shared by both card variants (mirrors StatusChip's `Glyph`). */
+function NodeStatusGlyph({
+  view,
+  selected,
+  Icon,
+}: {
+  view: AnalysisView;
+  selected: boolean;
+  Icon: ComponentType<LucideProps>;
+}) {
+  if (view === "failed") return <TriangleAlert size={12} className="text-danger" />;
+  if (view === "analyzed")
+    return <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />;
+  return <Loader2 size={12} className="animate-spin text-ink-faint" />; // running | pending
+}
+
+/** A collapsed card's status-driven body: failure reason, classified badges, or
+ *  the analyzing placeholder. */
+function NodeStatusBody({
+  view,
+  p,
+  core,
+  dependents,
+}: {
+  view: AnalysisView;
+  p: RepoProfile;
+  core: boolean;
+  dependents: number;
+}) {
+  const { t } = useTranslation();
+  if (view === "failed")
+    return <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>;
+  if (view === "analyzed")
+    return (
+      <>
+        <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
+        <NodeSummary profile={p} />
+      </>
+    );
+  return <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>; // running | pending
+}
+
 function RepoNode({
   profile: p,
   pt,
@@ -473,31 +557,7 @@ function RepoNode({
   const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
   const core = dependents >= 2;
-  // A failed classification is `!analyzed` too, but must read as a retryable
-  // failure on the canvas — not a permanent "analyzing" spinner.
-  const failed = p.analysis_state === "failed";
-
-  // Derive the multi-way states up front via if/else (CLAUDE.md bans nested
-  // ternaries). Precedence: failed → analyzed → analyzing.
-  let frameBase = "border-border hover:border-border-strong";
-  if (selected) frameBase = "border-brand/60 bg-brand-ghost/60";
-  else if (core) frameBase = "border-accent/50";
-
-  let statusIcon = <Loader2 size={12} className="animate-spin text-ink-faint" />;
-  if (failed) statusIcon = <TriangleAlert size={12} className="text-danger" />;
-  else if (p.analyzed)
-    statusIcon = <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />;
-
-  let statusBody = <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>;
-  if (failed)
-    statusBody = <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>;
-  else if (p.analyzed)
-    statusBody = (
-      <>
-        <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
-        <NodeSummary profile={p} />
-      </>
-    );
+  const view = analysisView(p); // canvas cards have no live stream → never "running"
 
   return (
     <div
@@ -505,13 +565,15 @@ function RepoNode({
       onClick={onSelect}
       className={cn(
         "group absolute flex flex-col gap-2 overflow-hidden rounded-[var(--radius-md)] border bg-surface px-3 py-2.5 text-left transition-[transform,border-color,background-color] hover:-translate-y-px",
-        frameBase,
-        failed ? "border-danger/40" : !p.analyzed && "border-dashed opacity-80",
+        cardFrame(selected, core),
+        CARD_STATUS_FRAME[view],
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
     >
       <div className="flex items-center gap-1.5">
-        <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">{statusIcon}</span>
+        <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
+          <NodeStatusGlyph view={view} selected={selected} Icon={Icon} />
+        </span>
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
@@ -533,7 +595,7 @@ function RepoNode({
         </button>
       </div>
 
-      {statusBody}
+      <NodeStatusBody view={view} p={p} core={core} dependents={dependents} />
     </div>
   );
 }
@@ -555,29 +617,21 @@ function ExpandedNode({
   const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
   // A failed reprofile keeps the prior monorepo components (still useful), but the
-  // header must flag the retryable failure — same precedence as the collapsed card.
-  const failed = p.analysis_state === "failed";
-  // if/else, not a nested ternary (CLAUDE.md): selected wins, then failed.
-  let frame = "border-border hover:border-border-strong";
-  if (selected) frame = "border-brand/60 bg-brand-ghost/40";
-  else if (failed) frame = "border-danger/40";
+  // header must flag the retryable failure — same discriminant as the collapsed card.
+  const view = analysisView(p);
   return (
     <div
       data-repo-node
       onClick={onSelect}
       className={cn(
         "group absolute flex flex-col overflow-hidden rounded-[var(--radius-md)] border bg-surface text-left",
-        frame,
+        expandedFrame(selected, view),
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
     >
       <div className="flex items-center gap-1.5 border-b border-border px-3 py-2">
         <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
-          {failed ? (
-            <TriangleAlert size={12} className="text-danger" />
-          ) : (
-            <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
-          )}
+          <NodeStatusGlyph view={view} selected={selected} Icon={Icon} />
         </span>
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
@@ -729,19 +783,24 @@ function AnalyzingTranscript({ text }: { text: string }) {
 }
 
 /** Failed state: the error + a manual retry (never a silent eternal spinner). */
-function AnalysisFailed({ error, onRetry }: { error: string | null; onRetry: () => void }) {
+/** A compact failure banner above the (still-editable) fields, so a repo whose
+ *  analysis fails can still be manually tiered/summarized — not a full takeover. */
+function FailedNotice({ error, onRetry }: { error: string | null; onRetry: () => void }) {
   const { t } = useTranslation();
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-      <div className="text-[13px] font-medium text-danger">{t("repomap.analysisFailed")}</div>
+    <div className="mb-4 rounded-[var(--radius-md)] border border-danger/30 bg-danger/5 px-3 py-2.5">
+      <div className="flex items-center gap-1.5 text-[12px] font-medium text-danger">
+        <TriangleAlert size={13} />
+        {t("repomap.analysisFailed")}
+      </div>
       {error && (
-        <pre className="max-h-32 w-full overflow-auto whitespace-pre-wrap break-words rounded-[var(--radius-md)] border border-border bg-bg p-2 text-left font-mono text-[11px] text-ink-faint">
+        <pre className="mt-1.5 max-h-24 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-ink-faint">
           {error}
         </pre>
       )}
       <button
         onClick={onRetry}
-        className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-3 py-1.5 text-[12px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
+        className="mt-2 inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-2.5 py-1 text-[12px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
       >
         <RefreshCw size={12} /> {t("repomap.retryAnalysis")}
       </button>
@@ -749,16 +808,16 @@ function AnalysisFailed({ error, onRetry }: { error: string | null; onRetry: () 
   );
 }
 
-/** Idle + never-analyzed (rare; auto-analysis usually covers this): offer a run. */
-function AnalysisIdle({ onAnalyze }: { onAnalyze: () => void }) {
+/** A compact "not analyzed yet" banner above the fields (offers a manual run);
+ *  the fields stay editable so a placeholder can be hand-classified. */
+function PendingNotice({ onAnalyze }: { onAnalyze: () => void }) {
   const { t } = useTranslation();
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-ink-faint">
-      <CircleDashed size={22} />
-      <p className="text-[12px]">{t("repomap.notAnalyzed")}</p>
+    <div className="mb-4 flex items-center justify-between gap-2 rounded-[var(--radius-md)] border border-dashed border-border bg-bg px-3 py-2 text-[12px] text-ink-faint">
+      <span>{t("repomap.notAnalyzed")}</span>
       <button
         onClick={onAnalyze}
-        className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-3 py-1.5 text-[12px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
+        className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-2.5 py-1 text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
       >
         <RefreshCw size={12} /> {t("repomap.analyze")}
       </button>
@@ -772,15 +831,21 @@ function AnalyzedProfileFields({
   deps,
   usedBy,
   onSelect,
+  notice,
 }: {
   profile: RepoProfile;
   deps: { edge: RepoEdge; repo: RepoProfile }[];
   usedBy: { edge: RepoEdge; repo: RepoProfile }[];
   onSelect: (id: number) => void;
+  /** Optional status banner shown above the fields (failed / not-analyzed). The
+   *  fields themselves stay editable so a placeholder/failed repo can be manually
+   *  tiered + summarized — the backend supports editing placeholder profiles. */
+  notice?: React.ReactNode;
 }) {
   const { t } = useTranslation();
   return (
     <div className="h-full overflow-auto px-4 py-4">
+      {notice}
       <ProfileSection title={t("repomap.oneLine")}>
         <NodeSummary profile={profile} />
       </ProfileSection>
@@ -849,16 +914,27 @@ function RepoProfilePane({
     .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
   const Icon = TIER_ICON[bandOf(profile.tier)] ?? CircleDashed;
   const retry = () => void reprofileRepo(profile.repo_id);
+  const view = analysisView(profile, stream.phase);
 
-  // Body by state — if/else, not nested ternaries (CLAUDE.md). Precedence: a
-  // running (re-)analysis shows the live process even over a classified repo;
-  // then a failed run; then the classified fields; then the idle affordance.
-  let paneBody = <AnalysisIdle onAnalyze={retry} />;
-  if (stream.phase === "running") paneBody = <AnalyzingTranscript text={stream.transcript} />;
-  else if (stream.phase === "failed") paneBody = <AnalysisFailed error={stream.error} onRetry={retry} />;
-  else if (profile.analyzed)
-    paneBody = (
-      <AnalyzedProfileFields profile={profile} deps={deps} usedBy={usedBy} onSelect={onSelect} />
+  // A live (re-)analysis takes over the pane to show the streamed process. EVERY
+  // other view shows the editable calibration fields (manual tiering / summary
+  // must work even for a placeholder or a repo whose analysis failed — the
+  // backend supports it), with a status notice keyed by the discriminant on top.
+  const notices: Partial<Record<AnalysisView, React.ReactNode>> = {
+    failed: <FailedNotice error={stream.error} onRetry={retry} />,
+    pending: <PendingNotice onAnalyze={retry} />,
+  };
+  const paneBody =
+    view === "running" ? (
+      <AnalyzingTranscript text={stream.transcript} />
+    ) : (
+      <AnalyzedProfileFields
+        profile={profile}
+        deps={deps}
+        usedBy={usedBy}
+        onSelect={onSelect}
+        notice={notices[view]}
+      />
     );
 
   return (
