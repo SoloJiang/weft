@@ -514,6 +514,80 @@ enum AnalysisEvent<'a> {
     Delta(&'a str),
 }
 
+/// Accumulates a streamed agent turn's assistant text + terminal signals. The
+/// "what counts as a clean vs failed turn" judgment lives — and is unit-tested —
+/// HERE, once, instead of being re-hand-rolled per transport. That duplication was
+/// the source of the repeated transport edge-case bugs (errored turn, mid-stream
+/// EOF, timeout, empty output); both the app-server and exec runners now feed this
+/// one collector so the two paths can't drift.
+#[derive(Default)]
+struct TurnCollector {
+    texts: Vec<String>,
+    deltas: String,
+    turn_failed: bool,
+    saw_turn_end: bool,
+}
+
+impl TurnCollector {
+    /// Feed one parsed event, forwarding any streamed text to `sink`. Returns true
+    /// once the turn END is seen (the caller should stop reading).
+    fn push<F: FnMut(AnalysisEvent)>(
+        &mut self,
+        ev: crate::lead_chat::proto::ChatEvent,
+        sink: &mut F,
+    ) -> bool {
+        use crate::lead_chat::proto::ChatEvent;
+        match ev {
+            ChatEvent::TextDelta { text } => {
+                sink(AnalysisEvent::Delta(&text));
+                self.deltas.push_str(&text);
+                false
+            }
+            ChatEvent::Assistant { texts, .. } => {
+                for s in &texts {
+                    sink(AnalysisEvent::Delta(s));
+                }
+                self.texts.extend(texts);
+                false
+            }
+            ChatEvent::TurnEnd { is_error, .. } => {
+                self.saw_turn_end = true;
+                self.turn_failed = is_error;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The accumulated assistant text — full messages if any arrived, else the
+    /// streamed deltas (the app-server delivers agent text only as deltas).
+    fn text(&self) -> String {
+        if self.texts.is_empty() {
+            self.deltas.clone()
+        } else {
+            self.texts.join("\n")
+        }
+    }
+
+    /// Decide the turn result: `Ok(text)` ONLY for a clean, non-error turn with
+    /// usable text. `reached_end` = the stream terminated on its own (not a
+    /// timeout). `require_turn_end` = treat a natural EOF WITHOUT a TurnEnd as a
+    /// failure: true for the app-server (it always emits a TurnEnd, so its absence
+    /// means a mid-turn disconnect), false for exec (opencode emits no TurnEnd, so a
+    /// clean EOF is its normal completion).
+    fn outcome(&self, label: &str, reached_end: bool, require_turn_end: bool) -> Result<String> {
+        let text = self.text();
+        let ended = if require_turn_end { self.saw_turn_end } else { reached_end };
+        if self.turn_failed || !ended || text.trim().is_empty() {
+            anyhow::bail!(
+                "{label} turn did not complete cleanly (error={}, ended={ended})",
+                self.turn_failed
+            );
+        }
+        Ok(text)
+    }
+}
+
 /// Run the resolved agent once over `cwd`, read-only, streaming text chunks to
 /// `on_event` and returning the final assistant text. codex prefers the
 /// app-server transport (token-by-token deltas, the same transport the chat
@@ -548,7 +622,6 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
     on_event: &mut F,
 ) -> Result<String> {
     use crate::codex_app_server::{codex_approval_reply, Client, ThreadMsg};
-    use crate::lead_chat::proto::ChatEvent;
     // Deliberately do NOT pre-trust `cwd`: this curator scan runs in the user's
     // CANONICAL repo (not a Weft-managed worktree), so silently writing it into
     // codex's trusted-folders config — permanently bypassing codex's own folder
@@ -579,22 +652,14 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
         let mut rx = client.subscribe(&thread).await;
         let turn = client.start_turn(&thread, &full).await?;
         client.set_active_turn(&thread, &turn).await;
-        let mut texts: Vec<String> = Vec::new();
-        let mut deltas = String::new();
-        let mut turn_failed = false;
-        let mut saw_turn_end = false;
+        let mut collector = TurnCollector::default();
         let collect = async {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
-                        on_event(AnalysisEvent::Delta(&text));
-                        deltas.push_str(&text);
-                    }
-                    ThreadMsg::Event(ChatEvent::Assistant { texts: t, .. }) => texts.extend(t),
-                    ThreadMsg::Event(ChatEvent::TurnEnd { is_error, .. }) => {
-                        saw_turn_end = true;
-                        turn_failed = is_error;
-                        break;
+                    ThreadMsg::Event(ev) => {
+                        if collector.push(ev, on_event) {
+                            break;
+                        }
                     }
                     ThreadMsg::Approval { id, method, .. } => {
                         // Decline every ask immediately with the SHAPE its kind needs:
@@ -613,19 +678,11 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
             }
         };
         let _ = tokio::time::timeout(CURATOR_TIMEOUT, collect).await;
-        let text = if texts.is_empty() { deltas } else { texts.join("\n") };
-        // Accept the reply ONLY on a clean, non-error TurnEnd with text. A timeout
-        // (collect cancelled) OR a mid-turn channel close — the child crashed or
-        // disconnected after partial text, so `rx.recv()` hits EOF and the loop
-        // exits WITHOUT a TurnEnd — both leave `saw_turn_end` false. Treat either as
-        // a transport failure (`Err`) so `run_streaming_agent` falls back to exec,
-        // instead of returning partial/empty output as if the app-server succeeded.
-        if turn_failed || !saw_turn_end || text.trim().is_empty() {
-            anyhow::bail!(
-                "codex app-server turn did not complete cleanly (error={turn_failed}, sawTurnEnd={saw_turn_end})"
-            );
-        }
-        Ok::<String, anyhow::Error>(text)
+        // require_turn_end = true: the app-server always emits a TurnEnd, so a
+        // timeout OR a mid-turn channel close (EOF without one) is a failure → Err,
+        // so `run_streaming_agent` falls back to exec instead of returning partial
+        // output as success.
+        collector.outcome("codex app-server", true, true)
     }
     .await;
     // Reap the child here (not just kill_on_drop): the curator opens a fresh
@@ -647,7 +704,6 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
     on_event: &mut F,
 ) -> Result<String> {
     use crate::adapters::{adapter_for, AdapterContext};
-    use crate::lead_chat::proto::ChatEvent;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let adapter = adapter_for(tool).ok_or_else(|| anyhow::anyhow!("unknown tool {tool}"))?;
@@ -703,27 +759,11 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
         .take()
         .ok_or_else(|| anyhow::anyhow!("curator child stdout not piped"))?;
     let mut reader = BufReader::new(stdout).lines();
-    let mut texts: Vec<String> = Vec::new();
-    let mut deltas = String::new();
-    let mut turn_failed = false;
+    let mut collector = TurnCollector::default();
     let collect = async {
         while let Some(line) = reader.next_line().await? {
-            match adapter.parse_line(&line) {
-                ChatEvent::Assistant { texts: t, .. } => {
-                    for s in &t {
-                        on_event(AnalysisEvent::Delta(s));
-                    }
-                    texts.extend(t);
-                }
-                ChatEvent::TextDelta { text } => {
-                    on_event(AnalysisEvent::Delta(&text));
-                    deltas.push_str(&text);
-                }
-                ChatEvent::TurnEnd { is_error, .. } => {
-                    turn_failed = is_error;
-                    break;
-                }
-                _ => {}
+            if collector.push(adapter.parse_line(&line), on_event) {
+                break;
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -736,18 +776,11 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
     // EOF the child has already exited and this is a no-op.
     drop(reader);
     let _ = child.kill().await;
-    let text = if texts.is_empty() { deltas } else { texts.join("\n") };
-    // Don't hand back partial/empty output as success (mirrors the app-server
-    // path): a timeout, an arg-parse / early exit (no stdout → empty text), or an
-    // errored turn must surface as `Err` so a failed reprofile shows the
-    // failed/retryable state instead of being masked as `done` — e.g.
-    // `classified_now` seeing a STALE prior tier. (We gate on completion + non-error
-    // + non-empty rather than requiring a TurnEnd, because opencode's exec stream
-    // emits none.)
-    if !completed || turn_failed || text.trim().is_empty() {
-        anyhow::bail!("{tool} exec turn did not complete cleanly (timedOut={}, error={turn_failed})", !completed);
-    }
-    Ok(text)
+    // require_turn_end = false: a timeout, an arg-parse / early exit (no stdout →
+    // empty text), or an errored turn must surface as `Err` so a failed reprofile
+    // shows the failed/retryable state instead of being masked as `done` — but a
+    // clean EOF WITHOUT a TurnEnd is fine, because opencode's exec stream emits none.
+    collector.outcome(tool, completed, false)
 }
 
 /// Group the agent's flat relations by producer (`from`), keep only those whose
@@ -1412,6 +1445,57 @@ mod tests {
             "never-prompt expressed via approval_policy config override"
         );
         assert!(a.iter().any(|s| s == "--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn turn_collector_decides_outcome_and_streams() {
+        use crate::lead_chat::proto::ChatEvent;
+        let te = |is_error| ChatEvent::TurnEnd { is_error, context_tokens: None };
+        let delta = |s: &str| ChatEvent::TextDelta { text: s.to_string() };
+        let asst = |s: &str| ChatEvent::Assistant { texts: vec![s.to_string()], tools: vec![] };
+        let mut noop = |_: super::AnalysisEvent| {};
+
+        // Clean app-server turn: deltas then a non-error TurnEnd → Ok with the text.
+        let mut c = super::TurnCollector::default();
+        assert!(!c.push(delta("hel"), &mut noop));
+        assert!(c.push(te(false), &mut noop), "TurnEnd ends the read");
+        assert_eq!(c.outcome("t", true, true).unwrap(), "hel");
+
+        // Errored turn → Err.
+        let mut c = super::TurnCollector::default();
+        c.push(delta("x"), &mut noop);
+        c.push(te(true), &mut noop);
+        assert!(c.outcome("t", true, true).is_err(), "errored turn fails");
+
+        // App-server EOF WITHOUT a TurnEnd (mid-crash) → Err even with partial text.
+        let mut c = super::TurnCollector::default();
+        c.push(delta("partial"), &mut noop);
+        assert!(c.outcome("t", true, true).is_err(), "require_turn_end: no TurnEnd → fail");
+
+        // Exec clean EOF without a TurnEnd (opencode) WITH text → Ok.
+        let mut c = super::TurnCollector::default();
+        c.push(asst("done"), &mut noop);
+        assert_eq!(c.outcome("t", true, false).unwrap(), "done");
+
+        // Timeout (reached_end = false) → Err.
+        let mut c = super::TurnCollector::default();
+        c.push(asst("partial"), &mut noop);
+        assert!(c.outcome("t", false, false).is_err(), "timeout fails");
+
+        // Empty output → Err.
+        let mut c = super::TurnCollector::default();
+        c.push(te(false), &mut noop);
+        assert!(c.outcome("t", true, true).is_err(), "empty output fails");
+
+        // Streamed text (deltas AND full messages) is forwarded to the sink in order.
+        let mut got = String::new();
+        let mut sink = |e: super::AnalysisEvent| match e {
+            super::AnalysisEvent::Delta(t) => got.push_str(t),
+        };
+        let mut c = super::TurnCollector::default();
+        c.push(delta("a"), &mut sink);
+        c.push(asst("b"), &mut sink);
+        assert_eq!(got, "ab");
     }
 
     #[test]
