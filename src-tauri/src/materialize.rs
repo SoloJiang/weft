@@ -112,10 +112,16 @@ pub async fn materialize_direction(
         // doesn't descend, fall through to the recreate path, whose R37-2 guard then bails
         // with a clear error. Don't validate for a blank base or a base that no longer
         // resolves (a gone base must not block resuming a surviving branch).
+        //
+        // R39-3: resolve the explicit base through branch_descends_from_base (LOCAL `<base>`
+        // OR `origin/<base>`), not a BARE LOCAL `<base>`. In a single-branch clone the base
+        // exists only as `origin/<base>`, so a bare-local check would skip entirely and let a
+        // reset-off-main branch slip through; a diverged local `<base>` would wrongly reject
+        // an origin-based checkout. Some(false) = base resolves in some form but the branch
+        // descends from NONE → mismatch; None (base gone) → don't block the surviving branch.
         let explicit_base = dir.base_branch.trim();
         let base_mismatch = !explicit_base.is_empty()
-            && git::ref_resolves(repo_path, explicit_base)
-            && !git::branch_descends_from(repo_path, &existing.branch, explicit_base);
+            && git::branch_descends_from_base(repo_path, &existing.branch, explicit_base) == Some(false);
         if git::is_registered_worktree(repo_path, wt_path, &existing.branch) && !base_mismatch {
             return Ok(vec![existing]);
         }
@@ -171,10 +177,15 @@ pub async fn materialize_direction(
         // branch resolves AND the explicit base STILL RESOLVES, the branch must descend from
         // that base — else bail. Only validate when the base resolves: a GONE explicit base
         // must NOT block resuming a surviving branch (the prior round's behavior).
+        //
+        // R39-3: resolve the base through branch_descends_from_base (LOCAL `<base>` OR
+        // `origin/<base>`) so a single-branch clone (origin-only base) is still checked and a
+        // diverged local base doesn't wrongly reject an origin-based branch. Some(false) =
+        // base resolves in some form but the branch descends from none; None (base gone) does
+        // not block resuming the surviving branch.
         if explicit
             && git::ref_resolves(repo_path, &existing.branch)
-            && git::ref_resolves(repo_path, &recreate_base)
-            && !git::branch_descends_from(repo_path, &existing.branch, &recreate_base)
+            && git::branch_descends_from_base(repo_path, &existing.branch, &recreate_base) == Some(false)
         {
             anyhow::bail!(
                 "work branch {:?} no longer descends from its explicit base {:?}; \
@@ -260,6 +271,17 @@ pub async fn materialize_direction(
     } else {
         recorded_base.clone()
     };
+    // R39-1: add_worktree_synced's path-exists fast-path can't tell a user-reused path
+    // from OUR OWN crash orphan (weft created the worktree+branch, then crashed between
+    // `worktree add` and record_worktree), so it returns ownership=false. But `path` is
+    // always under our managed, weft-reserved root, and we only reach here (the create
+    // path) with no DB row — so an existing registered checkout here is ours. Adopt it
+    // as weft-created, else reclaim/cascade treats it as user-owned and never cleans it.
+    // Computed here (above `finish`) so BOTH the record call and the error arm — which
+    // runs after the async block — see the adopted flags. Depends only on add/path/repo_path.
+    let crash_orphan = !add.created_checkout && path.starts_with(worktree_root(repo_path));
+    let owns_branch = add.created_branch || crash_orphan;
+    let owns_checkout = add.created_checkout || crash_orphan;
     let finish = async {
         if !explicit {
             // Record the ACTUAL branched-off ref as the immutable branch-off base, so
@@ -274,7 +296,12 @@ pub async fn materialize_direction(
             // materialize, but we propagate DB errors from set_direction_base_branch
             // above; an error here would be equally unexpected, so we let it surface).
             if let Some(ref live) = live_default {
-                if live != &repo_ref.base_ref {
+                // Persist when the value changed OR the row isn't yet marked default (an
+                // upgraded/legacy row whose base_ref already equals the live default but
+                // whose base_ref_is_default was never set). set_repo_base_ref also sets the
+                // marker, so this backfills it; without it a later offline materialize treats
+                // this verified default as legacy and can fall through to main/master.
+                if live != &repo_ref.base_ref || !repo_ref.base_ref_is_default {
                     // Best-effort: ignore errors so a transient write hiccup never
                     // fails the materialize call.
                     let _ = repo::set_repo_base_ref(db, repo_ref.id, live).await;
@@ -294,8 +321,8 @@ pub async fn materialize_direction(
             direction_id,
             &dir.branch,
             &path.to_string_lossy(),
-            add.created_branch,
-            add.created_checkout,
+            owns_branch,
+            owns_checkout,
         )
         .await?;
         Ok::<entities::worktree::Model, anyhow::Error>(rec)
@@ -304,12 +331,13 @@ pub async fn materialize_direction(
     match finish {
         Ok(rec) => Ok(vec![rec]),
         Err(err) => {
-            // Remove the checkout we created (if any); delete the branch ONLY if we
-            // created it — a pre-existing branch reused by the fallback must survive.
-            if add.created_checkout {
+            // Remove the checkout we own (created OR adopted as a crash orphan); delete the
+            // branch ONLY if we own it — a pre-existing branch reused by the fallback must
+            // survive. Using the adopted flags so a failed adoption cleans up its own orphan.
+            if owns_checkout {
                 let _ = git::remove_worktree(repo_path, &path);
             }
-            if add.created_branch {
+            if owns_branch {
                 let _ = git::delete_branch(repo_path, &dir.branch);
             }
             Err(err)
@@ -1444,6 +1472,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// R39-3: the idempotent fast-path's explicit-base ancestry check must resolve the base
+    /// through `branch_descends_from_base` (LOCAL `<base>` OR `origin/<base>`), not a BARE
+    /// LOCAL `<base>`. In a SINGLE-BRANCH clone the explicit base `develop` exists ONLY as
+    /// `origin/develop` (no local), so the bare-local `ref_resolves(repo, "develop")` is false
+    /// and the old check is SKIPPED — a registered work branch reset onto a `main` commit
+    /// (not descending from develop) would slip through as idempotent Ok. With the fix it must
+    /// fall through to recreate and bail. A develop(origin)-based work branch still returns Ok.
+    #[tokio::test]
+    async fn materialize_idempotent_rejects_registered_branch_reset_off_other_base_single_branch_clone() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-idem-sbc-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // origin: main + develop one commit AHEAD (so main does NOT descend from develop).
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let og = |a: &[&str]| { Cmd::new("git").args(a).current_dir(&origin).status().unwrap(); };
+        og(&["init", "-q"]); og(&["config", "user.email", "t@t.t"]); og(&["config", "user.name", "t"]);
+        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
+        og(&["add", "-A"]); og(&["commit", "-q", "-m", "init"]);
+        let main = crate::git::current_branch(&origin).unwrap();
+        og(&["checkout", "-q", "-b", "develop"]);
+        og(&["commit", "-q", "--allow-empty", "-m", "develop work"]);
+        og(&["checkout", "-q", &main]);
+
+        // SINGLE-BRANCH clone of main only → no local develop, origin/develop unfetched.
+        let clone = root.join("clone");
+        Cmd::new("git").args([
+            "clone", "-q", "--single-branch", "--branch", &main,
+            &origin.to_string_lossy(), &clone.to_string_lossy(),
+        ]).current_dir(&root).status().unwrap();
+        assert!(!crate::git::ref_resolves(&clone, "develop"), "precondition: no local develop");
+        assert!(!crate::git::ref_resolves(&clone, "origin/develop"), "precondition: origin/develop not fetched yet");
+
+        let g = |args: &[&str]| { Cmd::new("git").args(args).current_dir(&clone).status().unwrap(); };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&clone).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // ---- Case A: registered work branch reset off main (not descending from develop) → Err. ----
+        let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "develop")
+            .await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
+        let branch_a = wts_a[0].branch.clone();
+        // The materialize fetched origin/develop and branched off it; develop exists ONLY as origin/develop.
+        assert!(crate::git::ref_resolves(&clone, "origin/develop"), "origin/develop fetched by materialize");
+        assert!(!crate::git::ref_resolves(&clone, "develop"), "still no LOCAL develop (the bare-local check would skip)");
+        assert!(crate::git::branch_descends_from(&clone, &branch_a, "origin/develop"),
+            "precondition: work branch forked off origin/develop");
+        let main_sha = sha(&main);
+        // Reset the still-registered work branch onto a main commit (NOT descending from develop),
+        // from within its worktree (git refuses to force-update a branch checked out elsewhere).
+        Cmd::new("git").args(["reset", "--hard", &main_sha]).current_dir(&wt_a).status().unwrap();
+        assert_eq!(sha(&branch_a), main_sha, "precondition: work branch reset to main");
+        assert!(crate::git::is_registered_worktree(&clone, &wt_a, &branch_a),
+            "precondition: worktree still registered on the work branch");
+        assert!(!crate::git::branch_descends_from(&clone, &branch_a, "origin/develop"),
+            "precondition: reset branch no longer descends from origin/develop");
+        // Re-materialize: must NOT idempotently return the registered-but-mismatched worktree.
+        assert!(
+            materialize_direction(&db, dir_a.id).await.is_err(),
+            "single-branch clone: a registered work branch reset off main (origin-only develop base) must not slip through idempotently"
+        );
+
+        // ---- Case B: registered work branch still descends from origin/develop → idempotent Ok. ----
+        // Drop the reset Case-A worktree so a fresh develop-based lane can materialize.
+        let _ = crate::git::remove_worktree(&clone, &wt_a);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-D", &branch_a]);
+        let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "develop")
+            .await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
+        let branch_b = wts_b[0].branch.clone();
+        assert!(crate::git::branch_descends_from(&clone, &branch_b, "origin/develop"),
+            "precondition: work branch descends from origin/develop");
+        assert!(
+            materialize_direction(&db, dir_b.id).await.is_ok(),
+            "single-branch clone: a registered work branch still descending from origin/develop returns idempotently"
+        );
+        assert!(wt_b.exists(), "the still-valid worktree survives the idempotent reuse");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn rollback_direction_preserves_preexisting_branch() {
         use crate::store::repo;
@@ -1619,6 +1751,151 @@ mod tests {
             updated.base_ref, live_default,
             "R17-5: repo base_ref must be updated to the live remote default (was stale)"
         );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R39-2: when an upgraded repo's `base_ref` ALREADY EQUALS the live default but
+    /// `base_ref_is_default` is still false, materialize must still backfill the marker. The
+    /// old `live != base_ref` guard skipped set_repo_base_ref (which also sets the marker), so
+    /// the verified default stayed marked legacy — and a later OFFLINE materialize (where
+    /// recorded_base_or_default only trusts a base_ref with is_default=true) would treat it as
+    /// legacy and fall through to main/master. After a blank-base materialize the row's
+    /// base_ref_is_default must be true.
+    #[tokio::test]
+    async fn materialize_backfills_default_marker_when_base_ref_already_equals_live_default() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-r39-2-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // origin with a commit so `git ls-remote --symref` returns a HEAD.
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let g = |a: &[&str]| { Cmd::new("git").args(a).current_dir(&origin).status().unwrap(); };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t.t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "init"]);
+        let live_default = crate::git::current_branch(&origin).unwrap();
+
+        // Clone so the clone has an `origin` remote that live_default_branch can query.
+        let clone = root.join("clone");
+        Cmd::new("git")
+            .args(["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // base_ref ALREADY EQUALS the live default, but base_ref_is_default=false (the
+        // upgraded/legacy row whose marker was never set).
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &live_default, "", false)
+            .await.unwrap();
+        assert_eq!(r.base_ref, live_default, "precondition: base_ref equals the live default");
+        assert!(!r.base_ref_is_default, "precondition: marker not yet set");
+
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // Blank base → materialize calls live_default_branch (returns live_default == base_ref).
+        let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "")
+            .await.unwrap();
+
+        materialize_direction(&db, dir.id).await.unwrap();
+
+        // The marker must now be backfilled to true even though base_ref didn't change.
+        let updated = repo::get_repo(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(updated.base_ref, live_default, "base_ref unchanged (already correct)");
+        assert!(
+            updated.base_ref_is_default,
+            "R39-2: the default marker must be backfilled when base_ref already equals the live default"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R39-1: if weft crashes AFTER `git worktree add -b` but BEFORE record_worktree, the
+    /// retry's add_worktree_synced takes the path-exists fast-path and reports
+    /// created_branch=false/created_checkout=false — so the crash-orphan checkout+branch
+    /// would be recorded as USER-owned and reclaim/cascade would refuse to clean them
+    /// (zero-accumulation never reaches zero). Because lane worktrees ALWAYS live under the
+    /// managed, weft-reserved root, a registered checkout at our `path` with no DB row (we're
+    /// in the create path) is OUR orphan and must be adopted as weft-created: the new row's
+    /// created_branch AND created_checkout must both be true.
+    #[tokio::test]
+    async fn materialize_adopts_crash_orphan_worktree_as_weft_created() {
+        use crate::store::repo;
+        use sea_orm::EntityTrait;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-r39-1-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // ① Materialize: weft creates the worktree (branch + checkout) under the managed root
+        // and records the row owning both.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts.len(), 1);
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        assert!(wt_path.exists(), "precondition: on-disk worktree created");
+        assert!(wt_path.starts_with(worktree_root(&repo_path)), "precondition: under the managed root");
+        assert!(wts[0].created_branch && wts[0].created_checkout, "precondition: weft owns both initially");
+
+        // ② Simulate the crash: DELETE only the DB worktree row, leaving the on-disk worktree
+        // + git registration in place (as if weft died between `worktree add` and record).
+        entities::worktree::Entity::delete_by_id(wts[0].id).exec(&db.0).await.unwrap();
+        assert!(repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_none(),
+            "precondition: DB row gone (crash orphan), checkout still registered");
+        assert!(crate::git::is_registered_worktree(&repo_path, &wt_path, &wts[0].branch),
+            "precondition: the on-disk checkout is still a registered worktree of this repo");
+
+        // ③ Re-materialize the SAME direction: the create path runs (no row), add_worktree_synced
+        // hits the path-exists fast-path (ownership=false). The orphan must be ADOPTED so the new
+        // row owns BOTH — else reclaim/cascade would refuse to clean weft's own leftover.
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+        assert!(
+            wts2[0].created_branch,
+            "R39-1: a crash-orphan checkout under the managed root must be adopted with created_branch=true"
+        );
+        assert!(
+            wts2[0].created_checkout,
+            "R39-1: a crash-orphan checkout under the managed root must be adopted with created_checkout=true"
+        );
+        // And it persisted on the row.
+        let row = repo::worktree_for(&db, dir.id, r.id).await.unwrap().unwrap();
+        assert!(row.created_branch && row.created_checkout, "adopted ownership persisted on the row");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = cleanup_worktrees(&db, &removed).await;

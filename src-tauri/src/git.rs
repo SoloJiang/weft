@@ -370,6 +370,36 @@ pub fn branch_descends_from(repo: &Path, branch: &str, base: &str) -> bool {
     git(repo, &["merge-base", "--is-ancestor", base, branch]).is_ok()
 }
 
+/// Does `branch` descend from the explicit base NAME, resolved to whichever ref actually
+/// exists — preferring a LOCAL `<base>` then the remote-tracking `origin/<base>` (the same
+/// forms the create path may have branched from). Checks BOTH forms: returns Some(true) if
+/// the branch descends from EITHER, Some(false) if the base resolves in some form but the
+/// branch descends from NONE, and None if neither form resolves (base gone → caller skips).
+/// This avoids two failure modes of a bare-local check: a single-branch clone with no local
+/// `<base>` (only `origin/<base>`) would skip the check entirely, and a diverged local
+/// `<base>` would wrongly reject a checkout actually based on `origin/<base>`.
+pub fn branch_descends_from_base(repo: &Path, branch: &str, base: &str) -> Option<bool> {
+    let t = normalize_target(base);
+    if t.is_empty() || t == "HEAD" {
+        return None;
+    }
+    let remote = format!("origin/{t}");
+    let mut resolved_any = false;
+    for form in [t.as_str(), remote.as_str()] {
+        if ref_resolves(repo, form) {
+            resolved_any = true;
+            if branch_descends_from(repo, branch, form) {
+                return Some(true);
+            }
+        }
+    }
+    if resolved_any {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
 /// branches the new worktree off the FRESH `origin/<base_name>` when possible (see
 /// `WorktreeAdd` for what it reports). `require_resolvable` = the base was an explicit
@@ -1999,6 +2029,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt_a);
         let _ = std::fs::remove_dir_all(&wt_b);
+    }
+
+    #[test]
+    fn branch_descends_from_base_checks_local_and_origin_forms() {
+        // origin: main + develop one commit AHEAD of main.
+        let origin = tmp("bdfb-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "develop work"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        // (1) LOCAL-only base: a develop-based branch → Some(true); a main-based → Some(false).
+        let local = tmp("bdfb-local");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &local.to_string_lossy()]).unwrap();
+        git(&local, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&local, &["config", "user.name", "t"]).unwrap();
+        // A local `develop` and NO remote-tracking origin/develop (drop it).
+        git(&local, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
+        git(&local, &["checkout", "-q", &main]).unwrap();
+        let _ = git(&local, &["update-ref", "-d", "refs/remotes/origin/develop"]);
+        assert!(ref_resolves(&local, "develop"), "precondition: local develop");
+        assert!(!ref_resolves(&local, "origin/develop"), "precondition: no origin/develop");
+        git(&local, &["branch", "feat/on-develop", "develop"]).unwrap();
+        git(&local, &["branch", "feat/on-main", &main]).unwrap();
+        assert_eq!(
+            branch_descends_from_base(&local, "feat/on-develop", "develop"),
+            Some(true),
+            "local-only base: a develop-based branch descends"
+        );
+        assert_eq!(
+            branch_descends_from_base(&local, "feat/on-main", "develop"),
+            Some(false),
+            "local-only base: a main-based branch does NOT descend"
+        );
+
+        // (2) ORIGIN-only base (single-branch clone — no local develop, keep origin/develop):
+        // a develop-based branch → Some(true), a main-based branch → Some(false).
+        let oc = tmp("bdfb-origin-only");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &oc.to_string_lossy()]).unwrap();
+        git(&oc, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&oc, &["config", "user.name", "t"]).unwrap();
+        assert!(ref_resolves(&oc, "origin/develop"), "precondition: origin/develop present");
+        assert!(!ref_resolves(&oc, "develop"), "precondition: NO local develop");
+        git(&oc, &["branch", "feat/on-develop", "origin/develop"]).unwrap();
+        git(&oc, &["branch", "feat/on-main", &main]).unwrap();
+        assert_eq!(
+            branch_descends_from_base(&oc, "feat/on-develop", "develop"),
+            Some(true),
+            "origin-only base: a develop(origin)-based branch descends"
+        );
+        assert_eq!(
+            branch_descends_from_base(&oc, "feat/on-main", "develop"),
+            Some(false),
+            "origin-only base: a main-based branch does NOT descend (the bare-local check would skip)"
+        );
+
+        // (3) DIVERGED local vs origin: a branch based on origin/develop while local develop
+        // diverged off an OLDER point → must still be Some(true) (checks BOTH forms).
+        let dv = tmp("bdfb-diverged");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &dv.to_string_lossy()]).unwrap();
+        git(&dv, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&dv, &["config", "user.name", "t"]).unwrap();
+        // Local develop diverges from origin/develop (a different commit on develop's name).
+        git(&dv, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
+        git(&dv, &["commit", "-q", "--allow-empty", "-m", "local-diverge"]).unwrap();
+        git(&dv, &["checkout", "-q", &main]).unwrap();
+        // A branch forked off the fresh origin/develop (NOT the diverged local develop).
+        git(&dv, &["branch", "feat/on-origin-develop", "origin/develop"]).unwrap();
+        assert!(
+            !branch_descends_from(&dv, "feat/on-origin-develop", "develop"),
+            "precondition: it does NOT descend from the diverged LOCAL develop"
+        );
+        assert_eq!(
+            branch_descends_from_base(&dv, "feat/on-origin-develop", "develop"),
+            Some(true),
+            "diverged local: a branch off origin/develop descends via the origin form, not rejected"
+        );
+
+        // (4) Base GONE in BOTH forms → None (caller skips the check).
+        assert_eq!(
+            branch_descends_from_base(&local, "feat/on-develop", "no-such-base-xyz"),
+            None,
+            "a base that resolves in neither form returns None"
+        );
+        // HEAD / empty base → None.
+        assert_eq!(branch_descends_from_base(&local, "feat/on-develop", "HEAD"), None);
+        assert_eq!(branch_descends_from_base(&local, "feat/on-develop", ""), None);
+
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&local);
+        let _ = std::fs::remove_dir_all(&oc);
+        let _ = std::fs::remove_dir_all(&dv);
     }
 
 }
