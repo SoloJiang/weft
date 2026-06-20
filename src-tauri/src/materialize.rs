@@ -184,6 +184,15 @@ pub async fn materialize_direction(
     } else {
         add.branched_from.clone()
     };
+    // A bare "HEAD" is the detached / no-default fallback, not a usable stored base or
+    // target: pinning it makes the "vs target" diff resolve to the worktree's OWN HEAD
+    // (an empty self-diff) and makes reconcile compare against a moving ref. Store it as
+    // EMPTY so base/target/diff all fall back to their default resolution instead.
+    let recorded_base = if recorded_base == "HEAD" {
+        String::new()
+    } else {
+        recorded_base
+    };
     let finish = async {
         if !explicit {
             // Record the ACTUAL branched-off ref as the immutable branch-off base, so
@@ -637,6 +646,55 @@ mod tests {
     /// R15-2: materialize_direction must recreate the on-disk worktree when the
     /// row exists but the directory was reclaimed (remove_direction_worktree path).
     /// After re-materialization the directory must exist again.
+    #[tokio::test]
+    async fn materialize_detached_head_stores_empty_base_and_target_not_head() {
+        use crate::store::repo;
+        use sea_orm::EntityTrait;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-head-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        // Detach HEAD and delete the only branch → no main/master/any named branch, so
+        // the blank-base resolution falls all the way back to HEAD.
+        g(&["checkout", "-q", "--detach"]);
+        g(&["branch", "-D", &main]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), "main", "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // BLANK base → falls back to HEAD during materialize.
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts.len(), 1, "materialize must still create the worktree");
+
+        // recorded_base would be "HEAD" — it must be normalized to EMPTY for BOTH the
+        // stored base and the diff target (else the "vs target" diff is a self-diff).
+        let d2 = entities::direction::Entity::find_by_id(dir.id)
+            .one(&db.0).await.unwrap().unwrap();
+        assert_eq!(d2.base_branch, "", "HEAD fallback must store empty base, not 'HEAD'");
+        assert_eq!(d2.target_branch, "", "HEAD fallback must store empty target, not 'HEAD'");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn materialize_recreate_requires_explicit_base_only_when_work_branch_gone() {
         use crate::store::repo;
