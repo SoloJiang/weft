@@ -225,7 +225,8 @@ fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
     if needs_backfill && try_claim_backfill(workspace_id) {
         let db = db.clone();
         tauri::async_runtime::spawn(async move {
-            analyze_workspace_coalesced(&db, workspace_id).await;
+            // Auto pass (fires on graph reads) → not forced: leave failed repos be.
+            analyze_workspace_coalesced(&db, workspace_id, false).await;
         });
     }
 }
@@ -863,21 +864,16 @@ fn run_error(id: i32) -> Option<String> {
     run_lock().get(&id).and_then(|r| r.error.clone())
 }
 
-/// Clear the `failed` run-state for every repo in a workspace, so an EXPLICIT
-/// user re-run ("Analyze deps") isn't suppressed by the background anti-storm
-/// skip that ignores `failed` repos. Returns to idle → eligible for re-analysis.
-pub async fn clear_failed_states(db: &Db, workspace_id: i32) {
-    let Ok(repos) = repo::list_repos(db, workspace_id).await else {
-        return;
-    };
-    for r in repos {
-        // Only clear a failure we can ACTUALLY retry: `analyze_workspace` filters
-        // out missing checkouts before `profile_repo_agent`, so clearing a
-        // gone-checkout repo here would drop it to idle with no error (its cwd-guard
-        // never re-marks it). Keep that failed state; an existing checkout re-runs.
-        if run_phase(r.id) == "failed" && Path::new(&r.local_git_path).exists() {
-            run_finish_ok(r.id);
-        }
+/// Forget a repo's FAILED run-state — e.g. after re-adding a live checkout for a
+/// repo that failed because its old checkout was gone, so the next pass classifies
+/// the fresh checkout instead of the anti-storm skip suppressing it. No-op unless
+/// the repo is `failed`, so an in-flight `running` run is never disturbed. (A
+/// user-initiated "Analyze deps" retries failures via the pass's `force` flag, not
+/// by clearing state up front — clearing-then-hoping-the-pass-runs-it was fragile.)
+pub fn clear_failure(repo_id: i32) {
+    let mut g = run_lock();
+    if matches!(g.get(&repo_id), Some(r) if r.phase == "failed") {
+        g.remove(&repo_id);
     }
 }
 
@@ -1126,7 +1122,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 ///      emitting a graph refresh after each so nodes light up progressively;
 ///   2. a cross-repo pass (only with ≥2 repos) infers the relations between them.
 /// Any single failure leaves that repo's prior state intact.
-pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
+pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Result<()> {
     let repos = repo::list_repos(db, workspace_id).await?;
     // Only analyze repos whose checkout still exists on disk.
     let existing: Vec<repo_ref::Model> = repos
@@ -1142,14 +1138,11 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
     // HEAD) — re-running the minutes-long agent for every unchanged checkout when
     // a single repo is added would stall a large workspace for a long time.
     for r in &existing {
-        // A FAILED repo is not auto-retried: this auto-pass runs on every graph()
-        // read, so retrying here would storm a persistently-failing repo. It keeps
-        // its visible `failed` state until the user hits 重新分析 (reprofile_repo,
-        // which clears the failed entry and forces a fresh run).
-        if run_phase(r.id) == "failed" {
-            continue;
-        }
-        if !needs_classification(db, r).await {
+        let failed = run_phase(r.id) == "failed";
+        // Don't probe HEAD for a failed repo — its retry is gated on `force`, not on
+        // whether it changed (see should_analyze).
+        let needs = !failed && needs_classification(db, r).await;
+        if !should_analyze(failed, force, needs) {
             continue;
         }
         let _ = profile_repo_agent(db, r).await;
@@ -1158,6 +1151,18 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32) -> Result<()> {
 
     // Stage 2: cross-repo relations — needs at least two repos to relate.
     analyze_relations(db, workspace_id).await
+}
+
+/// Whether stage-1 should (re)classify a repo this pass. A FAILED repo is retried
+/// only on a `force`d (user-initiated) pass — never on an auto pass, which runs on
+/// every graph read (so a persistently-failing repo can't storm). A non-failed
+/// repo runs iff it `needs` (re)classification (unclassified, or HEAD moved).
+fn should_analyze(failed: bool, force: bool, needs: bool) -> bool {
+    if failed {
+        force
+    } else {
+        needs
+    }
 }
 
 /// Whether a repo needs the deep classifier on an automatic pass: a repo with no
@@ -1305,6 +1310,9 @@ pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 struct PassGate {
     lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Sticky across the drain window: a forced (user-initiated) request anywhere
+    /// while a pass is pending makes the next drained run force-retry failures.
+    force: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn pass_gate(workspace_id: i32) -> PassGate {
@@ -1316,6 +1324,7 @@ fn pass_gate(workspace_id: i32) -> PassGate {
         .or_insert_with(|| PassGate {
             lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            force: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
         .clone()
 }
@@ -1330,16 +1339,23 @@ fn pass_gate(workspace_id: i32) -> PassGate {
 /// batch add (many requests) collapses into ~one pass, while a request that lands
 /// mid-pass is still covered before any waiter is released. Spawn it
 /// fire-and-forget when you don't want to block (e.g. after adding a repo).
-pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32) {
+pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool) {
     use std::sync::atomic::Ordering;
     let gate = pass_gate(workspace_id);
     gate.dirty.store(true, Ordering::SeqCst);
+    if force {
+        gate.force.store(true, Ordering::SeqCst);
+    }
     let _g = gate.lock.lock().await;
     // Drain: run until no new request landed during the previous run. The holder
     // covers waiters' requests, so once it exits they acquire the lock, find
     // `dirty` already cleared, and return immediately — having awaited completion.
+    // A forced request anywhere in the drain window forces that run (then resets),
+    // so an explicit "Analyze deps" retries failures even if it coalesced with an
+    // auto pass.
     while gate.dirty.swap(false, Ordering::SeqCst) {
-        let _ = analyze_workspace(db, workspace_id).await;
+        let forced = gate.force.swap(false, Ordering::SeqCst);
+        let _ = analyze_workspace(db, workspace_id, forced).await;
     }
 }
 
@@ -1388,32 +1404,28 @@ mod tests {
         assert_eq!(super::run_error(101), None);
     }
 
-    #[tokio::test]
-    async fn clear_failed_states_only_clears_retryable() {
-        // An explicit "Analyze deps" clears failed repos so the background anti-storm
-        // skip doesn't suppress the retry — but ONLY those with a live checkout: a
-        // failed repo whose checkout is gone would be filtered out of the pass and
-        // silently go idle, so it keeps its failed state. A running repo is untouched.
+    #[test]
+    fn should_analyze_gates_failed_on_force() {
+        // A failed repo is retried ONLY on a forced (user) pass — never on an auto
+        // pass — regardless of whether it "needs" reclassification. A non-failed repo
+        // runs iff it needs (re)classification; force is irrelevant to it.
+        assert!(!super::should_analyze(true, false, true), "failed + auto → skip even if needs");
+        assert!(!super::should_analyze(true, false, false), "failed + auto → skip");
+        assert!(super::should_analyze(true, true, false), "failed + forced → retry even if unchanged");
+        assert!(super::should_analyze(false, false, true), "not failed + needs → run");
+        assert!(!super::should_analyze(false, true, false), "not failed + unchanged → skip even forced");
+    }
+
+    #[test]
+    fn clear_failure_only_drops_failed() {
+        // Clearing a re-added repo's stale failure must NOT disturb an in-flight run.
         super::run_state_clear_all_for_test();
-        let db = mem().await;
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        // Distinct paths (repos dedup by path). Only the to-be-cleared repo needs a
-        // live checkout; `b` is running so its path-existence is never checked.
-        let here = std::env::temp_dir().to_string_lossy().into_owned(); // an existing dir
-        let a = repo::add_repo_ref(&db, ws.id, "a", &here, "main", "").await.unwrap();
-        let gone = repo::add_repo_ref(&db, ws.id, "gone", "/nonexistent/weft/zzz", "main", "")
-            .await
-            .unwrap();
-        let b = repo::add_repo_ref(&db, ws.id, "b", "/nonexistent/weft/brun", "main", "")
-            .await
-            .unwrap();
-        super::run_finish_err(a.id, "boom".into());
-        super::run_finish_err(gone.id, "boom".into());
-        super::run_begin(b.id);
-        super::clear_failed_states(&db, ws.id).await;
-        assert_eq!(super::run_phase(a.id), "idle", "failed + live checkout → cleared, retryable");
-        assert_eq!(super::run_phase(gone.id), "failed", "failed + missing checkout → kept");
-        assert_eq!(super::run_phase(b.id), "running", "a running repo is left alone");
+        super::run_finish_err(7, "gone".into());
+        super::clear_failure(7);
+        assert_eq!(super::run_phase(7), "idle", "a failed entry is forgotten");
+        super::run_begin(8);
+        super::clear_failure(8);
+        assert_eq!(super::run_phase(8), "running", "a running run is left alone");
     }
 
     #[tokio::test]

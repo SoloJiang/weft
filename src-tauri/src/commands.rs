@@ -127,14 +127,18 @@ async fn register_repo(
     if matches!(repo::get_repo_profile(db, r.id).await, Ok(None)) {
         let _ = repo::upsert_repo_profile(db, r.id, "", "[]", "", "[]", "agent", "").await;
     }
+    // Re-adding a live checkout for a repo that previously failed (e.g. its old
+    // checkout was gone) clears that stale failure, so the auto pass below
+    // classifies the fresh checkout instead of the anti-storm skip suppressing it.
+    crate::curator::clear_failure(r.id);
     // Fire-and-forget the agent curator over the whole workspace so the new repo
     // gets a deep per-repo classification and cross-repo relations refresh.
     // Read-only, coalesced (a batch add runs one pass), and best-effort — it
-    // never blocks the add.
+    // never blocks the add. Not forced: an add shouldn't retry OTHER repos' failures.
     let db_bg = db.clone();
     let ws = r.workspace_id;
     tauri::async_runtime::spawn(async move {
-        crate::curator::analyze_workspace_coalesced(&db_bg, ws).await;
+        crate::curator::analyze_workspace_coalesced(&db_bg, ws, false).await;
     });
     Ok(r)
 }
@@ -239,11 +243,12 @@ pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
 /// caller can refresh the graph; coalesced with any in-flight pass.
 #[tauri::command]
 pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
-    // This is an EXPLICIT user re-run, so retry repos whose last classify failed:
-    // clear their failed state first, otherwise `analyze_workspace`'s background
-    // anti-storm skip would ignore them and only refresh relations.
-    crate::curator::clear_failed_states(&db, workspace_id).await;
-    crate::curator::analyze_workspace_coalesced(&db, workspace_id).await;
+    // An EXPLICIT user re-run: `force` so repos whose last classify failed are
+    // retried even if unchanged (the auto anti-storm skip otherwise ignores them).
+    // A failed repo whose checkout is gone is still filtered out by the pass and
+    // keeps its failed state — we no longer clear failures up front (that dropped
+    // such repos to a silent idle).
+    crate::curator::analyze_workspace_coalesced(&db, workspace_id, true).await;
     Ok(())
 }
 
