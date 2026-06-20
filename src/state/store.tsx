@@ -1851,14 +1851,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Flush any in-flight base-branch save for this thread FIRST: a blur-save still
       // writing the proposal can otherwise land AFTER deny_direction and restore the
       // lane's decision:"" — making the denied write reappear as pending. Mirrors the
-      // flush in confirmProposal/approveWriteTrigger. (A rejected save persisted
-      // nothing, so there is nothing to clobber — no abort needed here.)
+      // flush in confirmProposal/approveWriteTrigger.
       const pending = pendingBaseSave.current.get(item.thread_id) ?? Promise.resolve();
       pendingBaseSave.current.delete(item.thread_id);
       try {
         await pending;
       } catch {
-        // a rejected save wrote nothing
+        // handled by the latch check below
+      }
+      // If that save REJECTED, a re-proposal may have moved/replaced the lanes (the
+      // server-side base setter rejects when item.index's lane was replaced), so
+      // item.index is no longer trustworthy — denying by it could deny the WRONG lane.
+      // Abort and refresh to the real state instead of denying a stale index.
+      if ((baseSaveFailed.current.get(item.thread_id)?.size ?? 0) > 0) {
+        baseSaveFailed.current.delete(item.thread_id);
+        await refreshNeeds();
+        return;
       }
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
