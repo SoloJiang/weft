@@ -142,6 +142,7 @@ pub fn run() {
         .manage(asks)
         .manage(BusBase(bus_base))
         .manage(im::ImBridge::default())
+        .manage(im::feishu::registration::RegistrationService::default())
         .manage(backup_svc.clone())
         .on_window_event({
             let svc = backup_svc.clone();
@@ -269,6 +270,9 @@ pub fn run() {
             commands::im_set_enabled,
             commands::im_set_remote_standby,
             commands::im_status,
+            commands::feishu_scan_begin,
+            commands::feishu_scan_status,
+            commands::feishu_scan_cancel,
             commands::im_bind_thread,
             commands::im_unbind_thread,
             commands::im_route_for_thread,
