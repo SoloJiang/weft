@@ -10,6 +10,7 @@ import {
   Database,
   ExternalLink,
   FolderOpen,
+  KeyRound,
   MessageSquare,
   Monitor,
   Moon,
@@ -736,6 +737,8 @@ function ImSettings() {
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
+  // 两种接入模式:扫码创建新 PersonalAgent,或手填凭证绑定已有应用/机器人。
+  const [mode, setMode] = useState<"scan" | "manual">("scan");
   // The toggles default to `false`. Without this flag we'd render the
   // off-state for one tick before `api.imGetSettings()` resolves, producing
   // a visible "off → on" flash for users whose IM was already enabled.
@@ -881,23 +884,50 @@ function ImSettings() {
 
         {enabled && (
           <div className="flex flex-col gap-4 border-t border-border px-4 py-4">
-            <Button variant="primary" onClick={() => setScanOpen(true)} className="self-start">
-              <QrCode size={14} />
-              {t("settings.imScanConnect")}
-            </Button>
-            <details className="flex flex-col">
-              <summary className="cursor-pointer select-none text-[12px] text-ink-faint hover:text-ink-muted">
-                {t("settings.imAdvancedManual")}
-              </summary>
-              <div className="mt-4 flex flex-col gap-4">
+            <div className="flex gap-1 rounded-[var(--radius-md)] bg-bg p-1">
+              {(["scan", "manual"] as const).map((m) => (
                 <button
+                  key={m}
                   type="button"
-                  onClick={() => void api.openUrl("https://open.feishu.cn/app")}
-                  className="inline-flex items-center gap-1 self-start text-[12px] font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+                  onClick={() => setMode(m)}
+                  className={cn(
+                    "flex flex-1 items-center justify-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1.5 text-[12px] font-medium transition-colors",
+                    mode === m
+                      ? "bg-surface text-ink shadow-sm"
+                      : "text-ink-faint hover:text-ink-muted",
+                  )}
                 >
-                  {t("settings.imOpenPlatform")}
-                  <ExternalLink size={12} />
+                  {m === "scan" ? <QrCode size={13} /> : <KeyRound size={13} />}
+                  {m === "scan" ? t("settings.imModeScan") : t("settings.imModeManual")}
                 </button>
+              ))}
+            </div>
+
+            {mode === "scan" ? (
+              <div className="flex flex-col gap-3">
+                <p className="text-[12px] leading-relaxed text-ink-faint">
+                  {t("settings.imScanModeHint")}
+                </p>
+                <Button variant="primary" onClick={() => setScanOpen(true)} className="self-start">
+                  <QrCode size={14} />
+                  {t("settings.imScanConnect")}
+                </Button>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[12px] leading-relaxed text-ink-faint">
+                    {t("settings.imManualModeHint")}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void api.openUrl("https://open.feishu.cn/app")}
+                    className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+                  >
+                    {t("settings.imOpenPlatform")}
+                    <ExternalLink size={12} />
+                  </button>
+                </div>
                 <ImField label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
                   <Input
                     value={appId}
@@ -941,7 +971,7 @@ function ImSettings() {
                   </Button>
                 </div>
               </div>
-            </details>
+            )}
             <FeishuScanDialog
               open={scanOpen}
               onOpenChange={setScanOpen}

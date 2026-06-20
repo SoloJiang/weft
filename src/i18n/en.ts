@@ -630,7 +630,11 @@ export const en = {
     imScanError: "Connection failed — please try again.",
     imScanLarkUnsupported: "Please use a mainland Feishu account (Lark international not yet supported).",
     imScanRetry: "Scan again",
-    imAdvancedManual: "Advanced / manual setup",
+    imModeScan: "Scan to create",
+    imModeManual: "Bind existing",
+    imScanModeHint:
+      "Scan with Feishu on your phone to create a new PersonalAgent bot — no developer console needed.",
+    imManualModeHint: "Already have a Feishu app? Enter its App ID / App Secret to bind it.",
     imAppId: "App ID",
     imAppIdHint:
       "Create a self-built app on Feishu Open Platform; subscribe im.message.receive_v1 over long connection.",
