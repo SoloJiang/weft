@@ -25,6 +25,8 @@ Use TypeScript for frontend code and Rust 2021 for backend code. Keep modules fo
 
 Rust production paths deny `unwrap`, `expect`, and `panic`; return `Result` and surface errors clearly. Avoid adding embedded terminal/TUI dependencies; Weft renders its own chat UI and uses terminal takeover only as an escape hatch.
 
+Never nest ternary expressions — a `?:` inside another `?:`'s branch is banned in both TypeScript and Rust. A single, non-nested ternary is fine; for three or more branches use early returns, `if` / `else if`, a lookup map, or `match` (Rust). For multi-way JSX rendering, extract a small helper function or sub-component that returns the right element via `if`/`else` rather than chaining `cond1 ? a : cond2 ? b : c`.
+
 ## Testing Guidelines
 
 Backend logic is covered with Rust unit tests next to modules and integration tests under `src-tauri/tests/`. Add tests for store migrations, worktree behavior, chat protocol parsing, planner scope, bus behavior, and verification logic when those areas change. Frontend changes should at minimum pass `npm run build`.

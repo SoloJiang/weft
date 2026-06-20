@@ -476,31 +476,42 @@ function RepoNode({
   // A failed classification is `!analyzed` too, but must read as a retryable
   // failure on the canvas — not a permanent "analyzing" spinner.
   const failed = p.analysis_state === "failed";
+
+  // Derive the multi-way states up front via if/else (CLAUDE.md bans nested
+  // ternaries). Precedence: failed → analyzed → analyzing.
+  let frameBase = "border-border hover:border-border-strong";
+  if (selected) frameBase = "border-brand/60 bg-brand-ghost/60";
+  else if (core) frameBase = "border-accent/50";
+
+  let statusIcon = <Loader2 size={12} className="animate-spin text-ink-faint" />;
+  if (failed) statusIcon = <TriangleAlert size={12} className="text-danger" />;
+  else if (p.analyzed)
+    statusIcon = <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />;
+
+  let statusBody = <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>;
+  if (failed)
+    statusBody = <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>;
+  else if (p.analyzed)
+    statusBody = (
+      <>
+        <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
+        <NodeSummary profile={p} />
+      </>
+    );
+
   return (
     <div
       data-repo-node
       onClick={onSelect}
       className={cn(
         "group absolute flex flex-col gap-2 overflow-hidden rounded-[var(--radius-md)] border bg-surface px-3 py-2.5 text-left transition-[transform,border-color,background-color] hover:-translate-y-px",
-        selected
-          ? "border-brand/60 bg-brand-ghost/60"
-          : core
-            ? "border-accent/50"
-            : "border-border hover:border-border-strong",
+        frameBase,
         failed ? "border-danger/40" : !p.analyzed && "border-dashed opacity-80",
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
     >
       <div className="flex items-center gap-1.5">
-        <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
-          {failed ? (
-            <TriangleAlert size={12} className="text-danger" />
-          ) : p.analyzed ? (
-            <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
-          ) : (
-            <Loader2 size={12} className="animate-spin text-ink-faint" />
-          )}
-        </span>
+        <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">{statusIcon}</span>
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
@@ -522,16 +533,7 @@ function RepoNode({
         </button>
       </div>
 
-      {failed ? (
-        <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>
-      ) : p.analyzed ? (
-        <>
-          <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
-          <NodeSummary profile={p} />
-        </>
-      ) : (
-        <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>
-      )}
+      {statusBody}
     </div>
   );
 }
@@ -555,17 +557,17 @@ function ExpandedNode({
   // A failed reprofile keeps the prior monorepo components (still useful), but the
   // header must flag the retryable failure — same precedence as the collapsed card.
   const failed = p.analysis_state === "failed";
+  // if/else, not a nested ternary (CLAUDE.md): selected wins, then failed.
+  let frame = "border-border hover:border-border-strong";
+  if (selected) frame = "border-brand/60 bg-brand-ghost/40";
+  else if (failed) frame = "border-danger/40";
   return (
     <div
       data-repo-node
       onClick={onSelect}
       className={cn(
         "group absolute flex flex-col overflow-hidden rounded-[var(--radius-md)] border bg-surface text-left",
-        selected
-          ? "border-brand/60 bg-brand-ghost/40"
-          : failed
-            ? "border-danger/40"
-            : "border-border hover:border-border-strong",
+        frame,
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
     >
@@ -764,6 +766,58 @@ function AnalysisIdle({ onAnalyze }: { onAnalyze: () => void }) {
   );
 }
 
+/** The classified-repo fields, shown once analysis is done and not re-running. */
+function AnalyzedProfileFields({
+  profile,
+  deps,
+  usedBy,
+  onSelect,
+}: {
+  profile: RepoProfile;
+  deps: { edge: RepoEdge; repo: RepoProfile }[];
+  usedBy: { edge: RepoEdge; repo: RepoProfile }[];
+  onSelect: (id: number) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="h-full overflow-auto px-4 py-4">
+      <ProfileSection title={t("repomap.oneLine")}>
+        <NodeSummary profile={profile} />
+      </ProfileSection>
+
+      <ProfileSection title={t("repomap.tier")}>
+        <TierPicker profile={profile} />
+      </ProfileSection>
+
+      <ProfileSection title={t("repomap.stack")}>
+        <ChipList values={profile.stack} empty={t("repomap.none")} mono />
+      </ProfileSection>
+
+      {profile.components.length > 0 && (
+        <ProfileSection title={t("repomap.components")}>
+          <ComponentList components={profile.components} />
+        </ProfileSection>
+      )}
+
+      <ProfileSection title={t("repomap.dependsOn")}>
+        <RepoLinks items={deps} empty={t("repomap.noDeps")} onSelect={onSelect} />
+      </ProfileSection>
+
+      <ProfileSection title={t("repomap.usedBy")}>
+        <RepoLinks items={usedBy} empty={t("repomap.noUsedBy")} onSelect={onSelect} reverse />
+      </ProfileSection>
+
+      {profile.profiled_commit && (
+        <div className="mt-4 flex items-center gap-1.5 text-[11px] text-ink-faint">
+          <GitBranch size={12} />
+          <span>{t("repomap.profiledAt")}</span>
+          <span className="font-mono">{profile.profiled_commit.slice(0, 8)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RepoProfilePane({
   profile,
   profiles,
@@ -794,6 +848,18 @@ function RepoProfilePane({
     .map((e) => ({ edge: e, repo: profiles.find((p) => p.repo_id === e.from) }))
     .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
   const Icon = TIER_ICON[bandOf(profile.tier)] ?? CircleDashed;
+  const retry = () => void reprofileRepo(profile.repo_id);
+
+  // Body by state — if/else, not nested ternaries (CLAUDE.md). Precedence: a
+  // running (re-)analysis shows the live process even over a classified repo;
+  // then a failed run; then the classified fields; then the idle affordance.
+  let paneBody = <AnalysisIdle onAnalyze={retry} />;
+  if (stream.phase === "running") paneBody = <AnalyzingTranscript text={stream.transcript} />;
+  else if (stream.phase === "failed") paneBody = <AnalysisFailed error={stream.error} onRetry={retry} />;
+  else if (profile.analyzed)
+    paneBody = (
+      <AnalyzedProfileFields profile={profile} deps={deps} usedBy={usedBy} onSelect={onSelect} />
+    );
 
   return (
     <aside className="flex w-[320px] shrink-0 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
@@ -833,54 +899,7 @@ function RepoProfilePane({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-hidden">
-        {/* Render precedence: a running (re-)analysis shows the live process even
-            when the repo is already analyzed; then failed; then the classified
-            fields; then the rare idle-unanalyzed affordance. */}
-        {stream.phase === "running" ? (
-          <AnalyzingTranscript text={stream.transcript} />
-        ) : stream.phase === "failed" ? (
-          <AnalysisFailed error={stream.error} onRetry={() => void reprofileRepo(profile.repo_id)} />
-        ) : profile.analyzed ? (
-          <div className="h-full overflow-auto px-4 py-4">
-            <ProfileSection title={t("repomap.oneLine")}>
-              <NodeSummary profile={profile} />
-            </ProfileSection>
-
-            <ProfileSection title={t("repomap.tier")}>
-              <TierPicker profile={profile} />
-            </ProfileSection>
-
-            <ProfileSection title={t("repomap.stack")}>
-              <ChipList values={profile.stack} empty={t("repomap.none")} mono />
-            </ProfileSection>
-
-            {profile.components.length > 0 && (
-              <ProfileSection title={t("repomap.components")}>
-                <ComponentList components={profile.components} />
-              </ProfileSection>
-            )}
-
-            <ProfileSection title={t("repomap.dependsOn")}>
-              <RepoLinks items={deps} empty={t("repomap.noDeps")} onSelect={onSelect} />
-            </ProfileSection>
-
-            <ProfileSection title={t("repomap.usedBy")}>
-              <RepoLinks items={usedBy} empty={t("repomap.noUsedBy")} onSelect={onSelect} reverse />
-            </ProfileSection>
-
-            {profile.profiled_commit && (
-              <div className="mt-4 flex items-center gap-1.5 text-[11px] text-ink-faint">
-                <GitBranch size={12} />
-                <span>{t("repomap.profiledAt")}</span>
-                <span className="font-mono">{profile.profiled_commit.slice(0, 8)}</span>
-              </div>
-            )}
-          </div>
-        ) : (
-          <AnalysisIdle onAnalyze={() => void reprofileRepo(profile.repo_id)} />
-        )}
-      </div>
+      <div className="min-h-0 flex-1 overflow-hidden">{paneBody}</div>
 
       <Dialog open={confirmDelete} onOpenChange={(o) => !deleting && setConfirmDelete(o)}>
         <DialogContent title={t("repomap.deleteRepoTitle", { name: profile.repo_name })}>
