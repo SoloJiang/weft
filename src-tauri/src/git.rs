@@ -627,14 +627,32 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<(String, String)>> {
     let out = git(repo, &["worktree", "list", "--porcelain"])?;
     let mut res = Vec::new();
     let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut prunable = false;
+    // Each porcelain entry is `worktree <p>` / `HEAD <sha>` / `branch <ref>` (or
+    // `detached`) / optional `prunable <reason>`. The `prunable` line FOLLOWS `branch`, so
+    // flush an entry only at the NEXT `worktree` (or EOF) — and SKIP prunable ones: a
+    // registration left behind by an out-of-band `rm -rf` still lists here, but its path
+    // is no longer a real worktree and must not be matched/reused.
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            path = Some(p.to_string());
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            if let Some(p) = path.take() {
-                let branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
-                res.push((p, branch));
+            if let (Some(pp), Some(bb)) = (path.take(), branch.take()) {
+                if !prunable {
+                    res.push((pp, bb));
+                }
             }
+            path = Some(p.to_string());
+            branch = None;
+            prunable = false;
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            prunable = true;
+        }
+    }
+    if let (Some(pp), Some(bb)) = (path.take(), branch.take()) {
+        if !prunable {
+            res.push((pp, bb));
         }
     }
     Ok(res)
@@ -1532,6 +1550,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c2);
         let _ = std::fs::remove_dir_all(&wt1);
         let _ = std::fs::remove_dir_all(&wt2);
+    }
+
+    #[test]
+    fn list_worktrees_skips_prunable_entries() {
+        // A worktree removed out-of-band (rm -rf) leaves a PRUNABLE registration that git
+        // still lists — list_worktrees must skip it so a stale path isn't treated as a live
+        // worktree of this repo (which would let a plain dir there be reused).
+        let repo = tmp("lw-prunable");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let wt = tmp("lw-prunable-wt");
+        add_worktree_synced(&repo, "feat/p", &wt, &base, false).unwrap();
+        assert!(
+            list_worktrees(&repo).unwrap().iter().any(|(_, b)| b == "feat/p"),
+            "a live worktree is listed"
+        );
+        // Out-of-band rm -rf → the registration becomes prunable (dir gone).
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(
+            !list_worktrees(&repo).unwrap().iter().any(|(_, b)| b == "feat/p"),
+            "a prunable (rm -rf'd) worktree must not be listed"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

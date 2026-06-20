@@ -112,21 +112,21 @@ pub async fn materialize_direction(
         // arbitrary fallback ref. Mirror the normal path's base resolution.
         let explicit = !dir.base_branch.trim().is_empty();
         // A blank base paired with a stored target is the detached-HEAD fallback ONLY when
-        // that target is a bare COMMIT (the branch-off SHA) — reuse it so the recreate
-        // starts from the SAME point, not a re-resolved live default that may have moved.
-        // But on an UPGRADED direction, `base_branch==""` may instead pair with a
-        // USER-EDITED diff target that is a BRANCH NAME (pre-base_branch era); recreating
-        // off a user-edited branch name would start the task from the wrong point. So treat
-        // the stored target as a recreate base ONLY when it does NOT resolve as a branch ref
-        // AND does resolve as a commit; otherwise fall through to live/default re-resolution.
+        // that target is the branch-off COMMIT — reuse it so the recreate starts from the
+        // SAME point, not a re-resolved live default that may have moved. On an UPGRADED
+        // direction `base_branch==""` may instead pair with a USER-EDITED diff target that
+        // is a BRANCH NAME (`develop`, `origin/develop`, …); recreating off that would start
+        // the task from the wrong point. The detached fallback stores a FULL 40-char sha
+        // (head_commit_full), and a branch name is never 40 hex chars — so discriminate on
+        // that: reuse the target as the recreate base ONLY when it is a full commit sha that
+        // still resolves; otherwise fall through to live/default re-resolution.
         let t = dir.target_branch.trim();
-        let target_is_bare_commit = !t.is_empty()
-            && !git::ref_resolves(repo_path, &format!("refs/heads/{t}"))
-            && !git::ref_resolves(repo_path, &format!("refs/remotes/origin/{t}"))
+        let target_is_commit_sha = t.len() == 40
+            && t.chars().all(|c| c.is_ascii_hexdigit())
             && git::ref_resolves(repo_path, t);
         let recreate_base = if explicit {
             dir.base_branch.trim().to_string()
-        } else if target_is_bare_commit {
+        } else if target_is_commit_sha {
             t.to_string()
         } else {
             git::live_default_branch(repo_path)
