@@ -117,18 +117,28 @@ pub async fn materialize_direction(
             dir.branch
         );
     }
+    // The ref we actually branched off: use add.branched_from when available
+    // (the actual resolved ref, e.g. "origin/develop" → "develop"), otherwise
+    // fall back to the requested base (for existing-branch and path-reuse paths
+    // where no new branch was created from a known base).
+    let recorded_base = if add.branched_from.is_empty() {
+        base.clone()
+    } else {
+        add.branched_from.clone()
+    };
     let finish = async {
         if !explicit {
-            // Record the resolved default as the immutable branch-off base, so a later
-            // re-approval compares against what we actually branched off, not a
-            // re-resolved (possibly changed) default.
-            repo::set_direction_base_branch(db, direction_id, &base).await?;
+            // Record the ACTUAL branched-off ref as the immutable branch-off base, so
+            // a later re-approval compares against what we actually branched off, not a
+            // re-resolved (possibly changed) default. Use recorded_base (which may differ
+            // from the requested `base` when the fallback chain picked a different ref).
+            repo::set_direction_base_branch(db, direction_id, &recorded_base).await?;
         }
         // Keep the diff "vs target" consistent with the branch we actually based off:
-        // when the direction has no explicit target yet, pin it to the resolved base
-        // (otherwise an empty target would resolve via a possibly-stale repo base_ref).
+        // when the direction has no explicit target yet, pin it to the actual branched-from
+        // ref (otherwise an empty target would resolve via a possibly-stale repo base_ref).
         if dir.target_branch.trim().is_empty() {
-            repo::set_direction_target_branch(db, direction_id, &base).await?;
+            repo::set_direction_target_branch(db, direction_id, &recorded_base).await?;
         }
         let rec = repo::record_worktree(
             db,
@@ -136,6 +146,7 @@ pub async fn materialize_direction(
             direction_id,
             &dir.branch,
             &path.to_string_lossy(),
+            add.created_branch,
         )
         .await?;
         Ok::<entities::worktree::Model, anyhow::Error>(rec)
@@ -196,8 +207,12 @@ pub async fn rollback_direction(db: &Db, direction_id: i32) -> Result<()> {
             if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(&w.path)) {
                 eprintln!("[weft] rollback worktree remove failed for {}: {e}", w.path);
             }
-            if let Err(e) = git::delete_branch(repo_path, &w.branch) {
-                eprintln!("[weft] rollback branch delete failed for {}: {e}", w.branch);
+            // Only delete the branch if WE created it. A pre-existing branch reused
+            // by the fallback path must survive rollback (the user's own branch).
+            if w.created_branch {
+                if let Err(e) = git::delete_branch(repo_path, &w.branch) {
+                    eprintln!("[weft] rollback branch delete failed for {}: {e}", w.branch);
+                }
             }
         }
     }
@@ -463,6 +478,123 @@ mod tests {
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R13-1: a worktree row with created_branch=false must survive rollback with its
+    /// branch intact (the branch was pre-existing and must not be deleted).
+    #[tokio::test]
+    async fn rollback_direction_preserves_preexisting_branch() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-rollback-preex-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // Set up a bare git repo with an initial commit.
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+
+        // Create feat/keep as a pre-existing branch.
+        g(&["checkout", "-q", "-b", "feat/keep"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "keep"]);
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        // Switch away so we can check out feat/keep in a worktree.
+        g(&["checkout", "-q", "-"]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // Simulate: worktree dir where feat/keep would be checked out.
+        let wt_path = worktree_path(&repo_path, "feat/keep");
+        std::fs::create_dir_all(&wt_path).unwrap();
+
+        // Record a worktree row with created_branch=false (branch is pre-existing).
+        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false)
+            .await.unwrap();
+
+        // Rollback must NOT delete feat/keep.
+        rollback_direction(&db, dir.id).await.unwrap();
+
+        // The branch must still exist.
+        let branch_check = Cmd::new("git")
+            .args(["rev-parse", "--verify", "feat/keep"])
+            .current_dir(&repo_path)
+            .output().unwrap();
+        assert!(branch_check.status.success(), "pre-existing branch must survive rollback");
+
+        // The direction and its worktree rows must be gone.
+        assert!(repo::get_direction(&db, dir.id).await.unwrap().is_none(),
+            "direction row must be deleted after rollback");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R13-1 positive control: a worktree row with created_branch=true must have its
+    /// branch deleted on rollback (the normal weft-created branch case).
+    #[tokio::test]
+    async fn rollback_direction_deletes_created_branch() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-rollback-created-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        // Create feat/weft-branch using add_worktree_synced so the branch actually exists.
+        let wt_path = worktree_path(&repo_path, "feat/weft-branch");
+        let add = crate::git::add_worktree_synced(&repo_path, "feat/weft-branch", &wt_path, &main, false).unwrap();
+        assert!(add.created_branch, "precondition: branch was created");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // Record the worktree row with created_branch=true.
+        repo::record_worktree(&db, r.id, dir.id, "feat/weft-branch", &wt_path.to_string_lossy(), true)
+            .await.unwrap();
+
+        // Rollback MUST delete the branch.
+        rollback_direction(&db, dir.id).await.unwrap();
+
+        let branch_check = Cmd::new("git")
+            .args(["rev-parse", "--verify", "feat/weft-branch"])
+            .current_dir(&repo_path)
+            .output().unwrap();
+        assert!(!branch_check.status.success(), "weft-created branch must be deleted on rollback");
+
+        assert!(repo::get_direction(&db, dir.id).await.unwrap().is_none(),
+            "direction row must be deleted after rollback");
+
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

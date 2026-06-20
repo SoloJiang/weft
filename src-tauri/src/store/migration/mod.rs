@@ -35,6 +35,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0022RepoProfileRelations),
             Box::new(M0023RepoProfileComponents),
             Box::new(M0024DirectionBaseBranch),
+            Box::new(M0025WorktreeCreatedBranch),
         ]
     }
 }
@@ -948,6 +949,53 @@ impl MigrationTrait for M0024DirectionBaseBranch {
                 Table::alter()
                     .table(Alias::new("direction"))
                     .drop_column(Alias::new("base_branch"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds worktree.created_branch: whether Weft created this branch (vs. checking
+/// out a pre-existing one). Rollback deletes the branch only when true, so a
+/// pre-existing branch reused by the fallback is never deleted on rollback.
+/// Existing rows default to false (safe: rollback won't delete their branch).
+/// M0001 reflects the current entity, so a FRESH db already has it; sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0025WorktreeCreatedBranch;
+impl MigrationName for M0025WorktreeCreatedBranch {
+    fn name(&self) -> &str {
+        "m0025_worktree_created_branch"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0025WorktreeCreatedBranch {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("created_branch"))
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .drop_column(Alias::new("created_branch"))
                     .to_owned(),
             )
             .await

@@ -10,6 +10,10 @@ pub struct Model {
     pub branch: String,
     pub path: String,
     pub created_at: String,
+    /// Whether Weft created this branch (as opposed to checking out a pre-existing one).
+    /// Rollback deletes the branch only when this is true, preserving pre-existing branches.
+    #[sea_orm(default_value = false)]
+    pub created_branch: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

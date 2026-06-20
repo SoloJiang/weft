@@ -299,11 +299,15 @@ pub fn fetch_origin_branch(dir: &Path, branch: &str) -> bool {
 /// created it (a pre-existing branch reused by the fallback must survive). `synced`
 /// is true only when it branched off a freshly-fetched `origin/<base>` (false = a
 /// local/stale ref, an existing-branch checkout, or a reused path).
+/// `branched_from` is the normalized ref we actually branched off (non-empty only
+/// on the `-b` success path where we created a new branch); empty for the
+/// existing-branch fallback and the path-reuse path.
 pub struct WorktreeAdd {
     pub path: PathBuf,
     pub created_checkout: bool,
     pub created_branch: bool,
     pub synced: bool,
+    pub branched_from: String,
 }
 
 /// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
@@ -342,6 +346,7 @@ pub fn add_worktree_synced(
             created_checkout: false,
             created_branch: false,
             synced: false,
+            branched_from: String::new(),
         });
     }
     let resolved = resolved_opt.unwrap_or_else(|| resolve_base_ref(repo, &t));
@@ -361,6 +366,7 @@ pub fn add_worktree_synced(
             created_checkout: true,
             created_branch: false,
             synced: false,
+            branched_from: String::new(),
         });
     }
     Ok(WorktreeAdd {
@@ -368,6 +374,7 @@ pub fn add_worktree_synced(
         created_checkout: true,
         created_branch: true,
         synced,
+        branched_from: normalize_target(&resolved),
     })
 }
 
@@ -1316,6 +1323,25 @@ mod tests {
         let add = add_worktree_synced(&repo, "feat/exists", &wt, &base, false).unwrap();
         assert!(add.created_checkout, "the fallback created a new checkout dir");
         assert!(!add.created_branch, "the branch pre-existed; we did not create it");
+        // existing-branch fallback: branched_from must be empty (no new branch created from a base)
+        assert!(add.branched_from.is_empty(), "fallback to existing branch must have empty branched_from");
+        assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_sets_branched_from_on_new_branch() {
+        // Normal create: branched_from is set to the base branch (normalized).
+        let repo = tmp("aws-branched-from");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let wt = tmp("aws-branched-from-wt");
+        let add = add_worktree_synced(&repo, "feat/new", &wt, &base, false).unwrap();
+        assert!(add.created_branch, "new branch created");
+        // branched_from must be the base name (no origin/ prefix for local-only repo).
+        assert_eq!(add.branched_from, base, "branched_from equals the base we branched off");
         assert!(wt.join(".git").exists());
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);

@@ -1266,7 +1266,7 @@ mod live_slot_tests {
             .await
             .unwrap();
         repo::set_session_native_id(db, sess.id, "nat-1").await.unwrap();
-        repo::record_worktree(db, repo_ref.id, dir.id, "feat/alpha", "/tmp/wt")
+        repo::record_worktree(db, repo_ref.id, dir.id, "feat/alpha", "/tmp/wt", false)
             .await
             .unwrap();
         (th.id, dir.id, repo_ref.id, sess.id)

@@ -799,6 +799,7 @@ pub async fn record_worktree(
     direction_id: i32,
     branch: &str,
     path: &str,
+    created_branch: bool,
 ) -> Result<worktree::Model> {
     Ok(worktree::ActiveModel {
         repo_id: Set(repo_id),
@@ -806,6 +807,7 @@ pub async fn record_worktree(
         branch: Set(branch.to_string()),
         path: Set(path.to_string()),
         created_at: Set(now()),
+        created_branch: Set(created_branch),
         ..Default::default()
     }
     .insert(&db.0)
@@ -1492,7 +1494,7 @@ mod tests {
         let sess = create_session(&db, dir.id, a.id, "claude", "/tmp/a-wt")
             .await
             .unwrap();
-        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt")
+        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt", false)
             .await
             .unwrap();
         // a direction bound to repo `b` — must SURVIVE the delete of `a`
@@ -1926,7 +1928,7 @@ mod tests {
         assert_eq!(dir.reason, "build the feature");
 
         // pretend it was materialized
-        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt")
+        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt", false)
             .await
             .unwrap();
         assert_eq!(list_worktrees(&db, Some(dir.id)).await.unwrap().len(), 1);
