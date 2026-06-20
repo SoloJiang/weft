@@ -1720,10 +1720,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeThreadId, refreshProposal],
   );
 
-  // In-flight base-branch save, so confirm/approve can flush it before acting on
-  // the proposal (the field saves on blur fire-and-forget; a fast Create/Approve
-  // click must not race the save → stale base + status clobber).
-  const pendingBaseSave = useRef<Promise<unknown>>(Promise.resolve());
+  // In-flight base-branch save, keyed PER THREAD — confirm/approve flush their OWN
+  // thread's pending save before acting (the field saves on blur fire-and-forget), and
+  // a cross-thread reset must never corrupt another thread's serialization chain.
+  const pendingBaseSave = useRef<Map<number, Promise<unknown>>>(new Map());
   // Latches true if ANY queued base save in the current chain rejected — the chain's
   // `.catch` swallows predecessors for serialization, so confirm/approve consult this
   // latch (not just the final promise) before acting.
@@ -1738,8 +1738,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // old base — refresh the proposal to the real state and abort rather than
     // materializing from a stale base. Consume the promise so a retry isn't blocked
     // by the settled rejection.
-    const pending = pendingBaseSave.current;
-    pendingBaseSave.current = Promise.resolve();
+    const pending = pendingBaseSave.current.get(activeThreadId) ?? Promise.resolve();
+    pendingBaseSave.current.delete(activeThreadId);
     try {
       await pending;
     } catch {
@@ -1768,7 +1768,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Serialize onto any in-flight base save (chain, don't replace) and use the
       // targeted server-side setter — no whole-proposal rebuild from stale state,
       // no status downgrade. confirm/approve await pendingBaseSave before acting.
-      const p = pendingBaseSave.current
+      const p = (pendingBaseSave.current.get(tid) ?? Promise.resolve())
         .catch(() => {})
         .then(() => api.setProposalDirectionBase(tid, index, name, repo, base.trim()))
         .then(() => {
@@ -1787,7 +1787,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           baseSaveFailed.current.add(tid);
           throw err;
         });
-      pendingBaseSave.current = p;
+      pendingBaseSave.current.set(tid, p);
       return p;
     },
     [activeThreadId, refreshProposal],
@@ -1810,8 +1810,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // the lane, or a DB error), the backend still holds the old base — refresh the
       // active proposal and abort rather than approving from a stale base. Mirrors
       // confirmProposal. Consume the promise so a retry isn't blocked.
-      const pending = pendingBaseSave.current;
-      pendingBaseSave.current = Promise.resolve();
+      const pending = pendingBaseSave.current.get(item.thread_id) ?? Promise.resolve();
+      pendingBaseSave.current.delete(item.thread_id);
       try {
         await pending;
       } catch {
