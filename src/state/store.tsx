@@ -1772,6 +1772,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         .catch(() => {})
         .then(() => api.setProposalDirectionBase(tid, index, name, repo, base.trim()))
         .then(() => {
+          // This save LANDED — clear any prior failure latch for this thread, so a
+          // successful retry after an earlier failure isn't still treated as failed
+          // by the next Create/Approve (which would spuriously abort + refresh).
+          baseSaveFailed.current.delete(tid);
           // Don't let a save that completes after a thread switch overwrite the
           // global proposal with the old thread's data.
           if (activeThreadIdRef.current === tid) {
