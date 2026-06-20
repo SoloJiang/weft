@@ -537,7 +537,7 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
     prompt: &str,
     on_event: &mut F,
 ) -> Result<String> {
-    use crate::codex_app_server::{Client, ThreadMsg};
+    use crate::codex_app_server::{codex_approval_reply, Client, ThreadMsg};
     use crate::lead_chat::proto::ChatEvent;
     // Deliberately do NOT pre-trust `cwd`: this curator scan runs in the user's
     // CANONICAL repo (not a Weft-managed worktree), so silently writing it into
@@ -586,8 +586,17 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
                         turn_failed = is_error;
                         break;
                     }
-                    ThreadMsg::Approval { id, .. } => {
-                        let _ = client.reply_approval(&id, "decline").await;
+                    ThreadMsg::Approval { id, method, .. } => {
+                        // Decline every ask immediately with the SHAPE its kind needs:
+                        // a permission ask requires `{permissions:{}}` (a `{decision}`
+                        // reply no-ops it, so the turn would hang until CURATOR_TIMEOUT).
+                        // Read-only curator → always deny.
+                        let _ = client
+                            .reply_result(
+                                &id,
+                                codex_approval_reply(method.contains("permissions"), false, None),
+                            )
+                            .await;
                     }
                     _ => {}
                 }

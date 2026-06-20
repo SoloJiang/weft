@@ -493,10 +493,10 @@ function RepoNode({
     >
       <div className="flex items-center gap-1.5">
         <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
-          {p.analyzed ? (
-            <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
-          ) : failed ? (
+          {failed ? (
             <TriangleAlert size={12} className="text-danger" />
+          ) : p.analyzed ? (
+            <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
           ) : (
             <Loader2 size={12} className="animate-spin text-ink-faint" />
           )}
@@ -522,13 +522,13 @@ function RepoNode({
         </button>
       </div>
 
-      {p.analyzed ? (
+      {failed ? (
+        <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>
+      ) : p.analyzed ? (
         <>
           <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
           <NodeSummary profile={p} />
         </>
-      ) : failed ? (
-        <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>
       ) : (
         <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>
       )}
@@ -552,19 +552,30 @@ function ExpandedNode({
 }) {
   const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
+  // A failed reprofile keeps the prior monorepo components (still useful), but the
+  // header must flag the retryable failure — same precedence as the collapsed card.
+  const failed = p.analysis_state === "failed";
   return (
     <div
       data-repo-node
       onClick={onSelect}
       className={cn(
         "group absolute flex flex-col overflow-hidden rounded-[var(--radius-md)] border bg-surface text-left",
-        selected ? "border-brand/60 bg-brand-ghost/40" : "border-border hover:border-border-strong",
+        selected
+          ? "border-brand/60 bg-brand-ghost/40"
+          : failed
+            ? "border-danger/40"
+            : "border-border hover:border-border-strong",
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
     >
       <div className="flex items-center gap-1.5 border-b border-border px-3 py-2">
         <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
-          <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
+          {failed ? (
+            <TriangleAlert size={12} className="text-danger" />
+          ) : (
+            <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
+          )}
         </span>
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
