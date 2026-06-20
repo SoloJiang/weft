@@ -883,19 +883,24 @@ pub async fn delete_repo_cascade(db: &Db, repo_id: i32) -> Result<Vec<(i32, Stri
 
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
-pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, String, String)>> {
+pub async fn delete_thread_cascade(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Vec<(i32, String, String, bool)>> {
     let dirs = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&db.0)
         .await?;
-    let mut removed: Vec<(i32, String, String)> = Vec::new(); // (repo_id, worktree path, branch)
+    // (repo_id, worktree path, branch, created_branch) — created_branch gates whether
+    // cleanup deletes the branch (a reused pre-existing branch must survive).
+    let mut removed: Vec<(i32, String, String, bool)> = Vec::new();
     for d in &dirs {
         let wts = worktree::Entity::find()
             .filter(worktree::Column::DirectionId.eq(d.id))
             .all(&db.0)
             .await?;
         for w in wts {
-            removed.push((w.repo_id, w.path.clone(), w.branch.clone()));
+            removed.push((w.repo_id, w.path.clone(), w.branch.clone(), w.created_branch));
             worktree::Entity::delete_by_id(w.id).exec(&db.0).await?;
         }
         session::Entity::delete_many()
@@ -1941,7 +1946,8 @@ mod tests {
             vec![(
                 repo.id,
                 "/tmp/wt".to_string(),
-                "feature/add-login".to_string()
+                "feature/add-login".to_string(),
+                false
             )]
         );
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives

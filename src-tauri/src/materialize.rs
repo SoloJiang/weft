@@ -169,12 +169,14 @@ pub async fn materialize_direction(
 }
 
 /// Physically remove worktrees and their namespaced branches (called during
-/// cascade delete). `removed` is the (repo_id, path, branch) list returned by
-/// `repo::delete_thread_cascade`. Per the zero-accumulation principle, the
-/// branch is torn down too so deleted threads leave nothing in the canonical repo.
-pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Result<()> {
+/// cascade delete). `removed` is the (repo_id, path, branch, created_branch) list
+/// returned by `repo::delete_thread_cascade`. Per the zero-accumulation principle the
+/// worktree's namespaced branch is torn down too — but ONLY when weft created it
+/// (`created_branch`); a pre-existing branch the worktree merely checked out (the
+/// `-b` fallback) is preserved.
+pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String, bool)]) -> Result<()> {
     use sea_orm::EntityTrait;
-    for (repo_id, path, branch) in removed {
+    for (repo_id, path, branch, created_branch) in removed {
         if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id)
             .one(&db.0)
             .await?
@@ -183,8 +185,10 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String)]) -> Re
             if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
                 eprintln!("[weft] worktree remove failed for {path}: {e}");
             }
-            if let Err(e) = git::delete_branch(repo_path, branch) {
-                eprintln!("[weft] branch delete failed for {branch}: {e}");
+            if *created_branch {
+                if let Err(e) = git::delete_branch(repo_path, branch) {
+                    eprintln!("[weft] branch delete failed for {branch}: {e}");
+                }
             }
         }
     }
@@ -485,6 +489,56 @@ mod tests {
 
     /// R13-1: a worktree row with created_branch=false must survive rollback with its
     /// branch intact (the branch was pre-existing and must not be deleted).
+    #[tokio::test]
+    async fn cleanup_worktrees_preserves_preexisting_branch() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-cleanup-preex-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        g(&["checkout", "-q", "-b", "feat/keep"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "keep"]);
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        g(&["checkout", "-q", "-"]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+        let wt_path = worktree_path(&repo_path, "feat/keep");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        // created_branch=false → the branch is pre-existing (the -b fallback reused it).
+        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false)
+            .await.unwrap();
+
+        // Deleting the thread removes the worktree but must PRESERVE the pre-existing branch.
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        cleanup_worktrees(&db, &removed).await.unwrap();
+        let branch_check = Cmd::new("git")
+            .args(["rev-parse", "--verify", "feat/keep"])
+            .current_dir(&repo_path)
+            .output().unwrap();
+        assert!(branch_check.status.success(), "pre-existing branch must survive delete cleanup");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn rollback_direction_preserves_preexisting_branch() {
         use crate::store::repo;
