@@ -1848,6 +1848,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const denyWriteTrigger = useCallback(
     async (item: WriteTrigger) => {
+      // Flush any in-flight base-branch save for this thread FIRST: a blur-save still
+      // writing the proposal can otherwise land AFTER deny_direction and restore the
+      // lane's decision:"" — making the denied write reappear as pending. Mirrors the
+      // flush in confirmProposal/approveWriteTrigger. (A rejected save persisted
+      // nothing, so there is nothing to clobber — no abort needed here.)
+      const pending = pendingBaseSave.current.get(item.thread_id) ?? Promise.resolve();
+      pendingBaseSave.current.delete(item.thread_id);
+      try {
+        await pending;
+      } catch {
+        // a rejected save wrote nothing
+      }
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
