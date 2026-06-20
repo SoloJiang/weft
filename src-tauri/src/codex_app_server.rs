@@ -615,9 +615,12 @@ impl Client {
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
 
         // Handshake: initialize (await), then the `initialized` notification. If it
-        // wedges/errors (auth/network/version), tear the half-open client down
-        // (drops the child + closes read_loop) so a retry doesn't leak app-server /
-        // MCP processes while the turn falls back to exec.
+        // wedges/errors (auth/network/version), tear the half-open client down so a
+        // retry doesn't leak app-server / MCP processes while the turn falls back to
+        // exec. Kill AND REAP the child here (not plain `shutdown`, which only drops
+        // the handle): the curator probes app-server once per repo, so repeated
+        // handshake failures — e.g. an old Codex binary — would otherwise pile up
+        // unreaped children.
         let handshake = async {
             self.request(
                 "initialize",
@@ -628,7 +631,7 @@ impl Client {
         }
         .await;
         if let Err(e) = handshake {
-            self.shutdown().await;
+            self.shutdown_and_reap().await;
             return Err(e);
         }
         Ok(())
