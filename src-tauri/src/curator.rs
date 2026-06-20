@@ -124,8 +124,17 @@ pub async fn edit_profile(
         owns_summary(prior_source) || summary.is_some(),
         owns_tier(prior_source) || tier.is_some(),
     );
-    repo::upsert_repo_profile(db, repo_id, &new_tier, &stack, &new_summary, &components, source, &commit)
-        .await
+    let saved =
+        repo::upsert_repo_profile(db, repo_id, &new_tier, &stack, &new_summary, &components, source, &commit)
+            .await?;
+    // A manual edit that lands a canonical tier RECOVERS a repo whose analysis
+    // failed: clear any lingering `failed` run-state so it stops reading as a
+    // retryable failure (failed overrides analyzed in the UI) and auto passes stop
+    // skipping it. No-op if it wasn't failed.
+    if profile::normalize_tier(&new_tier).is_some() {
+        clear_failure(repo_id);
+    }
+    Ok(saved)
 }
 
 /// One repo as the UI sees it. `profile == None` means the agent hasn't analyzed
@@ -1426,6 +1435,23 @@ mod tests {
         super::run_begin(8);
         super::clear_failure(8);
         assert_eq!(super::run_phase(8), "running", "a running run is left alone");
+    }
+
+    #[tokio::test]
+    async fn manual_canonical_edit_recovers_a_failed_repo() {
+        // A failed analysis the user fixes by hand (canonical tier) must stop reading
+        // as failed; a summary-only edit that leaves it unclassified does not.
+        super::run_state_clear_all_for_test();
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "").await.unwrap();
+
+        super::run_finish_err(r.id, "analysis failed".into());
+        super::edit_profile(&db, r.id, Some("notes"), None).await.unwrap();
+        assert_eq!(super::run_phase(r.id), "failed", "summary-only edit leaves it failed (no tier)");
+
+        super::edit_profile(&db, r.id, Some("a web app"), Some("frontend")).await.unwrap();
+        assert_eq!(super::run_phase(r.id), "idle", "a canonical tier clears the failure");
     }
 
     #[tokio::test]

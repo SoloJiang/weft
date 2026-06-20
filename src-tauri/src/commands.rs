@@ -114,6 +114,13 @@ async fn register_repo(
     {
         if let Ok(Some(updated)) = repo::set_repo_path(db, r.id, &canonical).await {
             r = updated;
+            // Repointed from a DEAD checkout to this live one: forget the stale
+            // "checkout not found" failure so the auto pass below reclassifies the
+            // fresh path (its new HEAD ≠ the old profiled_commit → needs_classification
+            // re-runs it). We DON'T clear on a live-duplicate re-add: that pass isn't
+            // forced and would skip an unchanged classified repo, dropping the failure
+            // with no retry.
+            crate::curator::clear_failure(r.id);
         }
     }
     // The curator is agent-only now (ARCHITECTURE §4.9): there is no deterministic
@@ -127,10 +134,6 @@ async fn register_repo(
     if matches!(repo::get_repo_profile(db, r.id).await, Ok(None)) {
         let _ = repo::upsert_repo_profile(db, r.id, "", "[]", "", "[]", "agent", "").await;
     }
-    // Re-adding a live checkout for a repo that previously failed (e.g. its old
-    // checkout was gone) clears that stale failure, so the auto pass below
-    // classifies the fresh checkout instead of the anti-storm skip suppressing it.
-    crate::curator::clear_failure(r.id);
     // Fire-and-forget the agent curator over the whole workspace so the new repo
     // gets a deep per-repo classification and cross-repo relations refresh.
     // Read-only, coalesced (a batch add runs one pass), and best-effort — it
