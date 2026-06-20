@@ -1775,7 +1775,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     (index: number, name: string, repo: string, base: string, expectedOldBase: string): Promise<void> => {
       if (activeThreadId == null) return Promise.resolve();
       const tid = activeThreadId;
-      const laneKey = `${name}\0${repo}`;
+      // Include the lane INDEX: a proposal can hold two pending writes with the same
+      // name+repo, and a name+repo-only key would be shared — one lane's successful save
+      // would then clear the other lane's still-pending failure, so confirm/approve would
+      // stop aborting even though the first lane's base edit never landed.
+      const laneKey = `${index}\0${name}\0${repo}`;
       // Serialize onto any in-flight base save (chain, don't replace) and use the
       // targeted server-side setter — no whole-proposal rebuild from stale state,
       // no status downgrade. confirm/approve await pendingBaseSave before acting.
