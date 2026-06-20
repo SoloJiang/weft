@@ -286,12 +286,18 @@ function BaseBranchField({
   const { t } = useTranslation();
   const [val, setVal] = useState(value ?? "");
   const lastLoaded = useRef(value ?? "");
+  const lastIdentity = useRef(`${name} ${repo}`);
   useEffect(() => {
-    if ((value ?? "") !== lastLoaded.current) {
+    const identity = `${name} ${repo}`;
+    // Reset the input when the persisted value changes OR when the lane IDENTITY
+    // (name/repo) changes — a re-propose can swap the lane in this slot without
+    // changing `value`, and stale dirty input must not blur-save onto the new lane.
+    if (identity !== lastIdentity.current || (value ?? "") !== lastLoaded.current) {
+      lastIdentity.current = identity;
       lastLoaded.current = value ?? "";
       setVal(value ?? "");
     }
-  }, [value]);
+  }, [name, repo, value]);
   const skipNextBlur = useRef(false);
   const save = () => {
     if (disabled) return;
