@@ -260,13 +260,19 @@ impl RegistrationService {
         transport: Arc<dyn RegistrationTransport>,
         on_success: OnSuccess,
     ) -> anyhow::Result<ScanBegin> {
-        let (view, device_code, interval, expire) = do_begin(transport.as_ref()).await?;
+        // 先占据新一代,再发 begin 请求:这样 in-flight begin 期间的 cancel / 新一代 begin
+        // 能让本次作废(下方 is_live 检查),不会留下「迟到的旧 begin 启动一条看不见的轮询、
+        // 反把可见 QR 的轮询挤掉」的竞态(P2)。
         let generation = {
             let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
             s.generation = s.generation.wrapping_add(1);
             s.status = ScanStatus::Pending;
             s.generation
         };
+        let (view, device_code, interval, expire) = do_begin(transport.as_ref()).await?;
+        if !is_live(&self.session, generation) {
+            anyhow::bail!("scan registration superseded");
+        }
         let session = self.session.clone();
         tauri::async_runtime::spawn(async move {
             poll_loop(
@@ -359,6 +365,11 @@ async fn poll_loop(
                 continue;
             }
         };
+        // await 期间会话可能被 cancel / 新一代取代:重查代际,stale 响应一律丢弃,
+        // 避免用已废弃 QR 会话拿到的凭证覆盖落库 / 启用桥(P2)。
+        if !is_live(&session, generation) {
+            return;
+        }
         match classify_poll(&resp) {
             PollOutcome::Pending => {}
             PollOutcome::SlowDown => interval += 5,
@@ -667,5 +678,80 @@ mod tests {
             session.lock().unwrap_or_else(|e| e.into_inner()).status,
             ScanStatus::Error("access_denied".into())
         );
+    }
+
+    // 模拟「请求在飞途中,会话被 cancel / 新一代取代」:在指定 action 的请求里 bump generation。
+    struct GenBumpTransport {
+        session: Arc<Mutex<Session>>,
+        bump_on: &'static str,
+        begin: serde_json::Value,
+        poll: serde_json::Value,
+    }
+    #[async_trait::async_trait]
+    impl RegistrationTransport for GenBumpTransport {
+        async fn post_form(
+            &self,
+            _url: &str,
+            form: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            let action = form
+                .iter()
+                .find(|(k, _)| *k == "action")
+                .map(|(_, v)| *v)
+                .unwrap_or("");
+            if action == self.bump_on {
+                let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
+                s.generation = s.generation.wrapping_add(1);
+            }
+            Ok(if action == "begin" {
+                self.begin.clone()
+            } else {
+                self.poll.clone()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_loop_ignores_stale_success_after_supersede() {
+        let session = Arc::new(Mutex::new(Session {
+            status: ScanStatus::Pending,
+            generation: 1,
+        }));
+        // poll 请求「在飞途中」会话被取代(generation 1→2);返回的 Success 必须被丢弃,
+        // 不能 run on_success 覆盖凭证 / 启用桥。
+        let t: Arc<dyn RegistrationTransport> = Arc::new(GenBumpTransport {
+            session: session.clone(),
+            bump_on: "poll",
+            begin: serde_json::json!({}),
+            poll: serde_json::json!({
+                "client_id": "cli_x", "client_secret": "sec",
+                "user_info": {"open_id": "ou_1"}
+            }),
+        });
+        let (cb, log) = record_success();
+        poll_loop(t, session.clone(), 1, "dc".into(), 0, 100, cb).await;
+        assert!(
+            log.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "superseded session must NOT run on_success / apply credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_aborts_when_superseded_during_request() {
+        let svc = RegistrationService::default();
+        // begin 占据 generation 后,do_begin 请求「在飞途中」会话被取代 → begin 应放弃,不 spawn。
+        let t: Arc<dyn RegistrationTransport> = Arc::new(GenBumpTransport {
+            session: svc.session.clone(),
+            bump_on: "begin",
+            begin: serde_json::json!({
+                "device_code": "dc",
+                "verification_uri_complete": "https://accounts.feishu.cn/o",
+                "interval": 0, "expire_in": 100
+            }),
+            poll: serde_json::json!({}),
+        });
+        let (cb, _log) = record_success();
+        let r = svc.begin(t, cb).await;
+        assert!(r.is_err(), "begin must abort when superseded mid-request");
     }
 }

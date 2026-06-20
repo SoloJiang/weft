@@ -1360,17 +1360,27 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
 
 /// 写飞书凭证并重启桥。secret 空 = 保持原值(不覆盖已存密钥)。`enable=true` 时同时置
 /// `im.feishu.enabled`(扫码接入即启用);手填保存走 `enable=false`,enabled 仍由开关 /
-/// 默认决定。扫码注册成功路径与本函数共用,保证「落库 + 重连」单一实现。
+/// 默认决定。`owner_open_id=Some` 时把该 open_id 设为白名单——扫码创建的新机器人用它
+/// 让授权者立即可对话,并覆盖旧应用遗留的白名单(那些 open_id 属于旧 app、对新 bot 无效,
+/// 留着反而会让新 owner 被 `inbound::route` 忽略);手填路径传 `None`,不动既有白名单。
+/// 扫码注册成功路径与本函数共用,保证「落库 + 重连」单一实现。
 async fn apply_feishu_credentials(
     app: &tauri::AppHandle,
     db: &Db,
     app_id: &str,
     app_secret: &str,
     enable: bool,
+    owner_open_id: Option<&str>,
 ) -> anyhow::Result<()> {
     repo::set_setting(db, crate::im::K_APP_ID, app_id.trim()).await?;
     if !app_secret.is_empty() {
         repo::set_setting(db, crate::im::K_APP_SECRET, app_secret.trim()).await?;
+    }
+    if let Some(oid) = owner_open_id {
+        let oid = oid.trim();
+        if !oid.is_empty() {
+            repo::set_setting(db, crate::im::K_ALLOW, oid).await?;
+        }
     }
     if enable {
         repo::set_setting(db, crate::im::K_ENABLED, "1").await?;
@@ -1388,7 +1398,7 @@ pub async fn im_set_settings(
     app_id: String,
     app_secret: String,
 ) -> R<()> {
-    apply_feishu_credentials(&app, &db, &app_id, &app_secret, false)
+    apply_feishu_credentials(&app, &db, &app_id, &app_secret, false, None)
         .await
         .map_err(e)
 }
@@ -1453,11 +1463,12 @@ pub async fn feishu_scan_begin(
 ) -> R<ScanBeginView> {
     use crate::im::feishu::registration::{OnSuccess, ReqwestTransport};
     let app_cb = app.clone();
-    let on_success: OnSuccess = std::sync::Arc::new(move |client_id, client_secret, _open_id| {
+    let on_success: OnSuccess = std::sync::Arc::new(move |client_id, client_secret, open_id| {
         let app = app_cb.clone();
         Box::pin(async move {
             let db = app.state::<Db>().inner().clone();
-            apply_feishu_credentials(&app, &db, &client_id, &client_secret, true).await
+            apply_feishu_credentials(&app, &db, &client_id, &client_secret, true, Some(&open_id))
+                .await
         }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
     });
     let transport = std::sync::Arc::new(ReqwestTransport::default());
