@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { GitCompare, Info } from "lucide-react";
+import { FolderTree, GitCompare, Info } from "lucide-react";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
 import type { EnabledSkill, ObserveRef } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
 import { ChatComposer } from "./ChatComposer";
 import { DiffPanel } from "./DiffPanel";
+import { FileTreePanel } from "./FileTreePanel";
 import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
@@ -41,8 +42,8 @@ export function WorkerConversation() {
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
+  const [rail, setRail] = useState<"info" | "diff" | "files" | "none">("info");
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [rail, setRail] = useState<"info" | "diff" | "none">("info");
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
 
   const directionId = viewing?.directionId ?? null;
@@ -77,7 +78,7 @@ export function WorkerConversation() {
   // Resolve the worker's session ref (worktree/branch/tool/session_id/native_id).
   // Polls while not live so a backgrounded worker's status stays fresh.
   useEffect(() => {
-    setRail(viewing?.diff ? "diff" : "info");
+    setRail(viewing?.sidePanel ?? "info");
     if (directionId == null || repoId == null) {
       setRef(null);
       return;
@@ -102,7 +103,7 @@ export function WorkerConversation() {
       alive = false;
       clearInterval(h);
     };
-  }, [directionId, repoId, viewing?.diff, hydrateWorkerMeta]);
+  }, [directionId, repoId, viewing?.sidePanel, hydrateWorkerMeta]);
 
   // Enabled skills for the panel (workspace-level, CLI-agnostic). Re-fetch when
   // skills change so the silent skill-refresh is reflected without a restart.
@@ -208,6 +209,14 @@ export function WorkerConversation() {
           >
             <GitCompare size={13} />
           </button>
+          <button
+            onClick={() => setRail("files")}
+            title={t("files.tab")}
+            aria-label={t("files.tab")}
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border border-border text-ink-muted transition-colors hover:bg-surface hover:text-ink"
+          >
+            <FolderTree size={13} />
+          </button>
           {ref && (
             <Inspect
               path={ref.worktree}
@@ -277,6 +286,13 @@ export function WorkerConversation() {
           open={rail === "diff"}
           onClose={() => setRail("info")}
           onAsk={(text) => void sendToWorker(directionId, repoId, text)}
+        />
+      )}
+      {ref && (
+        <FileTreePanel
+          cwd={ref.worktree}
+          open={rail === "files"}
+          onClose={() => setRail("info")}
         />
       )}
     </div>

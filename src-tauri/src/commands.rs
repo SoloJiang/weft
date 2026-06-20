@@ -655,6 +655,141 @@ pub async fn repo_diff(db: State<'_, Db>, worktree_id: i32) -> R<crate::git::Dif
         .ok_or("worktree not found")?;
     crate::git::repo_diff(std::path::Path::new(&w.path)).map_err(e)
 }
+/// Worktree file tree response, including a truncation flag when the directory
+/// is too large to render efficiently.
+#[derive(serde::Serialize)]
+pub struct FileTree {
+    pub nodes: Vec<FileNode>,
+    pub truncated: bool,
+    pub total: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct FileNode {
+    pub path: String,
+    pub name: String,
+    pub kind: FileNodeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub children: Option<Vec<FileNode>>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileNodeKind {
+    File,
+    Directory,
+}
+
+const FILE_TREE_MAX_DEPTH: usize = 8;
+const FILE_TREE_MAX_NODES: usize = 5000;
+
+/// Directories that are usually large and uninteresting for code review.
+fn is_skipped_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".turbo"
+            | "coverage"
+            | ".coverage"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+    )
+}
+
+fn read_dir_tree(
+    path: &std::path::Path,
+    depth: usize,
+    counter: &mut usize,
+) -> R<(Vec<FileNode>, bool)> {
+    if *counter >= FILE_TREE_MAX_NODES {
+        return Ok((Vec::new(), true));
+    }
+    if depth == 0 {
+        // Reached the depth limit. If this directory has any entries, report
+        // truncation so the UI doesn't show a non-empty folder as empty.
+        let has_entries = std::fs::read_dir(path)
+            .map_err(e)?
+            .next()
+            .is_some();
+        return Ok((Vec::new(), has_entries));
+    }
+
+    // Collect up to the remaining budget so we never sort an unbounded list.
+    let mut entries = Vec::with_capacity(256);
+    let mut truncated = false;
+    for entry in std::fs::read_dir(path).map_err(e)? {
+        let entry = entry.map_err(e)?;
+        if *counter + entries.len() >= FILE_TREE_MAX_NODES {
+            truncated = true;
+            break;
+        }
+        entries.push(entry);
+    }
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    let mut nodes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if *counter >= FILE_TREE_MAX_NODES {
+            truncated = true;
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry_path = entry.path();
+        let path_str = entry_path.to_string_lossy().into_owned();
+        // Use symlink_metadata so we don't follow symlinks into directories
+        // outside the worktree. Symlinks are shown as files and not recursed.
+        let metadata = match std::fs::symlink_metadata(&entry_path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        if metadata.is_dir() {
+            if is_skipped_dir(&name) {
+                continue;
+            }
+            *counter += 1;
+            let (children, child_truncated) =
+                read_dir_tree(&entry_path, depth - 1, counter)?;
+            truncated = truncated || child_truncated;
+            nodes.push(FileNode {
+                path: path_str,
+                name,
+                kind: FileNodeKind::Directory,
+                children: Some(children),
+            });
+        } else {
+            *counter += 1;
+            nodes.push(FileNode {
+                path: path_str,
+                name,
+                kind: FileNodeKind::File,
+                children: None,
+            });
+        }
+    }
+    Ok((nodes, truncated))
+}
+
+/// The worktree file tree for the Files panel: a recursive snapshot of the
+/// worktree's directory structure, excluding build/output dirs and `.git`.
+#[tauri::command]
+pub fn list_worktree_files(cwd: String) -> R<FileTree> {
+    let mut counter = 0;
+    let (nodes, truncated) = read_dir_tree(std::path::Path::new(&cwd), FILE_TREE_MAX_DEPTH, &mut counter)?;
+    Ok(FileTree {
+        nodes,
+        truncated,
+        total: counter,
+    })
+}
+
+
 
 #[tauri::command]
 pub async fn delete_thread(db: State<'_, Db>, thread_id: i32) -> R<()> {
@@ -1362,6 +1497,37 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     })
 }
 
+/// 写飞书凭证并重启桥。secret 空 = 保持原值(不覆盖已存密钥)。`enable=true` 时同时置
+/// `im.feishu.enabled`(扫码接入即启用);手填保存走 `enable=false`,enabled 仍由开关 /
+/// 默认决定。`owner_open_id=Some` 时把该 open_id 设为白名单——扫码创建的新机器人用它
+/// 让授权者立即可对话,并覆盖旧应用遗留的白名单(那些 open_id 属于旧 app、对新 bot 无效,
+/// 留着反而会让新 owner 被 `inbound::route` 忽略);手填路径传 `None`,不动既有白名单。
+/// 扫码注册成功路径与本函数共用,保证「落库 + 重连」单一实现。
+async fn apply_feishu_credentials(
+    app: &tauri::AppHandle,
+    db: &Db,
+    app_id: &str,
+    app_secret: &str,
+    enable: bool,
+    owner_open_id: Option<&str>,
+) -> anyhow::Result<()> {
+    repo::set_setting(db, crate::im::K_APP_ID, app_id.trim()).await?;
+    if !app_secret.is_empty() {
+        repo::set_setting(db, crate::im::K_APP_SECRET, app_secret.trim()).await?;
+    }
+    if let Some(oid) = owner_open_id {
+        let oid = oid.trim();
+        if !oid.is_empty() {
+            repo::set_setting(db, crate::im::K_ALLOW, oid).await?;
+        }
+    }
+    if enable {
+        repo::set_setting(db, crate::im::K_ENABLED, "1").await?;
+    }
+    crate::im::spawn(app.clone());
+    Ok(())
+}
+
 /// 保存凭证并重启桥。secret 传空字符串 = 保持原值（不覆盖已存的密钥）。
 /// 是否真正连接由 `im.feishu.enabled` 和双凭证共同决定。
 #[tauri::command]
@@ -1371,16 +1537,9 @@ pub async fn im_set_settings(
     app_id: String,
     app_secret: String,
 ) -> R<()> {
-    repo::set_setting(&db, crate::im::K_APP_ID, app_id.trim())
+    apply_feishu_credentials(&app, &db, &app_id, &app_secret, false, None)
         .await
-        .map_err(e)?;
-    if !app_secret.is_empty() {
-        repo::set_setting(&db, crate::im::K_APP_SECRET, app_secret.trim())
-            .await
-            .map_err(e)?;
-    }
-    crate::im::spawn(app);
-    Ok(())
+        .map_err(e)
 }
 
 /// 开关桥：写 enabled 标志并重启。off = 断开但保留凭证；on = 凭证齐全则连接
@@ -1417,6 +1576,75 @@ pub async fn im_set_remote_standby(
 #[tauri::command]
 pub fn im_status(bridge: State<'_, crate::im::ImBridge>) -> R<String> {
     Ok(bridge.status())
+}
+
+// ───────────────────────── 飞书扫码接入(device-flow）─────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct ScanBeginView {
+    pub qr_data_uri: String,
+    pub expire_secs: u64,
+    pub poll_interval_ms: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ScanStatusView {
+    pub status: String,
+    pub error_reason: Option<String>,
+}
+
+/// 发起扫码:begin device-flow → 返回二维码 data URI 供前端 `<img>` 渲染。后台轮询在
+/// RegistrationService 内进行;成功时用拿到的 client_id/secret 落库 + 重连(enable）。
+#[tauri::command]
+pub async fn feishu_scan_begin(
+    app: tauri::AppHandle,
+    svc: State<'_, crate::im::feishu::registration::RegistrationService>,
+) -> R<ScanBeginView> {
+    use crate::im::feishu::registration::{OnSuccess, ReqwestTransport};
+    let app_cb = app.clone();
+    let on_success: OnSuccess = std::sync::Arc::new(move |client_id, client_secret, open_id| {
+        let app = app_cb.clone();
+        Box::pin(async move {
+            let db = app.state::<Db>().inner().clone();
+            apply_feishu_credentials(&app, &db, &client_id, &client_secret, true, Some(&open_id))
+                .await
+        }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
+    });
+    let transport = std::sync::Arc::new(ReqwestTransport::default());
+    let begin = svc.begin(transport, on_success).await.map_err(e)?;
+    Ok(ScanBeginView {
+        qr_data_uri: begin.qr_data_uri,
+        expire_secs: begin.expire_secs,
+        poll_interval_ms: begin.interval_secs.saturating_mul(1000),
+    })
+}
+
+/// 查询扫码状态(前端按 poll_interval_ms 轮询)。
+#[tauri::command]
+pub fn feishu_scan_status(
+    svc: State<'_, crate::im::feishu::registration::RegistrationService>,
+) -> R<ScanStatusView> {
+    use crate::im::feishu::registration::ScanStatus;
+    let (status, error_reason) = match svc.status() {
+        ScanStatus::Idle => ("idle", None),
+        ScanStatus::Pending => ("pending", None),
+        ScanStatus::Success => ("success", None),
+        ScanStatus::Expired => ("expired", None),
+        ScanStatus::Error(r) => ("error", Some(r)),
+    };
+    Ok(ScanStatusView {
+        status: status.to_string(),
+        error_reason,
+    })
+}
+
+/// 取消扫码(关闭 dialog / 卸载时调用),停止后台轮询。
+#[tauri::command]
+pub fn feishu_scan_cancel(
+    svc: State<'_, crate::im::feishu::registration::RegistrationService>,
+) -> R<()> {
+    svc.cancel();
+    Ok(())
 }
 
 // ───────────────────────── IM · 话题绑定（M2-5）─────────────────────────

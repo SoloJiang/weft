@@ -69,6 +69,17 @@ pub fn reveal_path(path: String) -> Result<(), String> {
     }
     tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
 }
+/// Open a real, already-resolved filesystem path with the OS default app.
+/// Unlike `open_path`, this does NOT strip `:line` suffixes or resolve chat
+/// tokens, so file-tree selections open the exact path returned by the backend.
+#[tauri::command]
+pub fn open_file(path: String) -> Result<(), String> {
+    if !std::path::Path::new(&path).exists() {
+        return Err("not_found".into());
+    }
+    tauri_plugin_opener::open_path(&path, None::<&str>).map_err(err)
+}
+
 
 /// Why a chat path token couldn't be turned into an openable absolute path.
 #[derive(Debug, PartialEq, Eq)]

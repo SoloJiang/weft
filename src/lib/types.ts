@@ -322,6 +322,18 @@ export interface FileDiff {
 export interface DiffSummary {
   files: FileDiff[];
 }
+export interface FileNode {
+  path: string;
+  name: string;
+  kind: "file" | "directory";
+  children?: FileNode[];
+}
+export interface FileTree {
+  nodes: FileNode[];
+  truncated: boolean;
+  total: number;
+}
+
 
 export interface BusMsg {
   from: string;
