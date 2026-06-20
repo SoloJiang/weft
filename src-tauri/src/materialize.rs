@@ -113,6 +113,12 @@ pub async fn materialize_direction(
         let explicit = !dir.base_branch.trim().is_empty();
         let recreate_base = if explicit {
             dir.base_branch.trim().to_string()
+        } else if !dir.target_branch.trim().is_empty() {
+            // A blank base with a stored target is the detached-HEAD fallback: base_branch
+            // is empty but target_branch holds the branch-off COMMIT (see the HEAD handling
+            // in the normal path). Reuse it so the recreate starts from the SAME point, not
+            // a re-resolved live default that may have moved since.
+            dir.target_branch.trim().to_string()
         } else {
             git::live_default_branch(repo_path)
                 .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref))
@@ -652,6 +658,71 @@ mod tests {
     /// R15-2: materialize_direction must recreate the on-disk worktree when the
     /// row exists but the directory was reclaimed (remove_direction_worktree path).
     /// After re-materialization the directory must exist again.
+    #[tokio::test]
+    async fn materialize_recreates_detached_head_lane_from_stored_target_commit() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-head-target-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        let sha = |rev: &str| {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // Detached, no named branch → blank base falls back to HEAD (commit X).
+        g(&["checkout", "-q", "--detach"]);
+        g(&["branch", "-D", &main]);
+        let x = sha("HEAD");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), "main", "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // ① materialize off HEAD (X); reclaim the dir + delete the work branch.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        let _ = crate::git::remove_worktree(&repo_path, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-D", &work_branch]);
+
+        // ② Advance the detached HEAD to a NEW commit Y — re-resolving the "live default"
+        // would now yield Y, not the original branch-off X.
+        g(&["commit", "-q", "--allow-empty", "-m", "advance-to-Y"]);
+        assert_ne!(x, sha("HEAD"), "HEAD advanced to Y");
+
+        // ③ Re-materialize: must recreate off the STORED target (X), not the advanced HEAD.
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+        assert!(wt_path.exists(), "worktree recreated");
+        assert_eq!(
+            sha(&work_branch), x,
+            "recreated off the stored branch-off commit X, not the advanced live HEAD"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn materialize_detached_head_stores_empty_base_and_target_not_head() {
         use crate::store::repo;
