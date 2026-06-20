@@ -129,8 +129,13 @@ pub async fn materialize_direction(
         } else if target_is_commit_sha {
             t.to_string()
         } else {
-            git::live_default_branch(repo_path)
-                .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref))
+            git::live_default_branch(repo_path).unwrap_or_else(|| {
+                git::recorded_base_or_default(
+                    repo_path,
+                    &repo_ref.base_ref,
+                    repo_ref.base_ref_is_default,
+                )
+            })
         };
         // Require the stored base to resolve ONLY when we must branch off it — i.e. the
         // work branch is gone. If the work branch still exists we just check it out (the
@@ -178,9 +183,9 @@ pub async fn materialize_direction(
     } else {
         // Live remote default (authoritative). Offline, prefer the recorded base_ref
         // (the live default captured at register) over a possibly-stale cached origin/HEAD.
-        live_default
-            .clone()
-            .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref))
+        live_default.clone().unwrap_or_else(|| {
+            git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default)
+        })
     };
     let add = git::add_worktree_synced(repo_path, &dir.branch, &path, &base, explicit)
         .with_context(|| format!("worktree for repo {}", repo_ref.name))?;
@@ -294,11 +299,13 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String, bool, b
                     eprintln!("[weft] worktree remove failed for {path}: {e}");
                 }
             } else {
-                // A reused (non-weft) checkout: keep the directory + contents, but
-                // UNregister it so the orphan-worktree GC — which reclaims registered,
-                // no-longer-DB-tracked worktrees under weft's root — can't sweep it after
-                // the TTL once this row is dropped.
-                let _ = git::unregister_worktree(repo_path, std::path::Path::new(path));
+                // A reused (non-weft) checkout: keep the directory + contents AND its
+                // git-worktree registration (so it stays a usable worktree), but LOCK it
+                // so the orphan-worktree GC — which reclaims registered, no-longer-DB-tracked
+                // worktrees under weft's root — skips it after the TTL once this row is
+                // dropped. The lock lives in the repo's git metadata, so it also survives a
+                // later repo re-add (which would otherwise re-orphan the checkout).
+                let _ = git::lock_worktree(repo_path, std::path::Path::new(path));
             }
             if *created_branch {
                 if let Err(e) = git::delete_branch(repo_path, branch) {
@@ -335,9 +342,9 @@ pub async fn rollback_direction(db: &Db, direction_id: i32) -> Result<()> {
                     eprintln!("[weft] rollback worktree remove failed for {}: {e}", w.path);
                 }
             } else {
-                // Reused (non-weft) checkout: keep it, but UNregister it so the orphan GC
-                // can't sweep it after the row is deleted below (see cleanup_worktrees).
-                let _ = git::unregister_worktree(repo_path, std::path::Path::new(&w.path));
+                // Reused (non-weft) checkout: keep it as a usable worktree, but LOCK it so
+                // the orphan GC skips it after the row is deleted below (see cleanup_worktrees).
+                let _ = git::lock_worktree(repo_path, std::path::Path::new(&w.path));
             }
             // Only delete the branch if WE created it. A pre-existing branch reused
             // by the fallback path must survive rollback (the user's own branch).
@@ -508,7 +515,7 @@ mod tests {
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         // Register with a STALE base_ref (a feature branch that isn't the remote default).
-        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), "stale-feature", "")
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), "stale-feature", "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // Empty base_branch → both base_branch and target_branch start empty.
@@ -551,7 +558,7 @@ mod tests {
         Cmd::new("git").args(["clone","-q",&origin.to_string_lossy(),&clone.to_string_lossy()]).current_dir(&root).status().unwrap();
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &main, "").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &main, "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "").await.unwrap();
         assert_eq!(dir.base_branch, "");
@@ -605,7 +612,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "develop")
@@ -652,7 +659,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
@@ -711,7 +718,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), "main", "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
@@ -787,7 +794,7 @@ mod tests {
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         // repo base_ref = main (the default). No remote, so live_default is None and the
         // offline fallback resolves to local main.
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         // BLANK base → would normally re-resolve to the default at materialize.
@@ -862,7 +869,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), "main", "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         // BLANK base → falls back to HEAD during materialize.
@@ -912,7 +919,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
 
@@ -972,7 +979,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", &main)
@@ -1034,7 +1041,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         // EXPLICIT base_branch = release.
@@ -1097,6 +1104,7 @@ mod tests {
             repo_path.to_str().unwrap(),
             &main,
             "",
+            true,
         )
         .await
         .unwrap();
@@ -1176,7 +1184,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
@@ -1235,7 +1243,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
@@ -1303,7 +1311,7 @@ mod tests {
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         // Register the clone with a STALE base_ref that differs from the live default.
         let stale_base = "stale-old-default";
-        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), stale_base, "")
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), stale_base, "", true)
             .await
             .unwrap();
         assert_eq!(r.base_ref, stale_base, "precondition: registered with stale base_ref");
@@ -1350,7 +1358,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
@@ -1379,13 +1387,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// R18-2b: cleanup_worktrees must NOT remove a checkout directory when
-    /// `created_checkout=false`. Mirrors the rollback test but via the cascade path.
+    /// R36-3: cleanup_worktrees must KEEP a `created_checkout=false` reused checkout as a
+    /// real, USABLE git worktree — it stays registered (`list_worktrees`) and `git status`
+    /// works inside it — while LOCKING it so the orphan GC can't reclaim it after the row
+    /// is dropped. (The previous behavior unregistered it, which degraded it to a plain
+    /// directory; locking preserves usability AND survives a repo re-add.)
     #[tokio::test]
-    async fn cleanup_unregisters_reused_checkout_so_gc_cant_sweep_it() {
+    async fn cleanup_locks_reused_checkout_kept_as_usable_worktree() {
         use crate::store::repo;
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-cleanup-unreg-{}", std::process::id());
+        let tag = format!("weft-cleanup-lock-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
         let _ = std::fs::remove_dir_all(&root);
@@ -1405,10 +1416,11 @@ mod tests {
             crate::git::list_worktrees(&repo_path).unwrap().iter().any(|(_, b)| b == "feat/reused"),
             "registered before cleanup"
         );
+        assert!(!crate::git::is_worktree_locked(&repo_path, &wt), "not locked before cleanup");
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &base, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &base, "", true)
             .await.unwrap();
 
         // Cascade cleanup of a reused (created_checkout=false, created_branch=false) entry.
@@ -1417,11 +1429,22 @@ mod tests {
 
         // Dir + contents survive...
         assert!(wt.join("user.txt").exists(), "reused checkout contents preserved");
-        // ...but it is UNregistered, so the orphan-worktree GC (registered + untracked)
-        // can't reclaim it after the row is gone.
+        // ...it stays a REAL, usable git worktree (still registered)...
         assert!(
-            !crate::git::list_worktrees(&repo_path).unwrap().iter().any(|(_, b)| b == "feat/reused"),
-            "reused checkout unregistered so the orphan GC can't sweep it"
+            crate::git::list_worktrees(&repo_path).unwrap().iter().any(|(_, b)| b == "feat/reused"),
+            "reused checkout stays a registered git worktree"
+        );
+        // ...`git status` inside it still works (it's a valid worktree, not a bare dir)...
+        let status_ok = std::process::Command::new("git")
+            .args(["-C", &wt.to_string_lossy(), "status", "--porcelain"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(status_ok, "git status works inside the preserved worktree");
+        // ...and it is LOCKED, so the orphan GC will skip it after the row is gone.
+        assert!(
+            crate::git::is_worktree_locked(&repo_path, &wt),
+            "reused checkout locked so the orphan GC can't sweep it"
         );
 
         std::env::remove_var("WEFT_HOME");
@@ -1447,7 +1470,7 @@ mod tests {
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
             .await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")

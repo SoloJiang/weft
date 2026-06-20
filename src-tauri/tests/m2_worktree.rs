@@ -38,10 +38,10 @@ async fn m2_acceptance() {
 
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
-    let ra = repo::add_repo_ref(&db, ws.id, "repo-a", repo_a.to_str().unwrap(), "main", "")
+    let ra = repo::add_repo_ref(&db, ws.id, "repo-a", repo_a.to_str().unwrap(), "main", "", true)
         .await
         .unwrap();
-    let rb = repo::add_repo_ref(&db, ws.id, "repo-b", repo_b.to_str().unwrap(), "main", "")
+    let rb = repo::add_repo_ref(&db, ws.id, "repo-b", repo_b.to_str().unwrap(), "main", "", true)
         .await
         .unwrap();
 

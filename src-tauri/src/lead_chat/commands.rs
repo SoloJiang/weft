@@ -1253,7 +1253,7 @@ mod live_slot_tests {
     // returning (thread_id, direction_id, repo_id, session_id).
     async fn fixture(db: &Db) -> (i32, i32, i32, i32) {
         let ws = repo::create_workspace(db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-slot-fake", "main", "")
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-slot-fake", "main", "", true)
             .await
             .unwrap();
         let th = repo::create_thread(db, ws.id, "issue", "feature", "codex")
@@ -1334,7 +1334,7 @@ mod live_slot_tests {
     async fn busy_worker_without_worktree_is_skipped() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true).await.unwrap();
         let th = repo::create_thread(&db, ws.id, "issue", "feature", "codex").await.unwrap();
         let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only", "")
             .await

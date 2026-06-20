@@ -39,13 +39,13 @@ async fn renders_empty_with_hint() {
 async fn renders_three_repos_no_hint() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
-    repo::add_repo_ref(&db, ws.id, "alpha", "/tmp/alpha", "main", "")
+    repo::add_repo_ref(&db, ws.id, "alpha", "/tmp/alpha", "main", "", true)
         .await
         .unwrap();
-    repo::add_repo_ref(&db, ws.id, "beta", "/tmp/beta", "main", "")
+    repo::add_repo_ref(&db, ws.id, "beta", "/tmp/beta", "main", "", true)
         .await
         .unwrap();
-    repo::add_repo_ref(&db, ws.id, "gamma", "/tmp/gamma", "main", "")
+    repo::add_repo_ref(&db, ws.id, "gamma", "/tmp/gamma", "main", "", true)
         .await
         .unwrap();
 
@@ -89,6 +89,7 @@ async fn truncates_over_eight() {
             &format!("/tmp/repo{i:02}"),
             "main",
             "",
+            true,
         )
         .await
         .unwrap();
@@ -119,7 +120,7 @@ async fn sanitizes_special_chars() {
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
     let nasty_name = "weird\nname\twith\rctrl";
     let long_path = format!("/tmp/{}", "x".repeat(250));
-    repo::add_repo_ref(&db, ws.id, nasty_name, &long_path, "main", "")
+    repo::add_repo_ref(&db, ws.id, nasty_name, &long_path, "main", "", true)
         .await
         .unwrap();
 
@@ -149,10 +150,10 @@ async fn isolates_workspaces() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let ws1 = repo::create_workspace(&db, "one").await.unwrap();
     let ws2 = repo::create_workspace(&db, "two").await.unwrap();
-    repo::add_repo_ref(&db, ws1.id, "only-one", "/tmp/one", "main", "")
+    repo::add_repo_ref(&db, ws1.id, "only-one", "/tmp/one", "main", "", true)
         .await
         .unwrap();
-    repo::add_repo_ref(&db, ws2.id, "only-two", "/tmp/two", "main", "")
+    repo::add_repo_ref(&db, ws2.id, "only-two", "/tmp/two", "main", "", true)
         .await
         .unwrap();
 

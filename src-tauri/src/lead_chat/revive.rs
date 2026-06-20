@@ -228,7 +228,7 @@ mod tests {
     // git and falls back gracefully on a missing repo, so no real worktree needed.
     async fn fixture(db: &Db) -> (i32, i32) {
         let ws = repo::create_workspace(db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-revive-fake", "main", "")
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-revive-fake", "main", "", true)
             .await
             .unwrap();
         let th = repo::create_thread(db, ws.id, "issue", "feature", "codex")

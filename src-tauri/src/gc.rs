@@ -86,12 +86,25 @@ fn sweep_repo(
     for path in git::list_registered_worktrees(canonical_repo) {
         let pc = canon_str(&path);
         let mtime = dir_mtime_secs(&path);
-        if should_sweep(&pc, home_canon, tracked, ttl, now, mtime) {
-            let _ = git::remove_worktree(canonical_repo, &path);
-            if !path.exists() {
-                eprintln!("[weft] gc: reclaimed orphan worktree {}", path.display());
-                removed += 1;
-            }
+        if !should_sweep(&pc, home_canon, tracked, ttl, now, mtime) {
+            continue;
+        }
+        // A LOCKED worktree is a preserved reused checkout (see materialize's
+        // cleanup/rollback + delete_repo): its DB row is intentionally gone, so the
+        // untracked + under-home + TTL gate above would otherwise mark it for reclaim.
+        // `git worktree remove --force` (a single -f) already refuses a locked worktree
+        // — git requires `-f -f` to override a lock — so the lock itself blocks removal
+        // today; this explicit skip makes that intent first-class (no futile remove
+        // attempt) and keeps the guarantee robust even if `remove_worktree` ever escalates
+        // to `-f -f`. The lock outlives the DB row and a repo re-add, which is exactly why
+        // it — not DB state — is the GC's signal to preserve.
+        if git::is_worktree_locked(canonical_repo, &path) {
+            continue;
+        }
+        let _ = git::remove_worktree(canonical_repo, &path);
+        if !path.exists() {
+            eprintln!("[weft] gc: reclaimed orphan worktree {}", path.display());
+            removed += 1;
         }
     }
     removed
@@ -237,6 +250,47 @@ mod tests {
         assert_eq!(n, 1, "exactly the orphan removed");
         assert!(tracked_wt.join(".git").exists(), "tracked worktree kept");
         assert!(!orphan_wt.exists(), "orphan worktree removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sweep_repo_skips_locked_orphan_reclaims_unlocked() {
+        // R36-3: two untracked orphans under the weft root, both past the TTL. The LOCKED
+        // one (a preserved reused checkout whose DB row was dropped) must survive the GC
+        // fully intact — still on disk, still registered, still locked — while the UNLOCKED
+        // orphan is reclaimed. `sweep_repo` consults the lock and skips it; the lock is also
+        // what git itself enforces (a single `git worktree remove --force` refuses a locked
+        // worktree), so the preservation holds even though the row is gone.
+        let base = std::env::temp_dir().join(format!("weft-gc-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        git::init_repo(&repo).unwrap();
+        let home = crate::materialize::worktree_root(&repo);
+        std::fs::create_dir_all(&home).unwrap();
+        let br = git::current_branch(&repo).unwrap();
+        let locked_wt = home.join("feat").join("locked");
+        let unlocked_wt = home.join("feat").join("unlocked");
+        git::add_worktree(&repo, "feat/locked", &locked_wt, &br).unwrap();
+        git::add_worktree(&repo, "feat/unlocked", &unlocked_wt, &br).unwrap();
+        // Lock the one that represents a preserved reused checkout.
+        git::lock_worktree(&repo, &locked_wt).unwrap();
+        assert!(git::is_worktree_locked(&repo, &locked_wt), "precondition: locked");
+        assert!(!git::is_worktree_locked(&repo, &unlocked_wt), "precondition: unlocked");
+
+        let home_canon = canon_str(&home);
+        // NOTHING is DB-tracked: both are orphans by the row-gone gate. TTL=0 => both old enough.
+        let tracked = set(&[]);
+        let n = sweep_repo(&repo, &home_canon, &tracked, 0, now_secs());
+        assert_eq!(n, 1, "only the unlocked orphan reclaimed");
+        // The locked orphan survives intact: on disk, still a registered worktree, still locked.
+        assert!(locked_wt.join(".git").exists(), "locked orphan survives GC on disk");
+        assert!(
+            git::list_worktrees(&repo).unwrap().iter().any(|(_, b)| b == "feat/locked"),
+            "locked orphan stays a registered worktree after GC"
+        );
+        assert!(git::is_worktree_locked(&repo, &locked_wt), "locked orphan stays locked after GC");
+        // The unlocked orphan is gone.
+        assert!(!unlocked_wt.exists(), "unlocked orphan reclaimed by GC");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

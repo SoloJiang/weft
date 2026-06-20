@@ -108,7 +108,10 @@ async fn register_repo(
             }
         }
     }
-    let mut r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote)
+    // `base` is the repo's real default (default_base_branch: origin/HEAD →
+    // main/master → current branch), so mark it as the captured default — the
+    // offline fallback may trust it over the main/master chain.
+    let mut r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote, true)
         .await
         .map_err(e)?;
     // If dedup resolved to an EXISTING row (by remote) at a different path whose
@@ -302,6 +305,12 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
             if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
                 eprintln!("[weft] worktree remove failed for {path}: {err}");
             }
+        } else {
+            // Reused (non-weft) checkout: keep it as a usable worktree, but LOCK it so the
+            // orphan GC skips it now that its DB row is gone (mirrors cleanup_worktrees).
+            // Locking via git metadata also means a later re-add of this repo can't
+            // re-orphan the checkout.
+            let _ = crate::git::lock_worktree(repo_path, std::path::Path::new(path));
         }
         if *created_branch {
             if let Err(err) = crate::git::delete_branch(repo_path, branch) {

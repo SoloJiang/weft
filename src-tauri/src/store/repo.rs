@@ -320,6 +320,7 @@ pub async fn add_repo_ref(
     local_git_path: &str,
     base_ref: &str,
     remote_url: &str,
+    base_ref_is_default: bool,
 ) -> Result<repo_ref::Model> {
     let existing = repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
@@ -342,6 +343,7 @@ pub async fn add_repo_ref(
         local_git_path: Set(local_git_path.to_string()),
         base_ref: Set(base_ref.to_string()),
         remote_url: Set(remote_url.to_string()),
+        base_ref_is_default: Set(base_ref_is_default),
         ..Default::default()
     };
     Ok(m.insert(&db.0).await?)
@@ -549,11 +551,14 @@ pub async fn set_repo_remote(db: &Db, repo_id: i32, remote_url: &str) -> Result<
 /// Persist a newly-learned default branch for a repo. Called when materialize
 /// discovers (via `live_default_branch`) that the remote's default has changed
 /// since the repo was registered, so future offline fallbacks use the current value.
+/// Also marks `base_ref_is_default = true`: this value IS the live default, so the
+/// offline fallback may now trust it over the main/master chain.
 /// Best-effort: a write hiccup (row gone, DB error) is silently ignored.
 pub async fn set_repo_base_ref(db: &Db, repo_id: i32, base_ref: &str) -> Result<()> {
     if let Some(m) = repo_ref::Entity::find_by_id(repo_id).one(&db.0).await? {
         let mut a: repo_ref::ActiveModel = m.into();
         a.base_ref = Set(base_ref.to_string());
+        a.base_ref_is_default = Set(true);
         a.update(&db.0).await?;
     }
     Ok(())
@@ -1479,12 +1484,13 @@ mod tests {
             "/code/web",
             "main",
             "https://github.com/acme/web.git",
+            true,
         )
         .await
         .unwrap();
 
         // Same local path (any name/remote) → returns the existing row, no insert.
-        let same_path = add_repo_ref(&db, ws.id, "renamed", "/code/web", "main", "")
+        let same_path = add_repo_ref(&db, ws.id, "renamed", "/code/web", "main", "", true)
             .await
             .unwrap();
         assert_eq!(same_path.id, a.id, "same path must not create a second repo");
@@ -1498,6 +1504,7 @@ mod tests {
             "/elsewhere/web",
             "main",
             "https://GitHub.com/acme/web",
+            true,
         )
         .await
         .unwrap();
@@ -1514,6 +1521,7 @@ mod tests {
             "/code/api",
             "main",
             "https://github.com/acme/api.git",
+            true,
         )
         .await
         .unwrap();
@@ -1521,10 +1529,10 @@ mod tests {
 
         // Two local repos with NO remote and different paths both exist — an empty
         // remote key must never collapse distinct repos.
-        let l1 = add_repo_ref(&db, ws.id, "local-1", "/code/l1", "main", "")
+        let l1 = add_repo_ref(&db, ws.id, "local-1", "/code/l1", "main", "", true)
             .await
             .unwrap();
-        let l2 = add_repo_ref(&db, ws.id, "local-2", "/code/l2", "main", "")
+        let l2 = add_repo_ref(&db, ws.id, "local-2", "/code/l2", "main", "", true)
             .await
             .unwrap();
         assert_ne!(l1.id, l2.id, "empty remote must not collapse distinct repos");
@@ -1538,6 +1546,7 @@ mod tests {
             "/code/web",
             "main",
             "https://github.com/acme/web.git",
+            true,
         )
         .await
         .unwrap();
@@ -1554,10 +1563,10 @@ mod tests {
     async fn delete_repo_cascade_removes_repo_and_its_deps_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "")
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
             .await
             .unwrap();
-        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "")
+        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true)
             .await
             .unwrap();
         upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "")
@@ -1668,7 +1677,7 @@ mod tests {
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
         let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let d = create_direction(&db, t.id, "d", "claude", r.id, "x", "plan+impl", "")
             .await
@@ -1701,7 +1710,7 @@ mod tests {
     async fn delete_repo_cascade_carries_created_branch_flag() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "repo", "/tmp/r", "main", "")
+        let r = add_repo_ref(&db, ws.id, "repo", "/tmp/r", "main", "", true)
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "T", "feature", "claude")
@@ -1739,10 +1748,10 @@ mod tests {
     async fn calibrate_repo_relation_adds_user_edge_then_tombstones_removal() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
-        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
             .await
             .unwrap();
         upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "")
@@ -1785,7 +1794,7 @@ mod tests {
 
         // a producer with no profile row yet (an "analyzing" placeholder) gets a
         // minimal row created so the calibration persists instead of vanishing.
-        let lib = add_repo_ref(&db, ws.id, "lib", "/tmp/lib", "main", "")
+        let lib = add_repo_ref(&db, ws.id, "lib", "/tmp/lib", "main", "", true)
             .await
             .unwrap();
         assert!(get_repo_profile(&db, lib.id).await.unwrap().is_none());
@@ -2121,7 +2130,7 @@ mod tests {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
         assert_eq!(ws.slug, "demo-ws");
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
@@ -2179,7 +2188,7 @@ mod tests {
     async fn latest_session_for_returns_newest_with_native() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let thread = create_thread(&db, ws.id, "T", "feature", "claude")
@@ -2305,7 +2314,7 @@ mod tests {
     async fn apply_to_existing_false_pins_old_sessions_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "w").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true).await.unwrap();
         // An existing claude lead + worker, created before any alias.
         let old_thread = create_thread(&db, ws.id, "old", "feature", "claude")
             .await
@@ -2377,7 +2386,7 @@ mod tests {
     async fn rename_updates_display_name_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
@@ -2422,7 +2431,7 @@ mod tests {
         assert!(rename_workspace(&db, ws_b.id, "Alpha").await.is_err());
         assert!(rename_workspace(&db, ws_a.id, "Alpha").await.is_ok());
 
-        let repo = add_repo_ref(&db, ws_a.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws_a.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let t1 = create_thread(&db, ws_a.id, "Login", "feature", "claude")
@@ -2532,7 +2541,7 @@ mod tests {
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let r = add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "")
+        let r = add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();

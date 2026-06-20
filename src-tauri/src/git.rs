@@ -196,18 +196,24 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
 }
 
 /// The default base for the OFFLINE fallback (when `live_default_branch` is
-/// unavailable): prefer the recorded `base_ref` when its REMOTE-tracking ref
-/// `origin/<base_ref>` still resolves — a genuinely-captured live default has a
-/// matching `origin/<base_ref>`, so this is more trustworthy than a possibly stale
-/// cached `origin/HEAD`. A LOCAL-only `base_ref` is NOT trusted here: on an upgraded
-/// DB `base_ref` was the repo's CURRENT branch at add time (e.g. a feature branch),
-/// not the default — trusting a local-only ref would pin that legacy feature branch
-/// offline. Otherwise fall through to `default_base_branch` (which still considers a
-/// local `base_ref`, but only AFTER main/master). Returns a bare branch name (no `origin/`).
-pub fn recorded_base_or_default(repo: &Path, base_ref: &str) -> String {
+/// unavailable): prefer the recorded `base_ref` when it was captured as the repo's
+/// real DEFAULT branch (`is_default`) AND it still resolves (local `<base_ref>` or
+/// remote `origin/<base_ref>`) — a genuinely-captured default is more trustworthy
+/// than a possibly stale cached `origin/HEAD`. `is_default` is the load-bearing
+/// signal: a LEGACY base_ref (the pre-marker current-branch capture on an upgraded
+/// DB) is NOT trusted even when it resolves, because a pushed legacy feature branch
+/// whose `origin/<base_ref>` exists is indistinguishable BY VALUE from a real
+/// non-standard default — trusting it would pin new work to that legacy branch.
+/// Otherwise fall through to `default_base_branch` (cached origin/HEAD → main/master
+/// → a resolvable base_ref → main). Returns a bare branch name (no `origin/`).
+pub fn recorded_base_or_default(repo: &Path, base_ref: &str, is_default: bool) -> String {
     let b = base_ref.trim();
     let b = b.strip_prefix("origin/").unwrap_or(b);
-    if !b.is_empty() && b != "HEAD" && ref_resolves(repo, &format!("origin/{b}")) {
+    if is_default
+        && !b.is_empty()
+        && b != "HEAD"
+        && (ref_resolves(repo, b) || ref_resolves(repo, &format!("origin/{b}")))
+    {
         return b.to_string();
     }
     default_base_branch(repo, base_ref)
@@ -478,16 +484,45 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stop tracking `worktree_path` as a git worktree of `repo` WITHOUT deleting the
-/// directory or its contents: drop the worktree's `.git` gitdir-pointer file (leaving a
-/// plain directory) and prune the now-stale admin entry. Used to DURABLY preserve a
-/// reused (non-weft-created) checkout — `gc::sweep_orphan_worktrees` reclaims REGISTERED
-/// worktrees under weft's root that are no longer DB-tracked, so unregistering keeps the
-/// preserved checkout from being swept after the TTL once its row is dropped.
-pub fn unregister_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
-    std::fs::remove_file(worktree_path.join(".git")).ok();
-    git(repo, &["worktree", "prune"]).ok();
+/// Mark `worktree_path` as a LOCKED git worktree of `repo` (`git worktree lock`).
+/// Used to DURABLY preserve a reused (non-weft-created) checkout: it stays a real,
+/// usable git worktree (its `.git` pointer is kept), and the lock protects it from
+/// the orphan-worktree GC — `gc::sweep_repo` skips locked entries so the preserved
+/// checkout survives even after its weft DB row is dropped (and across a repo re-add,
+/// since the lock lives in the repo's git metadata, not weft's DB). Idempotent: an
+/// "already locked" error is treated as success. Best-effort otherwise.
+pub fn lock_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
+    let path_str = worktree_path.to_string_lossy().to_string();
+    // `git worktree lock` errors if the worktree is already locked — that's the
+    // desired end state, so swallow it (and any other error: locking is a
+    // best-effort hardening, never a hard failure of teardown).
+    git(repo, &["worktree", "lock", &path_str]).ok();
     Ok(())
+}
+
+/// Whether git considers `worktree_path` a LOCKED worktree of `repo`. Parses the
+/// `locked` line (optionally with a reason) that `git worktree list --porcelain`
+/// emits for a locked entry, following its `worktree`/`HEAD`/`branch` block — the
+/// same position `prunable` occupies in [`list_worktrees`]. Path comparison is by
+/// canonicalized form so a symlinked/`..` spelling still matches. Best-effort:
+/// false on any git error.
+pub fn is_worktree_locked(repo: &Path, worktree_path: &Path) -> bool {
+    let want =
+        std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+    let Ok(out) = git(repo, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    let mut cur_match = false;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            let entry =
+                std::fs::canonicalize(p.trim()).unwrap_or_else(|_| PathBuf::from(p.trim()));
+            cur_match = entry == want;
+        } else if cur_match && (line == "locked" || line.starts_with("locked ")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Delete a (weft-namespaced) branch from `repo`, ignoring "not found".
@@ -1774,8 +1809,8 @@ mod tests {
     #[test]
     fn recorded_base_or_default_prefers_resolvable_base_ref_over_cached_origin_head() {
         // A clone whose cached origin/HEAD points at `main`, but the recorded base_ref
-        // is `develop` (e.g. captured live at register). Offline, we must prefer the
-        // recorded develop, not the stale cached main.
+        // is `develop` CAPTURED AS THE DEFAULT (is_default=true) at register. Offline, we
+        // must prefer the recorded develop, not the stale cached main.
         let origin = tmp("rbod-origin");
         init_repo(&origin).unwrap();
         let main = current_branch(&origin).unwrap();
@@ -1787,11 +1822,11 @@ mod tests {
         // clone's origin/HEAD → origin/main (the origin's default). develop is fetched.
         assert!(ref_resolves(&clone, "origin/develop"));
         // default_base_branch prefers cached origin/HEAD (main); recorded_base_or_default
-        // prefers the resolvable recorded base_ref (develop).
+        // prefers the resolvable CAPTURED-DEFAULT base_ref (develop).
         assert_eq!(default_base_branch(&clone, "develop"), main, "default_base_branch is origin/HEAD-first");
-        assert_eq!(recorded_base_or_default(&clone, "develop"), "develop", "recorded base_ref preferred when it resolves");
+        assert_eq!(recorded_base_or_default(&clone, "develop", true), "develop", "captured-default base_ref preferred when it resolves");
         // A non-resolving recorded base falls back to the default chain.
-        assert_eq!(recorded_base_or_default(&clone, "no-such-xyz"), main);
+        assert_eq!(recorded_base_or_default(&clone, "no-such-xyz", true), main);
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
     }
@@ -1799,9 +1834,9 @@ mod tests {
     #[test]
     fn recorded_base_or_default_ignores_local_only_legacy_base_ref() {
         // On an upgraded DB, base_ref was the repo's CURRENT branch at add time — a LOCAL
-        // feature branch (no origin/<base_ref>), NOT the live default. Offline, that
-        // local-only base_ref must NOT be trusted (else new work branches off the legacy
-        // feature branch); the main-family default must win instead.
+        // feature branch (no origin/<base_ref>), NOT the live default (is_default=false).
+        // Offline, that legacy base_ref must NOT be trusted (else new work branches off the
+        // legacy feature branch); the main-family default must win instead.
         let repo = tmp("rbod-local-legacy");
         init_repo(&repo).unwrap();
         let def = current_branch(&repo).unwrap(); // main or master
@@ -1809,10 +1844,40 @@ mod tests {
         git(&repo, &["branch", "feature/foo"]).unwrap();
         assert!(ref_resolves(&repo, "feature/foo"), "precondition: local feature/foo exists");
         assert!(!ref_resolves(&repo, "origin/feature/foo"), "precondition: no remote feature/foo");
-        let got = recorded_base_or_default(&repo, "feature/foo");
-        assert_eq!(got, def, "a local-only legacy base_ref must fall through to the main-family default");
+        let got = recorded_base_or_default(&repo, "feature/foo", false);
+        assert_eq!(got, def, "a legacy base_ref must fall through to the main-family default");
         assert_ne!(got, "feature/foo", "must not trust the legacy local feature branch");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn recorded_base_or_default_ignores_legacy_base_ref() {
+        // R36-1: a PUSHED legacy base_ref — `feature/foo` whose remote-tracking
+        // `origin/feature/foo` EXISTS — is indistinguishable BY VALUE from a real
+        // non-standard default. The is_default marker is the only signal: with
+        // is_default=false (legacy current-branch capture on an upgraded DB), the
+        // main-family default (cached origin/HEAD=main) must win, NOT feature/foo.
+        let origin = tmp("rbod-pushed-legacy-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        // origin also has a feature/foo branch (so the clone fetches origin/feature/foo).
+        git(&origin, &["checkout", "-q", "-b", "feature/foo"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "f"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        let clone = tmp("rbod-pushed-legacy-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        // Precondition: the pushed legacy branch DOES resolve via its remote-tracking ref,
+        // and the clone's cached origin/HEAD points at main.
+        assert!(ref_resolves(&clone, "origin/feature/foo"), "precondition: origin/feature/foo exists");
+        assert_eq!(remote_default_branch(&clone).as_deref(), Some(main.as_str()), "precondition: origin/HEAD → main");
+        // With is_default=false the pushed legacy base_ref must NOT win, even though it resolves.
+        let got = recorded_base_or_default(&clone, "feature/foo", false);
+        assert_eq!(got, main, "a pushed legacy base_ref must fall through to the real default");
+        assert_ne!(got, "feature/foo", "must not trust the legacy pushed feature branch");
+        // Sanity: flipping the marker to true (a genuine non-standard default) DOES trust it.
+        assert_eq!(recorded_base_or_default(&clone, "feature/foo", true), "feature/foo", "a captured-default base_ref is trusted when it resolves");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
     }
 
     #[test]

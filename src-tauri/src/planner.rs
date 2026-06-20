@@ -117,6 +117,7 @@ fn reconcile_reuse(
     proposed_base: &str,
     repo_path: &std::path::Path,
     base_ref: &str,
+    base_ref_is_default: bool,
 ) -> Result<()> {
     let effective = |b: &str| -> String {
         let b = b.trim();
@@ -124,8 +125,9 @@ fn reconcile_reuse(
             // Match materialize's resolution: live default, else the recorded base_ref
             // (the live default captured at register) when it still resolves, else the
             // cached chain — so the reuse comparison agrees with what was materialized.
-            crate::git::live_default_branch(repo_path)
-                .unwrap_or_else(|| crate::git::recorded_base_or_default(repo_path, base_ref))
+            crate::git::live_default_branch(repo_path).unwrap_or_else(|| {
+                crate::git::recorded_base_or_default(repo_path, base_ref, base_ref_is_default)
+            })
         } else {
             b.strip_prefix("origin/").unwrap_or(b).to_string()
         }
@@ -286,6 +288,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 &d.base_branch,
                 std::path::Path::new(&repo_ref.local_git_path),
                 &repo_ref.base_ref,
+                repo_ref.base_ref_is_default,
             ) {
                 rollback_created(db, &created_now).await;
                 return Err(err);
@@ -395,6 +398,7 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
             &resolved.base_branch,
             std::path::Path::new(&repo_ref.local_git_path),
             &repo_ref.base_ref,
+            repo_ref.base_ref_is_default,
         )?;
         // Already created (e.g. the lead re-proposed and the decision was reset).
         // Idempotent: don't create a second direction/worktree, but DO re-materialize
@@ -789,7 +793,7 @@ mod tests {
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "")
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
             .await
             .unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
@@ -904,7 +908,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale: "r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
@@ -939,7 +943,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api"); // local repo, only the default branch, no remote
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // An explicit base that does not exist locally or on a remote.
         let proposal = Proposal { rationale: "r".into(), directions: vec![
@@ -976,7 +980,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // The proposal approve will READ (a valid default base → create+materialize succeed).
         let original = Proposal { rationale:"r".into(), directions: vec![
@@ -1037,7 +1041,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale: "r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
@@ -1069,7 +1073,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale:"r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
@@ -1111,7 +1115,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // Lane A: default base (ok). Lane B: bad explicit base → materialize fails.
         let proposal = Proposal { rationale:"r".into(), directions: vec![
@@ -1148,7 +1152,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale:"r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
@@ -1183,7 +1187,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // The lead re-proposed the SAME lane name/repo with a base of "develop" (e.g. the
         // fresh value). A stale blur-save from the OLD proposal was editing FROM "" → its
@@ -1220,7 +1224,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
@@ -1258,7 +1262,7 @@ mod tests {
         let def = crate::git::current_branch(&repo_path).unwrap(); // repo default (main/master)
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &def, "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &def, "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
@@ -1290,7 +1294,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale:"r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
@@ -1322,7 +1326,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
@@ -1359,7 +1363,7 @@ mod tests {
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "")
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
             .await
             .unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
@@ -1399,7 +1403,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // Approve A (empty base) via Needs-you → A materialized.
         let prop_a = Proposal { rationale: "r".into(), directions: vec![
@@ -1440,7 +1444,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
             ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
@@ -1489,7 +1493,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
             ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
@@ -1536,7 +1540,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
         // Lane A is approved via approve_direction (decision="approved").
@@ -1591,7 +1595,7 @@ mod tests {
         let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
             ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
@@ -1653,12 +1657,12 @@ mod tests {
         let repo_path = std::path::Path::new("/tmp/weft-nonexistent-reconcile-head");
 
         // Blank re-proposal: must NOT error.
-        let result = reconcile_reuse(&existing, "", repo_path, "main");
+        let result = reconcile_reuse(&existing, "", repo_path, "main", true);
         assert!(result.is_ok(), "R18-4: blank re-proposal must reuse a HEAD-based direction, got: {:?}", result.err());
 
         // An explicit non-empty base against a HEAD-based direction: must still conflict
         // (we only relax the blank-proposal case).
-        let conflict = reconcile_reuse(&existing, "develop", repo_path, "main");
+        let conflict = reconcile_reuse(&existing, "develop", repo_path, "main", true);
         assert!(conflict.is_err(), "R18-4: explicit base against HEAD-based direction must conflict");
     }
 }

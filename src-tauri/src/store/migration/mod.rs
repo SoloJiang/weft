@@ -37,6 +37,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0024DirectionBaseBranch),
             Box::new(M0025WorktreeCreatedBranch),
             Box::new(M0026WorktreeCreatedCheckout),
+            Box::new(M0027RepoRefBaseRefIsDefault),
         ]
     }
 }
@@ -1053,6 +1054,56 @@ impl MigrationTrait for M0026WorktreeCreatedCheckout {
                 Table::alter()
                     .table(Alias::new("worktree"))
                     .drop_column(Alias::new("created_checkout"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds repo_ref.base_ref_is_default: whether `base_ref` was captured as the repo's
+/// real default branch (true) vs. a legacy current-branch capture on an upgraded DB
+/// (false). The offline fallback (`recorded_base_or_default`) only trusts `base_ref`
+/// over the default chain when this is true — a legacy base_ref (even a pushed
+/// feature branch whose `origin/<base_ref>` resolves) is indistinguishable from a
+/// genuine non-standard default by value alone, so the marker is the only signal.
+/// Existing/legacy rows default to FALSE (their base_ref was the current-branch
+/// capture, not a vetted default). M0001 reflects the current entity, so a FRESH db
+/// already has it; sqlite has no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0027RepoRefBaseRefIsDefault;
+impl MigrationName for M0027RepoRefBaseRefIsDefault {
+    fn name(&self) -> &str {
+        "m0027_repo_ref_base_ref_is_default"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0027RepoRefBaseRefIsDefault {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_ref"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("base_ref_is_default"))
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_ref"))
+                    .drop_column(Alias::new("base_ref_is_default"))
                     .to_owned(),
             )
             .await
