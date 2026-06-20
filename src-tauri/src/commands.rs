@@ -239,6 +239,10 @@ pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
 /// caller can refresh the graph; coalesced with any in-flight pass.
 #[tauri::command]
 pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
+    // This is an EXPLICIT user re-run, so retry repos whose last classify failed:
+    // clear their failed state first, otherwise `analyze_workspace`'s background
+    // anti-storm skip would ignore them and only refresh relations.
+    crate::curator::clear_failed_states(&db, workspace_id).await;
     crate::curator::analyze_workspace_coalesced(&db, workspace_id).await;
     Ok(())
 }

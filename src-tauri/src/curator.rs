@@ -863,6 +863,20 @@ fn run_error(id: i32) -> Option<String> {
     run_lock().get(&id).and_then(|r| r.error.clone())
 }
 
+/// Clear the `failed` run-state for every repo in a workspace, so an EXPLICIT
+/// user re-run ("Analyze deps") isn't suppressed by the background anti-storm
+/// skip that ignores `failed` repos. Returns to idle → eligible for re-analysis.
+pub async fn clear_failed_states(db: &Db, workspace_id: i32) {
+    let Ok(repos) = repo::list_repos(db, workspace_id).await else {
+        return;
+    };
+    for r in repos {
+        if run_phase(r.id) == "failed" {
+            run_finish_ok(r.id);
+        }
+    }
+}
+
 /// Whether a repo currently carries a usable (canonical) tier classification.
 /// This is the success criterion for an analysis run: the repo is classified iff
 /// it has a canonical tier — one just written this run, or a prior one preserved
@@ -1038,6 +1052,11 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     }
     let (ws, rid) = (repo.workspace_id, repo.id);
     emit_repo_analysis(ws, rid, "started", None, None);
+    // Also refresh the graph so an UNSELECTED card flips to `running` immediately:
+    // the per-repo `started` stream is only observed for the selected repo, and
+    // `repo-graph-updated` otherwise fires only when the (minutes-long) run ends —
+    // without this, a reprofiled-but-unselected card sits stale for the whole run.
+    emit_graph_updated(ws);
     let tool = crate::tools::default_tool(db).await;
     let prompt = build_repo_class_prompt(&repo.name);
     // Capture HEAD BEFORE the (minutes-long) run so the stored `profiled_commit`
@@ -1363,6 +1382,22 @@ mod tests {
         super::run_finish_ok(101);
         assert_eq!(super::run_phase(101), "idle");
         assert_eq!(super::run_error(101), None);
+    }
+
+    #[tokio::test]
+    async fn clear_failed_states_clears_only_failed() {
+        // An explicit "Analyze deps" clears failed repos so the background
+        // anti-storm skip doesn't suppress the retry; a running repo is untouched.
+        super::run_state_clear_all_for_test();
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let a = repo::add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "").await.unwrap();
+        let b = repo::add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "").await.unwrap();
+        super::run_finish_err(a.id, "boom".into());
+        super::run_begin(b.id);
+        super::clear_failed_states(&db, ws.id).await;
+        assert_eq!(super::run_phase(a.id), "idle", "failed → cleared, eligible for retry");
+        assert_eq!(super::run_phase(b.id), "running", "a running repo is left alone");
     }
 
     #[tokio::test]
