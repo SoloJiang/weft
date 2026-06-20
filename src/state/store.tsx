@@ -1724,12 +1724,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // thread's pending save before acting (the field saves on blur fire-and-forget), and
   // a cross-thread reset must never corrupt another thread's serialization chain.
   const pendingBaseSave = useRef<Map<number, Promise<unknown>>>(new Map());
-  // Latches true if ANY queued base save in the current chain rejected — the chain's
-  // `.catch` swallows predecessors for serialization, so confirm/approve consult this
-  // latch (not just the final promise) before acting.
-  // Per-thread: a base save that fails in thread A must not block Create/approve in
-  // thread B. Holds the ids of threads whose in-flight base save rejected.
-  const baseSaveFailed = useRef<Set<number>>(new Set());
+  // Base saves that rejected, keyed thread → set of failed LANE identities
+  // (`name\0repo`). The chain's `.catch` swallows predecessors for serialization, so
+  // confirm/approve consult this latch (not just the final promise) before acting.
+  // Per-LANE within a thread: a successful retry of one lane clears only THAT lane's
+  // failure, so a different lane's success can't mask an earlier lane's stale base;
+  // confirm/approve abort while the thread still has ANY unrecovered lane failure.
+  const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
 
   const confirmProposal = useCallback(async () => {
     if (activeThreadId == null) return;
@@ -1748,7 +1749,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Also abort if any EARLIER link in the chain failed — the chain's
     // `.catch(() => {})` swallows predecessors for serialization, so the final
     // promise may resolve even when a prior save rejected.
-    if (baseSaveFailed.current.has(activeThreadId)) {
+    if ((baseSaveFailed.current.get(activeThreadId)?.size ?? 0) > 0) {
       baseSaveFailed.current.delete(activeThreadId);
       await refreshProposal(activeThreadId);
       return;
@@ -1765,6 +1766,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     (index: number, name: string, repo: string, base: string): Promise<void> => {
       if (activeThreadId == null) return Promise.resolve();
       const tid = activeThreadId;
+      const laneKey = `${name} ${repo}`;
       // Serialize onto any in-flight base save (chain, don't replace) and use the
       // targeted server-side setter — no whole-proposal rebuild from stale state,
       // no status downgrade. confirm/approve await pendingBaseSave before acting.
@@ -1772,10 +1774,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         .catch(() => {})
         .then(() => api.setProposalDirectionBase(tid, index, name, repo, base.trim()))
         .then(() => {
-          // This save LANDED — clear any prior failure latch for this thread, so a
-          // successful retry after an earlier failure isn't still treated as failed
-          // by the next Create/Approve (which would spuriously abort + refresh).
-          baseSaveFailed.current.delete(tid);
+          // This LANE's save LANDED — clear ONLY this lane's failure (not the whole
+          // thread), so a successful retry isn't treated as failed by the next
+          // Create/Approve, while a DIFFERENT lane's earlier failure stays latched.
+          baseSaveFailed.current.get(tid)?.delete(laneKey);
           // Don't let a save that completes after a thread switch overwrite the
           // global proposal with the old thread's data.
           if (activeThreadIdRef.current === tid) {
@@ -1788,7 +1790,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // earlier rejections for serialization purposes; this terminal catch sets
           // the latch and re-throws so THIS link's own promise also rejects (the
           // NEXT edit's `.catch(() => {})` will swallow it in turn).
-          baseSaveFailed.current.add(tid);
+          const set = baseSaveFailed.current.get(tid) ?? new Set<string>();
+          set.add(laneKey);
+          baseSaveFailed.current.set(tid, set);
           throw err;
         });
       pendingBaseSave.current.set(tid, p);
@@ -1824,7 +1828,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Also abort if any EARLIER link in the chain failed — the chain's
       // `.catch(() => {})` swallows predecessors for serialization, so the final
       // promise may resolve even when a prior save rejected.
-      if (baseSaveFailed.current.has(item.thread_id)) {
+      if ((baseSaveFailed.current.get(item.thread_id)?.size ?? 0) > 0) {
         baseSaveFailed.current.delete(item.thread_id);
         if (activeThreadId != null) await refreshProposal(activeThreadId);
         return;
