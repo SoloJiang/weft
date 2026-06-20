@@ -421,21 +421,27 @@ pub fn add_worktree_synced(
                 worktree_path.display()
             );
         }
-        // For an EXPLICIT base, the registered branch must also DESCEND from the requested
-        // base — mirroring the `-b` fallback's ancestry check. A checkout registered for
-        // this branch but forked elsewhere (e.g. `feat/x` off main, now reused for an
-        // explicit `base_branch=release` lane) would otherwise record base=release while
-        // the worktree sits on main's line. `resolved_opt` is Some here whenever
-        // require_resolvable passed (the bail above guarantees it).
-        if require_resolvable {
-            if let Some(resolved) = resolved_opt.as_ref() {
-                if !branch_descends_from(repo, branch, resolved) {
-                    bail!(
-                        "branch {branch:?} already checked out but is not based on {resolved:?}; \
-                         refusing to record a mismatched base"
-                    );
-                }
-            }
+        // The registered branch must also DESCEND from the resolved base — mirroring the
+        // `-b` fallback's ancestry check. A checkout registered for this branch but forked
+        // elsewhere (e.g. `feat/x` off main, now reused for a `release` lane) would otherwise
+        // record base=release while the worktree sits on main's line. Validate WHENEVER the
+        // resolved base RESOLVES as a ref, regardless of require_resolvable: a BLANK-base lane
+        // (require_resolvable=false) still records the CURRENT resolved default as its base, so
+        // a reused branch not descending from it is just as wrong. `resolved_opt` is None for a
+        // blank base, so fall back to resolve_base_ref the same way the create path does. Skip
+        // when the base is HEAD or doesn't resolve (e.g. base gone): a surviving registered
+        // checkout can still be reused when its base is gone.
+        let resolved_base = resolved_opt
+            .clone()
+            .unwrap_or_else(|| resolve_base_ref(repo, &t));
+        if resolved_base != "HEAD"
+            && ref_resolves(repo, &resolved_base)
+            && !branch_descends_from(repo, branch, &resolved_base)
+        {
+            bail!(
+                "branch {branch:?} already checked out but is not based on {resolved_base:?}; \
+                 refusing to record a mismatched base"
+            );
         }
         return Ok(WorktreeAdd {
             path: worktree_path.to_path_buf(),
@@ -459,12 +465,16 @@ pub fn add_worktree_synced(
     git(repo, &["worktree", "prune"]).ok();
     let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &resolved]);
     if res.is_err() {
-        // Branch likely already exists (the name appeared after weft chose it). For an
-        // EXPLICIT base, verify the pre-existing branch actually descends from the
-        // requested base before reusing it — otherwise the lane would be recorded as
-        // based on `resolved` while its worktree sits on a branch forked elsewhere.
-        if require_resolvable
-            && !resolved.is_empty()
+        // Branch likely already exists (the name appeared after weft chose it). Verify the
+        // pre-existing branch actually descends from the resolved base before reusing it —
+        // otherwise the lane would be recorded as based on `resolved` while its worktree sits
+        // on a branch forked elsewhere. Validate WHENEVER the resolved base RESOLVES as a ref,
+        // regardless of require_resolvable: a BLANK base whose resolved default resolves (the
+        // common case) must still reject a branch forked off a DIFFERENT base. Skip only when
+        // the base is HEAD or doesn't resolve (e.g. detached / base gone), where a surviving
+        // pre-existing branch can still be checked out.
+        if resolved != "HEAD"
+            && ref_resolves(repo, &resolved)
             && !branch_descends_from(repo, branch, &resolved)
         {
             bail!(
@@ -1946,6 +1956,49 @@ mod tests {
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_existing_branch_not_from_resolved_default_for_blank_base() {
+        // R38-1: even for a BLANK base (require_resolvable=false), the `-b` fallback's
+        // ancestry check must fire when the RESOLVED default base RESOLVES as a ref. If the
+        // deterministic branch name pre-exists forked off a DIFFERENT base than the resolved
+        // default (an old default, a release line, …), reusing it would dispatch a worker on
+        // a branch not descending from the base materialize records (the current default).
+        // Validate whenever the resolved base resolves, regardless of the flag.
+        let repo = tmp("aws-blank-mismatch");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+
+        // (A) A pre-existing branch with a DISJOINT history (an orphan, modelling a branch
+        // forked off a different/old base), so it does NOT descend from the resolved default
+        // (main). Reusing it via the -b fallback for a BLANK base must be rejected, even
+        // though require_resolvable=false.
+        git(&repo, &["checkout", "-q", "--orphan", "feat/x"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "orphan work"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+        assert!(
+            !branch_descends_from(&repo, "feat/x", &main),
+            "precondition: orphan feat/x does not descend from the resolved default"
+        );
+        let wt_a = tmp("aws-blank-mismatch-a");
+        assert!(
+            add_worktree_synced(&repo, "feat/x", &wt_a, "", false).is_err(),
+            "blank base: existing branch not descending from the resolved default must be rejected"
+        );
+
+        // (B) A pre-existing branch based on the resolved default (main) → reused, Ok.
+        git(&repo, &["branch", "feat/y", &main]).unwrap();
+        let wt_b = tmp("aws-blank-mismatch-b");
+        assert!(
+            add_worktree_synced(&repo, "feat/y", &wt_b, "", false).is_ok(),
+            "blank base: existing branch descending from the resolved default is reused"
+        );
+
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
     }
 
 }

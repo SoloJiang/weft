@@ -103,7 +103,20 @@ pub async fn materialize_direction(
         // through to the recreate path below, whose add_worktree_synced fast-path then
         // bails on the non-registered/mismatched dir — surfacing the problem instead of
         // dispatching into it.
-        if git::is_registered_worktree(repo_path, wt_path, &existing.branch) {
+        //
+        // R38-3: registration alone is not enough. For an EXPLICIT base (`base_branch`
+        // non-empty) that STILL RESOLVES, the registered work branch must also DESCEND from
+        // it. A still-registered branch externally reset/recreated off a DIFFERENT base (e.g.
+        // a `release` lane reset onto `main`) would otherwise be returned idempotently and
+        // dispatched as release-based though it no longer descends from release. When it
+        // doesn't descend, fall through to the recreate path, whose R37-2 guard then bails
+        // with a clear error. Don't validate for a blank base or a base that no longer
+        // resolves (a gone base must not block resuming a surviving branch).
+        let explicit_base = dir.base_branch.trim();
+        let base_mismatch = !explicit_base.is_empty()
+            && git::ref_resolves(repo_path, explicit_base)
+            && !git::branch_descends_from(repo_path, &existing.branch, explicit_base);
+        if git::is_registered_worktree(repo_path, wt_path, &existing.branch) && !base_mismatch {
             return Ok(vec![existing]);
         }
         // The dir was reclaimed (remove_direction_worktree) or replaced, but the row (and
@@ -1339,6 +1352,92 @@ mod tests {
             "a surviving work branch that still descends from its explicit base must re-materialize"
         );
         assert!(wt_b.exists(), "worktree recreated by checking out the surviving work branch");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R38-3: the idempotent early-return must also validate explicit-base ancestry, not just
+    /// `is_registered_worktree`. A direction with `base_branch="release"` whose STILL-REGISTERED
+    /// work branch was externally reset/recreated off `main` (no longer descending from release)
+    /// must NOT be returned idempotently as release-based on a confirm/approve retry — it falls
+    /// through to the recreate path, whose R37-2 guard then bails. When the branch still descends
+    /// from release the early-return is idempotent Ok (the normal reuse). (Validated only for an
+    /// EXPLICIT base that still resolves; a blank or gone base does not validate.)
+    #[tokio::test]
+    async fn materialize_idempotent_rejects_registered_branch_reset_off_other_base() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-idem-reset-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // release: one commit AHEAD of main (so main does NOT descend from release).
+        g(&["checkout", "-q", "-b", "release"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "release work"]);
+        let release_sha = sha("release");
+        g(&["checkout", "-q", &main]);
+        let main_sha = sha(&main);
+        assert_ne!(release_sha, main_sha, "release must be ahead of main");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // ---- Case A: registered work branch reset OFF main (not descending from release) → Err. ----
+        let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
+        let branch_a = wts_a[0].branch.clone();
+        assert_eq!(sha(&branch_a), release_sha, "precondition: work branch forked off release");
+        // The worktree STAYS REGISTERED (this is the idempotent early-return path). Externally
+        // reset the checked-out work branch to main FROM WITHIN ITS WORKTREE (git refuses to
+        // force-update a branch checked out elsewhere).
+        Cmd::new("git").args(["reset", "--hard", &main_sha]).current_dir(&wt_a).status().unwrap();
+        assert_eq!(sha(&branch_a), main_sha, "precondition: registered work branch reset to main");
+        assert!(crate::git::is_registered_worktree(&repo_path, &wt_a, &branch_a),
+            "precondition: the worktree is still registered on the work branch");
+        assert!(crate::git::ref_resolves(&repo_path, "release"), "precondition: explicit base still resolves");
+        // Re-materialize: must NOT idempotently return the registered-but-mismatched worktree.
+        assert!(
+            materialize_direction(&db, dir_a.id).await.is_err(),
+            "a registered work branch reset off a different base than its explicit base must not be returned idempotently"
+        );
+
+        // ---- Case B: registered work branch still descends from release → idempotent Ok. ----
+        let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
+        let branch_b = wts_b[0].branch.clone();
+        assert!(crate::git::branch_descends_from(&repo_path, &branch_b, "release"),
+            "precondition: work branch still descends from release");
+        // The worktree stays registered + valid → the early-return is idempotent Ok.
+        assert!(
+            materialize_direction(&db, dir_b.id).await.is_ok(),
+            "a registered work branch still descending from its explicit base must return idempotently"
+        );
+        assert!(wt_b.exists(), "the still-valid worktree survives the idempotent reuse");
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
