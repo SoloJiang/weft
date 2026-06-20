@@ -36,6 +36,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0023RepoProfileComponents),
             Box::new(M0024DirectionBaseBranch),
             Box::new(M0025WorktreeCreatedBranch),
+            Box::new(M0026WorktreeCreatedCheckout),
         ]
     }
 }
@@ -996,6 +997,54 @@ impl MigrationTrait for M0025WorktreeCreatedBranch {
                 Table::alter()
                     .table(Alias::new("worktree"))
                     .drop_column(Alias::new("created_branch"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds worktree.created_checkout: whether Weft created this worktree directory
+/// (vs. reusing a pre-existing path). Rollback and cascade cleanup only call
+/// `git worktree remove` when this is true — a reused pre-existing path must
+/// survive rollback. Existing rows default to true (they ARE genuine Weft
+/// checkouts, safe to remove on teardown). M0001 reflects the current entity,
+/// so a FRESH db already has it; sqlite has no ADD COLUMN IF NOT EXISTS, so
+/// tolerate the duplicate.
+pub struct M0026WorktreeCreatedCheckout;
+impl MigrationName for M0026WorktreeCreatedCheckout {
+    fn name(&self) -> &str {
+        "m0026_worktree_created_checkout"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0026WorktreeCreatedCheckout {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("created_checkout"))
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .drop_column(Alias::new("created_checkout"))
                     .to_owned(),
             )
             .await

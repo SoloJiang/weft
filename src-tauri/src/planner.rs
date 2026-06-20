@@ -106,6 +106,12 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
 /// before base tracking) whose true base is unknown. Compares EFFECTIVE bases —
 /// empty resolves via the LIVE remote default (cached fallback), non-empty strips
 /// `origin/`. Ok(()) = safe to reuse; Err = reject (delete + recreate).
+///
+/// Treats an existing recorded base of `"HEAD"` as equivalent to an empty/default
+/// base: it means the blank-base path fell all the way back to the detached HEAD
+/// (no main/master in the repo) — a blank re-proposal is the same intent and must
+/// reuse safely without a conflict. Only genuinely different explicit bases
+/// (e.g. existing "develop" vs proposed "main") are treated as conflicts.
 fn reconcile_reuse(
     existing: &crate::store::entities::direction::Model,
     proposed_base: &str,
@@ -134,7 +140,15 @@ fn reconcile_reuse(
         }
         return Ok(());
     }
-    if effective(&existing.base_branch) != effective(proposed_base) {
+    // "HEAD" as the recorded base means the blank-base fallback landed on a detached
+    // HEAD (no main/master branch in the repo). A blank re-proposal is the same
+    // default intent — allow reuse without treating it as a genuine base mismatch.
+    // Only a truly non-empty, non-HEAD explicit base is considered a conflict.
+    let existing_base = existing.base_branch.trim();
+    if existing_base == "HEAD" && proposed_base.trim().is_empty() {
+        return Ok(());
+    }
+    if effective(existing_base) != effective(proposed_base) {
         anyhow::bail!(
             "direction {:?} already exists with base {:?}; delete the sub-task to recreate it from {:?}",
             existing.name, existing.base_branch, proposed_base
@@ -210,9 +224,12 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // - decision was NOT "approved" or "denied" at confirm time (those are handled
     //   by approve_direction / deny_direction and must not be re-dispatched here).
     // This mirrors exactly the lane-selection filter in the main confirm path below.
+    // Re-materialize each lane before returning so a reclaimed worktree dir is
+    // recreated and the dispatched worker has a live checkout. materialize_direction
+    // is idempotent when the dir already exists.
     if resolved.status == "confirmed" {
         let all = repo::list_directions(db, thread_id).await?;
-        let ids = all
+        let matching: Vec<i32> = all
             .into_iter()
             .filter(|d| {
                 resolved.directions.iter().any(|p| {
@@ -225,7 +242,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             })
             .map(|d| d.id)
             .collect();
-        return Ok(ids);
+        for &id in &matching {
+            materialize::materialize_direction(db, id).await?;
+        }
+        return Ok(matching);
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;
     let tool = crate::tools::default_tool(db).await;
@@ -1370,5 +1390,91 @@ mod tests {
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R18-3: confirmed fast-path re-materializes a reclaimed worktree dir. After
+    /// confirm, a lane's dir is reclaimed; a retry of confirm (still "confirmed")
+    /// must recreate the dir so the dispatched worker has a live checkout.
+    #[tokio::test]
+    async fn confirmed_fast_path_rematerializes_reclaimed_lane() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-remat-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // First confirm: creates and materializes lane A.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let first_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(first_ids.len(), 1);
+        let dir_id = first_ids[0];
+
+        // Find the worktree and reclaim it (remove the on-disk dir).
+        let wts = repo::list_worktrees(&db, Some(dir_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row after first confirm");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: dir must be gone before retry");
+
+        // The plan is now "confirmed". A retry (fast-path) must recreate the dir.
+        let second_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(second_ids, vec![dir_id], "fast-path retry returns the existing id");
+        assert!(wt_path.exists(), "R18-3: fast-path retry must re-materialize the reclaimed dir");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R18-4: reconcile_reuse treats a recorded base of "HEAD" as equivalent to an
+    /// empty/default proposed base — a blank re-proposal must reuse a HEAD-based
+    /// direction without a conflict error.
+    #[test]
+    fn reconcile_reuse_treats_head_as_default() {
+        use crate::store::entities::direction;
+        // Build a minimal direction model with base_branch="HEAD".
+        let existing = direction::Model {
+            id: 1,
+            thread_id: 1,
+            name: "A".to_string(),
+            slug: "a".to_string(),
+            tool: "codex".to_string(),
+            repo_id: 1,
+            reason: "r".to_string(),
+            status: "queued".to_string(),
+            mandate: "plan+impl".to_string(),
+            base_branch: "HEAD".to_string(),
+            target_branch: "".to_string(),
+            branch: "feat/a".to_string(),
+            created_at: "0".to_string(),
+        };
+
+        // A blank re-proposal with the repo on a non-existent path so
+        // live_default_branch returns None. The reconcile_reuse special-case for
+        // "HEAD" fires before effective() is called.
+        let repo_path = std::path::Path::new("/tmp/weft-nonexistent-reconcile-head");
+
+        // Blank re-proposal: must NOT error.
+        let result = reconcile_reuse(&existing, "", repo_path, "main");
+        assert!(result.is_ok(), "R18-4: blank re-proposal must reuse a HEAD-based direction, got: {:?}", result.err());
+
+        // An explicit non-empty base against a HEAD-based direction: must still conflict
+        // (we only relax the blank-proposal case).
+        let conflict = reconcile_reuse(&existing, "develop", repo_path, "main");
+        assert!(conflict.is_err(), "R18-4: explicit base against HEAD-based direction must conflict");
     }
 }

@@ -813,6 +813,7 @@ pub async fn record_worktree(
     branch: &str,
     path: &str,
     created_branch: bool,
+    created_checkout: bool,
 ) -> Result<worktree::Model> {
     Ok(worktree::ActiveModel {
         repo_id: Set(repo_id),
@@ -821,6 +822,7 @@ pub async fn record_worktree(
         path: Set(path.to_string()),
         created_at: Set(now()),
         created_branch: Set(created_branch),
+        created_checkout: Set(created_checkout),
         ..Default::default()
     }
     .insert(&db.0)
@@ -851,23 +853,24 @@ pub async fn worktree_for(
 /// Remove a repo from a workspace and all Weft state derived from it: its
 /// profile, the directions bound to it (a direction has one write repo) with
 /// their sessions, and its worktree rows. Returns the worktrees
-/// (repo_id, path, branch, created_branch) the caller must physically
-/// `git worktree remove` — DB rows are gone after this. `created_branch` gates
-/// whether the branch is deleted; a pre-existing branch reused by the -b
-/// fallback (`created_branch=false`) must survive. NEVER touches the user's
-/// actual repo directory at `local_git_path`.
+/// (repo_id, path, branch, created_branch, created_checkout) the caller must
+/// physically `git worktree remove` — DB rows are gone after this.
+/// `created_branch` gates whether the branch is deleted; `created_checkout`
+/// gates whether `git worktree remove` is called (a reused pre-existing
+/// checkout path must survive). NEVER touches the user's actual repo directory
+/// at `local_git_path`.
 pub async fn delete_repo_cascade(
     db: &Db,
     repo_id: i32,
-) -> Result<Vec<(i32, String, String, bool)>> {
+) -> Result<Vec<(i32, String, String, bool, bool)>> {
     // Worktrees registered for this repo (each direction's worktree is keyed to
     // its write repo, so this covers the bound directions' worktrees too).
-    let removed: Vec<(i32, String, String, bool)> = worktree::Entity::find()
+    let removed: Vec<(i32, String, String, bool, bool)> = worktree::Entity::find()
         .filter(worktree::Column::RepoId.eq(repo_id))
         .all(&db.0)
         .await?
         .into_iter()
-        .map(|w| (w.repo_id, w.path, w.branch, w.created_branch))
+        .map(|w| (w.repo_id, w.path, w.branch, w.created_branch, w.created_checkout))
         .collect();
     // Sessions of the directions bound to this repo, plus any keyed to the repo.
     let dirs = direction::Entity::find()
@@ -902,24 +905,26 @@ pub async fn delete_repo_cascade(
 
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
+/// Each tuple is (repo_id, path, branch, created_branch, created_checkout):
+/// `created_branch` gates branch deletion; `created_checkout` gates worktree
+/// directory removal (a reused pre-existing checkout must survive).
 pub async fn delete_thread_cascade(
     db: &Db,
     thread_id: i32,
-) -> Result<Vec<(i32, String, String, bool)>> {
+) -> Result<Vec<(i32, String, String, bool, bool)>> {
     let dirs = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&db.0)
         .await?;
-    // (repo_id, worktree path, branch, created_branch) — created_branch gates whether
-    // cleanup deletes the branch (a reused pre-existing branch must survive).
-    let mut removed: Vec<(i32, String, String, bool)> = Vec::new();
+    // (repo_id, worktree path, branch, created_branch, created_checkout)
+    let mut removed: Vec<(i32, String, String, bool, bool)> = Vec::new();
     for d in &dirs {
         let wts = worktree::Entity::find()
             .filter(worktree::Column::DirectionId.eq(d.id))
             .all(&db.0)
             .await?;
         for w in wts {
-            removed.push((w.repo_id, w.path.clone(), w.branch.clone(), w.created_branch));
+            removed.push((w.repo_id, w.path.clone(), w.branch.clone(), w.created_branch, w.created_checkout));
             worktree::Entity::delete_by_id(w.id).exec(&db.0).await?;
         }
         session::Entity::delete_many()
@@ -1518,7 +1523,7 @@ mod tests {
         let sess = create_session(&db, dir.id, a.id, "claude", "/tmp/a-wt")
             .await
             .unwrap();
-        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt", false)
+        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt", false, true)
             .await
             .unwrap();
         // a direction bound to repo `b` — must SURVIVE the delete of `a`
@@ -1561,14 +1566,14 @@ mod tests {
             .unwrap();
 
         // Record one worktree with created_branch=false (pre-existing branch).
-        record_worktree(&db, r.id, dir.id, "feat/preexist", "/tmp/r-wt", false)
+        record_worktree(&db, r.id, dir.id, "feat/preexist", "/tmp/r-wt", false, true)
             .await
             .unwrap();
         // Record another with created_branch=true (weft-created branch).
         let dir2 = create_direction(&db, t.id, "d2", "claude", r.id, "reason2", "plan+impl", "")
             .await
             .unwrap();
-        record_worktree(&db, r.id, dir2.id, "feat/weft-created", "/tmp/r-wt2", true)
+        record_worktree(&db, r.id, dir2.id, "feat/weft-created", "/tmp/r-wt2", true, true)
             .await
             .unwrap();
 
@@ -1578,8 +1583,10 @@ mod tests {
         // Both tuples must carry the correct created_branch flag.
         let preexist = removed.iter().find(|t| t.1 == "/tmp/r-wt").unwrap();
         assert!(!preexist.3, "pre-existing branch must have created_branch=false");
+        assert!(preexist.4, "created_checkout defaults to true");
         let created = removed.iter().find(|t| t.1 == "/tmp/r-wt2").unwrap();
         assert!(created.3, "weft-created branch must have created_branch=true");
+        assert!(created.4, "created_checkout defaults to true");
     }
 
     #[tokio::test]
@@ -1991,7 +1998,7 @@ mod tests {
         assert_eq!(dir.reason, "build the feature");
 
         // pretend it was materialized
-        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt", false)
+        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt", false, true)
             .await
             .unwrap();
         assert_eq!(list_worktrees(&db, Some(dir.id)).await.unwrap().len(), 1);
@@ -2005,7 +2012,8 @@ mod tests {
                 repo.id,
                 "/tmp/wt".to_string(),
                 "feature/add-login".to_string(),
-                false
+                false,
+                true
             )]
         );
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives

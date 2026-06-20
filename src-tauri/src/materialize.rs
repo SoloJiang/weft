@@ -187,6 +187,7 @@ pub async fn materialize_direction(
             &dir.branch,
             &path.to_string_lossy(),
             add.created_branch,
+            add.created_checkout,
         )
         .await?;
         Ok::<entities::worktree::Model, anyhow::Error>(rec)
@@ -209,21 +210,25 @@ pub async fn materialize_direction(
 }
 
 /// Physically remove worktrees and their namespaced branches (called during
-/// cascade delete). `removed` is the (repo_id, path, branch, created_branch) list
-/// returned by `repo::delete_thread_cascade`. Per the zero-accumulation principle the
-/// worktree's namespaced branch is torn down too — but ONLY when weft created it
-/// (`created_branch`); a pre-existing branch the worktree merely checked out (the
-/// `-b` fallback) is preserved.
-pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String, bool)]) -> Result<()> {
+/// cascade delete). `removed` is the (repo_id, path, branch, created_branch,
+/// created_checkout) list returned by `repo::delete_thread_cascade`. Per the
+/// zero-accumulation principle the worktree's namespaced branch is torn down
+/// too — but ONLY when weft created it (`created_branch`); a pre-existing branch
+/// the worktree merely checked out (the `-b` fallback) is preserved. Similarly,
+/// `git worktree remove` is only called when `created_checkout` is true — a
+/// reused pre-existing path must survive cascade cleanup.
+pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String, bool, bool)]) -> Result<()> {
     use sea_orm::EntityTrait;
-    for (repo_id, path, branch, created_branch) in removed {
+    for (repo_id, path, branch, created_branch, created_checkout) in removed {
         if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id)
             .one(&db.0)
             .await?
         {
             let repo_path = std::path::Path::new(&r.local_git_path);
-            if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
-                eprintln!("[weft] worktree remove failed for {path}: {e}");
+            if *created_checkout {
+                if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
+                    eprintln!("[weft] worktree remove failed for {path}: {e}");
+                }
             }
             if *created_branch {
                 if let Err(e) = git::delete_branch(repo_path, branch) {
@@ -240,6 +245,11 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String, bool)])
 /// direction + worktree rows. Used to keep confirm atomic — a failed batch leaves
 /// no partial worktrees/branches behind. Best-effort on the git side (a missing
 /// path/branch is fine); the row delete is authoritative.
+///
+/// Gates on `created_checkout`: if the worktree reused a pre-existing path
+/// (`created_checkout=false`) the directory is NOT removed — only Weft-created
+/// checkouts are torn down. Similarly, the branch is only deleted when
+/// `created_branch=true`.
 pub async fn rollback_direction(db: &Db, direction_id: i32) -> Result<()> {
     use sea_orm::EntityTrait;
     for w in repo::list_worktrees(db, Some(direction_id)).await? {
@@ -248,8 +258,12 @@ pub async fn rollback_direction(db: &Db, direction_id: i32) -> Result<()> {
             .await?
         {
             let repo_path = std::path::Path::new(&r.local_git_path);
-            if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(&w.path)) {
-                eprintln!("[weft] rollback worktree remove failed for {}: {e}", w.path);
+            // Only remove the checkout if WE created it. A reused pre-existing path
+            // must survive rollback.
+            if w.created_checkout {
+                if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(&w.path)) {
+                    eprintln!("[weft] rollback worktree remove failed for {}: {e}", w.path);
+                }
             }
             // Only delete the branch if WE created it. A pre-existing branch reused
             // by the fallback path must survive rollback (the user's own branch).
@@ -562,7 +576,7 @@ mod tests {
         let wt_path = worktree_path(&repo_path, "feat/keep");
         std::fs::create_dir_all(&wt_path).unwrap();
         // created_branch=false → the branch is pre-existing (the -b fallback reused it).
-        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false)
+        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false, true)
             .await.unwrap();
 
         // Deleting the thread removes the worktree but must PRESERVE the pre-existing branch.
@@ -698,7 +712,7 @@ mod tests {
         std::fs::create_dir_all(&wt_path).unwrap();
 
         // Record a worktree row with created_branch=false (branch is pre-existing).
-        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false)
+        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false, true)
             .await.unwrap();
 
         // Rollback must NOT delete feat/keep.
@@ -753,7 +767,7 @@ mod tests {
             .await.unwrap();
 
         // Record the worktree row with created_branch=true.
-        repo::record_worktree(&db, r.id, dir.id, "feat/weft-branch", &wt_path.to_string_lossy(), true)
+        repo::record_worktree(&db, r.id, dir.id, "feat/weft-branch", &wt_path.to_string_lossy(), true, true)
             .await.unwrap();
 
         // Rollback MUST delete the branch.
@@ -836,6 +850,101 @@ mod tests {
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R18-2a: rollback_direction must NOT remove a checkout directory when
+    /// `created_checkout=false` (the path was pre-existing; weft only reused it).
+    #[tokio::test]
+    async fn rollback_direction_preserves_reused_checkout() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-rollback-reused-co-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // Simulate a pre-existing path that weft did not create.
+        let wt_path = worktree_path(&repo_path, "feat/preexist-co");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        assert!(wt_path.exists(), "precondition: dir exists before rollback");
+
+        // Record with created_checkout=false (weft reused this path, did not create it).
+        repo::record_worktree(&db, r.id, dir.id, "feat/preexist-co", &wt_path.to_string_lossy(), false, false)
+            .await.unwrap();
+
+        rollback_direction(&db, dir.id).await.unwrap();
+
+        // The directory must SURVIVE — weft did not create it.
+        assert!(wt_path.exists(), "R18-2: reused checkout dir must survive rollback");
+
+        // The direction row must be gone.
+        assert!(repo::get_direction(&db, dir.id).await.unwrap().is_none(),
+            "direction row must be deleted after rollback");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R18-2b: cleanup_worktrees must NOT remove a checkout directory when
+    /// `created_checkout=false`. Mirrors the rollback test but via the cascade path.
+    #[tokio::test]
+    async fn cleanup_worktrees_preserves_reused_checkout() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-cleanup-reused-co-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // A pre-existing directory that weft did not create.
+        let wt_path = worktree_path(&repo_path, "feat/preexist-cascade");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        assert!(wt_path.exists(), "precondition: dir exists before cleanup");
+
+        // Record with created_checkout=false.
+        repo::record_worktree(&db, r.id, dir.id, "feat/preexist-cascade", &wt_path.to_string_lossy(), false, false)
+            .await.unwrap();
+
+        // Thread cascade returns the 5-tuple; cleanup must not remove the dir.
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        cleanup_worktrees(&db, &removed).await.unwrap();
+
+        assert!(wt_path.exists(), "R18-2: reused checkout dir must survive cascade cleanup");
+
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
