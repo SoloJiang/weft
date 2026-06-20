@@ -123,6 +123,31 @@ pub fn classify_poll(v: &serde_json::Value) -> PollOutcome {
     }
 }
 
+/// 把 begin 返回的 verification_uri_complete 拼成最终二维码 URL:附 `source=weft`
+/// 便于飞书侧归因、`app_name=Weft` 预填创建页名称。已有 query 用 `&`,否则用 `?`。
+pub fn build_qr_url(verification_uri_complete: &str) -> String {
+    let sep = if verification_uri_complete.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    format!("{verification_uri_complete}{sep}source=weft&app_name=Weft")
+}
+
+/// 由内容(二维码 URL)生成 SVG,转 `data:image/svg+xml;base64,…`。img 标签加载的
+/// SVG 不执行脚本,前端可安全 `<img src>` 渲染。
+pub fn qr_svg_data_uri(content: &str) -> anyhow::Result<String> {
+    use base64::Engine;
+    let code = qrcode::QrCode::new(content.as_bytes())
+        .map_err(|e| anyhow::anyhow!("qr encode: {e}"))?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(220, 220)
+        .build();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(svg.as_bytes());
+    Ok(format!("data:image/svg+xml;base64,{b64}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +259,29 @@ mod tests {
     #[test]
     fn classify_empty_is_pending() {
         assert_eq!(classify_poll(&serde_json::json!({})), PollOutcome::Pending);
+    }
+
+    #[test]
+    fn qr_url_appends_source_with_amp_when_query_exists() {
+        let u = build_qr_url("https://accounts.feishu.cn/o?x=1");
+        assert!(u.starts_with("https://accounts.feishu.cn/o?x=1"), "got: {u}");
+        assert!(u.contains("&source=weft"), "got: {u}");
+    }
+
+    #[test]
+    fn qr_url_uses_question_mark_when_no_query() {
+        let u = build_qr_url("https://accounts.feishu.cn/o");
+        assert!(u.contains("?source=weft"), "got: {u}");
+    }
+
+    #[test]
+    fn qr_data_uri_is_svg_base64() {
+        let d = qr_svg_data_uri("https://example.com/abc").unwrap();
+        assert!(
+            d.starts_with("data:image/svg+xml;base64,"),
+            "prefix: {}",
+            &d[..d.len().min(40)]
+        );
+        assert!(d.len() > 100, "len: {}", d.len());
     }
 }
