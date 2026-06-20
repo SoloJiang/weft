@@ -127,11 +127,14 @@ pub async fn edit_profile(
     let saved =
         repo::upsert_repo_profile(db, repo_id, &new_tier, &stack, &new_summary, &components, source, &commit)
             .await?;
-    // A manual edit that lands a canonical tier RECOVERS a repo whose analysis
-    // failed: clear any lingering `failed` run-state so it stops reading as a
-    // retryable failure (failed overrides analyzed in the UI) and auto passes stop
-    // skipping it. No-op if it wasn't failed.
-    if profile::normalize_tier(&new_tier).is_some() {
+    // A manual edit where the user PROVIDES a canonical tier RECOVERS a repo whose
+    // analysis failed: clear any lingering `failed` run-state so it stops reading as
+    // a retryable failure (failed overrides analyzed in the UI). Gate on `tier`
+    // being supplied, not just the resulting tier being canonical — a summary-only
+    // edit (`tier == None`) INHERITS the prior canonical role without re-classifying,
+    // so clearing there would silently drop a real (e.g. stale-refresh) failure with
+    // no re-run. No-op if it wasn't failed.
+    if tier.is_some() && profile::normalize_tier(&new_tier).is_some() {
         clear_failure(repo_id);
     }
     Ok(saved)
@@ -526,6 +529,7 @@ struct TurnCollector {
     deltas: String,
     turn_failed: bool,
     saw_turn_end: bool,
+    saw_delta: bool,
 }
 
 impl TurnCollector {
@@ -541,11 +545,20 @@ impl TurnCollector {
             ChatEvent::TextDelta { text } => {
                 sink(AnalysisEvent::Delta(&text));
                 self.deltas.push_str(&text);
+                self.saw_delta = true;
                 false
             }
             ChatEvent::Assistant { texts, .. } => {
-                for s in &texts {
-                    sink(AnalysisEvent::Delta(s));
+                // Forward the full message to the sink ONLY if it wasn't already
+                // streamed as deltas. claude exec (`--include-partial-messages`)
+                // sends BOTH the token deltas AND a final `assistant` message with
+                // the same text — forwarding both would double it in the transcript.
+                // codex exec / opencode send only the full message (no deltas), and
+                // the app-server sends only deltas, so each streams exactly once.
+                if !self.saw_delta {
+                    for s in &texts {
+                        sink(AnalysisEvent::Delta(s));
+                    }
                 }
                 self.texts.extend(texts);
                 false
@@ -768,9 +781,11 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
         }
         Ok::<(), anyhow::Error>(())
     };
-    // `completed` = the stream ended on its own (a TurnEnd break, or EOF) rather
-    // than the timeout firing.
-    let completed = tokio::time::timeout(CURATOR_TIMEOUT, collect).await.is_ok();
+    // `completed` = the stream ended cleanly on its own (a TurnEnd break, or EOF)
+    // rather than the timeout firing OR a reader error. `Ok(Ok(()))` is the only
+    // clean case: `Err(_)` is the timeout, `Ok(Err(_))` is a mid-stream read error
+    // (non-UTF-8 / pipe I/O) — both must count as not-cleanly-ended.
+    let completed = matches!(tokio::time::timeout(CURATOR_TIMEOUT, collect).await, Ok(Ok(())));
     // Close stdout so a child blocked on a full pipe unblocks, then SIGKILL and
     // reap (kill().await waits for exit — avoids a zombie on timeout). On a clean
     // EOF the child has already exited and this is a no-op.
@@ -938,18 +953,34 @@ pub fn clear_failure(repo_id: i32) {
     }
 }
 
-/// Whether a repo currently carries a usable (canonical) tier classification.
-/// This is the success criterion for an analysis run: the repo is classified iff
-/// it has a canonical tier — one just written this run, or a prior one preserved
-/// because the agent's reply was unusable. A fresh placeholder left without a
-/// canonical tier means the run failed (whether the reply was unparseable, or
-/// parseable but dropped by persist_repo_class's no-op rules).
-async fn classified_now(db: &Db, repo_id: i32) -> bool {
+/// Drop a repo's run-state entirely, whatever its phase — called when the repo is
+/// DELETED, so the process-global registry doesn't keep a stale `failed`/`running`
+/// entry for a repo that no longer exists. (Unlike `clear_failure`, this also drops
+/// a `running` entry; a background pass racing the delete finishes harmlessly via
+/// its deleted-repo guards.)
+pub fn run_forget(repo_id: i32) {
+    run_lock().remove(&repo_id);
+}
+
+/// The success criterion for an analysis run: the repo carries a usable (canonical)
+/// tier classification FOR THE TREE THIS RUN ANALYZED (`analyzed_commit`). A run
+/// persists `profiled_commit = analyzed_commit` only when it actually (re)classifies
+/// (a canonical tier, or a user-pinned tier kept on a real upsert); an unparseable
+/// or no-op reply leaves the PRIOR `profiled_commit`.
+///
+/// So requiring `profiled_commit == analyzed_commit` distinguishes the two cases a
+/// bare tier-check conflates:
+/// - HEAD unchanged + garbage reply → the prior canonical tier is still for THIS
+///   tree (`profiled_commit` already == HEAD) → success, prior result preserved.
+/// - HEAD moved + failed/garbage reply → the prior tier is for an OLD commit
+///   (`profiled_commit` != the new HEAD) → FAILURE (retryable), instead of showing
+///   the stale tier as a fresh `done` and re-running forever without converging.
+async fn classified_for(db: &Db, repo_id: i32, analyzed_commit: &str) -> bool {
     repo::get_repo_profile(db, repo_id)
         .await
         .ok()
         .flatten()
-        .map(|p| profile::normalize_tier(&p.role).is_some())
+        .map(|p| profile::normalize_tier(&p.role).is_some() && p.profiled_commit == analyzed_commit)
         .unwrap_or(false)
 }
 
@@ -1098,10 +1129,13 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     if !cwd.exists() {
         // The checkout is gone (e.g. a retry after it was moved/deleted). Don't
         // silently return Ok — that would drop a previously-failed repo to idle and
-        // lose its retryable error. Mark a visible, retryable failure with a clear
-        // reason instead. (Background passes pre-filter missing checkouts, so this
-        // only fires on an explicit reprofile_repo retry.)
-        const GONE: &str = "repository checkout not found on disk";
+        // lose its retryable error. Mark a visible, retryable failure instead.
+        // (Background passes pre-filter missing checkouts, so this only fires on an
+        // explicit reprofile_repo retry.) Store a stable CODE, not an English
+        // sentence: the agent/transport errors are inherently dynamic English
+        // diagnostics, but THIS is our own known, user-facing case, so the UI
+        // localizes it (see `analysisErrorCheckoutMissing` in the i18n files).
+        const GONE: &str = "checkout-missing";
         run_finish_err(repo.id, GONE.into());
         emit_repo_analysis(repo.workspace_id, repo.id, "failed", None, Some(GONE));
         return Ok(());
@@ -1147,12 +1181,13 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
             match persisted {
                 Err(e) => Err(e),
                 Ok(()) => {
-                    // Success iff the repo now carries a usable (canonical) tier —
-                    // freshly written this run, or a prior one preserved when the
-                    // reply was unusable. A placeholder left unclassified is a real
-                    // failure (visible + retryable), covering BOTH the unparseable
-                    // and the parseable-but-no-op cases uniformly.
-                    if classified_now(db, repo.id).await {
+                    // Success iff the repo carries a usable canonical tier FOR THE
+                    // TREE THIS RUN ANALYZED (head_before) — freshly written this run,
+                    // or a prior one still valid because HEAD hasn't moved. An
+                    // unparseable / no-op reply leaves the prior commit, so a failed
+                    // refresh of a MOVED-HEAD repo is a real failure (visible +
+                    // retryable), not the stale tier shown as a fresh `done`.
+                    if classified_for(db, repo.id, &head_before).await {
                         Ok(())
                     } else {
                         Err(anyhow::anyhow!("analyzer returned no usable classification"))
@@ -1490,15 +1525,28 @@ mod tests {
         c.push(te(false), &mut noop);
         assert!(c.outcome("t", true, true).is_err(), "empty output fails");
 
-        // Streamed text (deltas AND full messages) is forwarded to the sink in order.
+        // claude shape: token deltas THEN a final full `assistant` message carrying
+        // the SAME text → streamed to the sink ONCE (the final message is not
+        // re-forwarded after deltas), while `text()` returns the full message.
         let mut got = String::new();
         let mut sink = |e: super::AnalysisEvent| match e {
             super::AnalysisEvent::Delta(t) => got.push_str(t),
         };
         let mut c = super::TurnCollector::default();
-        c.push(delta("a"), &mut sink);
-        c.push(asst("b"), &mut sink);
-        assert_eq!(got, "ab");
+        c.push(delta("hel"), &mut sink);
+        c.push(delta("lo"), &mut sink);
+        c.push(asst("hello"), &mut sink);
+        assert_eq!(got, "hello", "claude's final full message is not double-streamed");
+        assert_eq!(c.text(), "hello", "final text is the full message");
+
+        // codex-exec / opencode shape: a full message with NO prior deltas → streamed.
+        let mut got2 = String::new();
+        let mut sink2 = |e: super::AnalysisEvent| match e {
+            super::AnalysisEvent::Delta(t) => got2.push_str(t),
+        };
+        let mut c2 = super::TurnCollector::default();
+        c2.push(asst("done"), &mut sink2);
+        assert_eq!(got2, "done", "a full message with no deltas streams once");
     }
 
     #[test]
@@ -1553,29 +1601,47 @@ mod tests {
         super::edit_profile(&db, r.id, Some("notes"), None).await.unwrap();
         assert_eq!(super::run_phase(r.id), "failed", "summary-only edit leaves it failed (no tier)");
 
+        // A summary-only edit on a repo that ALREADY has a canonical tier but is
+        // `failed` (a stale-refresh failure) must NOT clear it — the user didn't
+        // re-classify, the prior tier is just inherited, and the failure is real.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "old", "[]", "agent", "sha_a")
+            .await
+            .unwrap();
+        super::run_finish_err(r.id, "stale refresh failed".into());
+        super::edit_profile(&db, r.id, Some("new notes"), None).await.unwrap();
+        assert_eq!(
+            super::run_phase(r.id),
+            "failed",
+            "summary-only edit inheriting a canonical tier does NOT clear a real failure"
+        );
+
         super::edit_profile(&db, r.id, Some("a web app"), Some("frontend")).await.unwrap();
         assert_eq!(super::run_phase(r.id), "idle", "a canonical tier clears the failure");
     }
 
     #[tokio::test]
-    async fn classified_now_requires_canonical_tier() {
-        // The success criterion for a run: a repo counts as classified ONLY with a
-        // canonical tier. No profile, a non-canonical/legacy tier, or a tier-less
-        // placeholder all read as "not classified" → a fresh run that lands there
-        // is a failure (covers both the unparseable and parseable-but-no-op replies),
-        // while a re-analysis preserving a prior canonical tier stays a success.
+    async fn classified_for_requires_canonical_tier_at_the_analyzed_commit() {
+        // Success = a canonical tier FOR THE TREE THIS RUN ANALYZED. No profile or a
+        // non-canonical tier → not classified. A canonical tier counts only when its
+        // profiled_commit matches the commit just analyzed: a moved-HEAD repo whose
+        // refresh failed (prior tier kept at the OLD commit) is NOT a success, so the
+        // stale tier isn't shown as a fresh `done` (and the re-run can converge).
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "").await.unwrap();
-        assert!(!super::classified_now(&db, r.id).await, "no profile → not classified");
-        repo::upsert_repo_profile(&db, r.id, "service", "[]", "s", "[]", "agent", "")
+        assert!(!super::classified_for(&db, r.id, "sha_a").await, "no profile → not classified");
+        repo::upsert_repo_profile(&db, r.id, "service", "[]", "s", "[]", "agent", "sha_a")
             .await
             .unwrap();
-        assert!(!super::classified_now(&db, r.id).await, "non-canonical tier → not classified");
-        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "an api", "[]", "agent", "")
+        assert!(!super::classified_for(&db, r.id, "sha_a").await, "non-canonical tier → no");
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "an api", "[]", "agent", "sha_a")
             .await
             .unwrap();
-        assert!(super::classified_now(&db, r.id).await, "canonical tier → classified");
+        assert!(super::classified_for(&db, r.id, "sha_a").await, "canonical @ analyzed commit → yes");
+        assert!(
+            !super::classified_for(&db, r.id, "sha_b").await,
+            "canonical but for an OLD commit (HEAD moved) → not a success"
+        );
     }
 
     #[tokio::test]

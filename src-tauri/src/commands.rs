@@ -280,6 +280,9 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
         .map_err(e)?
         .ok_or("repo not found")?;
     let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
+    // Drop any in-memory analysis run-state so the process-global registry doesn't
+    // keep a stale failed/running entry for a repo that no longer exists.
+    crate::curator::run_forget(repo_id);
     let repo_path = std::path::Path::new(&repo.local_git_path);
     for (_repo_id, path, branch) in &removed {
         if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
