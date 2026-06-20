@@ -347,6 +347,16 @@ pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> 
             anyhow::bail!("cannot delete the worktree while its worker is active");
         }
     }
+    // Honor created_checkout: weft must not delete a worktree it did not create. A lane
+    // that reused a pre-existing checkout (created_checkout=false, never recreated)
+    // keeps it — consistent with rollback/cascade cleanup — so reclaim refuses rather
+    // than removing a checkout that isn't weft's to delete.
+    if !wt.created_checkout {
+        anyhow::bail!(
+            "cannot reclaim a worktree Weft did not create (reused pre-existing checkout): {}",
+            wt.path
+        );
+    }
     let path = std::path::Path::new(&wt.path);
     if let Some(r) = entities::repo_ref::Entity::find_by_id(wt.repo_id)
         .one(&db.0)

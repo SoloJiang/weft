@@ -145,3 +145,61 @@ async fn delete_worktree_keeps_branch_and_task() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&weft_home);
 }
+
+#[tokio::test]
+async fn delete_worktree_refuses_reused_checkout() {
+    // A worktree weft did NOT create (created_checkout=false — a reused pre-existing
+    // path) must not be removed by the Done-card reclaim, even when the task is done.
+    let root = std::env::temp_dir().join(format!("weft-wtdel-reused-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let weft_home =
+        std::env::temp_dir().join(format!("weft-wtdel-reused-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&weft_home);
+    std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+    let repo_a = make_repo(&root, "repo-a");
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let ws = repo::create_workspace(&db, "ws").await.unwrap();
+    let ra = repo::add_repo_ref(&db, ws.id, "repo-a", repo_a.to_str().unwrap(), "main", "")
+        .await
+        .unwrap();
+    let t1 = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+        .await
+        .unwrap();
+    let d1 = repo::create_direction(&db, t1.id, "da", "claude", ra.id, "modify", "plan+impl", "")
+        .await
+        .unwrap();
+    repo::set_direction_status(&db, d1.id, "done").await.unwrap();
+
+    // A pre-existing checkout dir weft merely reused (created_checkout=false), with
+    // user content in it.
+    let reused = root.join("preexisting-checkout");
+    std::fs::create_dir_all(&reused).unwrap();
+    std::fs::write(reused.join("user-file.txt"), "user data\n").unwrap();
+    let wt = repo::record_worktree(
+        &db,
+        ra.id,
+        d1.id,
+        "feat/reused",
+        &reused.to_string_lossy(),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Reclaim must REFUSE (honor created_checkout) and leave the dir + its contents.
+    assert!(
+        remove_direction_worktree(&db, wt.id).await.is_err(),
+        "reclaim must refuse a worktree weft did not create"
+    );
+    assert!(reused.exists(), "reused checkout dir preserved");
+    assert!(
+        reused.join("user-file.txt").exists(),
+        "reused checkout contents preserved"
+    );
+
+    std::env::remove_var("WEFT_HOME");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&weft_home);
+}
