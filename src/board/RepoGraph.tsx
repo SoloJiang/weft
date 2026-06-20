@@ -759,6 +759,20 @@ function useAnalysisStream(profile?: RepoProfile) {
       void un.then((f) => f());
     };
   }, [repoId]);
+
+  // A manual recovery (edit_profile lands a canonical tier → backend clears the
+  // failed run-state) fires NO analysis event, so the sticky live `phase` could
+  // keep showing the failure while the refreshed profile already reads recovered.
+  // Drop a stale live `failed` once the persisted state settles to "idle". Gated on
+  // exactly "idle" — never mid-run, where analysis_state is "running"/"failed" — so
+  // this can't race a genuine in-flight failure. Touches only `phase` (not the
+  // transcript or the listener), so it doesn't reintroduce the wipe.
+  useEffect(() => {
+    if (phase === "failed" && profile?.analysis_state === "idle") {
+      setPhase("idle");
+    }
+  }, [phase, profile?.analysis_state]);
+
   return { phase, transcript, error };
 }
 

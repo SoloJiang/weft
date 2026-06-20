@@ -989,6 +989,18 @@ fn run_state_clear_all_for_test() {
     run_lock().clear();
 }
 
+/// Serialize the tests that mutate the process-global run-state registry. cargo
+/// runs tests in parallel, and they share both the registry AND repo id 1 (each
+/// fresh in-memory DB starts its autoincrement at 1), so without this a
+/// `clear_all`/`run_finish_err` in one test could race another's assertion. Every
+/// run-state test takes this lock first. Poison-tolerant (a panicking test must not
+/// wedge the rest).
+#[cfg(test)]
+fn test_run_state_guard() -> std::sync::MutexGuard<'static, ()> {
+    static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Emit one analysis lifecycle/stream event for a repo so an open detail panel
 /// can render the live transcript + status. No-op outside a running app.
 fn emit_repo_analysis(
@@ -1551,6 +1563,7 @@ mod tests {
 
     #[test]
     fn run_state_transitions_and_dedupe() {
+        let _g = super::test_run_state_guard();
         super::run_state_clear_all_for_test();
         assert!(super::run_begin(101), "first begin starts it");
         assert!(!super::run_begin(101), "second begin deduped while running");
@@ -1579,6 +1592,7 @@ mod tests {
     #[test]
     fn clear_failure_only_drops_failed() {
         // Clearing a re-added repo's stale failure must NOT disturb an in-flight run.
+        let _g = super::test_run_state_guard();
         super::run_state_clear_all_for_test();
         super::run_finish_err(7, "gone".into());
         super::clear_failure(7);
@@ -1592,6 +1606,7 @@ mod tests {
     async fn manual_canonical_edit_recovers_a_failed_repo() {
         // A failed analysis the user fixes by hand (canonical tier) must stop reading
         // as failed; a summary-only edit that leaves it unclassified does not.
+        let _g = super::test_run_state_guard();
         super::run_state_clear_all_for_test();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
@@ -1649,6 +1664,7 @@ mod tests {
         // A retry whose checkout was moved/deleted must keep a visible, retryable
         // failure — not silently drop to idle. profile_repo_agent's cwd guard fires
         // before any agent spawn, so this is exercisable without a real run.
+        let _g = super::test_run_state_guard();
         super::run_state_clear_all_for_test();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
@@ -1662,6 +1678,7 @@ mod tests {
 
     #[tokio::test]
     async fn view_surfaces_failed_analysis_state() {
+        let _g = super::test_run_state_guard();
         super::run_state_clear_all_for_test();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
