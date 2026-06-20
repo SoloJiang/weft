@@ -104,13 +104,14 @@ pub fn default_target_branch(worktree: &Path, base_ref: &str) -> String {
     }
 }
 
-/// Resolve the ref to compare a target branch against: prefer the remote
-/// `origin/<target>` ONLY when it already contains the local `<target>` (origin is
-/// fresh / ahead-or-equal). When a local `<target>` is AHEAD of a stale origin — the
-/// worktree was branched off local after an offline materialize — prefer the LOCAL
-/// branch, so the diff doesn't fold local's lead over a stale origin into the change
-/// set. Else fall back through the default-branch chain (origin/HEAD → main → master
-/// → HEAD).
+/// Resolve the ref to compare a target branch against. When both `origin/<target>` and
+/// a local `<target>` exist and have DIVERGED, pick the one the WORKTREE actually forked
+/// from: its merge-base with the worktree's HEAD is the more recent (the fork point),
+/// while the diverged ref's merge-base is an older common ancestor. This is correct in
+/// BOTH directions — a worktree branched off a fresh `origin/<target>` (with a diverged
+/// local) compares against origin, and one branched off a local `<target>` (with a stale
+/// origin) compares against local. On ties (no divergence) prefer the fetched remote.
+/// Else fall back through the default-branch chain (origin/HEAD → main → master → HEAD).
 fn resolve_target_ref(worktree: &Path, target: &str) -> String {
     let t = normalize_target(target);
     // "HEAD" is not a real target branch (see default_target_branch); falling
@@ -120,12 +121,18 @@ fn resolve_target_ref(worktree: &Path, target: &str) -> String {
         let remote_ok = ref_resolves(worktree, &remote);
         let local_ok = ref_resolves(worktree, &t);
         if remote_ok && local_ok {
-            // Trust origin only when it already contains local (ahead-or-equal). If
-            // local is ahead of a stale origin, the worktree was based on local, so
-            // compare against local.
-            let origin_has_local =
-                git(worktree, &["merge-base", "--is-ancestor", &t, &remote]).is_ok();
-            return if origin_has_local { remote } else { t };
+            // Compare each ref's fork point with the worktree: the ref the worktree
+            // descends from has the more recent merge-base; prefer it.
+            let mb_remote = git(worktree, &["merge-base", "HEAD", &remote]).ok();
+            let mb_local = git(worktree, &["merge-base", "HEAD", &t]).ok();
+            if let (Some(mr), Some(ml)) = (mb_remote, mb_local) {
+                // Forked from origin when local's merge-base is an ancestor of origin's
+                // (origin's fork point is at least as recent); covers the no-divergence
+                // tie too.
+                let forked_from_origin =
+                    git(worktree, &["merge-base", "--is-ancestor", &ml, &mr]).is_ok();
+                return if forked_from_origin { remote } else { t };
+            }
         }
         if remote_ok {
             return remote;
@@ -1423,7 +1430,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_ref_prefers_local_over_stale_origin_but_fresh_origin_over_local() {
+    fn resolve_target_ref_picks_the_ref_the_worktree_forked_from() {
+        // resolve_target_ref runs against a WORKTREE's HEAD; when local & origin <target>
+        // diverge, it must pick whichever the worktree ACTUALLY forked from.
         let origin = tmp("rtr-origin");
         init_repo(&origin).unwrap();
         let main = current_branch(&origin).unwrap();
@@ -1431,39 +1440,51 @@ mod tests {
         git(&origin, &["commit", "-q", "--allow-empty", "-m", "d0"]).unwrap();
         git(&origin, &["checkout", "-q", &main]).unwrap();
 
-        // (1) LOCAL develop AHEAD of a stale origin/develop → prefer LOCAL (the worktree
-        // was branched off local after an offline materialize).
+        // (A) Worktree forked from LOCAL develop; origin/develop is stale-behind → LOCAL.
         let c1 = tmp("rtr-c1");
         git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &c1.to_string_lossy()]).unwrap();
-        // A clone does not inherit local user config, and CI has no global identity,
-        // so set one before committing in the clone.
+        // A clone does not inherit local user config, and CI has no global identity.
         git(&c1, &["config", "user.email", "t@t.t"]).unwrap();
         git(&c1, &["config", "user.name", "t"]).unwrap();
         git(&c1, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
-        git(&c1, &["commit", "-q", "--allow-empty", "-m", "local-ahead"]).unwrap();
+        git(&c1, &["commit", "-q", "--allow-empty", "-m", "local-ahead"]).unwrap(); // local past stale origin
         git(&c1, &["checkout", "-q", &main]).unwrap();
+        let wt1 = tmp("rtr-wt1");
+        git(&c1, &["worktree", "add", "-q", "-b", "feat/a", &wt1.to_string_lossy(), "develop"]).unwrap();
+        git(&wt1, &["commit", "-q", "--allow-empty", "-m", "agent-a"]).unwrap();
         assert_eq!(
-            resolve_target_ref(&c1, "develop"),
+            resolve_target_ref(&wt1, "develop"),
             "develop",
-            "local ahead of a stale origin → prefer local"
+            "worktree forked off local develop (stale origin) → prefer local"
         );
 
-        // (2) LOCAL develop is an ANCESTOR of a fresh origin/develop → prefer ORIGIN.
+        // (B) Worktree forked from fresh ORIGIN/develop; local develop diverged → ORIGIN.
         git(&origin, &["checkout", "-q", "develop"]).unwrap();
         git(&origin, &["commit", "-q", "--allow-empty", "-m", "d1"]).unwrap();
         git(&origin, &["checkout", "-q", &main]).unwrap();
         let c2 = tmp("rtr-c2");
         git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &c2.to_string_lossy()]).unwrap();
-        git(&c2, &["branch", "develop", "origin/develop~1"]).unwrap(); // local = d0 (behind)
+        git(&c2, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&c2, &["config", "user.name", "t"]).unwrap();
+        git(&c2, &["checkout", "-q", "-b", "develop", "origin/develop~1"]).unwrap(); // diverge off d0
+        git(&c2, &["commit", "-q", "--allow-empty", "-m", "local-diverge"]).unwrap();
+        git(&c2, &["checkout", "-q", &main]).unwrap();
+        let wt2 = tmp("rtr-wt2");
+        git(&c2, &["worktree", "add", "-q", "-b", "feat/b", &wt2.to_string_lossy(), "origin/develop"]).unwrap();
+        git(&wt2, &["commit", "-q", "--allow-empty", "-m", "agent-b"]).unwrap();
         assert_eq!(
-            resolve_target_ref(&c2, "develop"),
+            resolve_target_ref(&wt2, "develop"),
             "origin/develop",
-            "local ancestor of fresh origin → prefer origin"
+            "worktree forked off fresh origin/develop (diverged local) → prefer origin"
         );
 
+        let _ = remove_worktree(&c1, &wt1);
+        let _ = remove_worktree(&c2, &wt2);
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&c1);
         let _ = std::fs::remove_dir_all(&c2);
+        let _ = std::fs::remove_dir_all(&wt1);
+        let _ = std::fs::remove_dir_all(&wt2);
     }
 
     #[test]
