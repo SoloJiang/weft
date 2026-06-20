@@ -125,15 +125,23 @@ pub fn classify_poll(v: &serde_json::Value) -> PollOutcome {
     }
 }
 
-/// 把 begin 返回的 verification_uri_complete 拼成最终二维码 URL:附 `source=weft`
-/// 便于飞书侧归因、`app_name=Weft` 预填创建页名称。已有 query 用 `&`,否则用 `?`。
+/// 把 begin 返回的 verification_uri_complete 拼成最终二维码 URL,对齐官方 SDK
+/// scene/registration::buildQRCodeURL:URL 解析后设 from=sdk / tp=sdk(飞书据此走 SDK
+/// 注册页而非通用验证页)、source、以及 app preset `name`(注意是 `name` 不是 `app_name`)。
+/// 字符串拼接会漏掉这些 flag 且用错 key,导致真机扫码走错页 / 跳过创建预设。解析失败
+/// 回退原值(二维码仍可渲染)。
 pub fn build_qr_url(verification_uri_complete: &str) -> String {
-    let sep = if verification_uri_complete.contains('?') {
-        '&'
-    } else {
-        '?'
-    };
-    format!("{verification_uri_complete}{sep}source=weft&app_name=Weft")
+    match reqwest::Url::parse(verification_uri_complete) {
+        Ok(mut u) => {
+            u.query_pairs_mut()
+                .append_pair("from", "sdk")
+                .append_pair("tp", "sdk")
+                .append_pair("source", "weft")
+                .append_pair("name", "Weft");
+            u.to_string()
+        }
+        Err(_) => verification_uri_complete.to_string(),
+    }
 }
 
 /// 由内容(二维码 URL)生成 SVG,转 `data:image/svg+xml;base64,…`。img 标签加载的
@@ -166,9 +174,14 @@ pub struct ReqwestTransport {
 
 impl Default for ReqwestTransport {
     fn default() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        // 给每个请求设超时:accounts.feishu.cn / 代理可能接受连接后 stall(TLS / body 不返回),
+        // 无超时会让 begin 卡在「生成二维码」、poll 越过 expire_secs(deadline 只在两次 await
+        // 之间检查)。30s 与官方 SDK 默认的 http.Client timeout 一致。
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client }
     }
 }
 
@@ -209,6 +222,9 @@ pub struct ScanBegin {
     pub qr_data_uri: String,
     pub interval_secs: u64,
     pub expire_secs: u64,
+    /// 本次会话的代际号。前端回传给 cancel,使「关闭/重开」时旧的 cancel 只作用于自己
+    /// 那一代,不会误杀刚开始的新会话(否则新 QR 的轮询被旧 cancel 取消、status 卡 idle)。
+    pub generation: u64,
 }
 
 /// 成功落库回调:拿到凭证后写库 + 重连。返回 future 以支持 async 落库。
@@ -248,10 +264,14 @@ impl RegistrationService {
             .clone()
     }
 
-    pub fn cancel(&self) {
+    /// 取消指定代际的会话。只有当前会话仍是该代际时才生效——这样「快速关闭/重开」时
+    /// 迟到的旧 cancel(携带旧代际)不会误杀已经开始的新会话。
+    pub fn cancel(&self, generation: u64) {
         let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        s.generation = s.generation.wrapping_add(1);
-        s.status = ScanStatus::Idle;
+        if s.generation == generation {
+            s.generation = s.generation.wrapping_add(1);
+            s.status = ScanStatus::Idle;
+        }
     }
 
     /// 发起 device-flow:begin → 二维码 → 标 Pending → spawn 后台轮询。
@@ -269,10 +289,11 @@ impl RegistrationService {
             s.status = ScanStatus::Pending;
             s.generation
         };
-        let (view, device_code, interval, expire) = do_begin(transport.as_ref()).await?;
+        let (mut view, device_code, interval, expire) = do_begin(transport.as_ref()).await?;
         if !is_live(&self.session, generation) {
             anyhow::bail!("scan registration superseded");
         }
+        view.generation = generation;
         let session = self.session.clone();
         tauri::async_runtime::spawn(async move {
             poll_loop(
@@ -322,6 +343,7 @@ async fn do_begin(
             qr_data_uri,
             interval_secs: begin.interval_secs,
             expire_secs: begin.expire_secs,
+            generation: 0, // 占位;由 begin 在占据代际后填入。
         },
         begin.device_code,
         begin.interval_secs,
@@ -530,16 +552,23 @@ mod tests {
     }
 
     #[test]
-    fn qr_url_appends_source_with_amp_when_query_exists() {
-        let u = build_qr_url("https://accounts.feishu.cn/o?x=1");
-        assert!(u.starts_with("https://accounts.feishu.cn/o?x=1"), "got: {u}");
-        assert!(u.contains("&source=weft"), "got: {u}");
+    fn qr_url_sets_sdk_flags_and_preset() {
+        // 对齐官方 SDK buildQRCodeURL:必须带 from=sdk / tp=sdk(飞书据此走 SDK 注册页)、
+        // source、以及 app preset `name`(不是 `app_name`),且保留原始 query。
+        let u = build_qr_url("https://accounts.feishu.cn/o?device_code=dc");
+        assert!(u.contains("from=sdk"), "got: {u}");
+        assert!(u.contains("tp=sdk"), "got: {u}");
+        assert!(u.contains("source=weft"), "got: {u}");
+        assert!(u.contains("name=Weft"), "got: {u}");
+        assert!(u.contains("device_code=dc"), "must preserve original query: {u}");
     }
 
     #[test]
-    fn qr_url_uses_question_mark_when_no_query() {
+    fn qr_url_handles_no_query_and_invalid() {
         let u = build_qr_url("https://accounts.feishu.cn/o");
-        assert!(u.contains("?source=weft"), "got: {u}");
+        assert!(u.contains("from=sdk") && u.contains("source=weft"), "got: {u}");
+        // 不可解析的 URL 回退原值(二维码仍可渲染)。
+        assert_eq!(build_qr_url("not a url"), "not a url");
     }
 
     #[test]
@@ -753,5 +782,21 @@ mod tests {
         let (cb, _log) = record_success();
         let r = svc.begin(t, cb).await;
         assert!(r.is_err(), "begin must abort when superseded mid-request");
+    }
+
+    #[test]
+    fn cancel_only_affects_matching_generation() {
+        let svc = RegistrationService::default();
+        {
+            let mut s = svc.session.lock().unwrap_or_else(|e| e.into_inner());
+            s.generation = 2;
+            s.status = ScanStatus::Pending;
+        }
+        // 迟到的旧 cancel(代际 1)不应动到当前会话(代际 2)。
+        svc.cancel(1);
+        assert_eq!(svc.status(), ScanStatus::Pending);
+        // 当前代际的 cancel 生效。
+        svc.cancel(2);
+        assert_eq!(svc.status(), ScanStatus::Idle);
     }
 }

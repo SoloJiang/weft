@@ -1015,6 +1015,9 @@ function FeishuScanDialog({
   // attempt 自增触发 effect 重跑(重新扫码)。onConnected/onOpenChange 是稳定的 setter
   // 闭包,故意不列入依赖——否则父组件每次渲染都会重启 device-flow。
   const [attempt, setAttempt] = useState(0);
+  // 本次 begin 占据的代际号;cleanup 用它做 scoped cancel(只取消自己这代,迟到的旧
+  // cancel 不会误杀快速重开后新建的会话)。
+  const genRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -1029,10 +1032,12 @@ function FeishuScanDialog({
     setPhase("loading");
     setQr(null);
     setErrReason(null);
+    genRef.current = null;
     void api
       .feishuScanBegin()
       .then((b) => {
         if (!alive) return;
+        genRef.current = b.generation;
         setQr(b.qr_data_uri);
         setPhase("waiting");
         timer = window.setInterval(() => {
@@ -1062,7 +1067,9 @@ function FeishuScanDialog({
     return () => {
       alive = false;
       stop();
-      void api.feishuScanCancel();
+      // scoped cancel:只取消本代际。begin 尚未返回(genRef 为 null)时无需取消——
+      // 后端 begin 的 superseded 检查会让那次孤儿请求自然作废。
+      if (genRef.current !== null) void api.feishuScanCancel(genRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, attempt]);

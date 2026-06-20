@@ -1446,6 +1446,7 @@ pub struct ScanBeginView {
     pub qr_data_uri: String,
     pub expire_secs: u64,
     pub poll_interval_ms: u64,
+    pub generation: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -1477,6 +1478,7 @@ pub async fn feishu_scan_begin(
         qr_data_uri: begin.qr_data_uri,
         expire_secs: begin.expire_secs,
         poll_interval_ms: begin.interval_secs.saturating_mul(1000),
+        generation: begin.generation,
     })
 }
 
@@ -1499,12 +1501,14 @@ pub fn feishu_scan_status(
     })
 }
 
-/// 取消扫码(关闭 dialog / 卸载时调用),停止后台轮询。
+/// 取消指定代际的扫码会话(关闭 dialog / 卸载 / 重开时调用)。带 generation 是为了让迟到的
+/// 旧 cancel 只作用于自己那一代,不误杀刚开始的新会话。
 #[tauri::command]
 pub fn feishu_scan_cancel(
     svc: State<'_, crate::im::feishu::registration::RegistrationService>,
+    generation: u64,
 ) -> R<()> {
-    svc.cancel();
+    svc.cancel(generation);
     Ok(())
 }
 

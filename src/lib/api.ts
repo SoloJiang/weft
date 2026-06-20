@@ -280,12 +280,16 @@ export const api = {
     invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),
   feishuScanBegin: () =>
-    invoke<{ qr_data_uri: string; expire_secs: number; poll_interval_ms: number }>(
-      "feishu_scan_begin",
-    ),
+    invoke<{
+      qr_data_uri: string;
+      expire_secs: number;
+      poll_interval_ms: number;
+      generation: number;
+    }>("feishu_scan_begin"),
   feishuScanStatus: () =>
     invoke<{ status: string; error_reason: string | null }>("feishu_scan_status"),
-  feishuScanCancel: () => invoke<void>("feishu_scan_cancel"),
+  feishuScanCancel: (generation: number) =>
+    invoke<void>("feishu_scan_cancel", { generation }),
   imBindThread: (threadId: number, chatId: string, imThreadRef: string, channel = "feishu") =>
     invoke<ImRoute>("im_bind_thread", { threadId, channel, chatId, imThreadRef }),
   imUnbindThread: (threadId: number) =>
