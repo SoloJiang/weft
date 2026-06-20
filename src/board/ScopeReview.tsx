@@ -307,14 +307,24 @@ function BaseBranchField({
     }
     const next = val.trim();
     if (next === (value ?? "").trim()) return; // unchanged
+    // The lane this save belongs to. A re-propose can swap a DIFFERENT lane into this
+    // keyed slot while the save is in flight; the resolve/reject handlers below must
+    // not touch the input or load-tracking once that's happened, or they'd clobber the
+    // new lane's freshly-reset state with this (old) lane's value.
+    const savedIdentity = `${name} ${repo}`;
     void onSave(index, name, repo, next)
       .then(() => {
-        lastLoaded.current = next; // mark loaded only after the save actually lands
+        if (lastIdentity.current === savedIdentity) {
+          lastLoaded.current = next; // mark loaded only after the save actually lands
+        }
       })
       .catch(() => {
-        // Save failed — revert the field to the persisted value so the UI doesn't
-        // show an unsaved base that confirm/approve would ignore.
-        setVal(value ?? "");
+        // Save failed — revert the field to the persisted value so the UI doesn't show
+        // an unsaved base that confirm/approve would ignore. Only when this row still
+        // shows the same lane (see savedIdentity) — else we'd overwrite the new lane.
+        if (lastIdentity.current === savedIdentity) {
+          setVal(value ?? "");
+        }
       });
   };
   return (
