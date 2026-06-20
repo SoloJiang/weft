@@ -116,14 +116,26 @@ pub async fn materialize_direction(
         } else {
             dir.base_branch.trim().to_string()
         };
-        git::add_worktree_synced(repo_path, &existing.branch, wt_path, &recreate_base, false)
+        let add = git::add_worktree_synced(repo_path, &existing.branch, wt_path, &recreate_base, false)
             .with_context(|| {
                 format!(
                     "re-materialize reclaimed worktree for branch {}",
                     existing.branch
                 )
             })?;
-        // Row already exists with the correct path/branch; no need to re-insert.
+        // If the recreate CREATED a fresh branch/checkout (the original was deleted),
+        // weft now owns it — OR the new ownership into the row. Never CLEAR a flag: a
+        // branch/checkout weft made on the first materialize stays owned even when this
+        // pass only re-checked-out an existing one. Otherwise a branch/checkout weft
+        // just created would escape cleanup (stale created_*=false).
+        let cb = existing.created_branch || add.created_branch;
+        let cc = existing.created_checkout || add.created_checkout;
+        if cb != existing.created_branch || cc != existing.created_checkout {
+            repo::set_worktree_ownership(db, existing.id, cb, cc).await?;
+            if let Some(updated) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
+                return Ok(vec![updated]);
+            }
+        }
         return Ok(vec![existing]);
     }
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
@@ -608,6 +620,52 @@ mod tests {
     /// R15-2: materialize_direction must recreate the on-disk worktree when the
     /// row exists but the directory was reclaimed (remove_direction_worktree path).
     /// After re-materialization the directory must exist again.
+    #[tokio::test]
+    async fn materialize_recreate_updates_ownership_flags_when_branch_created() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-own-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", &main)
+            .await.unwrap();
+
+        // A reclaimed row recorded as NOT weft-owned (created_branch=false,
+        // created_checkout=false), for a branch + path that do not exist on disk →
+        // re-materialize must CREATE both and FLIP the ownership flags to true.
+        let branch = "feat/recreate-owns";
+        let wt_path = worktree_path(&repo_path, branch);
+        repo::record_worktree(&db, r.id, dir.id, branch, &wt_path.to_string_lossy(), false, false)
+            .await.unwrap();
+        assert!(!wt_path.exists(), "precondition: dir absent");
+
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts.len(), 1);
+        assert!(wt_path.exists(), "worktree recreated");
+        assert!(wts[0].created_branch, "created_branch must flip true after weft created the branch");
+        assert!(wts[0].created_checkout, "created_checkout must flip true after weft created the checkout");
+        let row = repo::worktree_for(&db, dir.id, r.id).await.unwrap().unwrap();
+        assert!(row.created_branch && row.created_checkout, "ownership persisted on the row");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn materialize_direction_recreates_off_stored_base_when_work_branch_gone() {
         use crate::store::repo;

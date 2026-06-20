@@ -829,6 +829,27 @@ pub async fn record_worktree(
     .await?)
 }
 
+/// Persist updated ownership flags on a worktree row. Used when re-materializing a
+/// reclaimed worktree CREATES a fresh branch/checkout because the original was deleted:
+/// weft now owns what it just made, so the flags are OR'd up (never cleared) and later
+/// cleanup/rollback correctly tears the new branch/checkout down.
+pub async fn set_worktree_ownership(
+    db: &Db,
+    worktree_id: i32,
+    created_branch: bool,
+    created_checkout: bool,
+) -> Result<()> {
+    worktree::ActiveModel {
+        id: Set(worktree_id),
+        created_branch: Set(created_branch),
+        created_checkout: Set(created_checkout),
+        ..Default::default()
+    }
+    .update(&db.0)
+    .await?;
+    Ok(())
+}
+
 pub async fn list_worktrees(db: &Db, direction_id: Option<i32>) -> Result<Vec<worktree::Model>> {
     let q = worktree::Entity::find();
     let q = match direction_id {
