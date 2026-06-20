@@ -104,7 +104,19 @@ pub async fn materialize_direction(
         // created_branch=false — the branch is preserved on future cleanup.
         let repo_path = std::path::Path::new(&repo_ref.local_git_path);
         let wt_path = std::path::Path::new(&existing.path);
-        git::add_worktree_synced(repo_path, &existing.branch, wt_path, &existing.branch, false)
+        // Recreate FROM the direction's stored branch-off base, NOT the work branch
+        // itself. When the work branch still exists, add_worktree_synced's -b fallback
+        // checks it out and the base is unused (work preserved). But if the work branch
+        // no longer resolves (deleted externally), the base must be the recorded
+        // branch-off point so the recreated branch starts there rather than off an
+        // arbitrary fallback ref. Mirror the normal path's base resolution.
+        let recreate_base = if dir.base_branch.trim().is_empty() {
+            git::live_default_branch(repo_path)
+                .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref))
+        } else {
+            dir.base_branch.trim().to_string()
+        };
+        git::add_worktree_synced(repo_path, &existing.branch, wt_path, &recreate_base, false)
             .with_context(|| {
                 format!(
                     "re-materialize reclaimed worktree for branch {}",
@@ -596,6 +608,77 @@ mod tests {
     /// R15-2: materialize_direction must recreate the on-disk worktree when the
     /// row exists but the directory was reclaimed (remove_direction_worktree path).
     /// After re-materialization the directory must exist again.
+    #[tokio::test]
+    async fn materialize_direction_recreates_off_stored_base_when_work_branch_gone() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-gone-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // A distinct base branch "release", one commit AHEAD of main (so a fallback to
+        // main/HEAD would yield a DIFFERENT commit than the stored base).
+        g(&["checkout", "-q", "-b", "release"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "release work"]);
+        let release_sha = sha("release");
+        g(&["checkout", "-q", &main]);
+        assert_ne!(release_sha, sha(&main), "release must be ahead of main");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // EXPLICIT base_branch = release.
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+
+        // ① materialize off release, then reclaim the dir, then DELETE the work branch.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        assert!(wt_path.exists());
+        let _ = crate::git::remove_worktree(&repo_path, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-D", &work_branch]);
+        assert!(
+            !Cmd::new("git").args(["rev-parse", "--verify", "--quiet", &work_branch])
+                .current_dir(&repo_path).status().unwrap().success(),
+            "precondition: work branch deleted"
+        );
+
+        // ② re-materialize: the gone work branch must be recreated off the STORED base
+        // (release), NOT an arbitrary fallback (main/HEAD).
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+        assert!(wt_path.exists(), "worktree dir recreated");
+        assert_eq!(
+            sha(&work_branch), release_sha,
+            "recreated work branch must branch off the stored base (release), not a fallback"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn materialize_direction_recreates_reclaimed_worktree() {
         use crate::store::repo;
