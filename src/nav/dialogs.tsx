@@ -388,7 +388,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent title={t("dialog.addRepoTitle")}>
-        <div className="mb-4 flex items-center rounded-[var(--radius-md)] bg-bg p-0.5">
+        <div className="mb-2 flex items-center rounded-[var(--radius-md)] bg-bg p-0.5">
           {(["local", "clone", "new"] as RepoMode[]).map((m) => (
             <button
               key={m}
@@ -409,6 +409,10 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
           ))}
         </div>
 
+        <p className="mb-4 px-0.5 text-[11px] leading-relaxed text-ink-faint">
+          {t(`dialog.repoModeHint_${mode}`)}
+        </p>
+
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -418,7 +422,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
         >
           {mode === "local" && (
             <>
-              <Field label={t("dialog.repoPath")} hint={t("dialog.localPickHint")}>
+              <Field label={t("dialog.repoPath")}>
                 <PathInput
                   value={path}
                   placeholder="/Users/you/code/web-app"
@@ -475,7 +479,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
 
           {mode === "clone" && (
             <>
-              <Field label={t("dialog.repoUrl")} hint={t("dialog.clonePasteHint")}>
+              <Field label={t("dialog.repoUrl")}>
                 <Textarea
                   autoFocus
                   rows={3}

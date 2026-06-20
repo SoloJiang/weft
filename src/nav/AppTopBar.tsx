@@ -203,12 +203,6 @@ export function AppTopBar() {
             <span className="shrink-0 text-[11.5px] text-ink-faint">
               {t("nav.repos", { count: repos.length })}
             </span>
-            {repos.length > 0 && (
-              <span className="hidden shrink-0 items-center gap-1.5 text-[11.5px] text-running sm:inline-flex">
-                <span className="h-1.5 w-1.5 rounded-full bg-running" />
-                {t("repomap.curatorReady")}
-              </span>
-            )}
           </div>
         )}
         {showNeeds && (

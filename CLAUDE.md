@@ -25,10 +25,12 @@ Use TypeScript for frontend code and Rust 2021 for backend code. Keep modules fo
 
 Rust production paths deny `unwrap`, `expect`, and `panic`; return `Result` and surface errors clearly. Avoid adding embedded terminal/TUI dependencies; Weft renders its own chat UI and uses terminal takeover only as an escape hatch.
 
-- Prefer a single enum/discriminated field over multiple booleans for mutually exclusive UI state (e.g. `sidePanel?: "diff" | "files"`).
+Never nest ternary expressions — a `?:` inside another `?:`'s branch is banned in both TypeScript and Rust. A single, non-nested ternary is fine; for three or more branches use early returns, `if` / `else if`, a lookup map, or `match` (Rust). For multi-way JSX rendering, extract a small helper function or sub-component that returns the right element via `if`/`else` rather than chaining `cond1 ? a : cond2 ? b : c`.
+
+**Discriminated state, exhaustive map.** When the same multi-way state drives rendering or logic — especially in more than one place — model it as ONE discriminated value derived by a pure function (`type Status = "a" | "b" | "c"`; `function statusOf(...): Status`) instead of multiple booleans, then map that value to output via a `Record<Status, …>` lookup, an exhaustive `switch`, or a small `status → view` component (see `src/components/ui/StatusChip.tsx`). Don't re-derive the same booleans (`isFailed`, `isDone`, …) at each call site, and don't reach for mutable `let x; if (…) x = …; else if (…) x = …` to pick a value — that's a pure mapping wearing imperative clothes. Prefer a `Record<Status, …>` literal: it's exhaustive by construction, so adding a new state is a compile error until every map handles it. This generalizes the no-nested-ternary rule: the goal is a single source of truth for the state plus one obvious place per surface that turns it into output.
+
 - When porting external UI components, install their underlying primitives and re-skin with the project's design tokens; remove unused exports after porting.
 - Edits to command/handler registries are high-risk; diff the surrounding lines to ensure adjacent entries were not dropped.
-
 ## Testing Guidelines
 
 Backend logic is covered with Rust unit tests next to modules and integration tests under `src-tauri/tests/`. Add tests for store migrations, worktree behavior, chat protocol parsing, planner scope, bus behavior, and verification logic when those areas change. Frontend changes should at minimum pass `npm run build`.

@@ -114,6 +114,13 @@ async fn register_repo(
     {
         if let Ok(Some(updated)) = repo::set_repo_path(db, r.id, &canonical).await {
             r = updated;
+            // Repointed from a DEAD checkout to this live one: forget the stale
+            // "checkout not found" failure so the auto pass below reclassifies the
+            // fresh path (its new HEAD ≠ the old profiled_commit → needs_classification
+            // re-runs it). We DON'T clear on a live-duplicate re-add: that pass isn't
+            // forced and would skip an unchanged classified repo, dropping the failure
+            // with no retry.
+            crate::curator::clear_failure(r.id);
         }
     }
     // The curator is agent-only now (ARCHITECTURE §4.9): there is no deterministic
@@ -130,11 +137,11 @@ async fn register_repo(
     // Fire-and-forget the agent curator over the whole workspace so the new repo
     // gets a deep per-repo classification and cross-repo relations refresh.
     // Read-only, coalesced (a batch add runs one pass), and best-effort — it
-    // never blocks the add.
+    // never blocks the add. Not forced: an add shouldn't retry OTHER repos' failures.
     let db_bg = db.clone();
     let ws = r.workspace_id;
     tauri::async_runtime::spawn(async move {
-        crate::curator::analyze_workspace_coalesced(&db_bg, ws).await;
+        crate::curator::analyze_workspace_coalesced(&db_bg, ws, false).await;
     });
     Ok(r)
 }
@@ -239,7 +246,12 @@ pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
 /// caller can refresh the graph; coalesced with any in-flight pass.
 #[tauri::command]
 pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
-    crate::curator::analyze_workspace_coalesced(&db, workspace_id).await;
+    // An EXPLICIT user re-run: `force` so repos whose last classify failed are
+    // retried even if unchanged (the auto anti-storm skip otherwise ignores them).
+    // A failed repo whose checkout is gone is still filtered out by the pass and
+    // keeps its failed state — we no longer clear failures up front (that dropped
+    // such repos to a silent idle).
+    crate::curator::analyze_workspace_coalesced(&db, workspace_id, true).await;
     Ok(())
 }
 
@@ -268,6 +280,9 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
         .map_err(e)?
         .ok_or("repo not found")?;
     let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
+    // Drop any in-memory analysis run-state so the process-global registry doesn't
+    // keep a stale failed/running entry for a repo that no longer exists.
+    crate::curator::run_forget(repo_id);
     let repo_path = std::path::Path::new(&repo.local_git_path);
     for (_repo_id, path, branch) in &removed {
         if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
