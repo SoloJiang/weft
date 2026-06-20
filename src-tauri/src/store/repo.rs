@@ -514,6 +514,19 @@ pub async fn set_repo_remote(db: &Db, repo_id: i32, remote_url: &str) -> Result<
     Ok(())
 }
 
+/// Persist a newly-learned default branch for a repo. Called when materialize
+/// discovers (via `live_default_branch`) that the remote's default has changed
+/// since the repo was registered, so future offline fallbacks use the current value.
+/// Best-effort: a write hiccup (row gone, DB error) is silently ignored.
+pub async fn set_repo_base_ref(db: &Db, repo_id: i32, base_ref: &str) -> Result<()> {
+    if let Some(m) = repo_ref::Entity::find_by_id(repo_id).one(&db.0).await? {
+        let mut a: repo_ref::ActiveModel = m.into();
+        a.base_ref = Set(base_ref.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// Repoint a repo at a new local checkout path. Used when remote-dedup matches a
 /// row whose old checkout has gone missing — we keep the fresh clone and update
 /// the row rather than orphaning the user. Returns the updated row; None if gone.

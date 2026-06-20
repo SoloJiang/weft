@@ -120,12 +120,20 @@ pub async fn materialize_direction(
     // Branch off the chosen base (or the repo's live default branch), syncing
     // origin first so the worktree starts from the latest remote state.
     let explicit = !dir.base_branch.trim().is_empty();
+    // For the blank-base path, capture the live default separately so we can
+    // detect when it differs from the recorded base_ref and persist the update.
+    let live_default: Option<String> = if explicit {
+        None
+    } else {
+        git::live_default_branch(repo_path)
+    };
     let base = if explicit {
         dir.base_branch.trim().to_string()
     } else {
         // Live remote default (authoritative). Offline, prefer the recorded base_ref
         // (the live default captured at register) over a possibly-stale cached origin/HEAD.
-        git::live_default_branch(repo_path)
+        live_default
+            .clone()
             .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref))
     };
     let add = git::add_worktree_synced(repo_path, &dir.branch, &path, &base, explicit)
@@ -152,6 +160,19 @@ pub async fn materialize_direction(
             // re-resolved (possibly changed) default. Use recorded_base (which may differ
             // from the requested `base` when the fallback chain picked a different ref).
             repo::set_direction_base_branch(db, direction_id, &recorded_base).await?;
+            // R17-5: if we learned a live default that differs from the recorded
+            // base_ref, persist it so future offline fallbacks use the current value.
+            // Only when live_default returned Some (never the offline fallback), and
+            // only when it actually differs — best-effort (write hiccup must not fail
+            // materialize, but we propagate DB errors from set_direction_base_branch
+            // above; an error here would be equally unexpected, so we let it surface).
+            if let Some(ref live) = live_default {
+                if live != &repo_ref.base_ref {
+                    // Best-effort: ignore errors so a transient write hiccup never
+                    // fails the materialize call.
+                    let _ = repo::set_repo_base_ref(db, repo_ref.id, live).await;
+                }
+            }
         }
         // Keep the diff "vs target" consistent with the branch we actually based off:
         // when the direction has no explicit target yet, pin it to the actual branched-from
@@ -747,6 +768,74 @@ mod tests {
         assert!(repo::get_direction(&db, dir.id).await.unwrap().is_none(),
             "direction row must be deleted after rollback");
 
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R17-5: blank-base materialize where live_default_branch resolves a default
+    /// that DIFFERS from the registered base_ref → the repo's base_ref must be
+    /// updated to the live default afterward (so future offline fallbacks are current).
+    #[tokio::test]
+    async fn materialize_persists_live_default_when_it_differs_from_registered_base_ref() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-r17-5-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // Set up an origin with a commit so `git ls-remote --symref` returns a HEAD.
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let g = |a: &[&str]| { Cmd::new("git").args(a).current_dir(&origin).status().unwrap(); };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t.t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "init"]);
+        // Discover the actual default branch name (could be "main" or "master").
+        let live_default = crate::git::current_branch(&origin).unwrap();
+
+        // Clone so the clone has an `origin` remote that live_default_branch can query.
+        let clone = root.join("clone");
+        Cmd::new("git")
+            .args(["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // Register the clone with a STALE base_ref that differs from the live default.
+        let stale_base = "stale-old-default";
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), stale_base, "")
+            .await
+            .unwrap();
+        assert_eq!(r.base_ref, stale_base, "precondition: registered with stale base_ref");
+
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // Blank base → will call live_default_branch, which should return `live_default`.
+        let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+
+        materialize_direction(&db, dir.id).await.unwrap();
+
+        // The repo row's base_ref must now be the live default, not the stale value.
+        let updated = repo::get_repo(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated.base_ref, live_default,
+            "R17-5: repo base_ref must be updated to the live remote default (was stale)"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

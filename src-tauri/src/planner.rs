@@ -205,16 +205,22 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
     // Idempotent fast-path: the plan was already fully confirmed in a prior call.
-    // Return ONLY the ids belonging to THIS proposal's lanes (by name+repo) — not
-    // every direction in the thread, which may include older-proposal or manual lanes
-    // that the frontend must not re-dispatch.
+    // Return ONLY the ids belonging to lanes that confirm itself creates/dispatches:
+    // - known repo, AND
+    // - decision was NOT "approved" or "denied" at confirm time (those are handled
+    //   by approve_direction / deny_direction and must not be re-dispatched here).
+    // This mirrors exactly the lane-selection filter in the main confirm path below.
     if resolved.status == "confirmed" {
         let all = repo::list_directions(db, thread_id).await?;
         let ids = all
             .into_iter()
             .filter(|d| {
                 resolved.directions.iter().any(|p| {
-                    p.repo.known && p.name == d.name && p.repo.repo_id == d.repo_id
+                    p.repo.known
+                        && p.name == d.name
+                        && p.repo.repo_id == d.repo_id
+                        && p.decision != "approved"
+                        && p.decision != "denied"
                 })
             })
             .map(|d| d.id)
@@ -261,6 +267,14 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 std::path::Path::new(&repo_ref.local_git_path),
                 &repo_ref.base_ref,
             ) {
+                rollback_created(db, &created_now).await;
+                return Err(err);
+            }
+            // Re-materialize in case the worktree dir was reclaimed (exists=false):
+            // materialize_direction is idempotent when the dir already exists, so
+            // calling it here is always safe. Mirror what the normal (non-reuse) path
+            // already does below.
+            if let Err(err) = materialize::materialize_direction(db, ex.id).await {
                 rollback_created(db, &created_now).await;
                 return Err(err);
             }
@@ -363,8 +377,13 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
             &repo_ref.base_ref,
         )?;
         // Already created (e.g. the lead re-proposed and the decision was reset).
-        // Idempotent: don't create a second direction/worktree.
+        // Idempotent: don't create a second direction/worktree, but DO re-materialize
+        // in case the worktree dir was reclaimed (exists=false) — so the lane has a
+        // live worktree to dispatch. Mirror what the normal (non-reuse) path does below.
         let id = existing.id;
+        if let Err(err) = materialize::materialize_direction(db, id).await {
+            return Err(err);
+        }
         proposal.directions[index].decision = "approved".to_string();
         persist_decision(db, thread_id, &proposal, &plan).await?;
         return Ok(id);
@@ -1196,6 +1215,156 @@ mod tests {
         let dirs = repo::list_directions(&db, t.id).await.unwrap();
         assert!(dirs.iter().any(|d| d.id == a_id), "reused lane A must NOT be rolled back");
         assert!(!dirs.iter().any(|d| d.name == "B"), "failed new lane B is rolled back");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R17-1: confirm REUSES a direction whose worktree dir was reclaimed (exists=false)
+    /// → after confirm, the worktree dir must exist again.
+    #[tokio::test]
+    async fn confirm_reuse_rematerializes_reclaimed_worktree() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-remat-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // First confirm: creates and materializes the direction.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let first_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(first_ids.len(), 1);
+        let dir_id = first_ids[0];
+
+        // Find the worktree path and simulate a reclaim: remove the on-disk directory.
+        let wts = crate::store::repo::list_worktrees(&db, Some(dir_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row after first confirm");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        // Remove the dir (simulate reclaim via git worktree remove + force remove).
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: dir must be gone before re-confirm");
+
+        // Re-propose (resets status to "proposed") and confirm again → reuse path.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let second_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(second_ids, vec![dir_id], "re-confirm returns the existing id");
+        assert!(wt_path.exists(), "R17-1: worktree dir must be recreated after confirm reuse");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R17-2: approve_direction REUSES a direction whose worktree dir was reclaimed
+    /// → after approve, the worktree dir must exist again.
+    #[tokio::test]
+    async fn approve_reuse_rematerializes_reclaimed_worktree() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-remat-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // First approve: creates and materializes the direction.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let dir_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Find worktree and simulate reclaim.
+        let wts = crate::store::repo::list_worktrees(&db, Some(dir_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row after first approve");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: dir must be gone before re-approve");
+
+        // Re-propose (resets proposal; decision clears) then re-approve → reuse path.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let dir_id2 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        assert_eq!(dir_id2, dir_id, "re-approve returns the existing id");
+        assert!(wt_path.exists(), "R17-2: worktree dir must be recreated after approve reuse");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R17-3: a proposal with one lane approved individually (via approve_direction)
+    /// and one lane created by confirm → a retry of confirm (after it's "confirmed")
+    /// must return ONLY the confirm-created lane's id, NOT the individually-approved one.
+    #[tokio::test]
+    async fn confirmed_fast_path_excludes_individually_approved_lanes() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-approved-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Lane A is approved via approve_direction (decision="approved").
+        // Lane B is pending (decision="") → confirm will create+dispatch it.
+        let prop_a_only = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_a_only).await.unwrap();
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Now re-propose with BOTH A (already approved) and B (pending).
+        // After approve_direction set A's decision to "approved", we need a new proposal
+        // that has A with decision="" (re-propose resets) + B with decision="".
+        let prop_ab = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "approved".into() },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        // Save this combined proposal (A=approved, B=pending) and confirm → creates B only.
+        save_proposal(&db, t.id, &prop_ab).await.unwrap();
+        let confirm_ids = confirm(&db, t.id).await.unwrap();
+        // confirm should dispatch only B (A is "approved" → skipped by main path).
+        assert_eq!(confirm_ids.len(), 1, "confirm creates only lane B (A is already approved)");
+        let b_id = confirm_ids[0];
+        assert_ne!(b_id, a_id, "B must be a different direction from A");
+
+        // Now the plan is "confirmed". A retry must return ONLY B's id.
+        let retry_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(retry_ids, vec![b_id],
+            "R17-3: confirmed fast-path must return only confirm-created lane B, NOT approved lane A");
+        assert!(!retry_ids.contains(&a_id),
+            "R17-3: individually-approved lane A must NOT appear in fast-path retry");
+
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
