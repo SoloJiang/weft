@@ -425,6 +425,7 @@ export const en = {
     analyzing: "Analyzing…",
     analyzingHint: "Reading the repo and classifying its tier…",
     analysisFailed: "Analysis failed",
+    analysisErrorCheckoutMissing: "Repository checkout not found on disk (moved or deleted)",
     retryAnalysis: "Retry analysis",
     analyze: "Analyze",
     notAnalyzed: "Not analyzed yet",

@@ -562,7 +562,10 @@ function RepoNode({
   const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
   const core = dependents >= 2;
-  const view = analysisView(p); // canvas cards have no live stream → never "running"
+  // Cards pass no live `phase`, but a card CAN still be "running": the backend sets
+  // `analysis_state: "running"` (and pushes a graph refresh) on start, so a repo
+  // being (re)analyzed shows the spinner on its card too, not just in the open pane.
+  const view = analysisView(p);
 
   return (
     <div
@@ -712,23 +715,25 @@ function ModeBtn({
   );
 }
 
-/** Subscribe to a repo's live analysis stream (started/delta/done/failed),
- *  seeded from the profile's persisted run-state. Returns the live phase + the
- *  accumulated transcript so the detail panel can show the process as it runs. */
+/** Subscribe to a repo's live analysis stream (started/delta/done/failed). The
+ *  LISTENER — not the profile — is the live source of truth for `phase`/`transcript`
+ *  here; `analysisView(profile, phase)` falls back to the profile's persisted
+ *  `analysis_state` when there's no live phase yet, and the caller falls back to
+ *  `analysis_error` for the failure detail. Subscribe ONCE per repo: the backend
+ *  fires `repo-graph-updated` on `started` and after every repo in a workspace pass,
+ *  so keying this effect on the profile's state would tear the listener down
+ *  mid-run, wiping the transcript and dropping deltas in the async re-subscribe gap. */
 function useAnalysisStream(profile?: RepoProfile) {
   const repoId = profile?.repo_id;
-  const seedPhase = profile?.analysis_state ?? "idle";
-  const seedError = profile?.analysis_error ?? null;
-  const [phase, setPhase] = useState<string>(seedPhase);
+  const [phase, setPhase] = useState<string>("idle");
   const [transcript, setTranscript] = useState("");
-  const [error, setError] = useState<string | null>(seedError);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    // Re-seed from the (possibly refreshed) profile whenever the selected repo or
-    // its persisted state changes — a `done` graph refresh lands here and flips
-    // the panel from transcript back to the classified fields.
-    setPhase(seedPhase);
-    setError(seedError);
+    // Reset the live state only when the SELECTED repo changes — NOT on a profile
+    // refresh. (The persisted `analysis_state`/`analysis_error` drive the fallback.)
+    setPhase("idle");
     setTranscript("");
+    setError(null);
     if (repoId == null) return;
     const un = listen<{ repoId: number; phase: string; text?: string; error?: string }>(
       "repo-analysis",
@@ -753,7 +758,7 @@ function useAnalysisStream(profile?: RepoProfile) {
     return () => {
       void un.then((f) => f());
     };
-  }, [repoId, seedPhase, seedError]);
+  }, [repoId]);
   return { phase, transcript, error };
 }
 
@@ -792,15 +797,21 @@ function AnalyzingTranscript({ text }: { text: string }) {
  *  analysis fails can still be manually tiered/summarized — not a full takeover. */
 function FailedNotice({ error, onRetry }: { error: string | null; onRetry: () => void }) {
   const { t } = useTranslation();
+  // Our own known failure cases are stored as stable CODES that the UI localizes;
+  // agent/transport errors are inherently dynamic English diagnostics, shown raw.
+  const errorCodes: Record<string, string> = {
+    "checkout-missing": t("repomap.analysisErrorCheckoutMissing"),
+  };
+  const message = error ? (errorCodes[error] ?? error) : null;
   return (
     <div className="mb-4 rounded-[var(--radius-md)] border border-danger/30 bg-danger/5 px-3 py-2.5">
       <div className="flex items-center gap-1.5 text-[12px] font-medium text-danger">
         <TriangleAlert size={13} />
         {t("repomap.analysisFailed")}
       </div>
-      {error && (
+      {message && (
         <pre className="mt-1.5 max-h-24 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-ink-faint">
-          {error}
+          {message}
         </pre>
       )}
       <button
@@ -926,7 +937,10 @@ function RepoProfilePane({
   // must work even for a placeholder or a repo whose analysis failed — the
   // backend supports it), with a status notice keyed by the discriminant on top.
   const notices: Partial<Record<AnalysisView, React.ReactNode>> = {
-    failed: <FailedNotice error={stream.error} onRetry={retry} />,
+    // The live stream's error wins; fall back to the persisted `analysis_error`
+    // when a failed repo is selected with no live event yet (the hook seeds no
+    // error from the profile, so without this the detail would be blank).
+    failed: <FailedNotice error={stream.error ?? profile.analysis_error ?? null} onRetry={retry} />,
     pending: <PendingNotice onAnalyze={retry} />,
   };
   const paneBody =

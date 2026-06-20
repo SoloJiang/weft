@@ -410,6 +410,7 @@ export const zh = {
     analyzing: "分析中…",
     analyzingHint: "正在读取仓库并判定层级…",
     analysisFailed: "分析失败",
+    analysisErrorCheckoutMissing: "仓库路径不存在(已被移动或删除)",
     retryAnalysis: "重新分析",
     analyze: "分析",
     notAnalyzed: "尚未分析",
