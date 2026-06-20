@@ -179,19 +179,24 @@ pub async fn materialize_direction(
     // (the actual resolved ref, e.g. "origin/develop" → "develop"), otherwise
     // fall back to the requested base (for existing-branch and path-reuse paths
     // where no new branch was created from a known base).
-    let recorded_base = if add.branched_from.is_empty() {
+    let raw_recorded = if add.branched_from.is_empty() {
         base.clone()
     } else {
         add.branched_from.clone()
     };
-    // A bare "HEAD" is the detached / no-default fallback, not a usable stored base or
-    // target: pinning it makes the "vs target" diff resolve to the worktree's OWN HEAD
-    // (an empty self-diff) and makes reconcile compare against a moving ref. Store it as
-    // EMPTY so base/target/diff all fall back to their default resolution instead.
-    let recorded_base = if recorded_base == "HEAD" {
-        String::new()
+    // A bare "HEAD" is the detached / no-default fallback. The BASE and the diff TARGET
+    // diverge here:
+    //   - base_branch stores EMPTY, because "HEAD" is not a usable named ref — reconcile
+    //     would otherwise compare against a moving ref; empty means "the default".
+    //   - target_branch stores the actual branch-off COMMIT (a stable SHA). An empty or
+    //     "HEAD" target would later resolve to the worktree's OWN HEAD, making the diff
+    //     merge-base(HEAD, HEAD) and HIDING all committed worker changes.
+    let was_head = raw_recorded == "HEAD";
+    let recorded_base = if was_head { String::new() } else { raw_recorded };
+    let recorded_target = if was_head {
+        git::head_commit(repo_path).unwrap_or_default()
     } else {
-        recorded_base
+        recorded_base.clone()
     };
     let finish = async {
         if !explicit {
@@ -214,11 +219,12 @@ pub async fn materialize_direction(
                 }
             }
         }
-        // Keep the diff "vs target" consistent with the branch we actually based off:
-        // when the direction has no explicit target yet, pin it to the actual branched-from
-        // ref (otherwise an empty target would resolve via a possibly-stale repo base_ref).
+        // Keep the diff "vs target" consistent with what we actually based off: when the
+        // direction has no explicit target yet, pin it to the branched-from ref — or, for
+        // the detached HEAD fallback, the branch-off COMMIT (see recorded_target above) so
+        // the diff has a stable ref instead of resolving to the worktree's own HEAD.
         if dir.target_branch.trim().is_empty() {
-            repo::set_direction_target_branch(db, direction_id, &recorded_base).await?;
+            repo::set_direction_target_branch(db, direction_id, &recorded_target).await?;
         }
         let rec = repo::record_worktree(
             db,
@@ -670,6 +676,11 @@ mod tests {
         // the blank-base resolution falls all the way back to HEAD.
         g(&["checkout", "-q", "--detach"]);
         g(&["branch", "-D", &main]);
+        // The commit HEAD points at — what the worktree branches off, and what the diff
+        // target must be pinned to (a stable SHA, not the moving "HEAD").
+        let head_sha = String::from_utf8(
+            Cmd::new("git").args(["rev-parse", "--short", "HEAD"]).current_dir(&repo_path).output().unwrap().stdout,
+        ).unwrap().trim().to_string();
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
@@ -683,12 +694,16 @@ mod tests {
         let wts = materialize_direction(&db, dir.id).await.unwrap();
         assert_eq!(wts.len(), 1, "materialize must still create the worktree");
 
-        // recorded_base would be "HEAD" — it must be normalized to EMPTY for BOTH the
-        // stored base and the diff target (else the "vs target" diff is a self-diff).
+        // The HEAD fallback stores an EMPTY base (reconcile default-equiv) but pins the
+        // diff target to the branch-off COMMIT — an empty/"HEAD" target would resolve to
+        // the worktree's own HEAD and hide committed work.
         let d2 = entities::direction::Entity::find_by_id(dir.id)
             .one(&db.0).await.unwrap().unwrap();
         assert_eq!(d2.base_branch, "", "HEAD fallback must store empty base, not 'HEAD'");
-        assert_eq!(d2.target_branch, "", "HEAD fallback must store empty target, not 'HEAD'");
+        assert_eq!(
+            d2.target_branch, head_sha,
+            "HEAD fallback must store the branch-off COMMIT as target, not empty/'HEAD'"
+        );
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
