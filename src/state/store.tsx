@@ -1766,7 +1766,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     (index: number, name: string, repo: string, base: string): Promise<void> => {
       if (activeThreadId == null) return Promise.resolve();
       const tid = activeThreadId;
-      const laneKey = `${name} ${repo}`;
+      const laneKey = `${name}\0${repo}`;
       // Serialize onto any in-flight base save (chain, don't replace) and use the
       // targeted server-side setter — no whole-proposal rebuild from stale state,
       // no status downgrade. confirm/approve await pendingBaseSave before acting.
@@ -1830,6 +1830,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // promise may resolve even when a prior save rejected.
       if ((baseSaveFailed.current.get(item.thread_id)?.size ?? 0) > 0) {
         baseSaveFailed.current.delete(item.thread_id);
+        // A rejected base save can mean a re-proposal changed the lane indices, so this
+        // card's item.index is now stale. Refresh the Needs cards (dropping the stale
+        // one) as well as the proposal before aborting — otherwise a second click on the
+        // stale card would approve/dispatch the WRONG lane once the latch is cleared.
+        await refreshNeeds();
         if (activeThreadId != null) await refreshProposal(activeThreadId);
         return;
       }
