@@ -11,8 +11,10 @@ pub struct Model {
     pub path: String,
     pub created_at: String,
     /// Whether Weft created this branch (as opposed to checking out a pre-existing one).
-    /// Rollback deletes the branch only when this is true, preserving pre-existing branches.
-    #[sea_orm(default_value = false)]
+    /// Rollback/cascade cleanup deletes the branch only when this is true, preserving
+    /// pre-existing branches. Existing rows default to true: every pre-this-change
+    /// worktree had its branch created by Weft, so its branch is torn down on teardown.
+    #[sea_orm(default_value = true)]
     pub created_branch: bool,
     /// Whether Weft created this checkout directory (vs. reusing a pre-existing worktree path).
     /// Rollback and cleanup remove the worktree directory only when this is true. Existing rows

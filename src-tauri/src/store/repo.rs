@@ -1571,6 +1571,42 @@ mod tests {
 
     /// R15-1: delete_repo_cascade must carry created_branch in its 4-tuple so
     /// the caller can gate branch deletion. A worktree row with created_branch=false
+    #[tokio::test]
+    async fn worktree_created_branch_defaults_to_true_when_unset() {
+        // A worktree row inserted WITHOUT created_branch (a legacy/pre-column row) must
+        // default to TRUE — pre-this-change worktrees had their branch created by Weft,
+        // so cascade cleanup must still tear those branches down (zero-accumulation).
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "d", "claude", r.id, "x", "plan+impl", "")
+            .await
+            .unwrap();
+        let inserted = worktree::ActiveModel {
+            repo_id: Set(r.id),
+            direction_id: Set(d.id),
+            branch: Set("feat/x".into()),
+            path: Set("/tmp/wt".into()),
+            created_at: Set(now()),
+            created_checkout: Set(true),
+            // created_branch intentionally NotSet → the DB column default applies.
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+        // Re-fetch to read what the DB actually persisted (the default), not the
+        // ActiveModel's unset Rust-side value.
+        let row = worktree::Entity::find_by_id(inserted.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.created_branch, "created_branch must default to true when unset");
+    }
+
     /// (pre-existing branch reused by the -b fallback) must have its flag preserved.
     #[tokio::test]
     async fn delete_repo_cascade_carries_created_branch_flag() {

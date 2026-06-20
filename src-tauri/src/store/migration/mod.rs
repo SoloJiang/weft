@@ -962,6 +962,14 @@ impl MigrationTrait for M0024DirectionBaseBranch {
 /// Existing rows default to false (safe: rollback won't delete their branch).
 /// M0001 reflects the current entity, so a FRESH db already has it; sqlite has
 /// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+/// Adds worktree.created_branch: whether Weft created this worktree's branch (via
+/// `git worktree add -b`) vs. reusing a pre-existing branch. Thread/repo cascade
+/// cleanup only deletes the branch when this is true — a reused branch must survive.
+/// Existing rows default to TRUE: every pre-this-change worktree had its branch
+/// created by Weft (the old materialize path always `worktree add -b`'d), so
+/// zero-accumulation still tears those legacy branches down on teardown. sqlite has no
+/// ADD COLUMN IF NOT EXISTS, so tolerate the duplicate (M0001 reflects the current
+/// entity, so a FRESH db already has the column).
 pub struct M0025WorktreeCreatedBranch;
 impl MigrationName for M0025WorktreeCreatedBranch {
     fn name(&self) -> &str {
@@ -979,7 +987,7 @@ impl MigrationTrait for M0025WorktreeCreatedBranch {
                         ColumnDef::new(Alias::new("created_branch"))
                             .boolean()
                             .not_null()
-                            .default(false),
+                            .default(true),
                     )
                     .to_owned(),
             )
