@@ -975,7 +975,18 @@ function ImSettings() {
             <FeishuScanDialog
               open={scanOpen}
               onOpenChange={setScanOpen}
-              onConnected={() => void api.imStatus().then(setStatus)}
+              onConnected={() => {
+                // 扫码成功后端已写入新 app_id/secret + owner 白名单:重读 settings,否则
+                // header 仍显示「未绑定」、手填表单留旧/空凭证(可能被用户误存覆盖新应用)。
+                void api.imGetSettings().then((s) => {
+                  setAppId(s.app_id);
+                  setSavedAppId(s.app_id);
+                  setHasSecret(s.has_secret);
+                  setBound(s.bound);
+                  setEnabled(s.enabled);
+                });
+                void api.imStatus().then(setStatus);
+              }}
             />
           </div>
         )}
