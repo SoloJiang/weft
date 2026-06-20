@@ -776,11 +776,14 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
     // EOF the child has already exited and this is a no-op.
     drop(reader);
     let _ = child.kill().await;
-    // require_turn_end = false: a timeout, an arg-parse / early exit (no stdout →
-    // empty text), or an errored turn must surface as `Err` so a failed reprofile
-    // shows the failed/retryable state instead of being masked as `done` — but a
-    // clean EOF WITHOUT a TurnEnd is fine, because opencode's exec stream emits none.
-    collector.outcome(tool, completed, false)
+    // A timeout, an arg-parse / early exit (empty text), or an errored turn must
+    // surface as `Err` so a failed reprofile shows the failed/retryable state
+    // instead of being masked as `done`. codex (turn.completed/turn.failed) and
+    // claude (result) emit a terminal event, so for them a stdout close BEFORE one
+    // is a crash/early-exit → require it (like the app-server path). opencode's exec
+    // stream emits none, so ONLY it may complete on a clean EOF.
+    let require_turn_end = tool != "opencode";
+    collector.outcome(tool, completed, require_turn_end)
 }
 
 /// Group the agent's flat relations by producer (`from`), keep only those whose
