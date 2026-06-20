@@ -354,6 +354,23 @@ pub fn add_worktree_synced(
         bail!("base branch {base_name:?} not found locally or on origin (after fetch)");
     }
     if worktree_path.exists() {
+        // Validate the existing path is genuinely a git worktree checked out on
+        // `branch` before reusing it. A stale plain directory, or a checkout for a
+        // DIFFERENT branch, left under .worktrees/weft would otherwise be recorded and
+        // handed to the worker (dispatch only checks the dir exists), so the agent would
+        // run in the wrong tree. Gate on the worktree's OWN `.git` (a plain dir has
+        // none, and this stops rev-parse from walking up to the parent repo) plus a
+        // matching HEAD branch; refuse otherwise so the problem surfaces.
+        let is_worktree = worktree_path.join(".git").exists();
+        let on_branch = git(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|h| h == branch)
+            .unwrap_or(false);
+        if !(is_worktree && on_branch) {
+            bail!(
+                "worktree path {} exists but is not a clean checkout of {branch:?}",
+                worktree_path.display()
+            );
+        }
         return Ok(WorktreeAdd {
             path: worktree_path.to_path_buf(),
             created_checkout: false,
@@ -1356,6 +1373,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_invalid_existing_path() {
+        // The path-exists reuse must validate the path is a clean worktree for `branch`,
+        // not blindly hand a stale/plain dir or a different-branch checkout to the worker.
+        let repo = tmp("aws-invalid");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+
+        // (A) A plain directory at the path → rejected, not reused.
+        let wt_a = tmp("aws-invalid-plain");
+        std::fs::create_dir_all(&wt_a).unwrap();
+        std::fs::write(wt_a.join("stuff.txt"), "not a worktree\n").unwrap();
+        assert!(
+            add_worktree_synced(&repo, "feat/a", &wt_a, &base, false).is_err(),
+            "a plain dir at the path must be rejected"
+        );
+
+        // (B) An existing worktree for a DIFFERENT branch → rejected.
+        let wt_b = tmp("aws-invalid-otherbranch");
+        add_worktree_synced(&repo, "feat/other", &wt_b, &base, false).unwrap();
+        assert!(
+            add_worktree_synced(&repo, "feat/b", &wt_b, &base, false).is_err(),
+            "an existing worktree on a different branch must be rejected"
+        );
+
+        // (C) A valid worktree on the SAME branch → idempotent reuse.
+        let wt_c = tmp("aws-invalid-same");
+        add_worktree_synced(&repo, "feat/c", &wt_c, &base, false).unwrap();
+        let reuse = add_worktree_synced(&repo, "feat/c", &wt_c, &base, false)
+            .expect("reusing a valid worktree on the same branch must succeed");
+        assert!(!reuse.created_checkout, "reuse reports created_checkout=false");
+
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = remove_worktree(&repo, &wt_c);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
+        let _ = std::fs::remove_dir_all(&wt_c);
     }
 
     #[test]
