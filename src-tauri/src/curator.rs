@@ -539,9 +539,13 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
 ) -> Result<String> {
     use crate::codex_app_server::{Client, ThreadMsg};
     use crate::lead_chat::proto::ChatEvent;
-    // Pre-accept folder trust so the first thread/start doesn't block on codex's
-    // trust prompt (the engine's app-server path does the same).
-    crate::codex::ensure_codex_trusted(cwd);
+    // Deliberately do NOT pre-trust `cwd`: this curator scan runs in the user's
+    // CANONICAL repo (not a Weft-managed worktree), so silently writing it into
+    // codex's trusted-folders config — permanently bypassing codex's own folder
+    // trust prompt for later sessions — would be wrong. The exec path skips
+    // `adapter.prepare` for the same reason. The scan is read-only + best-effort:
+    // an untrusted repo simply yields nothing (→ a retryable failed state), and
+    // the graph stays intact, rather than us escalating trust behind the user's back.
     let program = crate::tool_command::command_for("codex");
     // app-server has no per-turn CLI flags; the read-only + never-prompt policy is
     // applied as config overrides at spawn (the exec args' equivalent).
@@ -838,14 +842,19 @@ fn run_error(id: i32) -> Option<String> {
     run_lock().get(&id).and_then(|r| r.error.clone())
 }
 
-/// Whether an analysis run that produced NO parseable classification should be
-/// surfaced as a FAILURE (visible + retryable) rather than silently cleared to
-/// idle. It's a failure only when the repo has no usable prior classification to
-/// preserve: a fresh placeholder that got nothing back genuinely failed, while a
-/// re-analysis that returns garbage over an already-classified repo keeps its
-/// prior result and is not a failure.
-fn unclassified_run_failed(had_prior_classification: bool) -> bool {
-    !had_prior_classification
+/// Whether a repo currently carries a usable (canonical) tier classification.
+/// This is the success criterion for an analysis run: the repo is classified iff
+/// it has a canonical tier — one just written this run, or a prior one preserved
+/// because the agent's reply was unusable. A fresh placeholder left without a
+/// canonical tier means the run failed (whether the reply was unparseable, or
+/// parseable but dropped by persist_repo_class's no-op rules).
+async fn classified_now(db: &Db, repo_id: i32) -> bool {
+    repo::get_repo_profile(db, repo_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| profile::normalize_tier(&p.role).is_some())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1014,29 +1023,34 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     // Persistence runs inside the result so a persist/DB error still FINALIZES the
     // run-state (as failed, retryable) — never propagate via `?` and strand the
     // repo at a leaked "running" (the very stuck-state this whole change kills).
-    let outcome = match res {
-        Ok(text) => match parse_repo_class(&text) {
-            Some(wire) => persist_repo_class(db, repo, wire, &head_before).await,
-            // The agent finished but produced no usable classification. If the repo
-            // already has a good prior classification (a re-analysis that returned
-            // garbage), keep it and clear to idle so its fields still show. But a
-            // placeholder with no prior result is a real failure the user should
-            // see + retry, not a silent "done" that reads as "not analyzed yet".
-            None => {
-                let had_prior = repo::get_repo_profile(db, repo.id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|p| profile::normalize_tier(&p.role).is_some())
-                    .unwrap_or(false);
-                if unclassified_run_failed(had_prior) {
-                    Err(anyhow::anyhow!("analyzer returned no usable classification"))
-                } else {
-                    Ok(())
+    let outcome: Result<()> = match res {
+        Err(e) => Err(e),
+        Ok(text) => {
+            // Best-effort persist; a genuine DB error is itself a failure. Note
+            // persist_repo_class may legitimately write NOTHING — an unparseable
+            // reply, OR a parseable-but-unusable one (non-canonical tier / blank
+            // summary, which it intentionally drops) — so success can't be inferred
+            // from its `Ok`.
+            let persisted = match parse_repo_class(&text) {
+                Some(wire) => persist_repo_class(db, repo, wire, &head_before).await,
+                None => Ok(()),
+            };
+            match persisted {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    // Success iff the repo now carries a usable (canonical) tier —
+                    // freshly written this run, or a prior one preserved when the
+                    // reply was unusable. A placeholder left unclassified is a real
+                    // failure (visible + retryable), covering BOTH the unparseable
+                    // and the parseable-but-no-op cases uniformly.
+                    if classified_now(db, repo.id).await {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("analyzer returned no usable classification"))
+                    }
                 }
             }
-        },
-        Err(e) => Err(e),
+        }
     };
     match outcome {
         Ok(()) => {
@@ -1321,13 +1335,25 @@ mod tests {
         assert_eq!(super::run_error(101), None);
     }
 
-    #[test]
-    fn unclassified_run_is_failure_only_without_prior() {
-        // A finished run that yields no classification: a fresh placeholder failed
-        // (must show + be retryable), but a garbage re-analysis over an already-
-        // classified repo keeps the prior result and is NOT a failure.
-        assert!(super::unclassified_run_failed(false), "no prior → failure");
-        assert!(!super::unclassified_run_failed(true), "prior classification preserved → not a failure");
+    #[tokio::test]
+    async fn classified_now_requires_canonical_tier() {
+        // The success criterion for a run: a repo counts as classified ONLY with a
+        // canonical tier. No profile, a non-canonical/legacy tier, or a tier-less
+        // placeholder all read as "not classified" → a fresh run that lands there
+        // is a failure (covers both the unparseable and parseable-but-no-op replies),
+        // while a re-analysis preserving a prior canonical tier stays a success.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "").await.unwrap();
+        assert!(!super::classified_now(&db, r.id).await, "no profile → not classified");
+        repo::upsert_repo_profile(&db, r.id, "service", "[]", "s", "[]", "agent", "")
+            .await
+            .unwrap();
+        assert!(!super::classified_now(&db, r.id).await, "non-canonical tier → not classified");
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "an api", "[]", "agent", "")
+            .await
+            .unwrap();
+        assert!(super::classified_now(&db, r.id).await, "canonical tier → classified");
     }
 
     #[tokio::test]
