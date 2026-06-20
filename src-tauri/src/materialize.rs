@@ -93,17 +93,24 @@ pub async fn materialize_direction(
         return Ok(Vec::new());
     };
     if let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
-        // Idempotent: the worktree dir still exists — nothing to do.
-        if std::path::Path::new(&existing.path).exists() {
+        let repo_path = std::path::Path::new(&repo_ref.local_git_path);
+        let wt_path = std::path::Path::new(&existing.path);
+        // Idempotent ONLY when the recorded path is a worktree REGISTERED to this repo on
+        // the lane's branch — not merely that the path exists(). If it was replaced
+        // out-of-band by a plain dir or a checkout for another repo/branch, trusting
+        // `exists` would dispatch the worker into the wrong tree (the frontend dispatch
+        // only filters on `exists`). When it is NOT a valid registered worktree, fall
+        // through to the recreate path below, whose add_worktree_synced fast-path then
+        // bails on the non-registered/mismatched dir — surfacing the problem instead of
+        // dispatching into it.
+        if git::is_registered_worktree(repo_path, wt_path, &existing.branch) {
             return Ok(vec![existing]);
         }
-        // The dir was reclaimed (remove_direction_worktree), but the row (and
+        // The dir was reclaimed (remove_direction_worktree) or replaced, but the row (and
         // usually the branch) survives. Recreate the on-disk worktree for the
         // stored branch so the lane's worker can resume. The branch typically
         // still exists, so add_worktree_synced takes the -b fallback and sets
         // created_branch=false — the branch is preserved on future cleanup.
-        let repo_path = std::path::Path::new(&repo_ref.local_git_path);
-        let wt_path = std::path::Path::new(&existing.path);
         // Recreate FROM the direction's stored branch-off base, NOT the work branch
         // itself. When the work branch still exists, add_worktree_synced's -b fallback
         // checks it out and the base is unused (work preserved). But if the work branch
@@ -143,6 +150,25 @@ pub async fn materialize_direction(
         // when the work branch is gone AND the base is explicit, a missing base must ERROR
         // rather than silently branching off an arbitrary fallback ref.
         let require = explicit && !git::ref_resolves(repo_path, &existing.branch);
+        // R37-2: when require=false (the work branch survives) the -b fallback checks it out
+        // WITHOUT add_worktree_synced's explicit-base ancestry check. A surviving branch that
+        // was externally reset/recreated off a DIFFERENT base (e.g. main) while this lane's
+        // explicit base is `release` would then be recorded+dispatched as based on release
+        // while it sits on main's line. Guard it here: for an EXPLICIT base, when the work
+        // branch resolves AND the explicit base STILL RESOLVES, the branch must descend from
+        // that base — else bail. Only validate when the base resolves: a GONE explicit base
+        // must NOT block resuming a surviving branch (the prior round's behavior).
+        if explicit
+            && git::ref_resolves(repo_path, &existing.branch)
+            && git::ref_resolves(repo_path, &recreate_base)
+            && !git::branch_descends_from(repo_path, &existing.branch, &recreate_base)
+        {
+            anyhow::bail!(
+                "work branch {:?} no longer descends from its explicit base {:?}; \
+                 delete the sub-task to recreate it from {:?}",
+                existing.branch, recreate_base, recreate_base
+            );
+        }
         let add = git::add_worktree_synced(repo_path, &existing.branch, wt_path, &recreate_base, require)
             .with_context(|| {
                 format!(
@@ -1150,6 +1176,170 @@ mod tests {
         // Cleanup.
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R37-1: the idempotent early-return must GIT-VALIDATE the recorded path, not trust
+    /// `path.exists()` alone. If the recorded worktree dir was replaced out-of-band by a
+    /// PLAIN directory (not a registered worktree of this repo on the branch), materialize
+    /// must NOT return the stale row as-valid — it falls through to the recreate path, whose
+    /// add_worktree_synced fast-path then bails on the non-registered dir, surfacing the
+    /// problem rather than dispatching the worker into the wrong tree. A real registered
+    /// worktree at the path still returns Ok (the normal idempotent case).
+    #[tokio::test]
+    async fn materialize_idempotent_rejects_stale_unregistered_path() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-staledir-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // ① First materialize: a REAL registered worktree at the deterministic path.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        assert!(wt_path.exists(), "precondition: worktree dir exists");
+
+        // The NORMAL idempotent case: a real registered worktree still at the path → Ok,
+        // returns the existing row without recreating.
+        let again = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(again.len(), 1, "a valid registered worktree returns the row idempotently");
+
+        // ② Replace the dir OUT-OF-BAND with a PLAIN directory: drop the real worktree
+        // (so git's registration is gone) then recreate a bare dir at the same path. The
+        // path still exists(), but it is NOT a registered worktree of this repo on the branch.
+        let _ = crate::git::remove_worktree(&repo_path, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        g(&["branch", "-D", &work_branch]); // also drop the work branch so recreate can't reuse it
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join("stuff.txt"), "not a worktree\n").unwrap();
+        assert!(wt_path.exists(), "precondition: a plain dir now sits at the recorded path");
+        assert!(
+            !crate::git::is_registered_worktree(&repo_path, &wt_path, &work_branch),
+            "precondition: the plain dir is NOT a registered worktree"
+        );
+
+        // ③ Re-materialize: must NOT return the stale row as-valid. The trusting early-return
+        // is bypassed (path not git-validated), it falls to recreate, and add_worktree_synced
+        // bails on the non-registered dir → an error, not a bad path handed to the worker.
+        let res = materialize_direction(&db, dir.id).await;
+        assert!(
+            res.is_err(),
+            "a stale plain dir at the recorded path must surface an error, not be returned as a valid worktree"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R37-2: when a reclaimed explicit-base lane's WORK BRANCH still exists, the recreate
+    /// reuses it (require=false, the -b fallback bypasses the ancestry check). If that branch
+    /// was externally reset/recreated off a DIFFERENT base (e.g. main) while the recorded
+    /// `base_branch` is `release`, rematerialization must NOT record+dispatch a branch that no
+    /// longer descends from its explicit base — it bails. (Only validated when the explicit
+    /// base still resolves; a GONE base keeps the surviving-branch checkout working — see
+    /// materialize_recreate_requires_explicit_base_only_when_work_branch_gone Scenario B.)
+    #[tokio::test]
+    async fn materialize_recreate_rejects_work_branch_reset_off_other_base() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-reset-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // release: one commit AHEAD of main (so main does NOT descend from release).
+        g(&["checkout", "-q", "-b", "release"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "release work"]);
+        let release_sha = sha("release");
+        g(&["checkout", "-q", &main]);
+        let main_sha = sha(&main);
+        assert_ne!(release_sha, main_sha, "release must be ahead of main");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // ---- Case A: work branch reset OFF main (not descending from release) → Err. ----
+        let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
+        let branch_a = wts_a[0].branch.clone();
+        assert_eq!(sha(&branch_a), release_sha, "precondition: work branch forked off release");
+        // Reclaim the dir but KEEP the work branch.
+        let _ = crate::git::remove_worktree(&repo_path, &wt_a);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        g(&["worktree", "prune"]);
+        // Externally RESET the surviving work branch to main (a commit NOT descending from release).
+        g(&["branch", "-f", &branch_a, &main]);
+        assert_eq!(sha(&branch_a), main_sha, "precondition: work branch reset to main");
+        assert!(crate::git::ref_resolves(&repo_path, "release"), "precondition: explicit base still resolves");
+        // Re-materialize: must bail — the work branch no longer descends from its explicit base.
+        assert!(
+            materialize_direction(&db, dir_a.id).await.is_err(),
+            "a surviving work branch reset off a different base than its explicit base must error"
+        );
+
+        // ---- Case B: work branch still descends from release → Ok. ----
+        let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
+        let branch_b = wts_b[0].branch.clone();
+        // Reclaim the dir; the work branch (still off release) survives untouched.
+        let _ = crate::git::remove_worktree(&repo_path, &wt_b);
+        let _ = std::fs::remove_dir_all(&wt_b);
+        g(&["worktree", "prune"]);
+        assert!(crate::git::branch_descends_from(&repo_path, &branch_b, "release"),
+            "precondition: work branch still descends from release");
+        // Re-materialize: succeeds (checks out the surviving, still-valid work branch).
+        assert!(
+            materialize_direction(&db, dir_b.id).await.is_ok(),
+            "a surviving work branch that still descends from its explicit base must re-materialize"
+        );
+        assert!(wt_b.exists(), "worktree recreated by checking out the surviving work branch");
+
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

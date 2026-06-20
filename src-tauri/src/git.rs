@@ -346,6 +346,30 @@ pub struct WorktreeAdd {
     pub branched_from: String,
 }
 
+/// True when `worktree_path` is a worktree REGISTERED TO `repo` and checked out on
+/// `branch` — i.e. `list_worktrees(repo)` contains an entry whose canonicalized path
+/// equals `canonicalize(worktree_path)` AND whose branch equals `branch`. Checking only
+/// for a `.git` + a matching HEAD name is not enough: a stale plain dir, a checkout for a
+/// DIFFERENT branch, OR a checkout belonging to a DIFFERENT repository could sit at a
+/// deterministic path; `list_worktrees` reads THIS repo's own registry, so anything not
+/// registered here is refused. Path comparison is by canonicalized form so a
+/// symlinked/`..` spelling still matches.
+pub fn is_registered_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> bool {
+    let want = std::fs::canonicalize(worktree_path).ok();
+    list_worktrees(repo)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|(p, b)| b == branch && std::fs::canonicalize(&p).ok() == want)
+}
+
+/// True when `branch` DESCENDS FROM `base` in `repo` — i.e.
+/// `git merge-base --is-ancestor <base> <branch>` succeeds (base is an ancestor of
+/// branch). Used to verify a reused branch was actually forked from a requested
+/// explicit base before recording that base.
+pub fn branch_descends_from(repo: &Path, branch: &str, base: &str) -> bool {
+    git(repo, &["merge-base", "--is-ancestor", base, branch]).is_ok()
+}
+
 /// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
 /// branches the new worktree off the FRESH `origin/<base_name>` when possible (see
 /// `WorktreeAdd` for what it reports). `require_resolvable` = the base was an explicit
@@ -388,18 +412,10 @@ pub fn add_worktree_synced(
     }
     if worktree_path.exists() {
         // Validate the existing path is a worktree REGISTERED TO THIS REPO on `branch`
-        // before reusing it. Checking only for a `.git` + a matching HEAD name is not
-        // enough: a stale plain dir, a checkout for a DIFFERENT branch, OR a checkout
-        // belonging to a DIFFERENT repository could sit at this deterministic path and
-        // be silently recorded + handed to the worker (dispatch only checks the dir
-        // exists), running the agent in the wrong tree/repo. `list_worktrees` reads
-        // THIS repo's own worktree registry, so anything not registered here is refused.
-        let want = std::fs::canonicalize(worktree_path).ok();
-        let registered = list_worktrees(repo)
-            .unwrap_or_default()
-            .into_iter()
-            .any(|(p, b)| b == branch && std::fs::canonicalize(&p).ok() == want);
-        if !registered {
+        // before reusing it (a stale plain dir, a different-branch checkout, or a foreign
+        // repo's checkout could sit at this deterministic path and be handed to the worker,
+        // running the agent in the wrong tree/repo — dispatch only checks the dir exists).
+        if !is_registered_worktree(repo, worktree_path, branch) {
             bail!(
                 "worktree path {} exists but is not a worktree of this repo on {branch:?}",
                 worktree_path.display()
@@ -413,7 +429,7 @@ pub fn add_worktree_synced(
         // require_resolvable passed (the bail above guarantees it).
         if require_resolvable {
             if let Some(resolved) = resolved_opt.as_ref() {
-                if git(repo, &["merge-base", "--is-ancestor", resolved, branch]).is_err() {
+                if !branch_descends_from(repo, branch, resolved) {
                     bail!(
                         "branch {branch:?} already checked out but is not based on {resolved:?}; \
                          refusing to record a mismatched base"
@@ -449,7 +465,7 @@ pub fn add_worktree_synced(
         // based on `resolved` while its worktree sits on a branch forked elsewhere.
         if require_resolvable
             && !resolved.is_empty()
-            && git(repo, &["merge-base", "--is-ancestor", &resolved, branch]).is_err()
+            && !branch_descends_from(repo, branch, &resolved)
         {
             bail!(
                 "branch {branch:?} already exists but is not based on {resolved:?}; \

@@ -132,12 +132,26 @@ fn reconcile_reuse(
             b.strip_prefix("origin/").unwrap_or(b).to_string()
         }
     };
-    // Legacy row: true base unknown → reuse only if the re-proposal is also default.
+    // Empty recorded base spans two cases that share the legacy blank-reuse shortcut but a
+    // DETACHED-HEAD lane must not: it records base "" + target = the branch-off COMMIT (a
+    // 40-hex sha). A blank re-proposal means "fork from current HEAD" — reusing the lane is
+    // only correct while HEAD still points at that stored commit. If HEAD advanced, the
+    // re-proposal wants the NEW HEAD, so reuse of the stale lane must be rejected.
     if existing.base_branch.trim().is_empty() {
         if !proposed_base.trim().is_empty() {
             anyhow::bail!(
                 "direction {:?} predates base tracking (unknown branch-off base); delete the sub-task to recreate it from {:?}",
                 existing.name, proposed_base
+            );
+        }
+        // Detached-HEAD lane = empty base paired with a full 40-hex commit-sha target.
+        let target = existing.target_branch.trim();
+        let is_detached_head = target.len() == 40 && target.chars().all(|c| c.is_ascii_hexdigit());
+        if is_detached_head && crate::git::head_commit_full(repo_path).as_deref() != Some(target) {
+            anyhow::bail!(
+                "direction {:?} is based on a detached HEAD that has since moved; \
+                 delete the sub-task to recreate it from the new HEAD",
+                existing.name
             );
         }
         return Ok(());
@@ -1664,5 +1678,81 @@ mod tests {
         // (we only relax the blank-proposal case).
         let conflict = reconcile_reuse(&existing, "develop", repo_path, "main", true);
         assert!(conflict.is_err(), "R18-4: explicit base against HEAD-based direction must conflict");
+    }
+
+    /// R37-3: a DETACHED-HEAD lane records `base_branch==""` + `target_branch=<40-hex sha>`
+    /// (the branch-off commit). On a blank re-proposal ("fork from current HEAD") it must be
+    /// reused ONLY when HEAD is unchanged (head_commit_full == the stored sha). If the repo's
+    /// HEAD advanced since, reuse would fork the re-proposal from a stale commit — so bail.
+    /// A TRUE-legacy lane (target is empty or a branch name, not a sha) keeps the legacy
+    /// blank-reuse shortcut.
+    #[test]
+    fn reconcile_reuse_rejects_moved_detached_head() {
+        use crate::store::entities::direction;
+        use std::process::Command as Cmd;
+        let tag = format!("weft-reconcile-detached-{}", std::process::id());
+        let repo_path = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&repo_path);
+        crate::git::init_repo(&repo_path).unwrap();
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // The branch-off COMMIT x — what a detached-HEAD lane stores as its target.
+        let x = sha("HEAD");
+        assert_eq!(x.len(), 40, "precondition: full 40-char sha");
+
+        let make = |base: &str, target: &str| direction::Model {
+            id: 1,
+            thread_id: 1,
+            name: "A".to_string(),
+            slug: "a".to_string(),
+            tool: "codex".to_string(),
+            repo_id: 1,
+            reason: "r".to_string(),
+            status: "queued".to_string(),
+            mandate: "plan+impl".to_string(),
+            base_branch: base.to_string(),
+            target_branch: target.to_string(),
+            branch: "feat/a".to_string(),
+            created_at: "0".to_string(),
+        };
+
+        // Detached-HEAD lane: base "", target = x. HEAD == x → blank re-proposal reuses.
+        let detached = make("", &x);
+        assert!(
+            reconcile_reuse(&detached, "", &repo_path, "main", true).is_ok(),
+            "blank re-proposal must reuse a detached-HEAD lane whose stored commit == current HEAD"
+        );
+        // A non-blank proposed base against a detached-HEAD lane still bails (legacy branch).
+        assert!(
+            reconcile_reuse(&detached, "develop", &repo_path, "main", true).is_err(),
+            "an explicit base against a detached-HEAD lane must still conflict"
+        );
+
+        // Advance HEAD to a NEW commit y → head_commit_full now != x.
+        Cmd::new("git").args(["commit", "-q", "--allow-empty", "-m", "advance"])
+            .current_dir(&repo_path).status().unwrap();
+        assert_ne!(sha("HEAD"), x, "precondition: HEAD advanced to y");
+        // Blank re-proposal against the SAME stored x must now bail (HEAD moved).
+        assert!(
+            reconcile_reuse(&detached, "", &repo_path, "main", true).is_err(),
+            "a blank re-proposal must NOT reuse a detached-HEAD lane after HEAD moved off the stored commit"
+        );
+
+        // TRUE-legacy lanes are UNCHANGED: base "" + target "" (or a branch name) → blank reuse Ok.
+        let legacy_empty = make("", "");
+        assert!(
+            reconcile_reuse(&legacy_empty, "", &repo_path, "main", true).is_ok(),
+            "a legacy lane (empty target) must keep the blank-reuse shortcut"
+        );
+        let legacy_branch = make("", "develop");
+        assert!(
+            reconcile_reuse(&legacy_branch, "", &repo_path, "main", true).is_ok(),
+            "a legacy lane (branch-name target, not a sha) must keep the blank-reuse shortcut"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo_path);
     }
 }
