@@ -269,19 +269,26 @@ pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
 #[tauri::command]
 pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     // Capture the repo path before the cascade — the repo_ref row is gone after
-    // delete_repo_cascade, so we resolve worktree removal against it first.
+    // delete_repo_cascade, so we must resolve the git path first.
     let repo = repo::get_repo(&db, repo_id)
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
     let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
+    // Gate branch deletion on created_branch so a pre-existing branch reused by
+    // the -b fallback survives repo deletion. cleanup_worktrees cannot be used
+    // here because delete_repo_cascade already deleted the repo_ref row (which
+    // cleanup_worktrees needs for the git path lookup); instead we use the
+    // pre-fetched path directly.
     let repo_path = std::path::Path::new(&repo.local_git_path);
-    for (_repo_id, path, branch) in &removed {
+    for (_repo_id, path, branch, created_branch) in &removed {
         if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
             eprintln!("[weft] worktree remove failed for {path}: {err}");
         }
-        if let Err(err) = crate::git::delete_branch(repo_path, branch) {
-            eprintln!("[weft] branch delete failed for {branch}: {err}");
+        if *created_branch {
+            if let Err(err) = crate::git::delete_branch(repo_path, branch) {
+                eprintln!("[weft] branch delete failed for {branch}: {err}");
+            }
         }
     }
     Ok(())

@@ -93,6 +93,25 @@ pub async fn materialize_direction(
         return Ok(Vec::new());
     };
     if let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
+        // Idempotent: the worktree dir still exists — nothing to do.
+        if std::path::Path::new(&existing.path).exists() {
+            return Ok(vec![existing]);
+        }
+        // The dir was reclaimed (remove_direction_worktree), but the row (and
+        // usually the branch) survives. Recreate the on-disk worktree for the
+        // stored branch so the lane's worker can resume. The branch typically
+        // still exists, so add_worktree_synced takes the -b fallback and sets
+        // created_branch=false — the branch is preserved on future cleanup.
+        let repo_path = std::path::Path::new(&repo_ref.local_git_path);
+        let wt_path = std::path::Path::new(&existing.path);
+        git::add_worktree_synced(repo_path, &existing.branch, wt_path, &existing.branch, false)
+            .with_context(|| {
+                format!(
+                    "re-materialize reclaimed worktree for branch {}",
+                    existing.branch
+                )
+            })?;
+        // Row already exists with the correct path/branch; no need to re-insert.
         return Ok(vec![existing]);
     }
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
@@ -534,6 +553,85 @@ mod tests {
             .output().unwrap();
         assert!(branch_check.status.success(), "pre-existing branch must survive delete cleanup");
 
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R15-2: materialize_direction must recreate the on-disk worktree when the
+    /// row exists but the directory was reclaimed (remove_direction_worktree path).
+    /// After re-materialization the directory must exist again.
+    #[tokio::test]
+    async fn materialize_direction_recreates_reclaimed_worktree() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-reclaim-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // Stand up a minimal git repo (no remote needed; branch already exists).
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "repo",
+            repo_path.to_str().unwrap(),
+            &main,
+            "",
+        )
+        .await
+        .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        let dir =
+            repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+                .await
+                .unwrap();
+
+        // ① First materialize: creates the worktree dir and row.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts.len(), 1, "first materialize must succeed");
+        let wt_path = std::path::Path::new(&wts[0].path);
+        assert!(wt_path.exists(), "worktree dir must exist after first materialize");
+
+        // ② Simulate reclaim: remove the on-disk directory (but keep the DB row).
+        // Use git worktree remove so git's metadata is clean.
+        let _ = crate::git::remove_worktree(&repo_path, wt_path);
+        // Even if the git prune fails (the dir is already gone), make sure the dir is absent.
+        let _ = std::fs::remove_dir_all(wt_path);
+        assert!(!wt_path.exists(), "precondition: dir gone after simulated reclaim");
+
+        // The row must still be there.
+        let existing = repo::worktree_for(&db, dir.id, r.id).await.unwrap();
+        assert!(existing.is_some(), "worktree row must survive reclaim");
+
+        // ③ Re-materialize: must recreate the directory.
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1, "re-materialize must return one worktree");
+        assert!(
+            std::path::Path::new(&wts2[0].path).exists(),
+            "worktree dir must be recreated after re-materialize"
+        );
+        // Row count must not have grown (no duplicate insert).
+        assert_eq!(
+            repo::list_worktrees(&db, Some(dir.id)).await.unwrap().len(),
+            1,
+            "exactly one worktree row after re-materialize"
+        );
+
+        // Cleanup.
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

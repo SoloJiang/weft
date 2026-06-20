@@ -837,18 +837,24 @@ pub async fn worktree_for(
 
 /// Remove a repo from a workspace and all Weft state derived from it: its
 /// profile, the directions bound to it (a direction has one write repo) with
-/// their sessions, and its worktree rows. Returns the worktrees (repo_id, path,
-/// branch) the caller must physically `git worktree remove` — DB rows are gone
-/// after this. NEVER touches the user's actual repo directory at `local_git_path`.
-pub async fn delete_repo_cascade(db: &Db, repo_id: i32) -> Result<Vec<(i32, String, String)>> {
+/// their sessions, and its worktree rows. Returns the worktrees
+/// (repo_id, path, branch, created_branch) the caller must physically
+/// `git worktree remove` — DB rows are gone after this. `created_branch` gates
+/// whether the branch is deleted; a pre-existing branch reused by the -b
+/// fallback (`created_branch=false`) must survive. NEVER touches the user's
+/// actual repo directory at `local_git_path`.
+pub async fn delete_repo_cascade(
+    db: &Db,
+    repo_id: i32,
+) -> Result<Vec<(i32, String, String, bool)>> {
     // Worktrees registered for this repo (each direction's worktree is keyed to
     // its write repo, so this covers the bound directions' worktrees too).
-    let removed: Vec<(i32, String, String)> = worktree::Entity::find()
+    let removed: Vec<(i32, String, String, bool)> = worktree::Entity::find()
         .filter(worktree::Column::RepoId.eq(repo_id))
         .all(&db.0)
         .await?
         .into_iter()
-        .map(|w| (w.repo_id, w.path, w.branch))
+        .map(|w| (w.repo_id, w.path, w.branch, w.created_branch))
         .collect();
     // Sessions of the directions bound to this repo, plus any keyed to the repo.
     let dirs = direction::Entity::find()
@@ -1522,6 +1528,45 @@ mod tests {
         assert!(get_repo(&db, b.id).await.unwrap().is_some());
         assert!(get_repo_profile(&db, b.id).await.unwrap().is_some());
         assert!(get_direction(&db, dir_b.id).await.unwrap().is_some());
+    }
+
+    /// R15-1: delete_repo_cascade must carry created_branch in its 4-tuple so
+    /// the caller can gate branch deletion. A worktree row with created_branch=false
+    /// (pre-existing branch reused by the -b fallback) must have its flag preserved.
+    #[tokio::test]
+    async fn delete_repo_cascade_carries_created_branch_flag() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "repo", "/tmp/r", "main", "")
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // Record one worktree with created_branch=false (pre-existing branch).
+        record_worktree(&db, r.id, dir.id, "feat/preexist", "/tmp/r-wt", false)
+            .await
+            .unwrap();
+        // Record another with created_branch=true (weft-created branch).
+        let dir2 = create_direction(&db, t.id, "d2", "claude", r.id, "reason2", "plan+impl", "")
+            .await
+            .unwrap();
+        record_worktree(&db, r.id, dir2.id, "feat/weft-created", "/tmp/r-wt2", true)
+            .await
+            .unwrap();
+
+        let removed = delete_repo_cascade(&db, r.id).await.unwrap();
+        assert_eq!(removed.len(), 2);
+
+        // Both tuples must carry the correct created_branch flag.
+        let preexist = removed.iter().find(|t| t.1 == "/tmp/r-wt").unwrap();
+        assert!(!preexist.3, "pre-existing branch must have created_branch=false");
+        let created = removed.iter().find(|t| t.1 == "/tmp/r-wt2").unwrap();
+        assert!(created.3, "weft-created branch must have created_branch=true");
     }
 
     #[tokio::test]
