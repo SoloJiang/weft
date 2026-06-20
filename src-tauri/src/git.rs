@@ -34,7 +34,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 }
 
 /// True if `r` resolves to a commit in `dir` (non-empty + `rev-parse` verifies).
-fn ref_resolves(dir: &Path, r: &str) -> bool {
+pub fn ref_resolves(dir: &Path, r: &str) -> bool {
     !r.is_empty()
         && Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")])

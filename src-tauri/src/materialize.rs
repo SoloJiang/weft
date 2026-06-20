@@ -110,13 +110,20 @@ pub async fn materialize_direction(
         // no longer resolves (deleted externally), the base must be the recorded
         // branch-off point so the recreated branch starts there rather than off an
         // arbitrary fallback ref. Mirror the normal path's base resolution.
-        let recreate_base = if dir.base_branch.trim().is_empty() {
+        let explicit = !dir.base_branch.trim().is_empty();
+        let recreate_base = if explicit {
+            dir.base_branch.trim().to_string()
+        } else {
             git::live_default_branch(repo_path)
                 .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref))
-        } else {
-            dir.base_branch.trim().to_string()
         };
-        let add = git::add_worktree_synced(repo_path, &existing.branch, wt_path, &recreate_base, false)
+        // Require the stored base to resolve ONLY when we must branch off it — i.e. the
+        // work branch is gone. If the work branch still exists we just check it out (the
+        // base is unused), so a gone explicit base shouldn't block resuming the work. But
+        // when the work branch is gone AND the base is explicit, a missing base must ERROR
+        // rather than silently branching off an arbitrary fallback ref.
+        let require = explicit && !git::ref_resolves(repo_path, &existing.branch);
+        let add = git::add_worktree_synced(repo_path, &existing.branch, wt_path, &recreate_base, require)
             .with_context(|| {
                 format!(
                     "re-materialize reclaimed worktree for branch {}",
@@ -620,6 +627,72 @@ mod tests {
     /// R15-2: materialize_direction must recreate the on-disk worktree when the
     /// row exists but the directory was reclaimed (remove_direction_worktree path).
     /// After re-materialization the directory must exist again.
+    #[tokio::test]
+    async fn materialize_recreate_requires_explicit_base_only_when_work_branch_gone() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-req-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        g(&["branch", "develop"]);
+        g(&["branch", "release"]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // Scenario A: work branch GONE + explicit base GONE → re-materialize ERRORS
+        // (must not silently branch off an arbitrary fallback).
+        let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "develop")
+            .await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
+        let branch_a = wts_a[0].branch.clone();
+        let _ = crate::git::remove_worktree(&repo_path, &wt_a);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-D", &branch_a]);
+        g(&["branch", "-D", "develop"]);
+        assert!(
+            materialize_direction(&db, dir_a.id).await.is_err(),
+            "explicit base + work branch BOTH gone must error, not fall back to an arbitrary base"
+        );
+
+        // Scenario B: work branch EXISTS + explicit base GONE → re-materialize SUCCEEDS
+        // (we check out the surviving work branch; the base is unused).
+        let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
+        let _ = crate::git::remove_worktree(&repo_path, &wt_b);
+        let _ = std::fs::remove_dir_all(&wt_b);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-D", "release"]); // base gone, but the work branch survives
+        assert!(
+            materialize_direction(&db, dir_b.id).await.is_ok(),
+            "a surviving work branch must check out even when the explicit base is gone"
+        );
+        assert!(wt_b.exists(), "worktree recreated by checking out the surviving work branch");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn materialize_recreate_updates_ownership_flags_when_branch_created() {
         use crate::store::repo;
