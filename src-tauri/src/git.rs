@@ -169,6 +169,23 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     "main".to_string()
 }
 
+/// The default base for the OFFLINE fallback (when `live_default_branch` is
+/// unavailable): prefer the recorded `base_ref` when it still resolves — it was the
+/// live default captured at register time, so it is more trustworthy than a possibly
+/// stale cached `origin/HEAD`. Otherwise fall back to the `default_base_branch` chain.
+/// Returns a bare branch name (no `origin/`).
+pub fn recorded_base_or_default(repo: &Path, base_ref: &str) -> String {
+    let b = base_ref.trim();
+    let b = b.strip_prefix("origin/").unwrap_or(b);
+    if !b.is_empty()
+        && b != "HEAD"
+        && (ref_resolves(repo, b) || ref_resolves(repo, &format!("origin/{b}")))
+    {
+        return b.to_string();
+    }
+    default_base_branch(repo, base_ref)
+}
+
 /// The remote's CURRENT default branch name via `git ls-remote --symref origin HEAD`
 /// — queries the remote directly, so it works even for narrowed/single-branch clones
 /// where the default moved to an unfetched branch (unlike `git remote set-head --auto`,
@@ -1336,6 +1353,31 @@ mod tests {
         assert!(!ref_resolves(&clone, "origin/develop"), "precondition: develop not fetched");
         assert_eq!(live_default_branch(&clone).as_deref(), Some("develop"),
             "ls-remote --symref reports the live remote default without a local ref");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn recorded_base_or_default_prefers_resolvable_base_ref_over_cached_origin_head() {
+        // A clone whose cached origin/HEAD points at `main`, but the recorded base_ref
+        // is `develop` (e.g. captured live at register). Offline, we must prefer the
+        // recorded develop, not the stale cached main.
+        let origin = tmp("rbod-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        let clone = tmp("rbod-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        // clone's origin/HEAD → origin/main (the origin's default). develop is fetched.
+        assert!(ref_resolves(&clone, "origin/develop"));
+        // default_base_branch prefers cached origin/HEAD (main); recorded_base_or_default
+        // prefers the resolvable recorded base_ref (develop).
+        assert_eq!(default_base_branch(&clone, "develop"), main, "default_base_branch is origin/HEAD-first");
+        assert_eq!(recorded_base_or_default(&clone, "develop"), "develop", "recorded base_ref preferred when it resolves");
+        // A non-resolving recorded base falls back to the default chain.
+        assert_eq!(recorded_base_or_default(&clone, "no-such-xyz"), main);
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
     }
