@@ -202,17 +202,30 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
     // Idempotent fast-path: the plan was already fully confirmed in a prior call.
-    // Return the existing ids so the caller can (re-)dispatch workers without
-    // re-creating anything.
+    // Return ONLY the ids belonging to THIS proposal's lanes (by name+repo) — not
+    // every direction in the thread, which may include older-proposal or manual lanes
+    // that the frontend must not re-dispatch.
     if resolved.status == "confirmed" {
-        let existing = repo::list_directions(db, thread_id).await?;
-        return Ok(existing.into_iter().map(|d| d.id).collect());
+        let all = repo::list_directions(db, thread_id).await?;
+        let ids = all
+            .into_iter()
+            .filter(|d| {
+                resolved.directions.iter().any(|p| {
+                    p.repo.known && p.name == d.name && p.repo.repo_id == d.repo_id
+                })
+            })
+            .map(|d| d.id)
+            .collect();
+        return Ok(ids);
     }
-    let mut created: Vec<i32> = Vec::new();
-    let tool = crate::tools::default_tool(db).await;
-    // Snapshot existing directions ONCE before the loop so freshly-created lanes in
-    // this pass are not accidentally matched (each lane is created exactly once).
     let existing_dirs = repo::list_directions(db, thread_id).await?;
+    let tool = crate::tools::default_tool(db).await;
+    // dispatch_ids = every lane to dispatch (reused + newly created); returned to caller.
+    // created_now  = ONLY lanes created+materialized in THIS attempt; the rollback set.
+    // Reused lanes are NEVER in created_now — they must not be torn down on a later
+    // failure because they existed (and may be running) before this confirm call.
+    let mut dispatch_ids: Vec<i32> = Vec::new();
+    let mut created_now: Vec<i32> = Vec::new();
     for d in &resolved.directions {
         if !d.repo.known {
             continue; // unknown repo name never resolved to a worktree-able repo
@@ -228,16 +241,27 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             .iter()
             .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id)
         {
-            let repo_ref = repo::get_repo(db, d.repo.repo_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("repo {} not found", d.repo.repo_id))?;
-            reconcile_reuse(
+            let repo_ref = match repo::get_repo(db, d.repo.repo_id).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    rollback_created(db, &created_now).await;
+                    anyhow::bail!("repo {} not found", d.repo.repo_id);
+                }
+                Err(e) => {
+                    rollback_created(db, &created_now).await;
+                    return Err(e.into());
+                }
+            };
+            if let Err(err) = reconcile_reuse(
                 ex,
                 &d.base_branch,
                 std::path::Path::new(&repo_ref.local_git_path),
                 &repo_ref.base_ref,
-            )?;
-            created.push(ex.id);
+            ) {
+                rollback_created(db, &created_now).await;
+                return Err(err);
+            }
+            dispatch_ids.push(ex.id);
             continue;
         }
         let dir = match repo::create_direction(
@@ -254,10 +278,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         {
             Ok(dir) => dir,
             Err(err) => {
-                // Atomic: tear down everything created in this attempt.
-                for &id in &created {
-                    let _ = materialize::rollback_direction(db, id).await;
-                }
+                rollback_created(db, &created_now).await;
                 return Err(err);
             }
         };
@@ -265,17 +286,25 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             // The failing lane has no worktree yet; drop its row, then roll back
             // the earlier (materialized) lanes so a corrected retry starts clean.
             let _ = repo::delete_direction(db, dir.id).await;
-            for &id in &created {
-                let _ = materialize::rollback_direction(db, id).await;
-            }
+            rollback_created(db, &created_now).await;
             return Err(err);
         }
-        created.push(dir.id);
+        created_now.push(dir.id);
+        dispatch_ids.push(dir.id);
     }
     if let Some(p) = repo::get_plan(db, thread_id).await? {
         repo::upsert_plan(db, thread_id, &p.proposal, "confirmed", &p.created_at).await?;
     }
-    Ok(created)
+    Ok(dispatch_ids)
+}
+
+/// Tear down lanes created in the current confirm attempt (used on any failure to keep
+/// confirm atomic). Best-effort per lane — errors are ignored so the original failure
+/// is the one returned.
+async fn rollback_created(db: &Db, ids: &[i32]) {
+    for &id in ids {
+        let _ = materialize::rollback_direction(db, id).await;
+    }
 }
 
 /// Approve one proposed direction (by index): mark it approved in the stored
@@ -1124,6 +1153,48 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].base_branch, "develop", "base_branch flows into PendingWrite");
 
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_does_not_roll_back_a_reused_lane_when_a_later_lane_fails() {
+        // Lane A: approved via Needs-you (pre-existing, materialized). Lane B: a NEW
+        // lane with a bad explicit base that fails to materialize. The failed confirm
+        // must NOT tear down A (it existed before this attempt).
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-reuse-norollback-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // Approve A (empty base) via Needs-you → A materialized.
+        let prop_a = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_a).await.unwrap();
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // Re-propose A (reset) + add B with a bad explicit base.
+        let prop2 = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "no-such-xyz".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop2).await.unwrap();
+        let res = confirm(&db, t.id).await;
+        assert!(res.is_err(), "confirm fails on B's bad base");
+        // A must still exist (reused, not in the rollback set); B must not.
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        assert!(dirs.iter().any(|d| d.id == a_id), "reused lane A must NOT be rolled back");
+        assert!(!dirs.iter().any(|d| d.name == "B"), "failed new lane B is rolled back");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
