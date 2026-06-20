@@ -142,14 +142,19 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
 
 /// The default BASE branch name for a NEW worktree (and the value captured as a
 /// repo's base_ref at add time). Precedence: (1) the remote's default (origin/HEAD)
-/// if it still resolves; (2) the conventional integration branch main/master
-/// (local or origin/) — a repo added on a feature branch without origin/HEAD must
-/// not default to that feature branch; (3) the recorded `base_ref` if it resolves
-/// (non-standard repos, e.g. a "trunk"/"develop" default with no origin/HEAD and no
-/// main/master); (4) "main". Returns a bare branch name (no `origin/`).
+/// if its REMOTE-tracking ref `origin/<name>` still resolves — validated against the
+/// remote ref, NOT a coincidentally same-named local branch, so a stale origin/HEAD
+/// can't pin an old local feature branch as the "remote default"; (2) the conventional
+/// integration branch main/master (local or origin/) — a repo added on a feature branch
+/// without origin/HEAD must not default to that feature branch; (3) the recorded
+/// `base_ref` if it resolves (non-standard repos, e.g. a "trunk"/"develop" default with
+/// no origin/HEAD and no main/master); (4) "main". Returns a bare branch name.
 pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     if let Some(name) = remote_default_branch(repo) {
-        if ref_resolves(repo, &name) || ref_resolves(repo, &format!("origin/{name}")) {
+        // Validate the cached origin/HEAD against its REMOTE-tracking ref only: a local
+        // branch that happens to share the name must not vouch for a stale origin/HEAD
+        // whose upstream branch is gone.
+        if ref_resolves(repo, &format!("origin/{name}")) {
             return name;
         }
     }
@@ -1241,6 +1246,33 @@ mod tests {
         let got = default_base_branch(&clone, "");
         assert_ne!(got, "gone", "stale origin/HEAD must not be used");
         assert!(ref_resolves(&clone, &got) || got == "main", "falls through to a real default, got {got}");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn default_base_branch_ignores_local_branch_for_stale_origin_head() {
+        // origin/HEAD points at a branch whose REMOTE-tracking ref is gone, but a LOCAL
+        // branch shares the name — the local branch must NOT vouch for the stale
+        // origin/HEAD (else new work branches off an old local feature branch).
+        let origin = tmp("dbb-localvouch-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        let clone = tmp("dbb-localvouch-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        git(&clone, &["branch", "feature-x"]).unwrap(); // local branch only
+        git(&clone, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feature-x"]).unwrap();
+        assert!(ref_resolves(&clone, "feature-x"), "precondition: local feature-x exists");
+        assert!(!ref_resolves(&clone, "origin/feature-x"), "precondition: remote feature-x gone");
+        assert_eq!(
+            default_base_branch(&clone, ""),
+            main,
+            "a same-named LOCAL branch must not validate a stale origin/HEAD"
+        );
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
     }
