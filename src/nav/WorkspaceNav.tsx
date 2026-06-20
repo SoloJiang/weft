@@ -21,7 +21,6 @@ import { useStore } from "../state/store";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
 import { openCommandPalette } from "../components/CommandPalette";
-import { Tooltip } from "../components/ui/Tooltip";
 import { AddRepoDialog, CreateThreadDialog, CreateWorkspaceDialog, RenameDialog } from "./dialogs";
 
 export function WorkspaceNav() {
@@ -130,15 +129,13 @@ export function WorkspaceNav() {
               <SquarePen size={14} className="text-brand" />
               {t("nav.newThread")}
             </button>
-            <Tooltip label={t("dialog.addRepoTooltip")} className="w-full">
-              <button
-                onClick={() => setDlg("repo")}
-                className="flex w-full items-center gap-2 rounded-[var(--radius-md)] px-2 py-1.5 text-[13px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
-              >
-                <FolderPlus size={14} className="text-ink-faint" />
-                {t("dialog.addRepo")}
-              </button>
-            </Tooltip>
+            <button
+              onClick={() => setDlg("repo")}
+              className="flex w-full items-center gap-2 rounded-[var(--radius-md)] px-2 py-1.5 text-[13px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
+            >
+              <FolderPlus size={14} className="text-ink-faint" />
+              {t("dialog.addRepo")}
+            </button>
           </div>
 
           <div className="mx-2 my-1 border-t border-border" />

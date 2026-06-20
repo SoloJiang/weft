@@ -324,6 +324,18 @@ export interface FileDiff {
 export interface DiffSummary {
   files: FileDiff[];
 }
+export interface FileNode {
+  path: string;
+  name: string;
+  kind: "file" | "directory";
+  children?: FileNode[];
+}
+export interface FileTree {
+  nodes: FileNode[];
+  truncated: boolean;
+  total: number;
+}
+
 
 export interface BusMsg {
   from: string;
@@ -356,11 +368,16 @@ export interface RepoProfile {
   summary: string;
   source: string; // agent | user | "" (placeholder)
   profiled_commit: string;
-  stale: boolean;
   /** false = the agent hasn't classified this repo yet (placeholder node). */
   analyzed: boolean;
   /** Monorepo sub-components (empty for a single-purpose repo). */
   components: RepoComponent[];
+  /** Live analysis lifecycle (run-state registry): "idle" | "running" | "failed".
+   *  Distinct from `analyzed`: an unanalyzed repo may be idle, running, or failed —
+   *  the detail panel renders each differently instead of one eternal spinner. */
+  analysis_state: "idle" | "running" | "failed";
+  /** Error from the last failed analysis (set only when analysis_state === "failed"). */
+  analysis_error?: string | null;
 }
 
 /** A directed dependency edge: `from` consumes `to`, evidenced by `via`. */

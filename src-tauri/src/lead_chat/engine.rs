@@ -1725,7 +1725,10 @@ async fn codex_consumer(
                     Some(d) => {
                         let allow = matches!(d, crate::ask::Decision::Allow);
                         let _ = client
-                            .reply_result(&id, codex_approval_reply(is_perm, allow, requested))
+                            .reply_result(
+                                &id,
+                                crate::codex_app_server::codex_approval_reply(is_perm, allow, requested),
+                            )
                             .await;
                     }
                     // Needs a human answer: await it in a SIDE TASK so the consumer
@@ -1748,7 +1751,10 @@ async fn codex_consumer(
                             );
                             pending.remove(&key);
                             let _ = client
-                                .reply_result(&id, codex_approval_reply(is_perm, allow, requested))
+                                .reply_result(
+                                    &id,
+                                    crate::codex_app_server::codex_approval_reply(is_perm, allow, requested),
+                                )
                                 .await;
                         });
                     }
@@ -1773,23 +1779,6 @@ async fn codex_consumer(
     }
 }
 
-/// The reply payload for an app-server approval, by the user's decision. Permission
-/// asks are answered with the GRANTED permissions (a GrantedPermissionProfile
-/// OBJECT — echo the requested profile on allow, empty object on deny; a
-/// `{decision}` reply would silently no-op the grant). All others take `{decision}`.
-/// Shapes verified against the codex 0.139.0 app-server JSON schema.
-fn codex_approval_reply(is_perm: bool, allow: bool, requested: Option<serde_json::Value>) -> serde_json::Value {
-    if is_perm {
-        let granted = if allow {
-            requested.unwrap_or_else(|| serde_json::json!({}))
-        } else {
-            serde_json::json!({})
-        };
-        serde_json::json!({ "permissions": granted })
-    } else {
-        serde_json::json!({ "decision": if allow { "accept" } else { "decline" } })
-    }
-}
 
 /// Specific Needs-you summary for an app-server file-change approval: the
 /// changed path(s) (top-level or nested under `item`), so each distinct edit

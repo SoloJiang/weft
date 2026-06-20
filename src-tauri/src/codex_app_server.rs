@@ -193,6 +193,25 @@ pub fn decline_response(method: &str) -> Option<Value> {
     }
 }
 
+/// The `result` payload that ANSWERS an approval request, by kind. A permission
+/// ask (`item/permissions/requestApproval`) requires `{permissions}` — the granted
+/// profile on allow, an EMPTY object on deny; a `{decision}` reply NO-OPS the grant
+/// and leaves the turn hanging until timeout. Command-exec / file-change asks use
+/// `{decision: accept|decline}`. Shared by the lead-chat engine (human-routed) and
+/// the curator (always-decline) so neither path can drift to the wrong shape.
+pub(crate) fn codex_approval_reply(is_perm: bool, allow: bool, requested: Option<Value>) -> Value {
+    if is_perm {
+        let granted = if allow {
+            requested.unwrap_or_else(|| json!({}))
+        } else {
+            json!({})
+        };
+        json!({ "permissions": granted })
+    } else {
+        json!({ "decision": if allow { "accept" } else { "decline" } })
+    }
+}
+
 /// A blocking MCP elicitation (`mcpServer/elicitation/request`): a configured MCP
 /// server asking the user for STRUCTURED input. Weft has no UI to collect that
 /// content, so it's declined (`{action:"decline"}`) rather than routed to a
@@ -531,6 +550,19 @@ impl Client {
         *self.0.lock().await = None;
     }
 
+    /// Like [`shutdown`](Self::shutdown) but also REAPS the child — kill + await —
+    /// before returning. A caller that spawns many short-lived per-session
+    /// connections (the curator's per-repo + relation scans) would otherwise pile
+    /// up unreaped `codex app-server` children on tokio's best-effort reaper, since
+    /// plain `shutdown` only drops the handle (kill_on_drop, no await).
+    pub async fn shutdown_and_reap(&self) {
+        if let Some(mut inner) = self.0.lock().await.take() {
+            // SIGKILL + wait → the child is reaped synchronously here; closing
+            // stdin/stdout also drops the per-session consumer task.
+            let _ = inner._child.kill().await;
+        }
+    }
+
     async fn connect(&self) -> anyhow::Result<()> {
         // The app-scoped global client has no per-session pin; use the global codex
         // override (alias).
@@ -583,9 +615,12 @@ impl Client {
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
 
         // Handshake: initialize (await), then the `initialized` notification. If it
-        // wedges/errors (auth/network/version), tear the half-open client down
-        // (drops the child + closes read_loop) so a retry doesn't leak app-server /
-        // MCP processes while the turn falls back to exec.
+        // wedges/errors (auth/network/version), tear the half-open client down so a
+        // retry doesn't leak app-server / MCP processes while the turn falls back to
+        // exec. Kill AND REAP the child here (not plain `shutdown`, which only drops
+        // the handle): the curator probes app-server once per repo, so repeated
+        // handshake failures — e.g. an old Codex binary — would otherwise pile up
+        // unreaped children.
         let handshake = async {
             self.request(
                 "initialize",
@@ -596,7 +631,7 @@ impl Client {
         }
         .await;
         if let Err(e) = handshake {
-            self.shutdown().await;
+            self.shutdown_and_reap().await;
             return Err(e);
         }
         Ok(())
@@ -1155,6 +1190,21 @@ mod tests {
         );
         // No in-protocol decline for an unknown blocking request → JSON-RPC error.
         assert_eq!(decline_response("item/tool/call"), None);
+    }
+
+    #[test]
+    fn approval_reply_uses_per_kind_shape() {
+        // A permission deny MUST be `{permissions:{}}` — a `{decision}` reply no-ops
+        // the grant and hangs the turn (the curator's bug this helper de-dupes).
+        assert_eq!(codex_approval_reply(true, false, None), json!({ "permissions": {} }));
+        // Permission allow echoes the requested profile.
+        assert_eq!(
+            codex_approval_reply(true, true, Some(json!({ "disk": "read" }))),
+            json!({ "permissions": { "disk": "read" } })
+        );
+        // Command / file-change asks use `{decision}`.
+        assert_eq!(codex_approval_reply(false, false, None), json!({ "decision": "decline" }));
+        assert_eq!(codex_approval_reply(false, true, None), json!({ "decision": "accept" }));
     }
 
     #[test]

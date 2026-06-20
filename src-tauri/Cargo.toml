@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 base64 = "0.22"
+# 飞书扫码接入:二维码 SVG。svg render 内置、不需 image 特性,故关默认特性省编译。
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 tauri-plugin-mcp-bridge = "0.11.2"
 sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
 sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }

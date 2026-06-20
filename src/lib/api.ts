@@ -7,6 +7,7 @@ import type {
   DefaultToolInfo,
   Direction,
   EnabledSkill,
+  FileTree,
   ImageAttachment,
   ImRoute,
   LeadMessage,
@@ -121,6 +122,8 @@ export const api = {
 
   listWorktrees: (directionId: number) =>
     invoke<Worktree[]>("list_worktrees", { directionId }),
+  listWorktreeFiles: (cwd: string) =>
+    invoke<FileTree>("list_worktree_files", { cwd }),
   // Delete one finished task's worktree (directory + record); keeps the branch.
   deleteWorktree: (worktreeId: number) =>
     invoke<void>("delete_worktree", { worktreeId }),
@@ -217,6 +220,8 @@ export const api = {
     invoke<void>("deny_write_trigger", { threadId, index }),
 
   // Inspect escape hatches (§4.7): real ways into the hidden plumbing.
+  /** Open a real filesystem path verbatim (no chat-token / `:line` stripping). */
+  openFile: (path: string) => invoke<void>("open_file", { path }),
   openTerminal: (path: string) => invoke<void>("open_terminal", { path }),
   // Reveal a real filesystem path (the Inspect working copy) — taken verbatim,
   // no chat-URI normalization.
@@ -281,6 +286,13 @@ export const api = {
   imSetRemoteStandby: (enabled: boolean) =>
     invoke<void>("im_set_remote_standby", { enabled }),
   imStatus: () => invoke<string>("im_status"),
+  feishuScanBegin: () =>
+    invoke<{ qr_data_uri: string; expire_secs: number; poll_interval_ms: number }>(
+      "feishu_scan_begin",
+    ),
+  feishuScanStatus: () =>
+    invoke<{ status: string; error_reason: string | null }>("feishu_scan_status"),
+  feishuScanCancel: () => invoke<void>("feishu_scan_cancel"),
   imBindThread: (threadId: number, chatId: string, imThreadRef: string, channel = "feishu") =>
     invoke<ImRoute>("im_bind_thread", { threadId, channel, chatId, imThreadRef }),
   imUnbindThread: (threadId: number) =>
