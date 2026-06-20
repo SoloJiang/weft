@@ -327,16 +327,26 @@ pub fn add_worktree_synced(
     let fetched = fetch_origin_branch(repo, base_name);
     let t = normalize_target(base_name);
     let remote = format!("origin/{t}");
-    let resolved_opt = if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &remote) {
+    let nonempty = !t.is_empty() && t != "HEAD";
+    let resolved_opt = if nonempty && fetched && ref_resolves(repo, &remote) {
+        // A freshly-fetched remote ref — trustworthy.
         Some(remote.clone())
-    } else if !t.is_empty() && t != "HEAD" && ref_resolves(repo, &t) {
+    } else if nonempty && ref_resolves(repo, &t) {
+        // A local branch the user already has.
         Some(t.clone())
+    } else if nonempty && !require_resolvable && ref_resolves(repo, &remote) {
+        // A STALE remote-tracking ref (the fetch failed — offline, or the branch was
+        // deleted upstream). Trusted only for the lenient default/empty path; an
+        // EXPLICIT base must be currently confirmable (fresh fetch or a local branch),
+        // so a stale-only `origin/<base>` is rejected below rather than silently
+        // branching off a possibly-deleted branch.
+        Some(remote.clone())
     } else {
         None
     };
-    // An explicit base must resolve — even when we're about to reuse an existing
-    // checkout — so a misspelled explicit base can't be silently accepted via an
-    // orphan path.
+    // An explicit base must resolve to a CURRENT ref — even when we're about to reuse
+    // an existing checkout — so a misspelled OR stale (deleted-upstream) explicit base
+    // can't be silently accepted via an orphan path or a stale remote-tracking ref.
     if require_resolvable && resolved_opt.is_none() {
         bail!("base branch {base_name:?} not found locally or on origin (after fetch)");
     }
@@ -1309,6 +1319,34 @@ mod tests {
         assert!(res.is_err(), "explicit unresolvable base must error");
         assert!(!wt.exists(), "no worktree created on error");
         let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_explicit_stale_deleted_upstream_base_errors() {
+        // An EXPLICIT base whose origin/<base> is stale (the branch was deleted
+        // upstream, so the fetch fails) must error rather than silently branching off
+        // the stale remote-tracking ref. require_resolvable=true.
+        let origin = tmp("stale-explicit-origin");
+        init_repo(&origin).unwrap();
+        git(&origin, &["branch", "develop"]).unwrap();
+        // Full clone → origin/develop present as a remote-tracking ref; no LOCAL develop.
+        let clone = tmp("stale-explicit-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(ref_resolves(&clone, "origin/develop"), "precondition: origin ref present");
+        assert!(!ref_resolves(&clone, "develop"), "precondition: no local develop");
+        // Delete develop upstream so a fetch of it fails (origin/develop goes stale).
+        git(&origin, &["branch", "-D", "develop"]).unwrap();
+        let wt = tmp("stale-explicit-wt");
+        let res = add_worktree_synced(&clone, "feat/s", &wt, "develop", true);
+        assert!(res.is_err(), "explicit base deleted upstream (stale origin) must error");
+        assert!(!wt.exists(), "no worktree created on error");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
         let _ = std::fs::remove_dir_all(&wt);
     }
 
