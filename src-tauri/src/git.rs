@@ -264,6 +264,9 @@ pub fn add_worktree(
     }
     let path_str = worktree_path.to_string_lossy().to_string();
     let base = resolve_base_ref(repo, base_ref);
+    // Prune stale registrations (a dir removed out-of-band) so `worktree add` recreates
+    // instead of failing on the leftover registration; safe no-op when none are stale.
+    git(repo, &["worktree", "prune"]).ok();
     let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &base]);
     if res.is_err() {
         git(repo, &["worktree", "add", &path_str, branch])
@@ -366,6 +369,11 @@ pub fn add_worktree_synced(
         std::fs::create_dir_all(parent).ok();
     }
     let path_str = worktree_path.to_string_lossy().to_string();
+    // A worktree dir removed out-of-band leaves a prunable registration; without this
+    // the branch still looks checked out and `worktree add` fails ("missing but already
+    // registered") instead of recreating. Prune stale registrations first — a no-op when
+    // none are stale, and it never touches a live worktree whose dir still exists.
+    git(repo, &["worktree", "prune"]).ok();
     let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &resolved]);
     if res.is_err() {
         // Branch likely already exists: check it out into a new worktree dir.
@@ -1347,6 +1355,30 @@ mod tests {
         assert!(!wt.exists(), "no worktree created on error");
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_recreates_after_out_of_band_dir_removal() {
+        // A worktree dir removed out-of-band (rm -rf, not `git worktree remove`) leaves
+        // a prunable registration, so the branch still looks checked out. A fresh
+        // add_worktree_synced for the same branch/path must PRUNE the stale registration
+        // and recreate the checkout, not fail with "already checked out".
+        let repo = tmp("aws-oob");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let wt = tmp("aws-oob-wt");
+        add_worktree_synced(&repo, "feat/oob", &wt, &base, false).unwrap();
+        assert!(wt.join(".git").exists(), "first add created the worktree");
+        // Remove the dir OUT-OF-BAND — git keeps the (now-stale) registration.
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(!wt.exists(), "precondition: dir gone, registration stale");
+        // Re-add: without the prune this fails ("feat/oob is already checked out").
+        add_worktree_synced(&repo, "feat/oob", &wt, &base, false)
+            .expect("re-add must prune the stale registration and recreate");
+        assert!(wt.join(".git").exists(), "worktree recreated after out-of-band removal");
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
     }
 
