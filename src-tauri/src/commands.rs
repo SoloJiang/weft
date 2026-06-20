@@ -1493,6 +1493,37 @@ pub async fn im_get_settings(db: State<'_, Db>) -> R<ImSettingsView> {
     })
 }
 
+/// 写飞书凭证并重启桥。secret 空 = 保持原值(不覆盖已存密钥)。`enable=true` 时同时置
+/// `im.feishu.enabled`(扫码接入即启用);手填保存走 `enable=false`,enabled 仍由开关 /
+/// 默认决定。`owner_open_id=Some` 时把该 open_id 设为白名单——扫码创建的新机器人用它
+/// 让授权者立即可对话,并覆盖旧应用遗留的白名单(那些 open_id 属于旧 app、对新 bot 无效,
+/// 留着反而会让新 owner 被 `inbound::route` 忽略);手填路径传 `None`,不动既有白名单。
+/// 扫码注册成功路径与本函数共用,保证「落库 + 重连」单一实现。
+async fn apply_feishu_credentials(
+    app: &tauri::AppHandle,
+    db: &Db,
+    app_id: &str,
+    app_secret: &str,
+    enable: bool,
+    owner_open_id: Option<&str>,
+) -> anyhow::Result<()> {
+    repo::set_setting(db, crate::im::K_APP_ID, app_id.trim()).await?;
+    if !app_secret.is_empty() {
+        repo::set_setting(db, crate::im::K_APP_SECRET, app_secret.trim()).await?;
+    }
+    if let Some(oid) = owner_open_id {
+        let oid = oid.trim();
+        if !oid.is_empty() {
+            repo::set_setting(db, crate::im::K_ALLOW, oid).await?;
+        }
+    }
+    if enable {
+        repo::set_setting(db, crate::im::K_ENABLED, "1").await?;
+    }
+    crate::im::spawn(app.clone());
+    Ok(())
+}
+
 /// 保存凭证并重启桥。secret 传空字符串 = 保持原值（不覆盖已存的密钥）。
 /// 是否真正连接由 `im.feishu.enabled` 和双凭证共同决定。
 #[tauri::command]
@@ -1502,16 +1533,9 @@ pub async fn im_set_settings(
     app_id: String,
     app_secret: String,
 ) -> R<()> {
-    repo::set_setting(&db, crate::im::K_APP_ID, app_id.trim())
+    apply_feishu_credentials(&app, &db, &app_id, &app_secret, false, None)
         .await
-        .map_err(e)?;
-    if !app_secret.is_empty() {
-        repo::set_setting(&db, crate::im::K_APP_SECRET, app_secret.trim())
-            .await
-            .map_err(e)?;
-    }
-    crate::im::spawn(app);
-    Ok(())
+        .map_err(e)
 }
 
 /// 开关桥：写 enabled 标志并重启。off = 断开但保留凭证；on = 凭证齐全则连接
@@ -1548,6 +1572,75 @@ pub async fn im_set_remote_standby(
 #[tauri::command]
 pub fn im_status(bridge: State<'_, crate::im::ImBridge>) -> R<String> {
     Ok(bridge.status())
+}
+
+// ───────────────────────── 飞书扫码接入(device-flow）─────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct ScanBeginView {
+    pub qr_data_uri: String,
+    pub expire_secs: u64,
+    pub poll_interval_ms: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ScanStatusView {
+    pub status: String,
+    pub error_reason: Option<String>,
+}
+
+/// 发起扫码:begin device-flow → 返回二维码 data URI 供前端 `<img>` 渲染。后台轮询在
+/// RegistrationService 内进行;成功时用拿到的 client_id/secret 落库 + 重连(enable）。
+#[tauri::command]
+pub async fn feishu_scan_begin(
+    app: tauri::AppHandle,
+    svc: State<'_, crate::im::feishu::registration::RegistrationService>,
+) -> R<ScanBeginView> {
+    use crate::im::feishu::registration::{OnSuccess, ReqwestTransport};
+    let app_cb = app.clone();
+    let on_success: OnSuccess = std::sync::Arc::new(move |client_id, client_secret, open_id| {
+        let app = app_cb.clone();
+        Box::pin(async move {
+            let db = app.state::<Db>().inner().clone();
+            apply_feishu_credentials(&app, &db, &client_id, &client_secret, true, Some(&open_id))
+                .await
+        }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
+    });
+    let transport = std::sync::Arc::new(ReqwestTransport::default());
+    let begin = svc.begin(transport, on_success).await.map_err(e)?;
+    Ok(ScanBeginView {
+        qr_data_uri: begin.qr_data_uri,
+        expire_secs: begin.expire_secs,
+        poll_interval_ms: begin.interval_secs.saturating_mul(1000),
+    })
+}
+
+/// 查询扫码状态(前端按 poll_interval_ms 轮询)。
+#[tauri::command]
+pub fn feishu_scan_status(
+    svc: State<'_, crate::im::feishu::registration::RegistrationService>,
+) -> R<ScanStatusView> {
+    use crate::im::feishu::registration::ScanStatus;
+    let (status, error_reason) = match svc.status() {
+        ScanStatus::Idle => ("idle", None),
+        ScanStatus::Pending => ("pending", None),
+        ScanStatus::Success => ("success", None),
+        ScanStatus::Expired => ("expired", None),
+        ScanStatus::Error(r) => ("error", Some(r)),
+    };
+    Ok(ScanStatusView {
+        status: status.to_string(),
+        error_reason,
+    })
+}
+
+/// 取消扫码(关闭 dialog / 卸载时调用),停止后台轮询。
+#[tauri::command]
+pub fn feishu_scan_cancel(
+    svc: State<'_, crate::im::feishu::registration::RegistrationService>,
+) -> R<()> {
+    svc.cancel();
+    Ok(())
 }
 
 // ───────────────────────── IM · 话题绑定（M2-5）─────────────────────────

@@ -8,11 +8,14 @@ import {
   Check,
   Copy,
   Database,
+  ExternalLink,
   FolderOpen,
+  KeyRound,
   MessageSquare,
   Monitor,
   Moon,
   Palette,
+  QrCode,
   Search,
   Settings,
   Shield,
@@ -733,6 +736,9 @@ function ImSettings() {
   const [status, setStatus] = useState("disabled");
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [scanOpen, setScanOpen] = useState(false);
+  // 两种接入模式:扫码创建新 PersonalAgent,或手填凭证绑定已有应用/机器人。
+  const [mode, setMode] = useState<"scan" | "manual">("scan");
   // The toggles default to `false`. Without this flag we'd render the
   // off-state for one tick before `api.imGetSettings()` resolves, producing
   // a visible "off → on" flash for users whose IM was already enabled.
@@ -878,44 +884,99 @@ function ImSettings() {
 
         {enabled && (
           <div className="flex flex-col gap-4 border-t border-border px-4 py-4">
-            <ImField label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
-              <Input
-                value={appId}
-                placeholder="cli_xxxxxxxxxxxx"
-                onChange={(e) => setAppId(e.currentTarget.value)}
-                className="h-8 w-full bg-bg/80 font-mono text-[12px]"
-              />
-            </ImField>
-            <ImField label={t("settings.imAppSecret")} hint={t("settings.imAppSecretHint")}>
-              <Input
-                type="password"
-                value={secret}
-                placeholder={hasSecret ? "••••••••" : ""}
-                onChange={(e) => setSecret(e.currentTarget.value)}
-                className="h-8 w-full bg-bg/80 font-mono text-[12px]"
-              />
-            </ImField>
-            <ImField label={t("settings.imPermsLabel")} hint={t("settings.imPermsHint")}>
-              <div className="flex items-start gap-2">
-                <code className="flex-1 whitespace-pre rounded-[var(--radius-md)] border border-border bg-bg/80 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-ink-muted">
-                  {FEISHU_SCOPES.join("\n")}
-                </code>
-                <Button
-                  variant="default"
-                  size="sm"
-                  onClick={() => void copyPerms()}
-                  className="shrink-0"
+            <div className="flex gap-1 rounded-[var(--radius-md)] bg-bg p-1">
+              {(["scan", "manual"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setMode(m)}
+                  className={cn(
+                    "flex flex-1 items-center justify-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1.5 text-[12px] font-medium transition-colors",
+                    mode === m
+                      ? "bg-surface text-ink shadow-sm"
+                      : "text-ink-faint hover:text-ink-muted",
+                  )}
                 >
-                  {copied ? <Check size={13} /> : <Copy size={13} />}
-                  {copied ? t("settings.imPermsCopied") : t("settings.imPermsCopy")}
+                  {m === "scan" ? <QrCode size={13} /> : <KeyRound size={13} />}
+                  {m === "scan" ? t("settings.imModeScan") : t("settings.imModeManual")}
+                </button>
+              ))}
+            </div>
+
+            {mode === "scan" ? (
+              <div className="flex flex-col gap-3">
+                <p className="text-[12px] leading-relaxed text-ink-faint">
+                  {t("settings.imScanModeHint")}
+                </p>
+                <Button variant="primary" onClick={() => setScanOpen(true)} className="self-start">
+                  <QrCode size={14} />
+                  {t("settings.imScanConnect")}
                 </Button>
               </div>
-            </ImField>
-            <div className="flex justify-end">
-              <Button variant="primary" onClick={() => void reconnect()} disabled={saving || !dirty}>
-                {reconnectLabel}
-              </Button>
-            </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-[12px] leading-relaxed text-ink-faint">
+                    {t("settings.imManualModeHint")}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void api.openUrl("https://open.feishu.cn/app")}
+                    className="inline-flex shrink-0 items-center gap-1 text-[12px] font-medium text-brand underline decoration-brand/40 underline-offset-2 hover:decoration-brand"
+                  >
+                    {t("settings.imOpenPlatform")}
+                    <ExternalLink size={12} />
+                  </button>
+                </div>
+                <ImField label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
+                  <Input
+                    value={appId}
+                    placeholder="cli_xxxxxxxxxxxx"
+                    onChange={(e) => setAppId(e.currentTarget.value)}
+                    className="h-8 w-full bg-bg/80 font-mono text-[12px]"
+                  />
+                </ImField>
+                <ImField label={t("settings.imAppSecret")} hint={t("settings.imAppSecretHint")}>
+                  <Input
+                    type="password"
+                    value={secret}
+                    placeholder={hasSecret ? "••••••••" : ""}
+                    onChange={(e) => setSecret(e.currentTarget.value)}
+                    className="h-8 w-full bg-bg/80 font-mono text-[12px]"
+                  />
+                </ImField>
+                <ImField label={t("settings.imPermsLabel")} hint={t("settings.imPermsHint")}>
+                  <div className="flex items-start gap-2">
+                    <code className="flex-1 whitespace-pre rounded-[var(--radius-md)] border border-border bg-bg/80 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed text-ink-muted">
+                      {FEISHU_SCOPES.join("\n")}
+                    </code>
+                    <Button
+                      variant="default"
+                      size="sm"
+                      onClick={() => void copyPerms()}
+                      className="shrink-0"
+                    >
+                      {copied ? <Check size={13} /> : <Copy size={13} />}
+                      {copied ? t("settings.imPermsCopied") : t("settings.imPermsCopy")}
+                    </Button>
+                  </div>
+                </ImField>
+                <div className="flex justify-end">
+                  <Button
+                    variant="primary"
+                    onClick={() => void reconnect()}
+                    disabled={saving || !dirty}
+                  >
+                    {reconnectLabel}
+                  </Button>
+                </div>
+              </div>
+            )}
+            <FeishuScanDialog
+              open={scanOpen}
+              onOpenChange={setScanOpen}
+              onConnected={() => void api.imStatus().then(setStatus)}
+            />
           </div>
         )}
       </div>
@@ -931,6 +992,121 @@ function ImField({ label, hint, children }: { label: string; hint?: string; chil
       {children}
       {hint && <p className="text-[11.5px] leading-relaxed text-ink-faint">{hint}</p>}
     </div>
+  );
+}
+
+/// 扫码接入飞书 dialog:打开即 begin device-flow、渲染二维码、按服务端建议间隔轮询
+/// 状态;成功自动关闭并刷新连接状态,过期 / 出错可重新扫码。关闭 / 卸载时取消后台轮询。
+function FeishuScanDialog({
+  open,
+  onOpenChange,
+  onConnected,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  onConnected: () => void;
+}) {
+  const { t } = useTranslation();
+  const [qr, setQr] = useState<string | null>(null);
+  const [phase, setPhase] = useState<"loading" | "waiting" | "success" | "expired" | "error">(
+    "loading",
+  );
+  const [errReason, setErrReason] = useState<string | null>(null);
+  // attempt 自增触发 effect 重跑(重新扫码)。onConnected/onOpenChange 是稳定的 setter
+  // 闭包,故意不列入依赖——否则父组件每次渲染都会重启 device-flow。
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    let timer: number | null = null;
+    const stop = () => {
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+    setPhase("loading");
+    setQr(null);
+    setErrReason(null);
+    void api
+      .feishuScanBegin()
+      .then((b) => {
+        if (!alive) return;
+        setQr(b.qr_data_uri);
+        setPhase("waiting");
+        timer = window.setInterval(() => {
+          void api.feishuScanStatus().then((s) => {
+            if (!alive) return;
+            if (s.status === "success") {
+              stop();
+              setPhase("success");
+              onConnected();
+              window.setTimeout(() => {
+                if (alive) onOpenChange(false);
+              }, 1200);
+            } else if (s.status === "expired") {
+              stop();
+              setPhase("expired");
+            } else if (s.status === "error") {
+              stop();
+              setErrReason(s.error_reason);
+              setPhase("error");
+            }
+          });
+        }, b.poll_interval_ms);
+      })
+      .catch(() => {
+        if (alive) setPhase("error");
+      });
+    return () => {
+      alive = false;
+      stop();
+      void api.feishuScanCancel();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, attempt]);
+
+  const errorText =
+    errReason === "lark_unsupported"
+      ? t("settings.imScanLarkUnsupported")
+      : t("settings.imScanError");
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent title={t("settings.imScanTitle")}>
+        <div className="flex flex-col items-center gap-4 py-2">
+          {phase === "loading" && (
+            <p className="text-[12.5px] text-ink-faint">{t("settings.imScanLoading")}</p>
+          )}
+          {phase === "waiting" && qr && (
+            <>
+              <img
+                src={qr}
+                alt=""
+                className="h-48 w-48 rounded-[var(--radius-md)] border border-border bg-white p-2"
+              />
+              <p className="text-center text-[12.5px] text-ink-muted">
+                {t("settings.imScanHint")}
+              </p>
+            </>
+          )}
+          {phase === "success" && (
+            <p className="text-[13px] font-medium text-success">{t("settings.imScanSuccess")}</p>
+          )}
+          {(phase === "expired" || phase === "error") && (
+            <>
+              <p className="text-center text-[12.5px] text-ink-muted">
+                {phase === "expired" ? t("settings.imScanExpired") : errorText}
+              </p>
+              <Button variant="primary" onClick={() => setAttempt((a) => a + 1)}>
+                {t("settings.imScanRetry")}
+              </Button>
+            </>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
