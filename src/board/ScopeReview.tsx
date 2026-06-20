@@ -286,9 +286,9 @@ function BaseBranchField({
   const { t } = useTranslation();
   const [val, setVal] = useState(value ?? "");
   const lastLoaded = useRef(value ?? "");
-  const lastIdentity = useRef(`${name} ${repo}`);
+  const lastIdentity = useRef(`${name}\0${repo}`);
   useEffect(() => {
-    const identity = `${name} ${repo}`;
+    const identity = `${name}\0${repo}`;
     // Reset the input when the persisted value changes OR when the lane IDENTITY
     // (name/repo) changes — a re-propose can swap the lane in this slot without
     // changing `value`, and stale dirty input must not blur-save onto the new lane.
@@ -311,7 +311,7 @@ function BaseBranchField({
     // keyed slot while the save is in flight; the resolve/reject handlers below must
     // not touch the input or load-tracking once that's happened, or they'd clobber the
     // new lane's freshly-reset state with this (old) lane's value.
-    const savedIdentity = `${name} ${repo}`;
+    const savedIdentity = `${name}\0${repo}`;
     // The persisted base this field was editing FROM. The backend rejects the save if a
     // same-identity (same name+repo) re-propose changed the lane's base meanwhile —
     // optimistic concurrency the name/repo + CAS guards can't catch on their own.
