@@ -550,6 +550,19 @@ impl Client {
         *self.0.lock().await = None;
     }
 
+    /// Like [`shutdown`](Self::shutdown) but also REAPS the child — kill + await —
+    /// before returning. A caller that spawns many short-lived per-session
+    /// connections (the curator's per-repo + relation scans) would otherwise pile
+    /// up unreaped `codex app-server` children on tokio's best-effort reaper, since
+    /// plain `shutdown` only drops the handle (kill_on_drop, no await).
+    pub async fn shutdown_and_reap(&self) {
+        if let Some(mut inner) = self.0.lock().await.take() {
+            // SIGKILL + wait → the child is reaped synchronously here; closing
+            // stdin/stdout also drops the per-session consumer task.
+            let _ = inner._child.kill().await;
+        }
+    }
+
     async fn connect(&self) -> anyhow::Result<()> {
         // The app-scoped global client has no per-session pin; use the global codex
         // override (alias).

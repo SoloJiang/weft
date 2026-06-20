@@ -628,7 +628,10 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
         Ok::<String, anyhow::Error>(text)
     }
     .await;
-    client.shutdown().await;
+    // Reap the child here (not just kill_on_drop): the curator opens a fresh
+    // per-session app-server for EVERY repo + the relation pass, so over a large
+    // workspace plain `shutdown` would leave a trail of unreaped children.
+    client.shutdown_and_reap().await;
     outcome
 }
 
@@ -702,6 +705,7 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
     let mut reader = BufReader::new(stdout).lines();
     let mut texts: Vec<String> = Vec::new();
     let mut deltas = String::new();
+    let mut turn_failed = false;
     let collect = async {
         while let Some(line) = reader.next_line().await? {
             match adapter.parse_line(&line) {
@@ -715,23 +719,35 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
                     on_event(AnalysisEvent::Delta(&text));
                     deltas.push_str(&text);
                 }
-                ChatEvent::TurnEnd { .. } => break,
+                ChatEvent::TurnEnd { is_error, .. } => {
+                    turn_failed = is_error;
+                    break;
+                }
                 _ => {}
             }
         }
         Ok::<(), anyhow::Error>(())
     };
-    let _ = tokio::time::timeout(CURATOR_TIMEOUT, collect).await;
+    // `completed` = the stream ended on its own (a TurnEnd break, or EOF) rather
+    // than the timeout firing.
+    let completed = tokio::time::timeout(CURATOR_TIMEOUT, collect).await.is_ok();
     // Close stdout so a child blocked on a full pipe unblocks, then SIGKILL and
     // reap (kill().await waits for exit — avoids a zombie on timeout). On a clean
     // EOF the child has already exited and this is a no-op.
     drop(reader);
     let _ = child.kill().await;
-    Ok(if texts.is_empty() {
-        deltas
-    } else {
-        texts.join("\n")
-    })
+    let text = if texts.is_empty() { deltas } else { texts.join("\n") };
+    // Don't hand back partial/empty output as success (mirrors the app-server
+    // path): a timeout, an arg-parse / early exit (no stdout → empty text), or an
+    // errored turn must surface as `Err` so a failed reprofile shows the
+    // failed/retryable state instead of being masked as `done` — e.g.
+    // `classified_now` seeing a STALE prior tier. (We gate on completion + non-error
+    // + non-empty rather than requiring a TurnEnd, because opencode's exec stream
+    // emits none.)
+    if !completed || turn_failed || text.trim().is_empty() {
+        anyhow::bail!("{tool} exec turn did not complete cleanly (timedOut={}, error={turn_failed})", !completed);
+    }
+    Ok(text)
 }
 
 /// Group the agent's flat relations by producer (`from`), keep only those whose
