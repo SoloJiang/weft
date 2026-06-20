@@ -572,6 +572,7 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
         let mut texts: Vec<String> = Vec::new();
         let mut deltas = String::new();
         let mut turn_failed = false;
+        let mut saw_turn_end = false;
         let collect = async {
             while let Some(msg) = rx.recv().await {
                 match msg {
@@ -581,6 +582,7 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
                     }
                     ThreadMsg::Event(ChatEvent::Assistant { texts: t, .. }) => texts.extend(t),
                     ThreadMsg::Event(ChatEvent::TurnEnd { is_error, .. }) => {
+                        saw_turn_end = true;
                         turn_failed = is_error;
                         break;
                     }
@@ -591,15 +593,17 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
                 }
             }
         };
-        let completed = tokio::time::timeout(CURATOR_TIMEOUT, collect).await.is_ok();
+        let _ = tokio::time::timeout(CURATOR_TIMEOUT, collect).await;
         let text = if texts.is_empty() { deltas } else { texts.join("\n") };
-        // A turn that ENDED in error (auth/quota/context), never finished (timeout),
-        // or produced no text at all is a transport failure — surface it as `Err` so
-        // `run_streaming_agent` falls back to exec, instead of feeding empty/partial
-        // text downstream as if the app-server had succeeded.
-        if turn_failed || !completed || text.trim().is_empty() {
+        // Accept the reply ONLY on a clean, non-error TurnEnd with text. A timeout
+        // (collect cancelled) OR a mid-turn channel close — the child crashed or
+        // disconnected after partial text, so `rx.recv()` hits EOF and the loop
+        // exits WITHOUT a TurnEnd — both leave `saw_turn_end` false. Treat either as
+        // a transport failure (`Err`) so `run_streaming_agent` falls back to exec,
+        // instead of returning partial/empty output as if the app-server succeeded.
+        if turn_failed || !saw_turn_end || text.trim().is_empty() {
             anyhow::bail!(
-                "codex app-server turn did not produce a usable reply (error={turn_failed}, completed={completed})"
+                "codex app-server turn did not complete cleanly (error={turn_failed}, sawTurnEnd={saw_turn_end})"
             );
         }
         Ok::<String, anyhow::Error>(text)
@@ -1008,6 +1012,14 @@ async fn persist_repo_class(
 pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     let cwd = Path::new(&repo.local_git_path);
     if !cwd.exists() {
+        // The checkout is gone (e.g. a retry after it was moved/deleted). Don't
+        // silently return Ok — that would drop a previously-failed repo to idle and
+        // lose its retryable error. Mark a visible, retryable failure with a clear
+        // reason instead. (Background passes pre-filter missing checkouts, so this
+        // only fires on an explicit reprofile_repo retry.)
+        const GONE: &str = "repository checkout not found on disk";
+        run_finish_err(repo.id, GONE.into());
+        emit_repo_analysis(repo.workspace_id, repo.id, "failed", None, Some(GONE));
         return Ok(());
     }
     // Dedupe: a manual reprofile racing the background pass must not double-spawn
@@ -1243,10 +1255,11 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
 pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     let gate = pass_gate(repo.workspace_id);
     let _g = gate.lock.lock().await;
-    // Clear any prior `failed` run-state so this explicit retry actually runs:
-    // `run_begin` only blocks a still-`running` repo, but auto-passes skip `failed`
-    // ones — the user pressing 重新分析 is the sanctioned way to retry one.
-    run_finish_ok(repo.id);
+    // NB: do NOT clear the failed state up front. `profile_repo_agent` clears it via
+    // `run_begin` only once a run actually STARTS (after its checkout-exists guard),
+    // so a retry whose checkout is gone keeps a visible failed state instead of
+    // being silently dropped to idle. (run_begin overwrites a `failed` entry with
+    // `running`, and reprofile bypasses the auto-pass `failed`-skip by calling here.)
     profile_repo_agent(db, repo).await?;
     emit_graph_updated(repo.workspace_id);
     let _ = analyze_relations(db, repo.workspace_id).await;
@@ -1362,6 +1375,22 @@ mod tests {
             .await
             .unwrap();
         assert!(super::classified_now(&db, r.id).await, "canonical tier → classified");
+    }
+
+    #[tokio::test]
+    async fn missing_checkout_retry_stays_failed() {
+        // A retry whose checkout was moved/deleted must keep a visible, retryable
+        // failure — not silently drop to idle. profile_repo_agent's cwd guard fires
+        // before any agent spawn, so this is exercisable without a real run.
+        super::run_state_clear_all_for_test();
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "gone", "/nonexistent/weft/checkout/zzz", "main", "")
+            .await
+            .unwrap();
+        super::profile_repo_agent(&db, &r).await.unwrap();
+        assert_eq!(super::run_phase(r.id), "failed", "missing checkout stays failed");
+        assert!(super::run_error(r.id).is_some(), "with a reason the UI can show");
     }
 
     #[tokio::test]
