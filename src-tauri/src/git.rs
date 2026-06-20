@@ -196,17 +196,18 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
 }
 
 /// The default base for the OFFLINE fallback (when `live_default_branch` is
-/// unavailable): prefer the recorded `base_ref` when it still resolves — it was the
-/// live default captured at register time, so it is more trustworthy than a possibly
-/// stale cached `origin/HEAD`. Otherwise fall back to the `default_base_branch` chain.
-/// Returns a bare branch name (no `origin/`).
+/// unavailable): prefer the recorded `base_ref` when its REMOTE-tracking ref
+/// `origin/<base_ref>` still resolves — a genuinely-captured live default has a
+/// matching `origin/<base_ref>`, so this is more trustworthy than a possibly stale
+/// cached `origin/HEAD`. A LOCAL-only `base_ref` is NOT trusted here: on an upgraded
+/// DB `base_ref` was the repo's CURRENT branch at add time (e.g. a feature branch),
+/// not the default — trusting a local-only ref would pin that legacy feature branch
+/// offline. Otherwise fall through to `default_base_branch` (which still considers a
+/// local `base_ref`, but only AFTER main/master). Returns a bare branch name (no `origin/`).
 pub fn recorded_base_or_default(repo: &Path, base_ref: &str) -> String {
     let b = base_ref.trim();
     let b = b.strip_prefix("origin/").unwrap_or(b);
-    if !b.is_empty()
-        && b != "HEAD"
-        && (ref_resolves(repo, b) || ref_resolves(repo, &format!("origin/{b}")))
-    {
+    if !b.is_empty() && b != "HEAD" && ref_resolves(repo, &format!("origin/{b}")) {
         return b.to_string();
     }
     default_base_branch(repo, base_ref)
@@ -397,6 +398,22 @@ pub fn add_worktree_synced(
                 "worktree path {} exists but is not a worktree of this repo on {branch:?}",
                 worktree_path.display()
             );
+        }
+        // For an EXPLICIT base, the registered branch must also DESCEND from the requested
+        // base — mirroring the `-b` fallback's ancestry check. A checkout registered for
+        // this branch but forked elsewhere (e.g. `feat/x` off main, now reused for an
+        // explicit `base_branch=release` lane) would otherwise record base=release while
+        // the worktree sits on main's line. `resolved_opt` is Some here whenever
+        // require_resolvable passed (the bail above guarantees it).
+        if require_resolvable {
+            if let Some(resolved) = resolved_opt.as_ref() {
+                if git(repo, &["merge-base", "--is-ancestor", resolved, branch]).is_err() {
+                    bail!(
+                        "branch {branch:?} already checked out but is not based on {resolved:?}; \
+                         refusing to record a mismatched base"
+                    );
+                }
+            }
         }
         return Ok(WorktreeAdd {
             path: worktree_path.to_path_buf(),
@@ -865,6 +882,23 @@ pub fn git_url_key(url: &str) -> String {
 /// Short HEAD commit sha; used to stamp a repo profile and detect staleness.
 pub fn head_commit(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--short", "HEAD"])
+}
+
+/// FULL 40-char HEAD commit sha. Used where the value is PERSISTED as a stable
+/// branch-off point (e.g. a detached-HEAD lane's diff target): a short sha can grow
+/// ambiguous as the repo accumulates commits, breaking later ref resolution, so the
+/// stored target must be the unabbreviated sha. None on an empty repo (no HEAD yet).
+pub fn head_commit_full(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Append `name` to a worktree's git exclude (info/exclude) so weft's injected,
@@ -1710,6 +1744,25 @@ mod tests {
     }
 
     #[test]
+    fn recorded_base_or_default_ignores_local_only_legacy_base_ref() {
+        // On an upgraded DB, base_ref was the repo's CURRENT branch at add time — a LOCAL
+        // feature branch (no origin/<base_ref>), NOT the live default. Offline, that
+        // local-only base_ref must NOT be trusted (else new work branches off the legacy
+        // feature branch); the main-family default must win instead.
+        let repo = tmp("rbod-local-legacy");
+        init_repo(&repo).unwrap();
+        let def = current_branch(&repo).unwrap(); // main or master
+        // A local-only feature branch, with NO remote-tracking origin/feature/foo.
+        git(&repo, &["branch", "feature/foo"]).unwrap();
+        assert!(ref_resolves(&repo, "feature/foo"), "precondition: local feature/foo exists");
+        assert!(!ref_resolves(&repo, "origin/feature/foo"), "precondition: no remote feature/foo");
+        let got = recorded_base_or_default(&repo, "feature/foo");
+        assert_eq!(got, def, "a local-only legacy base_ref must fall through to the main-family default");
+        assert_ne!(got, "feature/foo", "must not trust the legacy local feature branch");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn add_worktree_synced_validates_explicit_base_even_when_path_exists() {
         let repo = tmp("aws-orphan");
         init_repo(&repo).unwrap();
@@ -1719,6 +1772,44 @@ mod tests {
         // path already exists — not silently reuse the orphan.
         let res = add_worktree_synced(&repo, "feat/x", &wt, "no-such-xyz", true);
         assert!(res.is_err(), "explicit unresolvable base must error before reusing an existing path");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_existing_path_branch_not_from_explicit_base() {
+        // The path-exists fast-path (a REGISTERED checkout for `branch`) must, for an
+        // EXPLICIT base, still verify the branch descends from that base before reusing —
+        // else a checkout forked off main, reused for an explicit `release` lane, records
+        // base=release while the worktree sits on main's line.
+        let repo = tmp("aws-path-mismatch");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // A distinct base "release", one commit AHEAD of main, so main is NOT a descendant.
+        git(&repo, &["checkout", "-q", "-b", "release"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "release work"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+
+        // Register a real worktree for `feat/x` forked from MAIN at the deterministic path.
+        let wt = tmp("aws-path-mismatch-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, &main, true).unwrap();
+        assert!(add.created_branch, "precondition: feat/x created off main");
+        assert!(wt.exists() && wt.join(".git").exists(), "precondition: registered worktree on feat/x");
+
+        // (A) Reuse the EXISTING path for an explicit base "release" → reject (feat/x is
+        // on main's line, not a descendant of release).
+        assert!(
+            add_worktree_synced(&repo, "feat/x", &wt, "release", true).is_err(),
+            "registered checkout not based on the explicit base must be rejected on the path-exists fast-path"
+        );
+
+        // (B) Reuse the EXISTING path for the branch's REAL base (main) → ok.
+        assert!(
+            add_worktree_synced(&repo, "feat/x", &wt, &main, true).is_ok(),
+            "registered checkout based on the explicit base is reused"
+        );
+
+        let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
     }

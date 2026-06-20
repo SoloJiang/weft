@@ -111,14 +111,23 @@ pub async fn materialize_direction(
         // branch-off point so the recreated branch starts there rather than off an
         // arbitrary fallback ref. Mirror the normal path's base resolution.
         let explicit = !dir.base_branch.trim().is_empty();
+        // A blank base paired with a stored target is the detached-HEAD fallback ONLY when
+        // that target is a bare COMMIT (the branch-off SHA) — reuse it so the recreate
+        // starts from the SAME point, not a re-resolved live default that may have moved.
+        // But on an UPGRADED direction, `base_branch==""` may instead pair with a
+        // USER-EDITED diff target that is a BRANCH NAME (pre-base_branch era); recreating
+        // off a user-edited branch name would start the task from the wrong point. So treat
+        // the stored target as a recreate base ONLY when it does NOT resolve as a branch ref
+        // AND does resolve as a commit; otherwise fall through to live/default re-resolution.
+        let t = dir.target_branch.trim();
+        let target_is_bare_commit = !t.is_empty()
+            && !git::ref_resolves(repo_path, &format!("refs/heads/{t}"))
+            && !git::ref_resolves(repo_path, &format!("refs/remotes/origin/{t}"))
+            && git::ref_resolves(repo_path, t);
         let recreate_base = if explicit {
             dir.base_branch.trim().to_string()
-        } else if !dir.target_branch.trim().is_empty() {
-            // A blank base with a stored target is the detached-HEAD fallback: base_branch
-            // is empty but target_branch holds the branch-off COMMIT (see the HEAD handling
-            // in the normal path). Reuse it so the recreate starts from the SAME point, not
-            // a re-resolved live default that may have moved since.
-            dir.target_branch.trim().to_string()
+        } else if target_is_bare_commit {
+            t.to_string()
         } else {
             git::live_default_branch(repo_path)
                 .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref))
@@ -200,7 +209,10 @@ pub async fn materialize_direction(
     let was_head = raw_recorded == "HEAD";
     let recorded_base = if was_head { String::new() } else { raw_recorded };
     let recorded_target = if was_head {
-        git::head_commit(repo_path).unwrap_or_default()
+        // FULL sha (not the --short head_commit): this is PERSISTED as the diff target
+        // and re-resolved later by worktree_diff_target/rematerialization, where a short
+        // sha could become ambiguous in a large repo.
+        git::head_commit_full(repo_path).unwrap_or_default()
     } else {
         recorded_base.clone()
     };
@@ -723,6 +735,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// R33-5: a reclaimed lane with `base_branch==""` may, on an UPGRADED direction, pair
+    /// with a USER-EDITED diff `target_branch` that is a BRANCH NAME (not the detached-HEAD
+    /// SHA). The recreate must NOT branch off that user-edited branch verbatim — only a bare
+    /// COMMIT target is reused; a branch-ref target is re-resolved to the live/default base.
+    #[tokio::test]
+    async fn materialize_recreate_ignores_branch_name_target_uses_default_base() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-branchtarget-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // A branch "develop" one commit AHEAD of main. If the recreate blindly used the
+        // user-edited target "develop" as the base, the work branch would land on develop's
+        // commit; the correct re-resolution to the default (main) lands on main's commit.
+        g(&["checkout", "-q", "-b", "develop"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "develop work"]);
+        let develop_sha = sha("develop");
+        g(&["checkout", "-q", &main]);
+        let main_sha = sha(&main);
+        assert_ne!(develop_sha, main_sha, "develop must be ahead of main");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // repo base_ref = main (the default). No remote, so live_default is None and the
+        // offline fallback resolves to local main.
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "")
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // BLANK base → would normally re-resolve to the default at materialize.
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // ① materialize (off the default main), then reclaim the dir + delete the work branch.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        let _ = crate::git::remove_worktree(&repo_path, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-D", &work_branch]);
+
+        // ② Simulate an UPGRADED, user-edited diff target: a BRANCH NAME ("develop"), with
+        // base_branch still blank. This is NOT a detached-HEAD SHA.
+        repo::set_direction_base_branch(&db, dir.id, "").await.unwrap();
+        repo::set_direction_target_branch(&db, dir.id, "develop").await.unwrap();
+        assert!(crate::git::ref_resolves(&repo_path, "refs/heads/develop"), "precondition: develop is a real branch");
+
+        // ③ Re-materialize: the work branch is gone, so the base is used. It must NOT be the
+        // user-edited branch "develop" verbatim — it re-resolves to the default (main).
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+        assert!(wt_path.exists(), "worktree recreated");
+        assert_eq!(
+            sha(&work_branch), main_sha,
+            "recreate must re-resolve a branch-name target to the default (main), not branch off 'develop' verbatim"
+        );
+        assert_ne!(
+            sha(&work_branch), develop_sha,
+            "a user-edited branch-name target must NOT be reused as the recreate base"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn materialize_detached_head_stores_empty_base_and_target_not_head() {
         use crate::store::repo;
@@ -748,10 +843,12 @@ mod tests {
         g(&["checkout", "-q", "--detach"]);
         g(&["branch", "-D", &main]);
         // The commit HEAD points at — what the worktree branches off, and what the diff
-        // target must be pinned to (a stable SHA, not the moving "HEAD").
+        // target must be pinned to (a stable FULL sha, not the moving "HEAD" nor a --short
+        // sha that could grow ambiguous later).
         let head_sha = String::from_utf8(
-            Cmd::new("git").args(["rev-parse", "--short", "HEAD"]).current_dir(&repo_path).output().unwrap().stdout,
+            Cmd::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo_path).output().unwrap().stdout,
         ).unwrap().trim().to_string();
+        assert_eq!(head_sha.len(), 40, "precondition: captured the FULL 40-char sha");
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
