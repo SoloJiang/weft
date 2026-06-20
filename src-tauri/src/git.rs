@@ -1435,6 +1435,10 @@ mod tests {
         // was branched off local after an offline materialize).
         let c1 = tmp("rtr-c1");
         git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &c1.to_string_lossy()]).unwrap();
+        // A clone does not inherit local user config, and CI has no global identity,
+        // so set one before committing in the clone.
+        git(&c1, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&c1, &["config", "user.name", "t"]).unwrap();
         git(&c1, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
         git(&c1, &["commit", "-q", "--allow-empty", "-m", "local-ahead"]).unwrap();
         git(&c1, &["checkout", "-q", &main]).unwrap();
