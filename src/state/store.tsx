@@ -1727,7 +1727,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Latches true if ANY queued base save in the current chain rejected — the chain's
   // `.catch` swallows predecessors for serialization, so confirm/approve consult this
   // latch (not just the final promise) before acting.
-  const baseSaveFailed = useRef(false);
+  // Per-thread: a base save that fails in thread A must not block Create/approve in
+  // thread B. Holds the ids of threads whose in-flight base save rejected.
+  const baseSaveFailed = useRef<Set<number>>(new Set());
 
   const confirmProposal = useCallback(async () => {
     if (activeThreadId == null) return;
@@ -1746,8 +1748,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Also abort if any EARLIER link in the chain failed — the chain's
     // `.catch(() => {})` swallows predecessors for serialization, so the final
     // promise may resolve even when a prior save rejected.
-    if (baseSaveFailed.current) {
-      baseSaveFailed.current = false;
+    if (baseSaveFailed.current.has(activeThreadId)) {
+      baseSaveFailed.current.delete(activeThreadId);
       await refreshProposal(activeThreadId);
       return;
     }
@@ -1782,7 +1784,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // earlier rejections for serialization purposes; this terminal catch sets
           // the latch and re-throws so THIS link's own promise also rejects (the
           // NEXT edit's `.catch(() => {})` will swallow it in turn).
-          baseSaveFailed.current = true;
+          baseSaveFailed.current.add(tid);
           throw err;
         });
       pendingBaseSave.current = p;
@@ -1818,8 +1820,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Also abort if any EARLIER link in the chain failed — the chain's
       // `.catch(() => {})` swallows predecessors for serialization, so the final
       // promise may resolve even when a prior save rejected.
-      if (baseSaveFailed.current) {
-        baseSaveFailed.current = false;
+      if (baseSaveFailed.current.has(item.thread_id)) {
+        baseSaveFailed.current.delete(item.thread_id);
         if (activeThreadId != null) await refreshProposal(activeThreadId);
         return;
       }
