@@ -115,8 +115,11 @@ fn reconcile_reuse(
     let effective = |b: &str| -> String {
         let b = b.trim();
         if b.is_empty() {
+            // Match materialize's resolution: live default, else the recorded base_ref
+            // (the live default captured at register) when it still resolves, else the
+            // cached chain — so the reuse comparison agrees with what was materialized.
             crate::git::live_default_branch(repo_path)
-                .unwrap_or_else(|| crate::git::default_base_branch(repo_path, base_ref))
+                .unwrap_or_else(|| crate::git::recorded_base_or_default(repo_path, base_ref))
         } else {
             b.strip_prefix("origin/").unwrap_or(b).to_string()
         }
