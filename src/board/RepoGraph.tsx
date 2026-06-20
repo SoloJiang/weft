@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Server,
   Trash2,
+  TriangleAlert,
   type LucideProps,
 } from "lucide-react";
 import type { ComponentType } from "react";
@@ -472,6 +473,9 @@ function RepoNode({
   const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
   const core = dependents >= 2;
+  // A failed classification is `!analyzed` too, but must read as a retryable
+  // failure on the canvas — not a permanent "analyzing" spinner.
+  const failed = p.analysis_state === "failed";
   return (
     <div
       data-repo-node
@@ -483,7 +487,7 @@ function RepoNode({
           : core
             ? "border-accent/50"
             : "border-border hover:border-border-strong",
-        !p.analyzed && "border-dashed opacity-80",
+        failed ? "border-danger/40" : !p.analyzed && "border-dashed opacity-80",
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
     >
@@ -491,6 +495,8 @@ function RepoNode({
         <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
           {p.analyzed ? (
             <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />
+          ) : failed ? (
+            <TriangleAlert size={12} className="text-danger" />
           ) : (
             <Loader2 size={12} className="animate-spin text-ink-faint" />
           )}
@@ -521,6 +527,8 @@ function RepoNode({
           <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
           <NodeSummary profile={p} />
         </>
+      ) : failed ? (
+        <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>
       ) : (
         <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>
       )}

@@ -557,48 +557,56 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
     ];
     let client = Client::connect_session(&program, &read_only, cwd).await?;
     let cwd_s = cwd.to_string_lossy().into_owned();
-    let thread = client.start_thread(&cwd_s).await?;
-    let mut rx = client.subscribe(&thread).await;
     // codex has no thread/start system-prompt field, so prepend it to the turn
     // (exactly as the exec adapter and the engine's first-turn text do).
     let full = format!("{CURATOR_SYSTEM_PROMPT}\n\n{prompt}");
-    let turn = client.start_turn(&thread, &full).await?;
-    client.set_active_turn(&thread, &turn).await;
-    let mut texts: Vec<String> = Vec::new();
-    let mut deltas = String::new();
-    let mut turn_failed = false;
-    let collect = async {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
-                    on_event(AnalysisEvent::Delta(&text));
-                    deltas.push_str(&text);
+    // Run the whole turn inside one scope whose result we capture, so
+    // `client.shutdown()` ALWAYS runs once `connect_session` succeeded — even when
+    // thread/start or turn/start fails. A bare `?` here would return early and
+    // leak the spawned `codex app-server` child + its read-loop.
+    let outcome = async {
+        let thread = client.start_thread(&cwd_s).await?;
+        let mut rx = client.subscribe(&thread).await;
+        let turn = client.start_turn(&thread, &full).await?;
+        client.set_active_turn(&thread, &turn).await;
+        let mut texts: Vec<String> = Vec::new();
+        let mut deltas = String::new();
+        let mut turn_failed = false;
+        let collect = async {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
+                        on_event(AnalysisEvent::Delta(&text));
+                        deltas.push_str(&text);
+                    }
+                    ThreadMsg::Event(ChatEvent::Assistant { texts: t, .. }) => texts.extend(t),
+                    ThreadMsg::Event(ChatEvent::TurnEnd { is_error, .. }) => {
+                        turn_failed = is_error;
+                        break;
+                    }
+                    ThreadMsg::Approval { id, .. } => {
+                        let _ = client.reply_approval(&id, "decline").await;
+                    }
+                    _ => {}
                 }
-                ThreadMsg::Event(ChatEvent::Assistant { texts: t, .. }) => texts.extend(t),
-                ThreadMsg::Event(ChatEvent::TurnEnd { is_error, .. }) => {
-                    turn_failed = is_error;
-                    break;
-                }
-                ThreadMsg::Approval { id, .. } => {
-                    let _ = client.reply_approval(&id, "decline").await;
-                }
-                _ => {}
             }
+        };
+        let completed = tokio::time::timeout(CURATOR_TIMEOUT, collect).await.is_ok();
+        let text = if texts.is_empty() { deltas } else { texts.join("\n") };
+        // A turn that ENDED in error (auth/quota/context), never finished (timeout),
+        // or produced no text at all is a transport failure — surface it as `Err` so
+        // `run_streaming_agent` falls back to exec, instead of feeding empty/partial
+        // text downstream as if the app-server had succeeded.
+        if turn_failed || !completed || text.trim().is_empty() {
+            anyhow::bail!(
+                "codex app-server turn did not produce a usable reply (error={turn_failed}, completed={completed})"
+            );
         }
-    };
-    let completed = tokio::time::timeout(CURATOR_TIMEOUT, collect).await.is_ok();
-    client.shutdown().await;
-    let text = if texts.is_empty() { deltas } else { texts.join("\n") };
-    // A turn that ENDED in error (auth/quota/context), never finished (timeout), or
-    // produced no text at all is a transport failure — surface it as `Err` so
-    // `run_streaming_agent` can fall back to exec, instead of feeding empty/partial
-    // text downstream as if the app-server had succeeded.
-    if turn_failed || !completed || text.trim().is_empty() {
-        anyhow::bail!(
-            "codex app-server turn did not produce a usable reply (error={turn_failed}, completed={completed})"
-        );
+        Ok::<String, anyhow::Error>(text)
     }
-    Ok(text)
+    .await;
+    client.shutdown().await;
+    outcome
 }
 
 /// Exec transport (codex/claude/opencode): spawn a one-shot per-turn child,
