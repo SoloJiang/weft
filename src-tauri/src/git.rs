@@ -420,7 +420,20 @@ pub fn add_worktree_synced(
     git(repo, &["worktree", "prune"]).ok();
     let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &resolved]);
     if res.is_err() {
-        // Branch likely already exists: check it out into a new worktree dir.
+        // Branch likely already exists (the name appeared after weft chose it). For an
+        // EXPLICIT base, verify the pre-existing branch actually descends from the
+        // requested base before reusing it — otherwise the lane would be recorded as
+        // based on `resolved` while its worktree sits on a branch forked elsewhere.
+        if require_resolvable
+            && !resolved.is_empty()
+            && git(repo, &["merge-base", "--is-ancestor", &resolved, branch]).is_err()
+        {
+            bail!(
+                "branch {branch:?} already exists but is not based on {resolved:?}; \
+                 refusing to record a mismatched base"
+            );
+        }
+        // Check the existing branch out into a new worktree dir.
         git(repo, &["worktree", "add", &path_str, branch])
             .context("worktree add (existing branch)")?;
         return Ok(WorktreeAdd {
@@ -1540,6 +1553,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wt_b);
         let _ = std::fs::remove_dir_all(&wt_c);
         let _ = std::fs::remove_dir_all(&wt_d);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_existing_branch_not_from_explicit_base() {
+        // The `-b` fallback (branch name already exists) must, for an EXPLICIT base, only
+        // reuse the branch if it actually descends from that base — else the lane would
+        // record a base its worktree wasn't forked from.
+        let repo = tmp("aws-mismatch");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        git(&repo, &["checkout", "-q", "-b", "release"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "release work"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+
+        // (A) An existing branch based on MAIN, not the explicit base "release" → reject.
+        git(&repo, &["branch", "feat/x", &main]).unwrap();
+        let wt_a = tmp("aws-mismatch-a");
+        assert!(
+            add_worktree_synced(&repo, "feat/x", &wt_a, "release", true).is_err(),
+            "existing branch not based on the explicit base must be rejected"
+        );
+
+        // (B) An existing branch based on "release" → reused.
+        git(&repo, &["branch", "feat/y", "release"]).unwrap();
+        let wt_b = tmp("aws-mismatch-b");
+        assert!(
+            add_worktree_synced(&repo, "feat/y", &wt_b, "release", true).is_ok(),
+            "existing branch based on the explicit base is reused"
+        );
+
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
     }
 
     #[test]
