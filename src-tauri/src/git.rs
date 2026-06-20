@@ -104,19 +104,33 @@ pub fn default_target_branch(worktree: &Path, base_ref: &str) -> String {
     }
 }
 
-/// Resolve the ref to compare a target branch against: prefer the (freshly
-/// fetched) remote `origin/<target>`, else a local `<target>`, else fall back
-/// through the repo's default-branch chain (origin/HEAD → main → master → HEAD).
+/// Resolve the ref to compare a target branch against: prefer the remote
+/// `origin/<target>` ONLY when it already contains the local `<target>` (origin is
+/// fresh / ahead-or-equal). When a local `<target>` is AHEAD of a stale origin — the
+/// worktree was branched off local after an offline materialize — prefer the LOCAL
+/// branch, so the diff doesn't fold local's lead over a stale origin into the change
+/// set. Else fall back through the default-branch chain (origin/HEAD → main → master
+/// → HEAD).
 fn resolve_target_ref(worktree: &Path, target: &str) -> String {
     let t = normalize_target(target);
     // "HEAD" is not a real target branch (see default_target_branch); falling
     // through to the default chain avoids merge-base(HEAD, HEAD) hiding commits.
     if !t.is_empty() && t != "HEAD" {
         let remote = format!("origin/{t}");
-        if ref_resolves(worktree, &remote) {
+        let remote_ok = ref_resolves(worktree, &remote);
+        let local_ok = ref_resolves(worktree, &t);
+        if remote_ok && local_ok {
+            // Trust origin only when it already contains local (ahead-or-equal). If
+            // local is ahead of a stale origin, the worktree was based on local, so
+            // compare against local.
+            let origin_has_local =
+                git(worktree, &["merge-base", "--is-ancestor", &t, &remote]).is_ok();
+            return if origin_has_local { remote } else { t };
+        }
+        if remote_ok {
             return remote;
         }
-        if ref_resolves(worktree, &t) {
+        if local_ok {
             return t;
         }
     }
@@ -359,20 +373,21 @@ pub fn add_worktree_synced(
         bail!("base branch {base_name:?} not found locally or on origin (after fetch)");
     }
     if worktree_path.exists() {
-        // Validate the existing path is genuinely a git worktree checked out on
-        // `branch` before reusing it. A stale plain directory, or a checkout for a
-        // DIFFERENT branch, left under .worktrees/weft would otherwise be recorded and
-        // handed to the worker (dispatch only checks the dir exists), so the agent would
-        // run in the wrong tree. Gate on the worktree's OWN `.git` (a plain dir has
-        // none, and this stops rev-parse from walking up to the parent repo) plus a
-        // matching HEAD branch; refuse otherwise so the problem surfaces.
-        let is_worktree = worktree_path.join(".git").exists();
-        let on_branch = git(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .map(|h| h == branch)
-            .unwrap_or(false);
-        if !(is_worktree && on_branch) {
+        // Validate the existing path is a worktree REGISTERED TO THIS REPO on `branch`
+        // before reusing it. Checking only for a `.git` + a matching HEAD name is not
+        // enough: a stale plain dir, a checkout for a DIFFERENT branch, OR a checkout
+        // belonging to a DIFFERENT repository could sit at this deterministic path and
+        // be silently recorded + handed to the worker (dispatch only checks the dir
+        // exists), running the agent in the wrong tree/repo. `list_worktrees` reads
+        // THIS repo's own worktree registry, so anything not registered here is refused.
+        let want = std::fs::canonicalize(worktree_path).ok();
+        let registered = list_worktrees(repo)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|(p, b)| b == branch && std::fs::canonicalize(&p).ok() == want);
+        if !registered {
             bail!(
-                "worktree path {} exists but is not a clean checkout of {branch:?}",
+                "worktree path {} exists but is not a worktree of this repo on {branch:?}",
                 worktree_path.display()
             );
         }
@@ -1408,6 +1423,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_target_ref_prefers_local_over_stale_origin_but_fresh_origin_over_local() {
+        let origin = tmp("rtr-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d0"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        // (1) LOCAL develop AHEAD of a stale origin/develop → prefer LOCAL (the worktree
+        // was branched off local after an offline materialize).
+        let c1 = tmp("rtr-c1");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &c1.to_string_lossy()]).unwrap();
+        git(&c1, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
+        git(&c1, &["commit", "-q", "--allow-empty", "-m", "local-ahead"]).unwrap();
+        git(&c1, &["checkout", "-q", &main]).unwrap();
+        assert_eq!(
+            resolve_target_ref(&c1, "develop"),
+            "develop",
+            "local ahead of a stale origin → prefer local"
+        );
+
+        // (2) LOCAL develop is an ANCESTOR of a fresh origin/develop → prefer ORIGIN.
+        git(&origin, &["checkout", "-q", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d1"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        let c2 = tmp("rtr-c2");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &c2.to_string_lossy()]).unwrap();
+        git(&c2, &["branch", "develop", "origin/develop~1"]).unwrap(); // local = d0 (behind)
+        assert_eq!(
+            resolve_target_ref(&c2, "develop"),
+            "origin/develop",
+            "local ancestor of fresh origin → prefer origin"
+        );
+
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&c1);
+        let _ = std::fs::remove_dir_all(&c2);
+    }
+
+    #[test]
     fn add_worktree_synced_rejects_invalid_existing_path() {
         // The path-exists reuse must validate the path is a clean worktree for `branch`,
         // not blindly hand a stale/plain dir or a different-branch checkout to the worker.
@@ -1439,12 +1494,27 @@ mod tests {
             .expect("reusing a valid worktree on the same branch must succeed");
         assert!(!reuse.created_checkout, "reuse reports created_checkout=false");
 
+        // (D) A worktree belonging to a DIFFERENT repo at the path, same branch name →
+        // rejected (it is not registered in THIS repo's worktree list).
+        let repo2 = tmp("aws-invalid-repo2");
+        init_repo(&repo2).unwrap();
+        let base2 = current_branch(&repo2).unwrap();
+        let wt_d = tmp("aws-invalid-foreign");
+        add_worktree_synced(&repo2, "feat/d", &wt_d, &base2, false).unwrap();
+        assert!(
+            add_worktree_synced(&repo, "feat/d", &wt_d, &base, false).is_err(),
+            "a worktree belonging to a DIFFERENT repo must be rejected"
+        );
+
         let _ = remove_worktree(&repo, &wt_b);
         let _ = remove_worktree(&repo, &wt_c);
+        let _ = remove_worktree(&repo2, &wt_d);
         let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo2);
         let _ = std::fs::remove_dir_all(&wt_a);
         let _ = std::fs::remove_dir_all(&wt_b);
         let _ = std::fs::remove_dir_all(&wt_c);
+        let _ = std::fs::remove_dir_all(&wt_d);
     }
 
     #[test]
