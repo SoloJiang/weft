@@ -871,7 +871,11 @@ pub async fn clear_failed_states(db: &Db, workspace_id: i32) {
         return;
     };
     for r in repos {
-        if run_phase(r.id) == "failed" {
+        // Only clear a failure we can ACTUALLY retry: `analyze_workspace` filters
+        // out missing checkouts before `profile_repo_agent`, so clearing a
+        // gone-checkout repo here would drop it to idle with no error (its cwd-guard
+        // never re-marks it). Keep that failed state; an existing checkout re-runs.
+        if run_phase(r.id) == "failed" && Path::new(&r.local_git_path).exists() {
             run_finish_ok(r.id);
         }
     }
@@ -1385,18 +1389,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_failed_states_clears_only_failed() {
-        // An explicit "Analyze deps" clears failed repos so the background
-        // anti-storm skip doesn't suppress the retry; a running repo is untouched.
+    async fn clear_failed_states_only_clears_retryable() {
+        // An explicit "Analyze deps" clears failed repos so the background anti-storm
+        // skip doesn't suppress the retry — but ONLY those with a live checkout: a
+        // failed repo whose checkout is gone would be filtered out of the pass and
+        // silently go idle, so it keeps its failed state. A running repo is untouched.
         super::run_state_clear_all_for_test();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let a = repo::add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "").await.unwrap();
-        let b = repo::add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "").await.unwrap();
+        // Distinct paths (repos dedup by path). Only the to-be-cleared repo needs a
+        // live checkout; `b` is running so its path-existence is never checked.
+        let here = std::env::temp_dir().to_string_lossy().into_owned(); // an existing dir
+        let a = repo::add_repo_ref(&db, ws.id, "a", &here, "main", "").await.unwrap();
+        let gone = repo::add_repo_ref(&db, ws.id, "gone", "/nonexistent/weft/zzz", "main", "")
+            .await
+            .unwrap();
+        let b = repo::add_repo_ref(&db, ws.id, "b", "/nonexistent/weft/brun", "main", "")
+            .await
+            .unwrap();
         super::run_finish_err(a.id, "boom".into());
+        super::run_finish_err(gone.id, "boom".into());
         super::run_begin(b.id);
         super::clear_failed_states(&db, ws.id).await;
-        assert_eq!(super::run_phase(a.id), "idle", "failed → cleared, eligible for retry");
+        assert_eq!(super::run_phase(a.id), "idle", "failed + live checkout → cleared, retryable");
+        assert_eq!(super::run_phase(gone.id), "failed", "failed + missing checkout → kept");
         assert_eq!(super::run_phase(b.id), "running", "a running repo is left alone");
     }
 

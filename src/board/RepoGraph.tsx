@@ -60,7 +60,10 @@ const bandOf = (tier: string): Band =>
 type AnalysisView = "running" | "failed" | "analyzed" | "pending";
 
 function analysisView(p: RepoProfile, phase?: string): AnalysisView {
-  if (phase === "running") return "running";
+  // `phase` is the detail pane's live stream; `analysis_state` is the persisted
+  // run-state (a graph refresh on start sets it "running"). EITHER means running —
+  // so a card reprofiled while already classified shows running, not stale tier.
+  if (phase === "running" || p.analysis_state === "running") return "running";
   if (p.analysis_state === "failed") return "failed";
   if (p.analyzed) return "analyzed";
   return "pending";
