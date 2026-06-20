@@ -293,6 +293,12 @@ pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String, bool, b
                 if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(path)) {
                     eprintln!("[weft] worktree remove failed for {path}: {e}");
                 }
+            } else {
+                // A reused (non-weft) checkout: keep the directory + contents, but
+                // UNregister it so the orphan-worktree GC — which reclaims registered,
+                // no-longer-DB-tracked worktrees under weft's root — can't sweep it after
+                // the TTL once this row is dropped.
+                let _ = git::unregister_worktree(repo_path, std::path::Path::new(path));
             }
             if *created_branch {
                 if let Err(e) = git::delete_branch(repo_path, branch) {
@@ -328,6 +334,10 @@ pub async fn rollback_direction(db: &Db, direction_id: i32) -> Result<()> {
                 if let Err(e) = git::remove_worktree(repo_path, std::path::Path::new(&w.path)) {
                     eprintln!("[weft] rollback worktree remove failed for {}: {e}", w.path);
                 }
+            } else {
+                // Reused (non-weft) checkout: keep it, but UNregister it so the orphan GC
+                // can't sweep it after the row is deleted below (see cleanup_worktrees).
+                let _ = git::unregister_worktree(repo_path, std::path::Path::new(&w.path));
             }
             // Only delete the branch if WE created it. A pre-existing branch reused
             // by the fallback path must survive rollback (the user's own branch).
@@ -1371,6 +1381,54 @@ mod tests {
 
     /// R18-2b: cleanup_worktrees must NOT remove a checkout directory when
     /// `created_checkout=false`. Mirrors the rollback test but via the cascade path.
+    #[tokio::test]
+    async fn cleanup_unregisters_reused_checkout_so_gc_cant_sweep_it() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-cleanup-unreg-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let base = crate::git::current_branch(&repo_path).unwrap();
+        // A REAL registered worktree, treated below as a reused (created_checkout=false)
+        // checkout with user content.
+        let wt = root.join("reused-wt");
+        crate::git::add_worktree_synced(&repo_path, "feat/reused", &wt, &base, false).unwrap();
+        std::fs::write(wt.join("user.txt"), "user content\n").unwrap();
+        assert!(
+            crate::git::list_worktrees(&repo_path).unwrap().iter().any(|(_, b)| b == "feat/reused"),
+            "registered before cleanup"
+        );
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &base, "")
+            .await.unwrap();
+
+        // Cascade cleanup of a reused (created_checkout=false, created_branch=false) entry.
+        let removed = vec![(r.id, wt.to_string_lossy().to_string(), "feat/reused".to_string(), false, false)];
+        cleanup_worktrees(&db, &removed).await.unwrap();
+
+        // Dir + contents survive...
+        assert!(wt.join("user.txt").exists(), "reused checkout contents preserved");
+        // ...but it is UNregistered, so the orphan-worktree GC (registered + untracked)
+        // can't reclaim it after the row is gone.
+        assert!(
+            !crate::git::list_worktrees(&repo_path).unwrap().iter().any(|(_, b)| b == "feat/reused"),
+            "reused checkout unregistered so the orphan GC can't sweep it"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn cleanup_worktrees_preserves_reused_checkout() {
         use crate::store::repo;

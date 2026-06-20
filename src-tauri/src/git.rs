@@ -478,6 +478,18 @@ pub fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Stop tracking `worktree_path` as a git worktree of `repo` WITHOUT deleting the
+/// directory or its contents: drop the worktree's `.git` gitdir-pointer file (leaving a
+/// plain directory) and prune the now-stale admin entry. Used to DURABLY preserve a
+/// reused (non-weft-created) checkout — `gc::sweep_orphan_worktrees` reclaims REGISTERED
+/// worktrees under weft's root that are no longer DB-tracked, so unregistering keeps the
+/// preserved checkout from being swept after the TTL once its row is dropped.
+pub fn unregister_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
+    std::fs::remove_file(worktree_path.join(".git")).ok();
+    git(repo, &["worktree", "prune"]).ok();
+    Ok(())
+}
+
 /// Delete a (weft-namespaced) branch from `repo`, ignoring "not found".
 pub fn delete_branch(repo: &Path, branch: &str) -> Result<()> {
     // -D force-deletes; weft worktree branches are throwaway WIP and the caller
