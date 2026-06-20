@@ -286,6 +286,12 @@ function BaseBranchField({
   const { t } = useTranslation();
   const [val, setVal] = useState(value ?? "");
   const lastLoaded = useRef(value ?? "");
+  // Always the LATEST persisted base. A rejected save's handler must revert to this, not
+  // the stale `value` its render captured: a same-identity re-propose can change the base
+  // while an older save is in flight, and reverting to the old closure value would put a
+  // stale base back into the field (which a later Create/Approve blur would then save).
+  const valueRef = useRef(value);
+  valueRef.current = value;
   const lastIdentity = useRef(`${name}\0${repo}`);
   useEffect(() => {
     const identity = `${name}\0${repo}`;
@@ -323,11 +329,12 @@ function BaseBranchField({
         }
       })
       .catch(() => {
-        // Save failed — revert the field to the persisted value so the UI doesn't show
-        // an unsaved base that confirm/approve would ignore. Only when this row still
-        // shows the same lane (see savedIdentity) — else we'd overwrite the new lane.
+        // Save failed — revert the field to the LATEST persisted value (valueRef, not the
+        // stale closure `value`) so a same-identity re-propose's fresh base isn't replaced
+        // by this old save's stale one. Only when this row still shows the same lane (see
+        // savedIdentity) — else we'd overwrite a different lane.
         if (lastIdentity.current === savedIdentity) {
-          setVal(value ?? "");
+          setVal(valueRef.current ?? "");
         }
       });
   };
