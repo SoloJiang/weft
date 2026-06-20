@@ -446,6 +446,29 @@ pub async fn upsert_plan(
     Ok(a.save(&db.0).await?.try_into_model()?)
 }
 
+/// Compare-and-swap the stored proposal: write `new_proposal` + `status` ONLY if the
+/// row's current proposal still equals `expected` (no re-propose landed since the caller
+/// read it). Returns true when applied, false when the proposal changed (or the plan is
+/// gone) — so a targeted base/decision edit rejects rather than clobbering a fresh
+/// re-propose with a stale full proposal. `created_at` is intentionally left untouched.
+pub async fn update_plan_proposal_cas(
+    db: &Db,
+    thread_id: i32,
+    new_proposal: &str,
+    expected: &str,
+    status: &str,
+) -> Result<bool> {
+    use sea_orm::sea_query::Expr;
+    let res = plan::Entity::update_many()
+        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
+        .col_expr(plan::Column::Status, Expr::value(status.to_string()))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected))
+        .exec(&db.0)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
 pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profile::Model>> {
     Ok(repo_profile::Entity::find()
         .filter(repo_profile::Column::RepoId.eq(repo_id))
@@ -1570,6 +1593,32 @@ mod tests {
     }
 
     /// R15-1: delete_repo_cascade must carry created_branch in its 4-tuple so
+    #[tokio::test]
+    async fn update_plan_proposal_cas_rejects_a_stale_write() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        upsert_plan(&db, t.id, "P1", "proposed", "t0").await.unwrap();
+        let plan_a = get_plan(&db, t.id).await.unwrap().unwrap(); // read v1 (proposal == "P1")
+        // A re-propose lands AFTER the read but before the CAS write.
+        upsert_plan(&db, t.id, "P2", "proposed", "t0").await.unwrap();
+        // A CAS expecting the STALE P1 must NOT apply (the live proposal is P2).
+        assert!(
+            !update_plan_proposal_cas(&db, t.id, "P3", &plan_a.proposal, "proposed").await.unwrap(),
+            "CAS must reject a write whose expected proposal is stale"
+        );
+        assert_eq!(
+            get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P2",
+            "the stale write left the fresh re-propose intact"
+        );
+        // A CAS expecting the CURRENT P2 applies.
+        assert!(
+            update_plan_proposal_cas(&db, t.id, "P3", "P2", "proposed").await.unwrap(),
+            "CAS applies when expected matches the live proposal"
+        );
+        assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P3");
+    }
+
     /// the caller can gate branch deletion. A worktree row with created_branch=false
     #[tokio::test]
     async fn worktree_created_branch_defaults_to_true_when_unset() {

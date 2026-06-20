@@ -490,7 +490,15 @@ async fn persist_decision(
     plan: &crate::store::entities::plan::Model,
 ) -> Result<()> {
     let json = serde_json::to_string(proposal)?;
-    repo::upsert_plan(db, thread_id, &json, &plan.status, &plan.created_at).await?;
+    // CAS on the proposal we read (`plan.proposal`): if a lead re-proposal landed between
+    // our read and this write, the stored proposal no longer matches, and we reject rather
+    // than clobbering the fresh re-propose with our stale full proposal (the frontend's
+    // base-save latch then aborts confirm/approve/deny and refreshes).
+    let applied =
+        repo::update_plan_proposal_cas(db, thread_id, &json, &plan.proposal, &plan.status).await?;
+    if !applied {
+        anyhow::bail!("proposal changed (re-proposed) before the edit was written; not applied");
+    }
     Ok(())
 }
 
