@@ -10,6 +10,7 @@
 //! 调用风格也从 `client.im.v1.message.create(req, None)` 改为「请求构建器 + `.execute*(body)`」。
 //! `app_type` 默认即 `SelfBuild`（openlark_core `AppType` 的 `#[default]`），故无需显式设置。
 
+pub mod registration;
 pub mod streaming;
 pub mod ws;
 
