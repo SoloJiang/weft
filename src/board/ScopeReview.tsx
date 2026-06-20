@@ -281,7 +281,7 @@ function BaseBranchField({
   repo: string;
   value: string;
   disabled: boolean;
-  onSave: (index: number, name: string, repo: string, base: string) => Promise<void>;
+  onSave: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
   const [val, setVal] = useState(value ?? "");
@@ -312,7 +312,11 @@ function BaseBranchField({
     // not touch the input or load-tracking once that's happened, or they'd clobber the
     // new lane's freshly-reset state with this (old) lane's value.
     const savedIdentity = `${name} ${repo}`;
-    void onSave(index, name, repo, next)
+    // The persisted base this field was editing FROM. The backend rejects the save if a
+    // same-identity (same name+repo) re-propose changed the lane's base meanwhile —
+    // optimistic concurrency the name/repo + CAS guards can't catch on their own.
+    const expectedOldBase = value ?? "";
+    void onSave(index, name, repo, next, expectedOldBase)
       .then(() => {
         if (lastIdentity.current === savedIdentity) {
           lastLoaded.current = next; // mark loaded only after the save actually lands

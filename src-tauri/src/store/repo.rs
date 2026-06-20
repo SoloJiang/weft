@@ -447,10 +447,12 @@ pub async fn upsert_plan(
 }
 
 /// Compare-and-swap the stored proposal: write `new_proposal` + `status` ONLY if the
-/// row's current proposal still equals `expected` (no re-propose landed since the caller
-/// read it). Returns true when applied, false when the proposal changed (or the plan is
-/// gone) — so a targeted base/decision edit rejects rather than clobbering a fresh
-/// re-propose with a stale full proposal. `created_at` is intentionally left untouched.
+/// row's current proposal still equals `expected` AND its current status still equals
+/// `status` (no re-propose AND no confirm landed since the caller read it). Returns true
+/// when applied, false when the proposal OR status changed (or the plan is gone) — so a
+/// targeted base/decision edit rejects rather than clobbering a fresh re-propose with a
+/// stale full proposal, OR reopening a just-confirmed plan back to "proposed".
+/// `created_at` is intentionally left untouched.
 pub async fn update_plan_proposal_cas(
     db: &Db,
     thread_id: i32,
@@ -464,6 +466,13 @@ pub async fn update_plan_proposal_cas(
         .col_expr(plan::Column::Status, Expr::value(status.to_string()))
         .filter(plan::Column::ThreadId.eq(thread_id))
         .filter(plan::Column::Proposal.eq(expected))
+        // Pin status too: a targeted edit reads the plan at one status; if `confirm`
+        // flips that SAME proposal JSON to "confirmed" before this CAS runs, the
+        // proposal predicate still matches and the SET would write the stale status
+        // back, reopening a materialized plan. Predicating on the read status makes
+        // a drifted row match 0 rows (rejecting the edit) while an in-status edit is
+        // a no-op on the status column (SET writes the same value).
+        .filter(plan::Column::Status.eq(status))
         .exec(&db.0)
         .await?;
     Ok(res.rows_affected > 0)
@@ -1617,6 +1626,37 @@ mod tests {
             "CAS applies when expected matches the live proposal"
         );
         assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P3");
+    }
+
+    /// R32-3: the CAS predicate must also pin `status`. A targeted base/decision edit
+    /// reads a "proposed" plan; if `confirm` flips that SAME proposal JSON to
+    /// "confirmed" before the CAS runs, the proposal still matches — but writing the
+    /// stale "proposed" status back would reopen an already-materialized plan. The
+    /// status guard makes the CAS reject (0 rows) when status drifted.
+    #[tokio::test]
+    async fn update_plan_proposal_cas_preserves_confirmed_status() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        upsert_plan(&db, t.id, "P1", "proposed", "t0").await.unwrap();
+        // The edit read the plan while it was "proposed" (expected status = "proposed").
+        // Meanwhile confirm marked the SAME proposal JSON "confirmed".
+        upsert_plan(&db, t.id, "P1", "confirmed", "t0").await.unwrap();
+        // A CAS whose expected proposal matches the live row but whose status differs
+        // (live="confirmed", call passes "proposed") must NOT apply.
+        assert!(
+            !update_plan_proposal_cas(&db, t.id, "P2", "P1", "proposed").await.unwrap(),
+            "CAS must reject when the live status drifted away from the expected status"
+        );
+        let after = get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.proposal, "P1", "stale-status write must not touch the proposal");
+        assert_eq!(after.status, "confirmed", "the confirmed status must survive the rejected edit");
+        // A CAS that agrees on BOTH proposal and the live status applies.
+        assert!(
+            update_plan_proposal_cas(&db, t.id, "P2", "P1", "confirmed").await.unwrap(),
+            "CAS applies when both proposal and status match the live row"
+        );
+        assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P2");
     }
 
     /// the caller can gate branch deletion. A worktree row with created_branch=false
