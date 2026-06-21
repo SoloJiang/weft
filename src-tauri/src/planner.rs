@@ -191,11 +191,16 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
     Ok(())
 }
 
-/// The stored proposal for a thread, resolved against its workspace repos.
-pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProposal>> {
-    let Some(p) = repo::get_plan(db, thread_id).await? else {
-        return Ok(None);
-    };
+/// Resolve a plan ROW (already read) against its workspace repos. Derives the
+/// resolved proposal from exactly the row passed in — so a caller that needs the
+/// resolved form AND a compare-and-swap baseline from the SAME snapshot (confirm)
+/// can read the plan once and feed it here, instead of reading the row twice with
+/// a re-propose racing in between.
+async fn resolved_from_plan(
+    db: &Db,
+    thread_id: i32,
+    p: &crate::store::entities::plan::Model,
+) -> Result<ResolvedProposal> {
     let proposal: Proposal = serde_json::from_str(&p.proposal).unwrap_or_default();
     let repos = workspace_repos(db, thread_id).await?;
     let directions = proposal
@@ -203,12 +208,20 @@ pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProp
         .iter()
         .map(|d| resolve(d, &repos))
         .collect();
-    Ok(Some(ResolvedProposal {
+    Ok(ResolvedProposal {
         thread_id,
         rationale: proposal.rationale,
-        status: p.status,
+        status: p.status.clone(),
         directions,
-    }))
+    })
+}
+
+/// The stored proposal for a thread, resolved against its workspace repos.
+pub async fn get_resolved(db: &Db, thread_id: i32) -> Result<Option<ResolvedProposal>> {
+    let Some(p) = repo::get_plan(db, thread_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(resolved_from_plan(db, thread_id, &p).await?))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -232,17 +245,15 @@ pub struct ResolvedProposal {
 /// existing direction ids are returned without re-creating anything (covers the
 /// dispatch-retry case where the frontend calls confirm again to redispatch workers).
 pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
-    let resolved = get_resolved(db, thread_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
-    // R42-4: capture the exact plan confirm is acting on, for a compare-and-swap at the final
-    // write. If the lead re-proposes during the (long) materialize loop below, the final CAS
-    // rejects rather than marking the FRESH proposal "confirmed" with THIS call's now-superseded
-    // directions (which would then dispatch while the new proposal's lanes never materialize).
-    // Adjacent to the get_resolved read above, so it reflects the same proposal.
+    // R44-2 / R42-4: read the plan ROW exactly ONCE and derive BOTH the resolved proposal we act
+    // on AND the compare-and-swap baseline (start_plan.proposal / .status) from that single
+    // snapshot. Reading get_resolved then a SEPARATE get_plan let a re-propose land between them —
+    // leaving `resolved` on the OLD proposal while the CAS guarded the NEW one, so confirm would
+    // materialize superseded lanes yet mark the fresh proposal confirmed. One row = one truth.
     let start_plan = repo::get_plan(db, thread_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("plan vanished for thread {thread_id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
+    let resolved = resolved_from_plan(db, thread_id, &start_plan).await?;
     // Idempotent fast-path: the plan was already fully confirmed in a prior call.
     // Return ONLY the ids belonging to lanes that confirm itself creates/dispatches:
     // - known repo, AND
@@ -285,6 +296,12 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // failure because they existed (and may be running) before this confirm call.
     let mut dispatch_ids: Vec<i32> = Vec::new();
     let mut created_now: Vec<i32> = Vec::new();
+    // R44-1: reused lanes whose worktree we must (re)materialize, DEFERRED until after the final
+    // CAS commits. Recreating a reclaimed reused checkout INSIDE the loop would survive a later
+    // lane failure or a CAS rejection (rollback_created only undoes created_now, never reused
+    // lanes) — silently undoing the user's reclaim for a confirm that never applied. So we record
+    // the ids here and only touch disk once the confirm is committed.
+    let mut reused_to_materialize: Vec<i32> = Vec::new();
     // Claim each existing direction at most once. An already-approved/denied lane (handled
     // via per-card approve/deny, skipped below) still OWNS its direction in existing_dirs;
     // without claiming it, a same-name+repo PENDING sibling's reuse `.find` would match and
@@ -341,14 +358,11 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 rollback_created(db, &created_now).await;
                 return Err(err);
             }
-            // Re-materialize in case the worktree dir was reclaimed (exists=false):
-            // materialize_direction is idempotent when the dir already exists, so
-            // calling it here is always safe. Mirror what the normal (non-reuse) path
-            // already does below.
-            if let Err(err) = materialize::materialize_direction(db, ex_id).await {
-                rollback_created(db, &created_now).await;
-                return Err(err);
-            }
+            // R44-1: DEFER the reuse re-materialize until after the final CAS. A reclaimed
+            // reused worktree dir is only recreated once the confirm is committed — never inside
+            // the loop, where a later failure or a CAS rejection would leave it recreated for a
+            // confirm that bailed (rollback_created only undoes created_now, not reused lanes).
+            reused_to_materialize.push(ex_id);
             dispatch_ids.push(ex_id);
             continue;
         }
@@ -380,12 +394,22 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         created_now.push(dir.id);
         dispatch_ids.push(dir.id);
     }
+    // Test-only seam: let a test land a re-propose in the window between our snapshot read and the
+    // CAS, deterministically driving the CAS rejection below (mirrors approve_persist_gate).
+    #[cfg(test)]
+    tests::confirm_cas_gate(db, thread_id).await;
     if !repo::mark_plan_confirmed_cas(db, thread_id, &start_plan.proposal, &start_plan.status).await? {
         // The lead re-proposed (or a concurrent confirm landed) between our start read and here —
         // the directions we created belong to the SUPERSEDED proposal. Roll them back so the new
         // proposal isn't marked confirmed with our stale lanes (which would then be dispatched).
         rollback_created(db, &created_now).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
+    }
+    // R44-1: the confirm is now committed (CAS passed) — only NOW recreate any reclaimed reused
+    // worktrees. A rejected CAS bailed above (after rollback_created) and never reaches here, so a
+    // reused lane's reclaimed dir is recreated exactly once the confirm actually applied.
+    for id in &reused_to_materialize {
+        materialize::materialize_direction(db, *id).await?;
     }
     Ok(dispatch_ids)
 }
@@ -431,9 +455,30 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         );
     }
     let dirs = repo::list_directions(db, thread_id).await?;
+    // R44-3: claim directions owned by OTHER already-approved/denied lanes so approving a
+    // duplicate-name+repo sibling doesn't reuse one of THEIRS. Without this, when two pending
+    // lanes share name+repo and one sibling is already approved (owning its direction), approving
+    // the other matches that sibling's direction by name+repo ALONE — marking this lane approved
+    // but returning the SIBLING's id, so this lane's sub-task is never created. Mirrors confirm's
+    // consumed-set pre-pass.
+    let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for (j, pj) in proposal.directions.iter().enumerate() {
+        if j == index {
+            continue;
+        }
+        if pj.decision == "approved" || pj.decision == "denied" {
+            let rj = resolve(pj, &repos);
+            if let Some(d) = dirs
+                .iter()
+                .find(|d| d.name == rj.name && d.repo_id == rj.repo.repo_id && !consumed.contains(&d.id))
+            {
+                consumed.insert(d.id);
+            }
+        }
+    }
     if let Some(existing) = dirs
         .iter()
-        .find(|d| d.name == resolved.name && d.repo_id == resolved.repo.repo_id)
+        .find(|d| d.name == resolved.name && d.repo_id == resolved.repo.repo_id && !consumed.contains(&d.id))
     {
         // The existing direction's worktree is already branched off its stored base;
         // a re-proposal that changes the base can't silently re-base a live (possibly
@@ -669,6 +714,43 @@ mod tests {
         if let Some((json, status)) = armed {
             // Replace the stored plan unconditionally (NOT a CAS) — this stands in for the
             // racing lead re-propose / confirm that the real CAS must then detect.
+            let created = repo::get_plan(db, thread_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.created_at)
+                .unwrap_or_else(now);
+            let _ = repo::upsert_plan(db, thread_id, &json, &status, &created).await;
+        }
+    }
+
+    /// Per-thread one-shot "race action" the CONFIRM flow fires (via `confirm_cas_gate`)
+    /// between its single plan-snapshot read and its final CAS write. A test arms it with
+    /// `arm_confirm_race(thread, new_proposal_json, new_status)`; when confirm reaches the
+    /// gate it REPLACES the stored plan outright (simulating a lead re-propose landing in
+    /// the window), then disarms — so the subsequent CAS, which expects the snapshot's
+    /// proposal/status, deterministically rejects. Mirrors the approve race seam.
+    fn confirm_race_map() -> &'static std::sync::Mutex<std::collections::HashMap<i32, (String, String)>> {
+        static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, (String, String)>>> =
+            std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn arm_confirm_race(thread_id: i32, new_proposal_json: &str, new_status: &str) {
+        confirm_race_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread_id, (new_proposal_json.to_string(), new_status.to_string()));
+    }
+
+    /// Fired by `confirm` (test build only) just before its CAS. If a race is armed for
+    /// `thread_id`, apply it ONCE (replacing the stored plan) and disarm.
+    pub(super) async fn confirm_cas_gate(db: &Db, thread_id: i32) {
+        let armed = confirm_race_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&thread_id);
+        if let Some((json, status)) = armed {
             let created = repo::get_plan(db, thread_id)
                 .await
                 .ok()
@@ -1414,6 +1496,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// R44-3: approve_direction must not reuse an APPROVED sibling's direction. Two pending lanes
+    /// share name+repo; approving index 0 creates D0. Approving index 1 must create its OWN second
+    /// distinct direction (not return D0) — the consumed-set pre-pass claims the approved sibling's
+    /// D0 so the index-1 lookup finds no unconsumed match and creates D1. Mirrors confirm's
+    /// `confirm_duplicate_name_lane_does_not_reuse_approved_sibling`.
+    #[tokio::test]
+    async fn approve_duplicate_pending_lane_creates_own_direction_when_sibling_approved() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-dupname-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // TWO pending lanes, same name "A" + same repo "api".
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let prop = Proposal { rationale:"r".into(), directions: vec![lane(), lane()] };
+        save_proposal(&db, t.id, &prop).await.unwrap();
+
+        // Approve index 0 → creates D0 and marks directions[0].decision="approved".
+        let d0 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Approve index 1 → must create a SECOND, distinct direction (not reuse D0).
+        let d1 = approve_direction(&db, t.id, 1, "codex").await.unwrap();
+        assert_ne!(d1, d0, "R44-3: the duplicate-name pending sibling must get its OWN direction, not D0");
+
+        // Both directions exist; index 1 is now approved in the stored proposal.
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let same: Vec<_> = dirs.iter().filter(|d| d.name == "A" && d.repo_id == ra.id).collect();
+        assert_eq!(same.len(), 2, "R44-3: two distinct same-name directions exist after approving both lanes");
+        assert!(same.iter().any(|d| d.id == d0));
+        assert!(same.iter().any(|d| d.id == d1));
+        let p = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored: Proposal = serde_json::from_str(&p.proposal).unwrap();
+        assert_eq!(stored.directions[1].decision, "approved", "R44-3: lane index 1 is marked approved");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn approve_rejects_base_specific_reproposal_of_legacy_empty_base() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1523,6 +1653,77 @@ mod tests {
         let dirs = repo::list_directions(&db, t.id).await.unwrap();
         assert!(dirs.iter().any(|d| d.id == a_id), "reused lane A must NOT be rolled back");
         assert!(!dirs.iter().any(|d| d.name == "B"), "failed new lane B is rolled back");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R44-1: confirm DEFERS recreating a reused lane's reclaimed worktree until AFTER the final
+    /// CAS commits. A reused direction whose dir was reclaimed; a lead re-propose lands in the CAS
+    /// window so the CAS rejects. The reuse re-materialize MUST NOT have fired — the reclaimed dir
+    /// stays absent (undoing the user's reclaim for a confirm that never applied would be wrong).
+    /// Then the no-race path: a clean confirm DOES recreate the reused dir and dispatches its id.
+    #[tokio::test]
+    async fn confirm_cas_rejection_does_not_recreate_reused_reclaimed_worktree() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-reuse-casleak-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // Approve A via Needs-you → A is materialized (a reusable, pre-existing lane).
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Reclaim A's worktree dir on disk (exists=false).
+        let wts = repo::list_worktrees(&db, Some(a_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row after approve");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: reclaimed worktree dir is gone before re-confirm");
+
+        // Re-propose A (resets its decision to "") so confirm takes the REUSE path for A.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        // Arm a re-propose to land in confirm's CAS window — a DIFFERENT stored proposal (extra
+        // lane) so the snapshot's expected proposal no longer matches and the CAS rejects.
+        let reproposed = Proposal { rationale: "reproposed".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r2".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        arm_confirm_race(t.id, &serde_json::to_string(&reproposed).unwrap(), "proposed");
+
+        // confirm: reuse path defers A's re-materialize; the gate fires the re-propose; CAS rejects.
+        let res = confirm(&db, t.id).await;
+        assert!(res.is_err(), "R44-1: confirm must error when the CAS rejects a stale re-propose");
+        assert!(
+            !wt_path.exists(),
+            "R44-1: a rejected confirm must NOT recreate the reused lane's reclaimed worktree dir"
+        );
+        // The fresh re-propose survives intact (no stale 'confirmed' clobbered onto it).
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "proposed", "R44-1: rejected confirm leaves the racing re-propose unconfirmed");
+
+        // No-race path: re-propose A alone (matches the snapshot) and confirm cleanly → the CAS
+        // passes, so A's reclaimed dir IS recreated and confirm dispatches A's id.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![a_id], "R44-1 no-race: confirm reuses A and dispatches its id");
+        assert!(wt_path.exists(), "R44-1 no-race: a committed confirm DOES recreate the reused dir");
+
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
