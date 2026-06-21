@@ -333,6 +333,16 @@ pub async fn add_repo_ref(
         r.local_git_path == local_git_path
             || (!key.is_empty() && crate::git::git_url_key(&r.remote_url) == key)
     }) {
+        // R42-1: re-adding with a VETTED default (is_default=true) repairs a legacy/stale
+        // marker on the existing row — an upgraded row may still carry base_ref_is_default=false
+        // (or a stale base_ref), which makes later blank-base materialization ignore the known
+        // default and fall through to main/master.
+        if base_ref_is_default && (!dup.base_ref_is_default || dup.base_ref != base_ref) {
+            let mut am: repo_ref::ActiveModel = dup.clone().into();
+            am.base_ref = Set(base_ref.to_string());
+            am.base_ref_is_default = Set(true);
+            return Ok(am.update(&db.0).await?);
+        }
         return Ok(dup.clone());
     }
     let slugs: Vec<String> = existing.into_iter().map(|r| r.slug).collect();
@@ -475,6 +485,29 @@ pub async fn update_plan_proposal_cas(
         // a drifted row match 0 rows (rejecting the edit) while an in-status edit is
         // a no-op on the status column (SET writes the same value).
         .filter(plan::Column::Status.eq(status))
+        .exec(&db.0)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
+/// Mark a thread's plan "confirmed" ONLY if its proposal AND status are still what `confirm`
+/// read at the start — i.e. no re-propose and no concurrent confirm landed in between. Unlike
+/// `update_plan_proposal_cas` (which pins expected==new status), this flips a NON-confirmed
+/// status to "confirmed", so it takes a SEPARATE `expected_status`. Returns true when applied,
+/// false when the proposal OR status drifted (or the plan is gone). Leaves proposal +
+/// created_at untouched.
+pub async fn mark_plan_confirmed_cas(
+    db: &Db,
+    thread_id: i32,
+    expected_proposal: &str,
+    expected_status: &str,
+) -> Result<bool> {
+    use sea_orm::sea_query::Expr;
+    let res = plan::Entity::update_many()
+        .col_expr(plan::Column::Status, Expr::value("confirmed"))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected_proposal))
+        .filter(plan::Column::Status.eq(expected_status))
         .exec(&db.0)
         .await?;
     Ok(res.rows_affected > 0)
@@ -1559,6 +1592,48 @@ mod tests {
         assert_eq!(list_repos(&db, ws.id).await.unwrap().len(), 4);
     }
 
+    /// R42-1: re-adding a repo with a VETTED default (is_default=true + a real base_ref)
+    /// repairs a legacy/stale marker on the existing row, but re-adding without a vetted
+    /// default must NOT clobber an already-true marker or its vetted base_ref.
+    #[tokio::test]
+    async fn add_repo_ref_re_add_repairs_legacy_default_marker() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        // Legacy row: registered before the default was vetted — marker is false and the
+        // base_ref is a stale guess.
+        let legacy = add_repo_ref(&db, ws.id, "web", "/code/web", "stale", "", false)
+            .await
+            .unwrap();
+        assert!(!legacy.base_ref_is_default, "precondition: legacy marker is false");
+        assert_eq!(legacy.base_ref, "stale");
+
+        // Re-add the SAME local path with a vetted default → repairs the row in place
+        // (same id; marker flips true; base_ref updated) — no second row.
+        let repaired = add_repo_ref(&db, ws.id, "web", "/code/web", "develop", "", true)
+            .await
+            .unwrap();
+        assert_eq!(repaired.id, legacy.id, "re-add must repair in place, not insert");
+        assert!(repaired.base_ref_is_default, "vetted default repaired the marker");
+        assert_eq!(repaired.base_ref, "develop", "vetted base_ref was written through");
+        assert_eq!(list_repos(&db, ws.id).await.unwrap().len(), 1, "no duplicate row");
+
+        // Re-add again WITHOUT a vetted default (is_default=false) must NOT clobber the
+        // now-true marker nor the vetted base_ref.
+        let unchanged = add_repo_ref(&db, ws.id, "web", "/code/web", "whatever", "", false)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.id, legacy.id);
+        assert!(
+            unchanged.base_ref_is_default,
+            "a non-vetted re-add must not downgrade an already-true marker"
+        );
+        assert_eq!(
+            unchanged.base_ref, "develop",
+            "a non-vetted re-add must not overwrite the vetted base_ref"
+        );
+    }
+
     #[tokio::test]
     async fn delete_repo_cascade_removes_repo_and_its_deps_only() {
         let db = mem().await;
@@ -1635,6 +1710,44 @@ mod tests {
             "CAS applies when expected matches the live proposal"
         );
         assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P3");
+    }
+
+    #[tokio::test]
+    async fn mark_plan_confirmed_cas_only_applies_when_proposal_and_status_match() {
+        // R42-4: confirm's final write must flip status -> "confirmed" ONLY if the proposal AND
+        // status are still what it read at the start; a re-propose (or concurrent confirm) in
+        // between must reject, so the fresh proposal isn't marked confirmed with stale lanes.
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        upsert_plan(&db, t.id, "P1", "scoped", "t0").await.unwrap();
+        // Stale proposal -> reject.
+        assert!(
+            !mark_plan_confirmed_cas(&db, t.id, "P0", "scoped").await.unwrap(),
+            "must reject when the expected proposal differs (re-proposed)"
+        );
+        // Drifted status -> reject.
+        assert!(
+            !mark_plan_confirmed_cas(&db, t.id, "P1", "proposed").await.unwrap(),
+            "must reject when the expected status differs"
+        );
+        assert_eq!(
+            get_plan(&db, t.id).await.unwrap().unwrap().status, "scoped",
+            "a rejected CAS left the status untouched"
+        );
+        // Matching proposal + status -> applies; status becomes confirmed, proposal untouched.
+        assert!(
+            mark_plan_confirmed_cas(&db, t.id, "P1", "scoped").await.unwrap(),
+            "must apply when proposal+status match"
+        );
+        let p = get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(p.status, "confirmed");
+        assert_eq!(p.proposal, "P1", "proposal left untouched by the status CAS");
+        // Absent plan -> false.
+        assert!(
+            !mark_plan_confirmed_cas(&db, t.id + 999, "P1", "scoped").await.unwrap(),
+            "must be false when the plan is absent"
+        );
     }
 
     /// R32-3: the CAS predicate must also pin `status`. A targeted base/decision edit

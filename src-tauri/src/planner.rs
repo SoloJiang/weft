@@ -235,6 +235,14 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     let resolved = get_resolved(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
+    // R42-4: capture the exact plan confirm is acting on, for a compare-and-swap at the final
+    // write. If the lead re-proposes during the (long) materialize loop below, the final CAS
+    // rejects rather than marking the FRESH proposal "confirmed" with THIS call's now-superseded
+    // directions (which would then dispatch while the new proposal's lanes never materialize).
+    // Adjacent to the get_resolved read above, so it reflects the same proposal.
+    let start_plan = repo::get_plan(db, thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("plan vanished for thread {thread_id}"))?;
     // Idempotent fast-path: the plan was already fully confirmed in a prior call.
     // Return ONLY the ids belonging to lanes that confirm itself creates/dispatches:
     // - known repo, AND
@@ -246,19 +254,24 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // is idempotent when the dir already exists.
     if resolved.status == "confirmed" {
         let all = repo::list_directions(db, thread_id).await?;
-        let matching: Vec<i32> = all
-            .into_iter()
-            .filter(|d| {
-                resolved.directions.iter().any(|p| {
-                    p.repo.known
-                        && p.name == d.name
-                        && p.repo.repo_id == d.repo_id
-                        && p.decision != "approved"
-                        && p.decision != "denied"
-                })
-            })
-            .map(|d| d.id)
-            .collect();
+        let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        // Pre-claim directions owned by approved/denied lanes so a same-name pending sibling
+        // doesn't re-dispatch them.
+        for p in &resolved.directions {
+            if p.repo.known && (p.decision == "approved" || p.decision == "denied") {
+                if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id)) {
+                    consumed.insert(d.id);
+                }
+            }
+        }
+        let mut matching: Vec<i32> = Vec::new();
+        for p in &resolved.directions {
+            if !p.repo.known || p.decision == "approved" || p.decision == "denied" { continue; }
+            if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id)) {
+                consumed.insert(d.id);
+                matching.push(d.id);
+            }
+        }
         for &id in &matching {
             materialize::materialize_direction(db, id).await?;
         }
@@ -367,8 +380,12 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         created_now.push(dir.id);
         dispatch_ids.push(dir.id);
     }
-    if let Some(p) = repo::get_plan(db, thread_id).await? {
-        repo::upsert_plan(db, thread_id, &p.proposal, "confirmed", &p.created_at).await?;
+    if !repo::mark_plan_confirmed_cas(db, thread_id, &start_plan.proposal, &start_plan.status).await? {
+        // The lead re-proposed (or a concurrent confirm landed) between our start read and here —
+        // the directions we created belong to the SUPERSEDED proposal. Roll them back so the new
+        // proposal isn't marked confirmed with our stale lanes (which would then be dispatched).
+        rollback_created(db, &created_now).await;
+        anyhow::bail!("plan changed during confirm (re-proposed); please retry");
     }
     Ok(dispatch_ids)
 }
@@ -1650,6 +1667,60 @@ mod tests {
             "R17-3: confirmed fast-path must return only confirm-created lane B, NOT approved lane A");
         assert!(!retry_ids.contains(&a_id),
             "R17-3: individually-approved lane A must NOT appear in fast-path retry");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R42-2: a confirmed plan with TWO same-name+repo lanes — one approved (owning its
+    /// own direction) and one pending (owning its own) — must, on the idempotent fast-path
+    /// retry, return ONLY the pending lane's direction id. Without consuming directions, the
+    /// `.any(...)` match returned EVERY same-name direction, re-dispatching the approved one.
+    #[tokio::test]
+    async fn confirmed_fast_path_does_not_redispatch_approved_duplicate_sibling() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-dup-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Approve a single `A` lane via approve_direction → creates the APPROVED lane's
+        // direction (a_id).
+        let prop_a = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_a).await.unwrap();
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Re-propose with TWO same-name+repo `A` lanes: one already approved, one pending.
+        // confirm pre-claims the approved lane's a_id (R41-3), so the pending lane creates
+        // its OWN distinct direction (b_id).
+        let prop_dup = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "approved".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_dup).await.unwrap();
+        let confirm_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(confirm_ids.len(), 1, "confirm creates only the pending duplicate lane");
+        let b_id = confirm_ids[0];
+        assert_ne!(b_id, a_id, "the pending lane owns a direction distinct from the approved one");
+
+        // Plan is now "confirmed". The fast-path retry must return ONLY the pending lane's
+        // b_id — NOT the approved a_id (which must not be re-dispatched here).
+        let retry_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(retry_ids.len(), 1, "R42-2: fast-path returns exactly one id (count == 1)");
+        assert_eq!(retry_ids, vec![b_id], "R42-2: fast-path returns only the pending duplicate lane");
+        assert!(!retry_ids.contains(&a_id), "R42-2: the approved duplicate sibling must NOT be re-dispatched");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

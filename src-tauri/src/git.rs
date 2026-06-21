@@ -66,6 +66,10 @@ pub fn is_full_commit_oid(repo: &Path, t: &str) -> bool {
 /// and ref resolution.
 fn normalize_target(target: &str) -> String {
     let t = target.trim();
+    // Strip a refs/heads/ prefix first: the local-branch base is stored QUALIFIED
+    // (refs/heads/<name>) so worktree-add + ancestry use an unambiguous ref, but the
+    // RECORDED branched_from must stay the bare branch name.
+    let t = t.strip_prefix("refs/heads/").unwrap_or(t);
     t.strip_prefix("origin/").unwrap_or(t).to_string()
 }
 
@@ -458,10 +462,12 @@ pub fn add_worktree_synced(
     } else if nonempty && ref_resolves(repo, &format!("refs/heads/{t}")) {
         // A local BRANCH the user already has. Qualified as refs/heads/<t> so a local
         // TAG named `t` is NOT accepted as a base (bare `ref_resolves(t)` is true for a
-        // tag too). The remote-tracking origin/<t> checks stay bare: refs/remotes/origin/
-        // is already the branch namespace, and the branch-namespaced fetch refspec keeps
-        // tags out of it.
-        Some(t.clone())
+        // tag too). Store the QUALIFIED ref (not bare `t`): it's the `worktree add -b … <ref>`
+        // start-point and the ancestry base, so a repo with BOTH a branch and a tag named `t`
+        // resolves unambiguously to the branch instead of failing on an ambiguous short ref.
+        // The remote-tracking origin/<t> checks stay bare: refs/remotes/origin/ is already the
+        // branch namespace, and the branch-namespaced fetch refspec keeps tags out of it.
+        Some(format!("refs/heads/{t}"))
     } else if nonempty && !require_resolvable && ref_resolves(repo, &remote) {
         // A STALE remote-tracking ref (the fetch failed — offline, or the branch was
         // deleted upstream). Trusted only for the lenient default/empty path; an
@@ -1984,6 +1990,40 @@ mod tests {
         let res = add_worktree_synced(&repo, "feat/x", &wt, "release", true);
         assert!(res.is_err(), "a LOCAL tag named like the base must be rejected");
         assert!(!wt.exists(), "no worktree created off the local tag");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_handles_branch_and_tag_same_name() {
+        // R42-3: a LOCAL repo (no origin) with BOTH a branch `develop` AND a tag `develop`
+        // at DIFFERENT commits. The local-branch fallback resolves via refs/heads/develop,
+        // but it must PASS the QUALIFIED ref to `worktree add -b`: a bare `develop` start-point
+        // is ambiguous (branch vs tag) and `worktree add` FAILS. The worktree must fork off
+        // the BRANCH tip, and branched_from must record the bare `develop` (not refs/heads/...).
+        let repo = tmp("aws-branch-and-tag");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // Create branch `develop` with its own distinct tip.
+        git(&repo, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "develop work"]).unwrap();
+        let branch_commit = git(&repo, &["rev-parse", "refs/heads/develop"]).unwrap();
+        // A tag `develop` on a DIFFERENT commit (back on main's initial commit).
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+        let tag_commit = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo, &["tag", "develop"]).unwrap();
+        assert_ne!(branch_commit, tag_commit, "precondition: branch tip differs from the tag commit");
+
+        let wt = tmp("aws-branch-and-tag-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, "develop", true)
+            .expect("a usable refs/heads/develop must be accepted even when a tag shadows it");
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap(),
+            branch_commit,
+            "worktree must fork off the BRANCH develop's tip, not the tag commit"
+        );
+        assert_eq!(add.branched_from, "develop", "branched_from records the bare branch name");
+        let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
     }
