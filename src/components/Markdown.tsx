@@ -1,12 +1,16 @@
-import { memo, type ReactNode } from "react";
+import { memo, useEffect, useState, type ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { codeToHtml } from "shiki";
 import { api } from "../lib/api";
 import { classifyHref, filePathsRehype, isPathLike } from "../lib/fileLinks";
+import { cn } from "../lib/cn";
 import { FilePathRef, InsideRefContext } from "./FilePathRef";
 
 // Script-y schemes are never handed to the DOM href or the OS opener.
 const UNSAFE_HREF = /^\s*(?:javascript|data|vbscript):/i;
+
+const CODE_CHIP = "rounded bg-raised px-1 py-0.5 font-mono text-[11.5px] text-ink";
 
 // react-markdown's default sanitizer blanks any non-web scheme, which would
 // strip both local file paths and legitimate app deep links (ms-settings:,
@@ -18,6 +22,81 @@ const fileAwareUrlTransform: NonNullable<Options["urlTransform"]> = (url, key) =
   if (key !== "href") return defaultUrlTransform(url);
   return UNSAFE_HREF.test(url) ? "" : url;
 };
+
+function parseLanguage(className?: string): string {
+  const match = /language-(\w+)/.exec(String(className ?? ""));
+  return match?.[1] ?? "text";
+}
+
+function currentShikiTheme(): "github-dark" | "github-light" {
+  return document.documentElement.dataset.theme === "light" ? "github-light" : "github-dark";
+}
+
+const htmlCache = new Map<string, string>();
+
+/**
+ * AI SDK Elements-style CodeBlock primitive, self-contained and Weft-skinned.
+ * Highlights fenced code with shiki and preserves the surrounding markdown
+ * link/file-ref semantics.
+ */
+function CodeBlock({
+  code,
+  language,
+  className,
+}: {
+  code: string;
+  language: string;
+  className?: string;
+}) {
+  const [html, setHtml] = useState<string>(() => htmlCache.get(`${language}:${code}`) ?? "");
+
+  useEffect(() => {
+    const key = `${language}:${code}`;
+    const cached = htmlCache.get(key);
+    if (cached) {
+      setHtml(cached);
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      const theme = currentShikiTheme();
+      try {
+        const out = await codeToHtml(code, { lang: language, theme });
+        if (cancelled) return;
+        htmlCache.set(key, out);
+        setHtml(out);
+      } catch {
+        // Unknown language: fall back to plain-text highlighting.
+        const out = await codeToHtml(code, { lang: "text", theme });
+        if (cancelled) return;
+        htmlCache.set(key, out);
+        setHtml(out);
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [code, language]);
+
+  return (
+    <pre
+      className={cn(
+        "overflow-x-auto rounded-[var(--radius-md)] border border-border bg-raised p-3 text-[11.5px]",
+        className,
+      )}
+    >
+      {html ? (
+        <code
+          className="font-mono"
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
+      ) : (
+        <code className="font-mono">{code}</code>
+      )}
+    </pre>
+  );
+}
 
 /**
  * Renders agent output as markdown — headings, lists, code, tables, links —
@@ -66,7 +145,9 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
             // still carries a trailing \n (verified), so only true single-line
             // inline code is eligible to become a file ref — never a fenced block.
             const block = String(className ?? "").includes("language-") || content.includes("\n");
-            if (block) return <code className="font-mono text-[11.5px]">{children}</code>;
+            if (block) {
+              return <CodeBlock code={content} language={parseLanguage(className)} className="my-2" />;
+            }
             if (isPathLike(content, true)) {
               return (
                 <FilePathRef token={content} cwd={cwd} code isUrl={/^file:/i.test(content)}>
@@ -74,11 +155,7 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
                 </FilePathRef>
               );
             }
-            return (
-              <code className="rounded bg-raised px-1 py-0.5 font-mono text-[11.5px] text-ink">
-                {children}
-              </code>
-            );
+            return <code className={CODE_CHIP}>{children}</code>;
           },
           span: ({ node, children }) => {
             const fp = (node as { properties?: Record<string, unknown> } | undefined)?.properties
