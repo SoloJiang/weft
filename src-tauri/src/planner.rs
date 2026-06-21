@@ -511,7 +511,30 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         // user's disk-reclaim for an approval that never applied).
         persist_decision(db, thread_id, &proposal, &plan).await?;
         // Approval committed — now idempotently recreate the worktree if its dir was reclaimed.
-        materialize::materialize_direction(db, id).await?;
+        if let Err(err) = materialize::materialize_direction(db, id).await {
+            // R45-2: the approval is persisted but rematerialization failed (path is now a plain
+            // dir, the branch no longer descends from base, …) — revert the lane to pending so the
+            // Needs card stays retryable (else refreshNeeds drops it with no worker dispatched).
+            // Best-effort CAS against the approved proposal we just wrote; if a re-propose has
+            // since landed the CAS no-ops (the card is superseded anyway).
+            let mut reverted = proposal.clone();
+            if let Some(d) = reverted.directions.get_mut(index) {
+                d.decision = String::new();
+            }
+            if let (Ok(approved_json), Ok(reverted_json)) =
+                (serde_json::to_string(&proposal), serde_json::to_string(&reverted))
+            {
+                let _ = repo::update_plan_proposal_cas(
+                    db,
+                    thread_id,
+                    &reverted_json,
+                    &approved_json,
+                    &plan.status,
+                )
+                .await;
+            }
+            return Err(err);
+        }
         return Ok(id);
     }
     let dir = repo::create_direction(
@@ -1885,6 +1908,70 @@ mod tests {
         let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
         assert_eq!(parsed.directions.len(), 2, "the racing re-propose is left intact");
         assert_eq!(parsed.directions[0].decision, "", "no stale 'approved' written onto the re-propose");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R45-2: the idempotent REUSE approve path CASes the approval BEFORE recreating a
+    /// reclaimed worktree. If that rematerialization then FAILS (the recorded path is now a
+    /// plain dir, the branch no longer descends from base, …), the approval is already
+    /// persisted — so the lane must be REVERTED to pending, else refreshNeeds drops the Needs
+    /// card with no worker dispatched and the user has no retry path. Contrast the no-failure
+    /// path (R17-2 above), which persists "approved" + returns Ok.
+    #[tokio::test]
+    async fn approve_reuse_reverts_decision_when_rematerialize_fails() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-reuse-revert-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // First approve: creates and materializes the direction (decision="approved").
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let dir_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Reclaim the worktree dir, then plant a PLAIN directory at the SAME recorded path so
+        // rematerialize fails deterministically: add_worktree_synced's path-exists check bails
+        // because a plain dir is "not a worktree of this repo on <branch>".
+        let wts = crate::store::repo::list_worktrees(&db, Some(dir_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row after first approve");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join("stray.txt"), b"not a worktree").unwrap();
+        assert!(
+            !crate::git::is_registered_worktree(&repo_p, &wt_path, &wts[0].branch),
+            "precondition: the planted plain dir is NOT a registered worktree"
+        );
+
+        // Re-propose (resets the decision to "") so re-approve takes the idempotent REUSE path.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let res = approve_direction(&db, t.id, 0, "codex").await;
+        assert!(res.is_err(), "R45-2: approve must error when rematerialize fails");
+
+        // The lane must be REVERTED to pending — not left "approved" — so the Needs card stays.
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
+        assert_eq!(
+            parsed.directions[0].decision, "",
+            "R45-2: a failed rematerialize must revert the approval to pending, not leave it 'approved'"
+        );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

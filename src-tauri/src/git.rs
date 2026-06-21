@@ -100,9 +100,13 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
     }
     // Conventional integration branch. Qualify the LOCAL check as `refs/heads/<c>` so a
     // same-named TAG (e.g. a `main` tag in a repo whose real default is `master`) can't
-    // masquerade as the branch; `origin/<c>` is already branch-namespaced.
+    // masquerade as the branch; qualify the REMOTE check as `refs/remotes/origin/<c>` so a
+    // local branch literally named `origin/<c>` (refs/heads/origin/<c>) can't shadow the
+    // remote-tracking ref and wrongly pin main/master.
     for c in ["main", "master"] {
-        if ref_resolves(repo, &format!("refs/heads/{c}")) || ref_resolves(repo, &format!("origin/{c}")) {
+        if ref_resolves(repo, &format!("refs/heads/{c}"))
+            || ref_resolves(repo, &format!("refs/remotes/origin/{c}"))
+        {
             return c.to_string();
         }
     }
@@ -201,13 +205,16 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     if let Some(name) = remote_default_branch(repo) {
         // Validate the cached origin/HEAD against its REMOTE-tracking ref only: a local
         // branch that happens to share the name must not vouch for a stale origin/HEAD
-        // whose upstream branch is gone.
-        if ref_resolves(repo, &format!("origin/{name}")) {
+        // whose upstream branch is gone. Qualify as `refs/remotes/origin/<name>` so a local
+        // branch literally named `origin/<name>` can't masquerade as the remote ref.
+        if ref_resolves(repo, &format!("refs/remotes/origin/{name}")) {
             return name;
         }
     }
     for c in ["main", "master"] {
-        if ref_resolves(repo, &format!("refs/heads/{c}")) || ref_resolves(repo, &format!("origin/{c}")) {
+        if ref_resolves(repo, &format!("refs/heads/{c}"))
+            || ref_resolves(repo, &format!("refs/remotes/origin/{c}"))
+        {
             return c.to_string();
         }
     }
@@ -215,7 +222,8 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     let b = b.strip_prefix("origin/").unwrap_or(b);
     if !b.is_empty()
         && b != "HEAD"
-        && (ref_resolves(repo, &format!("refs/heads/{b}")) || ref_resolves(repo, &format!("origin/{b}")))
+        && (ref_resolves(repo, &format!("refs/heads/{b}"))
+            || ref_resolves(repo, &format!("refs/remotes/origin/{b}")))
     {
         return b.to_string();
     }
@@ -239,7 +247,8 @@ pub fn recorded_base_or_default(repo: &Path, base_ref: &str, is_default: bool) -
     if is_default
         && !b.is_empty()
         && b != "HEAD"
-        && (ref_resolves(repo, &format!("refs/heads/{b}")) || ref_resolves(repo, &format!("origin/{b}")))
+        && (ref_resolves(repo, &format!("refs/heads/{b}"))
+            || ref_resolves(repo, &format!("refs/remotes/origin/{b}")))
     {
         return b.to_string();
     }
@@ -1597,6 +1606,37 @@ mod tests {
             "master",
             "a TAG named main must not shadow the real master integration branch"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn default_base_branch_ignores_local_branch_named_origin_main() {
+        // R45-1: the remote check in the main/master fallback must be qualified to
+        // `refs/remotes/origin/<c>`. A repo whose real default is `develop`, with NO
+        // `main`/`master` branch and NO origin/HEAD, but WITH a LOCAL branch literally
+        // named `origin/main` (refs/heads/origin/main). The old short `origin/main` check
+        // resolves that local branch and wrongly records "main"; the qualified remote check
+        // does not, so it falls through to the resolvable recorded base `develop`.
+        let repo = tmp("dbb-localoriginmain");
+        init_repo(&repo).unwrap();
+        // Make the real integration branch `develop`; ensure no main/master branch exists.
+        git(&repo, &["branch", "-m", "develop"]).unwrap();
+        assert!(ref_resolves(&repo, "refs/heads/develop"), "precondition: develop branch exists");
+        assert!(!ref_resolves(&repo, "refs/heads/main"), "precondition: no main branch");
+        assert!(!ref_resolves(&repo, "refs/heads/master"), "precondition: no master branch");
+        // A LOCAL branch literally named `origin/main` — the short `origin/main` resolves it.
+        git(&repo, &["branch", "origin/main", "develop"]).unwrap();
+        assert!(
+            ref_resolves(&repo, "origin/main"),
+            "precondition: short `origin/main` resolves (to the local branch)"
+        );
+        assert!(
+            !ref_resolves(&repo, "refs/remotes/origin/main"),
+            "precondition: no remote-tracking origin/main"
+        );
+        let got = default_base_branch(&repo, "develop");
+        assert_ne!(got, "main", "a LOCAL branch named origin/main must not pin main as the default");
+        assert_eq!(got, "develop", "must fall through to the resolvable recorded base develop");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
