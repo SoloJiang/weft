@@ -401,6 +401,11 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // failure because they existed (and may be running) before this confirm call.
     let mut dispatch_ids: Vec<i32> = Vec::new();
     let mut created_now: Vec<i32> = Vec::new();
+    // Reused lanes whose RECLAIMED worktree dir this attempt RECREATED. On any later failure they
+    // must be re-reclaimed (not torn down — the direction pre-existed), so the user's disk-reclaim
+    // isn't undone by a confirm that never committed. Tracked separately from created_now because
+    // their directions survive; only the recreation is rolled back. (R51-1)
+    let mut recreated_reused: Vec<i32> = Vec::new();
     // Claim each existing direction at most once. An already-approved/denied lane (handled
     // via per-card approve/deny, skipped below) still OWNS its direction in existing_dirs;
     // without claiming it, a same-name+repo PENDING sibling's reuse `.find` would match and
@@ -467,11 +472,11 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         let repo_ref = match repo::get_repo(db, d.repo.repo_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
-                rollback_created(db, &created_now).await;
+                rollback_attempt(db, &created_now, &recreated_reused).await;
                 anyhow::bail!("repo {} not found", d.repo.repo_id);
             }
             Err(e) => {
-                rollback_created(db, &created_now).await;
+                rollback_attempt(db, &created_now, &recreated_reused).await;
                 return Err(e.into());
             }
         };
@@ -505,18 +510,30 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 &repo_ref.base_ref,
                 repo_ref.base_ref_is_default,
             ) {
-                rollback_created(db, &created_now).await;
+                rollback_attempt(db, &created_now, &recreated_reused).await;
                 return Err(err);
             }
+            // Detect whether this reused lane's worktree dir was RECLAIMED (row present but the
+            // on-disk dir is gone) BEFORE we materialize it — materialize will then RECREATE it. If
+            // a later lane fails, that recreation must be undone (re-reclaimed) so the user's
+            // disk-reclaim isn't silently restored by a confirm that never commits. (R51-1)
+            let was_reclaimed = matches!(
+                repo::worktree_for(db, ex_id, repo_ref.id).await,
+                Ok(Some(w)) if !std::path::Path::new(&w.path).exists()
+            );
             // Materialize the reused lane HERE (it may have a reclaimed worktree dir to recreate).
             // The per-thread gate serializes plan mutations, so no re-propose can land during this
             // confirm — the final CAS can no longer reject, so doing every side effect BEFORE the
             // commit is safe. On failure roll back the lanes created in THIS attempt (created_now;
-            // the reused lane existed before and is never torn down) and bail, so nothing is marked
-            // confirmed — pending_writes keeps surfacing the Needs cards (no post-commit stranding).
+            // the reused lane existed before and is never torn down) AND undo any reused-lane
+            // recreations, so nothing is marked confirmed — pending_writes keeps surfacing the Needs
+            // cards (no post-commit stranding) and the user's reclaim stands.
             if let Err(err) = materialize::materialize_direction(db, ex_id).await {
-                rollback_created(db, &created_now).await;
+                rollback_attempt(db, &created_now, &recreated_reused).await;
                 return Err(err);
+            }
+            if was_reclaimed {
+                recreated_reused.push(ex_id);
             }
             dispatch_ids.push(ex_id);
             continue;
@@ -535,15 +552,16 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         {
             Ok(dir) => dir,
             Err(err) => {
-                rollback_created(db, &created_now).await;
+                rollback_attempt(db, &created_now, &recreated_reused).await;
                 return Err(err);
             }
         };
         if let Err(err) = materialize::materialize_direction(db, dir.id).await {
             // The failing lane has no worktree yet; drop its row, then roll back
-            // the earlier (materialized) lanes so a corrected retry starts clean.
+            // the earlier (materialized) lanes and undo any reused-lane recreations so a
+            // corrected retry starts clean (and the user's reclaim is restored).
             let _ = repo::delete_direction(db, dir.id).await;
-            rollback_created(db, &created_now).await;
+            rollback_attempt(db, &created_now, &recreated_reused).await;
             return Err(err);
         }
         created_now.push(dir.id);
@@ -561,7 +579,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // !applied branch is kept purely defensively: should it ever fire, roll back the lanes created
     // in this attempt and bail so the plan is NOT left "confirmed" with stale lanes.
     if !repo::mark_plan_confirmed_cas(db, thread_id, &start_plan.proposal, &start_plan.status).await? {
-        rollback_created(db, &created_now).await;
+        rollback_attempt(db, &created_now, &recreated_reused).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
     }
     Ok(dispatch_ids)
@@ -573,6 +591,19 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
 async fn rollback_created(db: &Db, ids: &[i32]) {
     for &id in ids {
         let _ = materialize::rollback_direction(db, id).await;
+    }
+}
+
+/// Roll back EVERY side effect of a failed `confirm` attempt: fully tear down the lanes CREATED
+/// in this attempt (`created_now`) AND undo the recreation of any REUSED lane whose reclaimed
+/// worktree dir this attempt recreated (`recreated_reused`) by re-reclaiming it. The reused lanes'
+/// directions pre-existed this confirm, so they are NOT deleted — only their just-made recreation
+/// is reverted, restoring the user's disk-reclaim for a confirm that never committed. (R51-1)
+/// Best-effort per lane — errors are ignored so the original failure is the one returned.
+async fn rollback_attempt(db: &Db, created_now: &[i32], recreated_reused: &[i32]) {
+    rollback_created(db, created_now).await;
+    for &id in recreated_reused {
+        let _ = materialize::reclaim_recreated_worktree(db, id).await;
     }
 }
 
@@ -2025,6 +2056,78 @@ mod tests {
         let dirs = repo::list_directions(&db, t.id).await.unwrap();
         assert!(dirs.iter().any(|d| d.id == a_id), "reused lane A must NOT be rolled back");
         assert!(!dirs.iter().any(|d| d.name == "B"), "failed new lane B is rolled back");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R51-1: confirm now materializes a reused lane IN the loop (to fix post-commit stranding).
+    /// If that reused lane's worktree dir had been RECLAIMED and this confirm RECREATES it, then a
+    /// LATER lane fails, the recreated reused checkout must NOT be left on disk — that would undo
+    /// the user's reclaim for a confirm that never committed. The fix tracks recreated reused lanes
+    /// and re-reclaims them on ANY failure. Red-first: before the fix, A's dir is left recreated
+    /// after B fails (rollback_created only tore down created_now, never the recreated reuse).
+    #[tokio::test]
+    async fn confirm_undoes_reused_recreation_when_a_later_lane_fails() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-undo-recreate-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Lane A: approved via Needs-you → materialized (a reusable, pre-existing lane).
+        let prop_a = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_a).await.unwrap();
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // RECLAIM A's worktree dir (the state the user created): remove the on-disk directory.
+        let wts = repo::list_worktrees(&db, Some(a_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row for A");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: A's worktree dir is reclaimed (absent) before confirm");
+
+        // Re-propose A (reset to pending, so confirm REUSES + RECREATES it) PLUS a NEW lane B with a
+        // bad explicit base that fails to materialize AFTER A is recreated.
+        let prop_ab = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "no-such-xyz".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_ab).await.unwrap();
+        let res = confirm(&db, t.id).await;
+        assert!(res.is_err(), "confirm fails on B's bad base");
+
+        // The plan must NOT be confirmed.
+        let after = get_resolved(&db, t.id).await.unwrap().unwrap();
+        assert_ne!(after.status, "confirmed", "a failed confirm must not mark the plan confirmed");
+        // A's direction still exists (it pre-existed — never torn down) ...
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        assert!(dirs.iter().any(|d| d.id == a_id), "reused lane A's direction must NOT be deleted");
+        // ... but its RECREATED worktree dir must be UNDONE (re-reclaimed) — the user's reclaim stands.
+        assert!(
+            !wt_path.exists(),
+            "R51-1: the reused lane's recreated worktree dir must be re-reclaimed when a later lane fails"
+        );
+
+        // Contrast — a no-failure run: re-propose A alone, confirm cleanly → A is recreated and STAYS.
+        save_proposal(&db, t.id, &prop_a).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![a_id], "no-failure: confirm reuses A and dispatches its id");
+        assert!(wt_path.exists(), "no-failure: a committed confirm recreates the reused dir and keeps it");
+
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");

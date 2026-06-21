@@ -531,6 +531,38 @@ pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> 
     Ok(())
 }
 
+/// Re-reclaim a reused lane's worktree that a FAILED `confirm` had recreated, restoring the
+/// user's pre-confirm reclaimed state: remove the on-disk worktree directory but KEEP the
+/// branch, the worktree row, and the direction (the direction pre-existed this confirm — it
+/// is never torn down). This is the inverse of the recreate `materialize_direction` performs
+/// for a reclaimed lane; without it, a confirm that recreates a reclaimed checkout and then
+/// fails (a later lane errors, or the final CAS rejects) would leave that checkout on disk,
+/// undoing the user's disk-reclaim for a confirm that never committed.
+///
+/// Unlike `remove_direction_worktree` (the Done-card reclaim) this has NO done-only or
+/// created_checkout guard: it is an internal rollback of weft's OWN just-made recreation, not
+/// a user action, and it must restore the absent-dir state regardless of the lane's status.
+/// Best-effort and idempotent: a missing row, or an already-absent directory, is a no-op.
+pub async fn reclaim_recreated_worktree(db: &Db, direction_id: i32) -> Result<()> {
+    use sea_orm::EntityTrait;
+    for wt in repo::list_worktrees(db, Some(direction_id)).await? {
+        let Some(r) = entities::repo_ref::Entity::find_by_id(wt.repo_id)
+            .one(&db.0)
+            .await?
+        else {
+            continue;
+        };
+        let repo_path = std::path::Path::new(&r.local_git_path);
+        let path = std::path::Path::new(&wt.path);
+        // remove_worktree drops the working tree and prunes; it leaves the branch and the row,
+        // mirroring the original reclaim (the dir goes, branch+row stay).
+        if let Err(e) = git::remove_worktree(repo_path, path) {
+            eprintln!("[weft] re-reclaim worktree remove failed for {}: {e}", wt.path);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

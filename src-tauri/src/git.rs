@@ -648,14 +648,26 @@ pub fn add_worktree_synced(
         // Check the existing branch out into a new worktree dir.
         git(repo, &["worktree", "add", &path_str, branch])
             .context("worktree add (existing branch)")?;
+        // R51-2: anchor the adopted branch with the resolved base's COMMIT. The fallback has
+        // ALREADY validated above (the create-time ancestry check) that this pre-existing branch
+        // descends from `resolved`, so resolved's tip is a valid fork-point anchor. Capture it the
+        // SAME way the `-b` SUCCESS path does — otherwise record_worktree stores no base_commit and
+        // a later materialize_direction SKIPS its fork-point check (empty base_commit), letting a
+        // worker reset this branch onto another base and redispatch from the wrong base. Best-effort:
+        // an unresolvable rev-parse (e.g. base is HEAD / gone) leaves it empty, same as before.
+        let base_commit = git(repo, &["rev-parse", "--verify", &format!("{resolved}^{{commit}}")])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         return Ok(WorktreeAdd {
             path: worktree_path.to_path_buf(),
             created_checkout: true,
             created_branch: false,
             synced: false,
             branched_from: String::new(),
-            // Adopted a pre-existing branch (we did NOT fork it here) — no fresh fork point.
-            base_commit: String::new(),
+            // Adopted a pre-existing branch (we did NOT fork it here), anchored to the validated
+            // resolved base commit so the fork-point check still runs on later re-materialize.
+            base_commit,
         });
     }
     // The `-b <branch> <resolved>` create SUCCEEDED: weft forked a fresh branch off the
@@ -2415,9 +2427,45 @@ mod tests {
         assert!(!add.created_branch, "the branch pre-existed; we did not create it");
         // existing-branch fallback: branched_from must be empty (no new branch created from a base)
         assert!(add.branched_from.is_empty(), "fallback to existing branch must have empty branched_from");
-        // ...and base_commit empty too: we adopted a pre-existing branch, no fresh fork point.
-        assert!(add.base_commit.is_empty(), "existing-branch fallback must have empty base_commit");
+        // base_commit is the resolved base's commit (R51-2): the fallback adopts a pre-existing
+        // branch that was validated to DESCEND FROM `resolved`, so resolved's tip is a valid
+        // ancestry anchor — record it so materialize's fork-point check isn't skipped.
+        let base_tip = git(&repo, &["rev-parse", &base]).unwrap();
+        assert_eq!(add.base_commit, base_tip, "existing-branch fallback anchors base_commit to the resolved base commit");
         assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_fallback_records_base_commit_for_adopted_branch() {
+        // R51-2: when `worktree add -b <branch> <resolved>` falls back (the branch already
+        // exists) and CHECKS OUT the pre-existing branch into a new worktree, the returned
+        // base_commit must be the resolved base's commit — NOT empty. An empty base_commit
+        // makes record_worktree store no fork-point anchor, and a later materialize_direction
+        // SKIPS the fork-point check (empty base_commit), letting a worker reset that branch
+        // onto another base and redispatch from the wrong base. The fallback has already
+        // validated the branch descends from `resolved`, so it's a valid ancestry anchor.
+        let repo = tmp("aws-fallback-anchor");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let base_tip = git(&repo, &["rev-parse", &base]).unwrap();
+        // Pre-create the branch OFF the base so `worktree add -b <branch>` fails (branch exists)
+        // and the create-fallback checks it out. Branched from `base`, so it descends from base.
+        git(&repo, &["branch", "feat/adopt", &base]).unwrap();
+        let wt = tmp("aws-fallback-anchor-wt");
+        let add = add_worktree_synced(&repo, "feat/adopt", &wt, &base, false).unwrap();
+        assert!(add.created_checkout, "fallback created a fresh checkout dir");
+        assert!(!add.created_branch, "branch pre-existed — not created here");
+        assert!(
+            !add.base_commit.is_empty(),
+            "adopted-branch fallback must record a non-empty base_commit (the validated resolved base)"
+        );
+        assert_eq!(
+            add.base_commit, base_tip,
+            "base_commit equals the resolved base's commit (the validated ancestry anchor)"
+        );
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt);
