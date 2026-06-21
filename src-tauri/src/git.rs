@@ -66,7 +66,12 @@ pub fn is_full_commit_oid(repo: &Path, t: &str) -> bool {
 /// and ref resolution.
 fn normalize_target(target: &str) -> String {
     let t = target.trim();
-    // Strip a refs/heads/ prefix first: the local-branch base is stored QUALIFIED
+    // Strip a refs/remotes/origin/ prefix first: the remote base is now carried FULLY
+    // QUALIFIED (refs/remotes/origin/<name>) so worktree-add + ancestry resolve the
+    // remote-tracking ref unambiguously (a local branch literally named `origin/<name>`
+    // can't shadow it), but the RECORDED branched_from must stay the bare branch name.
+    let t = t.strip_prefix("refs/remotes/origin/").unwrap_or(t);
+    // Strip a refs/heads/ prefix next: the local-branch base is stored QUALIFIED
     // (refs/heads/<name>) so worktree-add + ancestry use an unambiguous ref, but the
     // RECORDED branched_from must stay the bare branch name.
     let t = t.strip_prefix("refs/heads/").unwrap_or(t);
@@ -405,37 +410,32 @@ pub fn local_branch_exists(repo: &Path, branch: &str) -> bool {
     ref_resolves(repo, &format!("refs/heads/{branch}"))
 }
 
-/// Does `branch` descend from the explicit base NAME, resolved to whichever ref actually
-/// exists — preferring a LOCAL `<base>` then the remote-tracking `origin/<base>` (the same
-/// forms the create path may have branched from). Checks BOTH forms: returns Some(true) if
-/// the branch descends from EITHER, Some(false) if the base resolves in some form but the
-/// branch descends from NONE, and None if neither form resolves (base gone → caller skips).
-/// This avoids two failure modes of a bare-local check: a single-branch clone with no local
-/// `<base>` (only `origin/<base>`) would skip the check entirely, and a diverged local
-/// `<base>` would wrongly reject a checkout actually based on `origin/<base>`.
+/// Does `branch` descend from the explicit base NAME, resolved to the ref the create path
+/// would (or did) fork from? PREFERS the FULLY-QUALIFIED `refs/remotes/origin/<base>` when it
+/// resolves, falling back to the LOCAL `refs/heads/<base>` only when the remote is absent
+/// (single-branch / local-only). Returns Some(true)/Some(false) for the preferred form, and
+/// None when neither resolves (base gone → caller skips).
 pub fn branch_descends_from_base(repo: &Path, branch: &str, base: &str) -> Option<bool> {
     let t = normalize_target(base);
     if t.is_empty() || t == "HEAD" {
         return None;
     }
-    // Qualify the LOCAL base form as `refs/heads/<t>` (defense-in-depth: a same-named TAG
-    // must not vouch for the base); keep the remote-tracking `origin/<t>` form as-is.
+    // Mirror the create path's base preference so reuse validates against the SAME ref the lane
+    // was (or would be) forked from. Prefer the FULLY-QUALIFIED refs/remotes/origin/<t> when it
+    // resolves — (R43-2) a local branch literally named `origin/<t>` would shadow a short
+    // `origin/<t>`, and (R43-1) when origin/<t> is ahead of a stale local <t>, accepting a branch
+    // that only descends from the stale local ref dispatches it as <t>-based while MISSING origin's
+    // commits. Fall back to local refs/heads/<t> only when the remote is absent (single-branch /
+    // local-only). None when neither resolves (base gone → caller skips).
+    let remote = format!("refs/remotes/origin/{t}");
+    if ref_resolves(repo, &remote) {
+        return Some(branch_descends_from(repo, branch, &remote));
+    }
     let local = format!("refs/heads/{t}");
-    let remote = format!("origin/{t}");
-    let mut resolved_any = false;
-    for form in [local.as_str(), remote.as_str()] {
-        if ref_resolves(repo, form) {
-            resolved_any = true;
-            if branch_descends_from(repo, branch, form) {
-                return Some(true);
-            }
-        }
+    if ref_resolves(repo, &local) {
+        return Some(branch_descends_from(repo, branch, &local));
     }
-    if resolved_any {
-        Some(false)
-    } else {
-        None
-    }
+    None
 }
 
 /// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
@@ -454,7 +454,11 @@ pub fn add_worktree_synced(
 ) -> Result<WorktreeAdd> {
     let fetched = fetch_origin_branch(repo, base_name);
     let t = normalize_target(base_name);
-    let remote = format!("origin/{t}");
+    // FULLY-QUALIFIED remote-tracking ref (refs/remotes/origin/<t>), not the short `origin/<t>`:
+    // a LOCAL branch literally named `origin/<t>` (refs/heads/origin/<t>) would otherwise shadow
+    // the short form and be branched off instead of the freshly-fetched remote tip (R43-2). The
+    // qualified ref is unambiguous for the start-point, the ancestry base, and the `synced` check.
+    let remote = format!("refs/remotes/origin/{t}");
     let nonempty = !t.is_empty() && t != "HEAD";
     let resolved_opt = if nonempty && fetched && ref_resolves(repo, &remote) {
         // A freshly-fetched remote ref — trustworthy.
@@ -465,8 +469,7 @@ pub fn add_worktree_synced(
         // tag too). Store the QUALIFIED ref (not bare `t`): it's the `worktree add -b … <ref>`
         // start-point and the ancestry base, so a repo with BOTH a branch and a tag named `t`
         // resolves unambiguously to the branch instead of failing on an ambiguous short ref.
-        // The remote-tracking origin/<t> checks stay bare: refs/remotes/origin/ is already the
-        // branch namespace, and the branch-namespaced fetch refspec keeps tags out of it.
+        // The remote-tracking ref is carried as refs/remotes/origin/<t> for the same reason.
         Some(format!("refs/heads/{t}"))
     } else if nonempty && !require_resolvable && ref_resolves(repo, &remote) {
         // A STALE remote-tracking ref (the fetch failed — offline, or the branch was
@@ -526,8 +529,8 @@ pub fn add_worktree_synced(
         });
     }
     let resolved = resolved_opt.unwrap_or_else(|| resolve_base_ref(repo, &t));
-    // Fresh only if we branched off the remote ref AND the fetch actually succeeded.
-    let synced = resolved.starts_with("origin/") && fetched;
+    // Fresh only if we branched off the remote-tracking ref AND the fetch actually succeeded.
+    let synced = resolved.starts_with("refs/remotes/origin/") && fetched;
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -2383,6 +2386,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&local);
         let _ = std::fs::remove_dir_all(&oc);
         let _ = std::fs::remove_dir_all(&dv);
+    }
+
+    #[test]
+    fn branch_descends_from_base_prefers_remote_over_stale_local() {
+        // R43-1: when origin/develop is AHEAD of a stale LOCAL develop, the create path forks
+        // off the FRESH origin ref. The reuse guard must PREFER the remote form — a branch that
+        // only descends from the STALE LOCAL develop would otherwise be accepted as develop-based
+        // while MISSING origin's commits. Prefer-remote rejects it (Some(false)); a branch off
+        // origin/develop is accepted (Some(true)).
+        let origin = tmp("bdfb-prefer-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d0 (the stale-local fork point)"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        let clone = tmp("bdfb-prefer-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        git(&clone, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&clone, &["config", "user.name", "t"]).unwrap();
+        // A LOCAL develop pinned at the OLD origin tip (d0); a work branch forks off it here.
+        git(&clone, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
+        git(&clone, &["branch", "feat/off-stale-local", "develop"]).unwrap();
+        git(&clone, &["checkout", "-q", &main]).unwrap();
+        // origin/develop now ADVANCES past the local develop (a commit present on origin only).
+        git(&origin, &["checkout", "-q", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d1 (origin-only, ahead of local)"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        git(&clone, &["fetch", "-q", "origin"]).unwrap();
+        // A work branch forked off the FRESH origin/develop (carrying d1).
+        git(&clone, &["branch", "feat/off-origin", "refs/remotes/origin/develop"]).unwrap();
+
+        // Preconditions: the two develop forms have diverged; the stale-local branch does NOT
+        // descend from origin/develop, and the origin branch does NOT descend from local develop.
+        assert!(ref_resolves(&clone, "refs/heads/develop"), "precondition: local develop exists");
+        assert!(ref_resolves(&clone, "refs/remotes/origin/develop"), "precondition: origin/develop exists");
+        assert!(
+            !branch_descends_from(&clone, "feat/off-stale-local", "refs/remotes/origin/develop"),
+            "precondition: the stale-local branch lacks origin's d1"
+        );
+        assert!(
+            branch_descends_from(&clone, "feat/off-stale-local", "refs/heads/develop"),
+            "precondition: the stale-local branch descends from the local develop"
+        );
+
+        // PREFER REMOTE: a branch that only descends from the stale LOCAL develop is rejected
+        // (Some(false)), not accepted via the local form.
+        assert_eq!(
+            branch_descends_from_base(&clone, "feat/off-stale-local", "develop"),
+            Some(false),
+            "R43-1: prefer the qualified remote — a stale-local-only descent must NOT be accepted"
+        );
+        // A branch forked from refs/remotes/origin/develop descends from the preferred remote.
+        assert_eq!(
+            branch_descends_from_base(&clone, "feat/off-origin", "develop"),
+            Some(true),
+            "R43-1: a branch off origin/develop descends from the preferred remote form"
+        );
+
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn add_worktree_synced_prefers_remote_tracking_over_local_origin_branch() {
+        // R43-2: a LOCAL branch literally named `origin/develop` (refs/heads/origin/develop)
+        // would shadow a short `origin/develop`. add_worktree_synced must carry the
+        // FULLY-QUALIFIED refs/remotes/origin/develop, so the worktree forks off the
+        // remote-tracking tip — NOT the misleading local branch — and branched_from == "develop".
+        let origin = tmp("aws-shadow-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "develop work"]).unwrap();
+        let remote_dev_tip = git(&origin, &["rev-parse", "HEAD"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        let clone = tmp("aws-shadow-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        git(&clone, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&clone, &["config", "user.name", "t"]).unwrap();
+        assert!(ref_resolves(&clone, "refs/remotes/origin/develop"), "precondition: origin/develop fetched");
+        // A LOCAL branch literally named `origin/develop`, pointing at main's initial commit
+        // (a DIFFERENT commit than the remote-tracking develop tip).
+        let local_shadow_tip = git(&clone, &["rev-parse", &main]).unwrap();
+        assert_ne!(local_shadow_tip, remote_dev_tip, "precondition: the shadow points elsewhere");
+        git(&clone, &["branch", "origin/develop", &local_shadow_tip]).unwrap();
+        assert!(ref_resolves(&clone, "refs/heads/origin/develop"), "precondition: local origin/develop branch exists");
+
+        let wt = tmp("aws-shadow-wt");
+        let add = add_worktree_synced(&clone, "feat/x", &wt, "develop", true)
+            .expect("an explicit base `develop` resolvable via origin must be accepted");
+        // The worktree must fork off the REMOTE-tracking tip, not the local `origin/develop` branch.
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap(),
+            remote_dev_tip,
+            "R43-2: forked off refs/remotes/origin/develop, not the local origin/develop branch"
+        );
+        assert_eq!(add.branched_from, "develop", "R43-2: branched_from records the bare branch name");
+        assert!(add.synced, "branched off the freshly-fetched remote-tracking develop");
+
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
 }

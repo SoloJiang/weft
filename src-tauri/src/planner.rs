@@ -457,11 +457,16 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         // in case the worktree dir was reclaimed (exists=false) — so the lane has a
         // live worktree to dispatch. Mirror what the normal (non-reuse) path does below.
         let id = existing.id;
-        if let Err(err) = materialize::materialize_direction(db, id).await {
-            return Err(err);
-        }
+        // Test-only seam: let a test land a re-propose in the window between our read and the CAS.
+        #[cfg(test)]
+        tests::approve_persist_gate(db, thread_id).await;
         proposal.directions[index].decision = "approved".to_string();
+        // CAS the approval BEFORE any disk side effect: if a re-propose landed in the window the
+        // CAS rejects and we bail WITHOUT recreating the reclaimed worktree (which would undo the
+        // user's disk-reclaim for an approval that never applied).
         persist_decision(db, thread_id, &proposal, &plan).await?;
+        // Approval committed — now idempotently recreate the worktree if its dir was reclaimed.
+        materialize::materialize_direction(db, id).await?;
         return Ok(id);
     }
     let dir = repo::create_direction(
@@ -1612,6 +1617,73 @@ mod tests {
         let dir_id2 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         assert_eq!(dir_id2, dir_id, "re-approve returns the existing id");
         assert!(wt_path.exists(), "R17-2: worktree dir must be recreated after approve reuse");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R43-3: the idempotent REUSE approve path must CAS the approval BEFORE recreating a
+    /// reclaimed worktree. If a lead re-propose lands in the window (the CAS then rejects),
+    /// approve must bail WITHOUT recreating the checkout/branch — otherwise the user's
+    /// disk-reclaim is undone for an approval that never applied. Contrast the no-race path,
+    /// which recreates + returns Ok (covered by R17-2 above).
+    #[tokio::test]
+    async fn approve_reuse_cas_rejection_does_not_recreate_reclaimed_worktree() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-reuse-casleak-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // First approve: creates and materializes the direction (decision="approved").
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let dir_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Simulate the user reclaiming the worktree dir on disk.
+        let wts = crate::store::repo::list_worktrees(&db, Some(dir_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row after first approve");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: reclaimed worktree dir is gone before re-approve");
+
+        // Re-propose (resets the decision to "") so re-approve takes the idempotent REUSE path.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        // Arm a re-propose to land in the window between approve's plan read and its CAS — a
+        // DIFFERENT stored proposal (extra lane) so the CAS's expected no longer matches.
+        let reproposed = Proposal { rationale: "reproposed".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r2".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        arm_approve_race(t.id, &serde_json::to_string(&reproposed).unwrap(), "proposed");
+
+        // Re-approve the REUSE path: the gate fires the re-propose, the CAS rejects → Err.
+        let res = approve_direction(&db, t.id, 0, "codex").await;
+        assert!(res.is_err(), "R43-3: approve must error when the CAS rejects a stale re-propose");
+        // The reclaimed worktree dir must STILL be absent — the side effect was gated behind the CAS.
+        assert!(
+            !wt_path.exists(),
+            "R43-3: a rejected reuse approve must NOT recreate the reclaimed worktree dir"
+        );
+        // The fresh re-propose survives intact (no stale 'approved' clobbered onto it).
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
+        assert_eq!(parsed.directions.len(), 2, "the racing re-propose is left intact");
+        assert_eq!(parsed.directions[0].decision, "", "no stale 'approved' written onto the re-propose");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
