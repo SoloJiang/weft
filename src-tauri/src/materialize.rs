@@ -142,14 +142,13 @@ pub async fn materialize_direction(
         // SAME point, not a re-resolved live default that may have moved. On an UPGRADED
         // direction `base_branch==""` may instead pair with a USER-EDITED diff target that
         // is a BRANCH NAME (`develop`, `origin/develop`, …); recreating off that would start
-        // the task from the wrong point. The detached fallback stores a FULL 40-char sha
-        // (head_commit_full), and a branch name is never 40 hex chars — so discriminate on
-        // that: reuse the target as the recreate base ONLY when it is a full commit sha that
-        // still resolves; otherwise fall through to live/default re-resolution.
+        // the task from the wrong point. The detached fallback stores a FULL commit oid
+        // (head_commit_full), and a branch name is never a full oid — so discriminate on
+        // that: reuse the target as the recreate base ONLY when it is a full commit oid that
+        // still resolves; otherwise fall through to live/default re-resolution. Hash-agnostic
+        // (SHA-1 40-hex OR SHA-256 64-hex) via git object identity, not a hard-coded length.
         let t = dir.target_branch.trim();
-        let target_is_commit_sha = t.len() == 40
-            && t.chars().all(|c| c.is_ascii_hexdigit())
-            && git::ref_resolves(repo_path, t);
+        let target_is_commit_sha = git::is_full_commit_oid(repo_path, t);
         let recreate_base = if explicit {
             dir.base_branch.trim().to_string()
         } else if target_is_commit_sha {

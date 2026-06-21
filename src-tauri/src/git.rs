@@ -44,6 +44,21 @@ pub fn ref_resolves(dir: &Path, r: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// True when `t` is a FULL commit object id (any hash format — SHA-1 40-hex or SHA-256
+/// 64-hex), as opposed to a branch name or an abbreviation. Uses git object identity, not a
+/// hard-coded length: an all-hex string that `rev-parse --verify` resolves to a commit whose
+/// canonical oid equals `t` itself (a branch/abbrev resolves to a DIFFERENT full oid).
+pub fn is_full_commit_oid(repo: &Path, t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() || !t.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    match git(repo, &["rev-parse", "--verify", "-q", &format!("{t}^{{commit}}")]) {
+        Ok(out) => out.trim() == t,
+        Err(_) => false,
+    }
+}
+
 /// The bare branch name a user means for the diff target: trimmed, with a
 /// leading `origin/` (the remote the UI surfaces) stripped — so typing or
 /// pasting `origin/main` behaves like `main` for BOTH the fetch refspec
@@ -320,7 +335,10 @@ pub fn fetch_origin_branch(dir: &Path, branch: &str) -> bool {
     if b.is_empty() || b == "HEAD" {
         return false;
     }
-    let refspec = format!("+{b}:refs/remotes/origin/{b}");
+    // Source side is branch-namespaced (refs/heads/<b>) so ONLY a branch named `b`
+    // on origin lands in refs/remotes/origin/<b>; a same-named TAG no longer leaks
+    // into the remote-tracking branch namespace and can't be mistaken for a base.
+    let refspec = format!("+refs/heads/{b}:refs/remotes/origin/{b}");
     Command::new("git")
         .args(["fetch", "--quiet", "origin", &refspec])
         .current_dir(dir)
@@ -421,8 +439,12 @@ pub fn add_worktree_synced(
     let resolved_opt = if nonempty && fetched && ref_resolves(repo, &remote) {
         // A freshly-fetched remote ref — trustworthy.
         Some(remote.clone())
-    } else if nonempty && ref_resolves(repo, &t) {
-        // A local branch the user already has.
+    } else if nonempty && ref_resolves(repo, &format!("refs/heads/{t}")) {
+        // A local BRANCH the user already has. Qualified as refs/heads/<t> so a local
+        // TAG named `t` is NOT accepted as a base (bare `ref_resolves(t)` is true for a
+        // tag too). The remote-tracking origin/<t> checks stay bare: refs/remotes/origin/
+        // is already the branch namespace, and the branch-namespaced fetch refspec keeps
+        // tags out of it.
         Some(t.clone())
     } else if nonempty && !require_resolvable && ref_resolves(repo, &remote) {
         // A STALE remote-tracking ref (the fetch failed — offline, or the branch was
@@ -1179,6 +1201,51 @@ mod tests {
     }
 
     #[test]
+    fn is_full_commit_oid_distinguishes_oid_from_branch_and_abbrev() {
+        // R40-2: a FULL commit oid is identified by git object identity, not a length.
+        let repo = tmp("oid-sha1");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let full = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(full.len(), 40, "precondition: SHA-1 repo → 40-hex oid");
+        // A full HEAD oid → true.
+        assert!(is_full_commit_oid(&repo, &full), "full HEAD oid must be recognized");
+        // A branch name → false (it resolves to a commit, but to a DIFFERENT canonical oid).
+        assert!(!is_full_commit_oid(&repo, &base), "a branch name is not a full oid");
+        // A 7-char abbreviation of HEAD → false (rev-parse returns the full oid ≠ the abbrev).
+        let abbrev = &full[..7];
+        assert!(!is_full_commit_oid(&repo, abbrev), "an abbreviation is not a full oid");
+        // A non-hex string → false (never even reaches rev-parse).
+        assert!(!is_full_commit_oid(&repo, "develop"), "a non-hex name is not a full oid");
+        // Empty / whitespace → false.
+        assert!(!is_full_commit_oid(&repo, "   "), "empty is not a full oid");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn is_full_commit_oid_matches_sha256_repo() {
+        // R40-2: in a SHA-256 repo the oid is 64-hex; the helper must recognize it (the old
+        // len()==40 predicate never would). Guard: skip if this git can't init a sha256 repo.
+        let repo = tmp("oid-sha256");
+        let _ = std::fs::create_dir_all(&repo);
+        if git(&repo, &["init", "-q", "--object-format=sha256"]).is_err() {
+            eprintln!("SKIP is_full_commit_oid_matches_sha256_repo: git lacks --object-format=sha256");
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        }
+        git(&repo, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&repo, &["config", "user.name", "t"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]).unwrap();
+        let full = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(full.len(), 64, "precondition: SHA-256 repo → 64-hex oid");
+        assert!(is_full_commit_oid(&repo, &full), "a full 64-hex SHA-256 oid must be recognized");
+        // A branch name is still not an oid even in a sha256 repo.
+        let base = current_branch(&repo).unwrap();
+        assert!(!is_full_commit_oid(&repo, &base), "a branch name is not a full oid (sha256)");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn resolve_prefers_recorded_then_falls_back() {
         let repo = tmp("resolve");
         init_repo(&repo).unwrap();
@@ -1765,6 +1832,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt_a);
         let _ = std::fs::remove_dir_all(&wt_b);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_tag_named_like_explicit_base() {
+        // R40-1: an explicit base `release` that exists ONLY as a TAG on origin (no
+        // branch) must be REJECTED — the fetch refspec is branch-namespaced
+        // (refs/heads/<base>), so a same-named tag never lands in origin/<base> and
+        // the base is treated as missing. A worktree must NOT be forked off the tag.
+        let origin = tmp("aws-tag-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        // Tag a commit that is NOT reachable from main: make it on a side branch, tag
+        // it `release`, then delete the side branch. The tag keeps the commit alive on
+        // origin, but a `--single-branch --branch main` clone won't auto-fetch a tag
+        // pointing outside main's history — so the only way `release` could land in
+        // origin/release is via the (buggy) unqualified fetch refspec.
+        git(&origin, &["checkout", "-q", "-b", "side"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "side"]).unwrap();
+        let tag_commit = git(&origin, &["rev-parse", "HEAD"]).unwrap();
+        git(&origin, &["tag", "release", &tag_commit]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        git(&origin, &["branch", "-D", "side"]).unwrap();
+
+        // single-branch, no-tags clone of main only → no tags auto-fetched, so the only
+        // way `release` could leak in is via the (buggy) unqualified fetch refspec.
+        let clone = tmp("aws-tag-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", "--single-branch", "--no-tags", "--branch", &main,
+              &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(!ref_resolves(&clone, "release"), "precondition: no local `release`");
+        assert!(!ref_resolves(&clone, "origin/release"), "precondition: no origin/release");
+
+        // (i) tag-only base → Err, and NO worktree created off the tag.
+        let wt = tmp("aws-tag-wt");
+        let res = add_worktree_synced(&clone, "feat/x", &wt, "release", true);
+        assert!(res.is_err(), "a TAG named like the base must not be accepted as a branch");
+        assert!(!wt.exists(), "no worktree created off the tag");
+        assert!(
+            !ref_resolves(&clone, "feat/x"),
+            "the worker branch must not be created off the tag's commit"
+        );
+
+        // (ii) now make `release` a REAL branch on origin with its own distinct tip →
+        // Ok, and the worktree must fork off the BRANCH tip (not the same-named tag).
+        git(&origin, &["checkout", "-q", "-b", "release", &main]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "release work"]).unwrap();
+        // Disambiguate: origin now has BOTH refs/tags/release and refs/heads/release, so a
+        // bare `rev-parse release` is ambiguous — read the BRANCH ref explicitly.
+        let branch_commit = git(&origin, &["rev-parse", "refs/heads/release"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        assert_ne!(branch_commit, tag_commit, "the branch tip differs from the tag commit");
+        let wt2 = tmp("aws-tag-wt2");
+        let add = add_worktree_synced(&clone, "feat/y", &wt2, "release", true)
+            .expect("a real branch named `release` must be accepted");
+        assert!(add.synced, "branched off the freshly-fetched origin/release branch");
+        assert_eq!(
+            git(&wt2, &["rev-parse", "HEAD"]).unwrap(),
+            branch_commit,
+            "forked off the BRANCH tip, not the tag commit"
+        );
+
+        let _ = remove_worktree(&clone, &wt2);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt2);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_local_tag_named_like_explicit_base() {
+        // R40-1 (b): the local-branch fallback must reject a LOCAL tag `release` when
+        // no local BRANCH `release` exists — `ref_resolves` alone is true for a tag, so
+        // the fallback is tightened to refs/heads/<base>. No remote here, so resolution
+        // can only succeed via the local fallback.
+        let repo = tmp("aws-local-tag");
+        init_repo(&repo).unwrap();
+        // Tag the initial commit `release`; never create a branch of that name.
+        git(&repo, &["tag", "release"]).unwrap();
+        assert!(ref_resolves(&repo, "release"), "precondition: tag `release` resolves");
+        assert!(
+            !ref_resolves(&repo, "refs/heads/release"),
+            "precondition: no local BRANCH `release`"
+        );
+        let wt = tmp("aws-local-tag-wt");
+        let res = add_worktree_synced(&repo, "feat/x", &wt, "release", true);
+        assert!(res.is_err(), "a LOCAL tag named like the base must be rejected");
+        assert!(!wt.exists(), "no worktree created off the local tag");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     #[test]

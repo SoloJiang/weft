@@ -144,9 +144,10 @@ fn reconcile_reuse(
                 existing.name, proposed_base
             );
         }
-        // Detached-HEAD lane = empty base paired with a full 40-hex commit-sha target.
+        // Detached-HEAD lane = empty base paired with a full commit-oid target. Hash-agnostic
+        // (SHA-1 40-hex OR SHA-256 64-hex) via git object identity, not a hard-coded length.
         let target = existing.target_branch.trim();
-        let is_detached_head = target.len() == 40 && target.chars().all(|c| c.is_ascii_hexdigit());
+        let is_detached_head = crate::git::is_full_commit_oid(repo_path, target);
         if is_detached_head && crate::git::head_commit_full(repo_path).as_deref() != Some(target) {
             anyhow::bail!(
                 "direction {:?} is based on a detached HEAD that has since moved; \
