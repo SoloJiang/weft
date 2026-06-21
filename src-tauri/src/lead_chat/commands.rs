@@ -52,6 +52,7 @@ Do not write code, and do not plan the directions' implementations — each work
 Ask clarifying questions only when ambiguity changes write scope, acceptance, or sequencing. \
 When the write boundary is clear enough for workers to start, call propose_directions with a short rationale and directions \
 (name, the ONE repo each writes, reason, mandate). Only list repos each direction must WRITE; reads are free. \
+Each direction branches off its repo's default branch by default — leave base_branch empty for that. If the user names a specific integration or release branch to build on (e.g. develop, staging, release/*), set base_branch to it; when it is genuinely ambiguous which base to use, ask the human before proposing. \
 Pick mandate per direction as a planning-depth hint: plan+impl for directions that need worker planning, impl-only for small or fully specified directions. \
 Prefer independent directions that can proceed in parallel; put shared contract owners first only when they block others. \
 The human reviews and confirms in weft; you can re-propose after more discussion. \
@@ -1252,20 +1253,20 @@ mod live_slot_tests {
     // returning (thread_id, direction_id, repo_id, session_id).
     async fn fixture(db: &Db) -> (i32, i32, i32, i32) {
         let ws = repo::create_workspace(db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-slot-fake", "main", "")
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-slot-fake", "main", "", true)
             .await
             .unwrap();
         let th = repo::create_thread(db, ws.id, "issue", "feature", "codex")
             .await
             .unwrap();
-        let dir = repo::create_direction(db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only")
+        let dir = repo::create_direction(db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only", "")
             .await
             .unwrap();
         let sess = repo::create_session(db, dir.id, repo_ref.id, "codex", "/tmp/wt")
             .await
             .unwrap();
         repo::set_session_native_id(db, sess.id, "nat-1").await.unwrap();
-        repo::record_worktree(db, repo_ref.id, dir.id, "feat/alpha", "/tmp/wt")
+        repo::record_worktree(db, repo_ref.id, dir.id, "feat/alpha", "/tmp/wt", false, true, "")
             .await
             .unwrap();
         (th.id, dir.id, repo_ref.id, sess.id)
@@ -1333,9 +1334,9 @@ mod live_slot_tests {
     async fn busy_worker_without_worktree_is_skipped() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true).await.unwrap();
         let th = repo::create_thread(&db, ws.id, "issue", "feature", "codex").await.unwrap();
-        let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only")
+        let dir = repo::create_direction(&db, th.id, "alpha", "codex", repo_ref.id, "why", "impl-only", "")
             .await
             .unwrap();
         let sess = repo::create_session(&db, dir.id, repo_ref.id, "codex", "/tmp/wt")

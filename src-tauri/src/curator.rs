@@ -1610,7 +1610,7 @@ mod tests {
         super::run_state_clear_all_for_test();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
 
         super::run_finish_err(r.id, "analysis failed".into());
         super::edit_profile(&db, r.id, Some("notes"), None).await.unwrap();
@@ -1643,7 +1643,7 @@ mod tests {
         // stale tier isn't shown as a fresh `done` (and the re-run can converge).
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
         assert!(!super::classified_for(&db, r.id, "sha_a").await, "no profile → not classified");
         repo::upsert_repo_profile(&db, r.id, "service", "[]", "s", "[]", "agent", "sha_a")
             .await
@@ -1668,7 +1668,7 @@ mod tests {
         super::run_state_clear_all_for_test();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "gone", "/nonexistent/weft/checkout/zzz", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "gone", "/nonexistent/weft/checkout/zzz", "main", "", true)
             .await
             .unwrap();
         super::profile_repo_agent(&db, &r).await.unwrap();
@@ -1682,7 +1682,7 @@ mod tests {
         super::run_state_clear_all_for_test();
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
             .await
             .unwrap();
         super::run_finish_err(r.id, "codex failed".into());
@@ -1703,10 +1703,10 @@ mod tests {
     async fn graph_builds_edges_from_agent_relations() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+        let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
-        let api = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+        let api = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
             .await
             .unwrap();
         profile(&db, web.id, "frontend").await;
@@ -1745,7 +1745,7 @@ mod tests {
         // can let a degraded prompt wipe the other repos' edges.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
             .await
             .unwrap();
 
@@ -1777,7 +1777,7 @@ mod tests {
         // (no profile row). The edit must upsert one, not error.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
             .await
             .unwrap();
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
@@ -1794,7 +1794,7 @@ mod tests {
         // pass keeps the user's summary but migrates the invalid tier.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "service", "[]", "mine", "[]", "user", "")
@@ -1819,7 +1819,7 @@ mod tests {
     async fn persist_repo_class_keeps_valid_user_tier() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "gateway", "[]", "mine", "[]", "user", "")
@@ -1844,7 +1844,7 @@ mod tests {
         // the user's summary is still preserved.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "", "[]", "mine", "[]", "user", "")
@@ -1869,7 +1869,7 @@ mod tests {
         // tier-pinned, so a later pass can refresh it.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         // source "user" = both owned, but tier is empty (legacy/placeholder).
@@ -1900,7 +1900,7 @@ mod tests {
         // the repo's existing stack/components/summary.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(
@@ -1929,7 +1929,7 @@ mod tests {
         // from an omitted field (None), which preserves them.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(
@@ -1958,7 +1958,7 @@ mod tests {
         // saving a canonical tier that needs_classification would skip forever.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "", "[]", "", "[]", "agent", "")
@@ -1983,7 +1983,7 @@ mod tests {
         // summary, or needs_classification would skip it forever.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "backend", "[]", "prior summary", "[]", "agent", "")
@@ -2007,7 +2007,7 @@ mod tests {
         // agent's real summary should fill it rather than stay blank forever.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "user", "")
@@ -2033,7 +2033,7 @@ mod tests {
         // backfill gate would never retry.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let wire = super::RepoClassWire {
@@ -2056,7 +2056,7 @@ mod tests {
         // classification still persists.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "mono", "/tmp/mono", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "mono", "/tmp/mono", "main", "", true)
             .await
             .unwrap();
         let wire = super::RepoClassWire {
@@ -2084,7 +2084,7 @@ mod tests {
         // qualifies for the agent's backfill/migration.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "service", "[]", "old", "[]", "agent", "")
@@ -2103,7 +2103,7 @@ mod tests {
         // later agent pass can still refresh the summary.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
         repo::upsert_repo_profile(&db, r.id, "backend", "[]", "agent sum", "[]", "agent", "")
@@ -2134,7 +2134,7 @@ mod tests {
         // A repo removed mid-pass must not get an orphaned profile recreated.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "gone", "/tmp/gone", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "gone", "/tmp/gone", "main", "", true)
             .await
             .unwrap();
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
@@ -2157,7 +2157,7 @@ mod tests {
         // A stale edit after the repo is gone must error, not recreate an orphan.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "gone", "/tmp/gone", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "gone", "/tmp/gone", "main", "", true)
             .await
             .unwrap();
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
@@ -2232,7 +2232,7 @@ mod tests {
     async fn graph_returns_placeholder_for_unanalyzed_repo() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let r = repo::add_repo_ref(&db, ws.id, "fresh", "/tmp/fresh", "main", "")
+        let r = repo::add_repo_ref(&db, ws.id, "fresh", "/tmp/fresh", "main", "", true)
             .await
             .unwrap();
         // No profile row yet → a placeholder node, not an omission.
@@ -2282,10 +2282,10 @@ mod tests {
     async fn persist_relations_groups_filters_and_clears() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+        let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
-        let api = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+        let api = repo::add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
             .await
             .unwrap();
         profile(&db, web.id, "frontend").await;
@@ -2340,7 +2340,7 @@ mod tests {
     async fn graph_drops_agent_relation_to_unknown_repo() {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+        let web = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
         profile(&db, web.id, "frontend").await;

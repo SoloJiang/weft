@@ -60,13 +60,13 @@ async fn delete_worktree_keeps_branch_and_task() {
     let repo_a = make_repo(&root, "repo-a");
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let ws = repo::create_workspace(&db, "ws").await.unwrap();
-    let ra = repo::add_repo_ref(&db, ws.id, "repo-a", repo_a.to_str().unwrap(), "main", "")
+    let ra = repo::add_repo_ref(&db, ws.id, "repo-a", repo_a.to_str().unwrap(), "main", "", true)
         .await
         .unwrap();
     let t1 = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
         .await
         .unwrap();
-    let d1 = repo::create_direction(&db, t1.id, "da", "claude", ra.id, "modify repo-a", "plan+impl")
+    let d1 = repo::create_direction(&db, t1.id, "da", "claude", ra.id, "modify repo-a", "plan+impl", "")
         .await
         .unwrap();
 
@@ -140,6 +140,41 @@ async fn delete_worktree_keeps_branch_and_task() {
     assert!(
         !branch_exists(&repo_a, &branch),
         "kept branch is cleaned when the issue is deleted"
+    );
+
+    // A worktree weft did NOT create (created_checkout=false — a reused pre-existing
+    // path) must NOT be removed by the Done-card reclaim. Asserted HERE, not in a
+    // separate #[tokio::test], because a second WEFT_HOME-mutating test in this binary
+    // would race this one (see the module header).
+    let t2 = repo::create_thread(&db, ws.id, "t2", "feature", "claude")
+        .await
+        .unwrap();
+    let d2 = repo::create_direction(&db, t2.id, "db", "claude", ra.id, "modify", "plan+impl", "")
+        .await
+        .unwrap();
+    repo::set_direction_status(&db, d2.id, "done").await.unwrap();
+    let reused = root.join("preexisting-checkout");
+    std::fs::create_dir_all(&reused).unwrap();
+    std::fs::write(reused.join("user-file.txt"), "user data\n").unwrap();
+    let wt2 = repo::record_worktree(
+        &db,
+        ra.id,
+        d2.id,
+        "feat/reused",
+        &reused.to_string_lossy(),
+        false,
+        false,
+        "",
+    )
+    .await
+    .unwrap();
+    assert!(
+        remove_direction_worktree(&db, wt2.id).await.is_err(),
+        "reclaim refuses a worktree weft did not create"
+    );
+    assert!(
+        reused.join("user-file.txt").exists(),
+        "reused checkout contents preserved"
     );
 
     let _ = std::fs::remove_dir_all(&root);

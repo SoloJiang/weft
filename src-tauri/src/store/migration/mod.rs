@@ -34,6 +34,11 @@ impl MigratorTrait for Migrator {
             Box::new(M0021RepoRemoteUrl),
             Box::new(M0022RepoProfileRelations),
             Box::new(M0023RepoProfileComponents),
+            Box::new(M0024DirectionBaseBranch),
+            Box::new(M0025WorktreeCreatedBranch),
+            Box::new(M0026WorktreeCreatedCheckout),
+            Box::new(M0027RepoRefBaseRefIsDefault),
+            Box::new(M0028WorktreeBaseCommit),
         ]
     }
 }
@@ -903,6 +908,252 @@ impl MigrationTrait for M0023RepoProfileComponents {
                 Table::alter()
                     .table(Alias::new("repo_profile"))
                     .drop_column(Alias::new("components"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds direction.base_branch: the ref a worktree branches off (empty = repo
+/// default). M0001 reflects the current entity, so a FRESH db already has it;
+/// sqlite has no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0024DirectionBaseBranch;
+impl MigrationName for M0024DirectionBaseBranch {
+    fn name(&self) -> &str {
+        "m0024_direction_base_branch"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0024DirectionBaseBranch {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("base_branch"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .drop_column(Alias::new("base_branch"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds worktree.created_branch: whether Weft created this branch (vs. checking
+/// out a pre-existing one). Rollback deletes the branch only when true, so a
+/// pre-existing branch reused by the fallback is never deleted on rollback.
+/// Existing rows default to false (safe: rollback won't delete their branch).
+/// M0001 reflects the current entity, so a FRESH db already has it; sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+/// Adds worktree.created_branch: whether Weft created this worktree's branch (via
+/// `git worktree add -b`) vs. reusing a pre-existing branch. Thread/repo cascade
+/// cleanup only deletes the branch when this is true — a reused branch must survive.
+/// Existing rows default to TRUE: every pre-this-change worktree had its branch
+/// created by Weft (the old materialize path always `worktree add -b`'d), so
+/// zero-accumulation still tears those legacy branches down on teardown. sqlite has no
+/// ADD COLUMN IF NOT EXISTS, so tolerate the duplicate (M0001 reflects the current
+/// entity, so a FRESH db already has the column).
+pub struct M0025WorktreeCreatedBranch;
+impl MigrationName for M0025WorktreeCreatedBranch {
+    fn name(&self) -> &str {
+        "m0025_worktree_created_branch"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0025WorktreeCreatedBranch {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("created_branch"))
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .drop_column(Alias::new("created_branch"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds worktree.created_checkout: whether Weft created this worktree directory
+/// (vs. reusing a pre-existing path). Rollback and cascade cleanup only call
+/// `git worktree remove` when this is true — a reused pre-existing path must
+/// survive rollback. Existing rows default to true (they ARE genuine Weft
+/// checkouts, safe to remove on teardown). M0001 reflects the current entity,
+/// so a FRESH db already has it; sqlite has no ADD COLUMN IF NOT EXISTS, so
+/// tolerate the duplicate.
+pub struct M0026WorktreeCreatedCheckout;
+impl MigrationName for M0026WorktreeCreatedCheckout {
+    fn name(&self) -> &str {
+        "m0026_worktree_created_checkout"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0026WorktreeCreatedCheckout {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("created_checkout"))
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .drop_column(Alias::new("created_checkout"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds repo_ref.base_ref_is_default: whether `base_ref` was captured as the repo's
+/// real default branch (true) vs. a legacy current-branch capture on an upgraded DB
+/// (false). The offline fallback (`recorded_base_or_default`) only trusts `base_ref`
+/// over the default chain when this is true — a legacy base_ref (even a pushed
+/// feature branch whose `origin/<base_ref>` resolves) is indistinguishable from a
+/// genuine non-standard default by value alone, so the marker is the only signal.
+/// Existing/legacy rows default to FALSE (their base_ref was the current-branch
+/// capture, not a vetted default). M0001 reflects the current entity, so a FRESH db
+/// already has it; sqlite has no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0027RepoRefBaseRefIsDefault;
+impl MigrationName for M0027RepoRefBaseRefIsDefault {
+    fn name(&self) -> &str {
+        "m0027_repo_ref_base_ref_is_default"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0027RepoRefBaseRefIsDefault {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_ref"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("base_ref_is_default"))
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_ref"))
+                    .drop_column(Alias::new("base_ref_is_default"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds worktree.base_commit: the COMMIT the work branch was forked from at create time
+/// (the resolved base's tip on the `worktree add -b <branch> <resolved>` success path).
+/// Reuse-time validation checks the work branch DESCENDS from this STABLE commit rather
+/// than re-resolving a moving base NAME — so a base that advanced (or a lane forked from a
+/// local ref while origin later diverged) is not false-rejected, while a branch externally
+/// reset onto an unrelated base is still caught. Empty = legacy/reuse/fallback row (skip
+/// validation). M0001 reflects the current entity, so a FRESH db already has it; sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0028WorktreeBaseCommit;
+impl MigrationName for M0028WorktreeBaseCommit {
+    fn name(&self) -> &str {
+        "m0028_worktree_base_commit"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0028WorktreeBaseCommit {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("base_commit"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .drop_column(Alias::new("base_commit"))
                     .to_owned(),
             )
             .await

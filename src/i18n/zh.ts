@@ -253,6 +253,9 @@ export const zh = {
     back: "返回对话",
     confirm_other: "创建 {{count}} 个子任务",
     confirming: "创建中…",
+    baseBranch: "基线分支",
+    baseBranchHint: "从该分支拉出工作分支（留空 = 仓库默认分支）",
+    basePlaceholderDefault: "默认分支",
   },
   notify: {
     needsTitle: "待你处理",

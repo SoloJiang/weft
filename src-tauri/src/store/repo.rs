@@ -320,6 +320,7 @@ pub async fn add_repo_ref(
     local_git_path: &str,
     base_ref: &str,
     remote_url: &str,
+    base_ref_is_default: bool,
 ) -> Result<repo_ref::Model> {
     let existing = repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
@@ -332,6 +333,16 @@ pub async fn add_repo_ref(
         r.local_git_path == local_git_path
             || (!key.is_empty() && crate::git::git_url_key(&r.remote_url) == key)
     }) {
+        // R42-1: re-adding with a VETTED default (is_default=true) repairs a legacy/stale
+        // marker on the existing row — an upgraded row may still carry base_ref_is_default=false
+        // (or a stale base_ref), which makes later blank-base materialization ignore the known
+        // default and fall through to main/master.
+        if base_ref_is_default && (!dup.base_ref_is_default || dup.base_ref != base_ref) {
+            let mut am: repo_ref::ActiveModel = dup.clone().into();
+            am.base_ref = Set(base_ref.to_string());
+            am.base_ref_is_default = Set(true);
+            return Ok(am.update(&db.0).await?);
+        }
         return Ok(dup.clone());
     }
     let slugs: Vec<String> = existing.into_iter().map(|r| r.slug).collect();
@@ -342,6 +353,7 @@ pub async fn add_repo_ref(
         local_git_path: Set(local_git_path.to_string()),
         base_ref: Set(base_ref.to_string()),
         remote_url: Set(remote_url.to_string()),
+        base_ref_is_default: Set(base_ref_is_default),
         ..Default::default()
     };
     Ok(m.insert(&db.0).await?)
@@ -446,6 +458,76 @@ pub async fn upsert_plan(
     Ok(a.save(&db.0).await?.try_into_model()?)
 }
 
+/// Set a plan's `created_at`, which doubles as the proposal VERSION ("last proposed at").
+/// `save_proposal` bumps it on every re-propose (R50-2) so the frontend can reset a dirty base
+/// edit on ANY re-proposal. (Distinct from `upsert_plan`, which intentionally PRESERVES
+/// `created_at` on update — the targeted-edit / CAS / test-seam paths rely on that.) No-op if the
+/// plan row is absent.
+pub async fn set_plan_created_at(db: &Db, thread_id: i32, created_at: &str) -> Result<()> {
+    use sea_orm::sea_query::Expr;
+    plan::Entity::update_many()
+        .col_expr(plan::Column::CreatedAt, Expr::value(created_at.to_string()))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
+/// Compare-and-swap the stored proposal: write `new_proposal` + `status` ONLY if the
+/// row's current proposal still equals `expected` AND its current status still equals
+/// `status` (no re-propose AND no confirm landed since the caller read it). Returns true
+/// when applied, false when the proposal OR status changed (or the plan is gone) — so a
+/// targeted base/decision edit rejects rather than clobbering a fresh re-propose with a
+/// stale full proposal, OR reopening a just-confirmed plan back to "proposed".
+/// `created_at` is intentionally left untouched.
+pub async fn update_plan_proposal_cas(
+    db: &Db,
+    thread_id: i32,
+    new_proposal: &str,
+    expected: &str,
+    status: &str,
+) -> Result<bool> {
+    use sea_orm::sea_query::Expr;
+    let res = plan::Entity::update_many()
+        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
+        .col_expr(plan::Column::Status, Expr::value(status.to_string()))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected))
+        // Pin status too: a targeted edit reads the plan at one status; if `confirm`
+        // flips that SAME proposal JSON to "confirmed" before this CAS runs, the
+        // proposal predicate still matches and the SET would write the stale status
+        // back, reopening a materialized plan. Predicating on the read status makes
+        // a drifted row match 0 rows (rejecting the edit) while an in-status edit is
+        // a no-op on the status column (SET writes the same value).
+        .filter(plan::Column::Status.eq(status))
+        .exec(&db.0)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
+/// Mark a thread's plan "confirmed" ONLY if its proposal AND status are still what `confirm`
+/// read at the start — i.e. no re-propose and no concurrent confirm landed in between. Unlike
+/// `update_plan_proposal_cas` (which pins expected==new status), this flips a NON-confirmed
+/// status to "confirmed", so it takes a SEPARATE `expected_status`. Returns true when applied,
+/// false when the proposal OR status drifted (or the plan is gone). Leaves proposal +
+/// created_at untouched.
+pub async fn mark_plan_confirmed_cas(
+    db: &Db,
+    thread_id: i32,
+    expected_proposal: &str,
+    expected_status: &str,
+) -> Result<bool> {
+    use sea_orm::sea_query::Expr;
+    let res = plan::Entity::update_many()
+        .col_expr(plan::Column::Status, Expr::value("confirmed"))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected_proposal))
+        .filter(plan::Column::Status.eq(expected_status))
+        .exec(&db.0)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
 pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profile::Model>> {
     Ok(repo_profile::Entity::find()
         .filter(repo_profile::Column::RepoId.eq(repo_id))
@@ -509,6 +591,22 @@ pub async fn set_repo_remote(db: &Db, repo_id: i32, remote_url: &str) -> Result<
     if let Some(m) = repo_ref::Entity::find_by_id(repo_id).one(&db.0).await? {
         let mut a: repo_ref::ActiveModel = m.into();
         a.remote_url = Set(remote_url.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// Persist a newly-learned default branch for a repo. Called when materialize
+/// discovers (via `live_default_branch`) that the remote's default has changed
+/// since the repo was registered, so future offline fallbacks use the current value.
+/// Also marks `base_ref_is_default = true`: this value IS the live default, so the
+/// offline fallback may now trust it over the main/master chain.
+/// Best-effort: a write hiccup (row gone, DB error) is silently ignored.
+pub async fn set_repo_base_ref(db: &Db, repo_id: i32, base_ref: &str) -> Result<()> {
+    if let Some(m) = repo_ref::Entity::find_by_id(repo_id).one(&db.0).await? {
+        let mut a: repo_ref::ActiveModel = m.into();
+        a.base_ref = Set(base_ref.to_string());
+        a.base_ref_is_default = Set(true);
         a.update(&db.0).await?;
     }
     Ok(())
@@ -584,6 +682,17 @@ pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::M
         .await?)
 }
 
+/// Delete a direction row (and any worktree rows referencing it). Used to roll back
+/// a half-created direction when materialize fails, so a corrected retry starts clean.
+pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
+    worktree::Entity::delete_many()
+        .filter(worktree::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
+    direction::Entity::delete_by_id(direction_id).exec(&db.0).await?;
+    Ok(())
+}
+
 /// Create a direction bound to exactly one write repo + a reason (scope rework,
 /// spec Part 1). The worktree is materialized separately by `materialize`.
 pub async fn create_direction(
@@ -594,6 +703,7 @@ pub async fn create_direction(
     repo_id: i32,
     reason: &str,
     mandate: &str,
+    base_branch: &str,
 ) -> Result<direction::Model> {
     let t = thread::Entity::find_by_id(thread_id)
         .one(&db.0)
@@ -648,6 +758,8 @@ pub async fn create_direction(
         repo_id: Set(repo_id),
         reason: Set(reason.to_string()),
         mandate: Set(normalize_mandate(mandate).to_string()),
+        base_branch: Set(base_branch.trim().to_string()),
+        target_branch: Set(base_branch.trim().to_string()),
         created_at: Set(now()),
         ..Default::default()
     }
@@ -746,6 +858,24 @@ pub async fn set_direction_target_branch(
     Ok(())
 }
 
+/// Persist a direction's base branch (the immutable ref its worktree was branched
+/// off). Set once at materialize for the default-base case; not user-editable after.
+pub async fn set_direction_base_branch(
+    db: &Db,
+    direction_id: i32,
+    base: &str,
+) -> Result<()> {
+    if let Some(d) = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+    {
+        let mut a: direction::ActiveModel = d.into();
+        a.base_branch = Set(base.trim().to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// The single write repo bound to a direction (scope rework). None if the
 /// direction has no repo set (repo_id = 0) or the repo row is gone.
 pub async fn direction_repo_of(db: &Db, direction_id: i32) -> Result<Option<repo_ref::Model>> {
@@ -767,6 +897,9 @@ pub async fn record_worktree(
     direction_id: i32,
     branch: &str,
     path: &str,
+    created_branch: bool,
+    created_checkout: bool,
+    base_commit: &str,
 ) -> Result<worktree::Model> {
     Ok(worktree::ActiveModel {
         repo_id: Set(repo_id),
@@ -774,10 +907,54 @@ pub async fn record_worktree(
         branch: Set(branch.to_string()),
         path: Set(path.to_string()),
         created_at: Set(now()),
+        created_branch: Set(created_branch),
+        created_checkout: Set(created_checkout),
+        base_commit: Set(base_commit.to_string()),
         ..Default::default()
     }
     .insert(&db.0)
     .await?)
+}
+
+/// Persist the recorded fork-point commit on a worktree row. Used on RE-materialize when a
+/// reclaimed lane's recreate CREATED a fresh branch (the original was deleted) and the row's
+/// base_commit was still empty (legacy/reuse) — so the new fork point becomes the stable
+/// ancestry anchor. Callers MUST NOT overwrite a non-empty base_commit: the ORIGINAL fork
+/// point is the authoritative one.
+pub async fn set_worktree_base_commit(
+    db: &Db,
+    worktree_id: i32,
+    base_commit: &str,
+) -> Result<()> {
+    worktree::ActiveModel {
+        id: Set(worktree_id),
+        base_commit: Set(base_commit.to_string()),
+        ..Default::default()
+    }
+    .update(&db.0)
+    .await?;
+    Ok(())
+}
+
+/// Persist updated ownership flags on a worktree row. Used when re-materializing a
+/// reclaimed worktree CREATES a fresh branch/checkout because the original was deleted:
+/// weft now owns what it just made, so the flags are OR'd up (never cleared) and later
+/// cleanup/rollback correctly tears the new branch/checkout down.
+pub async fn set_worktree_ownership(
+    db: &Db,
+    worktree_id: i32,
+    created_branch: bool,
+    created_checkout: bool,
+) -> Result<()> {
+    worktree::ActiveModel {
+        id: Set(worktree_id),
+        created_branch: Set(created_branch),
+        created_checkout: Set(created_checkout),
+        ..Default::default()
+    }
+    .update(&db.0)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_worktrees(db: &Db, direction_id: Option<i32>) -> Result<Vec<worktree::Model>> {
@@ -803,18 +980,25 @@ pub async fn worktree_for(
 
 /// Remove a repo from a workspace and all Weft state derived from it: its
 /// profile, the directions bound to it (a direction has one write repo) with
-/// their sessions, and its worktree rows. Returns the worktrees (repo_id, path,
-/// branch) the caller must physically `git worktree remove` — DB rows are gone
-/// after this. NEVER touches the user's actual repo directory at `local_git_path`.
-pub async fn delete_repo_cascade(db: &Db, repo_id: i32) -> Result<Vec<(i32, String, String)>> {
+/// their sessions, and its worktree rows. Returns the worktrees
+/// (repo_id, path, branch, created_branch, created_checkout) the caller must
+/// physically `git worktree remove` — DB rows are gone after this.
+/// `created_branch` gates whether the branch is deleted; `created_checkout`
+/// gates whether `git worktree remove` is called (a reused pre-existing
+/// checkout path must survive). NEVER touches the user's actual repo directory
+/// at `local_git_path`.
+pub async fn delete_repo_cascade(
+    db: &Db,
+    repo_id: i32,
+) -> Result<Vec<(i32, String, String, bool, bool)>> {
     // Worktrees registered for this repo (each direction's worktree is keyed to
     // its write repo, so this covers the bound directions' worktrees too).
-    let removed: Vec<(i32, String, String)> = worktree::Entity::find()
+    let removed: Vec<(i32, String, String, bool, bool)> = worktree::Entity::find()
         .filter(worktree::Column::RepoId.eq(repo_id))
         .all(&db.0)
         .await?
         .into_iter()
-        .map(|w| (w.repo_id, w.path, w.branch))
+        .map(|w| (w.repo_id, w.path, w.branch, w.created_branch, w.created_checkout))
         .collect();
     // Sessions of the directions bound to this repo, plus any keyed to the repo.
     let dirs = direction::Entity::find()
@@ -849,19 +1033,26 @@ pub async fn delete_repo_cascade(db: &Db, repo_id: i32) -> Result<Vec<(i32, Stri
 
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
-pub async fn delete_thread_cascade(db: &Db, thread_id: i32) -> Result<Vec<(i32, String, String)>> {
+/// Each tuple is (repo_id, path, branch, created_branch, created_checkout):
+/// `created_branch` gates branch deletion; `created_checkout` gates worktree
+/// directory removal (a reused pre-existing checkout must survive).
+pub async fn delete_thread_cascade(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Vec<(i32, String, String, bool, bool)>> {
     let dirs = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&db.0)
         .await?;
-    let mut removed: Vec<(i32, String, String)> = Vec::new(); // (repo_id, worktree path, branch)
+    // (repo_id, worktree path, branch, created_branch, created_checkout)
+    let mut removed: Vec<(i32, String, String, bool, bool)> = Vec::new();
     for d in &dirs {
         let wts = worktree::Entity::find()
             .filter(worktree::Column::DirectionId.eq(d.id))
             .all(&db.0)
             .await?;
         for w in wts {
-            removed.push((w.repo_id, w.path.clone(), w.branch.clone()));
+            removed.push((w.repo_id, w.path.clone(), w.branch.clone(), w.created_branch, w.created_checkout));
             worktree::Entity::delete_by_id(w.id).exec(&db.0).await?;
         }
         session::Entity::delete_many()
@@ -1363,12 +1554,13 @@ mod tests {
             "/code/web",
             "main",
             "https://github.com/acme/web.git",
+            true,
         )
         .await
         .unwrap();
 
         // Same local path (any name/remote) → returns the existing row, no insert.
-        let same_path = add_repo_ref(&db, ws.id, "renamed", "/code/web", "main", "")
+        let same_path = add_repo_ref(&db, ws.id, "renamed", "/code/web", "main", "", true)
             .await
             .unwrap();
         assert_eq!(same_path.id, a.id, "same path must not create a second repo");
@@ -1382,6 +1574,7 @@ mod tests {
             "/elsewhere/web",
             "main",
             "https://GitHub.com/acme/web",
+            true,
         )
         .await
         .unwrap();
@@ -1398,6 +1591,7 @@ mod tests {
             "/code/api",
             "main",
             "https://github.com/acme/api.git",
+            true,
         )
         .await
         .unwrap();
@@ -1405,10 +1599,10 @@ mod tests {
 
         // Two local repos with NO remote and different paths both exist — an empty
         // remote key must never collapse distinct repos.
-        let l1 = add_repo_ref(&db, ws.id, "local-1", "/code/l1", "main", "")
+        let l1 = add_repo_ref(&db, ws.id, "local-1", "/code/l1", "main", "", true)
             .await
             .unwrap();
-        let l2 = add_repo_ref(&db, ws.id, "local-2", "/code/l2", "main", "")
+        let l2 = add_repo_ref(&db, ws.id, "local-2", "/code/l2", "main", "", true)
             .await
             .unwrap();
         assert_ne!(l1.id, l2.id, "empty remote must not collapse distinct repos");
@@ -1422,6 +1616,7 @@ mod tests {
             "/code/web",
             "main",
             "https://github.com/acme/web.git",
+            true,
         )
         .await
         .unwrap();
@@ -1434,14 +1629,56 @@ mod tests {
         assert_eq!(list_repos(&db, ws.id).await.unwrap().len(), 4);
     }
 
+    /// R42-1: re-adding a repo with a VETTED default (is_default=true + a real base_ref)
+    /// repairs a legacy/stale marker on the existing row, but re-adding without a vetted
+    /// default must NOT clobber an already-true marker or its vetted base_ref.
+    #[tokio::test]
+    async fn add_repo_ref_re_add_repairs_legacy_default_marker() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        // Legacy row: registered before the default was vetted — marker is false and the
+        // base_ref is a stale guess.
+        let legacy = add_repo_ref(&db, ws.id, "web", "/code/web", "stale", "", false)
+            .await
+            .unwrap();
+        assert!(!legacy.base_ref_is_default, "precondition: legacy marker is false");
+        assert_eq!(legacy.base_ref, "stale");
+
+        // Re-add the SAME local path with a vetted default → repairs the row in place
+        // (same id; marker flips true; base_ref updated) — no second row.
+        let repaired = add_repo_ref(&db, ws.id, "web", "/code/web", "develop", "", true)
+            .await
+            .unwrap();
+        assert_eq!(repaired.id, legacy.id, "re-add must repair in place, not insert");
+        assert!(repaired.base_ref_is_default, "vetted default repaired the marker");
+        assert_eq!(repaired.base_ref, "develop", "vetted base_ref was written through");
+        assert_eq!(list_repos(&db, ws.id).await.unwrap().len(), 1, "no duplicate row");
+
+        // Re-add again WITHOUT a vetted default (is_default=false) must NOT clobber the
+        // now-true marker nor the vetted base_ref.
+        let unchanged = add_repo_ref(&db, ws.id, "web", "/code/web", "whatever", "", false)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.id, legacy.id);
+        assert!(
+            unchanged.base_ref_is_default,
+            "a non-vetted re-add must not downgrade an already-true marker"
+        );
+        assert_eq!(
+            unchanged.base_ref, "develop",
+            "a non-vetted re-add must not overwrite the vetted base_ref"
+        );
+    }
+
     #[tokio::test]
     async fn delete_repo_cascade_removes_repo_and_its_deps_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "")
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
             .await
             .unwrap();
-        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "")
+        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true)
             .await
             .unwrap();
         upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "")
@@ -1454,17 +1691,17 @@ mod tests {
             .await
             .unwrap();
         // a direction bound to repo `a`, with a session + worktree
-        let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl")
+        let dir = create_direction(&db, t.id, "d", "claude", a.id, "reason", "plan+impl", "")
             .await
             .unwrap();
         let sess = create_session(&db, dir.id, a.id, "claude", "/tmp/a-wt")
             .await
             .unwrap();
-        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt")
+        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt", false, true, "")
             .await
             .unwrap();
         // a direction bound to repo `b` — must SURVIVE the delete of `a`
-        let dir_b = create_direction(&db, t.id, "db", "claude", b.id, "reason", "plan+impl")
+        let dir_b = create_direction(&db, t.id, "db", "claude", b.id, "reason", "plan+impl", "")
             .await
             .unwrap();
 
@@ -1485,14 +1722,239 @@ mod tests {
         assert!(get_direction(&db, dir_b.id).await.unwrap().is_some());
     }
 
+    /// R15-1: delete_repo_cascade must carry created_branch in its 4-tuple so
+    #[tokio::test]
+    async fn update_plan_proposal_cas_rejects_a_stale_write() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        upsert_plan(&db, t.id, "P1", "proposed", "t0").await.unwrap();
+        let plan_a = get_plan(&db, t.id).await.unwrap().unwrap(); // read v1 (proposal == "P1")
+        // A re-propose lands AFTER the read but before the CAS write.
+        upsert_plan(&db, t.id, "P2", "proposed", "t0").await.unwrap();
+        // A CAS expecting the STALE P1 must NOT apply (the live proposal is P2).
+        assert!(
+            !update_plan_proposal_cas(&db, t.id, "P3", &plan_a.proposal, "proposed").await.unwrap(),
+            "CAS must reject a write whose expected proposal is stale"
+        );
+        assert_eq!(
+            get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P2",
+            "the stale write left the fresh re-propose intact"
+        );
+        // A CAS expecting the CURRENT P2 applies.
+        assert!(
+            update_plan_proposal_cas(&db, t.id, "P3", "P2", "proposed").await.unwrap(),
+            "CAS applies when expected matches the live proposal"
+        );
+        assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P3");
+    }
+
+    #[tokio::test]
+    async fn mark_plan_confirmed_cas_only_applies_when_proposal_and_status_match() {
+        // R42-4: confirm's final write must flip status -> "confirmed" ONLY if the proposal AND
+        // status are still what it read at the start; a re-propose (or concurrent confirm) in
+        // between must reject, so the fresh proposal isn't marked confirmed with stale lanes.
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        upsert_plan(&db, t.id, "P1", "scoped", "t0").await.unwrap();
+        // Stale proposal -> reject.
+        assert!(
+            !mark_plan_confirmed_cas(&db, t.id, "P0", "scoped").await.unwrap(),
+            "must reject when the expected proposal differs (re-proposed)"
+        );
+        // Drifted status -> reject.
+        assert!(
+            !mark_plan_confirmed_cas(&db, t.id, "P1", "proposed").await.unwrap(),
+            "must reject when the expected status differs"
+        );
+        assert_eq!(
+            get_plan(&db, t.id).await.unwrap().unwrap().status, "scoped",
+            "a rejected CAS left the status untouched"
+        );
+        // Matching proposal + status -> applies; status becomes confirmed, proposal untouched.
+        assert!(
+            mark_plan_confirmed_cas(&db, t.id, "P1", "scoped").await.unwrap(),
+            "must apply when proposal+status match"
+        );
+        let p = get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(p.status, "confirmed");
+        assert_eq!(p.proposal, "P1", "proposal left untouched by the status CAS");
+        // Absent plan -> false.
+        assert!(
+            !mark_plan_confirmed_cas(&db, t.id + 999, "P1", "scoped").await.unwrap(),
+            "must be false when the plan is absent"
+        );
+    }
+
+    /// R32-3: the CAS predicate must also pin `status`. A targeted base/decision edit
+    /// reads a "proposed" plan; if `confirm` flips that SAME proposal JSON to
+    /// "confirmed" before the CAS runs, the proposal still matches — but writing the
+    /// stale "proposed" status back would reopen an already-materialized plan. The
+    /// status guard makes the CAS reject (0 rows) when status drifted.
+    #[tokio::test]
+    async fn update_plan_proposal_cas_preserves_confirmed_status() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        upsert_plan(&db, t.id, "P1", "proposed", "t0").await.unwrap();
+        // The edit read the plan while it was "proposed" (expected status = "proposed").
+        // Meanwhile confirm marked the SAME proposal JSON "confirmed".
+        upsert_plan(&db, t.id, "P1", "confirmed", "t0").await.unwrap();
+        // A CAS whose expected proposal matches the live row but whose status differs
+        // (live="confirmed", call passes "proposed") must NOT apply.
+        assert!(
+            !update_plan_proposal_cas(&db, t.id, "P2", "P1", "proposed").await.unwrap(),
+            "CAS must reject when the live status drifted away from the expected status"
+        );
+        let after = get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.proposal, "P1", "stale-status write must not touch the proposal");
+        assert_eq!(after.status, "confirmed", "the confirmed status must survive the rejected edit");
+        // A CAS that agrees on BOTH proposal and the live status applies.
+        assert!(
+            update_plan_proposal_cas(&db, t.id, "P2", "P1", "confirmed").await.unwrap(),
+            "CAS applies when both proposal and status match the live row"
+        );
+        assert_eq!(get_plan(&db, t.id).await.unwrap().unwrap().proposal, "P2");
+    }
+
+    /// the caller can gate branch deletion. A worktree row with created_branch=false
+    #[tokio::test]
+    async fn worktree_created_branch_defaults_to_true_when_unset() {
+        // A worktree row inserted WITHOUT created_branch (a legacy/pre-column row) must
+        // default to TRUE — pre-this-change worktrees had their branch created by Weft,
+        // so cascade cleanup must still tear those branches down (zero-accumulation).
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "d", "claude", r.id, "x", "plan+impl", "")
+            .await
+            .unwrap();
+        let inserted = worktree::ActiveModel {
+            repo_id: Set(r.id),
+            direction_id: Set(d.id),
+            branch: Set("feat/x".into()),
+            path: Set("/tmp/wt".into()),
+            created_at: Set(now()),
+            created_checkout: Set(true),
+            // created_branch intentionally NotSet → the DB column default applies.
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+        // Re-fetch to read what the DB actually persisted (the default), not the
+        // ActiveModel's unset Rust-side value.
+        let row = worktree::Entity::find_by_id(inserted.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.created_branch, "created_branch must default to true when unset");
+    }
+
+    /// M0028: worktree.base_commit round-trips and an UNSET column defaults to "" (legacy/
+    /// pre-column rows, which the reuse-time fork-commit validation then SKIPS).
+    #[tokio::test]
+    async fn worktree_base_commit_round_trips_and_defaults_to_empty() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "d", "claude", r.id, "x", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // (1) Inserted WITHOUT base_commit (a legacy/pre-column row) → defaults to "".
+        let legacy = worktree::ActiveModel {
+            repo_id: Set(r.id),
+            direction_id: Set(d.id),
+            branch: Set("feat/legacy".into()),
+            path: Set("/tmp/wt-legacy".into()),
+            created_at: Set(now()),
+            created_branch: Set(true),
+            created_checkout: Set(true),
+            // base_commit intentionally NotSet → the DB column default ("") applies.
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+        let legacy_row = worktree::Entity::find_by_id(legacy.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_row.base_commit, "", "base_commit must default to empty when unset");
+
+        // (2) record_worktree persists a non-empty base_commit, and set_worktree_base_commit
+        // updates it — both round-trip through the column.
+        let d2 = create_direction(&db, t.id, "d2", "claude", r.id, "x", "plan+impl", "")
+            .await
+            .unwrap();
+        let rec = record_worktree(&db, r.id, d2.id, "feat/rec", "/tmp/wt-rec", true, true, "abc123")
+            .await
+            .unwrap();
+        assert_eq!(rec.base_commit, "abc123", "record_worktree persists base_commit");
+        set_worktree_base_commit(&db, rec.id, "def456").await.unwrap();
+        let updated = worktree::Entity::find_by_id(rec.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.base_commit, "def456", "set_worktree_base_commit updates the row");
+    }
+
+    /// (pre-existing branch reused by the -b fallback) must have its flag preserved.
+    #[tokio::test]
+    async fn delete_repo_cascade_carries_created_branch_flag() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "repo", "/tmp/r", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "T", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // Record one worktree with created_branch=false (pre-existing branch).
+        record_worktree(&db, r.id, dir.id, "feat/preexist", "/tmp/r-wt", false, true, "")
+            .await
+            .unwrap();
+        // Record another with created_branch=true (weft-created branch).
+        let dir2 = create_direction(&db, t.id, "d2", "claude", r.id, "reason2", "plan+impl", "")
+            .await
+            .unwrap();
+        record_worktree(&db, r.id, dir2.id, "feat/weft-created", "/tmp/r-wt2", true, true, "")
+            .await
+            .unwrap();
+
+        let removed = delete_repo_cascade(&db, r.id).await.unwrap();
+        assert_eq!(removed.len(), 2);
+
+        // Both tuples must carry the correct created_branch flag.
+        let preexist = removed.iter().find(|t| t.1 == "/tmp/r-wt").unwrap();
+        assert!(!preexist.3, "pre-existing branch must have created_branch=false");
+        assert!(preexist.4, "created_checkout defaults to true");
+        let created = removed.iter().find(|t| t.1 == "/tmp/r-wt2").unwrap();
+        assert!(created.3, "weft-created branch must have created_branch=true");
+        assert!(created.4, "created_checkout defaults to true");
+    }
+
     #[tokio::test]
     async fn calibrate_repo_relation_adds_user_edge_then_tombstones_removal() {
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
-        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "")
+        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
-        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "")
+        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
             .await
             .unwrap();
         upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "")
@@ -1535,7 +1997,7 @@ mod tests {
 
         // a producer with no profile row yet (an "analyzing" placeholder) gets a
         // minimal row created so the calibration persists instead of vanishing.
-        let lib = add_repo_ref(&db, ws.id, "lib", "/tmp/lib", "main", "")
+        let lib = add_repo_ref(&db, ws.id, "lib", "/tmp/lib", "main", "", true)
             .await
             .unwrap();
         assert!(get_repo_profile(&db, lib.id).await.unwrap().is_none());
@@ -1871,7 +2333,7 @@ mod tests {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
         assert_eq!(ws.slug, "demo-ws");
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
@@ -1885,6 +2347,7 @@ mod tests {
             repo.id,
             "build the feature",
             "plan+impl",
+            "",
         )
         .await
         .unwrap();
@@ -1893,7 +2356,7 @@ mod tests {
         assert_eq!(dir.reason, "build the feature");
 
         // pretend it was materialized
-        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt")
+        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt", false, true, "")
             .await
             .unwrap();
         assert_eq!(list_worktrees(&db, Some(dir.id)).await.unwrap().len(), 1);
@@ -1906,7 +2369,9 @@ mod tests {
             vec![(
                 repo.id,
                 "/tmp/wt".to_string(),
-                "feature/add-login".to_string()
+                "feature/add-login".to_string(),
+                false,
+                true
             )]
         );
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1); // ws survives
@@ -1926,13 +2391,13 @@ mod tests {
     async fn latest_session_for_returns_newest_with_native() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let thread = create_thread(&db, ws.id, "T", "feature", "claude")
             .await
             .unwrap();
-        let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r", "impl-only")
+        let dir = create_direction(&db, thread.id, "D", "claude", repo.id, "r", "impl-only", "")
             .await
             .unwrap();
         // older session (no native), then newer (native captured)
@@ -2052,12 +2517,12 @@ mod tests {
     async fn apply_to_existing_false_pins_old_sessions_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "w").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "r", "/tmp/x", "main", "", true).await.unwrap();
         // An existing claude lead + worker, created before any alias.
         let old_thread = create_thread(&db, ws.id, "old", "feature", "claude")
             .await
             .unwrap();
-        let dir = create_direction(&db, old_thread.id, "d", "claude", repo.id, "why", "impl-only")
+        let dir = create_direction(&db, old_thread.id, "d", "claude", repo.id, "why", "impl-only", "")
             .await
             .unwrap();
         let old_sess = create_session(&db, dir.id, repo.id, "claude", "/tmp/wt")
@@ -2124,13 +2589,13 @@ mod tests {
     async fn rename_updates_display_name_only() {
         let db = mem().await;
         let ws = create_workspace(&db, "Demo WS").await.unwrap();
-        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let t = create_thread(&db, ws.id, "Add login", "feature", "claude")
             .await
             .unwrap();
-        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl")
+        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
 
@@ -2169,7 +2634,7 @@ mod tests {
         assert!(rename_workspace(&db, ws_b.id, "Alpha").await.is_err());
         assert!(rename_workspace(&db, ws_a.id, "Alpha").await.is_ok());
 
-        let repo = add_repo_ref(&db, ws_a.id, "web-app", "/tmp/x", "main", "")
+        let repo = add_repo_ref(&db, ws_a.id, "web-app", "/tmp/x", "main", "", true)
             .await
             .unwrap();
         let t1 = create_thread(&db, ws_a.id, "Login", "feature", "claude")
@@ -2186,15 +2651,15 @@ mod tests {
             .unwrap();
         assert!(rename_thread(&db, t3.id, "Login").await.is_ok());
 
-        let d1 = create_direction(&db, t1.id, "api", "claude", repo.id, "r", "plan+impl")
+        let d1 = create_direction(&db, t1.id, "api", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
-        let d2 = create_direction(&db, t1.id, "ui", "claude", repo.id, "r", "plan+impl")
+        let d2 = create_direction(&db, t1.id, "ui", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
         assert!(rename_direction(&db, d2.id, "api").await.is_err());
         // same direction name under a DIFFERENT thread is fine
-        let d3 = create_direction(&db, t2.id, "main", "claude", repo.id, "r", "plan+impl")
+        let d3 = create_direction(&db, t2.id, "main", "claude", repo.id, "r", "plan+impl", "")
             .await
             .unwrap();
         assert!(rename_direction(&db, d3.id, "api").await.is_ok());
@@ -2256,5 +2721,48 @@ mod tests {
         let d = add_skill_source(&db, url, Some("main")).await.unwrap();
         assert_ne!(a.id, d.id);
         assert_eq!(list_skill_sources(&db).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_direction_persists_base_and_defaults_target() {
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("weft-cdbase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo_path = root.join("api");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t.t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            Cmd::new("git").args(&args).current_dir(&repo_path).status().unwrap();
+        }
+        std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
+        Cmd::new("git").args(["add", "-A"]).current_dir(&repo_path).status().unwrap();
+        Cmd::new("git").args(["commit", "-q", "-m", "init"]).current_dir(&repo_path).status().unwrap();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // A concrete base → stored, and target_branch defaults to it.
+        let d = create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "develop")
+            .await
+            .unwrap();
+        assert_eq!(d.base_branch, "develop");
+        assert_eq!(d.target_branch, "develop", "target defaults to the chosen base");
+
+        // Empty base → both empty (each resolves to the repo default later).
+        let d2 = create_direction(&db, t.id, "y", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        assert_eq!(d2.base_branch, "");
+        assert_eq!(d2.target_branch, "", "empty base leaves target empty (= repo default)");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

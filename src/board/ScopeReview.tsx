@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import {
@@ -24,6 +24,7 @@ type ScopeLane =
       repoKnown: boolean;
       direction: ResolvedDirection;
       order: number;
+      dirIndex: number;
     }
   | {
       key: string;
@@ -53,6 +54,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
         repoKnown: entry.known,
         direction,
         order: dirIndex + 1,
+        dirIndex,
       });
     });
     const noneLanes: ScopeLane[] = repos
@@ -125,7 +127,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
             </div>
             <div className="flex flex-col gap-2">
               {lanes.map((lane, index) => (
-                <ScopeLaneRow key={lane.key} lane={lane} index={index} />
+                <ScopeLaneRow key={lane.key} lane={lane} index={index} confirming={confirming} />
               ))}
             </div>
           </div>
@@ -154,9 +156,12 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
   );
 }
 
-function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
+function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: number; confirming: boolean }) {
   const { t } = useTranslation();
-  const { defaultTool } = useStore();
+  const { defaultTool, setProposalDirectionBase, proposal } = useStore();
+  // Per-proposal version: changes on EVERY re-proposal (R50-2). Threaded into BaseBranchField so a
+  // re-propose with the same name/repo/base still resets a dirty (unblurred) base edit.
+  const proposalVersion = proposal?.created_at ?? "";
   const write = lane.role === "write";
   return (
     <motion.div
@@ -228,6 +233,15 @@ function ScopeLaneRow({ lane, index }: { lane: ScopeLane; index: number }) {
               ? t("scope.mandateImpl")
               : t("scope.mandatePlan")}
           </span>
+          <BaseBranchField
+            index={lane.dirIndex}
+            name={lane.direction.name}
+            repo={lane.repoName}
+            value={lane.direction.base_branch}
+            version={proposalVersion}
+            disabled={confirming || !!lane.direction.decision}
+            onSave={setProposalDirectionBase}
+          />
           {index > 0 && (
             <span className="hidden shrink-0 items-center gap-1 rounded-full border border-brand/30 bg-brand-ghost px-2 py-0.5 text-[10.5px] text-brand lg:flex">
               <Clock size={11} />
@@ -254,6 +268,118 @@ function SummaryPill({ tone, label }: { tone: "write" | "none"; label: string })
         )}
       />
       {label}
+    </span>
+  );
+}
+
+function BaseBranchField({
+  index,
+  name,
+  repo,
+  value,
+  version,
+  disabled,
+  onSave,
+}: {
+  index: number;
+  name: string;
+  repo: string;
+  value: string;
+  /** Per-proposal version (R50-2): changes on EVERY re-proposal, so a re-propose with the SAME
+   * name/repo/value still discards an unblurred (dirty) edit. */
+  version: string;
+  disabled: boolean;
+  onSave: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [val, setVal] = useState(value ?? "");
+  const lastLoaded = useRef(value ?? "");
+  // Always the LATEST persisted base. A rejected save's handler must revert to this, not
+  // the stale `value` its render captured: a same-identity re-propose can change the base
+  // while an older save is in flight, and reverting to the old closure value would put a
+  // stale base back into the field (which a later Create/Approve blur would then save).
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const lastIdentity = useRef(`${name}\0${repo}`);
+  const lastVersion = useRef(version);
+  useEffect(() => {
+    const identity = `${name}\0${repo}`;
+    // Reset the input when the persisted value changes, OR the lane IDENTITY (name/repo)
+    // changes, OR the proposal VERSION changes. A re-propose can swap the lane in this slot
+    // without changing `value`; and a re-propose of the SAME lane with the SAME base changes
+    // neither identity nor value — only the version — so include it (R50-2) to discard a dirty
+    // edit that would otherwise blur-save the stale value onto the fresh proposal.
+    if (
+      identity !== lastIdentity.current ||
+      version !== lastVersion.current ||
+      (value ?? "") !== lastLoaded.current
+    ) {
+      lastIdentity.current = identity;
+      lastVersion.current = version;
+      lastLoaded.current = value ?? "";
+      setVal(value ?? "");
+    }
+  }, [name, repo, value, version]);
+  const skipNextBlur = useRef(false);
+  const save = () => {
+    if (disabled) return;
+    if (skipNextBlur.current) {
+      skipNextBlur.current = false;
+      return;
+    }
+    const next = val.trim();
+    if (next === (value ?? "").trim()) return; // unchanged
+    // The lane this save belongs to. A re-propose can swap a DIFFERENT lane into this
+    // keyed slot while the save is in flight; the resolve/reject handlers below must
+    // not touch the input or load-tracking once that's happened, or they'd clobber the
+    // new lane's freshly-reset state with this (old) lane's value.
+    const savedIdentity = `${name}\0${repo}`;
+    // The persisted base this field was editing FROM. The backend rejects the save if a
+    // same-identity (same name+repo) re-propose changed the lane's base meanwhile —
+    // optimistic concurrency the name/repo + CAS guards can't catch on their own.
+    const expectedOldBase = value ?? "";
+    void onSave(index, name, repo, next, expectedOldBase)
+      .then(() => {
+        if (lastIdentity.current === savedIdentity) {
+          lastLoaded.current = next; // mark loaded only after the save actually lands
+        }
+      })
+      .catch(() => {
+        // Save failed — revert the field to the LATEST persisted value (valueRef, not the
+        // stale closure `value`) so a same-identity re-propose's fresh base isn't replaced
+        // by this old save's stale one. Only when this row still shows the same lane (see
+        // savedIdentity) — else we'd overwrite a different lane.
+        if (lastIdentity.current === savedIdentity) {
+          setVal(valueRef.current ?? "");
+        }
+      });
+  };
+  return (
+    <span
+      className="flex shrink-0 items-center gap-1"
+      title={t("scope.baseBranchHint")}
+    >
+      <GitBranch size={11} className="text-ink-faint" />
+      <input
+        value={val}
+        disabled={disabled}
+        onChange={(e) => setVal(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            (e.target as HTMLInputElement).blur();
+          } else if (e.key === "Escape") {
+            skipNextBlur.current = true;
+            setVal(value ?? "");
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        placeholder={t("scope.basePlaceholderDefault")}
+        spellCheck={false}
+        aria-label={t("scope.baseBranch")}
+        className="w-24 min-w-0 rounded-[var(--radius-sm)] border border-border bg-bg px-1.5 py-0.5 font-mono text-[10.5px] text-ink outline-none focus:border-brand disabled:cursor-not-allowed disabled:opacity-50"
+      />
     </span>
   );
 }

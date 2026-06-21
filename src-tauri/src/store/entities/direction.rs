@@ -32,6 +32,11 @@ pub struct Model {
     /// changes against the merge-base with `origin/<target_branch>`.
     #[sea_orm(default_value = "")]
     pub target_branch: String,
+    /// The ref the work branch is created OFF at materialize time (the base).
+    /// Empty = the repo's default branch, resolved live from origin/HEAD. Distinct
+    /// from `target_branch` (diff-comparison only); fixed once the worktree exists.
+    #[sea_orm(default_value = "")]
+    pub base_branch: String,
     pub created_at: String,
 }
 

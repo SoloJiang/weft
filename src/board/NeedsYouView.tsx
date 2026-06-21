@@ -129,6 +129,17 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
       <p className="px-3.5 pb-1 pt-1.5 text-[14px] leading-relaxed text-ink">
         {item.reason}
       </p>
+      {item.base_branch && (
+        <div className="px-3.5 pb-2">
+          <span
+            title={t("scope.baseBranch")}
+            className="inline-flex items-center gap-1 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] font-mono text-ink-faint"
+          >
+            <GitBranch size={10} />
+            {item.base_branch}
+          </span>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5">
         <Button
           variant="primary"

@@ -34,7 +34,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 }
 
 /// True if `r` resolves to a commit in `dir` (non-empty + `rev-parse` verifies).
-fn ref_resolves(dir: &Path, r: &str) -> bool {
+pub fn ref_resolves(dir: &Path, r: &str) -> bool {
     !r.is_empty()
         && Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")])
@@ -44,21 +44,92 @@ fn ref_resolves(dir: &Path, r: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Fully-qualified ref for a LOCAL branch — `refs/heads/<name>`. Use everywhere a branch
+/// name is checked/used so a same-named TAG (which bare `<name>` would match first) can't
+/// shadow it. This is the canonical spelling for the whole module; route inline
+/// `format!("refs/heads/{…}")` ref sites through it for one source of truth.
+pub fn local_branch_ref(name: &str) -> String {
+    format!("refs/heads/{name}")
+}
+
+/// Fully-qualified ref for the remote-tracking branch — `refs/remotes/origin/<name>`. Use
+/// instead of the short `origin/<name>`, which a local branch literally named `origin/<name>`
+/// (`refs/heads/origin/<name>`) would shadow. Canonical spelling for the whole module.
+fn remote_branch_ref(name: &str) -> String {
+    format!("refs/remotes/origin/{name}")
+}
+
+/// Collapse a fully-qualified branch ref back to the SHORT form shown to the user:
+/// `refs/remotes/origin/<name>` → `origin/<name>` (keeps the remote-vs-local distinction the
+/// UI surfaces), `refs/heads/<name>` → `<name>`. Resolution uses fully-qualified refs to dodge
+/// tag / local-`origin/*` shadowing, but the displayed "comparing against" label stays clean.
+/// A non-branch ref (a tag name, raw SHA, or the default-chain name) is returned unchanged.
+fn display_ref(r: &str) -> String {
+    if let Some(name) = r.strip_prefix("refs/remotes/origin/") {
+        return format!("origin/{name}");
+    }
+    r.strip_prefix("refs/heads/").unwrap_or(r).to_string()
+}
+
+/// True when `t` is a FULL commit object id (any hash format — SHA-1 40-hex or SHA-256
+/// 64-hex), as opposed to a branch name or an abbreviation. Uses git object identity, not a
+/// hard-coded length: an all-hex string that `rev-parse --verify` resolves to a commit whose
+/// canonical oid equals `t` itself (a branch/abbrev resolves to a DIFFERENT full oid).
+pub fn is_full_commit_oid(repo: &Path, t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() || !t.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    match git(repo, &["rev-parse", "--verify", "-q", &format!("{t}^{{commit}}")]) {
+        Ok(out) => out.trim() == t,
+        Err(_) => false,
+    }
+}
+
 /// The bare branch name a user means for the diff target: trimmed, with a
 /// leading `origin/` (the remote the UI surfaces) stripped — so typing or
 /// pasting `origin/main` behaves like `main` for BOTH the fetch refspec
 /// (`git fetch origin main`, not the failing `git fetch origin origin/main`)
 /// and ref resolution.
-fn normalize_target(target: &str) -> String {
+pub fn normalize_target(target: &str) -> String {
     let t = target.trim();
+    // Strip a refs/remotes/origin/ prefix first: the remote base is now carried FULLY
+    // QUALIFIED (refs/remotes/origin/<name>) so worktree-add + ancestry resolve the
+    // remote-tracking ref unambiguously (a local branch literally named `origin/<name>`
+    // can't shadow it), but the RECORDED branched_from must stay the bare branch name.
+    let t = t.strip_prefix("refs/remotes/origin/").unwrap_or(t);
+    // Strip a refs/heads/ prefix next: the local-branch base is stored QUALIFIED
+    // (refs/heads/<name>) so worktree-add + ancestry use an unambiguous ref, but the
+    // RECORDED branched_from must stay the bare branch name.
+    let t = t.strip_prefix("refs/heads/").unwrap_or(t);
     t.strip_prefix("origin/").unwrap_or(t).to_string()
 }
 
 /// Resolve a usable base commit-ish for a NEW worktree branch: prefer the repo's
 /// recorded base_ref; if it no longer resolves, fall back through origin/HEAD →
 /// main → master → HEAD so worktree creation never silently branches off whatever
-/// happens to be checked out in the canonical repo.
+/// happens to be checked out in the canonical repo. Every returned BRANCH is
+/// FULLY-QUALIFIED (refs/heads/<name> | refs/remotes/origin/<name>) so it's an
+/// unambiguous `worktree add` start-point; `normalize_target` collapses it back to the
+/// bare name for the recorded `branched_from` / `base_branch` (see materialize.rs).
 fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
+    // The recorded base_ref may be bare (`develop`), short-remote (`origin/develop`), or
+    // already qualified. Resolve it BRANCH-FIRST in both namespaces so a same-named TAG
+    // (R46-1, bare `<name>` matches the tag) or a local branch literally named
+    // `origin/<name>` (R46-2) can't shadow the real branch. Return the qualified ref.
+    let n = normalize_target(recorded);
+    if !n.is_empty() && n != "HEAD" {
+        if ref_resolves(repo, &local_branch_ref(&n)) {
+            return local_branch_ref(&n);
+        }
+        if ref_resolves(repo, &remote_branch_ref(&n)) {
+            return remote_branch_ref(&n);
+        }
+    }
+    // Not a branch in either namespace: a recorded TAG or raw SHA (e.g. a detached-HEAD
+    // base captured as a commit) may still legitimately resolve as a commit-ish. Accept the
+    // recorded value verbatim then (a bare commit-ish is a fine start-point and normalizes
+    // to itself), mirroring resolve_target_ref's tag/sha fallback.
     if ref_resolves(repo, recorded) {
         return recorded.to_string();
     }
@@ -68,15 +139,28 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
         .output()
     {
         if out.status.success() {
+            // `--short` yields `origin/<name>`; qualify to refs/remotes/origin/<name> so a
+            // local branch literally named `origin/<name>` can't shadow the remote default,
+            // and return that qualified ref (an unambiguous start-point).
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if ref_resolves(repo, &s) {
-                return s;
+            let name = s.strip_prefix("origin/").unwrap_or(&s);
+            let remote = remote_branch_ref(name);
+            if ref_resolves(repo, &remote) {
+                return remote;
             }
         }
     }
-    for c in ["main", "master", "origin/main", "origin/master"] {
-        if ref_resolves(repo, c) {
-            return c.to_string();
+    // Conventional integration branch. Qualify the LOCAL check as `refs/heads/<c>` so a
+    // same-named TAG (e.g. a `main` tag in a repo whose real default is `master`) can't
+    // masquerade as the branch; qualify the REMOTE check as `refs/remotes/origin/<c>` so a
+    // local branch literally named `origin/<c>` (refs/heads/origin/<c>) can't shadow the
+    // remote-tracking ref and wrongly pin main/master. Return the qualified ref that hit.
+    for c in ["main", "master"] {
+        if ref_resolves(repo, &local_branch_ref(c)) {
+            return local_branch_ref(c);
+        }
+        if ref_resolves(repo, &remote_branch_ref(c)) {
+            return remote_branch_ref(c);
         }
     }
     "HEAD".to_string()
@@ -87,40 +171,210 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
 /// else detected via origin/HEAD → main → master. Used as the placeholder /
 /// fallback when a direction has no explicit target_branch.
 pub fn default_target_branch(worktree: &Path, base_ref: &str) -> String {
-    let strip = |s: &str| s.strip_prefix("origin/").unwrap_or(s).to_string();
+    // normalize_target collapses ANY ref spelling to the bare branch name — the short
+    // `origin/<name>` the UI shows AND the fully-qualified `refs/heads/<name>` /
+    // `refs/remotes/origin/<name>` that resolve_base_ref now returns. (A plain `origin/`
+    // strip alone would leave a qualified ref intact and surface `refs/heads/main` as the
+    // "target branch".)
     let b = base_ref.trim();
     // A repo registered while detached records base_ref = "HEAD" — that's not a
     // real branch, so treat it like "unset" and detect, rather than letting the
     // default target become "HEAD" (which would resolve to the worker's own HEAD
     // and hide all committed task changes).
     if !b.is_empty() && b != "HEAD" {
-        return strip(b);
+        return normalize_target(b);
     }
     let detected = resolve_base_ref(worktree, "");
     if detected == "HEAD" {
         "main".to_string()
     } else {
-        strip(&detected)
+        normalize_target(&detected)
     }
 }
 
-/// Resolve the ref to compare a target branch against: prefer the (freshly
-/// fetched) remote `origin/<target>`, else a local `<target>`, else fall back
-/// through the repo's default-branch chain (origin/HEAD → main → master → HEAD).
+/// Resolve the ref to compare a target branch against. When both `origin/<target>` and
+/// a local `<target>` exist and have DIVERGED, pick the one the WORKTREE actually forked
+/// from: its merge-base with the worktree's HEAD is the more recent (the fork point),
+/// while the diverged ref's merge-base is an older common ancestor. This is correct in
+/// BOTH directions — a worktree branched off a fresh `origin/<target>` (with a diverged
+/// local) compares against origin, and one branched off a local `<target>` (with a stale
+/// origin) compares against local. On ties (no divergence) prefer the fetched remote.
+/// Else fall back through the default-branch chain (origin/HEAD → main → master → HEAD).
 fn resolve_target_ref(worktree: &Path, target: &str) -> String {
     let t = normalize_target(target);
     // "HEAD" is not a real target branch (see default_target_branch); falling
     // through to the default chain avoids merge-base(HEAD, HEAD) hiding commits.
     if !t.is_empty() && t != "HEAD" {
-        let remote = format!("origin/{t}");
-        if ref_resolves(worktree, &remote) {
+        // FULLY-QUALIFIED on both sides: refs/remotes/origin/<t> (R46-2 — a local branch
+        // literally named `origin/<t>` would shadow the short `origin/<t>`) and refs/heads/<t>
+        // (R46-1 — a bare `<t>` resolves a same-named TAG before the branch). So a BRANCH named
+        // <t> in either namespace can never be shadowed by a tag or a decoy local branch.
+        let remote = remote_branch_ref(&t);
+        let local = local_branch_ref(&t);
+        let remote_ok = ref_resolves(worktree, &remote);
+        let local_ok = ref_resolves(worktree, &local);
+        if remote_ok && local_ok {
+            // merge-base recency: prefer the ref the worktree ACTUALLY forked from. The ref it
+            // descends from has the more recent merge-base; the diverged ref's is an older
+            // common ancestor.
+            let mb_remote = git(worktree, &["merge-base", "HEAD", &remote]).ok();
+            let mb_local = git(worktree, &["merge-base", "HEAD", &local]).ok();
+            match (mb_remote, mb_local) {
+                (Some(mr), Some(ml)) => {
+                    // Both share history with HEAD — forked from origin when local's merge-base
+                    // is an ancestor of origin's (origin's fork point is at least as recent);
+                    // covers the no-divergence tie too.
+                    let forked_from_origin =
+                        git(worktree, &["merge-base", "--is-ancestor", &ml, &mr]).is_ok();
+                    return if forked_from_origin { remote } else { local };
+                }
+                // Only ONE side shares history with HEAD — that's the ref the worktree actually
+                // forked from. The other (e.g. an `origin/<t>` force-pushed to UNRELATED history)
+                // has no merge-base and would make the Diff tab compare against unrelated commits
+                // (huge/noisy). Return the side that HAS a merge-base.
+                (Some(_), None) => return remote,
+                (None, Some(_)) => return local,
+                // Neither shares history with HEAD — fall through to the existence preference.
+                (None, None) => {}
+            }
+        }
+        if remote_ok {
             return remote;
         }
+        if local_ok {
+            return local;
+        }
+        // No BRANCH by that name in either namespace — fall back to the bare commit-ish so a
+        // user can still diff vs a legitimately-named TAG or a raw SHA they set as the target.
         if ref_resolves(worktree, &t) {
             return t;
         }
     }
     resolve_base_ref(worktree, "")
+}
+
+/// The remote's default branch *name* (origin/HEAD's target, `origin/` stripped),
+/// or None when no remote-tracking HEAD is set locally (no remote, or a repo added
+/// by path that was never cloned / `git remote set-head`). Local-only; no network.
+fn remote_default_branch(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let name = s.strip_prefix("origin/").unwrap_or(&s).to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The default BASE branch name for a NEW worktree (and the value captured as a
+/// repo's base_ref at add time). Precedence: (1) the remote's default (origin/HEAD)
+/// if its REMOTE-tracking ref `origin/<name>` still resolves — validated against the
+/// remote ref, NOT a coincidentally same-named local branch, so a stale origin/HEAD
+/// can't pin an old local feature branch as the "remote default"; (2) the conventional
+/// integration branch main/master (local or origin/) — a repo added on a feature branch
+/// without origin/HEAD must not default to that feature branch; (3) the recorded
+/// `base_ref` if it resolves (non-standard repos, e.g. a "trunk"/"develop" default with
+/// no origin/HEAD and no main/master); (4) "main". Returns a bare branch name.
+pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
+    default_base_branch_vetted(repo, base_ref).0
+}
+
+/// Like `default_base_branch`, but also reports whether the chosen base is a genuinely
+/// VETTED default — i.e. it came from the remote default (origin/HEAD, tier 1) or a real
+/// `main`/`master` branch (tier 2). The recorded-base-resolves fallback (tier 3, e.g. a
+/// nonstandard "trunk"/"develop" checkout) and the "main" last-resort (tier 4) are NOT
+/// vetted: they're whatever happened to be checked out / a coincidental last resort.
+///
+/// `register_repo` (R47-2) uses this to set `base_ref_is_default` HONESTLY: marking a
+/// non-vetted fallback as the captured default would make the offline fallback
+/// (`recorded_base_or_default`) trust it over the main/master chain. Returns
+/// `(bare branch name, vetted)`; the name is IDENTICAL to `default_base_branch` so
+/// behavior is unchanged — only the boolean is new.
+pub fn default_base_branch_vetted(repo: &Path, base_ref: &str) -> (String, bool) {
+    if let Some(name) = remote_default_branch(repo) {
+        // Validate the cached origin/HEAD against its REMOTE-tracking ref only: a local
+        // branch that happens to share the name must not vouch for a stale origin/HEAD
+        // whose upstream branch is gone. Qualify as `refs/remotes/origin/<name>` so a local
+        // branch literally named `origin/<name>` can't masquerade as the remote ref.
+        if ref_resolves(repo, &remote_branch_ref(&name)) {
+            return (name, true);
+        }
+    }
+    for c in ["main", "master"] {
+        if ref_resolves(repo, &local_branch_ref(c)) || ref_resolves(repo, &remote_branch_ref(c)) {
+            return (c.to_string(), true);
+        }
+    }
+    let b = base_ref.trim();
+    let b = b.strip_prefix("origin/").unwrap_or(b);
+    if !b.is_empty()
+        && b != "HEAD"
+        && (ref_resolves(repo, &local_branch_ref(b)) || ref_resolves(repo, &remote_branch_ref(b)))
+    {
+        // Tier 3: the recorded base resolves but it's a fallback (no origin/HEAD, no
+        // main/master) — NOT a vetted default.
+        return (b.to_string(), false);
+    }
+    // Tier 4: "main" last resort — also not vetted.
+    ("main".to_string(), false)
+}
+
+/// The default base for the OFFLINE fallback (when `live_default_branch` is
+/// unavailable): prefer the recorded `base_ref` when it was captured as the repo's
+/// real DEFAULT branch (`is_default`) AND it still resolves (local `<base_ref>` or
+/// remote `origin/<base_ref>`) — a genuinely-captured default is more trustworthy
+/// than a possibly stale cached `origin/HEAD`. `is_default` is the load-bearing
+/// signal: a LEGACY base_ref (the pre-marker current-branch capture on an upgraded
+/// DB) is NOT trusted even when it resolves, because a pushed legacy feature branch
+/// whose `origin/<base_ref>` exists is indistinguishable BY VALUE from a real
+/// non-standard default — trusting it would pin new work to that legacy branch.
+/// Otherwise fall through to `default_base_branch` (cached origin/HEAD → main/master
+/// → a resolvable base_ref → main). Returns a bare branch name (no `origin/`).
+pub fn recorded_base_or_default(repo: &Path, base_ref: &str, is_default: bool) -> String {
+    let b = base_ref.trim();
+    let b = b.strip_prefix("origin/").unwrap_or(b);
+    if is_default
+        && !b.is_empty()
+        && b != "HEAD"
+        && (ref_resolves(repo, &local_branch_ref(b)) || ref_resolves(repo, &remote_branch_ref(b)))
+    {
+        return b.to_string();
+    }
+    default_base_branch(repo, base_ref)
+}
+
+/// The remote's CURRENT default branch name via `git ls-remote --symref origin HEAD`
+/// — queries the remote directly, so it works even for narrowed/single-branch clones
+/// where the default moved to an unfetched branch (unlike `git remote set-head --auto`,
+/// which needs the ref already fetched). None offline / no remote / parse miss.
+/// GIT_TERMINAL_PROMPT=0 fails fast instead of prompting.
+pub fn live_default_branch(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    // First line looks like: "ref: refs/heads/<branch>\tHEAD"
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("ref: ") {
+            if let Some(refname) = rest.split_whitespace().next() {
+                let name = refname.strip_prefix("refs/heads/").unwrap_or(refname);
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// PR-style diff (files + patch + the ref compared against) of a worktree
@@ -133,22 +387,11 @@ pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<Ta
     // Normalize so a remote-prefixed input (e.g. the `origin/main` the UI shows)
     // fetches as `main` rather than failing on `git fetch origin origin/main`.
     let target = normalize_target(target);
-    if fetch && !target.is_empty() && target != "HEAD" {
-        // Explicit destination refspec so the branch lands in
-        // refs/remotes/origin/<target> regardless of the clone's configured
-        // remote.origin.fetch — a --single-branch clone otherwise drops an
-        // unmapped branch in FETCH_HEAD only, and resolve_target_ref would
-        // miss origin/<target> and silently fall back to the default branch.
-        // Best-effort (offline / no remote / branch absent must not abort the
-        // diff); GIT_TERMINAL_PROMPT=0 makes a credential-needing fetch fail
-        // fast instead of hanging on a prompt.
-        let refspec = format!("+{target}:refs/remotes/origin/{target}");
-        let _ = Command::new("git")
-            .args(["fetch", "--quiet", "origin", &refspec])
-            .current_dir(worktree_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output();
+    if fetch {
+        fetch_origin_branch(worktree_path, &target);
     }
+    // FULLY-QUALIFIED ref (refs/heads/<t> | refs/remotes/origin/<t> | a commit-ish fallback) so
+    // the merge-base can't be computed against a same-named tag or a decoy local `origin/<t>`.
     let resolved = resolve_target_ref(worktree_path, &target);
     // PR-style base = merge-base(resolved, HEAD). If it fails (unrelated
     // histories / missing ref), fall back to diffing against the resolved ref
@@ -162,7 +405,9 @@ pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<Ta
     Ok(TargetDiff {
         files,
         patch,
-        resolved,
+        // The displayed "comparing against" label stays the clean short form
+        // (`origin/<t>` / `<t>`); only the internal merge-base used the qualified ref.
+        resolved: display_ref(&resolved),
     })
 }
 
@@ -184,6 +429,9 @@ pub fn add_worktree(
     }
     let path_str = worktree_path.to_string_lossy().to_string();
     let base = resolve_base_ref(repo, base_ref);
+    // Prune stale registrations (a dir removed out-of-band) so `worktree add` recreates
+    // instead of failing on the leftover registration; safe no-op when none are stale.
+    git(repo, &["worktree", "prune"]).ok();
     let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &base]);
     if res.is_err() {
         git(repo, &["worktree", "add", &path_str, branch])
@@ -192,12 +440,314 @@ pub fn add_worktree(
     Ok(worktree_path.to_path_buf())
 }
 
+/// Best-effort fetch of one branch from origin into refs/remotes/origin/<branch>.
+/// Explicit destination refspec so the branch lands in remote-tracking refs even
+/// under a `--single-branch` clone's narrowed remote.origin.fetch; GIT_TERMINAL_PROMPT=0
+/// fails fast instead of hanging on a credential prompt. Returns true when the fetch
+/// actually succeeded (the remote was reachable and returned data), false otherwise —
+/// callers use this to distinguish "freshly synced" from "stale ref already present".
+/// `dir` may be the canonical repo or any of its worktrees.
+pub fn fetch_origin_branch(dir: &Path, branch: &str) -> bool {
+    let b = normalize_target(branch);
+    if b.is_empty() || b == "HEAD" {
+        return false;
+    }
+    // Source side is branch-namespaced (refs/heads/<b>) so ONLY a branch named `b`
+    // on origin lands in refs/remotes/origin/<b>; a same-named TAG no longer leaks
+    // into the remote-tracking branch namespace and can't be mistaken for a base.
+    let refspec = format!("+refs/heads/{b}:refs/remotes/origin/{b}");
+    Command::new("git")
+        .args(["fetch", "--quiet", "origin", &refspec])
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Outcome of `add_worktree_synced`. `created_checkout`/`created_branch` drive
+/// rollback: remove the checkout when WE created it; delete the branch only when WE
+/// created it (a pre-existing branch reused by the fallback must survive). `synced`
+/// is true only when it branched off a freshly-fetched `origin/<base>` (false = a
+/// local/stale ref, an existing-branch checkout, or a reused path).
+/// `branched_from` is the normalized ref we actually branched off (non-empty only
+/// on the `-b` success path where we created a new branch); empty for the
+/// existing-branch fallback and the path-reuse path.
+pub struct WorktreeAdd {
+    pub path: PathBuf,
+    pub created_checkout: bool,
+    pub created_branch: bool,
+    pub synced: bool,
+    pub branched_from: String,
+    /// The COMMIT this lane's work branch is anchored to — a STABLE fork point used for reuse-time
+    /// ancestry validation (a branch later reset onto a different base no longer descends from it).
+    /// Captured on EVERY arm that records a usable anchor: the `worktree add -b <branch> <resolved>`
+    /// success path uses the resolved base's tip (the true fork point of the fresh branch); the `-b`
+    /// fallback adopting a pre-existing branch uses the validated resolved base's commit (R51-2); the
+    /// path-exists arm adopting a crash orphan uses the work branch's CURRENT commit (R53-2, the
+    /// orphan's tip ≈ its fork point). Best-effort: empty when the rev-parse fails (e.g. base is
+    /// HEAD / gone). Persisted as worktree.base_commit; when empty, materialize SKIPS the fork-point
+    /// check (no recorded point to validate against).
+    pub base_commit: String,
+}
+
+/// True when `worktree_path` is a worktree REGISTERED TO `repo` and checked out on
+/// `branch` — i.e. `list_worktrees(repo)` contains an entry whose canonicalized path
+/// equals `canonicalize(worktree_path)` AND whose branch equals `branch`. Checking only
+/// for a `.git` + a matching HEAD name is not enough: a stale plain dir, a checkout for a
+/// DIFFERENT branch, OR a checkout belonging to a DIFFERENT repository could sit at a
+/// deterministic path; `list_worktrees` reads THIS repo's own registry, so anything not
+/// registered here is refused. Path comparison is by canonicalized form so a
+/// symlinked/`..` spelling still matches.
+pub fn is_registered_worktree(repo: &Path, worktree_path: &Path, branch: &str) -> bool {
+    let want = std::fs::canonicalize(worktree_path).ok();
+    list_worktrees(repo)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|(p, b)| b == branch && std::fs::canonicalize(&p).ok() == want)
+}
+
+/// True when `branch` DESCENDS FROM `base` in `repo` — i.e.
+/// `git merge-base --is-ancestor <base> <branch>` succeeds (base is an ancestor of
+/// branch). Used to verify a reused branch was actually forked from a requested
+/// explicit base before recording that base.
+pub fn branch_descends_from(repo: &Path, branch: &str, base: &str) -> bool {
+    // Qualify the DESCENDANT (work-branch) side as `refs/heads/<branch>` so a TAG sharing
+    // the branch name can't shadow the real branch (bare `<branch>` resolves a same-named
+    // tag first), which would let a reset branch be accepted as based on `base`.
+    git(repo, &["merge-base", "--is-ancestor", base, &local_branch_ref(branch)]).is_ok()
+}
+
+/// Branch-qualified existence check: true only when `refs/heads/<branch>` resolves — a bare
+/// `ref_resolves(repo, branch)` would also accept a same-named TAG, so use this where the
+/// question is specifically "does the local BRANCH exist?".
+pub fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+    ref_resolves(repo, &local_branch_ref(branch))
+}
+
+/// True when `ancestor` is an ancestor of `descendant` — i.e.
+/// `git merge-base --is-ancestor <ancestor> <descendant>` succeeds. Both args are passed to
+/// git verbatim (callers qualify refs themselves, e.g. `local_branch_ref`); a recorded fork
+/// COMMIT oid needs no qualification. Used to validate a reused work branch still descends from
+/// the STABLE commit it was forked from, instead of a re-resolved (moving) base name.
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(repo, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+}
+
+/// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
+/// branches the new worktree off the FRESH `origin/<base_name>` when possible (see
+/// `WorktreeAdd` for what it reports). `require_resolvable` = the base was an explicit
+/// user/lead choice: if it resolves to neither `origin/<base>` nor local `<base>`
+/// (even after fetch), return an error rather than silently using the repo default.
+/// When false (empty/default base), fall back through the default-branch chain so the
+/// worktree is still created.
+pub fn add_worktree_synced(
+    repo: &Path,
+    branch: &str,
+    worktree_path: &Path,
+    base_name: &str,
+    require_resolvable: bool,
+) -> Result<WorktreeAdd> {
+    let fetched = fetch_origin_branch(repo, base_name);
+    let t = normalize_target(base_name);
+    // FULLY-QUALIFIED remote-tracking ref (refs/remotes/origin/<t>), not the short `origin/<t>`:
+    // a LOCAL branch literally named `origin/<t>` (refs/heads/origin/<t>) would otherwise shadow
+    // the short form and be branched off instead of the freshly-fetched remote tip (R43-2). The
+    // qualified ref is unambiguous for the start-point, the ancestry base, and the `synced` check.
+    let remote = remote_branch_ref(&t);
+    let nonempty = !t.is_empty() && t != "HEAD";
+    let resolved_opt = if nonempty && fetched && ref_resolves(repo, &remote) {
+        // A freshly-fetched remote ref — trustworthy.
+        Some(remote.clone())
+    } else if nonempty && ref_resolves(repo, &local_branch_ref(&t)) {
+        // A local BRANCH the user already has. Qualified as refs/heads/<t> so a local
+        // TAG named `t` is NOT accepted as a base (bare `ref_resolves(t)` is true for a
+        // tag too). Store the QUALIFIED ref (not bare `t`): it's the `worktree add -b … <ref>`
+        // start-point and the ancestry base, so a repo with BOTH a branch and a tag named `t`
+        // resolves unambiguously to the branch instead of failing on an ambiguous short ref.
+        // The remote-tracking ref is carried as refs/remotes/origin/<t> for the same reason.
+        Some(local_branch_ref(&t))
+    } else if nonempty && !require_resolvable && ref_resolves(repo, &remote) {
+        // A STALE remote-tracking ref (the fetch failed — offline, or the branch was
+        // deleted upstream). Trusted only for the lenient default/empty path; an
+        // EXPLICIT base must be currently confirmable (fresh fetch or a local branch),
+        // so a stale-only `origin/<base>` is rejected below rather than silently
+        // branching off a possibly-deleted branch.
+        Some(remote.clone())
+    } else {
+        None
+    };
+    // An explicit base must resolve to a CURRENT ref — even when we're about to reuse
+    // an existing checkout — so a misspelled OR stale (deleted-upstream) explicit base
+    // can't be silently accepted via an orphan path or a stale remote-tracking ref.
+    if require_resolvable && resolved_opt.is_none() {
+        bail!("base branch {base_name:?} not found locally or on origin (after fetch)");
+    }
+    if worktree_path.exists() {
+        // Validate the existing path is a worktree REGISTERED TO THIS REPO on `branch`
+        // before reusing it (a stale plain dir, a different-branch checkout, or a foreign
+        // repo's checkout could sit at this deterministic path and be handed to the worker,
+        // running the agent in the wrong tree/repo — dispatch only checks the dir exists).
+        if !is_registered_worktree(repo, worktree_path, branch) {
+            bail!(
+                "worktree path {} exists but is not a worktree of this repo on {branch:?}",
+                worktree_path.display()
+            );
+        }
+        // ADOPT the registered checkout WITHOUT re-validating its branch against a RE-RESOLVED
+        // base tip (R50-3). This path handles a CRASH ORPHAN: weft created the worktree but
+        // crashed before record_worktree. If the base advanced since the fork, the re-resolved
+        // tip is no longer an ancestor — an ancestry bail here would leave the task permanently
+        // stuck on a checkout weft itself made. Per the fork-point principle, the authority on
+        // "is this checkout still valid for its base" is materialize's recorded-fork-COMMIT check
+        // (it validates against the STABLE fork point, not a moving ref), NOT a descends-from-the-
+        // moving-base check here. (The `-b` create path below still validates a FRESH branch off
+        // the base, because that forks anew from the current tip — only this reuse arm changes.)
+        // R53-2: anchor the adopted crash-orphan with a STABLE fork point = the WORK branch's
+        // CURRENT commit. The orphan was just created (we crashed before record_worktree), so its
+        // tip ≈ its fork point; recording it (instead of leaving base_commit empty) means a later
+        // materialize_direction still runs its fork-point check for this weft-created branch. If the
+        // branch is later reset onto a DIFFERENT base it no longer descends from this commit and is
+        // caught, instead of being silently redispatched from the wrong history. Use the local work
+        // branch (refs/heads/<branch>), NOT a re-resolved base. Best-effort: empty if rev-parse fails.
+        let base_commit = git(repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}^{{commit}}")])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        return Ok(WorktreeAdd {
+            path: worktree_path.to_path_buf(),
+            created_checkout: false,
+            created_branch: false,
+            synced: false,
+            branched_from: String::new(),
+            base_commit,
+        });
+    }
+    let resolved = resolved_opt.unwrap_or_else(|| resolve_base_ref(repo, &t));
+    // Fresh only if we branched off the EXACT freshly-fetched remote-tracking ref for THIS base
+    // (`remote` == refs/remotes/origin/<t>) AND the fetch actually succeeded. Comparing to the
+    // exact ref (not just the refs/remotes/origin/ prefix) keeps `synced` honest now that the
+    // resolve_base_ref default-chain fallback can ALSO return a refs/remotes/origin/<default>
+    // for a DIFFERENT branch than the requested base.
+    let synced = resolved == remote && fetched;
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let path_str = worktree_path.to_string_lossy().to_string();
+    // A worktree dir removed out-of-band leaves a prunable registration; without this
+    // the branch still looks checked out and `worktree add` fails ("missing but already
+    // registered") instead of recreating. Prune stale registrations first — a no-op when
+    // none are stale, and it never touches a live worktree whose dir still exists.
+    git(repo, &["worktree", "prune"]).ok();
+    let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &resolved]);
+    if res.is_err() {
+        // Branch likely already exists (the name appeared after weft chose it). Verify the
+        // pre-existing branch actually descends from the resolved base before reusing it —
+        // otherwise the lane would be recorded as based on `resolved` while its worktree sits
+        // on a branch forked elsewhere. Validate WHENEVER the resolved base RESOLVES as a ref,
+        // regardless of require_resolvable: a BLANK base whose resolved default resolves (the
+        // common case) must still reject a branch forked off a DIFFERENT base. Skip only when
+        // the base is HEAD or doesn't resolve (e.g. detached / base gone), where a surviving
+        // pre-existing branch can still be checked out.
+        if resolved != "HEAD"
+            && ref_resolves(repo, &resolved)
+            && !branch_descends_from(repo, branch, &resolved)
+        {
+            bail!(
+                "branch {branch:?} already exists but is not based on {resolved:?}; \
+                 refusing to record a mismatched base"
+            );
+        }
+        // Check the existing branch out into a new worktree dir.
+        git(repo, &["worktree", "add", &path_str, branch])
+            .context("worktree add (existing branch)")?;
+        // R51-2: anchor the adopted branch with the resolved base's COMMIT. The fallback has
+        // ALREADY validated above (the create-time ancestry check) that this pre-existing branch
+        // descends from `resolved`, so resolved's tip is a valid fork-point anchor. Capture it the
+        // SAME way the `-b` SUCCESS path does — otherwise record_worktree stores no base_commit and
+        // a later materialize_direction SKIPS its fork-point check (empty base_commit), letting a
+        // worker reset this branch onto another base and redispatch from the wrong base. Best-effort:
+        // an unresolvable rev-parse (e.g. base is HEAD / gone) leaves it empty, same as before.
+        let base_commit = git(repo, &["rev-parse", "--verify", &format!("{resolved}^{{commit}}")])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        return Ok(WorktreeAdd {
+            path: worktree_path.to_path_buf(),
+            created_checkout: true,
+            created_branch: false,
+            synced: false,
+            branched_from: String::new(),
+            // Adopted a pre-existing branch (we did NOT fork it here), anchored to the validated
+            // resolved base commit so the fork-point check still runs on later re-materialize.
+            base_commit,
+        });
+    }
+    // The `-b <branch> <resolved>` create SUCCEEDED: weft forked a fresh branch off the
+    // resolved base. Capture that base's COMMIT (its tip oid) as the stable fork point, so a
+    // later reuse validates ancestry against THIS commit rather than a re-resolved base name
+    // that may have moved. Best-effort: an unresolvable rev-parse leaves it empty (skip).
+    let base_commit = git(repo, &["rev-parse", "--verify", &format!("{resolved}^{{commit}}")])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    Ok(WorktreeAdd {
+        path: worktree_path.to_path_buf(),
+        created_checkout: true,
+        created_branch: true,
+        synced,
+        branched_from: normalize_target(&resolved),
+        base_commit,
+    })
+}
+
 /// Remove a worktree and prune. (Used by M2 worktree lifecycle management.)
 pub fn remove_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
     let path_str = worktree_path.to_string_lossy().to_string();
     git(repo, &["worktree", "remove", "--force", &path_str]).ok();
     git(repo, &["worktree", "prune"]).ok();
     Ok(())
+}
+
+/// Mark `worktree_path` as a LOCKED git worktree of `repo` (`git worktree lock`).
+/// Used to DURABLY preserve a reused (non-weft-created) checkout: it stays a real,
+/// usable git worktree (its `.git` pointer is kept), and the lock protects it from
+/// the orphan-worktree GC — `gc::sweep_repo` skips locked entries so the preserved
+/// checkout survives even after its weft DB row is dropped (and across a repo re-add,
+/// since the lock lives in the repo's git metadata, not weft's DB). Idempotent: an
+/// "already locked" error is treated as success. Best-effort otherwise.
+pub fn lock_worktree(repo: &Path, worktree_path: &Path) -> Result<()> {
+    let path_str = worktree_path.to_string_lossy().to_string();
+    // `git worktree lock` errors if the worktree is already locked — that's the
+    // desired end state, so swallow it (and any other error: locking is a
+    // best-effort hardening, never a hard failure of teardown).
+    git(repo, &["worktree", "lock", &path_str]).ok();
+    Ok(())
+}
+
+/// Whether git considers `worktree_path` a LOCKED worktree of `repo`. Parses the
+/// `locked` line (optionally with a reason) that `git worktree list --porcelain`
+/// emits for a locked entry, following its `worktree`/`HEAD`/`branch` block — the
+/// same position `prunable` occupies in [`list_worktrees`]. Path comparison is by
+/// canonicalized form so a symlinked/`..` spelling still matches. Best-effort:
+/// false on any git error.
+pub fn is_worktree_locked(repo: &Path, worktree_path: &Path) -> bool {
+    let want =
+        std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+    let Ok(out) = git(repo, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    let mut cur_match = false;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            let entry =
+                std::fs::canonicalize(p.trim()).unwrap_or_else(|_| PathBuf::from(p.trim()));
+            cur_match = entry == want;
+        } else if cur_match && (line == "locked" || line.starts_with("locked ")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Delete a (weft-namespaced) branch from `repo`, ignoring "not found".
@@ -349,14 +899,32 @@ pub fn list_worktrees(repo: &Path) -> Result<Vec<(String, String)>> {
     let out = git(repo, &["worktree", "list", "--porcelain"])?;
     let mut res = Vec::new();
     let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut prunable = false;
+    // Each porcelain entry is `worktree <p>` / `HEAD <sha>` / `branch <ref>` (or
+    // `detached`) / optional `prunable <reason>`. The `prunable` line FOLLOWS `branch`, so
+    // flush an entry only at the NEXT `worktree` (or EOF) — and SKIP prunable ones: a
+    // registration left behind by an out-of-band `rm -rf` still lists here, but its path
+    // is no longer a real worktree and must not be matched/reused.
     for line in out.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            path = Some(p.to_string());
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            if let Some(p) = path.take() {
-                let branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
-                res.push((p, branch));
+            if let (Some(pp), Some(bb)) = (path.take(), branch.take()) {
+                if !prunable {
+                    res.push((pp, bb));
+                }
             }
+            path = Some(p.to_string());
+            branch = None;
+            prunable = false;
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            prunable = true;
+        }
+    }
+    if let (Some(pp), Some(bb)) = (path.take(), branch.take()) {
+        if !prunable {
+            res.push((pp, bb));
         }
     }
     Ok(res)
@@ -606,6 +1174,23 @@ pub fn head_commit(repo: &Path) -> Result<String> {
     git(repo, &["rev-parse", "--short", "HEAD"])
 }
 
+/// FULL 40-char HEAD commit sha. Used where the value is PERSISTED as a stable
+/// branch-off point (e.g. a detached-HEAD lane's diff target): a short sha can grow
+/// ambiguous as the repo accumulates commits, breaking later ref resolution, so the
+/// stored target must be the unabbreviated sha. None on an empty repo (no HEAD yet).
+pub fn head_commit_full(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 /// Append `name` to a worktree's git exclude (info/exclude) so weft's injected,
 /// untracked files never show in `git status` / diffs / accidental commits.
 /// Resolves the real exclude path via git (worktrees use a separate gitdir).
@@ -763,11 +1348,61 @@ mod tests {
     }
 
     #[test]
+    fn is_full_commit_oid_distinguishes_oid_from_branch_and_abbrev() {
+        // R40-2: a FULL commit oid is identified by git object identity, not a length.
+        let repo = tmp("oid-sha1");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let full = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(full.len(), 40, "precondition: SHA-1 repo → 40-hex oid");
+        // A full HEAD oid → true.
+        assert!(is_full_commit_oid(&repo, &full), "full HEAD oid must be recognized");
+        // A branch name → false (it resolves to a commit, but to a DIFFERENT canonical oid).
+        assert!(!is_full_commit_oid(&repo, &base), "a branch name is not a full oid");
+        // A 7-char abbreviation of HEAD → false (rev-parse returns the full oid ≠ the abbrev).
+        let abbrev = &full[..7];
+        assert!(!is_full_commit_oid(&repo, abbrev), "an abbreviation is not a full oid");
+        // A non-hex string → false (never even reaches rev-parse).
+        assert!(!is_full_commit_oid(&repo, "develop"), "a non-hex name is not a full oid");
+        // Empty / whitespace → false.
+        assert!(!is_full_commit_oid(&repo, "   "), "empty is not a full oid");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn is_full_commit_oid_matches_sha256_repo() {
+        // R40-2: in a SHA-256 repo the oid is 64-hex; the helper must recognize it (the old
+        // len()==40 predicate never would). Guard: skip if this git can't init a sha256 repo.
+        let repo = tmp("oid-sha256");
+        let _ = std::fs::create_dir_all(&repo);
+        if git(&repo, &["init", "-q", "--object-format=sha256"]).is_err() {
+            eprintln!("SKIP is_full_commit_oid_matches_sha256_repo: git lacks --object-format=sha256");
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        }
+        git(&repo, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&repo, &["config", "user.name", "t"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]).unwrap();
+        let full = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(full.len(), 64, "precondition: SHA-256 repo → 64-hex oid");
+        assert!(is_full_commit_oid(&repo, &full), "a full 64-hex SHA-256 oid must be recognized");
+        // A branch name is still not an oid even in a sha256 repo.
+        let base = current_branch(&repo).unwrap();
+        assert!(!is_full_commit_oid(&repo, &base), "a branch name is not a full oid (sha256)");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn resolve_prefers_recorded_then_falls_back() {
         let repo = tmp("resolve");
         init_repo(&repo).unwrap();
         let base = current_branch(&repo).unwrap();
-        assert_eq!(resolve_base_ref(&repo, &base), base);
+        // resolve_base_ref now returns a FULLY-QUALIFIED branch ref (unambiguous start-point);
+        // it must round-trip via normalize_target to the bare recorded name and resolve.
+        let resolved = resolve_base_ref(&repo, &base);
+        assert_eq!(resolved, local_branch_ref(&base), "recorded branch → refs/heads/<base>");
+        assert_eq!(normalize_target(&resolved), base, "qualified ref round-trips to bare name");
+        assert!(ref_resolves(&repo, &resolved), "qualified ref must resolve");
         let fb = resolve_base_ref(&repo, "nope-xyz");
         assert!(git(&repo, &["rev-parse", "--verify", &fb]).is_ok());
         let _ = std::fs::remove_dir_all(&repo);
@@ -970,4 +1605,1253 @@ mod tests {
         let n2 = choose_branch_name_from_refs("fix", "login", &refs2);
         assert_eq!(n2, "fix/login-2");
     }
+
+    #[test]
+    fn default_base_branch_prefers_remote_default_then_base_ref() {
+        // origin whose default HEAD is `develop` (not the initial branch).
+        let origin = tmp("dbb-origin");
+        init_repo(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d"]).unwrap();
+        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/develop"]).unwrap();
+        let clone = tmp("dbb-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        // The clone's origin/HEAD → origin/develop; the live remote default wins
+        // over a stale recorded base_ref ("main").
+        assert_eq!(default_base_branch(&clone, "main"), "develop");
+
+        // A repo with no remote falls back to the recorded base_ref only if it RESOLVES...
+        let local = tmp("dbb-local");
+        init_repo(&local).unwrap();
+        let cur = current_branch(&local).unwrap();
+        assert_eq!(default_base_branch(&local, &cur), cur);
+        // ...and falls through to main/master when the recorded base no longer exists.
+        let fell = default_base_branch(&local, "deleted-xyz");
+        assert!(fell == "main" || fell == "master", "stale base_ref must fall through, got {fell}");
+        // ...and an empty/HEAD base_ref detects main/master, never returns "HEAD".
+        let det = default_base_branch(&local, "");
+        assert!(det == "main" || det == "master", "got {det}");
+        assert_ne!(default_base_branch(&local, "HEAD"), "HEAD");
+
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&local);
+    }
+
+    #[test]
+    fn default_base_branch_falls_through_stale_origin_head() {
+        // origin/HEAD points at a branch that no longer resolves → must NOT be returned.
+        let origin = tmp("dbb-stale-origin");
+        init_repo(&origin).unwrap();
+        let clone = tmp("dbb-stale-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        // Point origin/HEAD at a dangling remote branch.
+        git(&clone, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]).unwrap();
+        assert!(!ref_resolves(&clone, "origin/gone"), "precondition: dangling origin/HEAD target");
+        let got = default_base_branch(&clone, "");
+        assert_ne!(got, "gone", "stale origin/HEAD must not be used");
+        assert!(ref_resolves(&clone, &got) || got == "main", "falls through to a real default, got {got}");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn default_base_branch_ignores_local_branch_for_stale_origin_head() {
+        // origin/HEAD points at a branch whose REMOTE-tracking ref is gone, but a LOCAL
+        // branch shares the name — the local branch must NOT vouch for the stale
+        // origin/HEAD (else new work branches off an old local feature branch).
+        let origin = tmp("dbb-localvouch-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        let clone = tmp("dbb-localvouch-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        git(&clone, &["branch", "feature-x"]).unwrap(); // local branch only
+        git(&clone, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feature-x"]).unwrap();
+        assert!(ref_resolves(&clone, "feature-x"), "precondition: local feature-x exists");
+        assert!(!ref_resolves(&clone, "origin/feature-x"), "precondition: remote feature-x gone");
+        assert_eq!(
+            default_base_branch(&clone, ""),
+            main,
+            "a same-named LOCAL branch must not validate a stale origin/HEAD"
+        );
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn default_base_branch_prefers_main_over_recorded_feature_branch() {
+        // No remote (no origin/HEAD). On a feature branch with main present, a blank
+        // base must default to main, NOT the recorded feature branch.
+        let repo = tmp("dbb-feature");
+        init_repo(&repo).unwrap();
+        let def = current_branch(&repo).unwrap(); // main or master
+        git(&repo, &["checkout", "-q", "-b", "feature-x"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "f"]).unwrap();
+        // base_ref recorded as the feature branch (what register_repo would capture here).
+        let got = default_base_branch(&repo, "feature-x");
+        assert_eq!(got, def, "must prefer the integration branch over a recorded feature branch");
+        assert_ne!(got, "feature-x");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn default_base_branch_vetted_flags_only_genuine_defaults() {
+        // R47-2: register_repo must mark a captured base as `is_default=true` ONLY when it
+        // is a genuinely-vetted default — i.e. it came from origin/HEAD or a real
+        // main/master branch — and `false` when it's the current-branch / "main"-last-resort
+        // fallback. `default_base_branch_vetted` returns the SAME name as `default_base_branch`
+        // (so behavior is unchanged) PLUS that boolean.
+
+        // (a) A repo with a real `main` (or `master`) integration branch → vetted=true,
+        // and the name matches default_base_branch (unchanged behavior).
+        let main_repo = tmp("dbbv-main");
+        init_repo(&main_repo).unwrap();
+        let def = current_branch(&main_repo).unwrap(); // main or master
+        assert!(def == "main" || def == "master", "precondition: init produced main/master");
+        let (name, vetted) = default_base_branch_vetted(&main_repo, &def);
+        assert_eq!(name, default_base_branch(&main_repo, &def), "name unchanged vs default_base_branch");
+        assert_eq!(name, def);
+        assert!(vetted, "a real main/master branch is a vetted default");
+        let _ = std::fs::remove_dir_all(&main_repo);
+
+        // (b) A nonstandard single-branch repo: only a `trunk` branch, no main/master, no
+        // origin/HEAD. default_base_branch falls all the way to the "main" last-resort — that
+        // is NOT a vetted default. So vetted=false (so register_repo records is_default=false),
+        // even though the returned name is still "main".
+        let trunk_repo = tmp("dbbv-trunk");
+        init_repo(&trunk_repo).unwrap();
+        git(&trunk_repo, &["branch", "-m", "trunk"]).unwrap();
+        assert!(ref_resolves(&trunk_repo, "refs/heads/trunk"), "precondition: trunk exists");
+        assert!(!ref_resolves(&trunk_repo, "refs/heads/main"), "precondition: no main branch");
+        assert!(!ref_resolves(&trunk_repo, "refs/heads/master"), "precondition: no master branch");
+        // base_ref captured at add = the current branch (trunk). default_base_branch returns
+        // "trunk" via tier (3) recorded-base-resolves — that's a fallback, not a vetted default.
+        let (name, vetted) = default_base_branch_vetted(&trunk_repo, "trunk");
+        assert_eq!(name, default_base_branch(&trunk_repo, "trunk"), "name unchanged vs default_base_branch");
+        assert!(!vetted, "a nonstandard fallback base (trunk, no main/master/origin-HEAD) is NOT a vetted default");
+        // And with an empty base_ref the name is the bare "main" last-resort, still not vetted.
+        let (last_resort, vetted2) = default_base_branch_vetted(&trunk_repo, "");
+        assert_eq!(last_resort, default_base_branch(&trunk_repo, ""));
+        assert!(!vetted2, "the bare main last-resort is NOT a vetted default");
+        let _ = std::fs::remove_dir_all(&trunk_repo);
+    }
+
+    #[test]
+    fn default_base_branch_ignores_tag_named_main_prefers_real_master() {
+        // R41-2: a repo whose real integration branch is `master`, with a TAG named `main`
+        // but NO `main` BRANCH and no origin/HEAD. The bare `ref_resolves(repo, "main")`
+        // resolves the TAG, so the old code wrongly selects "main"; qualifying the local
+        // check to `refs/heads/main` ignores the tag and selects the real "master".
+        let repo = tmp("dbb-tag-main");
+        init_repo(&repo).unwrap();
+        // Ensure the integration branch is `master` (rename whatever init produced), so there
+        // is definitely NO `main` branch present.
+        git(&repo, &["branch", "-m", "master"]).unwrap();
+        assert!(ref_resolves(&repo, "refs/heads/master"), "precondition: master branch exists");
+        assert!(!ref_resolves(&repo, "refs/heads/main"), "precondition: no main branch");
+        // A TAG named `main` (points at master's tip) — bare `main` now resolves to it.
+        git(&repo, &["tag", "main"]).unwrap();
+        assert!(ref_resolves(&repo, "main"), "precondition: bare `main` resolves (to the tag)");
+        assert!(ref_resolves(&repo, "refs/tags/main"), "precondition: refs/tags/main exists");
+        assert_eq!(
+            default_base_branch(&repo, ""),
+            "master",
+            "a TAG named main must not shadow the real master integration branch"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn default_base_branch_ignores_local_branch_named_origin_main() {
+        // R45-1: the remote check in the main/master fallback must be qualified to
+        // `refs/remotes/origin/<c>`. A repo whose real default is `develop`, with NO
+        // `main`/`master` branch and NO origin/HEAD, but WITH a LOCAL branch literally
+        // named `origin/main` (refs/heads/origin/main). The old short `origin/main` check
+        // resolves that local branch and wrongly records "main"; the qualified remote check
+        // does not, so it falls through to the resolvable recorded base `develop`.
+        let repo = tmp("dbb-localoriginmain");
+        init_repo(&repo).unwrap();
+        // Make the real integration branch `develop`; ensure no main/master branch exists.
+        git(&repo, &["branch", "-m", "develop"]).unwrap();
+        assert!(ref_resolves(&repo, "refs/heads/develop"), "precondition: develop branch exists");
+        assert!(!ref_resolves(&repo, "refs/heads/main"), "precondition: no main branch");
+        assert!(!ref_resolves(&repo, "refs/heads/master"), "precondition: no master branch");
+        // A LOCAL branch literally named `origin/main` — the short `origin/main` resolves it.
+        git(&repo, &["branch", "origin/main", "develop"]).unwrap();
+        assert!(
+            ref_resolves(&repo, "origin/main"),
+            "precondition: short `origin/main` resolves (to the local branch)"
+        );
+        assert!(
+            !ref_resolves(&repo, "refs/remotes/origin/main"),
+            "precondition: no remote-tracking origin/main"
+        );
+        let got = default_base_branch(&repo, "develop");
+        assert_ne!(got, "main", "a LOCAL branch named origin/main must not pin main as the default");
+        assert_eq!(got, "develop", "must fall through to the resolvable recorded base develop");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_base_ref_ignores_tag_named_main_prefers_real_master() {
+        // Same tag-shadow class as default_base_branch (preemptive): resolve_base_ref's
+        // conventional main/master fallback must qualify the LOCAL check as refs/heads/<c>
+        // so a TAG `main` (no `main` branch; real default `master`) can't masquerade as main.
+        let repo = tmp("rbr-tag-main");
+        init_repo(&repo).unwrap();
+        git(&repo, &["branch", "-m", "master"]).unwrap();
+        assert!(ref_resolves(&repo, "refs/heads/master"), "precondition: master branch exists");
+        assert!(!ref_resolves(&repo, "refs/heads/main"), "precondition: no main branch");
+        git(&repo, &["tag", "main"]).unwrap();
+        assert!(ref_resolves(&repo, "main"), "precondition: bare `main` resolves (to the tag)");
+        // Empty recorded base_ref + no origin/HEAD → falls through to the main/master loop.
+        // The fallback now returns the FULLY-QUALIFIED ref; it must be refs/heads/master
+        // (the real branch), never the `main` tag (which a bare check would have matched).
+        assert_eq!(
+            resolve_base_ref(&repo, ""),
+            "refs/heads/master",
+            "a TAG named main must not shadow the real master in resolve_base_ref"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn add_worktree_synced_branches_off_fresh_origin() {
+        // origin with develop ahead of main by one commit.
+        let origin = tmp("aws-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        std::fs::write(origin.join("d.txt"), "d\n").unwrap();
+        git(&origin, &["add", "-A"]).unwrap();
+        git(&origin, &["commit", "-q", "-m", "develop work"]).unwrap();
+        let dev_commit = git(&origin, &["rev-parse", "HEAD"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        // single-branch clone (main only) → origin/develop absent until fetched.
+        let clone = tmp("aws-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", "--single-branch", "--branch", &main,
+              &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(!ref_resolves(&clone, "origin/develop"), "precondition");
+
+        let wt = tmp("aws-wt");
+        let add = add_worktree_synced(&clone, "feat/x", &wt, "develop", false).unwrap();
+        assert!(add.synced, "branched off the synced origin/develop");
+        assert!(add.created_branch, "a new branch was created");
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), dev_commit);
+
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_falls_back_to_local_when_offline() {
+        // No remote → fetch is a no-op, branch off the local base, signal Some(false).
+        let repo = tmp("aws-offline");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let wt = tmp("aws-offline-wt");
+        let add = add_worktree_synced(&repo, "feat/y", &wt, &base, false).unwrap();
+        assert!(!add.synced, "offline → branched off local");
+        assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_stale_origin_without_fetch_is_not_synced() {
+        // Clone has origin/main, then break the remote so fetch fails — the stale
+        // origin ref still resolves, but we must NOT report it as freshly synced.
+        let origin = tmp("stale-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        let clone = tmp("stale-clone");
+        git(&std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        assert!(ref_resolves(&clone, &format!("origin/{main}")), "precondition: origin ref present");
+        // Break the remote so the fetch inside add_worktree_synced fails.
+        git(&clone, &["remote", "set-url", "origin", "/nonexistent/repo.git"]).unwrap();
+        let wt = tmp("stale-wt");
+        let add = add_worktree_synced(&clone, "feat/s", &wt, &main, false).unwrap();
+        assert!(!add.synced, "stale origin + failed fetch must not be 'synced'");
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_explicit_unresolvable_base_errors() {
+        // An explicit base that resolves to neither origin/<base> nor local must error
+        // (require_resolvable=true), instead of silently using the repo default.
+        let repo = tmp("explicit-bad");
+        init_repo(&repo).unwrap();
+        let wt = tmp("explicit-bad-wt");
+        let res = add_worktree_synced(&repo, "feat/e", &wt, "no-such-branch-xyz", true);
+        assert!(res.is_err(), "explicit unresolvable base must error");
+        assert!(!wt.exists(), "no worktree created on error");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_explicit_stale_deleted_upstream_base_errors() {
+        // An EXPLICIT base whose origin/<base> is stale (the branch was deleted
+        // upstream, so the fetch fails) must error rather than silently branching off
+        // the stale remote-tracking ref. require_resolvable=true.
+        let origin = tmp("stale-explicit-origin");
+        init_repo(&origin).unwrap();
+        git(&origin, &["branch", "develop"]).unwrap();
+        // Full clone → origin/develop present as a remote-tracking ref; no LOCAL develop.
+        let clone = tmp("stale-explicit-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(ref_resolves(&clone, "origin/develop"), "precondition: origin ref present");
+        assert!(!ref_resolves(&clone, "develop"), "precondition: no local develop");
+        // Delete develop upstream so a fetch of it fails (origin/develop goes stale).
+        git(&origin, &["branch", "-D", "develop"]).unwrap();
+        let wt = tmp("stale-explicit-wt");
+        let res = add_worktree_synced(&clone, "feat/s", &wt, "develop", true);
+        assert!(res.is_err(), "explicit base deleted upstream (stale origin) must error");
+        assert!(!wt.exists(), "no worktree created on error");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn resolve_target_ref_picks_the_ref_the_worktree_forked_from() {
+        // resolve_target_ref runs against a WORKTREE's HEAD; when local & origin <target>
+        // diverge, it must pick whichever the worktree ACTUALLY forked from.
+        let origin = tmp("rtr-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d0"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        // (A) Worktree forked from LOCAL develop; origin/develop is stale-behind → LOCAL.
+        let c1 = tmp("rtr-c1");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &c1.to_string_lossy()]).unwrap();
+        // A clone does not inherit local user config, and CI has no global identity.
+        git(&c1, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&c1, &["config", "user.name", "t"]).unwrap();
+        git(&c1, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
+        git(&c1, &["commit", "-q", "--allow-empty", "-m", "local-ahead"]).unwrap(); // local past stale origin
+        git(&c1, &["checkout", "-q", &main]).unwrap();
+        let wt1 = tmp("rtr-wt1");
+        git(&c1, &["worktree", "add", "-q", "-b", "feat/a", &wt1.to_string_lossy(), "develop"]).unwrap();
+        git(&wt1, &["commit", "-q", "--allow-empty", "-m", "agent-a"]).unwrap();
+        assert_eq!(
+            resolve_target_ref(&wt1, "develop"),
+            "refs/heads/develop",
+            "worktree forked off local develop (stale origin) → prefer local (fully qualified)"
+        );
+
+        // (B) Worktree forked from fresh ORIGIN/develop; local develop diverged → ORIGIN.
+        git(&origin, &["checkout", "-q", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d1"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        let c2 = tmp("rtr-c2");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &c2.to_string_lossy()]).unwrap();
+        git(&c2, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&c2, &["config", "user.name", "t"]).unwrap();
+        git(&c2, &["checkout", "-q", "-b", "develop", "origin/develop~1"]).unwrap(); // diverge off d0
+        git(&c2, &["commit", "-q", "--allow-empty", "-m", "local-diverge"]).unwrap();
+        git(&c2, &["checkout", "-q", &main]).unwrap();
+        let wt2 = tmp("rtr-wt2");
+        git(&c2, &["worktree", "add", "-q", "-b", "feat/b", &wt2.to_string_lossy(), "origin/develop"]).unwrap();
+        git(&wt2, &["commit", "-q", "--allow-empty", "-m", "agent-b"]).unwrap();
+        assert_eq!(
+            resolve_target_ref(&wt2, "develop"),
+            "refs/remotes/origin/develop",
+            "worktree forked off fresh origin/develop (diverged local) → prefer origin (fully qualified)"
+        );
+
+        let _ = remove_worktree(&c1, &wt1);
+        let _ = remove_worktree(&c2, &wt2);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&c1);
+        let _ = std::fs::remove_dir_all(&c2);
+        let _ = std::fs::remove_dir_all(&wt1);
+        let _ = std::fs::remove_dir_all(&wt2);
+    }
+
+    #[test]
+    fn resolve_target_ref_returns_the_side_with_a_merge_base() {
+        // R48-1: when local & origin <target> BOTH resolve but only ONE shares history with
+        // HEAD (the other was force-pushed/created with UNRELATED — disjoint — history), the
+        // asymmetric `match (mb_remote, mb_local)` must return the side that HAS a merge-base,
+        // not fall through to the existence preference (which would diff against unrelated
+        // commits — huge/noisy). Covers both directions.
+        let repo = tmp("rtr-asym");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // Make an ORPHAN (disjoint) commit with no shared ancestry with main/HEAD. Capture its
+        // sha so we can point a remote-tracking ref at it without it sharing history.
+        git(&repo, &["checkout", "-q", "--orphan", "disjoint"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "unrelated root"]).unwrap();
+        let orphan_sha = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+
+        // ---- (A) forked off LOCAL develop; origin/develop is UNRELATED → LOCAL. ----
+        // A real local `develop` sharing history with main (the genuine fork point).
+        git(&repo, &["branch", "develop", &main]).unwrap();
+        // A remote-tracking refs/remotes/origin/develop pointing at the disjoint orphan — it
+        // resolves as a ref but has NO merge-base with HEAD.
+        git(&repo, &["update-ref", "refs/remotes/origin/develop", &orphan_sha]).unwrap();
+        let wt_a = tmp("rtr-asym-wt-a");
+        git(&repo, &["worktree", "add", "-q", "-b", "feat/local", &wt_a.to_string_lossy(), "refs/heads/develop"]).unwrap();
+        git(&wt_a, &["commit", "-q", "--allow-empty", "-m", "agent-a"]).unwrap();
+        assert!(ref_resolves(&wt_a, "refs/heads/develop"), "precondition: local develop resolves");
+        assert!(ref_resolves(&wt_a, "refs/remotes/origin/develop"), "precondition: remote develop resolves");
+        assert_eq!(
+            resolve_target_ref(&wt_a, "develop"),
+            "refs/heads/develop",
+            "origin/develop has unrelated history (no merge-base) → return the LOCAL side"
+        );
+
+        // ---- (B) symmetric: forked off ORIGIN/develop; local develop is UNRELATED → REMOTE. ----
+        // Reset the remote-tracking develop back to a real ancestor of main (shared history),
+        // and make LOCAL develop the disjoint orphan instead.
+        git(&repo, &["update-ref", "refs/remotes/origin/develop", &main]).unwrap();
+        git(&repo, &["update-ref", "refs/heads/develop", &orphan_sha]).unwrap();
+        let wt_b = tmp("rtr-asym-wt-b");
+        git(&repo, &["worktree", "add", "-q", "-b", "feat/remote", &wt_b.to_string_lossy(), "refs/remotes/origin/develop"]).unwrap();
+        git(&wt_b, &["commit", "-q", "--allow-empty", "-m", "agent-b"]).unwrap();
+        assert!(ref_resolves(&wt_b, "refs/heads/develop"), "precondition: local develop resolves (orphan)");
+        assert!(ref_resolves(&wt_b, "refs/remotes/origin/develop"), "precondition: remote develop resolves");
+        assert_eq!(
+            resolve_target_ref(&wt_b, "develop"),
+            "refs/remotes/origin/develop",
+            "local develop has unrelated history (no merge-base) → return the REMOTE side"
+        );
+
+        let _ = remove_worktree(&repo, &wt_a);
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
+    }
+
+    #[test]
+    fn resolve_target_ref_prefers_branch_over_same_named_tag() {
+        // R46-1: a bare `<t>` resolves a same-named TAG before the branch. With a TAG `develop`
+        // (at an OLD commit) AND a BRANCH `develop` (the real fork point) both present, the old
+        // bare `ref_resolves(worktree, &t)` would diff against the tag. Qualifying the local
+        // check as refs/heads/<t> selects the BRANCH.
+        let repo = tmp("rtr-tag-branch");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // A real `develop` branch with its own commit — this is the genuine fork point.
+        git(&repo, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "develop tip"]).unwrap();
+        // A TAG also named `develop`, pinned to the OLDER initial commit (so it differs from the
+        // branch tip and from where the worktree forks).
+        git(&repo, &["tag", "develop", &format!("{main}")]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+        // A worktree that forked off the develop BRANCH. The start-point is spelled
+        // refs/heads/develop because a bare `develop` is itself ambiguous (tag + branch) to
+        // `git worktree add` — which is precisely the ambiguity resolve_target_ref must avoid.
+        let wt = tmp("rtr-tag-wt");
+        git(&repo, &["worktree", "add", "-q", "-b", "feat/x", &wt.to_string_lossy(), "refs/heads/develop"]).unwrap();
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "agent work"]).unwrap();
+
+        assert_eq!(
+            resolve_target_ref(&wt, "develop"),
+            "refs/heads/develop",
+            "a same-named TAG must not shadow the real develop BRANCH"
+        );
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn resolve_target_ref_uses_remote_tracking_not_local_origin_branch() {
+        // R46-2: a LOCAL branch literally named `origin/develop` (refs/heads/origin/develop)
+        // would satisfy the OLD short `origin/<t>` resolve and be diffed against instead of the
+        // real remote-tracking ref. Qualifying as refs/remotes/origin/<t> picks the remote.
+        let origin = tmp("rtr-rt-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "remote develop tip"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        let clone = tmp("rtr-rt-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        git(&clone, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&clone, &["config", "user.name", "t"]).unwrap();
+        // A real refs/remotes/origin/develop exists from the clone. Now create a DECOY local
+        // branch literally named `origin/develop` (refs/heads/origin/develop) at an unrelated
+        // commit, so the short `origin/develop` spelling resolves to the LOCAL decoy first.
+        git(&clone, &["branch", "origin/develop", &main]).unwrap();
+        assert!(
+            ref_resolves(&clone, "refs/heads/origin/develop"),
+            "precondition: decoy local origin/develop branch exists"
+        );
+        assert!(
+            ref_resolves(&clone, "refs/remotes/origin/develop"),
+            "precondition: real remote-tracking origin/develop exists"
+        );
+        // A worktree forked off the real remote-tracking develop.
+        let wt = tmp("rtr-rt-wt");
+        git(&clone, &["worktree", "add", "-q", "-b", "feat/y", &wt.to_string_lossy(), "refs/remotes/origin/develop"]).unwrap();
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "agent work"]).unwrap();
+
+        assert_eq!(
+            resolve_target_ref(&wt, "develop"),
+            "refs/remotes/origin/develop",
+            "the remote-tracking ref must win over a local branch named origin/develop"
+        );
+
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn resolve_target_ref_falls_back_to_tag_or_sha_when_no_branch() {
+        // When NO branch (local or remote) by that name exists, a user may still legitimately
+        // target a TAG or a raw SHA. The bare commit-ish fallback keeps that working.
+        let repo = tmp("rtr-tagonly");
+        init_repo(&repo).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "c1"]).unwrap();
+        // A release TAG with NO same-named branch.
+        git(&repo, &["tag", "v1.0.0"]).unwrap();
+        let sha = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "c2"]).unwrap();
+        assert!(
+            !ref_resolves(&repo, "refs/heads/v1.0.0"),
+            "precondition: no branch named v1.0.0"
+        );
+
+        // Tag target resolves to the bare tag name (a commit-ish, fed to merge-base).
+        assert_eq!(
+            resolve_target_ref(&repo, "v1.0.0"),
+            "v1.0.0",
+            "a tag-only target must resolve via the bare commit-ish fallback"
+        );
+        // A raw SHA target resolves to itself.
+        assert_eq!(
+            resolve_target_ref(&repo, &sha),
+            sha,
+            "a raw SHA target must resolve via the bare commit-ish fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn list_worktrees_skips_prunable_entries() {
+        // A worktree removed out-of-band (rm -rf) leaves a PRUNABLE registration that git
+        // still lists — list_worktrees must skip it so a stale path isn't treated as a live
+        // worktree of this repo (which would let a plain dir there be reused).
+        let repo = tmp("lw-prunable");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let wt = tmp("lw-prunable-wt");
+        add_worktree_synced(&repo, "feat/p", &wt, &base, false).unwrap();
+        assert!(
+            list_worktrees(&repo).unwrap().iter().any(|(_, b)| b == "feat/p"),
+            "a live worktree is listed"
+        );
+        // Out-of-band rm -rf → the registration becomes prunable (dir gone).
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(
+            !list_worktrees(&repo).unwrap().iter().any(|(_, b)| b == "feat/p"),
+            "a prunable (rm -rf'd) worktree must not be listed"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_invalid_existing_path() {
+        // The path-exists reuse must validate the path is a clean worktree for `branch`,
+        // not blindly hand a stale/plain dir or a different-branch checkout to the worker.
+        let repo = tmp("aws-invalid");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+
+        // (A) A plain directory at the path → rejected, not reused.
+        let wt_a = tmp("aws-invalid-plain");
+        std::fs::create_dir_all(&wt_a).unwrap();
+        std::fs::write(wt_a.join("stuff.txt"), "not a worktree\n").unwrap();
+        assert!(
+            add_worktree_synced(&repo, "feat/a", &wt_a, &base, false).is_err(),
+            "a plain dir at the path must be rejected"
+        );
+
+        // (B) An existing worktree for a DIFFERENT branch → rejected.
+        let wt_b = tmp("aws-invalid-otherbranch");
+        add_worktree_synced(&repo, "feat/other", &wt_b, &base, false).unwrap();
+        assert!(
+            add_worktree_synced(&repo, "feat/b", &wt_b, &base, false).is_err(),
+            "an existing worktree on a different branch must be rejected"
+        );
+
+        // (C) A valid worktree on the SAME branch → idempotent reuse.
+        let wt_c = tmp("aws-invalid-same");
+        add_worktree_synced(&repo, "feat/c", &wt_c, &base, false).unwrap();
+        let reuse = add_worktree_synced(&repo, "feat/c", &wt_c, &base, false)
+            .expect("reusing a valid worktree on the same branch must succeed");
+        assert!(!reuse.created_checkout, "reuse reports created_checkout=false");
+        // R53-2: path-reuse adopts an existing checkout and anchors it with the WORK branch's
+        // current commit (the orphan's tip ≈ its fork point), so the fork-point check still runs.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/c^{commit}"]).unwrap();
+        assert_eq!(
+            reuse.base_commit,
+            work_commit.trim(),
+            "R53-2: path-reuse anchors with the work branch's current commit"
+        );
+
+        // (D) A worktree belonging to a DIFFERENT repo at the path, same branch name →
+        // rejected (it is not registered in THIS repo's worktree list).
+        let repo2 = tmp("aws-invalid-repo2");
+        init_repo(&repo2).unwrap();
+        let base2 = current_branch(&repo2).unwrap();
+        let wt_d = tmp("aws-invalid-foreign");
+        add_worktree_synced(&repo2, "feat/d", &wt_d, &base2, false).unwrap();
+        assert!(
+            add_worktree_synced(&repo, "feat/d", &wt_d, &base, false).is_err(),
+            "a worktree belonging to a DIFFERENT repo must be rejected"
+        );
+
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = remove_worktree(&repo, &wt_c);
+        let _ = remove_worktree(&repo2, &wt_d);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo2);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
+        let _ = std::fs::remove_dir_all(&wt_c);
+        let _ = std::fs::remove_dir_all(&wt_d);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_existing_branch_not_from_explicit_base() {
+        // The `-b` fallback (branch name already exists) must, for an EXPLICIT base, only
+        // reuse the branch if it actually descends from that base — else the lane would
+        // record a base its worktree wasn't forked from.
+        let repo = tmp("aws-mismatch");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        git(&repo, &["checkout", "-q", "-b", "release"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "release work"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+
+        // (A) An existing branch based on MAIN, not the explicit base "release" → reject.
+        git(&repo, &["branch", "feat/x", &main]).unwrap();
+        let wt_a = tmp("aws-mismatch-a");
+        assert!(
+            add_worktree_synced(&repo, "feat/x", &wt_a, "release", true).is_err(),
+            "existing branch not based on the explicit base must be rejected"
+        );
+
+        // (B) An existing branch based on "release" → reused.
+        git(&repo, &["branch", "feat/y", "release"]).unwrap();
+        let wt_b = tmp("aws-mismatch-b");
+        assert!(
+            add_worktree_synced(&repo, "feat/y", &wt_b, "release", true).is_ok(),
+            "existing branch based on the explicit base is reused"
+        );
+
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_tag_named_like_explicit_base() {
+        // R40-1: an explicit base `release` that exists ONLY as a TAG on origin (no
+        // branch) must be REJECTED — the fetch refspec is branch-namespaced
+        // (refs/heads/<base>), so a same-named tag never lands in origin/<base> and
+        // the base is treated as missing. A worktree must NOT be forked off the tag.
+        let origin = tmp("aws-tag-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        // Tag a commit that is NOT reachable from main: make it on a side branch, tag
+        // it `release`, then delete the side branch. The tag keeps the commit alive on
+        // origin, but a `--single-branch --branch main` clone won't auto-fetch a tag
+        // pointing outside main's history — so the only way `release` could land in
+        // origin/release is via the (buggy) unqualified fetch refspec.
+        git(&origin, &["checkout", "-q", "-b", "side"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "side"]).unwrap();
+        let tag_commit = git(&origin, &["rev-parse", "HEAD"]).unwrap();
+        git(&origin, &["tag", "release", &tag_commit]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        git(&origin, &["branch", "-D", "side"]).unwrap();
+
+        // single-branch, no-tags clone of main only → no tags auto-fetched, so the only
+        // way `release` could leak in is via the (buggy) unqualified fetch refspec.
+        let clone = tmp("aws-tag-clone");
+        git(
+            &std::env::temp_dir(),
+            &["clone", "-q", "--single-branch", "--no-tags", "--branch", &main,
+              &origin.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(!ref_resolves(&clone, "release"), "precondition: no local `release`");
+        assert!(!ref_resolves(&clone, "origin/release"), "precondition: no origin/release");
+
+        // (i) tag-only base → Err, and NO worktree created off the tag.
+        let wt = tmp("aws-tag-wt");
+        let res = add_worktree_synced(&clone, "feat/x", &wt, "release", true);
+        assert!(res.is_err(), "a TAG named like the base must not be accepted as a branch");
+        assert!(!wt.exists(), "no worktree created off the tag");
+        assert!(
+            !ref_resolves(&clone, "feat/x"),
+            "the worker branch must not be created off the tag's commit"
+        );
+
+        // (ii) now make `release` a REAL branch on origin with its own distinct tip →
+        // Ok, and the worktree must fork off the BRANCH tip (not the same-named tag).
+        git(&origin, &["checkout", "-q", "-b", "release", &main]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "release work"]).unwrap();
+        // Disambiguate: origin now has BOTH refs/tags/release and refs/heads/release, so a
+        // bare `rev-parse release` is ambiguous — read the BRANCH ref explicitly.
+        let branch_commit = git(&origin, &["rev-parse", "refs/heads/release"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        assert_ne!(branch_commit, tag_commit, "the branch tip differs from the tag commit");
+        let wt2 = tmp("aws-tag-wt2");
+        let add = add_worktree_synced(&clone, "feat/y", &wt2, "release", true)
+            .expect("a real branch named `release` must be accepted");
+        assert!(add.synced, "branched off the freshly-fetched origin/release branch");
+        assert_eq!(
+            git(&wt2, &["rev-parse", "HEAD"]).unwrap(),
+            branch_commit,
+            "forked off the BRANCH tip, not the tag commit"
+        );
+
+        let _ = remove_worktree(&clone, &wt2);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt2);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_local_tag_named_like_explicit_base() {
+        // R40-1 (b): the local-branch fallback must reject a LOCAL tag `release` when
+        // no local BRANCH `release` exists — `ref_resolves` alone is true for a tag, so
+        // the fallback is tightened to refs/heads/<base>. No remote here, so resolution
+        // can only succeed via the local fallback.
+        let repo = tmp("aws-local-tag");
+        init_repo(&repo).unwrap();
+        // Tag the initial commit `release`; never create a branch of that name.
+        git(&repo, &["tag", "release"]).unwrap();
+        assert!(ref_resolves(&repo, "release"), "precondition: tag `release` resolves");
+        assert!(
+            !ref_resolves(&repo, "refs/heads/release"),
+            "precondition: no local BRANCH `release`"
+        );
+        let wt = tmp("aws-local-tag-wt");
+        let res = add_worktree_synced(&repo, "feat/x", &wt, "release", true);
+        assert!(res.is_err(), "a LOCAL tag named like the base must be rejected");
+        assert!(!wt.exists(), "no worktree created off the local tag");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_handles_branch_and_tag_same_name() {
+        // R42-3: a LOCAL repo (no origin) with BOTH a branch `develop` AND a tag `develop`
+        // at DIFFERENT commits. The local-branch fallback resolves via refs/heads/develop,
+        // but it must PASS the QUALIFIED ref to `worktree add -b`: a bare `develop` start-point
+        // is ambiguous (branch vs tag) and `worktree add` FAILS. The worktree must fork off
+        // the BRANCH tip, and branched_from must record the bare `develop` (not refs/heads/...).
+        let repo = tmp("aws-branch-and-tag");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // Create branch `develop` with its own distinct tip.
+        git(&repo, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "develop work"]).unwrap();
+        let branch_commit = git(&repo, &["rev-parse", "refs/heads/develop"]).unwrap();
+        // A tag `develop` on a DIFFERENT commit (back on main's initial commit).
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+        let tag_commit = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo, &["tag", "develop"]).unwrap();
+        assert_ne!(branch_commit, tag_commit, "precondition: branch tip differs from the tag commit");
+
+        let wt = tmp("aws-branch-and-tag-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, "develop", true)
+            .expect("a usable refs/heads/develop must be accepted even when a tag shadows it");
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap(),
+            branch_commit,
+            "worktree must fork off the BRANCH develop's tip, not the tag commit"
+        );
+        assert_eq!(add.branched_from, "develop", "branched_from records the bare branch name");
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_recreates_after_out_of_band_dir_removal() {
+        // A worktree dir removed out-of-band (rm -rf, not `git worktree remove`) leaves
+        // a prunable registration, so the branch still looks checked out. A fresh
+        // add_worktree_synced for the same branch/path must PRUNE the stale registration
+        // and recreate the checkout, not fail with "already checked out".
+        let repo = tmp("aws-oob");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let wt = tmp("aws-oob-wt");
+        add_worktree_synced(&repo, "feat/oob", &wt, &base, false).unwrap();
+        assert!(wt.join(".git").exists(), "first add created the worktree");
+        // Remove the dir OUT-OF-BAND — git keeps the (now-stale) registration.
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(!wt.exists(), "precondition: dir gone, registration stale");
+        // Re-add: without the prune this fails ("feat/oob is already checked out").
+        add_worktree_synced(&repo, "feat/oob", &wt, &base, false)
+            .expect("re-add must prune the stale registration and recreate");
+        assert!(wt.join(".git").exists(), "worktree recreated after out-of-band removal");
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_existing_branch_creates_checkout_not_branch() {
+        let repo = tmp("aws-existing-branch");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        // Pre-create the branch so `worktree add -b <branch>` fails and falls back.
+        git(&repo, &["branch", "feat/exists"]).unwrap();
+        let wt = tmp("aws-existing-branch-wt");
+        let add = add_worktree_synced(&repo, "feat/exists", &wt, &base, false).unwrap();
+        assert!(add.created_checkout, "the fallback created a new checkout dir");
+        assert!(!add.created_branch, "the branch pre-existed; we did not create it");
+        // existing-branch fallback: branched_from must be empty (no new branch created from a base)
+        assert!(add.branched_from.is_empty(), "fallback to existing branch must have empty branched_from");
+        // base_commit is the resolved base's commit (R51-2): the fallback adopts a pre-existing
+        // branch that was validated to DESCEND FROM `resolved`, so resolved's tip is a valid
+        // ancestry anchor — record it so materialize's fork-point check isn't skipped.
+        let base_tip = git(&repo, &["rev-parse", &base]).unwrap();
+        assert_eq!(add.base_commit, base_tip, "existing-branch fallback anchors base_commit to the resolved base commit");
+        assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_fallback_records_base_commit_for_adopted_branch() {
+        // R51-2: when `worktree add -b <branch> <resolved>` falls back (the branch already
+        // exists) and CHECKS OUT the pre-existing branch into a new worktree, the returned
+        // base_commit must be the resolved base's commit — NOT empty. An empty base_commit
+        // makes record_worktree store no fork-point anchor, and a later materialize_direction
+        // SKIPS the fork-point check (empty base_commit), letting a worker reset that branch
+        // onto another base and redispatch from the wrong base. The fallback has already
+        // validated the branch descends from `resolved`, so it's a valid ancestry anchor.
+        let repo = tmp("aws-fallback-anchor");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let base_tip = git(&repo, &["rev-parse", &base]).unwrap();
+        // Pre-create the branch OFF the base so `worktree add -b <branch>` fails (branch exists)
+        // and the create-fallback checks it out. Branched from `base`, so it descends from base.
+        git(&repo, &["branch", "feat/adopt", &base]).unwrap();
+        let wt = tmp("aws-fallback-anchor-wt");
+        let add = add_worktree_synced(&repo, "feat/adopt", &wt, &base, false).unwrap();
+        assert!(add.created_checkout, "fallback created a fresh checkout dir");
+        assert!(!add.created_branch, "branch pre-existed — not created here");
+        assert!(
+            !add.base_commit.is_empty(),
+            "adopted-branch fallback must record a non-empty base_commit (the validated resolved base)"
+        );
+        assert_eq!(
+            add.base_commit, base_tip,
+            "base_commit equals the resolved base's commit (the validated ancestry anchor)"
+        );
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_sets_branched_from_on_new_branch() {
+        // Normal create: branched_from is set to the base branch (normalized).
+        let repo = tmp("aws-branched-from");
+        init_repo(&repo).unwrap();
+        let base = current_branch(&repo).unwrap();
+        let base_tip = git(&repo, &["rev-parse", &base]).unwrap();
+        let wt = tmp("aws-branched-from-wt");
+        let add = add_worktree_synced(&repo, "feat/new", &wt, &base, false).unwrap();
+        assert!(add.created_branch, "new branch created");
+        // branched_from must be the base name (no origin/ prefix for local-only repo).
+        assert_eq!(add.branched_from, base, "branched_from equals the base we branched off");
+        // base_commit must be the resolved base's tip — the STABLE fork point recorded at create.
+        assert_eq!(add.base_commit, base_tip, "base_commit captures the resolved base's commit on the create-success path");
+        assert!(wt.join(".git").exists());
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_empty_default_base_is_lenient() {
+        // The default/empty path (require_resolvable=false) still falls back and creates,
+        // even if the passed name doesn't resolve.
+        let repo = tmp("lenient");
+        init_repo(&repo).unwrap();
+        let wt = tmp("lenient-wt");
+        let add = add_worktree_synced(&repo, "feat/l", &wt, "no-such-default", false).unwrap();
+        assert!(!add.synced);
+        assert!(wt.join(".git").exists(), "default path still creates a worktree");
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn live_default_branch_reads_remote_head_even_when_unfetched() {
+        // origin default moved to `develop`; a single-branch clone of main hasn't
+        // fetched develop, but ls-remote --symref still reports the live default.
+        let origin = tmp("ldb-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d"]).unwrap();
+        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/develop"]).unwrap();
+        let clone = tmp("ldb-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", "--single-branch", "--branch", &main,
+            &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        assert!(!ref_resolves(&clone, "origin/develop"), "precondition: develop not fetched");
+        assert_eq!(live_default_branch(&clone).as_deref(), Some("develop"),
+            "ls-remote --symref reports the live remote default without a local ref");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn recorded_base_or_default_prefers_resolvable_base_ref_over_cached_origin_head() {
+        // A clone whose cached origin/HEAD points at `main`, but the recorded base_ref
+        // is `develop` CAPTURED AS THE DEFAULT (is_default=true) at register. Offline, we
+        // must prefer the recorded develop, not the stale cached main.
+        let origin = tmp("rbod-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        let clone = tmp("rbod-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        // clone's origin/HEAD → origin/main (the origin's default). develop is fetched.
+        assert!(ref_resolves(&clone, "origin/develop"));
+        // default_base_branch prefers cached origin/HEAD (main); recorded_base_or_default
+        // prefers the resolvable CAPTURED-DEFAULT base_ref (develop).
+        assert_eq!(default_base_branch(&clone, "develop"), main, "default_base_branch is origin/HEAD-first");
+        assert_eq!(recorded_base_or_default(&clone, "develop", true), "develop", "captured-default base_ref preferred when it resolves");
+        // A non-resolving recorded base falls back to the default chain.
+        assert_eq!(recorded_base_or_default(&clone, "no-such-xyz", true), main);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn recorded_base_or_default_ignores_local_only_legacy_base_ref() {
+        // On an upgraded DB, base_ref was the repo's CURRENT branch at add time — a LOCAL
+        // feature branch (no origin/<base_ref>), NOT the live default (is_default=false).
+        // Offline, that legacy base_ref must NOT be trusted (else new work branches off the
+        // legacy feature branch); the main-family default must win instead.
+        let repo = tmp("rbod-local-legacy");
+        init_repo(&repo).unwrap();
+        let def = current_branch(&repo).unwrap(); // main or master
+        // A local-only feature branch, with NO remote-tracking origin/feature/foo.
+        git(&repo, &["branch", "feature/foo"]).unwrap();
+        assert!(ref_resolves(&repo, "feature/foo"), "precondition: local feature/foo exists");
+        assert!(!ref_resolves(&repo, "origin/feature/foo"), "precondition: no remote feature/foo");
+        let got = recorded_base_or_default(&repo, "feature/foo", false);
+        assert_eq!(got, def, "a legacy base_ref must fall through to the main-family default");
+        assert_ne!(got, "feature/foo", "must not trust the legacy local feature branch");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn recorded_base_or_default_ignores_legacy_base_ref() {
+        // R36-1: a PUSHED legacy base_ref — `feature/foo` whose remote-tracking
+        // `origin/feature/foo` EXISTS — is indistinguishable BY VALUE from a real
+        // non-standard default. The is_default marker is the only signal: with
+        // is_default=false (legacy current-branch capture on an upgraded DB), the
+        // main-family default (cached origin/HEAD=main) must win, NOT feature/foo.
+        let origin = tmp("rbod-pushed-legacy-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        // origin also has a feature/foo branch (so the clone fetches origin/feature/foo).
+        git(&origin, &["checkout", "-q", "-b", "feature/foo"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "f"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+        let clone = tmp("rbod-pushed-legacy-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        // Precondition: the pushed legacy branch DOES resolve via its remote-tracking ref,
+        // and the clone's cached origin/HEAD points at main.
+        assert!(ref_resolves(&clone, "origin/feature/foo"), "precondition: origin/feature/foo exists");
+        assert_eq!(remote_default_branch(&clone).as_deref(), Some(main.as_str()), "precondition: origin/HEAD → main");
+        // With is_default=false the pushed legacy base_ref must NOT win, even though it resolves.
+        let got = recorded_base_or_default(&clone, "feature/foo", false);
+        assert_eq!(got, main, "a pushed legacy base_ref must fall through to the real default");
+        assert_ne!(got, "feature/foo", "must not trust the legacy pushed feature branch");
+        // Sanity: flipping the marker to true (a genuine non-standard default) DOES trust it.
+        assert_eq!(recorded_base_or_default(&clone, "feature/foo", true), "feature/foo", "a captured-default base_ref is trusted when it resolves");
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
+    fn add_worktree_synced_adopts_registered_checkout_after_base_advanced() {
+        // R50-3: the path-exists fast-path must ADOPT a registered crash-orphan checkout
+        // WITHOUT re-validating its branch against the (possibly moved) base. Weft created the
+        // worktree but crashed before record_worktree; the base then advanced past the fork
+        // point, so the branch no longer descends from the RE-RESOLVED base tip. Per the
+        // fork-point principle (materialize's fork-commit check is the authority — don't
+        // re-validate an existing checkout against a moving ref), reuse it instead of bailing.
+        let repo = tmp("aws-adopt-orphan");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+
+        // Register a real worktree for `feat/x` forked from main at commit A.
+        let wt = tmp("aws-adopt-orphan-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, &main, true).unwrap();
+        assert!(add.created_branch, "precondition: feat/x created off main@A");
+        assert!(is_registered_worktree(&repo, &wt, "feat/x"), "precondition: registered checkout on feat/x");
+
+        // Advance the base (main) to B — now feat/x (still at A) does NOT descend from main's tip.
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base advance B"]).unwrap();
+        assert!(
+            !branch_descends_from(&repo, "feat/x", &main),
+            "precondition: feat/x no longer descends from the advanced base tip"
+        );
+
+        // Reuse the EXISTING registered path with the same base → must ADOPT (Ok), not reject.
+        let again = add_worktree_synced(&repo, "feat/x", &wt, &main, true)
+            .expect("registered crash-orphan checkout must be adopted even though base advanced");
+        assert!(!again.created_branch && !again.created_checkout, "adopted, not freshly created");
+        // R53-2: the adopt arm now anchors with the WORK branch's CURRENT commit (feat/x@A), NOT
+        // the advanced base tip — so the recorded fork point stays valid as the base moves.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/x^{commit}"]).unwrap();
+        assert_eq!(
+            again.base_commit,
+            work_commit.trim(),
+            "R53-2: adopted crash-orphan is anchored with the work branch's current commit"
+        );
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_validates_explicit_base_even_when_path_exists() {
+        let repo = tmp("aws-orphan");
+        init_repo(&repo).unwrap();
+        let wt = tmp("aws-orphan-wt");
+        std::fs::create_dir_all(&wt).unwrap(); // simulate an orphan worktree dir (no DB row)
+        // Explicit (require_resolvable=true) misspelled base must error even though the
+        // path already exists — not silently reuse the orphan.
+        let res = add_worktree_synced(&repo, "feat/x", &wt, "no-such-xyz", true);
+        assert!(res.is_err(), "explicit unresolvable base must error before reusing an existing path");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_adopts_existing_path_branch_for_resolvable_explicit_base() {
+        // R50-3 contract change: the path-exists fast-path (a REGISTERED checkout for `branch`)
+        // no longer re-validates the branch against the resolved base — it ADOPTS the registered
+        // checkout (a crash orphan whose base may have moved). Both an explicit base the branch
+        // does NOT descend from AND the branch's real base are reused; ancestry is re-checked by
+        // materialize's recorded-fork-commit guard, not here. (An UNRESOLVABLE explicit base is
+        // still rejected earlier — see add_worktree_synced_validates_explicit_base_even_when_path_exists.)
+        let repo = tmp("aws-path-adopt");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // A distinct base "release", one commit AHEAD of main, so main is NOT a descendant.
+        git(&repo, &["checkout", "-q", "-b", "release"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "release work"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+
+        // Register a real worktree for `feat/x` forked from MAIN at the deterministic path.
+        let wt = tmp("aws-path-adopt-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, &main, true).unwrap();
+        assert!(add.created_branch, "precondition: feat/x created off main");
+        assert!(wt.exists() && wt.join(".git").exists(), "precondition: registered worktree on feat/x");
+        assert!(
+            !branch_descends_from(&repo, "feat/x", "release"),
+            "precondition: feat/x does NOT descend from release"
+        );
+
+        // (A) Reuse the EXISTING path for a RESOLVABLE explicit base "release" the branch does
+        // NOT descend from → ADOPT (Ok), not reject.
+        let a = add_worktree_synced(&repo, "feat/x", &wt, "release", true)
+            .expect("registered checkout must be adopted even when it doesn't descend from the explicit base");
+        assert!(!a.created_branch && !a.created_checkout, "adopted, not created");
+        // R53-2: anchored with the WORK branch's commit (feat/x off main), independent of the
+        // explicit base passed in — the orphan's own tip is the stable fork point.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/x^{commit}"]).unwrap();
+        assert_eq!(
+            a.base_commit,
+            work_commit.trim(),
+            "R53-2: adopted path-exists checkout is anchored with the work branch's current commit"
+        );
+
+        // (B) Reuse the EXISTING path for the branch's REAL base (main) → still ok.
+        assert!(
+            add_worktree_synced(&repo, "feat/x", &wt, &main, true).is_ok(),
+            "registered checkout based on the explicit base is reused"
+        );
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_path_exists_anchors_adopted_orphan_with_branch_commit() {
+        // R53-2: the path-exists adopt arm handles a CRASH ORPHAN (weft created the worktree but
+        // crashed before record_worktree). It must record a STABLE fork-point anchor = the work
+        // branch's CURRENT commit, so record_worktree stores a base_commit and a later
+        // materialize_direction still runs its fork-point check. Without the anchor (empty
+        // base_commit) materialize SKIPS that check and a branch reset onto a different base could
+        // be redispatched from the wrong history. Red-first: the adopt arm returned an empty
+        // base_commit.
+        let repo = tmp("aws-anchor-orphan");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+
+        // Register a real worktree for `feat/x` (a crash orphan: dir + registration, no DB row).
+        let wt = tmp("aws-anchor-orphan-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, &main, true).unwrap();
+        assert!(add.created_branch, "precondition: feat/x created off main");
+        assert!(is_registered_worktree(&repo, &wt, "feat/x"), "precondition: registered checkout on feat/x");
+
+        // The work branch's CURRENT commit — the anchor the adopt arm must record.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/x^{commit}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!work_commit.is_empty(), "precondition: work branch resolves to a commit");
+
+        // Second call takes the path-exists adopt arm → must anchor with the work branch's commit.
+        let again = add_worktree_synced(&repo, "feat/x", &wt, &main, true)
+            .expect("registered crash-orphan checkout must be adopted");
+        assert!(!again.created_branch && !again.created_checkout, "adopted, not freshly created");
+        assert_eq!(
+            again.base_commit, work_commit,
+            "R53-2: the adopt arm must anchor with the work branch's CURRENT commit (non-empty)"
+        );
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_rejects_existing_branch_not_from_resolved_default_for_blank_base() {
+        // R38-1: even for a BLANK base (require_resolvable=false), the `-b` fallback's
+        // ancestry check must fire when the RESOLVED default base RESOLVES as a ref. If the
+        // deterministic branch name pre-exists forked off a DIFFERENT base than the resolved
+        // default (an old default, a release line, …), reusing it would dispatch a worker on
+        // a branch not descending from the base materialize records (the current default).
+        // Validate whenever the resolved base resolves, regardless of the flag.
+        let repo = tmp("aws-blank-mismatch");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+
+        // (A) A pre-existing branch with a DISJOINT history (an orphan, modelling a branch
+        // forked off a different/old base), so it does NOT descend from the resolved default
+        // (main). Reusing it via the -b fallback for a BLANK base must be rejected, even
+        // though require_resolvable=false.
+        git(&repo, &["checkout", "-q", "--orphan", "feat/x"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "orphan work"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+        assert!(
+            !branch_descends_from(&repo, "feat/x", &main),
+            "precondition: orphan feat/x does not descend from the resolved default"
+        );
+        let wt_a = tmp("aws-blank-mismatch-a");
+        assert!(
+            add_worktree_synced(&repo, "feat/x", &wt_a, "", false).is_err(),
+            "blank base: existing branch not descending from the resolved default must be rejected"
+        );
+
+        // (B) A pre-existing branch based on the resolved default (main) → reused, Ok.
+        git(&repo, &["branch", "feat/y", &main]).unwrap();
+        let wt_b = tmp("aws-blank-mismatch-b");
+        assert!(
+            add_worktree_synced(&repo, "feat/y", &wt_b, "", false).is_ok(),
+            "blank base: existing branch descending from the resolved default is reused"
+        );
+
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
+    }
+
+    #[test]
+    fn add_worktree_synced_prefers_remote_tracking_over_local_origin_branch() {
+        // R43-2: a LOCAL branch literally named `origin/develop` (refs/heads/origin/develop)
+        // would shadow a short `origin/develop`. add_worktree_synced must carry the
+        // FULLY-QUALIFIED refs/remotes/origin/develop, so the worktree forks off the
+        // remote-tracking tip — NOT the misleading local branch — and branched_from == "develop".
+        let origin = tmp("aws-shadow-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "develop work"]).unwrap();
+        let remote_dev_tip = git(&origin, &["rev-parse", "HEAD"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        let clone = tmp("aws-shadow-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        git(&clone, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&clone, &["config", "user.name", "t"]).unwrap();
+        assert!(ref_resolves(&clone, "refs/remotes/origin/develop"), "precondition: origin/develop fetched");
+        // A LOCAL branch literally named `origin/develop`, pointing at main's initial commit
+        // (a DIFFERENT commit than the remote-tracking develop tip).
+        let local_shadow_tip = git(&clone, &["rev-parse", &main]).unwrap();
+        assert_ne!(local_shadow_tip, remote_dev_tip, "precondition: the shadow points elsewhere");
+        git(&clone, &["branch", "origin/develop", &local_shadow_tip]).unwrap();
+        assert!(ref_resolves(&clone, "refs/heads/origin/develop"), "precondition: local origin/develop branch exists");
+
+        let wt = tmp("aws-shadow-wt");
+        let add = add_worktree_synced(&clone, "feat/x", &wt, "develop", true)
+            .expect("an explicit base `develop` resolvable via origin must be accepted");
+        // The worktree must fork off the REMOTE-tracking tip, not the local `origin/develop` branch.
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap(),
+            remote_dev_tip,
+            "R43-2: forked off refs/remotes/origin/develop, not the local origin/develop branch"
+        );
+        assert_eq!(add.branched_from, "develop", "R43-2: branched_from records the bare branch name");
+        assert!(add.synced, "branched off the freshly-fetched remote-tracking develop");
+
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
 }

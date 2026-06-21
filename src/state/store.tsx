@@ -196,6 +196,7 @@ interface Store {
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: () => Promise<void>;
+  setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
@@ -331,6 +332,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [directionsByThread, setDirections] = useState<Record<number, Direction[]>>({});
   const [worktreesByDirection, setWorktrees] = useState<Record<number, Worktree[]>>({});
   const [activeThreadId, setActiveThreadId] = useState<number | null>(null);
+  // Live mirror so async tasks can check the CURRENT active thread instead of
+  // the stale one captured when they started (mirrors activeWorkspaceIdRef).
+  const activeThreadIdRef = useRef(activeThreadId);
+  activeThreadIdRef.current = activeThreadId;
   const [sessions, setSessions] = useState<Record<number, OpenSession>>({});
   const [checksByDirection, setChecksByDirection] = useState<Record<number, RepoChecks[]>>({});
   const [checkingDirections, setCheckingDirections] = useState<Record<number, boolean>>({});
@@ -1724,15 +1729,92 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeThreadId, refreshProposal],
   );
 
+  // In-flight base-branch save, keyed PER THREAD — confirm/approve flush their OWN
+  // thread's pending save before acting (the field saves on blur fire-and-forget), and
+  // a cross-thread reset must never corrupt another thread's serialization chain.
+  const pendingBaseSave = useRef<Map<number, Promise<unknown>>>(new Map());
+  // Base saves that rejected, keyed thread → set of failed LANE identities
+  // (`name\0repo`). The chain's `.catch` swallows predecessors for serialization, so
+  // confirm/approve consult this latch (not just the final promise) before acting.
+  // Per-LANE within a thread: a successful retry of one lane clears only THAT lane's
+  // failure, so a different lane's success can't mask an earlier lane's stale base;
+  // confirm/approve abort while the thread still has ANY unrecovered lane failure.
+  const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
+
   const confirmProposal = useCallback(async () => {
     if (activeThreadId == null) return;
+    // Flush any in-flight base-branch save before materializing. If it REJECTED
+    // (e.g. a re-propose moved the lane, or a DB error), the backend still holds the
+    // old base — refresh the proposal to the real state and abort rather than
+    // materializing from a stale base. Consume the promise so a retry isn't blocked
+    // by the settled rejection.
+    const pending = pendingBaseSave.current.get(activeThreadId) ?? Promise.resolve();
+    pendingBaseSave.current.delete(activeThreadId);
+    try {
+      await pending;
+    } catch {
+      // handled by the latch below
+    }
+    // Also abort if any EARLIER link in the chain failed — the chain's
+    // `.catch(() => {})` swallows predecessors for serialization, so the final
+    // promise may resolve even when a prior save rejected.
+    if ((baseSaveFailed.current.get(activeThreadId)?.size ?? 0) > 0) {
+      baseSaveFailed.current.delete(activeThreadId);
+      await refreshProposal(activeThreadId);
+      return;
+    }
     const ids = await api.confirmProposal(activeThreadId);
     setProposal(null);
     setReviewingProposal(false);
     await loadThreadChildren(activeThreadId);
     // Automation-first: dispatch every new task's worker immediately.
     for (const id of ids) void dispatchDirection(id);
-  }, [activeThreadId, loadThreadChildren, dispatchDirection]);
+  }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
+
+  const setProposalDirectionBase = useCallback(
+    (index: number, name: string, repo: string, base: string, expectedOldBase: string): Promise<void> => {
+      if (activeThreadId == null) return Promise.resolve();
+      const tid = activeThreadId;
+      // Include the lane INDEX: a proposal can hold two pending writes with the same
+      // name+repo, and a name+repo-only key would be shared — one lane's successful save
+      // would then clear the other lane's still-pending failure, so confirm/approve would
+      // stop aborting even though the first lane's base edit never landed.
+      const laneKey = `${index}\0${name}\0${repo}`;
+      // Serialize onto any in-flight base save (chain, don't replace) and use the
+      // targeted server-side setter — no whole-proposal rebuild from stale state,
+      // no status downgrade. confirm/approve await pendingBaseSave before acting.
+      // `expectedOldBase` is the persisted base the field was editing FROM: the backend
+      // rejects the save if a same-identity re-propose changed the lane's base meanwhile.
+      const p = (pendingBaseSave.current.get(tid) ?? Promise.resolve())
+        .catch(() => {})
+        .then(() => api.setProposalDirectionBase(tid, index, name, repo, expectedOldBase, base.trim()))
+        .then(() => {
+          // This LANE's save LANDED — clear ONLY this lane's failure (not the whole
+          // thread), so a successful retry isn't treated as failed by the next
+          // Create/Approve, while a DIFFERENT lane's earlier failure stays latched.
+          baseSaveFailed.current.get(tid)?.delete(laneKey);
+          // Don't let a save that completes after a thread switch overwrite the
+          // global proposal with the old thread's data.
+          if (activeThreadIdRef.current === tid) {
+            return refreshProposal(tid);
+          }
+        })
+        .catch((err) => {
+          // Latch so confirm/approve know ANY link in the chain rejected, not just
+          // the final one. The predecessor's `.catch(() => {})` already swallows
+          // earlier rejections for serialization purposes; this terminal catch sets
+          // the latch and re-throws so THIS link's own promise also rejects (the
+          // NEXT edit's `.catch(() => {})` will swallow it in turn).
+          const set = baseSaveFailed.current.get(tid) ?? new Set<string>();
+          set.add(laneKey);
+          baseSaveFailed.current.set(tid, set);
+          throw err;
+        });
+      pendingBaseSave.current.set(tid, p);
+      return p;
+    },
+    [activeThreadId, refreshProposal],
+  );
 
   const answerAsk = useCallback(
     async (item: NeedItem, text: string) => {
@@ -1747,6 +1829,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const approveWriteTrigger = useCallback(
     async (item: WriteTrigger, tool?: string) => {
+      // Flush any in-flight base-branch save first. If it REJECTED (re-propose moved
+      // the lane, or a DB error), the backend still holds the old base — refresh the
+      // active proposal and abort rather than approving from a stale base. Mirrors
+      // confirmProposal. Consume the promise so a retry isn't blocked.
+      const pending = pendingBaseSave.current.get(item.thread_id) ?? Promise.resolve();
+      pendingBaseSave.current.delete(item.thread_id);
+      try {
+        await pending;
+      } catch {
+        // handled by the latch below
+      }
+      // Also abort if any EARLIER link in the chain failed — the chain's
+      // `.catch(() => {})` swallows predecessors for serialization, so the final
+      // promise may resolve even when a prior save rejected.
+      if ((baseSaveFailed.current.get(item.thread_id)?.size ?? 0) > 0) {
+        baseSaveFailed.current.delete(item.thread_id);
+        // A rejected base save can mean a re-proposal changed the lane indices, so this
+        // card's item.index is now stale. Refresh the Needs cards (dropping the stale
+        // one) as well as the proposal before aborting — otherwise a second click on the
+        // stale card would approve/dispatch the WRONG lane once the latch is cleared.
+        await refreshNeeds();
+        if (activeThreadId != null) await refreshProposal(activeThreadId);
+        return;
+      }
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
@@ -1757,11 +1863,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         await refreshNeeds();
       }
     },
-    [dispatchDirection, refreshNeeds, defaultTool],
+    [dispatchDirection, refreshNeeds, defaultTool, activeThreadId, refreshProposal],
   );
 
   const denyWriteTrigger = useCallback(
     async (item: WriteTrigger) => {
+      // Flush any in-flight base-branch save for this thread FIRST: a blur-save still
+      // writing the proposal can otherwise land AFTER deny_direction and restore the
+      // lane's decision:"" — making the denied write reappear as pending. Mirrors the
+      // flush in confirmProposal/approveWriteTrigger.
+      const pending = pendingBaseSave.current.get(item.thread_id) ?? Promise.resolve();
+      pendingBaseSave.current.delete(item.thread_id);
+      try {
+        await pending;
+      } catch {
+        // handled by the latch check below
+      }
+      // If that save REJECTED, a re-proposal may have moved/replaced the lanes (the
+      // server-side base setter rejects when item.index's lane was replaced), so
+      // item.index is no longer trustworthy — denying by it could deny the WRONG lane.
+      // Abort and refresh to the real state instead of denying a stale index.
+      if ((baseSaveFailed.current.get(item.thread_id)?.size ?? 0) > 0) {
+        baseSaveFailed.current.delete(item.thread_id);
+        await refreshNeeds();
+        return;
+      }
       setWriteTriggers((cur) =>
         cur.filter((w) => !(w.thread_id === item.thread_id && w.index === item.index)),
       );
@@ -2061,6 +2187,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshProposal,
     saveProposal,
     confirmProposal,
+    setProposalDirectionBase,
     overview,
     refreshOverview,
     selectWorkspace,

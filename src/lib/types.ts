@@ -84,6 +84,8 @@ export interface Direction {
   status: string;
   /** worker mandate: "plan+impl" (plans its direction first) | "impl-only". */
   mandate: string;
+  /** the ref the work branch was created off; "" = the repo's default branch. */
+  base_branch: string;
   created_at: string;
 }
 
@@ -405,6 +407,7 @@ export interface ProposedDirection {
   repo: string;
   reason: string;
   mandate?: string;
+  base_branch?: string;
   decision?: string;
 }
 export interface Proposal {
@@ -424,12 +427,19 @@ export interface ResolvedDirection {
   reason: string;
   /** "plan+impl" | "impl-only" */
   mandate: string;
+  /** the chosen base branch; "" = the repo's default branch. */
+  base_branch: string;
   decision: string;
 }
 export interface ResolvedProposal {
   thread_id: number;
   rationale: string;
   status: string; // proposed | confirmed
+  /**
+   * Proposal version ("last proposed at"): bumped on every re-proposal (R50-2). Used to reset a
+   * dirty base-branch edit on ANY re-proposal, even one with the same name/repo/base.
+   */
+  created_at: string;
   directions: ResolvedDirection[];
 }
 
@@ -514,6 +524,8 @@ export interface WriteTrigger {
   name: string;
   repo_name: string;
   reason: string;
+  /** the lead's chosen base branch for this write; "" = the repo's default branch. */
+  base_branch: string;
 }
 
 /** An open agent→human question, aggregated workspace-wide for "Needs you". */

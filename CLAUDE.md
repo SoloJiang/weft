@@ -51,10 +51,16 @@ When opening a PR, prefer the GitHub app/connector and fall back to `gh pr creat
 
 Opening a PR or pushing new commits to one triggers an automated review (the Codex review bot) on the GitHub remote. Pushing is not the end of the task: keep watching the PR until its review reaches a stable state — do not report "pushed" and stop.
 
-Close the loop only when one of these holds:
+A PR is **"truly mergeable"** — the bar for closing the loop — only when **ALL THREE** hold:
 
-- The Codex bot signals approval (e.g. a "Good"/LGTM reaction or an approving review).
-- No unresolved, actionable review threads remain.
+1. **CI is green** on every platform check,
+2. **the Codex bot has signalled the all-clear on the PR itself** — a 👍 ("Good") reaction on the PR (its body/description), or an approving review, AND
+3. **the branch has no merge conflict with its target/base branch** — the PR's mergeable state is clean (GitHub `mergeable == MERGEABLE`, not `CONFLICTING`). If the base advances and a conflict appears, merge the latest base in and resolve it (prefer a merge commit over a force-push), then re-run CI and re-check.
+
+A clean re-review reacts 👍 *instead of* commenting, so that reaction is the signal — watch the PR's reactions (`gh api repos/<owner>/<repo>/issues/<n>/reactions` for `content == "+1"`), not just its threads. Also poll the PR's `mergeable` state so a base-advance conflict is caught proactively, not just at merge time. **Zero unresolved threads is necessary but NOT sufficient**: keep handling rounds and re-monitoring until the 👍 lands with CI green and no conflict (or CI fails / a conflict appears, which you fix first). Do not report "mergeable" and stop just because threads are resolved.
+
+Stop short of that bar only when:
+
 - The remaining threads are out-of-scope, speculative, or duplicate gates, and you have replied on the PR with an explicit push-back.
 - The user tells you to stop.
 

@@ -74,8 +74,20 @@ async fn register_repo(
     let canonical = std::fs::canonicalize(p)
         .map(|c| c.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
-    // default base ref = current branch of the repo
-    let base = crate::git::current_branch(p).unwrap_or_else(|_| "main".into());
+    // Default base ref = the repo's real default branch: the remote's default
+    // (origin/HEAD), else the conventional integration branch (main/master), else
+    // the locally checked-out branch. So a repo added while on a feature branch
+    // records the integration branch as base, not that feature branch.
+    // Use the LOCAL default only — never a blocking network lookup (ls-remote) at
+    // registration time, which would hang Add Repo on a slow/VPN/SSH remote for a
+    // best-effort base hint. Materialization does the authoritative live-default
+    // resolution (and fetch) later, where a brief network call is acceptable.
+    // `vetted` is true ONLY when `base` came from origin/HEAD or a real main/master
+    // branch — NOT the current-branch / "main"-last-resort fallback (R47-2).
+    let (base, base_is_vetted_default) = crate::git::default_base_branch_vetted(
+        p,
+        &crate::git::current_branch(p).unwrap_or_default(),
+    );
     // Captured for workspace-level dedup; empty for a local repo with no origin.
     // Credentials embedded in an HTTPS remote are redacted so a PAT/password from
     // .git/config never lands in Weft's DB/backups.
@@ -101,9 +113,23 @@ async fn register_repo(
             }
         }
     }
-    let mut r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote)
-        .await
-        .map_err(e)?;
+    // Mark `base` as the captured default ONLY when it is a genuinely-vetted default
+    // (origin/HEAD or a real main/master branch — `base_is_vetted_default`). For a
+    // single-branch / nonstandard checkout with NO origin/HEAD and NO main/master, the
+    // base is whatever happened to be checked out / the "main" last-resort, which is NOT
+    // vetted; marking it is_default=true would make the offline fallback
+    // (`recorded_base_or_default`) trust it over the main/master chain (R47-2).
+    let mut r = repo::add_repo_ref(
+        db,
+        workspace_id,
+        name,
+        &canonical,
+        &base,
+        &remote,
+        base_is_vetted_default,
+    )
+    .await
+    .map_err(e)?;
     // If dedup resolved to an EXISTING row (by remote) at a different path whose
     // checkout is gone, repoint it to the path the user just gave us — a local add
     // OR a clone — so we don't keep pointing at a dead checkout and report success.
@@ -274,7 +300,7 @@ pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
 #[tauri::command]
 pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     // Capture the repo path before the cascade — the repo_ref row is gone after
-    // delete_repo_cascade, so we resolve worktree removal against it first.
+    // delete_repo_cascade, so we must resolve the git path first.
     let repo = repo::get_repo(&db, repo_id)
         .await
         .map_err(e)?
@@ -283,13 +309,29 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     // Drop any in-memory analysis run-state so the process-global registry doesn't
     // keep a stale failed/running entry for a repo that no longer exists.
     crate::curator::run_forget(repo_id);
+    // Gate worktree removal on created_checkout (a reused pre-existing path must
+    // survive) and branch deletion on created_branch (a pre-existing branch reused
+    // by the -b fallback survives repo deletion). cleanup_worktrees cannot be used
+    // here because delete_repo_cascade already deleted the repo_ref row (which
+    // cleanup_worktrees needs for the git path lookup); instead we use the
+    // pre-fetched path directly.
     let repo_path = std::path::Path::new(&repo.local_git_path);
-    for (_repo_id, path, branch) in &removed {
-        if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
-            eprintln!("[weft] worktree remove failed for {path}: {err}");
+    for (_repo_id, path, branch, created_branch, created_checkout) in &removed {
+        if *created_checkout {
+            if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
+                eprintln!("[weft] worktree remove failed for {path}: {err}");
+            }
+        } else {
+            // Reused (non-weft) checkout: keep it as a usable worktree, but LOCK it so the
+            // orphan GC skips it now that its DB row is gone (mirrors cleanup_worktrees).
+            // Locking via git metadata also means a later re-add of this repo can't
+            // re-orphan the checkout.
+            let _ = crate::git::lock_worktree(repo_path, std::path::Path::new(path));
         }
-        if let Err(err) = crate::git::delete_branch(repo_path, branch) {
-            eprintln!("[weft] branch delete failed for {branch}: {err}");
+        if *created_branch {
+            if let Err(err) = crate::git::delete_branch(repo_path, branch) {
+                eprintln!("[weft] branch delete failed for {branch}: {err}");
+            }
         }
     }
     Ok(())
@@ -433,6 +475,26 @@ pub async fn save_proposal(
         .map_err(e)
 }
 
+/// Set one proposed direction's base branch in the stored proposal (targeted; keeps status).
+/// `name` and `repo` are the lane identity the frontend edited — rejected if the
+/// proposal was replaced under the index (re-propose while a blur-save was in flight).
+/// `expected_base` is the base the field was editing FROM — rejected if a same-identity
+/// re-propose changed the lane's base in the meantime (optimistic concurrency).
+#[tauri::command]
+pub async fn set_proposal_direction_base(
+    db: State<'_, Db>,
+    thread_id: i32,
+    index: usize,
+    name: String,
+    repo: String,
+    expected_base: String,
+    base: String,
+) -> R<()> {
+    crate::planner::set_direction_base(&db, thread_id, index, &name, &repo, &expected_base, &base)
+        .await
+        .map_err(e)
+}
+
 /// Confirm the stored proposal: create its directions + materialize worktrees.
 #[tauri::command]
 pub async fn confirm_proposal(db: State<'_, Db>, thread_id: i32) -> R<Vec<i32>> {
@@ -499,6 +561,7 @@ pub async fn create_direction(
     repo_id: i32,
     reason: String,
     mandate: Option<String>,
+    base_branch: Option<String>,
 ) -> R<entities::direction::Model> {
     let dir = repo::create_direction(
         &db,
@@ -508,6 +571,7 @@ pub async fn create_direction(
         repo_id,
         &reason,
         mandate.as_deref().unwrap_or("plan+impl"),
+        base_branch.as_deref().unwrap_or(""),
     )
     .await
     .map_err(e)?;
@@ -997,6 +1061,7 @@ pub struct WriteTrigger {
     pub name: String,
     pub repo_name: String,
     pub reason: String,
+    pub base_branch: String,
 }
 
 /// Every pending write declaration across the workspace's threads — the
@@ -1019,6 +1084,7 @@ pub async fn write_triggers(db: State<'_, Db>, workspace_id: i32) -> R<Vec<Write
                 name: p.name,
                 repo_name: p.repo_name,
                 reason: p.reason,
+                base_branch: p.base_branch,
             });
         }
     }
@@ -1774,4 +1840,83 @@ pub async fn db_change_password(
     Ok(DbEncryptionMutationResult {
         restart_required: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sh(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "command failed: {args:?}");
+    }
+
+    /// Init a repo with a real integration branch (main/master) present.
+    fn init_main_repo(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        sh(&p, &["git", "init", "-q"]);
+        sh(&p, &["git", "config", "user.email", "t@t.t"]);
+        sh(&p, &["git", "config", "user.name", "t"]);
+        std::fs::write(p.join("README.md"), "# x\n").unwrap();
+        sh(&p, &["git", "add", "-A"]);
+        sh(&p, &["git", "commit", "-q", "-m", "init"]);
+        p
+    }
+
+    /// R47-2: `register_repo` must capture `base_ref_is_default` HONESTLY.
+    /// - A standard repo (real main/master, the vetted default) → is_default=true (unchanged).
+    /// - A nonstandard single-branch repo (only `trunk`, no main/master, no origin/HEAD) →
+    ///   the base is the current-branch / "main"-last-resort fallback, NOT a vetted default →
+    ///   is_default=false, so the offline fallback won't trust it over the main/master chain.
+    #[tokio::test]
+    async fn register_repo_marks_only_vetted_default_as_default() {
+        let tag = format!("weft-regrepo-{}", std::process::id());
+        let root = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+
+        // (a) Standard repo with a real main/master integration branch → vetted default.
+        let std_repo = init_main_repo(&root, "api");
+        let def = crate::git::current_branch(&std_repo).unwrap();
+        assert!(def == "main" || def == "master", "precondition: init produced main/master");
+        let r_std = register_repo(&db, ws.id, "api", std_repo.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            r_std.base_ref_is_default,
+            "R47-2: a real main/master default must be captured as is_default=true (unchanged)"
+        );
+        assert_eq!(r_std.base_ref, def, "captured base is the vetted default branch");
+
+        // (b) Nonstandard repo: rename the only branch to `trunk` (no main/master, no remote).
+        let nonstd = init_main_repo(&root, "weird");
+        sh(&nonstd, &["git", "branch", "-m", "trunk"]);
+        assert!(
+            crate::git::ref_resolves(&nonstd, "refs/heads/trunk"),
+            "precondition: trunk exists"
+        );
+        assert!(
+            !crate::git::ref_resolves(&nonstd, "refs/heads/main")
+                && !crate::git::ref_resolves(&nonstd, "refs/heads/master"),
+            "precondition: no main/master branch"
+        );
+        let r_nonstd = register_repo(&db, ws.id, "weird", nonstd.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !r_nonstd.base_ref_is_default,
+            "R47-2: a nonstandard fallback base (trunk; no main/master/origin-HEAD) must NOT be \
+             captured as a vetted default"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
