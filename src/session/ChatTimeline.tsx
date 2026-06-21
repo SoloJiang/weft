@@ -180,7 +180,7 @@ export function ChatTimeline({
       {busy && (
         <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
           {activity ? (
-            <ActivityLine name={activity.name} summary={activity.summary} />
+            <ToolStatus name={activity.name} summary={activity.summary} />
           ) : (
             <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
@@ -283,8 +283,90 @@ function EmptyLeadState({
   );
 }
 
+type ToolStatus = "streaming" | "complete" | "error";
+
+function deriveToolStatus(m: LeadMessage, c: Record<string, unknown>): ToolStatus {
+  if (m.status === "streaming") return "streaming";
+  if (c.is_error === true || m.status === "error") return "error";
+  return "complete";
+}
+
+function Tool({
+  name,
+  summary,
+  status,
+  input,
+  output,
+}: {
+  name: string;
+  summary: string;
+  status: ToolStatus;
+  input?: string;
+  output?: string;
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const Icon = toolIcon(name);
+  const labelKey = status === "streaming" ? toolLabelKey(name) : toolDoneLabelKey(name);
+  const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
+  const label = generic ? cleanToolName(name) : t(labelKey);
+  const { target, added, removed } = compactToolTarget(name, summary);
+  const hasDetail = (input && input.length > 0) || (output && output.length > 0);
+
+  return (
+    <div>
+      <button
+        type="button"
+        disabled={!hasDetail}
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
+          hasDetail && "hover:bg-surface/60",
+        )}
+      >
+        <Icon
+          size={13}
+          className={cn(
+            "shrink-0",
+            status === "streaming" && "animate-pulse text-running",
+            status === "error" && "text-danger",
+            status === "complete" && "text-ink-faint",
+          )}
+        />
+        <span className="shrink-0 text-ink-muted">{label}</span>
+        {(target || summary) && (
+          <span className="min-w-0 truncate font-mono text-ink-faint">{target || summary}</span>
+        )}
+        {added && <span className="shrink-0 font-mono text-running">+{added}</span>}
+        {removed && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
+        {hasDetail && (
+          <ChevronRight
+            size={12}
+            className={cn(
+              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
+              open && "rotate-90",
+            )}
+          />
+        )}
+      </button>
+      {open && hasDetail && (
+        <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
+          {input && <ToolBlock label={t("tool.input")} body={input} />}
+          {output && (
+            <ToolBlock
+              label={t("tool.output")}
+              body={output}
+              tone={status === "error" ? "error" : "default"}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The tool call in flight — pulsing, transient, precise about WHAT it calls. */
-function ActivityLine({ name, summary }: { name: string; summary: string }) {
+function ToolStatus({ name, summary }: { name: string; summary: string }) {
   const { t } = useTranslation();
   const Icon = toolIcon(name);
   const labelKey = toolLabelKey(name);
@@ -307,78 +389,6 @@ function ActivityLine({ name, summary }: { name: string; summary: string }) {
       )}
       {added && <span className="shrink-0 font-mono text-running">+{added}</span>}
       {removed && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
-    </div>
-  );
-}
-
-/**
- * A persisted tool call: a low-weight, borderless line (codex-style) — a
- * state-colored icon + label + target — that expands to show the full input and
- * the tool's output. `status` mirrors the row: "streaming" = running,
- * "complete"/"error" = finished.
- */
-function ToolRow({ m }: { m: LeadMessage }) {
-  const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  const c = parse(m.content);
-  const name = typeof c.name === "string" ? c.name : "tool";
-  const summary = typeof c.summary === "string" ? c.summary : "";
-  const output = typeof c.output === "string" ? c.output : "";
-  const inputText = formatToolValue(c.input);
-  const running = m.status === "streaming";
-  const isError = c.is_error === true || m.status === "error";
-  const Icon = toolIcon(name);
-  // Finished rows read past-tense ("Ran"/"已运行"); a running row stays "Running".
-  const labelKey = running ? toolLabelKey(name) : toolDoneLabelKey(name);
-  const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
-  const label = generic ? cleanToolName(name) : t(labelKey);
-  const { target } = compactToolTarget(name, summary);
-  const hasDetail = inputText.length > 0 || output.length > 0;
-
-  return (
-    <div>
-      <button
-        type="button"
-        disabled={!hasDetail}
-        onClick={() => setOpen((v) => !v)}
-        className={cn(
-          "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
-          hasDetail && "hover:bg-surface/60",
-        )}
-      >
-        <Icon
-          size={13}
-          className={cn(
-            "shrink-0",
-            running
-              ? "animate-pulse text-running"
-              : isError
-                ? "text-danger"
-                : "text-ink-faint",
-          )}
-        />
-        <span className="shrink-0 text-ink-muted">{label}</span>
-        {(target || summary) && (
-          <span className="min-w-0 truncate font-mono text-ink-faint">{target || summary}</span>
-        )}
-        {hasDetail && (
-          <ChevronRight
-            size={12}
-            className={cn(
-              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
-              open && "rotate-90",
-            )}
-          />
-        )}
-      </button>
-      {open && hasDetail && (
-        <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
-          {inputText && <ToolBlock label={t("tool.input")} body={inputText} />}
-          {output && (
-            <ToolBlock label={t("tool.output")} body={output} tone={isError ? "error" : "default"} />
-          )}
-        </div>
-      )}
     </div>
   );
 }
@@ -521,7 +531,20 @@ function TimelineRow({
   const c = parse(m.content);
 
   if (m.kind === "tool") {
-    return <ToolRow m={m} />;
+    const content = parse(m.content);
+    const name = typeof content.name === "string" ? content.name : "tool";
+    const summary = typeof content.summary === "string" ? content.summary : "";
+    const output = typeof content.output === "string" ? content.output : "";
+    const inputText = formatToolValue(content.input);
+    return (
+      <Tool
+        name={name}
+        summary={summary}
+        status={deriveToolStatus(m, content)}
+        input={inputText}
+        output={output}
+      />
+    );
   }
 
   if (m.kind === "action_card") {
