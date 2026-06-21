@@ -48,7 +48,7 @@ pub fn ref_resolves(dir: &Path, r: &str) -> bool {
 /// name is checked/used so a same-named TAG (which bare `<name>` would match first) can't
 /// shadow it. This is the canonical spelling for the whole module; route inline
 /// `format!("refs/heads/{…}")` ref sites through it for one source of truth.
-fn local_branch_ref(name: &str) -> String {
+pub fn local_branch_ref(name: &str) -> String {
     format!("refs/heads/{name}")
 }
 
@@ -219,13 +219,23 @@ fn resolve_target_ref(worktree: &Path, target: &str) -> String {
             // common ancestor.
             let mb_remote = git(worktree, &["merge-base", "HEAD", &remote]).ok();
             let mb_local = git(worktree, &["merge-base", "HEAD", &local]).ok();
-            if let (Some(mr), Some(ml)) = (mb_remote, mb_local) {
-                // Forked from origin when local's merge-base is an ancestor of origin's
-                // (origin's fork point is at least as recent); covers the no-divergence
-                // tie too.
-                let forked_from_origin =
-                    git(worktree, &["merge-base", "--is-ancestor", &ml, &mr]).is_ok();
-                return if forked_from_origin { remote } else { local };
+            match (mb_remote, mb_local) {
+                (Some(mr), Some(ml)) => {
+                    // Both share history with HEAD — forked from origin when local's merge-base
+                    // is an ancestor of origin's (origin's fork point is at least as recent);
+                    // covers the no-divergence tie too.
+                    let forked_from_origin =
+                        git(worktree, &["merge-base", "--is-ancestor", &ml, &mr]).is_ok();
+                    return if forked_from_origin { remote } else { local };
+                }
+                // Only ONE side shares history with HEAD — that's the ref the worktree actually
+                // forked from. The other (e.g. an `origin/<t>` force-pushed to UNRELATED history)
+                // has no merge-base and would make the Diff tab compare against unrelated commits
+                // (huge/noisy). Return the side that HAS a merge-base.
+                (Some(_), None) => return remote,
+                (None, Some(_)) => return local,
+                // Neither shares history with HEAD — fall through to the existence preference.
+                (None, None) => {}
             }
         }
         if remote_ok {
@@ -469,6 +479,13 @@ pub struct WorktreeAdd {
     pub created_branch: bool,
     pub synced: bool,
     pub branched_from: String,
+    /// The COMMIT the NEW work branch was forked from — the resolved base's tip, captured ONLY
+    /// on the `worktree add -b <branch> <resolved>` success path (a freshly-created branch). The
+    /// reuse/fallback arms (path-exists, `-b` fallback adopting a pre-existing branch) leave this
+    /// EMPTY: those adopt a checkout/branch rather than fork a fresh one, so there's no new fork
+    /// point to record. Persisted as worktree.base_commit and used for reuse-time ancestry
+    /// validation against a STABLE point instead of a re-resolved base name.
+    pub base_commit: String,
 }
 
 /// True when `worktree_path` is a worktree REGISTERED TO `repo` and checked out on
@@ -505,32 +522,13 @@ pub fn local_branch_exists(repo: &Path, branch: &str) -> bool {
     ref_resolves(repo, &local_branch_ref(branch))
 }
 
-/// Does `branch` descend from the explicit base NAME, resolved to the ref the create path
-/// would (or did) fork from? PREFERS the FULLY-QUALIFIED `refs/remotes/origin/<base>` when it
-/// resolves, falling back to the LOCAL `refs/heads/<base>` only when the remote is absent
-/// (single-branch / local-only). Returns Some(true)/Some(false) for the preferred form, and
-/// None when neither resolves (base gone → caller skips).
-pub fn branch_descends_from_base(repo: &Path, branch: &str, base: &str) -> Option<bool> {
-    let t = normalize_target(base);
-    if t.is_empty() || t == "HEAD" {
-        return None;
-    }
-    // Mirror the create path's base preference so reuse validates against the SAME ref the lane
-    // was (or would be) forked from. Prefer the FULLY-QUALIFIED refs/remotes/origin/<t> when it
-    // resolves — (R43-2) a local branch literally named `origin/<t>` would shadow a short
-    // `origin/<t>`, and (R43-1) when origin/<t> is ahead of a stale local <t>, accepting a branch
-    // that only descends from the stale local ref dispatches it as <t>-based while MISSING origin's
-    // commits. Fall back to local refs/heads/<t> only when the remote is absent (single-branch /
-    // local-only). None when neither resolves (base gone → caller skips).
-    let remote = remote_branch_ref(&t);
-    if ref_resolves(repo, &remote) {
-        return Some(branch_descends_from(repo, branch, &remote));
-    }
-    let local = local_branch_ref(&t);
-    if ref_resolves(repo, &local) {
-        return Some(branch_descends_from(repo, branch, &local));
-    }
-    None
+/// True when `ancestor` is an ancestor of `descendant` — i.e.
+/// `git merge-base --is-ancestor <ancestor> <descendant>` succeeds. Both args are passed to
+/// git verbatim (callers qualify refs themselves, e.g. `local_branch_ref`); a recorded fork
+/// COMMIT oid needs no qualification. Used to validate a reused work branch still descends from
+/// the STABLE commit it was forked from, instead of a re-resolved (moving) base name.
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(repo, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
 }
 
 /// Like `add_worktree`, but first best-effort fetches `base_name` from origin and
@@ -621,6 +619,8 @@ pub fn add_worktree_synced(
             created_branch: false,
             synced: false,
             branched_from: String::new(),
+            // Reused a pre-existing registered checkout — no fresh fork point to record.
+            base_commit: String::new(),
         });
     }
     let resolved = resolved_opt.unwrap_or_else(|| resolve_base_ref(repo, &t));
@@ -667,14 +667,25 @@ pub fn add_worktree_synced(
             created_branch: false,
             synced: false,
             branched_from: String::new(),
+            // Adopted a pre-existing branch (we did NOT fork it here) — no fresh fork point.
+            base_commit: String::new(),
         });
     }
+    // The `-b <branch> <resolved>` create SUCCEEDED: weft forked a fresh branch off the
+    // resolved base. Capture that base's COMMIT (its tip oid) as the stable fork point, so a
+    // later reuse validates ancestry against THIS commit rather than a re-resolved base name
+    // that may have moved. Best-effort: an unresolvable rev-parse leaves it empty (skip).
+    let base_commit = git(repo, &["rev-parse", "--verify", &format!("{resolved}^{{commit}}")])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     Ok(WorktreeAdd {
         path: worktree_path.to_path_buf(),
         created_checkout: true,
         created_branch: true,
         synced,
         branched_from: normalize_target(&resolved),
+        base_commit,
     })
 }
 
@@ -1973,6 +1984,63 @@ mod tests {
     }
 
     #[test]
+    fn resolve_target_ref_returns_the_side_with_a_merge_base() {
+        // R48-1: when local & origin <target> BOTH resolve but only ONE shares history with
+        // HEAD (the other was force-pushed/created with UNRELATED — disjoint — history), the
+        // asymmetric `match (mb_remote, mb_local)` must return the side that HAS a merge-base,
+        // not fall through to the existence preference (which would diff against unrelated
+        // commits — huge/noisy). Covers both directions.
+        let repo = tmp("rtr-asym");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // Make an ORPHAN (disjoint) commit with no shared ancestry with main/HEAD. Capture its
+        // sha so we can point a remote-tracking ref at it without it sharing history.
+        git(&repo, &["checkout", "-q", "--orphan", "disjoint"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "unrelated root"]).unwrap();
+        let orphan_sha = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+
+        // ---- (A) forked off LOCAL develop; origin/develop is UNRELATED → LOCAL. ----
+        // A real local `develop` sharing history with main (the genuine fork point).
+        git(&repo, &["branch", "develop", &main]).unwrap();
+        // A remote-tracking refs/remotes/origin/develop pointing at the disjoint orphan — it
+        // resolves as a ref but has NO merge-base with HEAD.
+        git(&repo, &["update-ref", "refs/remotes/origin/develop", &orphan_sha]).unwrap();
+        let wt_a = tmp("rtr-asym-wt-a");
+        git(&repo, &["worktree", "add", "-q", "-b", "feat/local", &wt_a.to_string_lossy(), "refs/heads/develop"]).unwrap();
+        git(&wt_a, &["commit", "-q", "--allow-empty", "-m", "agent-a"]).unwrap();
+        assert!(ref_resolves(&wt_a, "refs/heads/develop"), "precondition: local develop resolves");
+        assert!(ref_resolves(&wt_a, "refs/remotes/origin/develop"), "precondition: remote develop resolves");
+        assert_eq!(
+            resolve_target_ref(&wt_a, "develop"),
+            "refs/heads/develop",
+            "origin/develop has unrelated history (no merge-base) → return the LOCAL side"
+        );
+
+        // ---- (B) symmetric: forked off ORIGIN/develop; local develop is UNRELATED → REMOTE. ----
+        // Reset the remote-tracking develop back to a real ancestor of main (shared history),
+        // and make LOCAL develop the disjoint orphan instead.
+        git(&repo, &["update-ref", "refs/remotes/origin/develop", &main]).unwrap();
+        git(&repo, &["update-ref", "refs/heads/develop", &orphan_sha]).unwrap();
+        let wt_b = tmp("rtr-asym-wt-b");
+        git(&repo, &["worktree", "add", "-q", "-b", "feat/remote", &wt_b.to_string_lossy(), "refs/remotes/origin/develop"]).unwrap();
+        git(&wt_b, &["commit", "-q", "--allow-empty", "-m", "agent-b"]).unwrap();
+        assert!(ref_resolves(&wt_b, "refs/heads/develop"), "precondition: local develop resolves (orphan)");
+        assert!(ref_resolves(&wt_b, "refs/remotes/origin/develop"), "precondition: remote develop resolves");
+        assert_eq!(
+            resolve_target_ref(&wt_b, "develop"),
+            "refs/remotes/origin/develop",
+            "local develop has unrelated history (no merge-base) → return the REMOTE side"
+        );
+
+        let _ = remove_worktree(&repo, &wt_a);
+        let _ = remove_worktree(&repo, &wt_b);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt_a);
+        let _ = std::fs::remove_dir_all(&wt_b);
+    }
+
+    #[test]
     fn resolve_target_ref_prefers_branch_over_same_named_tag() {
         // R46-1: a bare `<t>` resolves a same-named TAG before the branch. With a TAG `develop`
         // (at an OLD commit) AND a BRANCH `develop` (the real fork point) both present, the old
@@ -2137,6 +2205,8 @@ mod tests {
         let reuse = add_worktree_synced(&repo, "feat/c", &wt_c, &base, false)
             .expect("reusing a valid worktree on the same branch must succeed");
         assert!(!reuse.created_checkout, "reuse reports created_checkout=false");
+        // Path-reuse adopts an existing checkout — no fresh fork point recorded.
+        assert!(reuse.base_commit.is_empty(), "path-reuse must have empty base_commit");
 
         // (D) A worktree belonging to a DIFFERENT repo at the path, same branch name →
         // rejected (it is not registered in THIS repo's worktree list).
@@ -2358,6 +2428,8 @@ mod tests {
         assert!(!add.created_branch, "the branch pre-existed; we did not create it");
         // existing-branch fallback: branched_from must be empty (no new branch created from a base)
         assert!(add.branched_from.is_empty(), "fallback to existing branch must have empty branched_from");
+        // ...and base_commit empty too: we adopted a pre-existing branch, no fresh fork point.
+        assert!(add.base_commit.is_empty(), "existing-branch fallback must have empty base_commit");
         assert!(wt.join(".git").exists());
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2370,11 +2442,14 @@ mod tests {
         let repo = tmp("aws-branched-from");
         init_repo(&repo).unwrap();
         let base = current_branch(&repo).unwrap();
+        let base_tip = git(&repo, &["rev-parse", &base]).unwrap();
         let wt = tmp("aws-branched-from-wt");
         let add = add_worktree_synced(&repo, "feat/new", &wt, &base, false).unwrap();
         assert!(add.created_branch, "new branch created");
         // branched_from must be the base name (no origin/ prefix for local-only repo).
         assert_eq!(add.branched_from, base, "branched_from equals the base we branched off");
+        // base_commit must be the resolved base's tip — the STABLE fork point recorded at create.
+        assert_eq!(add.base_commit, base_tip, "base_commit captures the resolved base's commit on the create-success path");
         assert!(wt.join(".git").exists());
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2583,160 +2658,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&wt_a);
         let _ = std::fs::remove_dir_all(&wt_b);
-    }
-
-    #[test]
-    fn branch_descends_from_base_checks_local_and_origin_forms() {
-        // origin: main + develop one commit AHEAD of main.
-        let origin = tmp("bdfb-origin");
-        init_repo(&origin).unwrap();
-        let main = current_branch(&origin).unwrap();
-        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
-        git(&origin, &["commit", "-q", "--allow-empty", "-m", "develop work"]).unwrap();
-        git(&origin, &["checkout", "-q", &main]).unwrap();
-
-        // (1) LOCAL-only base: a develop-based branch → Some(true); a main-based → Some(false).
-        let local = tmp("bdfb-local");
-        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &local.to_string_lossy()]).unwrap();
-        git(&local, &["config", "user.email", "t@t.t"]).unwrap();
-        git(&local, &["config", "user.name", "t"]).unwrap();
-        // A local `develop` and NO remote-tracking origin/develop (drop it).
-        git(&local, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
-        git(&local, &["checkout", "-q", &main]).unwrap();
-        let _ = git(&local, &["update-ref", "-d", "refs/remotes/origin/develop"]);
-        assert!(ref_resolves(&local, "develop"), "precondition: local develop");
-        assert!(!ref_resolves(&local, "origin/develop"), "precondition: no origin/develop");
-        git(&local, &["branch", "feat/on-develop", "develop"]).unwrap();
-        git(&local, &["branch", "feat/on-main", &main]).unwrap();
-        assert_eq!(
-            branch_descends_from_base(&local, "feat/on-develop", "develop"),
-            Some(true),
-            "local-only base: a develop-based branch descends"
-        );
-        assert_eq!(
-            branch_descends_from_base(&local, "feat/on-main", "develop"),
-            Some(false),
-            "local-only base: a main-based branch does NOT descend"
-        );
-
-        // (2) ORIGIN-only base (single-branch clone — no local develop, keep origin/develop):
-        // a develop-based branch → Some(true), a main-based branch → Some(false).
-        let oc = tmp("bdfb-origin-only");
-        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &oc.to_string_lossy()]).unwrap();
-        git(&oc, &["config", "user.email", "t@t.t"]).unwrap();
-        git(&oc, &["config", "user.name", "t"]).unwrap();
-        assert!(ref_resolves(&oc, "origin/develop"), "precondition: origin/develop present");
-        assert!(!ref_resolves(&oc, "develop"), "precondition: NO local develop");
-        git(&oc, &["branch", "feat/on-develop", "origin/develop"]).unwrap();
-        git(&oc, &["branch", "feat/on-main", &main]).unwrap();
-        assert_eq!(
-            branch_descends_from_base(&oc, "feat/on-develop", "develop"),
-            Some(true),
-            "origin-only base: a develop(origin)-based branch descends"
-        );
-        assert_eq!(
-            branch_descends_from_base(&oc, "feat/on-main", "develop"),
-            Some(false),
-            "origin-only base: a main-based branch does NOT descend (the bare-local check would skip)"
-        );
-
-        // (3) DIVERGED local vs origin: a branch based on origin/develop while local develop
-        // diverged off an OLDER point → must still be Some(true) (checks BOTH forms).
-        let dv = tmp("bdfb-diverged");
-        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &dv.to_string_lossy()]).unwrap();
-        git(&dv, &["config", "user.email", "t@t.t"]).unwrap();
-        git(&dv, &["config", "user.name", "t"]).unwrap();
-        // Local develop diverges from origin/develop (a different commit on develop's name).
-        git(&dv, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
-        git(&dv, &["commit", "-q", "--allow-empty", "-m", "local-diverge"]).unwrap();
-        git(&dv, &["checkout", "-q", &main]).unwrap();
-        // A branch forked off the fresh origin/develop (NOT the diverged local develop).
-        git(&dv, &["branch", "feat/on-origin-develop", "origin/develop"]).unwrap();
-        assert!(
-            !branch_descends_from(&dv, "feat/on-origin-develop", "develop"),
-            "precondition: it does NOT descend from the diverged LOCAL develop"
-        );
-        assert_eq!(
-            branch_descends_from_base(&dv, "feat/on-origin-develop", "develop"),
-            Some(true),
-            "diverged local: a branch off origin/develop descends via the origin form, not rejected"
-        );
-
-        // (4) Base GONE in BOTH forms → None (caller skips the check).
-        assert_eq!(
-            branch_descends_from_base(&local, "feat/on-develop", "no-such-base-xyz"),
-            None,
-            "a base that resolves in neither form returns None"
-        );
-        // HEAD / empty base → None.
-        assert_eq!(branch_descends_from_base(&local, "feat/on-develop", "HEAD"), None);
-        assert_eq!(branch_descends_from_base(&local, "feat/on-develop", ""), None);
-
-        let _ = std::fs::remove_dir_all(&origin);
-        let _ = std::fs::remove_dir_all(&local);
-        let _ = std::fs::remove_dir_all(&oc);
-        let _ = std::fs::remove_dir_all(&dv);
-    }
-
-    #[test]
-    fn branch_descends_from_base_prefers_remote_over_stale_local() {
-        // R43-1: when origin/develop is AHEAD of a stale LOCAL develop, the create path forks
-        // off the FRESH origin ref. The reuse guard must PREFER the remote form — a branch that
-        // only descends from the STALE LOCAL develop would otherwise be accepted as develop-based
-        // while MISSING origin's commits. Prefer-remote rejects it (Some(false)); a branch off
-        // origin/develop is accepted (Some(true)).
-        let origin = tmp("bdfb-prefer-origin");
-        init_repo(&origin).unwrap();
-        let main = current_branch(&origin).unwrap();
-        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
-        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d0 (the stale-local fork point)"]).unwrap();
-        git(&origin, &["checkout", "-q", &main]).unwrap();
-
-        let clone = tmp("bdfb-prefer-clone");
-        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
-        git(&clone, &["config", "user.email", "t@t.t"]).unwrap();
-        git(&clone, &["config", "user.name", "t"]).unwrap();
-        // A LOCAL develop pinned at the OLD origin tip (d0); a work branch forks off it here.
-        git(&clone, &["checkout", "-q", "-b", "develop", "origin/develop"]).unwrap();
-        git(&clone, &["branch", "feat/off-stale-local", "develop"]).unwrap();
-        git(&clone, &["checkout", "-q", &main]).unwrap();
-        // origin/develop now ADVANCES past the local develop (a commit present on origin only).
-        git(&origin, &["checkout", "-q", "develop"]).unwrap();
-        git(&origin, &["commit", "-q", "--allow-empty", "-m", "d1 (origin-only, ahead of local)"]).unwrap();
-        git(&origin, &["checkout", "-q", &main]).unwrap();
-        git(&clone, &["fetch", "-q", "origin"]).unwrap();
-        // A work branch forked off the FRESH origin/develop (carrying d1).
-        git(&clone, &["branch", "feat/off-origin", "refs/remotes/origin/develop"]).unwrap();
-
-        // Preconditions: the two develop forms have diverged; the stale-local branch does NOT
-        // descend from origin/develop, and the origin branch does NOT descend from local develop.
-        assert!(ref_resolves(&clone, "refs/heads/develop"), "precondition: local develop exists");
-        assert!(ref_resolves(&clone, "refs/remotes/origin/develop"), "precondition: origin/develop exists");
-        assert!(
-            !branch_descends_from(&clone, "feat/off-stale-local", "refs/remotes/origin/develop"),
-            "precondition: the stale-local branch lacks origin's d1"
-        );
-        assert!(
-            branch_descends_from(&clone, "feat/off-stale-local", "refs/heads/develop"),
-            "precondition: the stale-local branch descends from the local develop"
-        );
-
-        // PREFER REMOTE: a branch that only descends from the stale LOCAL develop is rejected
-        // (Some(false)), not accepted via the local form.
-        assert_eq!(
-            branch_descends_from_base(&clone, "feat/off-stale-local", "develop"),
-            Some(false),
-            "R43-1: prefer the qualified remote — a stale-local-only descent must NOT be accepted"
-        );
-        // A branch forked from refs/remotes/origin/develop descends from the preferred remote.
-        assert_eq!(
-            branch_descends_from_base(&clone, "feat/off-origin", "develop"),
-            Some(true),
-            "R43-1: a branch off origin/develop descends from the preferred remote form"
-        );
-
-        let _ = std::fs::remove_dir_all(&origin);
-        let _ = std::fs::remove_dir_all(&clone);
     }
 
     #[test]

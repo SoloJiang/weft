@@ -21,6 +21,14 @@ pub struct Model {
     /// default to true (they are genuine Weft checkouts; safe to remove on teardown).
     #[sea_orm(default_value = true)]
     pub created_checkout: bool,
+    /// The COMMIT this worktree's work branch was forked from at create time (the resolved
+    /// base's tip, captured only on the `worktree add -b <branch> <resolved>` success path).
+    /// Reuse-time validation checks the work branch still DESCENDS from this stable commit —
+    /// not a re-resolved (moving) base NAME — so an advanced base or a local-fork/diverged-origin
+    /// lane is not false-rejected, while an externally reset branch is still caught. Empty for
+    /// legacy/reuse/fallback rows, which SKIP that validation.
+    #[sea_orm(default_value = "")]
+    pub base_commit: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -38,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0025WorktreeCreatedBranch),
             Box::new(M0026WorktreeCreatedCheckout),
             Box::new(M0027RepoRefBaseRefIsDefault),
+            Box::new(M0028WorktreeBaseCommit),
         ]
     }
 }
@@ -1104,6 +1105,55 @@ impl MigrationTrait for M0027RepoRefBaseRefIsDefault {
                 Table::alter()
                     .table(Alias::new("repo_ref"))
                     .drop_column(Alias::new("base_ref_is_default"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds worktree.base_commit: the COMMIT the work branch was forked from at create time
+/// (the resolved base's tip on the `worktree add -b <branch> <resolved>` success path).
+/// Reuse-time validation checks the work branch DESCENDS from this STABLE commit rather
+/// than re-resolving a moving base NAME — so a base that advanced (or a lane forked from a
+/// local ref while origin later diverged) is not false-rejected, while a branch externally
+/// reset onto an unrelated base is still caught. Empty = legacy/reuse/fallback row (skip
+/// validation). M0001 reflects the current entity, so a FRESH db already has it; sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0028WorktreeBaseCommit;
+impl MigrationName for M0028WorktreeBaseCommit {
+    fn name(&self) -> &str {
+        "m0028_worktree_base_commit"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0028WorktreeBaseCommit {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("base_commit"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("worktree"))
+                    .drop_column(Alias::new("base_commit"))
                     .to_owned(),
             )
             .await

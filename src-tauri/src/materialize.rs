@@ -104,24 +104,23 @@ pub async fn materialize_direction(
         // bails on the non-registered/mismatched dir — surfacing the problem instead of
         // dispatching into it.
         //
-        // R38-3: registration alone is not enough. For an EXPLICIT base (`base_branch`
-        // non-empty) that STILL RESOLVES, the registered work branch must also DESCEND from
-        // it. A still-registered branch externally reset/recreated off a DIFFERENT base (e.g.
-        // a `release` lane reset onto `main`) would otherwise be returned idempotently and
-        // dispatched as release-based though it no longer descends from release. When it
-        // doesn't descend, fall through to the recreate path, whose R37-2 guard then bails
-        // with a clear error. Don't validate for a blank base or a base that no longer
-        // resolves (a gone base must not block resuming a surviving branch).
-        //
-        // R39-3: resolve the explicit base through branch_descends_from_base (LOCAL `<base>`
-        // OR `origin/<base>`), not a BARE LOCAL `<base>`. In a single-branch clone the base
-        // exists only as `origin/<base>`, so a bare-local check would skip entirely and let a
-        // reset-off-main branch slip through; a diverged local `<base>` would wrongly reject
-        // an origin-based checkout. Some(false) = base resolves in some form but the branch
-        // descends from NONE → mismatch; None (base gone) → don't block the surviving branch.
-        let explicit_base = dir.base_branch.trim();
-        let base_mismatch = !explicit_base.is_empty()
-            && git::branch_descends_from_base(repo_path, &existing.branch, explicit_base) == Some(false);
+        // R47-1/R47-5: registration alone is not enough — but re-resolving the base NAME to
+        // validate ancestry is WRONG. If the base ref ADVANCED since create (R47-5), requiring
+        // the new tip to be an ancestor of the work branch false-rejects a valid branch; if the
+        // lane was forked from the LOCAL ref (fetch failed at create) while `origin/<base>` later
+        // diverged (R47-1), preferring origin false-rejects too. Instead validate against the
+        // STABLE commit the work branch was FORKED FROM at create (worktree.base_commit): a
+        // branch externally reset onto a DIFFERENT base no longer descends from that fork commit
+        // (→ mismatch → falls through to recreate, which bails), while a valid branch always
+        // descends from its own fork commit regardless of base movement/fetch state (→ no
+        // false-reject). When base_commit is empty (legacy/reuse row), SKIP — there is no
+        // recorded fork point to validate against, so don't re-validate.
+        let base_mismatch = !existing.base_commit.is_empty()
+            && !git::is_ancestor(
+                repo_path,
+                &existing.base_commit,
+                &git::local_branch_ref(&existing.branch),
+            );
         if git::is_registered_worktree(repo_path, wt_path, &existing.branch) && !base_mismatch {
             return Ok(vec![existing]);
         }
@@ -130,13 +129,8 @@ pub async fn materialize_direction(
         // stored branch so the lane's worker can resume. The branch typically
         // still exists, so add_worktree_synced takes the -b fallback and sets
         // created_branch=false — the branch is preserved on future cleanup.
-        // Recreate FROM the direction's stored branch-off base, NOT the work branch
-        // itself. When the work branch still exists, add_worktree_synced's -b fallback
-        // checks it out and the base is unused (work preserved). But if the work branch
-        // no longer resolves (deleted externally), the base must be the recorded
-        // branch-off point so the recreated branch starts there rather than off an
-        // arbitrary fallback ref. Mirror the normal path's base resolution.
         let explicit = !dir.base_branch.trim().is_empty();
+        let work_branch_survives = git::local_branch_exists(repo_path, &existing.branch);
         // A blank base paired with a stored target is the detached-HEAD fallback ONLY when
         // that target is the branch-off COMMIT — reuse it so the recreate starts from the
         // SAME point, not a re-resolved live default that may have moved. On an UPGRADED
@@ -149,7 +143,20 @@ pub async fn materialize_direction(
         // (SHA-1 40-hex OR SHA-256 64-hex) via git object identity, not a hard-coded length.
         let t = dir.target_branch.trim();
         let target_is_commit_sha = git::is_full_commit_oid(repo_path, t);
-        let recreate_base = if explicit {
+        // Recreate base precedence:
+        //   - Work branch SURVIVES + a recorded fork commit → use the STABLE fork commit. The
+        //     -b fallback only checks the surviving branch out, but it STILL runs its ancestry
+        //     check against the resolved base; re-resolving a base NAME that has since ADVANCED
+        //     (R47-5) or whose origin form DIVERGED from the local fork (R47-1) would false-reject
+        //     a valid branch. The fork commit is the exact point the branch descends from, so the
+        //     check always passes and the branch is just checked out (work preserved). The
+        //     fork-commit guard below already validates the branch against this same commit.
+        //   - Otherwise (work branch GONE, or a legacy row with no fork commit) → branch off the
+        //     stored base afresh: explicit base name, else the detached-HEAD target commit, else
+        //     the live/default chain.
+        let recreate_base = if work_branch_survives && !existing.base_commit.is_empty() {
+            existing.base_commit.clone()
+        } else if explicit {
             dir.base_branch.trim().to_string()
         } else if target_is_commit_sha {
             t.to_string()
@@ -167,29 +174,31 @@ pub async fn materialize_direction(
         // base is unused), so a gone explicit base shouldn't block resuming the work. But
         // when the work branch is gone AND the base is explicit, a missing base must ERROR
         // rather than silently branching off an arbitrary fallback ref.
-        let require = explicit && !git::local_branch_exists(repo_path, &existing.branch);
+        let require = explicit && !work_branch_survives;
         // R37-2: when require=false (the work branch survives) the -b fallback checks it out
         // WITHOUT add_worktree_synced's explicit-base ancestry check. A surviving branch that
-        // was externally reset/recreated off a DIFFERENT base (e.g. main) while this lane's
-        // explicit base is `release` would then be recorded+dispatched as based on release
-        // while it sits on main's line. Guard it here: for an EXPLICIT base, when the work
-        // branch resolves AND the explicit base STILL RESOLVES, the branch must descend from
-        // that base — else bail. Only validate when the base resolves: a GONE explicit base
-        // must NOT block resuming a surviving branch (the prior round's behavior).
-        //
-        // R39-3: resolve the base through branch_descends_from_base (LOCAL `<base>` OR
-        // `origin/<base>`) so a single-branch clone (origin-only base) is still checked and a
-        // diverged local base doesn't wrongly reject an origin-based branch. Some(false) =
-        // base resolves in some form but the branch descends from none; None (base gone) does
-        // not block resuming the surviving branch.
-        if explicit
-            && git::local_branch_exists(repo_path, &existing.branch)
-            && git::branch_descends_from_base(repo_path, &existing.branch, &recreate_base) == Some(false)
+        // was externally reset/recreated off a DIFFERENT base (e.g. main) while this lane was
+        // forked from `release` would then be recorded+dispatched as based on release while it
+        // sits on main's line. Guard it here — but validate against the STABLE fork COMMIT
+        // (worktree.base_commit), NOT a re-resolved base NAME (R47-1/R47-5: a base that advanced,
+        // or a local-fork/diverged-origin lane, would be false-rejected by name re-resolution).
+        // A reset branch no longer descends from the recorded fork commit → bail; a valid branch
+        // always descends from it regardless of base movement/fetch state → proceed. When the
+        // work branch is gone (it doesn't resolve) the recreate branches off the stored base
+        // afresh, so there's nothing to validate; when base_commit is empty (legacy/reuse row)
+        // SKIP — no recorded fork point.
+        if !existing.base_commit.is_empty()
+            && work_branch_survives
+            && !git::is_ancestor(
+                repo_path,
+                &existing.base_commit,
+                &git::local_branch_ref(&existing.branch),
+            )
         {
             anyhow::bail!(
-                "work branch {:?} no longer descends from its explicit base {:?}; \
-                 delete the sub-task to recreate it from {:?}",
-                existing.branch, recreate_base, recreate_base
+                "work branch {:?} no longer descends from the commit it was forked from ({}); \
+                 delete the sub-task to recreate it from its base {:?}",
+                existing.branch, existing.base_commit, recreate_base
             );
         }
         let add = git::add_worktree_synced(repo_path, &existing.branch, wt_path, &recreate_base, require)
@@ -206,8 +215,26 @@ pub async fn materialize_direction(
         // just created would escape cleanup (stale created_*=false).
         let cb = existing.created_branch || add.created_branch;
         let cc = existing.created_checkout || add.created_checkout;
+        // When the recreate FORKED a fresh branch (the original was deleted) and the row had
+        // no recorded fork point yet (legacy row, or a prior reuse/fallback that recorded
+        // none), adopt the new fork commit as the stable ancestry anchor. NEVER overwrite a
+        // non-empty base_commit: the ORIGINAL fork point is authoritative — preserve it across
+        // re-materializes so base-movement/fetch state can't shift the validation target.
+        let new_base_commit = if existing.base_commit.is_empty() {
+            add.base_commit.clone()
+        } else {
+            String::new()
+        };
+        let mut changed = false;
         if cb != existing.created_branch || cc != existing.created_checkout {
             repo::set_worktree_ownership(db, existing.id, cb, cc).await?;
+            changed = true;
+        }
+        if !new_base_commit.is_empty() {
+            repo::set_worktree_base_commit(db, existing.id, &new_base_commit).await?;
+            changed = true;
+        }
+        if changed {
             if let Some(updated) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
                 return Ok(vec![updated]);
             }
@@ -322,6 +349,10 @@ pub async fn materialize_direction(
             &path.to_string_lossy(),
             owns_branch,
             owns_checkout,
+            // The fork point of the freshly-created branch (empty when we adopted a
+            // pre-existing branch/checkout). Persisted so a later reuse validates ancestry
+            // against this STABLE commit instead of a re-resolved (moving) base name.
+            &add.base_commit,
         )
         .await?;
         Ok::<entities::worktree::Model, anyhow::Error>(rec)
@@ -733,7 +764,7 @@ mod tests {
         let wt_path = worktree_path(&repo_path, "feat/keep");
         std::fs::create_dir_all(&wt_path).unwrap();
         // created_branch=false → the branch is pre-existing (the -b fallback reused it).
-        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false, true)
+        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false, true, "")
             .await.unwrap();
 
         // Deleting the thread removes the worktree but must PRESERVE the pre-existing branch.
@@ -1056,7 +1087,7 @@ mod tests {
         // re-materialize must CREATE both and FLIP the ownership flags to true.
         let branch = "feat/recreate-owns";
         let wt_path = worktree_path(&repo_path, branch);
-        repo::record_worktree(&db, r.id, dir.id, branch, &wt_path.to_string_lossy(), false, false)
+        repo::record_worktree(&db, r.id, dir.id, branch, &wt_path.to_string_lossy(), false, false, "")
             .await.unwrap();
         assert!(!wt_path.exists(), "precondition: dir absent");
 
@@ -1295,13 +1326,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// R37-2: when a reclaimed explicit-base lane's WORK BRANCH still exists, the recreate
-    /// reuses it (require=false, the -b fallback bypasses the ancestry check). If that branch
-    /// was externally reset/recreated off a DIFFERENT base (e.g. main) while the recorded
-    /// `base_branch` is `release`, rematerialization must NOT record+dispatch a branch that no
-    /// longer descends from its explicit base — it bails. (Only validated when the explicit
-    /// base still resolves; a GONE base keeps the surviving-branch checkout working — see
-    /// materialize_recreate_requires_explicit_base_only_when_work_branch_gone Scenario B.)
+    /// R37-2 (now via the recorded fork COMMIT — R47-1/R47-5): when a reclaimed lane's WORK
+    /// BRANCH still exists, the recreate reuses it (require=false, the -b fallback bypasses
+    /// add_worktree_synced's ancestry check). If that branch was externally reset/recreated off
+    /// a DIFFERENT base (e.g. main) than the commit it was FORKED FROM (release's tip, recorded
+    /// as base_commit), rematerialization must NOT record+dispatch it — it bails because the
+    /// branch no longer descends from its recorded fork commit. A branch still descending from
+    /// that commit re-materializes fine, regardless of whether the base NAME moved.
     #[tokio::test]
     async fn materialize_recreate_rejects_work_branch_reset_off_other_base() {
         use crate::store::repo;
@@ -1385,13 +1416,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// R38-3: the idempotent early-return must also validate explicit-base ancestry, not just
-    /// `is_registered_worktree`. A direction with `base_branch="release"` whose STILL-REGISTERED
-    /// work branch was externally reset/recreated off `main` (no longer descending from release)
-    /// must NOT be returned idempotently as release-based on a confirm/approve retry — it falls
-    /// through to the recreate path, whose R37-2 guard then bails. When the branch still descends
-    /// from release the early-return is idempotent Ok (the normal reuse). (Validated only for an
-    /// EXPLICIT base that still resolves; a blank or gone base does not validate.)
+    /// R38-3 (now via the recorded fork COMMIT — R47-1/R47-5): the idempotent early-return must
+    /// also validate ancestry, not just `is_registered_worktree`. A lane forked from `release`
+    /// (base_commit = release's tip) whose STILL-REGISTERED work branch was externally reset off
+    /// `main` (no longer descending from that fork commit) must NOT be returned idempotently — it
+    /// falls through to the recreate path, whose fork-commit guard then bails. When the branch
+    /// still descends from the recorded fork commit the early-return is idempotent Ok (the normal
+    /// reuse). Validation is against the STABLE fork commit, never a re-resolved base name.
     #[tokio::test]
     async fn materialize_idempotent_rejects_registered_branch_reset_off_other_base() {
         use crate::store::repo;
@@ -1550,13 +1581,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// R39-3: the idempotent fast-path's explicit-base ancestry check must resolve the base
-    /// through `branch_descends_from_base` (LOCAL `<base>` OR `origin/<base>`), not a BARE
-    /// LOCAL `<base>`. In a SINGLE-BRANCH clone the explicit base `develop` exists ONLY as
-    /// `origin/develop` (no local), so the bare-local `ref_resolves(repo, "develop")` is false
-    /// and the old check is SKIPPED — a registered work branch reset onto a `main` commit
-    /// (not descending from develop) would slip through as idempotent Ok. With the fix it must
-    /// fall through to recreate and bail. A develop(origin)-based work branch still returns Ok.
+    /// R47-1/R47-5 (single-branch clone): the fork-commit validation works even when the base
+    /// `develop` only ever existed as `origin/develop` (no local) — because we validate against
+    /// the COMMIT the work branch was forked from at create (origin/develop's tip, captured as
+    /// base_commit), NOT a re-resolved base name. A registered work branch reset onto a `main`
+    /// commit no longer descends from that fork commit → falls through to recreate and bails. A
+    /// branch still descending from the recorded fork commit returns idempotent Ok.
     #[tokio::test]
     async fn materialize_idempotent_rejects_registered_branch_reset_off_other_base_single_branch_clone() {
         use crate::store::repo;
@@ -1612,9 +1642,11 @@ mod tests {
         let branch_a = wts_a[0].branch.clone();
         // The materialize fetched origin/develop and branched off it; develop exists ONLY as origin/develop.
         assert!(crate::git::ref_resolves(&clone, "origin/develop"), "origin/develop fetched by materialize");
-        assert!(!crate::git::ref_resolves(&clone, "develop"), "still no LOCAL develop (the bare-local check would skip)");
+        assert!(!crate::git::ref_resolves(&clone, "develop"), "still no LOCAL develop (base existed only as origin/develop)");
         assert!(crate::git::branch_descends_from(&clone, &branch_a, "origin/develop"),
-            "precondition: work branch forked off origin/develop");
+            "precondition: work branch forked off origin/develop (its tip is the recorded base_commit)");
+        assert!(!wts_a[0].base_commit.is_empty(),
+            "precondition: the fork commit (origin/develop tip) was recorded at create");
         let main_sha = sha(&main);
         // Reset the still-registered work branch onto a main commit (NOT descending from develop),
         // from within its worktree (git refuses to force-update a branch checked out elsewhere).
@@ -1648,6 +1680,228 @@ mod tests {
             "single-branch clone: a registered work branch still descending from origin/develop returns idempotently"
         );
         assert!(wt_b.exists(), "the still-valid worktree survives the idempotent reuse");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R47-5: a reused work branch must NOT be false-rejected when its BASE ADVANCED since
+    /// create. The lane forks off origin/main (records base_commit = A); origin/main then moves
+    /// to B. The OLD base-name re-resolution required the work branch to descend from the NEW
+    /// tip (B) — which it can't, having forked at A — and false-rejected. Validating against the
+    /// recorded fork commit (A) instead, the work branch always descends from A → both the
+    /// idempotent fast-path AND the recreate-after-reclaim path return Ok.
+    #[tokio::test]
+    async fn materialize_reuse_accepts_branch_when_base_advanced() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-reuse-advanced-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // origin: main with one commit (A becomes the fork point once cloned).
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let og = |a: &[&str]| { Cmd::new("git").args(a).current_dir(&origin).status().unwrap(); };
+        og(&["init", "-q"]); og(&["config", "user.email", "t@t.t"]); og(&["config", "user.name", "t"]);
+        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
+        og(&["add", "-A"]); og(&["commit", "-q", "-m", "A"]);
+        let main = crate::git::current_branch(&origin).unwrap();
+
+        let clone = root.join("clone");
+        Cmd::new("git").args(["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()])
+            .current_dir(&root).status().unwrap();
+        let g = |args: &[&str]| { Cmd::new("git").args(args).current_dir(&clone).status().unwrap(); };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&clone).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        let a_sha = sha("origin/main");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // Explicit base = main; the lane forks off origin/main (commit A).
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", &main)
+            .await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        assert_eq!(wts[0].base_commit, a_sha, "recorded fork commit is origin/main's tip A");
+
+        // origin/main ADVANCES to B; fetch so the clone's origin/main moves past A.
+        og(&["commit", "-q", "--allow-empty", "-m", "B"]);
+        g(&["fetch", "-q", "origin"]);
+        let b_sha = sha("origin/main");
+        assert_ne!(a_sha, b_sha, "origin/main advanced");
+        assert!(!crate::git::is_ancestor(&clone, &b_sha, &crate::git::local_branch_ref(&work_branch)),
+            "precondition: work branch (at A) does NOT descend from the advanced tip B");
+
+        // (1) Idempotent fast-path: the worktree is still registered → Ok despite base advance.
+        let again = materialize_direction(&db, dir.id).await;
+        assert!(again.is_ok(),
+            "base advanced is NOT a mismatch — the work branch still descends from its fork commit A");
+
+        // (2) Recreate-after-reclaim path: reclaim the dir (work branch survives) → still Ok.
+        let _ = crate::git::remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        g(&["worktree", "prune"]);
+        let recreated = materialize_direction(&db, dir.id).await;
+        assert!(recreated.is_ok(),
+            "recreate after reclaim must also accept the branch — validated against fork commit A, not the advanced base");
+        assert!(wt.exists(), "worktree recreated by checking out the surviving work branch");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R47-1: a lane forked from the LOCAL base ref (fetch failed at create) must NOT be
+    /// false-rejected when `origin/<base>` later DIVERGES. With no origin reachable at create,
+    /// the lane forks off LOCAL `develop` (base_commit = local develop's tip). An origin/develop
+    /// that later diverges ahead would make the OLD reuse check (which prefers origin/<base>)
+    /// reject a valid branch. Validating against the recorded LOCAL fork commit instead, the
+    /// work branch still descends from it → re-materialize is Ok.
+    #[tokio::test]
+    async fn materialize_reuse_accepts_local_forked_branch_when_origin_diverged() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-reuse-localfork-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // A LOCAL-ONLY repo (no origin remote) with a local `develop` — so at create the fetch
+        // finds no remote and the lane forks off the LOCAL develop ref.
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| { Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap(); };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // develop one commit ahead of main (a real local branch, no remote-tracking ref).
+        g(&["checkout", "-q", "-b", "develop"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "develop tip (local fork point)"]);
+        let local_develop_sha = sha("develop");
+        g(&["checkout", "-q", &main]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "develop")
+            .await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        assert_eq!(wts[0].base_commit, local_develop_sha,
+            "fork commit recorded as the LOCAL develop tip (no remote was reachable at create)");
+
+        // Now make `origin/develop` exist and DIVERGE ahead — an UNRELATED commit on develop's
+        // remote-tracking ref that the work branch does NOT descend from. (Build the divergent
+        // commit on a scratch branch, then point refs/remotes/origin/develop at it.)
+        g(&["checkout", "-q", "-b", "scratch", &main]);
+        g(&["commit", "-q", "--allow-empty", "-m", "origin develop diverged"]);
+        let diverged_sha = sha("scratch");
+        g(&["checkout", "-q", &main]);
+        g(&["update-ref", "refs/remotes/origin/develop", &diverged_sha]);
+        assert!(crate::git::ref_resolves(&repo_path, "refs/remotes/origin/develop"),
+            "precondition: origin/develop now resolves");
+        assert!(!crate::git::is_ancestor(&repo_path, &diverged_sha, &crate::git::local_branch_ref(&work_branch)),
+            "precondition: the work branch does NOT descend from the diverged origin/develop");
+        assert!(crate::git::is_ancestor(&repo_path, &local_develop_sha, &crate::git::local_branch_ref(&work_branch)),
+            "precondition: the work branch DOES descend from its recorded LOCAL fork commit");
+
+        // Re-materialize: must be Ok — validated against the recorded local fork commit, not
+        // the diverged origin/develop. (Idempotent fast-path: the worktree is still registered.)
+        let again = materialize_direction(&db, dir.id).await;
+        assert!(again.is_ok(),
+            "a local-forked lane must not be false-rejected when origin/<base> later diverges");
+        assert!(wt.exists(), "the still-valid worktree survives the reuse");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// Preserves the R37-2 intent under the fork-commit semantics: a work branch externally
+    /// RESET onto a DIFFERENT base (a `main` commit not descending from the recorded fork commit
+    /// R) must be REJECTED on reuse. The lane forks off `release` (base_commit = R); the work
+    /// branch is then force-reset onto main. It no longer descends from R → re-materialize Err.
+    #[tokio::test]
+    async fn materialize_reuse_rejects_branch_reset_off_other_base() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-reuse-reset-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| { Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap(); };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // release one commit AHEAD of main (so a main commit does NOT descend from release = R).
+        g(&["checkout", "-q", "-b", "release"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "release work"]);
+        let release_sha = sha("release");
+        g(&["checkout", "-q", &main]);
+        let main_sha = sha(&main);
+        assert_ne!(release_sha, main_sha, "release must be ahead of main");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        assert_eq!(wts[0].base_commit, release_sha, "recorded fork commit is release's tip R");
+
+        // Reclaim the dir (so the branch is no longer checked out), then force-RESET the
+        // surviving work branch onto main — a commit NOT descending from R.
+        let _ = crate::git::remove_worktree(&repo_path, &wt);
+        let _ = std::fs::remove_dir_all(&wt);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-f", &work_branch, &main_sha]);
+        assert_eq!(sha(&work_branch), main_sha, "precondition: work branch reset to main");
+        assert!(!crate::git::is_ancestor(&repo_path, &release_sha, &crate::git::local_branch_ref(&work_branch)),
+            "precondition: reset branch no longer descends from the recorded fork commit R");
+
+        // Re-materialize: must bail — the branch no longer descends from the commit it forked from.
+        assert!(
+            materialize_direction(&db, dir.id).await.is_err(),
+            "a work branch reset off a base it was not forked from must be rejected on reuse"
+        );
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
@@ -1694,7 +1948,7 @@ mod tests {
         std::fs::create_dir_all(&wt_path).unwrap();
 
         // Record a worktree row with created_branch=false (branch is pre-existing).
-        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false, true)
+        repo::record_worktree(&db, r.id, dir.id, "feat/keep", &wt_path.to_string_lossy(), false, true, "")
             .await.unwrap();
 
         // Rollback must NOT delete feat/keep.
@@ -1749,7 +2003,7 @@ mod tests {
             .await.unwrap();
 
         // Record the worktree row with created_branch=true.
-        repo::record_worktree(&db, r.id, dir.id, "feat/weft-branch", &wt_path.to_string_lossy(), true, true)
+        repo::record_worktree(&db, r.id, dir.id, "feat/weft-branch", &wt_path.to_string_lossy(), true, true, "")
             .await.unwrap();
 
         // Rollback MUST delete the branch.
@@ -2014,7 +2268,7 @@ mod tests {
         assert!(wt_path.exists(), "precondition: dir exists before rollback");
 
         // Record with created_checkout=false (weft reused this path, did not create it).
-        repo::record_worktree(&db, r.id, dir.id, "feat/preexist-co", &wt_path.to_string_lossy(), false, false)
+        repo::record_worktree(&db, r.id, dir.id, "feat/preexist-co", &wt_path.to_string_lossy(), false, false, "")
             .await.unwrap();
 
         rollback_direction(&db, dir.id).await.unwrap();
@@ -2126,7 +2380,7 @@ mod tests {
         assert!(wt_path.exists(), "precondition: dir exists before cleanup");
 
         // Record with created_checkout=false.
-        repo::record_worktree(&db, r.id, dir.id, "feat/preexist-cascade", &wt_path.to_string_lossy(), false, false)
+        repo::record_worktree(&db, r.id, dir.id, "feat/preexist-cascade", &wt_path.to_string_lossy(), false, false, "")
             .await.unwrap();
 
         // Thread cascade returns the 5-tuple; cleanup must not remove the dir.

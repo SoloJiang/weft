@@ -164,6 +164,7 @@ async fn delete_worktree_keeps_branch_and_task() {
         &reused.to_string_lossy(),
         false,
         false,
+        "",
     )
     .await
     .unwrap();

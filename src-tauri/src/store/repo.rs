@@ -884,6 +884,7 @@ pub async fn record_worktree(
     path: &str,
     created_branch: bool,
     created_checkout: bool,
+    base_commit: &str,
 ) -> Result<worktree::Model> {
     Ok(worktree::ActiveModel {
         repo_id: Set(repo_id),
@@ -893,10 +894,31 @@ pub async fn record_worktree(
         created_at: Set(now()),
         created_branch: Set(created_branch),
         created_checkout: Set(created_checkout),
+        base_commit: Set(base_commit.to_string()),
         ..Default::default()
     }
     .insert(&db.0)
     .await?)
+}
+
+/// Persist the recorded fork-point commit on a worktree row. Used on RE-materialize when a
+/// reclaimed lane's recreate CREATED a fresh branch (the original was deleted) and the row's
+/// base_commit was still empty (legacy/reuse) — so the new fork point becomes the stable
+/// ancestry anchor. Callers MUST NOT overwrite a non-empty base_commit: the ORIGINAL fork
+/// point is the authoritative one.
+pub async fn set_worktree_base_commit(
+    db: &Db,
+    worktree_id: i32,
+    base_commit: &str,
+) -> Result<()> {
+    worktree::ActiveModel {
+        id: Set(worktree_id),
+        base_commit: Set(base_commit.to_string()),
+        ..Default::default()
+    }
+    .update(&db.0)
+    .await?;
+    Ok(())
 }
 
 /// Persist updated ownership flags on a worktree row. Used when re-materializing a
@@ -1660,7 +1682,7 @@ mod tests {
         let sess = create_session(&db, dir.id, a.id, "claude", "/tmp/a-wt")
             .await
             .unwrap();
-        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt", false, true)
+        record_worktree(&db, a.id, dir.id, &dir.branch, "/tmp/a-wt", false, true, "")
             .await
             .unwrap();
         // a direction bound to repo `b` — must SURVIVE the delete of `a`
@@ -1818,6 +1840,59 @@ mod tests {
         assert!(row.created_branch, "created_branch must default to true when unset");
     }
 
+    /// M0028: worktree.base_commit round-trips and an UNSET column defaults to "" (legacy/
+    /// pre-column rows, which the reuse-time fork-commit validation then SKIPS).
+    #[tokio::test]
+    async fn worktree_base_commit_round_trips_and_defaults_to_empty() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "d", "claude", r.id, "x", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // (1) Inserted WITHOUT base_commit (a legacy/pre-column row) → defaults to "".
+        let legacy = worktree::ActiveModel {
+            repo_id: Set(r.id),
+            direction_id: Set(d.id),
+            branch: Set("feat/legacy".into()),
+            path: Set("/tmp/wt-legacy".into()),
+            created_at: Set(now()),
+            created_branch: Set(true),
+            created_checkout: Set(true),
+            // base_commit intentionally NotSet → the DB column default ("") applies.
+            ..Default::default()
+        }
+        .insert(&db.0)
+        .await
+        .unwrap();
+        let legacy_row = worktree::Entity::find_by_id(legacy.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_row.base_commit, "", "base_commit must default to empty when unset");
+
+        // (2) record_worktree persists a non-empty base_commit, and set_worktree_base_commit
+        // updates it — both round-trip through the column.
+        let d2 = create_direction(&db, t.id, "d2", "claude", r.id, "x", "plan+impl", "")
+            .await
+            .unwrap();
+        let rec = record_worktree(&db, r.id, d2.id, "feat/rec", "/tmp/wt-rec", true, true, "abc123")
+            .await
+            .unwrap();
+        assert_eq!(rec.base_commit, "abc123", "record_worktree persists base_commit");
+        set_worktree_base_commit(&db, rec.id, "def456").await.unwrap();
+        let updated = worktree::Entity::find_by_id(rec.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.base_commit, "def456", "set_worktree_base_commit updates the row");
+    }
+
     /// (pre-existing branch reused by the -b fallback) must have its flag preserved.
     #[tokio::test]
     async fn delete_repo_cascade_carries_created_branch_flag() {
@@ -1834,14 +1909,14 @@ mod tests {
             .unwrap();
 
         // Record one worktree with created_branch=false (pre-existing branch).
-        record_worktree(&db, r.id, dir.id, "feat/preexist", "/tmp/r-wt", false, true)
+        record_worktree(&db, r.id, dir.id, "feat/preexist", "/tmp/r-wt", false, true, "")
             .await
             .unwrap();
         // Record another with created_branch=true (weft-created branch).
         let dir2 = create_direction(&db, t.id, "d2", "claude", r.id, "reason2", "plan+impl", "")
             .await
             .unwrap();
-        record_worktree(&db, r.id, dir2.id, "feat/weft-created", "/tmp/r-wt2", true, true)
+        record_worktree(&db, r.id, dir2.id, "feat/weft-created", "/tmp/r-wt2", true, true, "")
             .await
             .unwrap();
 
@@ -2266,7 +2341,7 @@ mod tests {
         assert_eq!(dir.reason, "build the feature");
 
         // pretend it was materialized
-        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt", false, true)
+        record_worktree(&db, repo.id, dir.id, &dir.branch, "/tmp/wt", false, true, "")
             .await
             .unwrap();
         assert_eq!(list_worktrees(&db, Some(dir.id)).await.unwrap().len(), 1);
