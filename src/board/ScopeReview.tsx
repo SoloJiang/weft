@@ -289,7 +289,7 @@ function BaseBranchField({
    * name/repo/value still discards an unblurred (dirty) edit. */
   version: string;
   disabled: boolean;
-  onSave: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
+  onSave: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
   const [val, setVal] = useState(value ?? "");
@@ -338,7 +338,10 @@ function BaseBranchField({
     // same-identity (same name+repo) re-propose changed the lane's base meanwhile —
     // optimistic concurrency the name/repo + CAS guards can't catch on their own.
     const expectedOldBase = value ?? "";
-    void onSave(index, name, repo, next, expectedOldBase)
+    // The proposal version this edit was composed against. The backend rejects the save if a
+    // re-propose bumped the version even with the lane's base UNCHANGED (R54-2) — a gap the
+    // name/repo + expectedOldBase + CAS guards can't close on their own.
+    void onSave(index, name, repo, next, expectedOldBase, version)
       .then(() => {
         if (lastIdentity.current === savedIdentity) {
           lastLoaded.current = next; // mark loaded only after the save actually lands

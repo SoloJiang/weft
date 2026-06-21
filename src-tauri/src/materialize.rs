@@ -208,6 +208,12 @@ pub async fn materialize_direction(
                     existing.branch
                 )
             })?;
+        // Test-only seam: simulate a DB write FAILING after the worktree was successfully
+        // recreated on disk (the recreate-then-fail case). Production never references this; it
+        // lets a test exercise the reused-recreation undo (R54-4 / approve, R51-1 / confirm) for
+        // a single-lane call, where there is no later lane to force the post-recreate failure.
+        #[cfg(test)]
+        materialize_recreate_fault(repo_path)?;
         // If the recreate CREATED a fresh branch/checkout (the original was deleted),
         // weft now owns it — OR the new ownership into the row. Never CLEAR a flag: a
         // branch/checkout weft made on the first materialize stays owned even when this
@@ -287,6 +293,16 @@ pub async fn materialize_direction(
     } else {
         add.branched_from.clone()
     };
+    // R54-1: a BLANK-base materialization that took the ADOPT / `-b`-fallback arm reports an
+    // empty `add.branched_from`, so `raw_recorded` is the requested placeholder base NAME (e.g.
+    // "main" — the no-default last resort). In a repo with no main/master that name does NOT
+    // resolve: recording it as the diff target makes `resolve_target_ref` collapse to the
+    // worker's OWN HEAD and HIDE committed work. The adopt arm still captures a RESOLVABLE
+    // `add.base_commit` (the work branch's tip = its fork point), so treat this exactly like the
+    // detached-HEAD case below — record the COMMIT as the target and keep the base blank. (Only
+    // the blank path: an EXPLICIT base that took the adopt arm is a resolvable name, and its
+    // base_branch isn't rewritten here anyway — see the `!explicit` guard in `finish`.)
+    let blank_base_adopt = !explicit && add.branched_from.is_empty() && !add.base_commit.is_empty();
     // A bare "HEAD" is the detached / no-default fallback. The BASE and the diff TARGET
     // diverge here:
     //   - base_branch stores EMPTY, because "HEAD" is not a usable named ref — reconcile
@@ -294,9 +310,14 @@ pub async fn materialize_direction(
     //   - target_branch stores the actual branch-off COMMIT (a stable SHA). An empty or
     //     "HEAD" target would later resolve to the worktree's OWN HEAD, making the diff
     //     merge-base(HEAD, HEAD) and HIDING all committed worker changes.
-    let was_head = raw_recorded == "HEAD";
+    // The blank-base-adopt case (R54-1) is the same divergence reached via a different arm.
+    let was_head = raw_recorded == "HEAD" || blank_base_adopt;
     let recorded_base = if was_head { String::new() } else { raw_recorded };
-    let recorded_target = if was_head {
+    let recorded_target = if blank_base_adopt {
+        // The adopt arm already resolved a stable fork-point COMMIT (the work branch tip). It is
+        // resolvable by `resolve_target_ref`'s bare-sha fallback — unlike the placeholder NAME.
+        add.base_commit.clone()
+    } else if was_head {
         // FULL sha (not the --short head_commit): this is PERSISTED as the diff target
         // and re-resolved later by worktree_diff_target/rematerialization, where a short
         // sha could become ambiguous in a large repo.
@@ -559,6 +580,39 @@ pub async fn reclaim_recreated_worktree(db: &Db, direction_id: i32) -> Result<()
         if let Err(e) = git::remove_worktree(repo_path, path) {
             eprintln!("[weft] re-reclaim worktree remove failed for {}: {e}", wt.path);
         }
+    }
+    Ok(())
+}
+
+/// Fault-injection seam for `materialize_direction`'s reclaim/recreate path. A test ARMS it for a
+/// repo path with `arm_materialize_recreate_fault(repo_path)`; the NEXT recreate that reaches
+/// `materialize_recreate_fault` (AFTER `add_worktree_synced` recreated the dir on disk) returns Err,
+/// simulating a DB write failing post-recreate. One-shot: it disarms on fire. Behind `#[cfg(test)]`,
+/// so production never references this — the recreate path's only post-recreate failures are DB
+/// writes, which a single-lane test can't otherwise force.
+#[cfg(test)]
+fn recreate_fault_map() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn arm_materialize_recreate_fault(repo_path: &Path) {
+    if let Ok(mut m) = recreate_fault_map().lock() {
+        m.insert(repo_path.to_string_lossy().to_string());
+    }
+}
+
+#[cfg(test)]
+fn materialize_recreate_fault(repo_path: &Path) -> anyhow::Result<()> {
+    let key = repo_path.to_string_lossy().to_string();
+    let armed = recreate_fault_map()
+        .lock()
+        .map(|mut m| m.remove(&key))
+        .unwrap_or(false);
+    if armed {
+        anyhow::bail!("injected: DB write failed after the worktree was recreated on disk");
     }
     Ok(())
 }
@@ -2360,6 +2414,105 @@ mod tests {
         // And it persisted on the row.
         let row = repo::worktree_for(&db, dir.id, r.id).await.unwrap().unwrap();
         assert!(row.created_branch && row.created_checkout, "adopted ownership persisted on the row");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R54-1: a blank-base materialization that takes the ADOPT / `-b`-fallback arm
+    /// (`add.branched_from` empty) must NOT record the unresolvable placeholder base NAME
+    /// (e.g. "main") as the diff target. In a repo with NO main/master the blank base really
+    /// resolves to HEAD; recording "main" makes `resolve_target_ref` fail to resolve it and
+    /// collapse to the worker's OWN HEAD, so the Diff tab hides all committed task changes.
+    /// The adopt arm captures a RESOLVABLE `add.base_commit` (the work branch's tip) — record
+    /// THAT as the target (mirroring the detached-HEAD case) and keep the base blank. Red-first:
+    /// before the fix the recorded target is "main" and resolve_target_ref collapses to HEAD.
+    #[tokio::test]
+    async fn materialize_blank_base_no_default_records_resolvable_diff_target() {
+        use crate::store::repo;
+        use sea_orm::EntityTrait;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-r54-1-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        // Detach HEAD and delete the only branch → no main/master/any named branch, so the
+        // blank-base resolution falls all the way back to HEAD (placeholder base name = "main").
+        g(&["checkout", "-q", "--detach"]);
+        g(&["branch", "-D", &main]);
+        assert!(
+            !crate::git::ref_resolves(&repo_path, "refs/heads/main"),
+            "precondition: no main branch in this repo"
+        );
+        let head_sha = String::from_utf8(
+            Cmd::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo_path).output().unwrap().stdout,
+        ).unwrap().trim().to_string();
+        assert_eq!(head_sha.len(), 40, "precondition: captured the FULL 40-char sha");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), "main", "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // BLANK base → falls back to HEAD during materialize.
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // ① First materialize: weft forks the work branch off HEAD (the create-SUCCESS path,
+        // branched_from="HEAD"). Delete the DB row AND clear the recorded target so the SECOND
+        // materialize hits the ADOPT arm (branched_from empty) with target_branch still "" —
+        // exactly the crash-orphan state R54-1 fixes.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts.len(), 1, "materialize must create the worktree");
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let branch = wts[0].branch.clone();
+        entities::worktree::Entity::delete_by_id(wts[0].id).exec(&db.0).await.unwrap();
+        repo::set_direction_target_branch(&db, dir.id, "").await.unwrap();
+        assert!(crate::git::is_registered_worktree(&repo_path, &wt_path, &branch),
+            "precondition: the on-disk checkout is still a registered worktree (crash orphan)");
+
+        // ② Re-materialize: the create path runs (no DB row), the path exists+is registered →
+        // the ADOPT arm fires (add.branched_from empty, add.base_commit = the work branch tip).
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+
+        // The recorded base stays blank (a name or "" — reconcile expects that, never a sha) and
+        // the diff TARGET is a RESOLVABLE commit (the branch-off sha), NOT "main".
+        let d2 = entities::direction::Entity::find_by_id(dir.id)
+            .one(&db.0).await.unwrap().unwrap();
+        assert_eq!(d2.base_branch, "", "blank-base adopt must keep base blank, not the placeholder 'main'");
+        assert_ne!(d2.target_branch, "main",
+            "R54-1: must NOT record the unresolvable placeholder base NAME as the diff target");
+        assert_eq!(d2.target_branch, head_sha,
+            "R54-1: the adopt arm must record the resolvable branch-off COMMIT as the diff target");
+        // And it actually resolves — committing work in the worktree and diffing against the
+        // recorded target SHOWS the committed file. A collapse to the worktree's OWN HEAD would
+        // make the merge-base(HEAD, HEAD) empty and HIDE the commit (the bug's user symptom).
+        std::fs::write(wt_path.join("task_change.txt"), b"committed work\n").unwrap();
+        let gw = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&wt_path).status().unwrap();
+        };
+        gw(&["add", "-A"]);
+        gw(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "task work"]);
+        let td = crate::git::target_diff(&wt_path, &d2.target_branch, false).unwrap();
+        assert!(
+            td.files.iter().any(|f| f.path == "task_change.txt"),
+            "R54-1: the committed task change must appear in the vs-target diff (target did not collapse to HEAD)"
+        );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = cleanup_worktrees(&db, &removed).await;

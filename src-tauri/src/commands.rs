@@ -480,6 +480,9 @@ pub async fn save_proposal(
 /// proposal was replaced under the index (re-propose while a blur-save was in flight).
 /// `expected_base` is the base the field was editing FROM — rejected if a same-identity
 /// re-propose changed the lane's base in the meantime (optimistic concurrency).
+/// `expected_version` is the proposal version (created_at) the edit was composed against —
+/// rejected if a re-propose bumped it even with the lane's base unchanged (R54-2). Empty is
+/// tolerated; the guard only applies when non-empty.
 #[tauri::command]
 pub async fn set_proposal_direction_base(
     db: State<'_, Db>,
@@ -488,11 +491,21 @@ pub async fn set_proposal_direction_base(
     name: String,
     repo: String,
     expected_base: String,
+    expected_version: String,
     base: String,
 ) -> R<()> {
-    crate::planner::set_direction_base(&db, thread_id, index, &name, &repo, &expected_base, &base)
-        .await
-        .map_err(e)
+    crate::planner::set_direction_base(
+        &db,
+        thread_id,
+        index,
+        &name,
+        &repo,
+        &expected_base,
+        &expected_version,
+        &base,
+    )
+    .await
+    .map_err(e)
 }
 
 /// Confirm the stored proposal: create its directions + materialize worktrees.
