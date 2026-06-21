@@ -184,8 +184,29 @@ fn now() -> String {
     format!("{secs}")
 }
 
+/// Per-thread serialization gate for plan-mutating ops. Two confirm/approve/deny/save_proposal
+/// calls for the SAME thread never overlap, so the read→create/reuse→materialize→commit dance is
+/// atomic per thread — eliminating the TOCTOU races (duplicate directions, a loser's rollback
+/// deleting a winner's direction, a re-propose landing mid-confirm). Different threads don't block
+/// each other. The REGISTRY is a lock-free DashMap; the per-thread value is a tokio Mutex held
+/// across the whole op (incl. slow git materialize — tokio::sync::Mutex is async/await-safe).
+fn thread_gate(thread_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static GATES: std::sync::OnceLock<dashmap::DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>> =
+        std::sync::OnceLock::new();
+    let gates = GATES.get_or_init(dashmap::DashMap::new);
+    // Clone the Arc OUT of the entry so the DashMap shard guard drops before any .await
+    // (never hold a DashMap guard across await — deadlock risk).
+    let arc = gates
+        .entry(thread_id)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    arc
+}
+
 /// Store (replace) the proposal for a thread, status = "proposed".
 pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Result<()> {
+    let gate = thread_gate(thread_id);
+    let _gate = gate.lock().await;
     let json = serde_json::to_string(proposal)?;
     repo::upsert_plan(db, thread_id, &json, "proposed", &now()).await?;
     Ok(())
@@ -245,6 +266,11 @@ pub struct ResolvedProposal {
 /// existing direction ids are returned without re-creating anything (covers the
 /// dispatch-retry case where the frontend calls confirm again to redispatch workers).
 pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
+    // Serialize all plan mutations for this thread: held across the whole confirm (read → reuse/
+    // create → materialize → CAS commit) so no concurrent confirm/approve/deny/save_proposal can
+    // interleave. This is what makes the read→commit dance atomic and the TOCTOU races impossible.
+    let gate = thread_gate(thread_id);
+    let _gate = gate.lock().await;
     // R44-2 / R42-4: read the plan ROW exactly ONCE and derive BOTH the resolved proposal we act
     // on AND the compare-and-swap baseline (start_plan.proposal / .status) from that single
     // snapshot. Reading get_resolved then a SEPARATE get_plan let a re-propose land between them —
@@ -296,12 +322,6 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // failure because they existed (and may be running) before this confirm call.
     let mut dispatch_ids: Vec<i32> = Vec::new();
     let mut created_now: Vec<i32> = Vec::new();
-    // R44-1: reused lanes whose worktree we must (re)materialize, DEFERRED until after the final
-    // CAS commits. Recreating a reclaimed reused checkout INSIDE the loop would survive a later
-    // lane failure or a CAS rejection (rollback_created only undoes created_now, never reused
-    // lanes) — silently undoing the user's reclaim for a confirm that never applied. So we record
-    // the ids here and only touch disk once the confirm is committed.
-    let mut reused_to_materialize: Vec<i32> = Vec::new();
     // Claim each existing direction at most once. An already-approved/denied lane (handled
     // via per-card approve/deny, skipped below) still OWNS its direction in existing_dirs;
     // without claiming it, a same-name+repo PENDING sibling's reuse `.find` would match and
@@ -358,11 +378,16 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 rollback_created(db, &created_now).await;
                 return Err(err);
             }
-            // R44-1: DEFER the reuse re-materialize until after the final CAS. A reclaimed
-            // reused worktree dir is only recreated once the confirm is committed — never inside
-            // the loop, where a later failure or a CAS rejection would leave it recreated for a
-            // confirm that bailed (rollback_created only undoes created_now, not reused lanes).
-            reused_to_materialize.push(ex_id);
+            // Materialize the reused lane HERE (it may have a reclaimed worktree dir to recreate).
+            // The per-thread gate serializes plan mutations, so no re-propose can land during this
+            // confirm — the final CAS can no longer reject, so doing every side effect BEFORE the
+            // commit is safe. On failure roll back the lanes created in THIS attempt (created_now;
+            // the reused lane existed before and is never torn down) and bail, so nothing is marked
+            // confirmed — pending_writes keeps surfacing the Needs cards (no post-commit stranding).
+            if let Err(err) = materialize::materialize_direction(db, ex_id).await {
+                rollback_created(db, &created_now).await;
+                return Err(err);
+            }
             dispatch_ids.push(ex_id);
             continue;
         }
@@ -394,22 +419,20 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         created_now.push(dir.id);
         dispatch_ids.push(dir.id);
     }
-    // Test-only seam: let a test land a re-propose in the window between our snapshot read and the
-    // CAS, deterministically driving the CAS rejection below (mirrors approve_persist_gate).
+    // Test-only seam: let a test land a re-propose in the window before the CAS to exercise the
+    // defensive rollback below (mirrors approve_persist_gate). In production the per-thread gate
+    // serializes plan mutations, so no save_proposal/confirm can land here — see the CAS note.
     #[cfg(test)]
     tests::confirm_cas_gate(db, thread_id).await;
+    // FINAL commit, after ALL materialization. Now that the per-thread gate serializes every
+    // plan-mutating op, no re-propose (save_proposal) can land between our snapshot read and here,
+    // so this CAS can no longer reject in production — that's why materializing the reused lanes
+    // BEFORE this point is safe (a failure above already bailed without marking confirmed). The
+    // !applied branch is kept purely defensively: should it ever fire, roll back the lanes created
+    // in this attempt and bail so the plan is NOT left "confirmed" with stale lanes.
     if !repo::mark_plan_confirmed_cas(db, thread_id, &start_plan.proposal, &start_plan.status).await? {
-        // The lead re-proposed (or a concurrent confirm landed) between our start read and here —
-        // the directions we created belong to the SUPERSEDED proposal. Roll them back so the new
-        // proposal isn't marked confirmed with our stale lanes (which would then be dispatched).
         rollback_created(db, &created_now).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
-    }
-    // R44-1: the confirm is now committed (CAS passed) — only NOW recreate any reclaimed reused
-    // worktrees. A rejected CAS bailed above (after rollback_created) and never reaches here, so a
-    // reused lane's reclaimed dir is recreated exactly once the confirm actually applied.
-    for id in &reused_to_materialize {
-        materialize::materialize_direction(db, *id).await?;
     }
     Ok(dispatch_ids)
 }
@@ -431,6 +454,11 @@ async fn rollback_created(db: &Db, ids: &[i32]) {
 /// Idempotent on re-approve: if the direction already exists, its id is
 /// returned and a differing `tool` pick is ignored — the first pick wins.
 pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str) -> Result<i32> {
+    // Serialize all plan mutations for this thread (see `thread_gate`): a concurrent
+    // approve/confirm/save_proposal for the same thread can no longer interleave with this read →
+    // CAS → materialize, so the existing CAS-then-materialize-then-revert ordering is race-free.
+    let gate = thread_gate(thread_id);
+    let _gate = gate.lock().await;
     if !crate::detect::TOOL_PRIORITY.contains(&tool) {
         anyhow::bail!(
             "unknown tool {tool:?}; expected one of {:?}",
@@ -574,6 +602,9 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
 /// proposal. Returns the denied direction's (name, repo_name) for the caller to
 /// relay to the lead over the bus.
 pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(String, String)> {
+    // Serialize all plan mutations for this thread (see `thread_gate`).
+    let gate = thread_gate(thread_id);
+    let _gate = gate.lock().await;
     let plan = repo::get_plan(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal for thread {thread_id}"))?;
@@ -613,6 +644,10 @@ pub async fn set_direction_base(
     expected_base: &str,
     base: &str,
 ) -> Result<()> {
+    // Serialize all plan mutations for this thread (see `thread_gate`): the base edit's
+    // read → guard → CAS can no longer interleave with a concurrent confirm/approve/save_proposal.
+    let gate = thread_gate(thread_id);
+    let _gate = gate.lock().await;
     let plan = repo::get_plan(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal for thread {thread_id}"))?;
@@ -1683,15 +1718,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// R44-1: confirm DEFERS recreating a reused lane's reclaimed worktree until AFTER the final
-    /// CAS commits. A reused direction whose dir was reclaimed; a lead re-propose lands in the CAS
-    /// window so the CAS rejects. The reuse re-materialize MUST NOT have fired — the reclaimed dir
-    /// stays absent (undoing the user's reclaim for a confirm that never applied would be wrong).
-    /// Then the no-race path: a clean confirm DOES recreate the reused dir and dispatches its id.
+    /// R46-1 (replaces the old R44-1 deferred-materialize test): now that the per-thread gate
+    /// serializes plan mutations, no re-propose can land mid-confirm, so the final CAS can never
+    /// reject in production and materialization happens BEFORE the commit. The CAS `!applied` branch
+    /// survives only defensively. Drive it via the test seam and assert the property that still
+    /// holds: a rejected CAS leaves the plan NOT "confirmed" (the racing re-propose survives intact)
+    /// and rolls back the lanes CREATED in this attempt (created_now) — a reused pre-existing lane
+    /// is never torn down. Then the no-race path: a clean confirm recreates the reused dir and
+    /// dispatches its id.
     #[tokio::test]
-    async fn confirm_cas_rejection_does_not_recreate_reused_reclaimed_worktree() {
+    async fn confirm_defensive_cas_rejection_rolls_back_created_and_leaves_plan_unconfirmed() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = format!("weft-confirm-reuse-casleak-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Lane A: approved via Needs-you → materialized (a reusable, pre-existing lane).
+        let prop_a = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_a).await.unwrap();
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // Re-propose A (reset to pending) PLUS a brand-new pending lane B → confirm's reuse path
+        // handles A and CREATES B (B lands in created_now, so a rejected CAS must roll B back).
+        let prop_ab = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop_ab).await.unwrap();
+        // Arm a re-propose to land in confirm's CAS window — a DIFFERENT stored proposal so the
+        // snapshot's expected proposal no longer matches and the defensive CAS rejects.
+        let reproposed = Proposal { rationale: "reproposed".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "C".into(), repo: "api".into(), reason: "rc".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        arm_confirm_race(t.id, &serde_json::to_string(&reproposed).unwrap(), "proposed");
+
+        let res = confirm(&db, t.id).await;
+        assert!(res.is_err(), "confirm must error when the defensive CAS rejects a stale re-propose");
+        // The newly-created lane B was rolled back (created_now); the pre-existing reused lane A stays.
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        assert!(dirs.iter().any(|d| d.id == a_id), "reused lane A must NOT be torn down on CAS rejection");
+        assert!(!dirs.iter().any(|d| d.name == "B"), "lane created in this attempt is rolled back on CAS rejection");
+        // The fresh re-propose survives intact (no stale 'confirmed' clobbered onto it).
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "proposed", "rejected confirm leaves the racing re-propose unconfirmed");
+
+        // Reclaim A's worktree dir, then the no-race path: re-propose A alone (matches the snapshot)
+        // and confirm cleanly → the CAS passes, A's reclaimed dir IS recreated, A's id dispatched.
+        let wts = repo::list_worktrees(&db, Some(a_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row for A");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: reclaimed worktree dir is gone before the clean confirm");
+        save_proposal(&db, t.id, &prop_a).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![a_id], "no-race: confirm reuses A and dispatches its id");
+        assert!(wt_path.exists(), "no-race: a committed confirm recreates the reused dir (materialize-before-commit)");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R46-3: confirm now materializes a reused lane BEFORE the final commit (the gate makes the CAS
+    /// unrejectable, so all side effects can precede it). If that rematerialization FAILS — the
+    /// reused lane's worktree dir was reclaimed and its recorded path is now a PLAIN dir — confirm
+    /// must bail BEFORE marking the plan "confirmed" and roll back lanes created in this attempt, so
+    /// pending_writes keeps surfacing the Needs cards (no post-commit stranding with no worker).
+    /// Red-first: with the OLD deferred (post-CAS) materialize, the plan would already be "confirmed"
+    /// when this failure hit.
+    #[tokio::test]
+    async fn confirm_bails_before_marking_confirmed_when_reused_materialize_fails() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-reuse-matfail-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
         let _ = std::fs::remove_dir_all(&root);
@@ -1710,42 +1823,93 @@ mod tests {
         save_proposal(&db, t.id, &prop).await.unwrap();
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
 
-        // Reclaim A's worktree dir on disk (exists=false).
+        // Reclaim A's worktree dir, then plant a PLAIN directory at the SAME recorded path so the
+        // reuse re-materialize fails deterministically (mirrors R45-2): add_worktree_synced's
+        // path-exists check bails because a plain dir is "not a worktree of this repo on <branch>".
         let wts = repo::list_worktrees(&db, Some(a_id)).await.unwrap();
         assert_eq!(wts.len(), 1, "precondition: one worktree row after approve");
         let wt_path = std::path::PathBuf::from(&wts[0].path);
         let repo_p = root.join("api");
         let _ = crate::git::remove_worktree(&repo_p, &wt_path);
         let _ = std::fs::remove_dir_all(&wt_path);
-        assert!(!wt_path.exists(), "precondition: reclaimed worktree dir is gone before re-confirm");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join("stray.txt"), b"not a worktree").unwrap();
+        assert!(
+            !crate::git::is_registered_worktree(&repo_p, &wt_path, &wts[0].branch),
+            "precondition: the planted plain dir is NOT a registered worktree"
+        );
 
         // Re-propose A (resets its decision to "") so confirm takes the REUSE path for A.
         save_proposal(&db, t.id, &prop).await.unwrap();
-        // Arm a re-propose to land in confirm's CAS window — a DIFFERENT stored proposal (extra
-        // lane) so the snapshot's expected proposal no longer matches and the CAS rejects.
-        let reproposed = Proposal { rationale: "reproposed".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r2".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-        ]};
-        arm_confirm_race(t.id, &serde_json::to_string(&reproposed).unwrap(), "proposed");
-
-        // confirm: reuse path defers A's re-materialize; the gate fires the re-propose; CAS rejects.
         let res = confirm(&db, t.id).await;
-        assert!(res.is_err(), "R44-1: confirm must error when the CAS rejects a stale re-propose");
-        assert!(
-            !wt_path.exists(),
-            "R44-1: a rejected confirm must NOT recreate the reused lane's reclaimed worktree dir"
-        );
-        // The fresh re-propose survives intact (no stale 'confirmed' clobbered onto it).
-        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
-        assert_eq!(after.status, "proposed", "R44-1: rejected confirm leaves the racing re-propose unconfirmed");
+        assert!(res.is_err(), "R46-3: confirm must error when the reused lane's rematerialize fails");
 
-        // No-race path: re-propose A alone (matches the snapshot) and confirm cleanly → the CAS
-        // passes, so A's reclaimed dir IS recreated and confirm dispatches A's id.
+        // The plan must NOT be left "confirmed" — it still surfaces via get_resolved / pending_writes
+        // so the Needs card stays retryable (no stranding with no worker dispatched).
+        let after = get_resolved(&db, t.id).await.unwrap().unwrap();
+        assert_ne!(after.status, "confirmed", "R46-3: a pre-commit materialize failure must NOT mark the plan confirmed");
+        let pending = pending_writes(&db, t.id).await.unwrap();
+        assert_eq!(pending.len(), 1, "R46-3: the Needs card still surfaces after the failed confirm");
+        assert_eq!(pending[0].name, "A");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// The per-thread gate serializes plan mutations: two concurrent `confirm` calls for the SAME
+    /// thread can't interleave, so exactly ONE direction is created for a single pending lane (no
+    /// duplicate) and BOTH calls return the same id (the loser blocks, then hits the idempotent
+    /// confirmed fast-path). Without the gate the read→create→commit dance races and can double-
+    /// create. Uses a shared `Db` (SeaORM `DatabaseConnection` is internally a clonable pool handle)
+    /// across two `tokio::spawn`ed tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn thread_gate_serializes_concurrent_confirms() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-gate-concurrent-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        // A file-backed (not :memory:) DB so the cloned pool handles in both tasks share one store;
+        // an in-memory SQLite connection is private to its single connection.
+        let db_file = weft_home.join("gate-concurrent.sqlite");
+        std::fs::create_dir_all(&weft_home).unwrap();
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_file.to_str().unwrap()))
+            .await
+            .unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let ids = confirm(&db, t.id).await.unwrap();
-        assert_eq!(ids, vec![a_id], "R44-1 no-race: confirm reuses A and dispatches its id");
-        assert!(wt_path.exists(), "R44-1 no-race: a committed confirm DOES recreate the reused dir");
+
+        // Fire two confirms concurrently for the same thread.
+        let db1 = db.clone();
+        let db2 = db.clone();
+        let tid = t.id;
+        let h1 = tokio::spawn(async move { confirm(&db1, tid).await });
+        let h2 = tokio::spawn(async move { confirm(&db2, tid).await });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+
+        // Both succeed (the gate serializes them; the loser hits the idempotent confirmed fast-path).
+        let ids1 = r1.expect("first confirm ok");
+        let ids2 = r2.expect("second confirm ok");
+        assert_eq!(ids1.len(), 1, "first confirm dispatches the single lane");
+        assert_eq!(ids2.len(), 1, "second confirm returns the same single lane (idempotent)");
+        assert_eq!(ids1, ids2, "both confirms return the SAME direction id (no duplicate)");
+
+        // Exactly ONE direction exists for the lane — the gate prevented a duplicate.
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let a_dirs: Vec<_> = dirs.iter().filter(|d| d.name == "A").collect();
+        assert_eq!(a_dirs.len(), 1, "exactly one direction for lane A despite two concurrent confirms");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
