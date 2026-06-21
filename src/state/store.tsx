@@ -196,7 +196,7 @@ interface Store {
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: () => Promise<void>;
-  setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
+  setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
@@ -1772,7 +1772,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
 
   const setProposalDirectionBase = useCallback(
-    (index: number, name: string, repo: string, base: string, expectedOldBase: string): Promise<void> => {
+    (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string): Promise<void> => {
       if (activeThreadId == null) return Promise.resolve();
       const tid = activeThreadId;
       // Include the lane INDEX: a proposal can hold two pending writes with the same
@@ -1785,9 +1785,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // no status downgrade. confirm/approve await pendingBaseSave before acting.
       // `expectedOldBase` is the persisted base the field was editing FROM: the backend
       // rejects the save if a same-identity re-propose changed the lane's base meanwhile.
+      // `version` is the proposal version the edit was composed against: the backend also
+      // rejects a re-propose that kept the SAME base for the lane (R54-2), which the
+      // expectedOldBase + CAS guards can't catch on their own.
       const p = (pendingBaseSave.current.get(tid) ?? Promise.resolve())
         .catch(() => {})
-        .then(() => api.setProposalDirectionBase(tid, index, name, repo, expectedOldBase, base.trim()))
+        .then(() => api.setProposalDirectionBase(tid, index, name, repo, expectedOldBase, version, base.trim()))
         .then(() => {
           // This LANE's save LANDED — clear ONLY this lane's failure (not the whole
           // thread), so a successful retry isn't treated as failed by the next

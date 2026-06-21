@@ -383,6 +383,18 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             }
         }
         let base_ok = |existing_base: &str, p: &ResolvedDirection| -> bool {
+            // R54-3: in the CONFIRMED fast-path, a BLANK proposed base matches an already-
+            // materialized direction WITHOUT re-resolving the live default. The lane was created
+            // from the THEN-default and its direction recorded the ACTUAL base (e.g. `main`); the
+            // direction is materialized, so its recorded base is authoritative. If the live default
+            // later moves (main → develop), re-resolving the blank against `develop` would falsely
+            // mismatch the recorded `main` and DROP the lane, so the dispatcher couldn't resume the
+            // confirmed worker. (Non-confirmed paths keep `base_compatible`, where a blank base
+            // legitimately resolves to the current default at CREATION time — only this confirmed,
+            // already-materialized retry treats blank as match-any.)
+            if p.base_branch.trim().is_empty() {
+                return true;
+            }
             // Fall back to a name+repo-only match when the repo is missing (None), so a missing
             // repo doesn't crash the retry — the same best-effort posture as the pre-pass below.
             repo_cache
@@ -798,6 +810,16 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         // CAS rejects and we bail WITHOUT recreating the reclaimed worktree (which would undo the
         // user's disk-reclaim for an approval that never applied).
         persist_decision(db, thread_id, &proposal, &plan).await?;
+        // R54-4: was this lane's worktree dir RECLAIMED (row present, dir absent) before we
+        // recreate it? Captured BEFORE the materialize so the error arm can UNDO a recreation
+        // (mirrors confirm's recreated_reused tracking, R51-1). If materialize recreates the dir
+        // on disk but a later DB write inside it FAILS, reverting the decision alone would leave
+        // the recreation behind — undoing the user's reclaim for an approval that never applied.
+        // Best-effort read: treat an unreadable row as NOT reclaimed (never crash approve).
+        let was_reclaimed = matches!(
+            repo::worktree_for(db, id, repo_ref.id).await,
+            Ok(Some(w)) if !std::path::Path::new(&w.path).exists()
+        );
         // Approval committed — now idempotently recreate the worktree if its dir was reclaimed.
         if let Err(err) = materialize::materialize_direction(db, id).await {
             // R45-2: the approval is persisted but rematerialization failed (path is now a plain
@@ -820,6 +842,12 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
                     &plan.status,
                 )
                 .await;
+            }
+            // R54-4: if the dir was reclaimed before this call, materialize may have RECREATED it
+            // on disk before failing — re-reclaim so the user's disk-reclaim isn't undone by an
+            // approval that didn't apply. No-op when nothing was recreated (dir still absent).
+            if was_reclaimed {
+                let _ = materialize::reclaim_recreated_worktree(db, id).await;
             }
             return Err(err);
         }
@@ -895,6 +923,14 @@ pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(St
 /// read, so the CAS can't catch it either. Optimistic-concurrency on the base field
 /// closes that gap: if the lane's current base no longer equals `expected_base`, a
 /// fresher base already landed and we reject rather than overwriting it with a stale one.
+///
+/// `expected_version` is the proposal VERSION (`plan.created_at`, bumped on every
+/// re-propose) the client composed the edit against. Even expected_base can't catch a
+/// re-propose that kept the SAME base for the lane (same name/repo, same base, fresh
+/// stored proposal): all three other guards pass, so a stale unblurred edit would apply
+/// to the FRESH proposal. Pinning the version closes that last gap — bail when the stored
+/// version drifted. Empty `expected_version` is TOLERATED (a caller without one yet): the
+/// guard is enforced only when it is non-empty, so it never breaks an unversioned caller.
 pub async fn set_direction_base(
     db: &Db,
     thread_id: i32,
@@ -902,6 +938,7 @@ pub async fn set_direction_base(
     expected_name: &str,
     expected_repo: &str,
     expected_base: &str,
+    expected_version: &str,
     base: &str,
 ) -> Result<()> {
     // Serialize all plan mutations for this thread (see `thread_gate`): the base edit's
@@ -911,6 +948,16 @@ pub async fn set_direction_base(
     let plan = repo::get_plan(db, thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal for thread {thread_id}"))?;
+    // Proposal-version guard (R54-2): a re-propose that kept this lane's base UNCHANGED passes the
+    // name/repo + expected_base checks below AND predates this read (so the CAS misses it). Reject
+    // a stale edit BEFORE mutating when the client's pinned version no longer matches the stored
+    // one. Only when non-empty, so a caller that doesn't supply a version isn't broken.
+    if !expected_version.is_empty() && plan.created_at != expected_version {
+        anyhow::bail!(
+            "proposal re-proposed since the edit started (version {:?} != {:?}); base not applied",
+            expected_version, plan.created_at
+        );
+    }
     let mut proposal: Proposal = serde_json::from_str(&plan.proposal).unwrap_or_default();
     let pd = proposal
         .directions
@@ -1375,14 +1422,14 @@ mod tests {
         // Simulate a confirmed plan, then a targeted base edit must NOT downgrade status.
         let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
         repo::upsert_plan(&db, t.id, &plan.proposal, "confirmed", &plan.created_at).await.unwrap();
-        set_direction_base(&db, t.id, 1, "B", "api", "", "develop").await.unwrap();
+        set_direction_base(&db, t.id, 1, "B", "api", "", "", "develop").await.unwrap();
         let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
         assert_eq!(after.status, "confirmed", "targeted base edit must not downgrade status");
         let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
         assert_eq!(parsed.directions[1].base_branch, "develop");
         assert_eq!(parsed.directions[0].base_branch, "", "other directions untouched");
         // Out-of-range index errors.
-        assert!(set_direction_base(&db, t.id, 9, "Z", "api", "", "x").await.is_err());
+        assert!(set_direction_base(&db, t.id, 9, "Z", "api", "", "", "x").await.is_err());
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
@@ -1586,7 +1633,7 @@ mod tests {
             "atomic: NO directions remain after a failed confirm (lane A rolled back too)");
         // Fix B's base and retry → both lanes created cleanly, no duplicates.
         // Editing FROM the bad "no-such-xyz" base the proposal still holds.
-        set_direction_base(&db, t.id, 1, "B", "api", "no-such-xyz", "").await.unwrap();
+        set_direction_base(&db, t.id, 1, "B", "api", "no-such-xyz", "", "").await.unwrap();
         let ids = confirm(&db, t.id).await.unwrap();
         assert_eq!(ids.len(), 2, "retry creates both lanes");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 2, "exactly two, no duplicates");
@@ -1616,11 +1663,11 @@ mod tests {
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         // Correct identity (editing FROM the empty default base) → applies.
-        set_direction_base(&db, t.id, 0, "A", "api", "", "develop").await.unwrap();
+        set_direction_base(&db, t.id, 0, "A", "api", "", "", "develop").await.unwrap();
         let p1: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
         assert_eq!(p1.directions[0].base_branch, "develop");
         // Wrong identity (lane changed under the index) → error, no write.
-        assert!(set_direction_base(&db, t.id, 0, "B", "api", "develop", "main").await.is_err());
+        assert!(set_direction_base(&db, t.id, 0, "B", "api", "develop", "", "main").await.is_err());
         let p2: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
         assert_eq!(p2.directions[0].base_branch, "develop", "stale-identity save must not overwrite");
         std::env::remove_var("WEFT_HOME");
@@ -1655,15 +1702,75 @@ mod tests {
         save_proposal(&db, t.id, &proposal).await.unwrap();
         // Stale save: same name/repo, but expected_base "" ≠ live "develop" → reject.
         assert!(
-            set_direction_base(&db, t.id, 0, "A", "api", "", "feature/old").await.is_err(),
+            set_direction_base(&db, t.id, 0, "A", "api", "", "", "feature/old").await.is_err(),
             "a stale base save from an older same-identity proposal must be rejected"
         );
         let p1: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
         assert_eq!(p1.directions[0].base_branch, "develop", "the fresh base must survive the stale save");
         // A save editing FROM the matching current base ("develop") applies.
-        set_direction_base(&db, t.id, 0, "A", "api", "develop", "release").await.unwrap();
+        set_direction_base(&db, t.id, 0, "A", "api", "develop", "", "release").await.unwrap();
         let p2: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
         assert_eq!(p2.directions[0].base_branch, "release", "matching expected_base applies");
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R54-2: the base-save must pin the proposal VERSION too. The name/repo + expected_base + CAS
+    /// guards all PASS for a re-propose that kept the SAME base for the lane (same identity, same
+    /// base, fresh stored proposal) — so a stale unblurred edit composed against the OLD proposal
+    /// would otherwise apply to the FRESH one. The frontend already has a monotonic version
+    /// (proposal.created_at, bumped each save_proposal); threading it as `expected_version` and
+    /// bailing on a mismatch closes the gap. Red-first: before the version guard, the v1 edit
+    /// applies to the v2 proposal (all other checks pass because the base is unchanged).
+    #[tokio::test]
+    async fn set_direction_base_rejects_stale_proposal_version() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-baseversion-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // v1: lane A/api with base "develop".
+        let prop = Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"develop".into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let v1 = get_resolved(&db, t.id).await.unwrap().unwrap().created_at;
+        // The lead RE-PROPOSED, keeping the SAME lane identity AND the SAME base "develop" → name/repo
+        // and expected_base both still match; only the VERSION changed.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let v2 = get_resolved(&db, t.id).await.unwrap().unwrap().created_at;
+        assert_ne!(v1, v2, "precondition: the re-propose bumped the version");
+
+        // A stale edit composed against v1 (expected_base "develop" — unchanged — and expected_version
+        // v1) must be REJECTED, and the base must NOT change to the stale value.
+        assert!(
+            set_direction_base(&db, t.id, 0, "A", "api", "develop", &v1, "feature/old").await.is_err(),
+            "R54-2: a base save pinned to a stale proposal version must be rejected"
+        );
+        let p1: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
+        assert_eq!(p1.directions[0].base_branch, "develop", "the stale-version save must not change the base");
+
+        // The SAME edit pinned to the CURRENT version applies.
+        set_direction_base(&db, t.id, 0, "A", "api", "develop", &v2, "release").await.unwrap();
+        let p2: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
+        assert_eq!(p2.directions[0].base_branch, "release", "the current-version save applies");
+
+        // An EMPTY expected_version is TOLERATED (a caller that doesn't yet have one): it falls back
+        // to the name/repo + expected_base + CAS guards and applies.
+        let v3 = get_resolved(&db, t.id).await.unwrap().unwrap().created_at;
+        assert_eq!(v3, v2, "set_direction_base preserves created_at, so v3 == v2");
+        set_direction_base(&db, t.id, 0, "A", "api", "release", "", "develop").await.unwrap();
+        let p3: Proposal = serde_json::from_str(&repo::get_plan(&db, t.id).await.unwrap().unwrap().proposal).unwrap();
+        assert_eq!(p3.directions[0].base_branch, "develop", "empty expected_version is tolerated (only enforced when non-empty)");
+
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
@@ -2691,6 +2798,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// R54-4 (PROACTIVE): `confirm` tracks reused-worktree RECREATIONS and re-reclaims them on a
+    /// later failure (R51-1), but `approve_direction`'s reuse fast-path did NOT. It CASes the
+    /// decision then `materialize_direction(id)`; if that RECREATES the reclaimed dir on disk but a
+    /// later DB write inside materialize FAILS, approve reverts the decision to pending yet LEAVES
+    /// the recreated worktree on disk — undoing the user's reclaim for an approval that never
+    /// applied. The fix detects `was_reclaimed` BEFORE the materialize and, in the materialize-error
+    /// arm, re-reclaims the recreation. Red-first: before the fix, the recreated dir is left on disk
+    /// after the post-recreate failure. (A DB-write-after-recreate failure can't be forced in a
+    /// single-lane call from git state alone, so a test-only seam in materialize injects it.)
+    #[tokio::test]
+    async fn approve_reuse_reclaims_recreation_when_materialize_fails() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-reuse-undorecreate-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // First approve: creates + materializes the direction (decision="approved"), recording the
+        // work branch's fork commit so the recreate just checks the surviving branch out.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let dir_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+
+        // RECLAIM the worktree dir (the user's state): remove ONLY the on-disk directory, leaving
+        // the row + work branch, so `was_reclaimed` is true and the reuse path will RECREATE it.
+        let wts = repo::list_worktrees(&db, Some(dir_id)).await.unwrap();
+        assert_eq!(wts.len(), 1, "precondition: one worktree row after first approve");
+        let wt_path = std::path::PathBuf::from(&wts[0].path);
+        let repo_p = root.join("api");
+        let _ = crate::git::remove_worktree(&repo_p, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        assert!(!wt_path.exists(), "precondition: the worktree dir is reclaimed (absent) before re-approve");
+
+        // ARM the post-recreate fault: the next recreate succeeds on disk, then materialize bails
+        // (simulating a DB write failing AFTER the worktree was recreated).
+        materialize::arm_materialize_recreate_fault(&repo_p);
+
+        // Re-propose (resets the decision to "") so re-approve takes the idempotent REUSE path.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let res = approve_direction(&db, t.id, 0, "codex").await;
+        assert!(res.is_err(), "R54-4: approve must error when the post-recreate materialize fails");
+
+        // Decision reverted to pending (the Needs card stays retryable).
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
+        assert_eq!(parsed.directions[0].decision, "",
+            "R54-4: a failed reuse approve must revert the decision to pending");
+        // AND the recreated worktree dir must be UNDONE (re-reclaimed) — the user's reclaim stands.
+        assert!(!wt_path.exists(),
+            "R54-4: a failed reuse approve must re-reclaim the worktree it recreated (not leave it on disk)");
+
+        // Contrast — a clean re-approve (no fault): the reuse path recreates the dir and KEEPS it.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let id2 = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        assert_eq!(id2, dir_id, "no-fault: reuse approve returns the existing direction id");
+        assert!(wt_path.exists(), "no-fault: a committed reuse approve recreates the dir and keeps it");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     /// R17-3: a proposal with one lane approved individually (via approve_direction)
     /// and one lane created by confirm → a retry of confirm (after it's "confirmed")
     /// must return ONLY the confirm-created lane's id, NOT the individually-approved one.
@@ -3222,6 +3402,84 @@ mod tests {
             "R52-1: fast-path must return the pending release lane's OWN (base-matching) release direction");
         assert!(!ids.contains(&dir_develop.id),
             "R52-1: the approved develop lane's direction must NOT be dispatched for the release lane (no swap)");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R54-3: in the CONFIRMED fast-path, a lane created from the THEN-default has proposal
+    /// `base_branch == ""` while its materialized direction recorded the ACTUAL base (e.g. `main`).
+    /// If the repo's LIVE default later moves (main → develop), `base_compatible("main", "", ...)`
+    /// resolves the blank against the NEW default `develop` → mismatch → the fast-path returns no
+    /// id → the dispatcher can't resume the confirmed worker. The direction is already
+    /// materialized, so its recorded base is authoritative: a BLANK proposed base must match it
+    /// WITHOUT re-resolving the moving live default. Red-first: before the fix, the moved default
+    /// makes the fast-path drop the lane (returns []), so confirm can't re-dispatch it.
+    #[tokio::test]
+    async fn confirmed_fast_path_blank_base_matches_recorded_base_after_default_change() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-blank-defaultmove-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // An ORIGIN with `main` (default) + `develop`, then a CLONE registered as the repo. The
+        // live default is read via `ls-remote --symref origin HEAD`, so moving origin's HEAD later
+        // genuinely changes what a blank base resolves to.
+        let origin = make_repo(&root, "origin");
+        // Read make_repo's actual initial branch (init.defaultBranch may be main OR master) rather
+        // than hardcoding — the test must hold under both CI default-branch configs.
+        let main = crate::git::current_branch(&origin).unwrap();
+        sh(&origin, &["git", "checkout", "-q", "-b", "develop"]);
+        sh(&origin, &["git", "commit", "-q", "--allow-empty", "-m", "d"]);
+        sh(&origin, &["git", "symbolic-ref", "HEAD", &format!("refs/heads/{main}")]);
+        sh(&origin, &["git", "checkout", "-q", &main]);
+        let repo_path = root.join("clone");
+        sh(&root, &["git", "clone", "-q", origin.to_str().unwrap(), repo_path.to_str().unwrap()]);
+        sh(&repo_path, &["git", "config", "user.email", "t@t.t"]);
+        sh(&repo_path, &["git", "config", "user.name", "t"]);
+        assert_eq!(crate::git::live_default_branch(&repo_path).as_deref(), Some(main.as_str()),
+            "precondition: the clone's live default is the origin's main-family default");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &main, "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Create + materialize a BLANK-base lane: it branches off the live default (main) and
+        // records base == "main".
+        let dir = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "").await.unwrap();
+        materialize::materialize_direction(&db, dir.id).await.unwrap();
+        let recorded = repo::list_directions(&db, t.id).await.unwrap()
+            .into_iter().find(|d| d.id == dir.id).unwrap();
+        assert_eq!(recorded.base_branch, main,
+            "precondition: the materialized direction recorded the actual default base ({main})");
+
+        // Stored proposal: ONE lane, BLANK base, plan CONFIRMED → confirm takes the fast-path.
+        let stored = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into() },
+        ]};
+        let json = serde_json::to_string(&stored).unwrap();
+        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
+
+        // The repo's LIVE default MOVES main → develop (origin HEAD repointed). Now a blank base
+        // resolves to `develop`, which differs from the recorded `main`.
+        sh(&origin, &["git", "symbolic-ref", "HEAD", "refs/heads/develop"]);
+        assert_eq!(crate::git::live_default_branch(&repo_path).as_deref(), Some("develop"),
+            "precondition: the live default moved to develop");
+
+        // Fast-path retry: the blank-base lane must STILL claim its already-materialized `main`
+        // direction (its recorded base is authoritative), not be dropped by re-resolving the
+        // moved live default.
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![dir.id],
+            "R54-3: a confirmed blank-base lane must match its recorded-base direction even after the live default moves");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
