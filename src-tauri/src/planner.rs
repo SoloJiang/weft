@@ -315,7 +315,9 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         // doesn't re-dispatch them.
         for p in &resolved.directions {
             if p.repo.known && (p.decision == "approved" || p.decision == "denied") {
-                if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id)) {
+                // Exclude terminal (done) directions from reuse: a completed lane is history,
+                // not a resumable target — a re-proposal must create fresh work.
+                if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done") {
                     consumed.insert(d.id);
                 }
             }
@@ -323,7 +325,9 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         let mut matching: Vec<i32> = Vec::new();
         for p in &resolved.directions {
             if !p.repo.known || p.decision == "approved" || p.decision == "denied" { continue; }
-            if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id)) {
+            // Exclude terminal (done) directions from reuse: a completed lane is history,
+            // not a resumable target — a re-proposal must create fresh work.
+            if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done") {
                 consumed.insert(d.id);
                 matching.push(d.id);
             }
@@ -352,7 +356,9 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         if d.decision == "approved" || d.decision == "denied" {
             if let Some(ex) = existing_dirs
                 .iter()
-                .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id))
+                // Exclude terminal (done) directions from reuse: a completed lane is history,
+                // not a resumable target — a re-proposal must create fresh work.
+                .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id) && x.status != "done")
             {
                 consumed.insert(ex.id);
             }
@@ -371,7 +377,9 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         // create a duplicate direction/worktree.
         if let Some(ex) = existing_dirs
             .iter()
-            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id))
+            // Exclude terminal (done) directions from reuse: a completed lane is history,
+            // not a resumable target — a re-proposal must create fresh work.
+            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id) && x.status != "done")
         {
             let ex_id = ex.id;
             // Claim this direction so a later same-name+repo duplicate lane can't reuse it.
@@ -517,7 +525,9 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
             let rj = resolve(pj, &repos);
             if let Some(d) = dirs
                 .iter()
-                .find(|d| d.name == rj.name && d.repo_id == rj.repo.repo_id && !consumed.contains(&d.id))
+                // Exclude terminal (done) directions from reuse: a completed lane is history,
+                // not a resumable target — a re-proposal must create fresh work.
+                .find(|d| d.name == rj.name && d.repo_id == rj.repo.repo_id && !consumed.contains(&d.id) && d.status != "done")
             {
                 consumed.insert(d.id);
             }
@@ -525,7 +535,9 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
     }
     if let Some(existing) = dirs
         .iter()
-        .find(|d| d.name == resolved.name && d.repo_id == resolved.repo.repo_id && !consumed.contains(&d.id))
+        // Exclude terminal (done) directions from reuse: a completed lane is history,
+        // not a resumable target — a re-proposal must create fresh work.
+        .find(|d| d.name == resolved.name && d.repo_id == resolved.repo.repo_id && !consumed.contains(&d.id) && d.status != "done")
     {
         // The existing direction's worktree is already branched off its stored base;
         // a re-proposal that changes the base can't silently re-base a live (possibly
@@ -1621,6 +1633,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// A completed (status="done", terminal) direction must NOT be reused by confirm. When the
+    /// lead re-proposes a lane whose previous same-name+repo sub-task already reached "done",
+    /// reuse would return the done id and resume the old native session WITHOUT a fresh brief
+    /// and WITHOUT moving it out of "done" — newly-approved work looks accepted while no new
+    /// worker starts. confirm must instead create a FRESH direction, leaving the done one as
+    /// history. Red-first: before excluding "done" from reuse, confirm returns the done id.
+    #[tokio::test]
+    async fn confirm_does_not_reuse_a_done_direction_creates_fresh() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-done-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let prop = Proposal { rationale:"r".into(), directions: vec![lane()] };
+        // Approve A (creates + materializes the first direction), then mark it terminal ("done").
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let done_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        repo::set_direction_status(&db, done_id, "done").await.unwrap();
+        // Lead re-proposes the SAME name+repo lane (pending), then the user clicks Create.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        // confirm must create a NEW, distinct direction and dispatch it — not reuse the done one.
+        assert_eq!(ids.len(), 1, "confirm dispatches exactly the fresh lane");
+        assert_ne!(ids[0], done_id, "confirm must NOT reuse the completed (done) direction; it creates fresh");
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let same: Vec<_> = dirs.iter().filter(|d| d.name == "A" && d.repo_id == ra.id).collect();
+        assert_eq!(same.len(), 2, "a SECOND distinct direction exists alongside the completed one");
+        // The done direction is untouched (still terminal, kept as history).
+        let done_row = dirs.iter().find(|d| d.id == done_id).expect("the done direction still exists");
+        assert_eq!(done_row.status, "done", "the completed direction stays done (history), untouched");
+        assert!(same.iter().any(|d| d.id == ids[0]), "the dispatched id is the fresh same-name direction");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// approve_direction must NOT reuse a completed (status="done", terminal) direction. After a
+    /// lane reaches "done" and the lead re-proposes it (decision reset to ""), approving it again
+    /// must create a FRESH direction (fresh worker), leaving the done one as history. Mirrors
+    /// `confirm_does_not_reuse_a_done_direction_creates_fresh`. Red-first: before excluding
+    /// "done" from reuse, approve returns the done id.
+    #[tokio::test]
+    async fn approve_does_not_reuse_a_done_direction_creates_fresh() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-done-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let prop = Proposal { rationale:"r".into(), directions: vec![lane()] };
+        // Approve A (creates + materializes direction #1), then mark it terminal ("done").
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let done_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        repo::set_direction_status(&db, done_id, "done").await.unwrap();
+        // Lead re-proposes the SAME lane (decision resets to ""); user approves it again.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let new_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        assert_ne!(new_id, done_id, "approve must NOT reuse the completed (done) direction; it creates fresh");
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let same: Vec<_> = dirs.iter().filter(|d| d.name == "A" && d.repo_id == ra.id).collect();
+        assert_eq!(same.len(), 2, "a SECOND distinct direction exists alongside the completed one");
+        let done_row = dirs.iter().find(|d| d.id == done_id).expect("the done direction still exists");
+        assert_eq!(done_row.status, "done", "the completed direction stays done (history), untouched");
+        assert!(same.iter().any(|d| d.id == new_id), "the new direction is the fresh same-name lane");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn approve_rejects_base_specific_reproposal_of_legacy_empty_base() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2255,6 +2355,50 @@ mod tests {
         assert_eq!(retry_ids, vec![b_id], "R42-2: fast-path returns only the pending duplicate lane");
         assert!(!retry_ids.contains(&a_id), "R42-2: the approved duplicate sibling must NOT be re-dispatched");
 
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// The confirmed (idempotent) fast-path must also exclude completed (status="done", terminal)
+    /// directions from reuse. After a plan is confirmed and its lane's direction reaches "done", a
+    /// retry of confirm (plan still "confirmed") must NOT re-dispatch the done id — the done lane is
+    /// history, not a resumable target. Red-first: before excluding "done", the fast-path's match
+    /// over all directions returns the done id.
+    #[tokio::test]
+    async fn confirmed_fast_path_excludes_done_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-done-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale:"r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+        ]};
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        // First confirm: creates the lane and marks the plan "confirmed".
+        let first_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(first_ids.len(), 1, "first confirm creates the single lane");
+        let done_id = first_ids[0];
+        // The lane completes (terminal). The plan stays "confirmed" (no re-propose).
+        repo::set_direction_status(&db, done_id, "done").await.unwrap();
+        // Retry hits the idempotent fast-path (plan == "confirmed"). It must NOT return the done id.
+        let retry_ids = confirm(&db, t.id).await.unwrap();
+        assert!(!retry_ids.contains(&done_id), "fast-path must NOT re-dispatch the completed (done) lane");
+        assert!(retry_ids.is_empty(), "no reusable (non-done) lane remains, so the fast-path returns nothing");
+        // The done direction is untouched.
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let done_row = dirs.iter().find(|d| d.id == done_id).expect("the done direction still exists");
+        assert_eq!(done_row.status, "done", "the completed direction stays done (history), untouched");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
