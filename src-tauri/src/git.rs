@@ -479,12 +479,15 @@ pub struct WorktreeAdd {
     pub created_branch: bool,
     pub synced: bool,
     pub branched_from: String,
-    /// The COMMIT the NEW work branch was forked from — the resolved base's tip, captured ONLY
-    /// on the `worktree add -b <branch> <resolved>` success path (a freshly-created branch). The
-    /// reuse/fallback arms (path-exists, `-b` fallback adopting a pre-existing branch) leave this
-    /// EMPTY: those adopt a checkout/branch rather than fork a fresh one, so there's no new fork
-    /// point to record. Persisted as worktree.base_commit and used for reuse-time ancestry
-    /// validation against a STABLE point instead of a re-resolved base name.
+    /// The COMMIT this lane's work branch is anchored to — a STABLE fork point used for reuse-time
+    /// ancestry validation (a branch later reset onto a different base no longer descends from it).
+    /// Captured on EVERY arm that records a usable anchor: the `worktree add -b <branch> <resolved>`
+    /// success path uses the resolved base's tip (the true fork point of the fresh branch); the `-b`
+    /// fallback adopting a pre-existing branch uses the validated resolved base's commit (R51-2); the
+    /// path-exists arm adopting a crash orphan uses the work branch's CURRENT commit (R53-2, the
+    /// orphan's tip ≈ its fork point). Best-effort: empty when the rev-parse fails (e.g. base is
+    /// HEAD / gone). Persisted as worktree.base_commit; when empty, materialize SKIPS the fork-point
+    /// check (no recorded point to validate against).
     pub base_commit: String,
 }
 
@@ -600,14 +603,24 @@ pub fn add_worktree_synced(
         // (it validates against the STABLE fork point, not a moving ref), NOT a descends-from-the-
         // moving-base check here. (The `-b` create path below still validates a FRESH branch off
         // the base, because that forks anew from the current tip — only this reuse arm changes.)
+        // R53-2: anchor the adopted crash-orphan with a STABLE fork point = the WORK branch's
+        // CURRENT commit. The orphan was just created (we crashed before record_worktree), so its
+        // tip ≈ its fork point; recording it (instead of leaving base_commit empty) means a later
+        // materialize_direction still runs its fork-point check for this weft-created branch. If the
+        // branch is later reset onto a DIFFERENT base it no longer descends from this commit and is
+        // caught, instead of being silently redispatched from the wrong history. Use the local work
+        // branch (refs/heads/<branch>), NOT a re-resolved base. Best-effort: empty if rev-parse fails.
+        let base_commit = git(repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}^{{commit}}")])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         return Ok(WorktreeAdd {
             path: worktree_path.to_path_buf(),
             created_checkout: false,
             created_branch: false,
             synced: false,
             branched_from: String::new(),
-            // Reused a pre-existing registered checkout — no fresh fork point to record.
-            base_commit: String::new(),
+            base_commit,
         });
     }
     let resolved = resolved_opt.unwrap_or_else(|| resolve_base_ref(repo, &t));
@@ -2204,8 +2217,14 @@ mod tests {
         let reuse = add_worktree_synced(&repo, "feat/c", &wt_c, &base, false)
             .expect("reusing a valid worktree on the same branch must succeed");
         assert!(!reuse.created_checkout, "reuse reports created_checkout=false");
-        // Path-reuse adopts an existing checkout — no fresh fork point recorded.
-        assert!(reuse.base_commit.is_empty(), "path-reuse must have empty base_commit");
+        // R53-2: path-reuse adopts an existing checkout and anchors it with the WORK branch's
+        // current commit (the orphan's tip ≈ its fork point), so the fork-point check still runs.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/c^{commit}"]).unwrap();
+        assert_eq!(
+            reuse.base_commit,
+            work_commit.trim(),
+            "R53-2: path-reuse anchors with the work branch's current commit"
+        );
 
         // (D) A worktree belonging to a DIFFERENT repo at the path, same branch name →
         // rejected (it is not registered in THIS repo's worktree list).
@@ -2629,7 +2648,14 @@ mod tests {
         let again = add_worktree_synced(&repo, "feat/x", &wt, &main, true)
             .expect("registered crash-orphan checkout must be adopted even though base advanced");
         assert!(!again.created_branch && !again.created_checkout, "adopted, not freshly created");
-        assert!(again.base_commit.is_empty(), "no fresh fork point recorded for an adopted checkout");
+        // R53-2: the adopt arm now anchors with the WORK branch's CURRENT commit (feat/x@A), NOT
+        // the advanced base tip — so the recorded fork point stays valid as the base moves.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/x^{commit}"]).unwrap();
+        assert_eq!(
+            again.base_commit,
+            work_commit.trim(),
+            "R53-2: adopted crash-orphan is anchored with the work branch's current commit"
+        );
 
         let _ = remove_worktree(&repo, &wt);
         let _ = std::fs::remove_dir_all(&repo);
@@ -2681,12 +2707,59 @@ mod tests {
         let a = add_worktree_synced(&repo, "feat/x", &wt, "release", true)
             .expect("registered checkout must be adopted even when it doesn't descend from the explicit base");
         assert!(!a.created_branch && !a.created_checkout, "adopted, not created");
-        assert!(a.base_commit.is_empty(), "no fresh fork point for an adopted checkout");
+        // R53-2: anchored with the WORK branch's commit (feat/x off main), independent of the
+        // explicit base passed in — the orphan's own tip is the stable fork point.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/x^{commit}"]).unwrap();
+        assert_eq!(
+            a.base_commit,
+            work_commit.trim(),
+            "R53-2: adopted path-exists checkout is anchored with the work branch's current commit"
+        );
 
         // (B) Reuse the EXISTING path for the branch's REAL base (main) → still ok.
         assert!(
             add_worktree_synced(&repo, "feat/x", &wt, &main, true).is_ok(),
             "registered checkout based on the explicit base is reused"
+        );
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn add_worktree_synced_path_exists_anchors_adopted_orphan_with_branch_commit() {
+        // R53-2: the path-exists adopt arm handles a CRASH ORPHAN (weft created the worktree but
+        // crashed before record_worktree). It must record a STABLE fork-point anchor = the work
+        // branch's CURRENT commit, so record_worktree stores a base_commit and a later
+        // materialize_direction still runs its fork-point check. Without the anchor (empty
+        // base_commit) materialize SKIPS that check and a branch reset onto a different base could
+        // be redispatched from the wrong history. Red-first: the adopt arm returned an empty
+        // base_commit.
+        let repo = tmp("aws-anchor-orphan");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+
+        // Register a real worktree for `feat/x` (a crash orphan: dir + registration, no DB row).
+        let wt = tmp("aws-anchor-orphan-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, &main, true).unwrap();
+        assert!(add.created_branch, "precondition: feat/x created off main");
+        assert!(is_registered_worktree(&repo, &wt, "feat/x"), "precondition: registered checkout on feat/x");
+
+        // The work branch's CURRENT commit — the anchor the adopt arm must record.
+        let work_commit = git(&repo, &["rev-parse", "--verify", "refs/heads/feat/x^{commit}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!work_commit.is_empty(), "precondition: work branch resolves to a commit");
+
+        // Second call takes the path-exists adopt arm → must anchor with the work branch's commit.
+        let again = add_worktree_synced(&repo, "feat/x", &wt, &main, true)
+            .expect("registered crash-orphan checkout must be adopted");
+        assert!(!again.created_branch && !again.created_checkout, "adopted, not freshly created");
+        assert_eq!(
+            again.base_commit, work_commit,
+            "R53-2: the adopt arm must anchor with the work branch's CURRENT commit (non-empty)"
         );
 
         let _ = remove_worktree(&repo, &wt);

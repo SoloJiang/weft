@@ -423,8 +423,31 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 matching.push(d.id);
             }
         }
+        // Re-materialize each claimed lane (recreating any reclaimed worktree dir). MIRROR the
+        // main loop's R51-1 atomicity: track which reclaimed dirs THIS pass RECREATES and undo them
+        // (re-reclaim) if a LATER lane fails — otherwise the `?` would bail with an earlier lane's
+        // checkout left recreated (undoing the user's reclaim) while nothing is dispatched. The
+        // directions pre-exist, so we never delete them — only the just-made recreation is reverted.
+        let mut recreated_fastpath: Vec<i32> = Vec::new();
         for &id in &matching {
-            materialize::materialize_direction(db, id).await?;
+            // repo_id for this direction (from the `all` list already loaded). If the row/worktree
+            // can't be read, treat as NOT reclaimed — never crash the idempotent retry.
+            let was_reclaimed = match all.iter().find(|d| d.id == id).map(|d| d.repo_id) {
+                Some(repo_id) => matches!(
+                    repo::worktree_for(db, id, repo_id).await,
+                    Ok(Some(w)) if !std::path::Path::new(&w.path).exists()
+                ),
+                None => false,
+            };
+            if let Err(err) = materialize::materialize_direction(db, id).await {
+                for r in &recreated_fastpath {
+                    let _ = materialize::reclaim_recreated_worktree(db, *r).await;
+                }
+                return Err(err);
+            }
+            if was_reclaimed {
+                recreated_fastpath.push(id);
+            }
         }
         return Ok(matching);
     }
@@ -2154,6 +2177,86 @@ mod tests {
         let ids = confirm(&db, t.id).await.unwrap();
         assert_eq!(ids, vec![a_id], "no-failure: confirm reuses A and dispatches its id");
         assert!(wt_path.exists(), "no-failure: a committed confirm recreates the reused dir and keeps it");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R53-1: the CONFIRMED (idempotent) fast-path's final materialize loop must ALSO track and undo
+    /// reused-worktree RECREATIONS on a later failure — exactly like the main confirm loop (R51-1).
+    /// After a plan is confirmed with two reusable lanes, lane A's dir is reclaimed (the fast-path
+    /// will RECREATE it) and lane B's recorded worktree path is replaced by a PLAIN directory (so its
+    /// materialize bails). A retry hits the fast-path: it recreates A, then B fails. Before the fix the
+    /// `?` bailed and left A's recreation on disk (undoing the user's reclaim) while nothing dispatched.
+    /// The fix re-reclaims A on failure. Red-first: before, A's dir is left recreated after B fails.
+    #[tokio::test]
+    async fn confirmed_fast_path_undoes_recreation_when_a_later_lane_fails() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-undo-recreate-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Two pending lanes A then B. A clean confirm creates+materializes both and marks the plan
+        // "confirmed". Neither decision is "approved"/"denied", so a retry claims BOTH via the fast-path.
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "ra".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let first = confirm(&db, t.id).await.unwrap();
+        assert_eq!(first.len(), 2, "first confirm creates both lanes");
+        let after_first = get_resolved(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after_first.status, "confirmed", "plan is confirmed after the first confirm");
+
+        // Identify each lane's direction + worktree path (order in `first` follows the proposal).
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let a_id = dirs.iter().find(|d| d.name == "A").map(|d| d.id).unwrap();
+        let b_id = dirs.iter().find(|d| d.name == "B").map(|d| d.id).unwrap();
+        let repo_p = root.join("api");
+
+        // RECLAIM lane A's worktree dir — the fast-path retry will RECREATE it.
+        let a_wts = repo::list_worktrees(&db, Some(a_id)).await.unwrap();
+        assert_eq!(a_wts.len(), 1, "precondition: one worktree row for A");
+        let a_wt_path = std::path::PathBuf::from(&a_wts[0].path);
+        let _ = crate::git::remove_worktree(&repo_p, &a_wt_path);
+        let _ = std::fs::remove_dir_all(&a_wt_path);
+        assert!(!a_wt_path.exists(), "precondition: A's worktree dir is reclaimed (absent) before retry");
+
+        // SABOTAGE lane B: drop its real worktree, then leave a PLAIN directory at the recorded path.
+        // materialize_direction(B) then sees a non-registered dir → recreate → add_worktree_synced
+        // bails on the existing-but-unregistered path. B is AFTER A in `matching`, so A is recreated
+        // first, then B fails — exercising the rollback of A's recreation.
+        let b_wts = repo::list_worktrees(&db, Some(b_id)).await.unwrap();
+        assert_eq!(b_wts.len(), 1, "precondition: one worktree row for B");
+        let b_wt_path = std::path::PathBuf::from(&b_wts[0].path);
+        let _ = crate::git::remove_worktree(&repo_p, &b_wt_path);
+        let _ = std::fs::remove_dir_all(&b_wt_path);
+        std::fs::create_dir_all(&b_wt_path).unwrap();
+        std::fs::write(b_wt_path.join("stuff.txt"), "not a worktree\n").unwrap();
+
+        // Retry hits the idempotent fast-path (plan == "confirmed"). It recreates A, then B fails.
+        let res = confirm(&db, t.id).await;
+        assert!(res.is_err(), "fast-path retry fails on B's sabotaged worktree path");
+
+        // A's direction still exists (it pre-existed — never torn down) ...
+        let dirs2 = repo::list_directions(&db, t.id).await.unwrap();
+        assert!(dirs2.iter().any(|d| d.id == a_id), "reused lane A's direction must NOT be deleted");
+        // ... but its RECREATED worktree dir must be UNDONE (re-reclaimed) — the user's reclaim stands.
+        assert!(
+            !a_wt_path.exists(),
+            "R53-1: the fast-path must re-reclaim A's recreated worktree dir when a later lane fails"
+        );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
