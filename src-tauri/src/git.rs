@@ -89,8 +89,11 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
             }
         }
     }
-    for c in ["main", "master", "origin/main", "origin/master"] {
-        if ref_resolves(repo, c) {
+    // Conventional integration branch. Qualify the LOCAL check as `refs/heads/<c>` so a
+    // same-named TAG (e.g. a `main` tag in a repo whose real default is `master`) can't
+    // masquerade as the branch; `origin/<c>` is already branch-namespaced.
+    for c in ["main", "master"] {
+        if ref_resolves(repo, &format!("refs/heads/{c}")) || ref_resolves(repo, &format!("origin/{c}")) {
             return c.to_string();
         }
     }
@@ -1584,6 +1587,27 @@ mod tests {
             default_base_branch(&repo, ""),
             "master",
             "a TAG named main must not shadow the real master integration branch"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_base_ref_ignores_tag_named_main_prefers_real_master() {
+        // Same tag-shadow class as default_base_branch (preemptive): resolve_base_ref's
+        // conventional main/master fallback must qualify the LOCAL check as refs/heads/<c>
+        // so a TAG `main` (no `main` branch; real default `master`) can't masquerade as main.
+        let repo = tmp("rbr-tag-main");
+        init_repo(&repo).unwrap();
+        git(&repo, &["branch", "-m", "master"]).unwrap();
+        assert!(ref_resolves(&repo, "refs/heads/master"), "precondition: master branch exists");
+        assert!(!ref_resolves(&repo, "refs/heads/main"), "precondition: no main branch");
+        git(&repo, &["tag", "main"]).unwrap();
+        assert!(ref_resolves(&repo, "main"), "precondition: bare `main` resolves (to the tag)");
+        // Empty recorded base_ref + no origin/HEAD → falls through to the main/master loop.
+        assert_eq!(
+            resolve_base_ref(&repo, ""),
+            "master",
+            "a TAG named main must not shadow the real master in resolve_base_ref"
         );
         let _ = std::fs::remove_dir_all(&repo);
     }
