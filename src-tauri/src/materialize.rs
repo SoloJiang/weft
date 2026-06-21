@@ -167,7 +167,7 @@ pub async fn materialize_direction(
         // base is unused), so a gone explicit base shouldn't block resuming the work. But
         // when the work branch is gone AND the base is explicit, a missing base must ERROR
         // rather than silently branching off an arbitrary fallback ref.
-        let require = explicit && !git::ref_resolves(repo_path, &existing.branch);
+        let require = explicit && !git::local_branch_exists(repo_path, &existing.branch);
         // R37-2: when require=false (the work branch survives) the -b fallback checks it out
         // WITHOUT add_worktree_synced's explicit-base ancestry check. A surviving branch that
         // was externally reset/recreated off a DIFFERENT base (e.g. main) while this lane's
@@ -183,7 +183,7 @@ pub async fn materialize_direction(
         // base resolves in some form but the branch descends from none; None (base gone) does
         // not block resuming the surviving branch.
         if explicit
-            && git::ref_resolves(repo_path, &existing.branch)
+            && git::local_branch_exists(repo_path, &existing.branch)
             && git::branch_descends_from_base(repo_path, &existing.branch, &recreate_base) == Some(false)
         {
             anyhow::bail!(
@@ -1465,6 +1465,85 @@ mod tests {
             "a registered work branch still descending from its explicit base must return idempotently"
         );
         assert!(wt_b.exists(), "the still-valid worktree survives the idempotent reuse");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R41-1: a TAG sharing the WORK BRANCH name must not let a reset work branch pass the
+    /// idempotent explicit-base ancestry guard. The registered work branch `feat/…` is reset
+    /// OFF `main` (no longer descending from the explicit base `release`), but a TAG with the
+    /// SAME NAME as the work branch points at `release`'s tip. With a BARE descendant ref the
+    /// ancestry check `merge-base --is-ancestor release <branch>` resolves `<branch>` to the
+    /// TAG (release's tip) — "release is an ancestor of release" is TRUE — so the reset branch
+    /// is wrongly accepted as release-based. Qualifying the descendant to `refs/heads/<branch>`
+    /// makes the check read the REAL reset branch (on main) → Some(false) → bail. MUST be Err.
+    #[tokio::test]
+    async fn materialize_idempotent_rejects_tag_shadowed_work_branch_reset_off_other_base() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-idem-tagshadow-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // release: one commit AHEAD of main (so main does NOT descend from release).
+        g(&["checkout", "-q", "-b", "release"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "release work"]);
+        let release_sha = sha("release");
+        g(&["checkout", "-q", &main]);
+        let main_sha = sha(&main);
+        assert_ne!(release_sha, main_sha, "release must be ahead of main");
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // Explicit base `release` (a real branch); materialize the lane off release.
+        let dir = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt = std::path::Path::new(&wts[0].path).to_path_buf();
+        let branch = wts[0].branch.clone();
+        assert_eq!(sha(&branch), release_sha, "precondition: work branch forked off release");
+
+        // Reset the still-registered work branch onto a main commit (NOT descending from release),
+        // from within its worktree (git refuses to force-update a branch checked out elsewhere).
+        Cmd::new("git").args(["reset", "--hard", &main_sha]).current_dir(&wt).status().unwrap();
+        assert_eq!(sha(&branch), main_sha, "precondition: registered work branch reset to main");
+        // ALSO create a TAG with the SAME NAME as the work branch, pointing at release's tip.
+        // A bare `<branch>` ref then resolves to this tag (release), shadowing the real branch.
+        g(&["tag", &branch, &release_sha]);
+        assert_eq!(sha(&format!("refs/tags/{branch}")), release_sha, "precondition: tag points at release");
+        assert!(crate::git::ref_resolves(&repo_path, &branch),
+            "precondition: bare branch name resolves (to the tag)");
+        assert!(crate::git::is_registered_worktree(&repo_path, &wt, &branch),
+            "precondition: the worktree is still registered on the work branch");
+        assert!(crate::git::ref_resolves(&repo_path, "release"), "precondition: explicit base still resolves");
+
+        // Re-materialize: the tag must NOT make the reset branch pass the release-ancestry guard.
+        assert!(
+            materialize_direction(&db, dir.id).await.is_err(),
+            "a tag sharing the work-branch name must not let a reset branch be accepted as release-based"
+        );
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);

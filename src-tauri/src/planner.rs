@@ -272,6 +272,23 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // failure because they existed (and may be running) before this confirm call.
     let mut dispatch_ids: Vec<i32> = Vec::new();
     let mut created_now: Vec<i32> = Vec::new();
+    // Claim each existing direction at most once. An already-approved/denied lane (handled
+    // via per-card approve/deny, skipped below) still OWNS its direction in existing_dirs;
+    // without claiming it, a same-name+repo PENDING sibling's reuse `.find` would match and
+    // reuse that approved direction instead of creating its own — silently dropping the
+    // pending lane. Pre-claim the approved/denied lanes' directions so duplicates fall
+    // through to create their own.
+    let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for d in &resolved.directions {
+        if d.decision == "approved" || d.decision == "denied" {
+            if let Some(ex) = existing_dirs
+                .iter()
+                .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id))
+            {
+                consumed.insert(ex.id);
+            }
+        }
+    }
     for d in &resolved.directions {
         if !d.repo.known {
             continue; // unknown repo name never resolved to a worktree-able repo
@@ -285,8 +302,11 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         // create a duplicate direction/worktree.
         if let Some(ex) = existing_dirs
             .iter()
-            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id)
+            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id))
         {
+            let ex_id = ex.id;
+            // Claim this direction so a later same-name+repo duplicate lane can't reuse it.
+            consumed.insert(ex_id);
             let repo_ref = match repo::get_repo(db, d.repo.repo_id).await {
                 Ok(Some(r)) => r,
                 Ok(None) => {
@@ -312,11 +332,11 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             // materialize_direction is idempotent when the dir already exists, so
             // calling it here is always safe. Mirror what the normal (non-reuse) path
             // already does below.
-            if let Err(err) = materialize::materialize_direction(db, ex.id).await {
+            if let Err(err) = materialize::materialize_direction(db, ex_id).await {
                 rollback_created(db, &created_now).await;
                 return Err(err);
             }
-            dispatch_ids.push(ex.id);
+            dispatch_ids.push(ex_id);
             continue;
         }
         let dir = match repo::create_direction(
@@ -1322,6 +1342,49 @@ mod tests {
         let ids = confirm(&db, t.id).await.unwrap();
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "confirm must NOT duplicate the approved lane");
         assert!(ids.contains(&approved_id), "confirm returns the existing lane id for dispatch");
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirm_duplicate_name_lane_does_not_reuse_approved_sibling() {
+        // R41-3: a proposal with TWO lanes of the SAME name+repo, ONE already approved. confirm
+        // skips the approved lane (decision="approved") but its direction stays in existing_dirs;
+        // the PENDING sibling's reuse `.find(name+repo)` then matches that APPROVED direction and
+        // reuses it instead of creating its own — the pending lane is silently dropped. Claiming
+        // each existing direction at most once makes the approved direction pre-consumed, so the
+        // pending sibling finds no unconsumed match and creates a SECOND, distinct direction.
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-dupname-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        // TWO lanes, same name "A" + same repo "api".
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let prop = Proposal { rationale:"r".into(), directions: vec![lane(), lane()] };
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        // Approve the FIRST lane (index 0): creates + materializes direction #1, sets its decision.
+        let approved_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // The stored proposal now has directions[0].decision="approved", directions[1] pending.
+        let ids = confirm(&db, t.id).await.unwrap();
+        // The pending sibling must get its OWN direction, not reuse the approved one.
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let same: Vec<_> = dirs.iter().filter(|d| d.name == "A" && d.repo_id == ra.id).collect();
+        assert_eq!(same.len(), 2, "the pending duplicate-name lane must create a SECOND distinct direction");
+        assert_eq!(ids.len(), 1, "confirm dispatches only the pending lane (the approved one is handled separately)");
+        assert!(!ids.contains(&approved_id), "the pending lane's dispatched id must NOT be the approved direction's id");
+        assert!(same.iter().any(|d| d.id == approved_id), "the approved direction still exists");
+        assert!(same.iter().any(|d| d.id == ids[0]), "the new pending direction is among the same-name lanes");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");

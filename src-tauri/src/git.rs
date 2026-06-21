@@ -195,7 +195,7 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
         }
     }
     for c in ["main", "master"] {
-        if ref_resolves(repo, c) || ref_resolves(repo, &format!("origin/{c}")) {
+        if ref_resolves(repo, &format!("refs/heads/{c}")) || ref_resolves(repo, &format!("origin/{c}")) {
             return c.to_string();
         }
     }
@@ -203,7 +203,7 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     let b = b.strip_prefix("origin/").unwrap_or(b);
     if !b.is_empty()
         && b != "HEAD"
-        && (ref_resolves(repo, b) || ref_resolves(repo, &format!("origin/{b}")))
+        && (ref_resolves(repo, &format!("refs/heads/{b}")) || ref_resolves(repo, &format!("origin/{b}")))
     {
         return b.to_string();
     }
@@ -227,7 +227,7 @@ pub fn recorded_base_or_default(repo: &Path, base_ref: &str, is_default: bool) -
     if is_default
         && !b.is_empty()
         && b != "HEAD"
-        && (ref_resolves(repo, b) || ref_resolves(repo, &format!("origin/{b}")))
+        && (ref_resolves(repo, &format!("refs/heads/{b}")) || ref_resolves(repo, &format!("origin/{b}")))
     {
         return b.to_string();
     }
@@ -385,7 +385,17 @@ pub fn is_registered_worktree(repo: &Path, worktree_path: &Path, branch: &str) -
 /// branch). Used to verify a reused branch was actually forked from a requested
 /// explicit base before recording that base.
 pub fn branch_descends_from(repo: &Path, branch: &str, base: &str) -> bool {
-    git(repo, &["merge-base", "--is-ancestor", base, branch]).is_ok()
+    // Qualify the DESCENDANT (work-branch) side as `refs/heads/<branch>` so a TAG sharing
+    // the branch name can't shadow the real branch (bare `<branch>` resolves a same-named
+    // tag first), which would let a reset branch be accepted as based on `base`.
+    git(repo, &["merge-base", "--is-ancestor", base, &format!("refs/heads/{branch}")]).is_ok()
+}
+
+/// Branch-qualified existence check: true only when `refs/heads/<branch>` resolves — a bare
+/// `ref_resolves(repo, branch)` would also accept a same-named TAG, so use this where the
+/// question is specifically "does the local BRANCH exist?".
+pub fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+    ref_resolves(repo, &format!("refs/heads/{branch}"))
 }
 
 /// Does `branch` descend from the explicit base NAME, resolved to whichever ref actually
@@ -401,9 +411,12 @@ pub fn branch_descends_from_base(repo: &Path, branch: &str, base: &str) -> Optio
     if t.is_empty() || t == "HEAD" {
         return None;
     }
+    // Qualify the LOCAL base form as `refs/heads/<t>` (defense-in-depth: a same-named TAG
+    // must not vouch for the base); keep the remote-tracking `origin/<t>` form as-is.
+    let local = format!("refs/heads/{t}");
     let remote = format!("origin/{t}");
     let mut resolved_any = false;
-    for form in [t.as_str(), remote.as_str()] {
+    for form in [local.as_str(), remote.as_str()] {
         if ref_resolves(repo, form) {
             resolved_any = true;
             if branch_descends_from(repo, branch, form) {
@@ -1547,6 +1560,31 @@ mod tests {
         let got = default_base_branch(&repo, "feature-x");
         assert_eq!(got, def, "must prefer the integration branch over a recorded feature branch");
         assert_ne!(got, "feature-x");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn default_base_branch_ignores_tag_named_main_prefers_real_master() {
+        // R41-2: a repo whose real integration branch is `master`, with a TAG named `main`
+        // but NO `main` BRANCH and no origin/HEAD. The bare `ref_resolves(repo, "main")`
+        // resolves the TAG, so the old code wrongly selects "main"; qualifying the local
+        // check to `refs/heads/main` ignores the tag and selects the real "master".
+        let repo = tmp("dbb-tag-main");
+        init_repo(&repo).unwrap();
+        // Ensure the integration branch is `master` (rename whatever init produced), so there
+        // is definitely NO `main` branch present.
+        git(&repo, &["branch", "-m", "master"]).unwrap();
+        assert!(ref_resolves(&repo, "refs/heads/master"), "precondition: master branch exists");
+        assert!(!ref_resolves(&repo, "refs/heads/main"), "precondition: no main branch");
+        // A TAG named `main` (points at master's tip) — bare `main` now resolves to it.
+        git(&repo, &["tag", "main"]).unwrap();
+        assert!(ref_resolves(&repo, "main"), "precondition: bare `main` resolves (to the tag)");
+        assert!(ref_resolves(&repo, "refs/tags/main"), "precondition: refs/tags/main exists");
+        assert_eq!(
+            default_base_branch(&repo, ""),
+            "master",
+            "a TAG named main must not shadow the real master integration branch"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
