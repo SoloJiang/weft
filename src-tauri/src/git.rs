@@ -591,28 +591,15 @@ pub fn add_worktree_synced(
                 worktree_path.display()
             );
         }
-        // The registered branch must also DESCEND from the resolved base — mirroring the
-        // `-b` fallback's ancestry check. A checkout registered for this branch but forked
-        // elsewhere (e.g. `feat/x` off main, now reused for a `release` lane) would otherwise
-        // record base=release while the worktree sits on main's line. Validate WHENEVER the
-        // resolved base RESOLVES as a ref, regardless of require_resolvable: a BLANK-base lane
-        // (require_resolvable=false) still records the CURRENT resolved default as its base, so
-        // a reused branch not descending from it is just as wrong. `resolved_opt` is None for a
-        // blank base, so fall back to resolve_base_ref the same way the create path does. Skip
-        // when the base is HEAD or doesn't resolve (e.g. base gone): a surviving registered
-        // checkout can still be reused when its base is gone.
-        let resolved_base = resolved_opt
-            .clone()
-            .unwrap_or_else(|| resolve_base_ref(repo, &t));
-        if resolved_base != "HEAD"
-            && ref_resolves(repo, &resolved_base)
-            && !branch_descends_from(repo, branch, &resolved_base)
-        {
-            bail!(
-                "branch {branch:?} already checked out but is not based on {resolved_base:?}; \
-                 refusing to record a mismatched base"
-            );
-        }
+        // ADOPT the registered checkout WITHOUT re-validating its branch against a RE-RESOLVED
+        // base tip (R50-3). This path handles a CRASH ORPHAN: weft created the worktree but
+        // crashed before record_worktree. If the base advanced since the fork, the re-resolved
+        // tip is no longer an ancestor — an ancestry bail here would leave the task permanently
+        // stuck on a checkout weft itself made. Per the fork-point principle, the authority on
+        // "is this checkout still valid for its base" is materialize's recorded-fork-COMMIT check
+        // (it validates against the STABLE fork point, not a moving ref), NOT a descends-from-the-
+        // moving-base check here. (The `-b` create path below still validates a FRESH branch off
+        // the base, because that forks anew from the current tip — only this reuse arm changes.)
         return Ok(WorktreeAdd {
             path: worktree_path.to_path_buf(),
             created_checkout: false,
@@ -2566,6 +2553,42 @@ mod tests {
     }
 
     #[test]
+    fn add_worktree_synced_adopts_registered_checkout_after_base_advanced() {
+        // R50-3: the path-exists fast-path must ADOPT a registered crash-orphan checkout
+        // WITHOUT re-validating its branch against the (possibly moved) base. Weft created the
+        // worktree but crashed before record_worktree; the base then advanced past the fork
+        // point, so the branch no longer descends from the RE-RESOLVED base tip. Per the
+        // fork-point principle (materialize's fork-commit check is the authority — don't
+        // re-validate an existing checkout against a moving ref), reuse it instead of bailing.
+        let repo = tmp("aws-adopt-orphan");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+
+        // Register a real worktree for `feat/x` forked from main at commit A.
+        let wt = tmp("aws-adopt-orphan-wt");
+        let add = add_worktree_synced(&repo, "feat/x", &wt, &main, true).unwrap();
+        assert!(add.created_branch, "precondition: feat/x created off main@A");
+        assert!(is_registered_worktree(&repo, &wt, "feat/x"), "precondition: registered checkout on feat/x");
+
+        // Advance the base (main) to B — now feat/x (still at A) does NOT descend from main's tip.
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base advance B"]).unwrap();
+        assert!(
+            !branch_descends_from(&repo, "feat/x", &main),
+            "precondition: feat/x no longer descends from the advanced base tip"
+        );
+
+        // Reuse the EXISTING registered path with the same base → must ADOPT (Ok), not reject.
+        let again = add_worktree_synced(&repo, "feat/x", &wt, &main, true)
+            .expect("registered crash-orphan checkout must be adopted even though base advanced");
+        assert!(!again.created_branch && !again.created_checkout, "adopted, not freshly created");
+        assert!(again.base_commit.is_empty(), "no fresh fork point recorded for an adopted checkout");
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
     fn add_worktree_synced_validates_explicit_base_even_when_path_exists() {
         let repo = tmp("aws-orphan");
         init_repo(&repo).unwrap();
@@ -2580,12 +2603,14 @@ mod tests {
     }
 
     #[test]
-    fn add_worktree_synced_rejects_existing_path_branch_not_from_explicit_base() {
-        // The path-exists fast-path (a REGISTERED checkout for `branch`) must, for an
-        // EXPLICIT base, still verify the branch descends from that base before reusing —
-        // else a checkout forked off main, reused for an explicit `release` lane, records
-        // base=release while the worktree sits on main's line.
-        let repo = tmp("aws-path-mismatch");
+    fn add_worktree_synced_adopts_existing_path_branch_for_resolvable_explicit_base() {
+        // R50-3 contract change: the path-exists fast-path (a REGISTERED checkout for `branch`)
+        // no longer re-validates the branch against the resolved base — it ADOPTS the registered
+        // checkout (a crash orphan whose base may have moved). Both an explicit base the branch
+        // does NOT descend from AND the branch's real base are reused; ancestry is re-checked by
+        // materialize's recorded-fork-commit guard, not here. (An UNRESOLVABLE explicit base is
+        // still rejected earlier — see add_worktree_synced_validates_explicit_base_even_when_path_exists.)
+        let repo = tmp("aws-path-adopt");
         init_repo(&repo).unwrap();
         let main = current_branch(&repo).unwrap();
         // A distinct base "release", one commit AHEAD of main, so main is NOT a descendant.
@@ -2594,19 +2619,23 @@ mod tests {
         git(&repo, &["checkout", "-q", &main]).unwrap();
 
         // Register a real worktree for `feat/x` forked from MAIN at the deterministic path.
-        let wt = tmp("aws-path-mismatch-wt");
+        let wt = tmp("aws-path-adopt-wt");
         let add = add_worktree_synced(&repo, "feat/x", &wt, &main, true).unwrap();
         assert!(add.created_branch, "precondition: feat/x created off main");
         assert!(wt.exists() && wt.join(".git").exists(), "precondition: registered worktree on feat/x");
-
-        // (A) Reuse the EXISTING path for an explicit base "release" → reject (feat/x is
-        // on main's line, not a descendant of release).
         assert!(
-            add_worktree_synced(&repo, "feat/x", &wt, "release", true).is_err(),
-            "registered checkout not based on the explicit base must be rejected on the path-exists fast-path"
+            !branch_descends_from(&repo, "feat/x", "release"),
+            "precondition: feat/x does NOT descend from release"
         );
 
-        // (B) Reuse the EXISTING path for the branch's REAL base (main) → ok.
+        // (A) Reuse the EXISTING path for a RESOLVABLE explicit base "release" the branch does
+        // NOT descend from → ADOPT (Ok), not reject.
+        let a = add_worktree_synced(&repo, "feat/x", &wt, "release", true)
+            .expect("registered checkout must be adopted even when it doesn't descend from the explicit base");
+        assert!(!a.created_branch && !a.created_checkout, "adopted, not created");
+        assert!(a.base_commit.is_empty(), "no fresh fork point for an adopted checkout");
+
+        // (B) Reuse the EXISTING path for the branch's REAL base (main) → still ok.
         assert!(
             add_worktree_synced(&repo, "feat/x", &wt, &main, true).is_ok(),
             "registered checkout based on the explicit base is reused"

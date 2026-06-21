@@ -215,12 +215,19 @@ pub async fn materialize_direction(
         // just created would escape cleanup (stale created_*=false).
         let cb = existing.created_branch || add.created_branch;
         let cc = existing.created_checkout || add.created_checkout;
-        // When the recreate FORKED a fresh branch (the original was deleted) and the row had
-        // no recorded fork point yet (legacy row, or a prior reuse/fallback that recorded
-        // none), adopt the new fork commit as the stable ancestry anchor. NEVER overwrite a
-        // non-empty base_commit: the ORIGINAL fork point is authoritative — preserve it across
-        // re-materializes so base-movement/fetch state can't shift the validation target.
-        let new_base_commit = if existing.base_commit.is_empty() {
+        // Decide whether to UPDATE the row's recorded fork commit:
+        //   - A FRESH branch was forked (`add.created_branch`, the `-b` SUCCESS path): the
+        //     original branch was deleted and re-created off the (possibly force-moved) base, so
+        //     its NEW fork point is the authoritative anchor now. The old commit belonged to the
+        //     deleted branch — overwriting it is REQUIRED (R50-1), else the next re-materialize
+        //     validates the fresh branch against the stale fork commit and false-rejects.
+        //   - No fresh branch, but the row had no fork point yet (legacy/reuse row): adopt the
+        //     new one if the recreate produced one.
+        //   - Otherwise the branch was REUSED (checked out): preserve the ORIGINAL fork point so
+        //     base-movement/fetch state can't shift the validation target.
+        let new_base_commit = if add.created_branch {
+            add.base_commit.clone()
+        } else if existing.base_commit.is_empty() {
             add.base_commit.clone()
         } else {
             String::new()
@@ -1098,6 +1105,99 @@ mod tests {
         assert!(wts[0].created_checkout, "created_checkout must flip true after weft created the checkout");
         let row = repo::worktree_for(&db, dir.id, r.id).await.unwrap().unwrap();
         assert!(row.created_branch && row.created_checkout, "ownership persisted on the row");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R50-1: when the recreate FORKS A FRESH branch (the original was deleted) the stored
+    /// fork commit must be UPDATED to the new fork point — not preserved. The recreate path
+    /// preserves a non-empty `base_commit` across re-materializes (so base movement can't shift
+    /// the validation target for a REUSED branch). But when the work branch was deleted AND the
+    /// base force-moved, `add_worktree_synced` forks a FRESH branch off the moved base and returns
+    /// its new fork point; discarding it would leave the STALE old commit, so the NEXT
+    /// re-materialize validates the fresh branch against the stale fork commit and false-rejects.
+    #[tokio::test]
+    async fn materialize_recreate_updates_fork_commit_when_branch_recreated() {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-remat-forkupd-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+        let g = |args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(&repo_path).status().unwrap();
+        };
+        let sha = |rev: &str| -> String {
+            String::from_utf8(
+                Cmd::new("git").args(["rev-parse", rev]).current_dir(&repo_path).output().unwrap().stdout,
+            ).unwrap().trim().to_string()
+        };
+        // release @ R1 (one commit ahead of main).
+        g(&["checkout", "-q", "-b", "release"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "release R1"]);
+        let r1 = sha("release");
+        g(&["checkout", "-q", &main]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // EXPLICIT base = release. ① materialize: forks the work branch off release @ R1.
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "release")
+            .await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let work_branch = wts[0].branch.clone();
+        let row1 = repo::worktree_for(&db, dir.id, r.id).await.unwrap().unwrap();
+        assert_eq!(row1.base_commit, r1, "precondition: fork commit recorded as release@R1");
+
+        // Reclaim the dir, DELETE the work branch, and move release to an UNRELATED R2 (an
+        // orphan line so R1 is NOT an ancestor of R2).
+        let _ = crate::git::remove_worktree(&repo_path, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        g(&["worktree", "prune"]);
+        g(&["branch", "-D", &work_branch]);
+        g(&["checkout", "-q", "--orphan", "release-2"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "release R2 (unrelated)"]);
+        let r2 = sha("release-2");
+        g(&["branch", "-f", "release", &r2]);
+        g(&["checkout", "-q", &main]);
+        assert_ne!(r1, r2, "R1 and R2 must differ");
+        assert!(
+            !crate::git::is_ancestor(&repo_path, &r1, "release"),
+            "precondition: release moved to an UNRELATED commit (R1 not an ancestor of R2)"
+        );
+
+        // ② re-materialize: the gone work branch is recreated off release@R2 (a FRESH branch) →
+        // the stored fork commit must be UPDATED to R2.
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+        assert!(wt_path.exists(), "worktree dir recreated");
+        assert_eq!(sha(&work_branch), r2, "recreated work branch forked off release@R2");
+        let row2 = repo::worktree_for(&db, dir.id, r.id).await.unwrap().unwrap();
+        assert_eq!(row2.base_commit, r2, "stored fork commit UPDATED to the fresh fork point (R2), not the stale R1");
+
+        // ③ a SECOND re-materialize must be Ok: it validates the fresh branch against R2 (the
+        // updated anchor), not the stale R1 (which would false-reject). Reclaim the dir but keep
+        // the now-valid work branch.
+        let _ = crate::git::remove_worktree(&repo_path, &wt_path);
+        let _ = std::fs::remove_dir_all(&wt_path);
+        g(&["worktree", "prune"]);
+        assert!(
+            materialize_direction(&db, dir.id).await.is_ok(),
+            "second re-materialize validates against the UPDATED fork commit (R2), not the stale R1"
+        );
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);

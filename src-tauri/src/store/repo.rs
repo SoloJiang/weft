@@ -458,6 +458,21 @@ pub async fn upsert_plan(
     Ok(a.save(&db.0).await?.try_into_model()?)
 }
 
+/// Set a plan's `created_at`, which doubles as the proposal VERSION ("last proposed at").
+/// `save_proposal` bumps it on every re-propose (R50-2) so the frontend can reset a dirty base
+/// edit on ANY re-proposal. (Distinct from `upsert_plan`, which intentionally PRESERVES
+/// `created_at` on update — the targeted-edit / CAS / test-seam paths rely on that.) No-op if the
+/// plan row is absent.
+pub async fn set_plan_created_at(db: &Db, thread_id: i32, created_at: &str) -> Result<()> {
+    use sea_orm::sea_query::Expr;
+    plan::Entity::update_many()
+        .col_expr(plan::Column::CreatedAt, Expr::value(created_at.to_string()))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
 /// Compare-and-swap the stored proposal: write `new_proposal` + `status` ONLY if the
 /// row's current proposal still equals `expected` AND its current status still equals
 /// `status` (no re-propose AND no confirm landed since the caller read it). Returns true

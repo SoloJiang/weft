@@ -99,6 +99,49 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
 
 // ---- Direction reuse reconciliation ----
 
+/// Pure predicate: do `existing_base` (a direction's RECORDED branch-off base) and
+/// `proposed_base` (a re-proposal's requested base) refer to the SAME base — i.e. is the
+/// existing direction a base-compatible reuse target for the proposal?
+///
+/// This is the SAME normalize_target/effective comparison `reconcile_reuse` performs, factored
+/// out so the lane-reuse `.find` predicates can PREFER a base-compatible direction when duplicate
+/// same-name/repo lanes have different bases (R50-4) — instead of matching the first by name+repo
+/// and then erroring in `reconcile_reuse` on a base mismatch. Returns true when:
+///   - both are the default (empty existing/proposed, or existing "HEAD" + empty proposed), OR
+///   - their effective (normalized) bases are equal.
+/// An empty existing base paired with a NON-empty proposed base is NOT compatible (a legacy row's
+/// true base is unknown — reconcile_reuse rejects it). The detached-HEAD moved-target case is left
+/// to reconcile_reuse: it is about a moved TARGET, not base identity, so it must not affect which
+/// direction is SELECTED.
+fn base_compatible(
+    existing_base: &str,
+    proposed_base: &str,
+    repo_path: &std::path::Path,
+    base_ref: &str,
+    base_ref_is_default: bool,
+) -> bool {
+    let effective = |b: &str| -> String {
+        let b = b.trim();
+        if b.is_empty() {
+            crate::git::live_default_branch(repo_path).unwrap_or_else(|| {
+                crate::git::recorded_base_or_default(repo_path, base_ref, base_ref_is_default)
+            })
+        } else {
+            crate::git::normalize_target(b)
+        }
+    };
+    let existing_base = existing_base.trim();
+    let proposed_base = proposed_base.trim();
+    if existing_base.is_empty() {
+        // Legacy/blank-recorded base: reusable only by a blank (default) re-proposal.
+        return proposed_base.is_empty();
+    }
+    if existing_base == "HEAD" && proposed_base.is_empty() {
+        return true;
+    }
+    effective(existing_base) == effective(proposed_base)
+}
+
 /// Decide whether a re-proposal can reuse an already-materialized direction of the
 /// same name+repo, or must be rejected (the worktree is branched off a fixed base; a
 /// live worktree can't be re-based). `existing.base_branch` is the immutable
@@ -119,24 +162,6 @@ fn reconcile_reuse(
     base_ref: &str,
     base_ref_is_default: bool,
 ) -> Result<()> {
-    let effective = |b: &str| -> String {
-        let b = b.trim();
-        if b.is_empty() {
-            // Match materialize's resolution: live default, else the recorded base_ref
-            // (the live default captured at register) when it still resolves, else the
-            // cached chain — so the reuse comparison agrees with what was materialized.
-            crate::git::live_default_branch(repo_path).unwrap_or_else(|| {
-                crate::git::recorded_base_or_default(repo_path, base_ref, base_ref_is_default)
-            })
-        } else {
-            // A stored explicit base can be QUALIFIED (refs/heads/<n> | refs/remotes/origin/<n>)
-            // now that materialization carries fully-qualified bases — so normalize with the SAME
-            // canonical normalizer the materialization path uses (strips refs/remotes/origin/,
-            // refs/heads/, and origin/). A plain `origin/` strip would leave a qualified ref intact
-            // and wrongly reject a bare-equivalent re-proposal as a base change (R47-4).
-            crate::git::normalize_target(b)
-        }
-    };
     // Empty recorded base spans two cases that share the legacy blank-reuse shortcut but a
     // DETACHED-HEAD lane must not: it records base "" + target = the branch-off COMMIT (a
     // 40-hex sha). A blank re-proposal means "fork from current HEAD" — reusing the lane is
@@ -162,15 +187,16 @@ fn reconcile_reuse(
         }
         return Ok(());
     }
-    // "HEAD" as the recorded base means the blank-base fallback landed on a detached
-    // HEAD (no main/master branch in the repo). A blank re-proposal is the same
-    // default intent — allow reuse without treating it as a genuine base mismatch.
-    // Only a truly non-empty, non-HEAD explicit base is considered a conflict.
-    let existing_base = existing.base_branch.trim();
-    if existing_base == "HEAD" && proposed_base.trim().is_empty() {
-        return Ok(());
-    }
-    if effective(existing_base) != effective(proposed_base) {
+    // Non-empty recorded base: the final guard is the SAME comparison `base_compatible` uses
+    // (incl. the "HEAD" recorded base == blank re-proposal shortcut), kept here as the single
+    // source of truth so the reuse `.find` predicates and this guard never diverge.
+    if !base_compatible(
+        &existing.base_branch,
+        proposed_base,
+        repo_path,
+        base_ref,
+        base_ref_is_default,
+    ) {
         anyhow::bail!(
             "direction {:?} already exists with base {:?}; delete the sub-task to recreate it from {:?}",
             existing.name, existing.base_branch, proposed_base
@@ -187,6 +213,23 @@ fn now() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{secs}")
+}
+
+/// A STRICTLY-MONOTONIC proposal version string (R50-2). `save_proposal` writes this into the
+/// plan's `created_at` ("last proposed at") so the frontend can reset a dirty base edit on ANY
+/// re-proposal — including two that land within the SAME second (where a coarse `now()` would
+/// repeat and the reset would NOT fire). A wall-clock nanosecond stamp is combined with a
+/// process-wide atomic counter so the value is unique and increasing even under back-to-back
+/// saves on a low-resolution clock.
+fn proposal_version() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{seq}")
 }
 
 /// Per-thread serialization gate for plan-mutating ops. Two confirm/approve/deny/save_proposal
@@ -227,7 +270,13 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
         d.decision = String::new();
     }
     let json = serde_json::to_string(&p)?;
-    repo::upsert_plan(db, thread_id, &json, "proposed", &now()).await?;
+    // Bump the proposal VERSION on EVERY re-propose (R50-2). `upsert_plan` uses `version` as the
+    // INSERT created_at but PRESERVES created_at on UPDATE; for a re-propose (existing row) the
+    // explicit set_plan_created_at below applies the fresh version so the frontend reliably resets
+    // a dirty base edit even when name/repo/base are unchanged.
+    let version = proposal_version();
+    repo::upsert_plan(db, thread_id, &json, "proposed", &version).await?;
+    repo::set_plan_created_at(db, thread_id, &version).await?;
     Ok(())
 }
 
@@ -252,6 +301,9 @@ async fn resolved_from_plan(
         thread_id,
         rationale: proposal.rationale,
         status: p.status.clone(),
+        // The plan's `created_at` doubles as the proposal VERSION ("last proposed at"): bumped on
+        // every save_proposal (R50-2) so the frontend can reset a dirty base edit on ANY re-propose.
+        created_at: p.created_at.clone(),
         directions,
     })
 }
@@ -269,6 +321,10 @@ pub struct ResolvedProposal {
     pub thread_id: i32,
     pub rationale: String,
     pub status: String,
+    /// Proposal VERSION ("last proposed at"): the plan's `created_at`, bumped on every
+    /// save_proposal (R50-2). The frontend includes it in the base-field reset condition so a
+    /// re-propose with the SAME name/repo/base still discards an unblurred (dirty) edit.
+    pub created_at: String,
     pub directions: Vec<ResolvedDirection>,
 }
 
@@ -354,12 +410,41 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
     for d in &resolved.directions {
         if d.decision == "approved" || d.decision == "denied" {
-            if let Some(ex) = existing_dirs
+            // Prefer claiming the BASE-COMPATIBLE direction among same-name/repo duplicates so the
+            // PENDING sibling's reuse find (which is base-aware) is left the matching one — mirrors
+            // the main find's predicate (R50-4). Best-effort repo lookup: if it fails, fall back to
+            // a name+repo-only claim (the main loop still reconciles the real base).
+            let repo_info = repo::get_repo(db, d.repo.repo_id).await.ok().flatten();
+            let claimed = existing_dirs
                 .iter()
                 // Exclude terminal (done) directions from reuse: a completed lane is history,
                 // not a resumable target — a re-proposal must create fresh work.
-                .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id) && x.status != "done")
-            {
+                .find(|x| {
+                    x.name == d.name
+                        && x.repo_id == d.repo.repo_id
+                        && !consumed.contains(&x.id)
+                        && x.status != "done"
+                        && repo_info.as_ref().is_none_or(|r| {
+                            base_compatible(
+                                &x.base_branch,
+                                &d.base_branch,
+                                std::path::Path::new(&r.local_git_path),
+                                &r.base_ref,
+                                r.base_ref_is_default,
+                            )
+                        })
+                })
+                // Fall back to a name+repo-only claim when no base-compatible match exists, so an
+                // approved/denied lane's direction is still claimed (a pending sibling must not reuse it).
+                .or_else(|| {
+                    existing_dirs.iter().find(|x| {
+                        x.name == d.name
+                            && x.repo_id == d.repo.repo_id
+                            && !consumed.contains(&x.id)
+                            && x.status != "done"
+                    })
+                });
+            if let Some(ex) = claimed {
                 consumed.insert(ex.id);
             }
         }
@@ -374,31 +459,49 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         // A lane may already be materialized (e.g. approved via Needs-you, then the
         // lead re-proposed it resetting the decision to ""). Reuse the same-base lane
         // (and still return its id for dispatch) or reject a base change — never
-        // create a duplicate direction/worktree.
+        // create a duplicate direction/worktree. Fetch the repo BEFORE the find so the
+        // reuse `.find` can prefer a BASE-COMPATIBLE direction (R50-4): when duplicate
+        // same-name/repo lanes have different bases, matching by name+repo alone could pick
+        // a base-incompatible one and make reconcile_reuse error even though a compatible
+        // direction with the requested base exists. (All candidates share d.repo.repo_id.)
+        let repo_ref = match repo::get_repo(db, d.repo.repo_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                rollback_created(db, &created_now).await;
+                anyhow::bail!("repo {} not found", d.repo.repo_id);
+            }
+            Err(e) => {
+                rollback_created(db, &created_now).await;
+                return Err(e.into());
+            }
+        };
+        let repo_path = std::path::Path::new(&repo_ref.local_git_path);
         if let Some(ex) = existing_dirs
             .iter()
             // Exclude terminal (done) directions from reuse: a completed lane is history,
-            // not a resumable target — a re-proposal must create fresh work.
-            .find(|x| x.name == d.name && x.repo_id == d.repo.repo_id && !consumed.contains(&x.id) && x.status != "done")
+            // not a resumable target — a re-proposal must create fresh work. Prefer a
+            // base-COMPATIBLE direction so a same-name lane with a different base is skipped.
+            .find(|x| {
+                x.name == d.name
+                    && x.repo_id == d.repo.repo_id
+                    && !consumed.contains(&x.id)
+                    && x.status != "done"
+                    && base_compatible(
+                        &x.base_branch,
+                        &d.base_branch,
+                        repo_path,
+                        &repo_ref.base_ref,
+                        repo_ref.base_ref_is_default,
+                    )
+            })
         {
             let ex_id = ex.id;
             // Claim this direction so a later same-name+repo duplicate lane can't reuse it.
             consumed.insert(ex_id);
-            let repo_ref = match repo::get_repo(db, d.repo.repo_id).await {
-                Ok(Some(r)) => r,
-                Ok(None) => {
-                    rollback_created(db, &created_now).await;
-                    anyhow::bail!("repo {} not found", d.repo.repo_id);
-                }
-                Err(e) => {
-                    rollback_created(db, &created_now).await;
-                    return Err(e.into());
-                }
-            };
             if let Err(err) = reconcile_reuse(
                 ex,
                 &d.base_branch,
-                std::path::Path::new(&repo_ref.local_git_path),
+                repo_path,
                 &repo_ref.base_ref,
                 repo_ref.base_ref_is_default,
             ) {
@@ -523,21 +626,69 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         }
         if pj.decision == "approved" || pj.decision == "denied" {
             let rj = resolve(pj, &repos);
-            if let Some(d) = dirs
+            // Prefer claiming the BASE-COMPATIBLE direction among same-name/repo duplicates so the
+            // lane being approved (whose find is base-aware) is left the matching one — mirrors
+            // confirm's pre-pass (R50-4). Best-effort repo lookup with a name+repo-only fallback.
+            let repo_info = repo::get_repo(db, rj.repo.repo_id).await.ok().flatten();
+            let claimed = dirs
                 .iter()
                 // Exclude terminal (done) directions from reuse: a completed lane is history,
                 // not a resumable target — a re-proposal must create fresh work.
-                .find(|d| d.name == rj.name && d.repo_id == rj.repo.repo_id && !consumed.contains(&d.id) && d.status != "done")
-            {
+                .find(|d| {
+                    d.name == rj.name
+                        && d.repo_id == rj.repo.repo_id
+                        && !consumed.contains(&d.id)
+                        && d.status != "done"
+                        && repo_info.as_ref().is_none_or(|r| {
+                            base_compatible(
+                                &d.base_branch,
+                                &rj.base_branch,
+                                std::path::Path::new(&r.local_git_path),
+                                &r.base_ref,
+                                r.base_ref_is_default,
+                            )
+                        })
+                })
+                .or_else(|| {
+                    dirs.iter().find(|d| {
+                        d.name == rj.name
+                            && d.repo_id == rj.repo.repo_id
+                            && !consumed.contains(&d.id)
+                            && d.status != "done"
+                    })
+                });
+            if let Some(d) = claimed {
                 consumed.insert(d.id);
             }
         }
     }
+    // Fetch the repo BEFORE the existing-lookup so the find can prefer a BASE-COMPATIBLE
+    // direction (R50-4): among same-name/repo duplicates with different bases, matching by
+    // name+repo alone could pick a base-incompatible one and make reconcile_reuse error even
+    // though a compatible direction with the requested base exists. (All candidates share
+    // resolved.repo.repo_id.)
+    let repo_ref = repo::get_repo(db, resolved.repo.repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {} not found", resolved.repo.repo_id))?;
+    let repo_path = std::path::Path::new(&repo_ref.local_git_path);
     if let Some(existing) = dirs
         .iter()
         // Exclude terminal (done) directions from reuse: a completed lane is history,
-        // not a resumable target — a re-proposal must create fresh work.
-        .find(|d| d.name == resolved.name && d.repo_id == resolved.repo.repo_id && !consumed.contains(&d.id) && d.status != "done")
+        // not a resumable target — a re-proposal must create fresh work. Prefer a
+        // base-COMPATIBLE direction so a same-name lane with a different base is skipped.
+        .find(|d| {
+            d.name == resolved.name
+                && d.repo_id == resolved.repo.repo_id
+                && !consumed.contains(&d.id)
+                && d.status != "done"
+                && base_compatible(
+                    &d.base_branch,
+                    &resolved.base_branch,
+                    repo_path,
+                    &repo_ref.base_ref,
+                    repo_ref.base_ref_is_default,
+                )
+        })
     {
         // The existing direction's worktree is already branched off its stored base;
         // a re-proposal that changes the base can't silently re-base a live (possibly
@@ -546,13 +697,10 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         // Also handles legacy rows (base_branch == "") where the true base is unknown:
         // those may only be reused when the re-proposal is also default (empty base).
         // Uses the LIVE remote default for comparison (not the cached origin/HEAD).
-        let repo_ref = repo::get_repo(db, resolved.repo.repo_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("repo {} not found", resolved.repo.repo_id))?;
         reconcile_reuse(
             existing,
             &resolved.base_branch,
-            std::path::Path::new(&repo_ref.local_git_path),
+            repo_path,
             &repo_ref.base_ref,
             repo_ref.base_ref_is_default,
         )?;
@@ -1679,6 +1827,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// R50-4: when duplicate same-name/repo directions have DIFFERENT bases, confirm's reuse
+    /// `.find` must pick the BASE-COMPATIBLE one, not whichever the DB returns first. Before the
+    /// fix the find matched by name+repo+!consumed ONLY, so a base-INCOMPATIBLE direction found
+    /// first reached `reconcile_reuse`, which errored on the base mismatch — blocking an
+    /// idempotent confirm whose requested base matches a DIFFERENT existing direction. Red-first:
+    /// without base-aware selection, confirm errors instead of reusing the `release` direction.
+    #[tokio::test]
+    async fn confirm_reuses_base_compatible_direction_among_duplicates() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-basecompat-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        // Two real explicit bases so each direction can materialize off its own.
+        sh(&repo_path, &["git", "branch", "develop"]);
+        sh(&repo_path, &["git", "branch", "release"]);
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Seed TWO existing directions, same name+repo, DIFFERENT bases. Insert `develop` FIRST
+        // so the name+repo-only `.find` would match it before `release`. Materialize both so they
+        // are live lanes with worktrees (the reuse path re-materializes whichever is chosen).
+        let dir_dev = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "develop").await.unwrap();
+        materialize::materialize_direction(&db, dir_dev.id).await.unwrap();
+        let dir_rel = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "release").await.unwrap();
+        materialize::materialize_direction(&db, dir_rel.id).await.unwrap();
+
+        // Re-propose the SAME name+repo lane with base `release`, then Create. confirm must reuse
+        // the `release` direction (dir_rel), NOT error on the develop-first base mismatch.
+        let lane = ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"release".into(), decision:"".into() };
+        let prop = Proposal { rationale:"r".into(), directions: vec![lane] };
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![dir_rel.id], "confirm reuses the base-COMPATIBLE (release) direction, not the develop one, and not a new lane");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     /// approve_direction must NOT reuse a completed (status="done", terminal) direction. After a
     /// lane reaches "done" and the lead re-proposes it (decision reset to ""), approving it again
     /// must create a FRESH direction (fresh worker), leaving the done one as history. Mirrors
@@ -2528,6 +2723,47 @@ mod tests {
         );
 
         // Cleanup.
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R50-2: every save_proposal (re-propose) must bump the proposal VERSION exposed on
+    /// ResolvedProposal, so the frontend can reset a dirty (unblurred) base edit on ANY
+    /// re-proposal — even one that keeps the same name/repo AND base. The version is the plan's
+    /// `created_at` (repurposed as "last proposed at"); it must STRICTLY change between two
+    /// back-to-back saves (a coarse second-granular timestamp would not — hence a monotonic
+    /// version). Red-first: before bumping, the version is identical across re-proposals.
+    #[tokio::test]
+    async fn save_proposal_bumps_proposal_version() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-version-bump-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+        ]};
+
+        // First save → capture the exposed version.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let v1 = get_resolved(&db, t.id).await.unwrap().unwrap().created_at;
+        assert!(!v1.is_empty(), "version must be exposed on ResolvedProposal");
+
+        // Re-propose the SAME proposal (same name/repo/base) → version must STRICTLY change.
+        save_proposal(&db, t.id, &prop).await.unwrap();
+        let v2 = get_resolved(&db, t.id).await.unwrap().unwrap().created_at;
+        assert_ne!(v1, v2, "every re-proposal must bump the proposal version, even with identical content");
+
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");

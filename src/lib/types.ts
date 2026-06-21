@@ -435,6 +435,11 @@ export interface ResolvedProposal {
   thread_id: number;
   rationale: string;
   status: string; // proposed | confirmed
+  /**
+   * Proposal version ("last proposed at"): bumped on every re-proposal (R50-2). Used to reset a
+   * dirty base-branch edit on ANY re-proposal, even one with the same name/repo/base.
+   */
+  created_at: string;
   directions: ResolvedDirection[];
 }
 

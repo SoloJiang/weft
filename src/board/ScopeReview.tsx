@@ -158,7 +158,10 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
 
 function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: number; confirming: boolean }) {
   const { t } = useTranslation();
-  const { defaultTool, setProposalDirectionBase } = useStore();
+  const { defaultTool, setProposalDirectionBase, proposal } = useStore();
+  // Per-proposal version: changes on EVERY re-proposal (R50-2). Threaded into BaseBranchField so a
+  // re-propose with the same name/repo/base still resets a dirty (unblurred) base edit.
+  const proposalVersion = proposal?.created_at ?? "";
   const write = lane.role === "write";
   return (
     <motion.div
@@ -235,6 +238,7 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
             name={lane.direction.name}
             repo={lane.repoName}
             value={lane.direction.base_branch}
+            version={proposalVersion}
             disabled={confirming || !!lane.direction.decision}
             onSave={setProposalDirectionBase}
           />
@@ -273,6 +277,7 @@ function BaseBranchField({
   name,
   repo,
   value,
+  version,
   disabled,
   onSave,
 }: {
@@ -280,6 +285,9 @@ function BaseBranchField({
   name: string;
   repo: string;
   value: string;
+  /** Per-proposal version (R50-2): changes on EVERY re-proposal, so a re-propose with the SAME
+   * name/repo/value still discards an unblurred (dirty) edit. */
+  version: string;
   disabled: boolean;
   onSave: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
 }) {
@@ -293,17 +301,25 @@ function BaseBranchField({
   const valueRef = useRef(value);
   valueRef.current = value;
   const lastIdentity = useRef(`${name}\0${repo}`);
+  const lastVersion = useRef(version);
   useEffect(() => {
     const identity = `${name}\0${repo}`;
-    // Reset the input when the persisted value changes OR when the lane IDENTITY
-    // (name/repo) changes — a re-propose can swap the lane in this slot without
-    // changing `value`, and stale dirty input must not blur-save onto the new lane.
-    if (identity !== lastIdentity.current || (value ?? "") !== lastLoaded.current) {
+    // Reset the input when the persisted value changes, OR the lane IDENTITY (name/repo)
+    // changes, OR the proposal VERSION changes. A re-propose can swap the lane in this slot
+    // without changing `value`; and a re-propose of the SAME lane with the SAME base changes
+    // neither identity nor value — only the version — so include it (R50-2) to discard a dirty
+    // edit that would otherwise blur-save the stale value onto the fresh proposal.
+    if (
+      identity !== lastIdentity.current ||
+      version !== lastVersion.current ||
+      (value ?? "") !== lastLoaded.current
+    ) {
       lastIdentity.current = identity;
+      lastVersion.current = version;
       lastLoaded.current = value ?? "";
       setVal(value ?? "");
     }
-  }, [name, repo, value]);
+  }, [name, repo, value, version]);
   const skipNextBlur = useRef(false);
   const save = () => {
     if (disabled) return;
