@@ -1,28 +1,10 @@
-//! Sidecar: retained `NormEvent` type and OpenCode session-usage helpers.
+//! Sidecar: OpenCode session-usage helpers.
 //! The transcript-reading path (`read_transcript` / `read_claude` / `read_codex` /
 //! `read_opencode`) was removed with the dead `Transcript` UI surface.
 
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-/// A normalized, tool-agnostic transcript event for the chat view.
-#[derive(serde::Serialize, Clone, Debug, PartialEq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum NormEvent {
-    /// A conversation turn (human or agent prose).
-    Message {
-        role: String,
-        text: String,
-        ts: String,
-    },
-    /// An agent tool call, summarized to one line.
-    Tool {
-        name: String,
-        summary: String,
-        ts: String,
-    },
-}
 
 // ---- OpenCode (read-only from its SQLite db, by session.directory) ----
 
@@ -143,16 +125,5 @@ mod tests {
         assert!(!is_opencode_db("opencode.db-shm"));
         assert!(!is_opencode_db("other.db"));
         assert!(!is_opencode_db("opencode.sqlite"));
-    }
-
-    #[test]
-    fn norm_event_serializes() {
-        let ev = NormEvent::Message {
-            role: "user".into(),
-            text: "hello".into(),
-            ts: "t0".into(),
-        };
-        let json = serde_json::to_value(&ev).unwrap();
-        assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("message"));
     }
 }
