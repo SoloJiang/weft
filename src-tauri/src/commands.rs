@@ -82,7 +82,12 @@ async fn register_repo(
     // registration time, which would hang Add Repo on a slow/VPN/SSH remote for a
     // best-effort base hint. Materialization does the authoritative live-default
     // resolution (and fetch) later, where a brief network call is acceptable.
-    let base = crate::git::default_base_branch(p, &crate::git::current_branch(p).unwrap_or_default());
+    // `vetted` is true ONLY when `base` came from origin/HEAD or a real main/master
+    // branch — NOT the current-branch / "main"-last-resort fallback (R47-2).
+    let (base, base_is_vetted_default) = crate::git::default_base_branch_vetted(
+        p,
+        &crate::git::current_branch(p).unwrap_or_default(),
+    );
     // Captured for workspace-level dedup; empty for a local repo with no origin.
     // Credentials embedded in an HTTPS remote are redacted so a PAT/password from
     // .git/config never lands in Weft's DB/backups.
@@ -108,12 +113,23 @@ async fn register_repo(
             }
         }
     }
-    // `base` is the repo's real default (default_base_branch: origin/HEAD →
-    // main/master → current branch), so mark it as the captured default — the
-    // offline fallback may trust it over the main/master chain.
-    let mut r = repo::add_repo_ref(db, workspace_id, name, &canonical, &base, &remote, true)
-        .await
-        .map_err(e)?;
+    // Mark `base` as the captured default ONLY when it is a genuinely-vetted default
+    // (origin/HEAD or a real main/master branch — `base_is_vetted_default`). For a
+    // single-branch / nonstandard checkout with NO origin/HEAD and NO main/master, the
+    // base is whatever happened to be checked out / the "main" last-resort, which is NOT
+    // vetted; marking it is_default=true would make the offline fallback
+    // (`recorded_base_or_default`) trust it over the main/master chain (R47-2).
+    let mut r = repo::add_repo_ref(
+        db,
+        workspace_id,
+        name,
+        &canonical,
+        &base,
+        &remote,
+        base_is_vetted_default,
+    )
+    .await
+    .map_err(e)?;
     // If dedup resolved to an EXISTING row (by remote) at a different path whose
     // checkout is gone, repoint it to the path the user just gave us — a local add
     // OR a clone — so we don't keep pointing at a dead checkout and report success.
@@ -1824,4 +1840,83 @@ pub async fn db_change_password(
     Ok(DbEncryptionMutationResult {
         restart_required: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sh(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(dir)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "command failed: {args:?}");
+    }
+
+    /// Init a repo with a real integration branch (main/master) present.
+    fn init_main_repo(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        sh(&p, &["git", "init", "-q"]);
+        sh(&p, &["git", "config", "user.email", "t@t.t"]);
+        sh(&p, &["git", "config", "user.name", "t"]);
+        std::fs::write(p.join("README.md"), "# x\n").unwrap();
+        sh(&p, &["git", "add", "-A"]);
+        sh(&p, &["git", "commit", "-q", "-m", "init"]);
+        p
+    }
+
+    /// R47-2: `register_repo` must capture `base_ref_is_default` HONESTLY.
+    /// - A standard repo (real main/master, the vetted default) → is_default=true (unchanged).
+    /// - A nonstandard single-branch repo (only `trunk`, no main/master, no origin/HEAD) →
+    ///   the base is the current-branch / "main"-last-resort fallback, NOT a vetted default →
+    ///   is_default=false, so the offline fallback won't trust it over the main/master chain.
+    #[tokio::test]
+    async fn register_repo_marks_only_vetted_default_as_default() {
+        let tag = format!("weft-regrepo-{}", std::process::id());
+        let root = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+
+        // (a) Standard repo with a real main/master integration branch → vetted default.
+        let std_repo = init_main_repo(&root, "api");
+        let def = crate::git::current_branch(&std_repo).unwrap();
+        assert!(def == "main" || def == "master", "precondition: init produced main/master");
+        let r_std = register_repo(&db, ws.id, "api", std_repo.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            r_std.base_ref_is_default,
+            "R47-2: a real main/master default must be captured as is_default=true (unchanged)"
+        );
+        assert_eq!(r_std.base_ref, def, "captured base is the vetted default branch");
+
+        // (b) Nonstandard repo: rename the only branch to `trunk` (no main/master, no remote).
+        let nonstd = init_main_repo(&root, "weird");
+        sh(&nonstd, &["git", "branch", "-m", "trunk"]);
+        assert!(
+            crate::git::ref_resolves(&nonstd, "refs/heads/trunk"),
+            "precondition: trunk exists"
+        );
+        assert!(
+            !crate::git::ref_resolves(&nonstd, "refs/heads/main")
+                && !crate::git::ref_resolves(&nonstd, "refs/heads/master"),
+            "precondition: no main/master branch"
+        );
+        let r_nonstd = register_repo(&db, ws.id, "weird", nonstd.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !r_nonstd.base_ref_is_default,
+            "R47-2: a nonstandard fallback base (trunk; no main/master/origin-HEAD) must NOT be \
+             captured as a vetted default"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

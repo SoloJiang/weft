@@ -129,7 +129,12 @@ fn reconcile_reuse(
                 crate::git::recorded_base_or_default(repo_path, base_ref, base_ref_is_default)
             })
         } else {
-            b.strip_prefix("origin/").unwrap_or(b).to_string()
+            // A stored explicit base can be QUALIFIED (refs/heads/<n> | refs/remotes/origin/<n>)
+            // now that materialization carries fully-qualified bases — so normalize with the SAME
+            // canonical normalizer the materialization path uses (strips refs/remotes/origin/,
+            // refs/heads/, and origin/). A plain `origin/` strip would leave a qualified ref intact
+            // and wrongly reject a bare-equivalent re-proposal as a base change (R47-4).
+            crate::git::normalize_target(b)
         }
     };
     // Empty recorded base spans two cases that share the legacy blank-reuse shortcut but a
@@ -204,10 +209,24 @@ fn thread_gate(thread_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 }
 
 /// Store (replace) the proposal for a thread, status = "proposed".
+///
+/// TRUST BOUNDARY (R47-3): both callers (commands.rs and bus/server.rs) feed a
+/// LEAD-supplied payload. `ProposedDirection.decision` is `#[serde(default)]`, so a
+/// malformed/hostile `propose_directions` call can inject `decision="approved"`/`"denied"`
+/// — which would drop the lane from `pending_writes` (bypassing a required human approval)
+/// and make `confirm` skip it (dropping a write with NO human action). The lead must NEVER
+/// set decisions; only `approve_direction`/`deny_direction` do (via `persist_decision` /
+/// `update_plan_proposal_cas`, NOT this function). So scrub every decision to "" (pending)
+/// before storing. This is safe: approve/deny never route through save_proposal, so no
+/// server-set decision is lost.
 pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Result<()> {
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
-    let json = serde_json::to_string(proposal)?;
+    let mut p = proposal.clone();
+    for d in &mut p.directions {
+        d.decision = String::new();
+    }
+    let json = serde_json::to_string(&p)?;
     repo::upsert_plan(db, thread_id, &json, "proposed", &now()).await?;
     Ok(())
 }
@@ -2162,23 +2181,17 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
-        // Lane A is approved via approve_direction (decision="approved").
-        // Lane B is pending (decision="") → confirm will create+dispatch it.
-        let prop_a_only = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-        ]};
-        save_proposal(&db, t.id, &prop_a_only).await.unwrap();
-        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
-
-        // Now re-propose with BOTH A (already approved) and B (pending).
-        // After approve_direction set A's decision to "approved", we need a new proposal
-        // that has A with decision="" (re-propose resets) + B with decision="".
+        // Re-propose with BOTH lanes pending (the lead can ONLY emit pending lanes —
+        // save_proposal scrubs any injected decision, R47-3). The human then approves A
+        // individually via approve_direction; B stays pending for confirm to create.
         let prop_ab = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "approved".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
             ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
         ]};
-        // Save this combined proposal (A=approved, B=pending) and confirm → creates B only.
         save_proposal(&db, t.id, &prop_ab).await.unwrap();
+        // Lane A is approved via approve_direction (the legitimate decision path) → decision="approved".
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // confirm → creates B only (A is "approved" → skipped by main path).
         let confirm_ids = confirm(&db, t.id).await.unwrap();
         // confirm should dispatch only B (A is "approved" → skipped by main path).
         assert_eq!(confirm_ids.len(), 1, "confirm creates only lane B (A is already approved)");
@@ -2218,22 +2231,18 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
-        // Approve a single `A` lane via approve_direction → creates the APPROVED lane's
-        // direction (a_id).
-        let prop_a = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-        ]};
-        save_proposal(&db, t.id, &prop_a).await.unwrap();
-        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
-
-        // Re-propose with TWO same-name+repo `A` lanes: one already approved, one pending.
-        // confirm pre-claims the approved lane's a_id (R41-3), so the pending lane creates
-        // its OWN distinct direction (b_id).
+        // Propose TWO same-name+repo `A` lanes, BOTH pending (the lead can only emit
+        // pending lanes — save_proposal scrubs any injected decision, R47-3).
         let prop_dup = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "approved".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
             ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
         ]};
         save_proposal(&db, t.id, &prop_dup).await.unwrap();
+        // Approve the FIRST `A` lane individually via approve_direction (the legitimate
+        // decision path) → creates the APPROVED lane's direction (a_id). The second `A`
+        // stays pending. confirm pre-claims the approved lane's a_id (R41-3), so the
+        // pending lane creates its OWN distinct direction (b_id).
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         let confirm_ids = confirm(&db, t.id).await.unwrap();
         assert_eq!(confirm_ids.len(), 1, "confirm creates only the pending duplicate lane");
         let b_id = confirm_ids[0];
@@ -2301,6 +2310,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// R47-3 (SECURITY): `save_proposal` is the trust boundary for the lead's payload.
+    /// `ProposedDirection.decision` has `#[serde(default)]`, so a malformed/hostile
+    /// `propose_directions` call can inject `decision="approved"`/`"denied"`. Those lanes
+    /// would then vanish from `pending_writes` (a required human approval silently bypassed)
+    /// and `confirm` would skip them (a write dropped with NO human action). The lead must
+    /// NEVER set decisions — only approve/deny do. So `save_proposal` must scrub every
+    /// direction's decision to "" before storing.
+    #[tokio::test]
+    async fn save_proposal_scrubs_injected_decisions() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-scrub-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_a = make_repo(&root, "api");
+        let repo_b = make_repo(&root, "web");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(&db, ws.id, "api", repo_a.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        repo::add_repo_ref(&db, ws.id, "web", repo_b.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+
+        // Hostile proposal: BOTH directions carry an injected decision the lead must
+        // never be able to set.
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![
+                ProposedDirection {
+                    name: "Payments".into(),
+                    repo: "api".into(),
+                    reason: "add discount endpoint".into(),
+                    mandate: "impl-only".into(),
+                    base_branch: "".into(),
+                    decision: "approved".into(),
+                },
+                ProposedDirection {
+                    name: "Web".into(),
+                    repo: "web".into(),
+                    reason: "wire it up".into(),
+                    mandate: "".into(),
+                    base_branch: "".into(),
+                    decision: "denied".into(),
+                },
+            ],
+        };
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+
+        // The stored/resolved proposal must show NO decisions — all scrubbed to pending.
+        let resolved = get_resolved(&db, t.id).await.unwrap().unwrap();
+        for d in &resolved.directions {
+            assert_eq!(
+                d.decision, "",
+                "R47-3: lead-injected decision must be scrubbed to pending, got {:?} on {:?}",
+                d.decision, d.name
+            );
+        }
+        // And both lanes must surface as pending writes (the human approval was NOT bypassed).
+        let pending = pending_writes(&db, t.id).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "R47-3: both lanes must be pending (injected approved/denied must not drop them)"
+        );
+
+        // Cleanup.
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     /// R18-4: reconcile_reuse treats a recorded base of "HEAD" as equivalent to an
     /// empty/default proposed base — a blank re-proposal must reuse a HEAD-based
     /// direction without a conflict error.
@@ -2337,6 +2427,54 @@ mod tests {
         // (we only relax the blank-proposal case).
         let conflict = reconcile_reuse(&existing, "develop", repo_path, "main", true);
         assert!(conflict.is_err(), "R18-4: explicit base against HEAD-based direction must conflict");
+    }
+
+    /// R47-4: a stored explicit base can now be QUALIFIED (`refs/heads/develop` or
+    /// `refs/remotes/origin/develop`). `reconcile_reuse`'s `effective` closure must
+    /// normalize with the SAME canonical normalizer the materialization path uses
+    /// (`git::normalize_target`, which strips refs/remotes/origin/, refs/heads/, and
+    /// origin/) so a later bare-equivalent re-proposal (`develop`) is NOT wrongly
+    /// rejected as a base change — that would block idempotent approve/confirm. A
+    /// genuinely different base (`release`) must still bail.
+    #[test]
+    fn reconcile_reuse_matches_qualified_base_against_bare_reproposal() {
+        use crate::store::entities::direction;
+        let make = |base: &str| direction::Model {
+            id: 1,
+            thread_id: 1,
+            name: "A".to_string(),
+            slug: "a".to_string(),
+            tool: "codex".to_string(),
+            repo_id: 1,
+            reason: "r".to_string(),
+            status: "queued".to_string(),
+            mandate: "plan+impl".to_string(),
+            base_branch: base.to_string(),
+            target_branch: "".to_string(),
+            branch: "feat/a".to_string(),
+            created_at: "0".to_string(),
+        };
+        // Non-empty bases are normalized purely by string prefix-stripping — no repo
+        // touched — so an inert path is fine.
+        let repo_path = std::path::Path::new("/tmp/weft-nonexistent-reconcile-qualified");
+
+        // refs/heads/develop (locally-qualified) vs bare `develop` re-proposal → reuse Ok.
+        let local_qualified = make("refs/heads/develop");
+        assert!(
+            reconcile_reuse(&local_qualified, "develop", repo_path, "main", true).is_ok(),
+            "R47-4: refs/heads/develop must match a bare `develop` re-proposal (no spurious base-change)"
+        );
+        // refs/remotes/origin/develop (remote-qualified) vs bare `develop` → reuse Ok.
+        let remote_qualified = make("refs/remotes/origin/develop");
+        assert!(
+            reconcile_reuse(&remote_qualified, "develop", repo_path, "main", true).is_ok(),
+            "R47-4: refs/remotes/origin/develop must match a bare `develop` re-proposal"
+        );
+        // A genuinely different base still bails.
+        assert!(
+            reconcile_reuse(&local_qualified, "release", repo_path, "main", true).is_err(),
+            "R47-4: a genuinely different base (release vs develop) must still conflict"
+        );
     }
 
     /// R37-3: a DETACHED-HEAD lane records `base_branch==""` + `target_branch=<40-hex sha>`

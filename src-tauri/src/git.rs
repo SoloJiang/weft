@@ -91,7 +91,7 @@ pub fn is_full_commit_oid(repo: &Path, t: &str) -> bool {
 /// pasting `origin/main` behaves like `main` for BOTH the fetch refspec
 /// (`git fetch origin main`, not the failing `git fetch origin origin/main`)
 /// and ref resolution.
-fn normalize_target(target: &str) -> String {
+pub fn normalize_target(target: &str) -> String {
     let t = target.trim();
     // Strip a refs/remotes/origin/ prefix first: the remote base is now carried FULLY
     // QUALIFIED (refs/remotes/origin/<name>) so worktree-add + ancestry resolve the
@@ -270,18 +270,33 @@ fn remote_default_branch(repo: &Path) -> Option<String> {
 /// `base_ref` if it resolves (non-standard repos, e.g. a "trunk"/"develop" default with
 /// no origin/HEAD and no main/master); (4) "main". Returns a bare branch name.
 pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
+    default_base_branch_vetted(repo, base_ref).0
+}
+
+/// Like `default_base_branch`, but also reports whether the chosen base is a genuinely
+/// VETTED default — i.e. it came from the remote default (origin/HEAD, tier 1) or a real
+/// `main`/`master` branch (tier 2). The recorded-base-resolves fallback (tier 3, e.g. a
+/// nonstandard "trunk"/"develop" checkout) and the "main" last-resort (tier 4) are NOT
+/// vetted: they're whatever happened to be checked out / a coincidental last resort.
+///
+/// `register_repo` (R47-2) uses this to set `base_ref_is_default` HONESTLY: marking a
+/// non-vetted fallback as the captured default would make the offline fallback
+/// (`recorded_base_or_default`) trust it over the main/master chain. Returns
+/// `(bare branch name, vetted)`; the name is IDENTICAL to `default_base_branch` so
+/// behavior is unchanged — only the boolean is new.
+pub fn default_base_branch_vetted(repo: &Path, base_ref: &str) -> (String, bool) {
     if let Some(name) = remote_default_branch(repo) {
         // Validate the cached origin/HEAD against its REMOTE-tracking ref only: a local
         // branch that happens to share the name must not vouch for a stale origin/HEAD
         // whose upstream branch is gone. Qualify as `refs/remotes/origin/<name>` so a local
         // branch literally named `origin/<name>` can't masquerade as the remote ref.
         if ref_resolves(repo, &remote_branch_ref(&name)) {
-            return name;
+            return (name, true);
         }
     }
     for c in ["main", "master"] {
         if ref_resolves(repo, &local_branch_ref(c)) || ref_resolves(repo, &remote_branch_ref(c)) {
-            return c.to_string();
+            return (c.to_string(), true);
         }
     }
     let b = base_ref.trim();
@@ -290,9 +305,12 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
         && b != "HEAD"
         && (ref_resolves(repo, &local_branch_ref(b)) || ref_resolves(repo, &remote_branch_ref(b)))
     {
-        return b.to_string();
+        // Tier 3: the recorded base resolves but it's a fallback (no origin/HEAD, no
+        // main/master) — NOT a vetted default.
+        return (b.to_string(), false);
     }
-    "main".to_string()
+    // Tier 4: "main" last resort — also not vetted.
+    ("main".to_string(), false)
 }
 
 /// The default base for the OFFLINE fallback (when `live_default_branch` is
@@ -1659,6 +1677,48 @@ mod tests {
         assert_eq!(got, def, "must prefer the integration branch over a recorded feature branch");
         assert_ne!(got, "feature-x");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn default_base_branch_vetted_flags_only_genuine_defaults() {
+        // R47-2: register_repo must mark a captured base as `is_default=true` ONLY when it
+        // is a genuinely-vetted default — i.e. it came from origin/HEAD or a real
+        // main/master branch — and `false` when it's the current-branch / "main"-last-resort
+        // fallback. `default_base_branch_vetted` returns the SAME name as `default_base_branch`
+        // (so behavior is unchanged) PLUS that boolean.
+
+        // (a) A repo with a real `main` (or `master`) integration branch → vetted=true,
+        // and the name matches default_base_branch (unchanged behavior).
+        let main_repo = tmp("dbbv-main");
+        init_repo(&main_repo).unwrap();
+        let def = current_branch(&main_repo).unwrap(); // main or master
+        assert!(def == "main" || def == "master", "precondition: init produced main/master");
+        let (name, vetted) = default_base_branch_vetted(&main_repo, &def);
+        assert_eq!(name, default_base_branch(&main_repo, &def), "name unchanged vs default_base_branch");
+        assert_eq!(name, def);
+        assert!(vetted, "a real main/master branch is a vetted default");
+        let _ = std::fs::remove_dir_all(&main_repo);
+
+        // (b) A nonstandard single-branch repo: only a `trunk` branch, no main/master, no
+        // origin/HEAD. default_base_branch falls all the way to the "main" last-resort — that
+        // is NOT a vetted default. So vetted=false (so register_repo records is_default=false),
+        // even though the returned name is still "main".
+        let trunk_repo = tmp("dbbv-trunk");
+        init_repo(&trunk_repo).unwrap();
+        git(&trunk_repo, &["branch", "-m", "trunk"]).unwrap();
+        assert!(ref_resolves(&trunk_repo, "refs/heads/trunk"), "precondition: trunk exists");
+        assert!(!ref_resolves(&trunk_repo, "refs/heads/main"), "precondition: no main branch");
+        assert!(!ref_resolves(&trunk_repo, "refs/heads/master"), "precondition: no master branch");
+        // base_ref captured at add = the current branch (trunk). default_base_branch returns
+        // "trunk" via tier (3) recorded-base-resolves — that's a fallback, not a vetted default.
+        let (name, vetted) = default_base_branch_vetted(&trunk_repo, "trunk");
+        assert_eq!(name, default_base_branch(&trunk_repo, "trunk"), "name unchanged vs default_base_branch");
+        assert!(!vetted, "a nonstandard fallback base (trunk, no main/master/origin-HEAD) is NOT a vetted default");
+        // And with an empty base_ref the name is the bare "main" last-resort, still not vetted.
+        let (last_resort, vetted2) = default_base_branch_vetted(&trunk_repo, "");
+        assert_eq!(last_resort, default_base_branch(&trunk_repo, ""));
+        assert!(!vetted2, "the bare main last-resort is NOT a vetted default");
+        let _ = std::fs::remove_dir_all(&trunk_repo);
     }
 
     #[test]
