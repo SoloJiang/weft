@@ -1723,7 +1723,7 @@ mod tests {
                 Cmd::new("git").args(["rev-parse", rev]).current_dir(&clone).output().unwrap().stdout,
             ).unwrap().trim().to_string()
         };
-        let a_sha = sha("origin/main");
+        let a_sha = sha(&format!("origin/{main}"));
 
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
@@ -1741,7 +1741,7 @@ mod tests {
         // origin/main ADVANCES to B; fetch so the clone's origin/main moves past A.
         og(&["commit", "-q", "--allow-empty", "-m", "B"]);
         g(&["fetch", "-q", "origin"]);
-        let b_sha = sha("origin/main");
+        let b_sha = sha(&format!("origin/{main}"));
         assert_ne!(a_sha, b_sha, "origin/main advanced");
         assert!(!crate::git::is_ancestor(&clone, &b_sha, &crate::git::local_branch_ref(&work_branch)),
             "precondition: work branch (at A) does NOT descend from the advanced tip B");
