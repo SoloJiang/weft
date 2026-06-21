@@ -44,6 +44,33 @@ pub fn ref_resolves(dir: &Path, r: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Fully-qualified ref for a LOCAL branch — `refs/heads/<name>`. Use everywhere a branch
+/// name is checked/used so a same-named TAG (which bare `<name>` would match first) can't
+/// shadow it. This is the canonical spelling for the whole module; route inline
+/// `format!("refs/heads/{…}")` ref sites through it for one source of truth.
+fn local_branch_ref(name: &str) -> String {
+    format!("refs/heads/{name}")
+}
+
+/// Fully-qualified ref for the remote-tracking branch — `refs/remotes/origin/<name>`. Use
+/// instead of the short `origin/<name>`, which a local branch literally named `origin/<name>`
+/// (`refs/heads/origin/<name>`) would shadow. Canonical spelling for the whole module.
+fn remote_branch_ref(name: &str) -> String {
+    format!("refs/remotes/origin/{name}")
+}
+
+/// Collapse a fully-qualified branch ref back to the SHORT form shown to the user:
+/// `refs/remotes/origin/<name>` → `origin/<name>` (keeps the remote-vs-local distinction the
+/// UI surfaces), `refs/heads/<name>` → `<name>`. Resolution uses fully-qualified refs to dodge
+/// tag / local-`origin/*` shadowing, but the displayed "comparing against" label stays clean.
+/// A non-branch ref (a tag name, raw SHA, or the default-chain name) is returned unchanged.
+fn display_ref(r: &str) -> String {
+    if let Some(name) = r.strip_prefix("refs/remotes/origin/") {
+        return format!("origin/{name}");
+    }
+    r.strip_prefix("refs/heads/").unwrap_or(r).to_string()
+}
+
 /// True when `t` is a FULL commit object id (any hash format — SHA-1 40-hex or SHA-256
 /// 64-hex), as opposed to a branch name or an abbreviation. Uses git object identity, not a
 /// hard-coded length: an all-hex string that `rev-parse --verify` resolves to a commit whose
@@ -81,8 +108,28 @@ fn normalize_target(target: &str) -> String {
 /// Resolve a usable base commit-ish for a NEW worktree branch: prefer the repo's
 /// recorded base_ref; if it no longer resolves, fall back through origin/HEAD →
 /// main → master → HEAD so worktree creation never silently branches off whatever
-/// happens to be checked out in the canonical repo.
+/// happens to be checked out in the canonical repo. Every returned BRANCH is
+/// FULLY-QUALIFIED (refs/heads/<name> | refs/remotes/origin/<name>) so it's an
+/// unambiguous `worktree add` start-point; `normalize_target` collapses it back to the
+/// bare name for the recorded `branched_from` / `base_branch` (see materialize.rs).
 fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
+    // The recorded base_ref may be bare (`develop`), short-remote (`origin/develop`), or
+    // already qualified. Resolve it BRANCH-FIRST in both namespaces so a same-named TAG
+    // (R46-1, bare `<name>` matches the tag) or a local branch literally named
+    // `origin/<name>` (R46-2) can't shadow the real branch. Return the qualified ref.
+    let n = normalize_target(recorded);
+    if !n.is_empty() && n != "HEAD" {
+        if ref_resolves(repo, &local_branch_ref(&n)) {
+            return local_branch_ref(&n);
+        }
+        if ref_resolves(repo, &remote_branch_ref(&n)) {
+            return remote_branch_ref(&n);
+        }
+    }
+    // Not a branch in either namespace: a recorded TAG or raw SHA (e.g. a detached-HEAD
+    // base captured as a commit) may still legitimately resolve as a commit-ish. Accept the
+    // recorded value verbatim then (a bare commit-ish is a fine start-point and normalizes
+    // to itself), mirroring resolve_target_ref's tag/sha fallback.
     if ref_resolves(repo, recorded) {
         return recorded.to_string();
     }
@@ -92,9 +139,14 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
         .output()
     {
         if out.status.success() {
+            // `--short` yields `origin/<name>`; qualify to refs/remotes/origin/<name> so a
+            // local branch literally named `origin/<name>` can't shadow the remote default,
+            // and return that qualified ref (an unambiguous start-point).
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if ref_resolves(repo, &s) {
-                return s;
+            let name = s.strip_prefix("origin/").unwrap_or(&s);
+            let remote = remote_branch_ref(name);
+            if ref_resolves(repo, &remote) {
+                return remote;
             }
         }
     }
@@ -102,12 +154,13 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
     // same-named TAG (e.g. a `main` tag in a repo whose real default is `master`) can't
     // masquerade as the branch; qualify the REMOTE check as `refs/remotes/origin/<c>` so a
     // local branch literally named `origin/<c>` (refs/heads/origin/<c>) can't shadow the
-    // remote-tracking ref and wrongly pin main/master.
+    // remote-tracking ref and wrongly pin main/master. Return the qualified ref that hit.
     for c in ["main", "master"] {
-        if ref_resolves(repo, &format!("refs/heads/{c}"))
-            || ref_resolves(repo, &format!("refs/remotes/origin/{c}"))
-        {
-            return c.to_string();
+        if ref_resolves(repo, &local_branch_ref(c)) {
+            return local_branch_ref(c);
+        }
+        if ref_resolves(repo, &remote_branch_ref(c)) {
+            return remote_branch_ref(c);
         }
     }
     "HEAD".to_string()
@@ -118,20 +171,24 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
 /// else detected via origin/HEAD → main → master. Used as the placeholder /
 /// fallback when a direction has no explicit target_branch.
 pub fn default_target_branch(worktree: &Path, base_ref: &str) -> String {
-    let strip = |s: &str| s.strip_prefix("origin/").unwrap_or(s).to_string();
+    // normalize_target collapses ANY ref spelling to the bare branch name — the short
+    // `origin/<name>` the UI shows AND the fully-qualified `refs/heads/<name>` /
+    // `refs/remotes/origin/<name>` that resolve_base_ref now returns. (A plain `origin/`
+    // strip alone would leave a qualified ref intact and surface `refs/heads/main` as the
+    // "target branch".)
     let b = base_ref.trim();
     // A repo registered while detached records base_ref = "HEAD" — that's not a
     // real branch, so treat it like "unset" and detect, rather than letting the
     // default target become "HEAD" (which would resolve to the worker's own HEAD
     // and hide all committed task changes).
     if !b.is_empty() && b != "HEAD" {
-        return strip(b);
+        return normalize_target(b);
     }
     let detected = resolve_base_ref(worktree, "");
     if detected == "HEAD" {
         "main".to_string()
     } else {
-        strip(&detected)
+        normalize_target(&detected)
     }
 }
 
@@ -148,27 +205,38 @@ fn resolve_target_ref(worktree: &Path, target: &str) -> String {
     // "HEAD" is not a real target branch (see default_target_branch); falling
     // through to the default chain avoids merge-base(HEAD, HEAD) hiding commits.
     if !t.is_empty() && t != "HEAD" {
-        let remote = format!("origin/{t}");
+        // FULLY-QUALIFIED on both sides: refs/remotes/origin/<t> (R46-2 — a local branch
+        // literally named `origin/<t>` would shadow the short `origin/<t>`) and refs/heads/<t>
+        // (R46-1 — a bare `<t>` resolves a same-named TAG before the branch). So a BRANCH named
+        // <t> in either namespace can never be shadowed by a tag or a decoy local branch.
+        let remote = remote_branch_ref(&t);
+        let local = local_branch_ref(&t);
         let remote_ok = ref_resolves(worktree, &remote);
-        let local_ok = ref_resolves(worktree, &t);
+        let local_ok = ref_resolves(worktree, &local);
         if remote_ok && local_ok {
-            // Compare each ref's fork point with the worktree: the ref the worktree
-            // descends from has the more recent merge-base; prefer it.
+            // merge-base recency: prefer the ref the worktree ACTUALLY forked from. The ref it
+            // descends from has the more recent merge-base; the diverged ref's is an older
+            // common ancestor.
             let mb_remote = git(worktree, &["merge-base", "HEAD", &remote]).ok();
-            let mb_local = git(worktree, &["merge-base", "HEAD", &t]).ok();
+            let mb_local = git(worktree, &["merge-base", "HEAD", &local]).ok();
             if let (Some(mr), Some(ml)) = (mb_remote, mb_local) {
                 // Forked from origin when local's merge-base is an ancestor of origin's
                 // (origin's fork point is at least as recent); covers the no-divergence
                 // tie too.
                 let forked_from_origin =
                     git(worktree, &["merge-base", "--is-ancestor", &ml, &mr]).is_ok();
-                return if forked_from_origin { remote } else { t };
+                return if forked_from_origin { remote } else { local };
             }
         }
         if remote_ok {
             return remote;
         }
         if local_ok {
+            return local;
+        }
+        // No BRANCH by that name in either namespace — fall back to the bare commit-ish so a
+        // user can still diff vs a legitimately-named TAG or a raw SHA they set as the target.
+        if ref_resolves(worktree, &t) {
             return t;
         }
     }
@@ -207,14 +275,12 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
         // branch that happens to share the name must not vouch for a stale origin/HEAD
         // whose upstream branch is gone. Qualify as `refs/remotes/origin/<name>` so a local
         // branch literally named `origin/<name>` can't masquerade as the remote ref.
-        if ref_resolves(repo, &format!("refs/remotes/origin/{name}")) {
+        if ref_resolves(repo, &remote_branch_ref(&name)) {
             return name;
         }
     }
     for c in ["main", "master"] {
-        if ref_resolves(repo, &format!("refs/heads/{c}"))
-            || ref_resolves(repo, &format!("refs/remotes/origin/{c}"))
-        {
+        if ref_resolves(repo, &local_branch_ref(c)) || ref_resolves(repo, &remote_branch_ref(c)) {
             return c.to_string();
         }
     }
@@ -222,8 +288,7 @@ pub fn default_base_branch(repo: &Path, base_ref: &str) -> String {
     let b = b.strip_prefix("origin/").unwrap_or(b);
     if !b.is_empty()
         && b != "HEAD"
-        && (ref_resolves(repo, &format!("refs/heads/{b}"))
-            || ref_resolves(repo, &format!("refs/remotes/origin/{b}")))
+        && (ref_resolves(repo, &local_branch_ref(b)) || ref_resolves(repo, &remote_branch_ref(b)))
     {
         return b.to_string();
     }
@@ -247,8 +312,7 @@ pub fn recorded_base_or_default(repo: &Path, base_ref: &str, is_default: bool) -
     if is_default
         && !b.is_empty()
         && b != "HEAD"
-        && (ref_resolves(repo, &format!("refs/heads/{b}"))
-            || ref_resolves(repo, &format!("refs/remotes/origin/{b}")))
+        && (ref_resolves(repo, &local_branch_ref(b)) || ref_resolves(repo, &remote_branch_ref(b)))
     {
         return b.to_string();
     }
@@ -298,6 +362,8 @@ pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<Ta
     if fetch {
         fetch_origin_branch(worktree_path, &target);
     }
+    // FULLY-QUALIFIED ref (refs/heads/<t> | refs/remotes/origin/<t> | a commit-ish fallback) so
+    // the merge-base can't be computed against a same-named tag or a decoy local `origin/<t>`.
     let resolved = resolve_target_ref(worktree_path, &target);
     // PR-style base = merge-base(resolved, HEAD). If it fails (unrelated
     // histories / missing ref), fall back to diffing against the resolved ref
@@ -311,7 +377,9 @@ pub fn target_diff(worktree_path: &Path, target: &str, fetch: bool) -> Result<Ta
     Ok(TargetDiff {
         files,
         patch,
-        resolved,
+        // The displayed "comparing against" label stays the clean short form
+        // (`origin/<t>` / `<t>`); only the internal merge-base used the qualified ref.
+        resolved: display_ref(&resolved),
     })
 }
 
@@ -409,14 +477,14 @@ pub fn branch_descends_from(repo: &Path, branch: &str, base: &str) -> bool {
     // Qualify the DESCENDANT (work-branch) side as `refs/heads/<branch>` so a TAG sharing
     // the branch name can't shadow the real branch (bare `<branch>` resolves a same-named
     // tag first), which would let a reset branch be accepted as based on `base`.
-    git(repo, &["merge-base", "--is-ancestor", base, &format!("refs/heads/{branch}")]).is_ok()
+    git(repo, &["merge-base", "--is-ancestor", base, &local_branch_ref(branch)]).is_ok()
 }
 
 /// Branch-qualified existence check: true only when `refs/heads/<branch>` resolves — a bare
 /// `ref_resolves(repo, branch)` would also accept a same-named TAG, so use this where the
 /// question is specifically "does the local BRANCH exist?".
 pub fn local_branch_exists(repo: &Path, branch: &str) -> bool {
-    ref_resolves(repo, &format!("refs/heads/{branch}"))
+    ref_resolves(repo, &local_branch_ref(branch))
 }
 
 /// Does `branch` descend from the explicit base NAME, resolved to the ref the create path
@@ -436,11 +504,11 @@ pub fn branch_descends_from_base(repo: &Path, branch: &str, base: &str) -> Optio
     // that only descends from the stale local ref dispatches it as <t>-based while MISSING origin's
     // commits. Fall back to local refs/heads/<t> only when the remote is absent (single-branch /
     // local-only). None when neither resolves (base gone → caller skips).
-    let remote = format!("refs/remotes/origin/{t}");
+    let remote = remote_branch_ref(&t);
     if ref_resolves(repo, &remote) {
         return Some(branch_descends_from(repo, branch, &remote));
     }
-    let local = format!("refs/heads/{t}");
+    let local = local_branch_ref(&t);
     if ref_resolves(repo, &local) {
         return Some(branch_descends_from(repo, branch, &local));
     }
@@ -467,19 +535,19 @@ pub fn add_worktree_synced(
     // a LOCAL branch literally named `origin/<t>` (refs/heads/origin/<t>) would otherwise shadow
     // the short form and be branched off instead of the freshly-fetched remote tip (R43-2). The
     // qualified ref is unambiguous for the start-point, the ancestry base, and the `synced` check.
-    let remote = format!("refs/remotes/origin/{t}");
+    let remote = remote_branch_ref(&t);
     let nonempty = !t.is_empty() && t != "HEAD";
     let resolved_opt = if nonempty && fetched && ref_resolves(repo, &remote) {
         // A freshly-fetched remote ref — trustworthy.
         Some(remote.clone())
-    } else if nonempty && ref_resolves(repo, &format!("refs/heads/{t}")) {
+    } else if nonempty && ref_resolves(repo, &local_branch_ref(&t)) {
         // A local BRANCH the user already has. Qualified as refs/heads/<t> so a local
         // TAG named `t` is NOT accepted as a base (bare `ref_resolves(t)` is true for a
         // tag too). Store the QUALIFIED ref (not bare `t`): it's the `worktree add -b … <ref>`
         // start-point and the ancestry base, so a repo with BOTH a branch and a tag named `t`
         // resolves unambiguously to the branch instead of failing on an ambiguous short ref.
         // The remote-tracking ref is carried as refs/remotes/origin/<t> for the same reason.
-        Some(format!("refs/heads/{t}"))
+        Some(local_branch_ref(&t))
     } else if nonempty && !require_resolvable && ref_resolves(repo, &remote) {
         // A STALE remote-tracking ref (the fetch failed — offline, or the branch was
         // deleted upstream). Trusted only for the lenient default/empty path; an
@@ -538,8 +606,12 @@ pub fn add_worktree_synced(
         });
     }
     let resolved = resolved_opt.unwrap_or_else(|| resolve_base_ref(repo, &t));
-    // Fresh only if we branched off the remote-tracking ref AND the fetch actually succeeded.
-    let synced = resolved.starts_with("refs/remotes/origin/") && fetched;
+    // Fresh only if we branched off the EXACT freshly-fetched remote-tracking ref for THIS base
+    // (`remote` == refs/remotes/origin/<t>) AND the fetch actually succeeded. Comparing to the
+    // exact ref (not just the refs/remotes/origin/ prefix) keeps `synced` honest now that the
+    // resolve_base_ref default-chain fallback can ALSO return a refs/remotes/origin/<default>
+    // for a DIFFERENT branch than the requested base.
+    let synced = resolved == remote && fetched;
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -1284,7 +1356,12 @@ mod tests {
         let repo = tmp("resolve");
         init_repo(&repo).unwrap();
         let base = current_branch(&repo).unwrap();
-        assert_eq!(resolve_base_ref(&repo, &base), base);
+        // resolve_base_ref now returns a FULLY-QUALIFIED branch ref (unambiguous start-point);
+        // it must round-trip via normalize_target to the bare recorded name and resolve.
+        let resolved = resolve_base_ref(&repo, &base);
+        assert_eq!(resolved, local_branch_ref(&base), "recorded branch → refs/heads/<base>");
+        assert_eq!(normalize_target(&resolved), base, "qualified ref round-trips to bare name");
+        assert!(ref_resolves(&repo, &resolved), "qualified ref must resolve");
         let fb = resolve_base_ref(&repo, "nope-xyz");
         assert!(git(&repo, &["rev-parse", "--verify", &fb]).is_ok());
         let _ = std::fs::remove_dir_all(&repo);
@@ -1653,9 +1730,11 @@ mod tests {
         git(&repo, &["tag", "main"]).unwrap();
         assert!(ref_resolves(&repo, "main"), "precondition: bare `main` resolves (to the tag)");
         // Empty recorded base_ref + no origin/HEAD → falls through to the main/master loop.
+        // The fallback now returns the FULLY-QUALIFIED ref; it must be refs/heads/master
+        // (the real branch), never the `main` tag (which a bare check would have matched).
         assert_eq!(
             resolve_base_ref(&repo, ""),
-            "master",
+            "refs/heads/master",
             "a TAG named main must not shadow the real master in resolve_base_ref"
         );
         let _ = std::fs::remove_dir_all(&repo);
@@ -1800,8 +1879,8 @@ mod tests {
         git(&wt1, &["commit", "-q", "--allow-empty", "-m", "agent-a"]).unwrap();
         assert_eq!(
             resolve_target_ref(&wt1, "develop"),
-            "develop",
-            "worktree forked off local develop (stale origin) → prefer local"
+            "refs/heads/develop",
+            "worktree forked off local develop (stale origin) → prefer local (fully qualified)"
         );
 
         // (B) Worktree forked from fresh ORIGIN/develop; local develop diverged → ORIGIN.
@@ -1820,8 +1899,8 @@ mod tests {
         git(&wt2, &["commit", "-q", "--allow-empty", "-m", "agent-b"]).unwrap();
         assert_eq!(
             resolve_target_ref(&wt2, "develop"),
-            "origin/develop",
-            "worktree forked off fresh origin/develop (diverged local) → prefer origin"
+            "refs/remotes/origin/develop",
+            "worktree forked off fresh origin/develop (diverged local) → prefer origin (fully qualified)"
         );
 
         let _ = remove_worktree(&c1, &wt1);
@@ -1831,6 +1910,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c2);
         let _ = std::fs::remove_dir_all(&wt1);
         let _ = std::fs::remove_dir_all(&wt2);
+    }
+
+    #[test]
+    fn resolve_target_ref_prefers_branch_over_same_named_tag() {
+        // R46-1: a bare `<t>` resolves a same-named TAG before the branch. With a TAG `develop`
+        // (at an OLD commit) AND a BRANCH `develop` (the real fork point) both present, the old
+        // bare `ref_resolves(worktree, &t)` would diff against the tag. Qualifying the local
+        // check as refs/heads/<t> selects the BRANCH.
+        let repo = tmp("rtr-tag-branch");
+        init_repo(&repo).unwrap();
+        let main = current_branch(&repo).unwrap();
+        // A real `develop` branch with its own commit — this is the genuine fork point.
+        git(&repo, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "develop tip"]).unwrap();
+        // A TAG also named `develop`, pinned to the OLDER initial commit (so it differs from the
+        // branch tip and from where the worktree forks).
+        git(&repo, &["tag", "develop", &format!("{main}")]).unwrap();
+        git(&repo, &["checkout", "-q", &main]).unwrap();
+        // A worktree that forked off the develop BRANCH. The start-point is spelled
+        // refs/heads/develop because a bare `develop` is itself ambiguous (tag + branch) to
+        // `git worktree add` — which is precisely the ambiguity resolve_target_ref must avoid.
+        let wt = tmp("rtr-tag-wt");
+        git(&repo, &["worktree", "add", "-q", "-b", "feat/x", &wt.to_string_lossy(), "refs/heads/develop"]).unwrap();
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "agent work"]).unwrap();
+
+        assert_eq!(
+            resolve_target_ref(&wt, "develop"),
+            "refs/heads/develop",
+            "a same-named TAG must not shadow the real develop BRANCH"
+        );
+
+        let _ = remove_worktree(&repo, &wt);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn resolve_target_ref_uses_remote_tracking_not_local_origin_branch() {
+        // R46-2: a LOCAL branch literally named `origin/develop` (refs/heads/origin/develop)
+        // would satisfy the OLD short `origin/<t>` resolve and be diffed against instead of the
+        // real remote-tracking ref. Qualifying as refs/remotes/origin/<t> picks the remote.
+        let origin = tmp("rtr-rt-origin");
+        init_repo(&origin).unwrap();
+        let main = current_branch(&origin).unwrap();
+        git(&origin, &["checkout", "-q", "-b", "develop"]).unwrap();
+        git(&origin, &["commit", "-q", "--allow-empty", "-m", "remote develop tip"]).unwrap();
+        git(&origin, &["checkout", "-q", &main]).unwrap();
+
+        let clone = tmp("rtr-rt-clone");
+        git(&std::env::temp_dir(), &["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()]).unwrap();
+        git(&clone, &["config", "user.email", "t@t.t"]).unwrap();
+        git(&clone, &["config", "user.name", "t"]).unwrap();
+        // A real refs/remotes/origin/develop exists from the clone. Now create a DECOY local
+        // branch literally named `origin/develop` (refs/heads/origin/develop) at an unrelated
+        // commit, so the short `origin/develop` spelling resolves to the LOCAL decoy first.
+        git(&clone, &["branch", "origin/develop", &main]).unwrap();
+        assert!(
+            ref_resolves(&clone, "refs/heads/origin/develop"),
+            "precondition: decoy local origin/develop branch exists"
+        );
+        assert!(
+            ref_resolves(&clone, "refs/remotes/origin/develop"),
+            "precondition: real remote-tracking origin/develop exists"
+        );
+        // A worktree forked off the real remote-tracking develop.
+        let wt = tmp("rtr-rt-wt");
+        git(&clone, &["worktree", "add", "-q", "-b", "feat/y", &wt.to_string_lossy(), "refs/remotes/origin/develop"]).unwrap();
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "agent work"]).unwrap();
+
+        assert_eq!(
+            resolve_target_ref(&wt, "develop"),
+            "refs/remotes/origin/develop",
+            "the remote-tracking ref must win over a local branch named origin/develop"
+        );
+
+        let _ = remove_worktree(&clone, &wt);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&clone);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn resolve_target_ref_falls_back_to_tag_or_sha_when_no_branch() {
+        // When NO branch (local or remote) by that name exists, a user may still legitimately
+        // target a TAG or a raw SHA. The bare commit-ish fallback keeps that working.
+        let repo = tmp("rtr-tagonly");
+        init_repo(&repo).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "c1"]).unwrap();
+        // A release TAG with NO same-named branch.
+        git(&repo, &["tag", "v1.0.0"]).unwrap();
+        let sha = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "c2"]).unwrap();
+        assert!(
+            !ref_resolves(&repo, "refs/heads/v1.0.0"),
+            "precondition: no branch named v1.0.0"
+        );
+
+        // Tag target resolves to the bare tag name (a commit-ish, fed to merge-base).
+        assert_eq!(
+            resolve_target_ref(&repo, "v1.0.0"),
+            "v1.0.0",
+            "a tag-only target must resolve via the bare commit-ish fallback"
+        );
+        // A raw SHA target resolves to itself.
+        assert_eq!(
+            resolve_target_ref(&repo, &sha),
+            sha,
+            "a raw SHA target must resolve via the bare commit-ish fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
