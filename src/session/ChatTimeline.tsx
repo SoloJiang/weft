@@ -18,6 +18,37 @@ import type { useRepoActions } from "./useRepoActions";
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 type EmptyStateMode = "default" | "lead-task" | "lead-repo-guide";
 
+function Message({
+  role,
+  children,
+}: {
+  role: "user" | "assistant";
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "group flex w-full gap-2.5",
+        role === "user" ? "flex-row-reverse" : "flex-row",
+      )}
+    >
+      {role === "assistant" && (
+        <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
+          <Sparkles size={14} />
+        </span>
+      )}
+      <div
+        className={cn(
+          "flex min-w-0 flex-col",
+          role === "user" ? "items-end" : "flex-1 items-start",
+        )}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /**
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
  * no jsonl). Structured cards (proposal/approval/worker events) live inline in
@@ -634,7 +665,7 @@ function TimelineRow({
     const files = Array.isArray(c.files) ? (c.files as string[]) : [];
     const text = String(c.text ?? "");
     return (
-      <div className="group flex flex-col items-end">
+      <Message role="user">
         <div
           className={cn(
             "flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5",
@@ -681,41 +712,38 @@ function TimelineRow({
           )}
         </div>
         {text && <CopyMessageButton text={text} align="end" />}
-      </div>
+      </Message>
     );
   }
 
   // assistant / system text
   const terminal = typeof c.terminal === "string" ? c.terminal : "";
-  const assistantText =
-    terminal === "error_before_output"
-      ? t("lead.terminalErrorBeforeOutput")
-      : terminal === "interrupted_before_output"
-        ? t("lead.terminalInterruptedBeforeOutput")
-        : String(c.text ?? "");
+  let assistantText: string;
+  if (terminal === "error_before_output") {
+    assistantText = t("lead.terminalErrorBeforeOutput");
+  } else if (terminal === "interrupted_before_output") {
+    assistantText = t("lead.terminalInterruptedBeforeOutput");
+  } else {
+    assistantText = String(c.text ?? "");
+  }
   return (
-    <div className="group flex items-start gap-2.5">
-      <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
-        <Sparkles size={14} />
-      </span>
-      <div className="flex min-w-0 flex-1 flex-col">
-        <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-          {assistantText && <Markdown text={assistantText} cwd={cwd} />}
-          {m.status === "streaming" && (
-            <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
-          )}
-          {m.status === "interrupted" && (
-            <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>
-          )}
-          {m.status === "error" && (
-            <p className="mt-1.5 text-[11px] text-danger">{t("lead.errored")}</p>
-          )}
-        </div>
-        {assistantText && m.status !== "streaming" && (
-          <CopyMessageButton text={assistantText} align="start" />
+    <Message role="assistant">
+      <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
+        {assistantText && <Markdown text={assistantText} cwd={cwd} />}
+        {m.status === "streaming" && (
+          <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
+        )}
+        {m.status === "interrupted" && (
+          <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>
+        )}
+        {m.status === "error" && (
+          <p className="mt-1.5 text-[11px] text-danger">{t("lead.errored")}</p>
         )}
       </div>
-    </div>
+      {assistantText && m.status !== "streaming" && (
+        <CopyMessageButton text={assistantText} align="start" />
+      )}
+    </Message>
   );
 }
 
