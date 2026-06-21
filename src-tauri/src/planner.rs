@@ -366,14 +366,48 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // is idempotent when the dir already exists.
     if resolved.status == "confirmed" {
         let all = repo::list_directions(db, thread_id).await?;
+        // Per-repo cache so BOTH the pre-pass and the per-lane match below can be BASE-AWARE
+        // (R52-1) without re-fetching the repo for every lane. The fast-path must mirror the
+        // non-confirmed path's base-compatible claim: with duplicate same-name/repo lanes on
+        // DIFFERENT bases, a name+repo-only `.find` could pre-claim the wrong base-specific
+        // direction and dispatch the swapped one. On a missing repo (None/Err) we leave the
+        // entry None and fall back to a name+repo-only match so a retry never crashes.
+        let mut repo_cache: std::collections::HashMap<
+            i32,
+            Option<crate::store::entities::repo_ref::Model>,
+        > = std::collections::HashMap::new();
+        for p in &resolved.directions {
+            if p.repo.known && !repo_cache.contains_key(&p.repo.repo_id) {
+                let r = repo::get_repo(db, p.repo.repo_id).await.ok().flatten();
+                repo_cache.insert(p.repo.repo_id, r);
+            }
+        }
+        let base_ok = |existing_base: &str, p: &ResolvedDirection| -> bool {
+            // Fall back to a name+repo-only match when the repo is missing (None), so a missing
+            // repo doesn't crash the retry — the same best-effort posture as the pre-pass below.
+            repo_cache
+                .get(&p.repo.repo_id)
+                .and_then(|r| r.as_ref())
+                .is_none_or(|r| {
+                    base_compatible(
+                        existing_base,
+                        &p.base_branch,
+                        std::path::Path::new(&r.local_git_path),
+                        &r.base_ref,
+                        r.base_ref_is_default,
+                    )
+                })
+        };
         let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
         // Pre-claim directions owned by approved/denied lanes so a same-name pending sibling
-        // doesn't re-dispatch them.
+        // doesn't re-dispatch them. Base-aware (R52-1): prefer the approved/denied lane's OWN
+        // base-matching direction so a same-name/repo pending sibling with a different base is
+        // left its own.
         for p in &resolved.directions {
             if p.repo.known && (p.decision == "approved" || p.decision == "denied") {
                 // Exclude terminal (done) directions from reuse: a completed lane is history,
                 // not a resumable target — a re-proposal must create fresh work.
-                if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done") {
+                if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done" && base_ok(&d.base_branch, p)) {
                     consumed.insert(d.id);
                 }
             }
@@ -382,8 +416,9 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         for p in &resolved.directions {
             if !p.repo.known || p.decision == "approved" || p.decision == "denied" { continue; }
             // Exclude terminal (done) directions from reuse: a completed lane is history,
-            // not a resumable target — a re-proposal must create fresh work.
-            if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done") {
+            // not a resumable target — a re-proposal must create fresh work. Base-aware (R52-1):
+            // claim this lane's OWN base-matching direction, not a sibling's different-base one.
+            if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done" && base_ok(&d.base_branch, p)) {
                 consumed.insert(d.id);
                 matching.push(d.id);
             }
@@ -415,10 +450,15 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
     for d in &resolved.directions {
         if d.decision == "approved" || d.decision == "denied" {
-            // Prefer claiming the BASE-COMPATIBLE direction among same-name/repo duplicates so the
+            // Claim ONLY the BASE-COMPATIBLE direction among same-name/repo duplicates so the
             // PENDING sibling's reuse find (which is base-aware) is left the matching one — mirrors
-            // the main find's predicate (R50-4). Best-effort repo lookup: if it fails, fall back to
-            // a name+repo-only claim (the main loop still reconciles the real base).
+            // the main find's predicate (R50-4). An approved/denied lane's OWN direction was created
+            // from its OWN base, so base_compatible matches it; there is no legitimate ownership a
+            // name+repo-only fallback would recover (R52-2). The removed fallback used to let a
+            // denied lane that never created a direction mis-claim a SIBLING's base-incompatible
+            // direction, so approving the pending sibling created a DUPLICATE. Best-effort repo
+            // lookup: if the repo is missing, fall back to name+repo only (the main loop still
+            // reconciles the real base).
             let repo_info = repo::get_repo(db, d.repo.repo_id).await.ok().flatten();
             let claimed = existing_dirs
                 .iter()
@@ -438,16 +478,6 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                                 r.base_ref_is_default,
                             )
                         })
-                })
-                // Fall back to a name+repo-only claim when no base-compatible match exists, so an
-                // approved/denied lane's direction is still claimed (a pending sibling must not reuse it).
-                .or_else(|| {
-                    existing_dirs.iter().find(|x| {
-                        x.name == d.name
-                            && x.repo_id == d.repo.repo_id
-                            && !consumed.contains(&x.id)
-                            && x.status != "done"
-                    })
                 });
             if let Some(ex) = claimed {
                 consumed.insert(ex.id);
@@ -657,9 +687,14 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         }
         if pj.decision == "approved" || pj.decision == "denied" {
             let rj = resolve(pj, &repos);
-            // Prefer claiming the BASE-COMPATIBLE direction among same-name/repo duplicates so the
+            // Claim ONLY the BASE-COMPATIBLE direction among same-name/repo duplicates so the
             // lane being approved (whose find is base-aware) is left the matching one — mirrors
-            // confirm's pre-pass (R50-4). Best-effort repo lookup with a name+repo-only fallback.
+            // confirm's pre-pass (R50-4). An approved/denied lane's OWN direction was created from
+            // its OWN base, so base_compatible matches it; there is no legitimate ownership a
+            // name+repo-only fallback would recover (R52-2). The removed fallback used to let a
+            // denied lane that never created a direction mis-claim a SIBLING's base-incompatible
+            // direction, so approving the pending sibling created a DUPLICATE. Best-effort repo
+            // lookup: if the repo is missing, fall back to name+repo only.
             let repo_info = repo::get_repo(db, rj.repo.repo_id).await.ok().flatten();
             let claimed = dirs
                 .iter()
@@ -679,14 +714,6 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
                                 r.base_ref_is_default,
                             )
                         })
-                })
-                .or_else(|| {
-                    dirs.iter().find(|d| {
-                        d.name == rj.name
-                            && d.repo_id == rj.repo.repo_id
-                            && !consumed.contains(&d.id)
-                            && d.status != "done"
-                    })
                 });
             if let Some(d) = claimed {
                 consumed.insert(d.id);
@@ -3034,5 +3061,186 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo_path);
+    }
+
+    /// R52-1: the confirmed (idempotent) fast-path must be BASE-AWARE when it claims existing
+    /// directions, exactly like the non-confirmed path. Two same-name+repo lanes have DIFFERENT
+    /// bases: the `develop` lane is approved (owns its `develop` direction) and the `release` lane
+    /// is pending (owns its `release` direction). Both directions exist; the plan is "confirmed".
+    /// On a retry, the fast-path's consumed PRE-PASS claims the approved `develop` lane's direction
+    /// and its per-lane MAIN match returns the pending `release` lane's direction. Without
+    /// base-awareness the name+repo-only `.find` returns whichever direction the DB lists FIRST:
+    /// with the `release` direction created first, the pre-pass mis-claims it for the approved
+    /// `develop` lane, so the pending `release` lane's per-lane match then returns the `develop`
+    /// direction — the two are SWAPPED and the wrong base-specific lane is dispatched. Red-first:
+    /// before base-aware selection, the fast-path returns the develop direction for the release lane.
+    #[tokio::test]
+    async fn confirmed_fast_path_claims_base_compatible_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-basecompat-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        // Two real explicit bases (neither is the git default branch) so each lane materializes
+        // off its own and base_compatible compares non-empty bases by normalized identity.
+        sh(&repo_path, &["git", "branch", "develop"]);
+        sh(&repo_path, &["git", "branch", "release"]);
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Seed the PENDING lane's `release` direction FIRST so list_directions returns it before
+        // the `develop` direction — the name+repo-only pre-pass would then mis-claim it for the
+        // approved `develop` lane. Both materialized (live lanes the fast-path re-materializes).
+        let dir_release = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "release").await.unwrap();
+        materialize::materialize_direction(&db, dir_release.id).await.unwrap();
+        let dir_develop = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "develop").await.unwrap();
+        materialize::materialize_direction(&db, dir_develop.id).await.unwrap();
+
+        // Stored proposal: lane[0]=`release` PENDING, lane[1]=`develop` APPROVED. Write the
+        // decision directly (save_proposal scrubs decisions, R47-3) and mark the plan confirmed,
+        // so confirm takes the idempotent fast-path.
+        let stored = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"approved".into() },
+        ]};
+        let json = serde_json::to_string(&stored).unwrap();
+        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
+
+        // Fast-path retry: returns ONLY the pending `release` lane's id, and it must be the
+        // base-MATCHING `release` direction — not the `develop` direction (which belongs to the
+        // approved lane and would be a swap).
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![dir_release.id],
+            "R52-1: fast-path must return the pending release lane's OWN (base-matching) release direction");
+        assert!(!ids.contains(&dir_develop.id),
+            "R52-1: the approved develop lane's direction must NOT be dispatched for the release lane (no swap)");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R52-2: the consumed PRE-PASS (in BOTH confirm and approve) must claim ONLY a
+    /// base-COMPATIBLE direction — it must NOT fall back to a name+repo-only claim. Two same-name
+    /// (`api` repo) lanes: a `release` lane that is DENIED and never materialized (owns NO
+    /// direction), and a `main` lane that already has a reusable `main` direction from a prior
+    /// approval. Approving the pending `main` lane must REUSE its existing `main` direction. With a
+    /// name+repo-only `.or_else` fallback, the denied `release` lane's pre-pass mis-claims the
+    /// SIBLING's base-incompatible `main` direction (the denied lane owns none of its own), so the
+    /// approve's main lookup finds it consumed and creates a DUPLICATE. Red-first: before removing
+    /// the fallback, approving the `main` lane creates a second `main` direction instead of reusing.
+    #[tokio::test]
+    async fn approve_pending_lane_reuses_own_direction_when_sibling_denied_without_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-denied-nofallback-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        // Two real explicit bases (neither is the git default branch): `develop` for the `main`
+        // lane's reusable direction and `release` for the denied sibling — DIFFERENT bases so the
+        // denied lane is base-INCOMPATIBLE with dir_main (only the removed name+repo-only fallback
+        // could mis-claim it).
+        sh(&repo_path, &["git", "branch", "develop"]);
+        sh(&repo_path, &["git", "branch", "release"]);
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Seed the `main`-lane's reusable direction (base `develop`) from a prior approval, and
+        // materialize it. This is the ONLY direction; the denied `release` lane owns none, and its
+        // `release` base is NOT compatible with this `develop` direction.
+        let dir_main = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "develop").await.unwrap();
+        materialize::materialize_direction(&db, dir_main.id).await.unwrap();
+
+        // Stored proposal: index 0 = `release` lane DENIED (base `release`, no direction was ever
+        // made for it), index 1 = `main` lane pending whose base (`develop`) matches dir_main. Both
+        // share name `api` + repo `api`. Write the denied decision directly (save_proposal scrubs).
+        let stored = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"denied".into() },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"".into() },
+        ]};
+        let json = serde_json::to_string(&stored).unwrap();
+        repo::upsert_plan(&db, t.id, &json, "proposed", &now()).await.unwrap();
+
+        // Approve the pending `main` lane (index 1): it must REUSE dir_main, not create a duplicate.
+        let approved_id = approve_direction(&db, t.id, 1, "codex").await.unwrap();
+        assert_eq!(approved_id, dir_main.id,
+            "R52-2: approving the pending lane must reuse its OWN base-matching direction");
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let same: Vec<_> = dirs.iter().filter(|d| d.name == "api" && d.repo_id == ra.id).collect();
+        assert_eq!(same.len(), 1,
+            "R52-2: no duplicate direction is created (the denied sibling must not mis-claim dir_main)");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R52-2 (confirm side): the confirm pre-pass must likewise claim ONLY a base-compatible
+    /// direction. A `release` lane is DENIED with no direction; a `main` lane is pending with a
+    /// reusable `main` direction (base `develop`). On confirm, the denied lane's pre-pass must NOT
+    /// mis-claim the `main` direction via a name+repo-only fallback — otherwise the pending `main`
+    /// lane's reuse `.find` finds it consumed and confirm creates a DUPLICATE. Red-first: before
+    /// removing the fallback, confirm creates a second `main` direction instead of reusing.
+    #[tokio::test]
+    async fn confirm_pending_lane_reuses_own_direction_when_sibling_denied_without_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-confirm-denied-nofallback-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        // Two real explicit bases (neither is the git default): `develop` for the reusable `main`
+        // direction, `release` for the denied sibling — DIFFERENT so the denied lane is
+        // base-INCOMPATIBLE with dir_main (only a name+repo-only fallback could mis-claim it).
+        sh(&repo_path, &["git", "branch", "develop"]);
+        sh(&repo_path, &["git", "branch", "release"]);
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // The ONLY direction: the `main` lane's reusable direction (base `develop`), materialized.
+        let dir_main = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "develop").await.unwrap();
+        materialize::materialize_direction(&db, dir_main.id).await.unwrap();
+
+        // Stored proposal: index 0 = `release` lane DENIED (base `release`, no direction), index 1
+        // = `main` lane pending whose base (`develop`) matches dir_main. Both share name `api` + repo.
+        let stored = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"denied".into() },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"".into() },
+        ]};
+        let json = serde_json::to_string(&stored).unwrap();
+        repo::upsert_plan(&db, t.id, &json, "proposed", &now()).await.unwrap();
+
+        // Confirm: the pending `main` lane must REUSE dir_main (the denied sibling must not claim it).
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![dir_main.id],
+            "R52-2: confirm must reuse the pending lane's OWN base-matching direction");
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        let same: Vec<_> = dirs.iter().filter(|d| d.name == "api" && d.repo_id == ra.id).collect();
+        assert_eq!(same.len(), 1,
+            "R52-2: confirm creates no duplicate (the denied sibling must not mis-claim dir_main)");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
     }
 }
