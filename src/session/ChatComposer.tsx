@@ -145,6 +145,7 @@ function ChatComposerBody({
   const wrapRef = useRef<HTMLDivElement>(null);
   const askedSlashRef = useRef(false);
   const lastSendRef = useRef(0);
+  const composingRef = useRef(false);
 
   const slashQuery =
     text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
@@ -259,6 +260,23 @@ function ChatComposerBody({
     ref.current?.focus();
   };
 
+  const submitComposer = () => {
+    if (!paletteOpen) {
+      send();
+      return;
+    }
+    const exact =
+      slashQuery != null
+        ? slashMatches.find((item) => item.name === slashQuery)
+        : undefined;
+    if (exact?.source === "cli") {
+      send();
+      return;
+    }
+    const item = exact ?? slashMatches[activeSlashIdx];
+    if (item) complete(item);
+  };
+
   const addImageBlob = (blob: Blob) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -323,15 +341,7 @@ function ChatComposerBody({
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      const exact =
-        slashQuery != null
-          ? slashMatches.find((x) => x.name === slashQuery)
-          : undefined;
-      if (exact && exact.source === "cli") {
-        send();
-      } else {
-        complete(exact ?? slashMatches[activeSlashIdx]);
-      }
+      submitComposer();
       return;
     }
     if (e.key === "Escape") {
@@ -393,10 +403,7 @@ function ChatComposerBody({
   return (
     <div className="border-t border-border bg-bg px-4 py-3">
       <PromptInput
-        onSubmit={() => {
-          if (paletteOpen) return;
-          send();
-        }}
+        onSubmit={submitComposer}
         className="relative mx-auto max-w-[820px] rounded-[var(--radius-lg)] border border-border bg-surface p-2 shadow-[0_12px_40px_-28px_rgba(0,0,0,0.65)]"
       >
         <div ref={wrapRef} className="relative">
@@ -463,6 +470,17 @@ function ChatComposerBody({
               ref={ref}
               autoFocus
               onFocus={() => setDismissed(false)}
+              onCompositionStart={() => {
+                composingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                composingRef.current = false;
+              }}
+              onKeyDownCapture={(e) => {
+                if (e.key === "Enter" && composingRef.current) {
+                  e.stopPropagation();
+                }
+              }}
               onPaste={onPaste}
               onKeyDown={handleKeyDown}
               placeholder={placeholder ?? t("lead.compose")}

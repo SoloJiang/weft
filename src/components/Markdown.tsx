@@ -40,6 +40,21 @@ function currentShikiTheme(): "github-dark" | "github-light" {
 
 const htmlCache = new Map<string, string>();
 
+function useShikiTheme(): "github-dark" | "github-light" {
+  const [theme, setTheme] = useState(currentShikiTheme);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const syncTheme = () => setTheme(currentShikiTheme());
+    const observer = new MutationObserver(syncTheme);
+    observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+    syncTheme();
+    return () => observer.disconnect();
+  }, []);
+
+  return theme;
+}
+
 /**
  * AI SDK Elements-style CodeBlock primitive, self-contained and Weft-skinned.
  * Highlights fenced code with shiki and preserves the surrounding markdown
@@ -54,28 +69,29 @@ function CodeBlock({
   language: string;
   className?: string;
 }) {
-  const [html, setHtml] = useState<string>(() => htmlCache.get(`${language}:${code}`) ?? "");
+  const theme = useShikiTheme();
+  const cacheKey = `${theme}:${language}:${code}`;
+  const [html, setHtml] = useState<string>(() => htmlCache.get(cacheKey) ?? "");
 
   useEffect(() => {
-    const key = `${language}:${code}`;
-    const cached = htmlCache.get(key);
-    if (cached) {
+    const cached = htmlCache.get(cacheKey);
+    if (cached != null) {
       setHtml(cached);
       return;
     }
+    setHtml("");
     let cancelled = false;
     const run = async () => {
-      const theme = currentShikiTheme();
       try {
         const out = await codeToHtml(code, { lang: language, theme });
         if (cancelled) return;
-        htmlCache.set(key, out);
+        htmlCache.set(cacheKey, out);
         setHtml(out);
       } catch {
         // Unknown language: fall back to plain-text highlighting.
         const out = await codeToHtml(code, { lang: "text", theme });
         if (cancelled) return;
-        htmlCache.set(key, out);
+        htmlCache.set(cacheKey, out);
         setHtml(out);
       }
     };
@@ -83,7 +99,19 @@ function CodeBlock({
     return () => {
       cancelled = true;
     };
-  }, [code, language]);
+  }, [cacheKey, code, language, theme]);
+
+  if (html) {
+    return (
+      <div
+        className={cn(
+          "[&_code]:font-mono [&_pre]:overflow-x-auto [&_pre]:rounded-[var(--radius-md)] [&_pre]:border [&_pre]:border-border [&_pre]:p-3 [&_pre]:text-[11.5px]",
+          className,
+        )}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
+  }
 
   return (
     <pre
@@ -92,14 +120,7 @@ function CodeBlock({
         className,
       )}
     >
-      {html ? (
-        <code
-          className="font-mono"
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
-      ) : (
-        <code className="font-mono">{code}</code>
-      )}
+      <code className="font-mono">{code}</code>
     </pre>
   );
 }
