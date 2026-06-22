@@ -1126,6 +1126,12 @@ pub async fn delete_repo_cascade(
     db: &Db,
     repo_id: i32,
 ) -> Result<Vec<(i32, String, String, bool, bool)>> {
+    // The workspace's repo-map doc enumerates repos/edges, so removing a repo makes
+    // it stale. Capture the workspace before the repo_ref row is deleted below; the
+    // doc is invalidated at the end (it regenerates on the next analysis pass or a
+    // manual Regenerate). Nothing else clears it on delete, so without this the map
+    // pane keeps showing the deleted repo until a later manual analysis.
+    let workspace_id = get_repo(db, repo_id).await?.map(|r| r.workspace_id);
     // Worktrees registered for this repo (each direction's worktree is keyed to
     // its write repo, so this covers the bound directions' worktrees too).
     let removed: Vec<(i32, String, String, bool, bool)> = worktree::Entity::find()
@@ -1163,6 +1169,10 @@ pub async fn delete_repo_cascade(
         .exec(&db.0)
         .await?;
     repo_ref::Entity::delete_by_id(repo_id).exec(&db.0).await?;
+    // Best-effort: invalidate the now-stale workspace map doc (see top of fn).
+    if let Some(ws) = workspace_id {
+        let _ = clear_repo_map_doc(db, ws).await;
+    }
     Ok(removed)
 }
 
@@ -1839,6 +1849,8 @@ mod tests {
         let dir_b = create_direction(&db, t.id, "db", "claude", b.id, "reason", "plan+impl", "")
             .await
             .unwrap();
+        // A stored workspace map doc (enumerates repos) must be invalidated on delete.
+        set_repo_map_doc(&db, ws.id, "## Inventory\n- a (backend)\n- b (backend)").await.unwrap();
 
         let removed = delete_repo_cascade(&db, a.id).await.unwrap();
         // returns repo `a`'s worktree(s) for the caller to physically remove
@@ -1855,6 +1867,11 @@ mod tests {
         assert!(get_repo(&db, b.id).await.unwrap().is_some());
         assert!(get_repo_profile(&db, b.id).await.unwrap().is_some());
         assert!(get_direction(&db, dir_b.id).await.unwrap().is_some());
+        // …and the stale workspace map doc was cleared (regenerates on next analysis).
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "deleting a repo must invalidate the workspace map doc"
+        );
     }
 
     /// R15-1: delete_repo_cascade must carry created_branch in its 4-tuple so

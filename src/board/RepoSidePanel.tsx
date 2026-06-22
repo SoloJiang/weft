@@ -144,6 +144,12 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
   const [view, setView] = useState<CuratorView>("chat");
   const [mapDoc, setMapDoc] = useState<string | null | undefined>(undefined);
   const [regenerating, setRegenerating] = useState(false);
+  // Latest active workspace, readable inside async continuations so a result that
+  // resolves after a workspace switch can be discarded (this panel is kept mounted).
+  const activeWsRef = useRef(activeWorkspaceId);
+  useEffect(() => {
+    activeWsRef.current = activeWorkspaceId;
+  }, [activeWorkspaceId]);
 
   useEffect(() => {
     if (view !== "map" || activeWorkspaceId == null) return;
@@ -178,11 +184,16 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
   }, [view, activeWorkspaceId]);
 
   function handleRegenerate() {
+    const ws = activeWorkspaceId;
+    if (ws == null) return;
     setRegenerating(true);
     reanalyzeDeps()
-      .then(() => {
-        if (activeWorkspaceId == null) return;
-        return api.getRepoMapDoc(activeWorkspaceId).then((doc) => setMapDoc(doc));
+      .then(() => api.getRepoMapDoc(ws))
+      .then((doc) => {
+        // Ignore the result if the user switched workspaces mid-regenerate — else
+        // this would overwrite the new workspace's map with the old one's (the
+        // switch effect above has already reset/loaded it). Mirrors the load() guard.
+        if (activeWsRef.current === ws) setMapDoc(doc);
       })
       .catch(() => { /* surface nothing; spinner clears below */ })
       .finally(() => setRegenerating(false));
