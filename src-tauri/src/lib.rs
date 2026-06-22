@@ -28,6 +28,7 @@ pub mod im;
 mod inspect;
 pub mod lead_chat;
 pub mod materialize;
+pub mod manifest;
 mod opencode;
 pub mod paths;
 mod planner;
