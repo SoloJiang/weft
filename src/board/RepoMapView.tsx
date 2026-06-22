@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Network } from "lucide-react";
 import { useStore } from "../state/store";
 import { RepoGraph } from "./RepoGraph";
-import { CuratorPanel } from "./CuratorPanel";
+import { RepoDrawer } from "./RepoDrawer";
 import { useRepoActions } from "../session/useRepoActions";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
@@ -16,28 +16,33 @@ import { Button } from "../components/ui/Button";
  * stack, and one-line summary, with dependencies as edges.
  */
 export function RepoMapView({ embedded = false }: { embedded?: boolean }) {
-  const { repoProfiles, refreshRepoMap } = useStore();
+  const { repoProfiles, refreshRepoMap, selectedRepoId, repoDrawerTab, clearSelectedRepo, closeRepoDrawer } =
+    useStore();
 
   useEffect(() => {
     void refreshRepoMap();
   }, [refreshRepoMap]);
+
+  // Repair drawer state when the selected repo is deleted or vanishes after a map
+  // refresh (the old local seeding effect did this): drop the dangling selection,
+  // and close the drawer if it's showing that now-empty detail. Lives here (always
+  // mounted, unlike RepoGraph) so it also fires when the last repo is removed.
+  useEffect(() => {
+    if (selectedRepoId != null && !repoProfiles.some((p) => p.repo_id === selectedRepoId)) {
+      clearSelectedRepo();
+      if (repoDrawerTab === "detail") closeRepoDrawer();
+    }
+  }, [repoProfiles, selectedRepoId, repoDrawerTab, clearSelectedRepo, closeRepoDrawer]);
 
   const body =
     repoProfiles.length === 0 ? (
       <div className="min-h-0 flex-1">
         <EmptyMap />
       </div>
-    ) : repoProfiles.length < 2 ? (
-      <div className="min-h-0 flex-1">
-        <RepoGraph />
-      </div>
     ) : (
-      // >=2 repos: graph + the curator chat panel docked beside it.
-      <div className="flex min-h-0 flex-1">
-        <div className="min-w-0 flex-1">
-          <RepoGraph />
-        </div>
-        <CuratorPanel />
+      <div className="relative min-h-0 flex-1">
+        <RepoGraph />
+        <RepoDrawer />
       </div>
     );
 
