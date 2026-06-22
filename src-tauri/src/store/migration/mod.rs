@@ -39,6 +39,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0026WorktreeCreatedCheckout),
             Box::new(M0027RepoRefBaseRefIsDefault),
             Box::new(M0028WorktreeBaseCommit),
+            Box::new(M0029GatewayToBackend),
         ]
     }
 }
@@ -1157,5 +1158,126 @@ impl MigrationTrait for M0028WorktreeBaseCommit {
                     .to_owned(),
             )
             .await
+    }
+}
+
+/// Rewrite any `repo_profile` rows that still carry the old "gateway" tier value
+/// (removed from the model in B-T1). Both the top-level `role` column and
+/// per-component `tier` fields inside the `components` JSON blob are updated.
+/// `down` is a no-op — the merge is irreversible.
+pub struct M0029GatewayToBackend;
+impl MigrationName for M0029GatewayToBackend {
+    fn name(&self) -> &str {
+        "m0029_gateway_to_backend"
+    }
+}
+
+/// Pure helper: rewrite any component tiers that equal "gateway" to "backend".
+/// Returns the input string unchanged on any parse error so a malformed blob
+/// never aborts the migration.
+pub(crate) fn gateway_components_to_backend(components_json: &str) -> String {
+    let mut comps: Vec<crate::profile::Component> = match serde_json::from_str(components_json) {
+        Ok(v) => v,
+        Err(_) => return components_json.to_string(),
+    };
+    for c in &mut comps {
+        if c.tier == "gateway" {
+            c.tier = "backend".to_string();
+        }
+    }
+    match serde_json::to_string(&comps) {
+        Ok(s) => s,
+        Err(_) => components_json.to_string(),
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0029GatewayToBackend {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        let db = manager.get_connection();
+
+        // 1) Rewrite the top-level role column.
+        db.execute_unprepared(
+            "UPDATE repo_profile SET role = 'backend' WHERE role = 'gateway'",
+        )
+        .await?;
+
+        // 2) Rewrite gateway tiers embedded in the components JSON array.
+        let rows = repo_profile::Entity::find().all(db).await?;
+        for row in rows {
+            if !row.components.contains("\"gateway\"") {
+                continue;
+            }
+            let fixed = gateway_components_to_backend(&row.components);
+            // Skip if the helper returned the blob unchanged (malformed JSON).
+            if fixed == row.components {
+                continue;
+            }
+            let mut am: repo_profile::ActiveModel = row.into();
+            am.components = Set(fixed);
+            am.update(db).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Data merge is irreversible.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gateway_components_to_backend;
+
+    #[test]
+    fn gateway_tier_rewritten_to_backend() {
+        let input = r#"[{"name":"api","path":"services/api","tier":"gateway","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        assert!(
+            !output.contains("\"gateway\""),
+            "gateway should be gone: {output}"
+        );
+        assert!(
+            output.contains("\"backend\""),
+            "backend should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn non_gateway_tier_untouched() {
+        let input = r#"[{"name":"web","path":"apps/web","tier":"frontend","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn malformed_json_returned_unchanged() {
+        let input = "not valid json {{";
+        let output = gateway_components_to_backend(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn idempotent_already_backend() {
+        let input =
+            r#"[{"name":"api","path":"services/api","tier":"backend","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn mixed_tiers_only_gateway_rewritten() {
+        let input = r#"[{"name":"a","path":"a","tier":"gateway","summary":"","deps":[]},{"name":"b","path":"b","tier":"frontend","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        assert!(
+            !output.contains("\"gateway\""),
+            "no gateway should remain: {output}"
+        );
+        assert!(
+            output.contains("\"frontend\""),
+            "frontend should survive: {output}"
+        );
     }
 }
