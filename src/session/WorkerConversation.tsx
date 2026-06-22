@@ -12,6 +12,7 @@ import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { appLink, resumeCommand } from "../lib/resume";
+import { useImeComposition } from "../lib/useImeComposition";
 
 /**
  * The worker conversation — same model as the lead console (LeadTab): a single,
@@ -302,14 +303,16 @@ export function WorkerConversation() {
 function AskInline({ text, onAnswer }: { text: string; onAnswer: (answer: string) => void }) {
   const { t } = useTranslation();
   const [val, setVal] = useState("");
+  const { composition, isComposing } = useImeComposition();
   return (
     <div className="flex items-center gap-2 py-1">
       <span className="min-w-0 flex-1 truncate text-[13px] text-ink">{text}</span>
       <input
         value={val}
         onChange={(e) => setVal(e.target.value)}
+        {...composition}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && val.trim()) {
+          if (e.key === "Enter" && !isComposing(e) && val.trim()) {
             onAnswer(val.trim());
             setVal("");
           }

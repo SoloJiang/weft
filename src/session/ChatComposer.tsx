@@ -15,6 +15,7 @@ import type { ImageAttachment, SlashCmd } from "../lib/types";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { useClickOutside } from "../lib/useClickOutside";
+import { useImeComposition } from "../lib/useImeComposition";
 import { Button } from "../components/ui/Button";
 import { Tooltip } from "../components/ui/Tooltip";
 
@@ -166,9 +167,10 @@ export function ChatComposer({
   // immediately interrupt its own turn. Record the last send so a Stop click that
   // lands right after is ignored (guardedStop below).
   const lastSendRef = useRef(0);
-  // IME composition (e.g. pinyin): while composing, Enter confirms the candidate and
-  // must NOT send. Tracked here, plus the native event's isComposing flag.
-  const composingRef = useRef(false);
+  // IME composition (e.g. pinyin): while composing, Enter confirms the candidate
+  // and must NOT send. WKWebView fires compositionend before that Enter's keydown,
+  // so the hook holds the flag across it (see useImeComposition).
+  const { composition, isComposing } = useImeComposition();
   useEffect(() => {
     if (slashQuery == null) {
       askedSlashRef.current = false;
@@ -349,14 +351,9 @@ export function ChatComposer({
           onChange={(e) => setText(e.currentTarget.value)}
           onFocus={() => setDismissed(false)}
           onPaste={onPaste}
-          onCompositionStart={() => {
-            composingRef.current = true;
-          }}
-          onCompositionEnd={() => {
-            composingRef.current = false;
-          }}
+          {...composition}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.nativeEvent.isComposing || composingRef.current)) {
+            if (e.key === "Enter" && isComposing(e)) {
               return; // IME is confirming a candidate — let the browser handle Enter
             }
             if (paletteOpen) {
