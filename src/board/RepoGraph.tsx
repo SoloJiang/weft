@@ -785,6 +785,12 @@ function AnalyzedProfileFields({
         <ChipList values={profile.stack} empty={t("repomap.none")} mono />
       </ProfileSection>
 
+      {profile.domains.length > 0 && (
+        <ProfileSection title={t("repomap.domains")}>
+          <ChipList values={profile.domains} empty={t("repomap.none")} />
+        </ProfileSection>
+      )}
+
       {profile.components.length > 0 && (
         <ProfileSection title={t("repomap.components")}>
           <ComponentList components={profile.components} />
@@ -863,6 +869,11 @@ export function RepoDetailContent({ repoId }: { repoId: number | null }) {
             <div className="flex items-center gap-2">
               <h2 className="truncate font-mono text-[16px] font-semibold text-ink">{profile.repo_name}</h2>
               <TierBadge profile={profile} />
+              {profile.category && (
+                <span className="shrink-0 rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-ink-muted">
+                  {profile.category}
+                </span>
+              )}
             </div>
           </div>
           <button

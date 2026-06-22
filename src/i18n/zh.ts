@@ -407,6 +407,8 @@ export const zh = {
     oneLine: "一句话职责",
     stack: "技术栈",
     tier: "层级",
+    category: "角色",
+    domains: "领域",
     components: "内部组件",
     analyzing: "分析中…",
     analyzingHint: "正在读取仓库并判定层级…",

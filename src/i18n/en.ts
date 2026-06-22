@@ -422,6 +422,8 @@ export const en = {
     oneLine: "One-line role",
     stack: "Stack",
     tier: "Tier",
+    category: "Category",
+    domains: "Domains",
     components: "Components",
     analyzing: "Analyzing…",
     analyzingHint: "Reading the repo and classifying its tier…",
