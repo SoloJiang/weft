@@ -1233,13 +1233,16 @@ impl MigrationTrait for M0029GatewayToBackend {
             if fixed == components {
                 continue;
             }
-            let _ = db
-                .execute(Statement::from_sql_and_values(
-                    backend,
-                    "UPDATE repo_profile SET components = ? WHERE id = ?",
-                    [fixed.into(), id.into()],
-                ))
-                .await;
+            // Propagate a write failure rather than swallowing it: if this UPDATE
+            // errors, the migration must fail so it is NOT recorded as applied and
+            // retries on the next startup. Discarding the error would leave these
+            // component blobs permanently on the removed "gateway" tier.
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE repo_profile SET components = ? WHERE id = ?",
+                [fixed.into(), id.into()],
+            ))
+            .await?;
         }
         Ok(())
     }
