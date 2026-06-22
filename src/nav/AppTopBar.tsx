@@ -219,7 +219,7 @@ export function AppTopBar() {
         )}
       </div>
 
-      {inWorkspaceRepos && activeWorkspaceId != null && (
+      {inWorkspaceRepos && activeWorkspaceId != null && repos.length > 0 && (
         <Button size="sm" variant="ghost" onClick={openCurator}>
           <Route size={14} />
           {t("repomap.curatorTitle")}
