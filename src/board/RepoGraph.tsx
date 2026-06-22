@@ -42,8 +42,6 @@ const TIER_ICON: Record<string, ComponentType<LucideProps>> = {
   other: CircleDashed,
 };
 
-/** The relation kinds an edge can carry, for the filter toggles. */
-const KINDS = ["lib", "http", "grpc", "queue", "infra"] as const;
 
 const bandOf = (tier: string): Band =>
   (TIER_ORDER as readonly string[]).includes(tier) ? (tier as Band) : "other";
@@ -149,27 +147,8 @@ export function RepoGraph() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [profileOpen, setProfileOpen] = useState(true);
   const [mode, setMode] = useState<ViewMode>("overview");
-  const [activeKinds, setActiveKinds] = useState<Set<string>>(() => new Set(KINDS));
   const seededSelection = useRef(false);
 
-  const toggleKind = useCallback((kind: string) => {
-    setActiveKinds((prev) => {
-      const next = new Set(prev);
-      if (next.has(kind)) next.delete(kind);
-      else next.add(kind);
-      return next;
-    });
-  }, []);
-
-  // An edge is shown unless its kind has been filtered out (unknown kinds — e.g.
-  // a legacy "dep" — always show so nothing silently vanishes).
-  const visibleEdges = useMemo(
-    () =>
-      repoEdges.filter(
-        (e) => !e.kind || !(KINDS as readonly string[]).includes(e.kind) || activeKinds.has(e.kind),
-      ),
-    [repoEdges, activeKinds],
-  );
 
   // Seed the profile pane once so the repo map starts useful, while still
   // letting the user close the pane afterwards.
@@ -309,22 +288,6 @@ export function RepoGraph() {
         onPointerLeave={endDrag}
         className="relative min-w-0 flex-1 cursor-grab select-none overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface/35 [touch-action:none] active:cursor-grabbing"
       >
-        {/* Tier band headers — fixed in canvas space so they track pan/zoom. */}
-        <div
-          className="pointer-events-none absolute left-0 top-0 origin-top-left"
-          style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
-        >
-          {layout.bands.map((b, col) => (
-            <div
-              key={b}
-              className="absolute text-[10.5px] font-medium uppercase tracking-wide text-ink-faint"
-              style={{ left: PAD + col * (NODE_W + COL_GAP), top: 0, width: NODE_W }}
-            >
-              {t(`repomap.tier_${b}`, b)}
-            </div>
-          ))}
-        </div>
-
         <div
           className="absolute left-0 top-0 origin-top-left"
           style={{
@@ -342,7 +305,7 @@ export function RepoGraph() {
                 <path d="M0 0 L8 4 L0 8 z" className="fill-brand" />
               </marker>
             </defs>
-            {visibleEdges.map((e, i) => {
+            {repoEdges.map((e, i) => {
               const a = layout.pos.get(e.from);
               const b = layout.pos.get(e.to);
               if (!a || !b) return null;
@@ -434,28 +397,6 @@ export function RepoGraph() {
                 </div>
               )}
             </div>
-            {repoEdges.length > 0 && (
-              <div
-                data-graph-controls
-                className="pointer-events-auto flex items-center gap-1 rounded-[var(--radius-md)] border border-border bg-raised px-1.5 py-1 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
-              >
-                {KINDS.map((kind) => (
-                  <button
-                    key={kind}
-                    onClick={() => toggleKind(kind)}
-                    title={t("repomap.filterKind", { kind })}
-                    className={cn(
-                      "rounded px-1.5 py-0.5 text-[10px] font-medium uppercase transition-colors",
-                      activeKinds.has(kind)
-                        ? "bg-brand-ghost text-brand"
-                        : "text-ink-faint line-through hover:text-ink-muted",
-                    )}
-                  >
-                    {kind}
-                  </button>
-                ))}
-              </div>
-            )}
           </div>
           <div
             data-graph-controls
