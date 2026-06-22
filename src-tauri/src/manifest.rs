@@ -93,14 +93,12 @@ pub fn parse_cargo_toml(s: &str) -> ManifestInfo {
         }
     }
 
-    // workspace.dependencies
-    if let Some(table) = val
-        .get("workspace")
-        .and_then(|w| w.get("dependencies"))
-        .and_then(|t| t.as_table())
-    {
-        push_cargo_dep_names(table, &mut info.requires);
-    }
+    // Deliberately NOT scanning [workspace.dependencies]: that table is a central
+    // version/source CATALOG, not the workspace root's own dependencies. A package
+    // only depends on one of those crates when it ALSO declares it under its own
+    // [dependencies] (typically `dep = { workspace = true }`), which the per-crate
+    // scan picks up. Treating the catalog as requires seeded false lib edges from a
+    // workspace root to crates it merely lists versions for.
 
     info.dedup();
     info
@@ -132,37 +130,35 @@ pub fn parse_go_mod(s: &str) -> ManifestInfo {
     let mut in_require_block = false;
 
     for line in s.lines() {
-        let trimmed = line.trim();
+        // Strip an inline `// comment` before any structural check. go.mod has no
+        // string literals, so this is safe, and it's needed so a block closed as
+        // `) // comment` still terminates (and `module x // c` / entries with
+        // trailing comments record the bare path). Module/require paths never
+        // contain `//`, so splitting on it can't truncate a real token.
+        let code = line.split("//").next().unwrap_or("").trim();
 
-        if trimmed.starts_with("module ") {
-            // The module path is a single token; a trailing `// comment` (valid
-            // go.mod, accepted by `go list -m`) must not become part of the recorded
-            // module name, or consumers requiring the bare path never match.
-            let module_path = trimmed
-                .trim_start_matches("module ")
-                .split_whitespace()
-                .next()
-                .unwrap_or("");
+        if let Some(rest) = code.strip_prefix("module ") {
+            let module_path = rest.split_whitespace().next().unwrap_or("");
             if !module_path.is_empty() {
                 info.provides.push(module_path.to_string());
             }
             continue;
         }
 
-        if trimmed == "require (" {
+        if code == "require (" {
             in_require_block = true;
             continue;
         }
 
-        if trimmed == ")" && in_require_block {
+        if code == ")" && in_require_block {
             in_require_block = false;
             continue;
         }
 
         if in_require_block {
             // lines like: "\tgithub.com/acme/lib v1.2.0"
-            if let Some(path) = trimmed.split_whitespace().next() {
-                if !path.is_empty() && path != "//" {
+            if let Some(path) = code.split_whitespace().next() {
+                if !path.is_empty() {
                     info.requires.push(path.to_string());
                 }
             }
@@ -170,7 +166,7 @@ pub fn parse_go_mod(s: &str) -> ManifestInfo {
         }
 
         // single-line: "require github.com/foo/bar v1.0.0"
-        if let Some(rest) = trimmed.strip_prefix("require ") {
+        if let Some(rest) = code.strip_prefix("require ") {
             if let Some(path) = rest.split_whitespace().next() {
                 if !path.is_empty() {
                     info.requires.push(path.to_string());
@@ -418,6 +414,18 @@ pub fn parse_gradle(s: &str) -> ManifestInfo {
 
 /// Best-effort: read `rootProject.name` from settings.gradle[.kts] and
 /// `group` from build.gradle[.kts], then emit `group:name` (or bare `name`).
+/// Extract the first single- or double-quoted string from `s`. The CLOSING quote
+/// terminates it, so a trailing `// comment`, `)`, or `;` is ignored — unlike a
+/// trim-based approach, which records `api" // service` for `= "api" // service`.
+/// Returns None when there is no quoted literal.
+fn extract_first_quoted(s: &str) -> Option<String> {
+    let start = s.find(|c| c == '"' || c == '\'')?;
+    let quote = s.as_bytes()[start] as char;
+    let after = &s[start + 1..];
+    let end = after.find(quote)?;
+    Some(after[..end].to_string())
+}
+
 pub fn parse_gradle_provides(settings_src: &str, build_src: &str) -> Vec<String> {
     let mut name: Option<String> = None;
     let mut group: Option<String> = None;
@@ -429,14 +437,11 @@ pub fn parse_gradle_provides(settings_src: &str, build_src: &str) -> Vec<String>
         }
         // rootProject.name = "x"  or  rootProject.name 'x'
         if let Some(rest) = t.strip_prefix("rootProject.name") {
-            let rest = rest.trim_start_matches(|c: char| c == ' ' || c == '=' || c == '(');
-            let value = rest
-                .trim_start_matches(|c| c == '\'' || c == '"')
-                .trim_end_matches(|c: char| c == '\'' || c == '"' || c == ')' || c == ';');
-            let value = value.trim();
-            if !value.is_empty() {
-                name = Some(value.to_string());
-                break;
+            if let Some(value) = extract_first_quoted(rest) {
+                if !value.is_empty() {
+                    name = Some(value);
+                    break;
+                }
             }
         }
     }
@@ -448,14 +453,11 @@ pub fn parse_gradle_provides(settings_src: &str, build_src: &str) -> Vec<String>
         }
         // group = "x"  or  group "x"  or  group 'x'
         if let Some(rest) = t.strip_prefix("group") {
-            let rest = rest.trim_start_matches(|c: char| c == ' ' || c == '=' || c == '(');
-            let value = rest
-                .trim_start_matches(|c| c == '\'' || c == '"')
-                .trim_end_matches(|c: char| c == '\'' || c == '"' || c == ')' || c == ';');
-            let value = value.trim();
-            if !value.is_empty() {
-                group = Some(value.to_string());
-                break;
+            if let Some(value) = extract_first_quoted(rest) {
+                if !value.is_empty() {
+                    group = Some(value);
+                    break;
+                }
             }
         }
     }
@@ -661,6 +663,32 @@ mod tests {
     }
 
     #[test]
+    fn cargo_toml_workspace_dependencies_not_required() {
+        // [workspace.dependencies] is a central version catalog, not the root's own
+        // deps — it must NOT become requires (that seeds false lib edges).
+        let s = "[workspace]\nmembers = [\"crates/a\"]\n[workspace.dependencies]\nserde = \"1\"\nacme-core = { version = \"1\" }\n";
+        let m = parse_cargo_toml(s);
+        assert!(
+            m.requires.is_empty(),
+            "workspace.dependencies catalog must not be treated as requires: {:?}",
+            m.requires
+        );
+    }
+
+    #[test]
+    fn cargo_toml_member_workspace_true_dep_is_required() {
+        // A member crate's `dep = { workspace = true }` under [dependencies] IS a
+        // real dependency (recorded under the crate name), unaffected by the above.
+        let s = "[package]\nname = \"a\"\n[dependencies]\nacme-core = { workspace = true }\n";
+        let m = parse_cargo_toml(s);
+        assert!(
+            m.requires.contains(&"acme-core".to_string()),
+            "member workspace-true dep must be required: {:?}",
+            m.requires
+        );
+    }
+
+    #[test]
     fn go_mod_module_and_require() {
         let s = "module github.com/acme/svc\n\nrequire (\n\tgithub.com/acme/lib v1.2.0\n\tgithub.com/x/y v0.1.0\n)\n";
         let m = parse_go_mod(s);
@@ -692,6 +720,25 @@ mod tests {
             !m.provides.iter().any(|p| p.contains("//") || p.contains("deprecated")),
             "no comment text in provides: {:?}",
             m.provides
+        );
+    }
+
+    #[test]
+    fn go_mod_require_block_closes_with_comment() {
+        // A block closed as `) // comment` must still terminate, so ")" is never
+        // recorded as a dependency and a later single-line require still parses.
+        let s = "module example.com/m\nrequire (\n\tgithub.com/a/b v1.0.0\n) // tidy\nrequire github.com/c/d v2.0.0\n";
+        let m = parse_go_mod(s);
+        assert!(m.requires.contains(&"github.com/a/b".to_string()), "{:?}", m.requires);
+        assert!(
+            m.requires.contains(&"github.com/c/d".to_string()),
+            "block must close so the later require parses: {:?}",
+            m.requires
+        );
+        assert!(
+            !m.requires.iter().any(|r| r.contains(')')),
+            "')' must not be recorded as a dep: {:?}",
+            m.requires
         );
     }
 
@@ -973,6 +1020,19 @@ dependencies {
             "gradle provides bare name when no group: {:?}",
             provides
         );
+    }
+
+    #[test]
+    fn gradle_strips_assignment_comments() {
+        // `rootProject.name = "api" // service` must record `api`, not `api" // service`.
+        let name_only = parse_gradle_provides("rootProject.name = \"api\" // service\n", "");
+        assert_eq!(name_only, vec!["api".to_string()]);
+        // Same for a trailing comment on `group`, yielding the clean coordinate.
+        let full = parse_gradle_provides(
+            "rootProject.name = \"api\"\n",
+            "group = \"com.acme\" // org\n",
+        );
+        assert_eq!(full, vec!["com.acme:api".to_string()]);
     }
 
     // -----------------------------------------------------------------------

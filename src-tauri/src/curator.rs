@@ -1680,15 +1680,28 @@ pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
 /// edge to/from an UNPROFILED provider the prompt never saw. When that happens the
 /// markdown omits a node/edge now present in the graph, so it must not be
 /// republished (the doc stays cleared until a later pass profiles everything).
-/// Returns false iff any non-rejected edge is incident to a repo outside the set.
+///
+/// `current_ids` is the set of repos that still exist in the workspace. An edge to
+/// a DELETED repo is stale — the graph drops it by current node id (see `graph`),
+/// so it must be ignored here too; otherwise a lingering user-pinned edge to a
+/// removed repo would block republishing the map forever.
+///
+/// Returns false iff any non-rejected edge to a CURRENT repo is incident to a repo
+/// outside the profiled set.
 fn markdown_covers_graph(
     profiled_ids: &std::collections::HashSet<i32>,
+    current_ids: &std::collections::HashSet<i32>,
     relations: &[(i32, Vec<AgentRelation>)],
 ) -> bool {
     for (owner, rels) in relations {
         let owner_profiled = profiled_ids.contains(owner);
         for e in rels {
             if e.rejected {
+                continue;
+            }
+            // Stale edge to a deleted repo: not in the graph, so it can't make the
+            // markdown incomplete.
+            if !current_ids.contains(&e.to) {
                 continue;
             }
             if !owner_profiled || !profiled_ids.contains(&e.to) {
@@ -1777,6 +1790,9 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     if let Some(md) = fresh_markdown {
         let profiled_ids: std::collections::HashSet<i32> =
             profiled.iter().map(|(r, _)| r.id).collect();
+        // Repos that still exist in the workspace — edges to anything else are stale
+        // (the graph filters them out), so they must not block republishing.
+        let current_ids: std::collections::HashSet<i32> = repos.iter().map(|r| r.id).collect();
         let mut final_relations: Vec<(i32, Vec<AgentRelation>)> = Vec::new();
         for r in &repos {
             if let Ok(Some(p)) = repo::get_repo_profile(db, r.id).await {
@@ -1784,7 +1800,7 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
                 final_relations.push((r.id, rels));
             }
         }
-        if markdown_covers_graph(&profiled_ids, &final_relations) {
+        if markdown_covers_graph(&profiled_ids, &current_ids, &final_relations) {
             let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
         }
     }
@@ -3263,6 +3279,8 @@ mod tests {
     fn markdown_covers_graph_detects_unprofiled_edges() {
         use std::collections::HashSet;
         let profiled: HashSet<i32> = [1, 2].into_iter().collect();
+        // 3 still exists (unprofiled); 99 has been deleted.
+        let current: HashSet<i32> = [1, 2, 3].into_iter().collect();
         let edge = |to: i32, rejected: bool| AgentRelation {
             to,
             kind: "lib".into(),
@@ -3274,21 +3292,27 @@ mod tests {
         };
         // All live edges within the profiled set → markdown covers the graph.
         let within = vec![(1, vec![edge(2, false)]), (2, vec![])];
-        assert!(super::markdown_covers_graph(&profiled, &within));
+        assert!(super::markdown_covers_graph(&profiled, &current, &within));
 
-        // A profiled repo has a live edge to an UNPROFILED repo (3) → not covered
-        // (the target node is missing from the analyst's markdown).
+        // A profiled repo has a live edge to an UNPROFILED-but-current repo (3) →
+        // not covered (the target node is missing from the analyst's markdown).
         let to_unprofiled = vec![(1, vec![edge(3, false)]), (2, vec![])];
-        assert!(!super::markdown_covers_graph(&profiled, &to_unprofiled));
+        assert!(!super::markdown_covers_graph(&profiled, &current, &to_unprofiled));
 
-        // An UNPROFILED repo (3) owns a live edge → not covered (its source node is
-        // missing from the markdown).
+        // An UNPROFILED-but-current repo (3) owns a live edge → not covered (its
+        // source node is missing from the markdown).
         let from_unprofiled = vec![(1, vec![]), (3, vec![edge(1, false)])];
-        assert!(!super::markdown_covers_graph(&profiled, &from_unprofiled));
+        assert!(!super::markdown_covers_graph(&profiled, &current, &from_unprofiled));
 
         // A REJECTED edge to an unprofiled repo is a tombstone, not a live edge → covered.
         let rejected_only = vec![(1, vec![edge(3, true)]), (2, vec![])];
-        assert!(super::markdown_covers_graph(&profiled, &rejected_only));
+        assert!(super::markdown_covers_graph(&profiled, &current, &rejected_only));
+
+        // A live edge to a DELETED repo (99 ∉ current) is stale — the graph drops
+        // it, so it must NOT block coverage. (Regression: round-9 bug where this
+        // refused to republish the map forever after deleting an edge target.)
+        let to_deleted = vec![(1, vec![edge(99, false)]), (2, vec![])];
+        assert!(super::markdown_covers_graph(&profiled, &current, &to_deleted));
     }
 
     #[tokio::test]
