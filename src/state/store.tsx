@@ -591,8 +591,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("weft-active-workspace", String(id));
     // Drop the previous workspace's curator thread id so it is re-ensured lazily.
     setCuratorThreadId(null);
-    // Repos drawer: width persists (shared key with the old curator panel), but
-    // open state does not — each workspace visit starts with the canvas full-width.
+    // Repos side panel: open state resets each visit (canvas starts full-width);
+    // per-surface width is remembered in the panel's own localStorage, not here.
     setRepoDrawerOpen(false);
     setRepoDrawerTabState("detail");
     setSelectedRepoId(null);
