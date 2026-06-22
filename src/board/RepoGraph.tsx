@@ -10,8 +10,6 @@ import {
   Maximize2,
   Minus,
   Network,
-  PanelRightClose,
-  PanelRightOpen,
   Pencil,
   Plus,
   RefreshCw,
@@ -141,32 +139,10 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * relations and can be filtered by kind. Drag to pan, scroll/buttons to zoom.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps } = useStore();
+  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, selectedRepoId, openRepoDetail } = useStore();
   const [analyzing, setAnalyzing] = useState(false);
   const { t } = useTranslation();
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [profileOpen, setProfileOpen] = useState(true);
   const [mode, setMode] = useState<ViewMode>("overview");
-  const seededSelection = useRef(false);
-
-
-  // Seed the profile pane once so the repo map starts useful, while still
-  // letting the user close the pane afterwards.
-  useEffect(() => {
-    if (repoProfiles.length === 0) {
-      seededSelection.current = false;
-      setSelectedId(null);
-      return;
-    }
-    if (!seededSelection.current) {
-      seededSelection.current = true;
-      setSelectedId(repoProfiles[0].repo_id);
-      return;
-    }
-    if (selectedId != null && !repoProfiles.some((p) => p.repo_id === selectedId)) {
-      setSelectedId(repoProfiles[0].repo_id);
-    }
-  }, [repoProfiles, selectedId]);
 
   const layout = useMemo(() => {
     const dependents = (id: number) => repoEdges.filter((e) => e.to === id).length;
@@ -279,14 +255,14 @@ export function RepoGraph() {
   const anyComponents = repoProfiles.some((p) => p.components.length > 0);
 
   return (
-    <div className="flex h-full min-h-0 w-full gap-3 bg-bg p-4">
+    <div className="h-full min-h-0 w-full bg-bg p-4">
       <div
         ref={containerRef}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerLeave={endDrag}
-        className="relative min-w-0 flex-1 cursor-grab select-none overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface/35 [touch-action:none] active:cursor-grabbing"
+        className="relative h-full w-full cursor-grab select-none overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface/35 [touch-action:none] active:cursor-grabbing"
       >
         <div
           className="absolute left-0 top-0 origin-top-left"
@@ -317,7 +293,7 @@ export function RepoGraph() {
               const y1 = a.y + a.h / 2;
               const y2 = b.y + b.h / 2;
               const mx = (x1 + x2) / 2;
-              const active = selectedId === e.from || selectedId === e.to;
+              const active = selectedRepoId === e.from || selectedRepoId === e.to;
               return (
                 <path
                   key={i}
@@ -335,11 +311,8 @@ export function RepoGraph() {
             const pt = layout.pos.get(p.repo_id);
             if (!pt) return null;
             const dependents = repoEdges.filter((e) => e.to === p.repo_id).length;
-            const selected = selectedId === p.repo_id;
-            const onSelect = () => {
-              setSelectedId(p.repo_id);
-              setProfileOpen(true);
-            };
+            const selected = selectedRepoId === p.repo_id;
+            const onSelect = () => openRepoDetail(p.repo_id);
             const expanded = mode === "expanded" && p.components.length > 0;
             return expanded ? (
               <ExpandedNode
@@ -421,21 +394,6 @@ export function RepoGraph() {
           </div>
         </div>
       </div>
-
-      {profileOpen ? (
-        <RepoProfilePane
-          profile={repoProfiles.find((p) => p.repo_id === selectedId)}
-          edges={repoEdges}
-          profiles={repoProfiles}
-          onSelect={(id) => {
-            setSelectedId(id);
-            setProfileOpen(true);
-          }}
-          onCollapse={() => setProfileOpen(false)}
-        />
-      ) : (
-        <CollapsedProfileRail onOpen={() => setProfileOpen(true)} />
-      )}
     </div>
   );
 }
@@ -854,47 +812,32 @@ function AnalyzedProfileFields({
   );
 }
 
-function RepoProfilePane({
-  profile,
-  profiles,
-  edges,
-  onSelect,
-  onCollapse,
-}: {
-  profile?: RepoProfile;
-  profiles: RepoProfile[];
-  edges: RepoEdge[];
-  onSelect: (id: number) => void;
-  onCollapse: () => void;
-}) {
+/** Detail body for the drawer: same content as the old RepoProfilePane, but
+ *  store-driven (by repoId), without the fixed-width aside shell or the collapse
+ *  button (the drawer owns close). */
+export function RepoDetailContent({ repoId }: { repoId: number | null }) {
   const { t } = useTranslation();
-  const { reprofileRepo, deleteRepo } = useStore();
+  const { repoProfiles, repoEdges, reprofileRepo, deleteRepo, openRepoDetail } = useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const profile = repoId != null ? repoProfiles.find((p) => p.repo_id === repoId) : undefined;
   // Always call the hook (rules of hooks) — it no-ops when there's no profile.
   const stream = useAnalysisStream(profile);
-  if (!profile) return <EmptyProfilePane />;
+  if (!profile) return <EmptyProfileBody />;
 
-  const deps = edges
+  const deps = repoEdges
     .filter((e) => e.from === profile.repo_id)
-    .map((e) => ({ edge: e, repo: profiles.find((p) => p.repo_id === e.to) }))
+    .map((e) => ({ edge: e, repo: repoProfiles.find((p) => p.repo_id === e.to) }))
     .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
-  const usedBy = edges
+  const usedBy = repoEdges
     .filter((e) => e.to === profile.repo_id)
-    .map((e) => ({ edge: e, repo: profiles.find((p) => p.repo_id === e.from) }))
+    .map((e) => ({ edge: e, repo: repoProfiles.find((p) => p.repo_id === e.from) }))
     .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
   const Icon = TIER_ICON[bandOf(profile.tier)] ?? CircleDashed;
   const retry = () => void reprofileRepo(profile.repo_id);
   const view = analysisView(profile, stream.phase);
 
-  // A live (re-)analysis takes over the pane to show the streamed process. EVERY
-  // other view shows the editable calibration fields (manual tiering / summary
-  // must work even for a placeholder or a repo whose analysis failed — the
-  // backend supports it), with a status notice keyed by the discriminant on top.
   const notices: Partial<Record<AnalysisView, React.ReactNode>> = {
-    // The live stream's error wins; fall back to the persisted `analysis_error`
-    // when a failed repo is selected with no live event yet (the hook seeds no
-    // error from the profile, so without this the detail would be blank).
     failed: <FailedNotice error={stream.error ?? profile.analysis_error ?? null} onRetry={retry} />,
     pending: <PendingNotice onAnalyze={retry} />,
   };
@@ -906,13 +849,13 @@ function RepoProfilePane({
         profile={profile}
         deps={deps}
         usedBy={usedBy}
-        onSelect={onSelect}
+        onSelect={openRepoDetail}
         notice={notices[view]}
       />
     );
 
   return (
-    <aside className="flex w-[320px] shrink-0 flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface">
+    <div className="flex h-full min-h-0 flex-col">
       <div className="border-b border-border px-4 py-3">
         <div className="flex min-h-10 items-center gap-2.5">
           <span className="grid h-8 w-8 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost">
@@ -937,14 +880,6 @@ function RepoProfilePane({
             className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-danger/10 hover:text-danger"
           >
             <Trash2 size={14} />
-          </button>
-          <button
-            onClick={onCollapse}
-            aria-label={t("repomap.collapseProfile")}
-            title={t("repomap.collapseProfile")}
-            className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-          >
-            <PanelRightClose size={14} />
           </button>
         </div>
       </div>
@@ -973,7 +908,7 @@ function RepoProfilePane({
           </div>
         </DialogContent>
       </Dialog>
-    </aside>
+    </div>
   );
 }
 
@@ -1036,29 +971,15 @@ function ComponentList({ components }: { components: RepoComponent[] }) {
   );
 }
 
-function CollapsedProfileRail({ onOpen }: { onOpen: () => void }) {
+/** Drawer detail tab with no repo selected. */
+function EmptyProfileBody() {
   const { t } = useTranslation();
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      aria-label={t("repomap.expandProfile")}
-      title={t("repomap.expandProfile")}
-      className="flex w-10 shrink-0 items-start justify-center rounded-[var(--radius-lg)] border border-border bg-surface pt-3 text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-    >
-      <PanelRightOpen size={15} />
-    </button>
-  );
-}
-
-function EmptyProfilePane() {
-  const { t } = useTranslation();
-  return (
-    <aside className="flex w-[320px] shrink-0 flex-col items-center justify-center rounded-[var(--radius-lg)] border border-border bg-surface px-5 text-center">
+    <div className="flex h-full flex-col items-center justify-center px-5 text-center">
       <CircleDashed size={22} className="text-ink-faint" />
       <p className="mt-3 text-[13px] font-medium text-ink">{t("repomap.selectRepo")}</p>
       <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">{t("repomap.selectRepoBody")}</p>
-    </aside>
+    </div>
   );
 }
 

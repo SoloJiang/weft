@@ -406,6 +406,7 @@ export const en = {
     reanalyze: "Analyze deps",
     reanalyzing: "Analyzing…",
     reanalyzeHint: "Re-run the agent to classify each repo's tier and infer cross-repo links (read-only)",
+    detailTab: "Detail",
     curatorTitle: "Curator",
     curatorSubtitle: "Calibrate cross-repo dependencies",
     curatorLoading: "Opening curator…",

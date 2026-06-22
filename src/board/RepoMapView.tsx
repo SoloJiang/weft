@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Network } from "lucide-react";
 import { useStore } from "../state/store";
 import { RepoGraph } from "./RepoGraph";
-import { CuratorPanel } from "./CuratorPanel";
+import { RepoDrawer } from "./RepoDrawer";
 import { useRepoActions } from "../session/useRepoActions";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
@@ -27,17 +27,10 @@ export function RepoMapView({ embedded = false }: { embedded?: boolean }) {
       <div className="min-h-0 flex-1">
         <EmptyMap />
       </div>
-    ) : repoProfiles.length < 2 ? (
-      <div className="min-h-0 flex-1">
-        <RepoGraph />
-      </div>
     ) : (
-      // >=2 repos: graph + the curator chat panel docked beside it.
-      <div className="flex min-h-0 flex-1">
-        <div className="min-w-0 flex-1">
-          <RepoGraph />
-        </div>
-        <CuratorPanel />
+      <div className="relative min-h-0 flex-1">
+        <RepoGraph />
+        <RepoDrawer />
       </div>
     );
 
