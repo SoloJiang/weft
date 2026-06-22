@@ -1259,7 +1259,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           void api
             .getProposal(tid)
             .then((pr) => {
-              if (pr) setProposal(pr);
+              if (!pr) return;
+              setProposal(pr);
+              // A withdrawn/confirmed refresh must also drop a stale review flag: otherwise
+              // a later re-propose in this thread would auto-reopen ScopeReview without the
+              // user clicking the new review card (ThreadBoard gates open on status+flag).
+              if (pr.status !== "proposed") setReviewingProposal(false);
             })
             .catch(() => {});
         }

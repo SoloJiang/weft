@@ -482,9 +482,16 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "propose_directions" => {
-            let proposal: crate::planner::Proposal =
-                serde_json::from_value(args.clone()).unwrap_or_default();
-            // Empty directions is NOT a proposal — it's a cancel. Route it to the same
+            // A MALFORMED payload is not a cancel — surface the parse error to the lead
+            // (so it retries) instead of defaulting to an empty proposal that would take
+            // the withdraw path and silently clear an existing pending plan.
+            let proposal: crate::planner::Proposal = match serde_json::from_value(args.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return text_result(format!("error: invalid propose_directions payload: {e}"))
+                }
+            };
+            // An explicitly EMPTY directions list is a cancel. Route it to the same
             // withdraw path as `cancel_directions`, so a stray empty propose can never
             // persist a "proposed" 0-direction plan or the dead-end "查看并创建" card.
             if proposal.directions.is_empty() {

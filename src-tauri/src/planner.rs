@@ -311,8 +311,15 @@ pub async fn withdraw_proposal(db: &Db, thread_id: i32, rationale: &str) -> Resu
     // with them at the DB level (see `thread_gate`).
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
-    // Nothing proposed yet → no plan to withdraw; the caller still emits the row.
-    if repo::get_plan(db, thread_id).await?.is_none() {
+    // Cancel applies only to a still-pending proposal. Nothing proposed → no plan to
+    // withdraw (the caller still emits the row). And NEVER clobber a CONFIRMED plan: if
+    // a cancel races a confirm and the confirm wins the gate first, the plan already
+    // carries dispatched workers + recorded direction_ids — overwriting it with an empty
+    // "withdrawn" proposal would orphan those worktrees and break the confirmed fast-path.
+    let Some(plan) = repo::get_plan(db, thread_id).await? else {
+        return Ok(());
+    };
+    if plan.status == "confirmed" {
         return Ok(());
     }
     // Store an EMPTY proposal (keep the rationale for the record): a confirm racing
@@ -1705,6 +1712,46 @@ mod tests {
         assert!(confirm(&db, t.id).await.is_err(), "a withdrawn plan must not confirm");
         assert!(repo::list_directions(&db, t.id).await.unwrap().is_empty(), "no direction materialized from a withdrawn plan");
 
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn confirmed_plan_survives_late_withdraw() {
+        // A cancel that lands AFTER confirm (confirm won the gate first) must not clobber
+        // the confirmed plan: workers were dispatched and direction_ids recorded.
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-withdraw-confirmed-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let proposal = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"impl-only".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        let confirmed_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(confirmed_ids.len(), 1, "confirm dispatches the lane");
+        assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1);
+
+        // A late cancel must be a no-op on a confirmed plan.
+        withdraw_proposal(&db, t.id, "late cancel").await.unwrap();
+
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "confirmed", "a confirmed plan stays confirmed after a late withdraw");
+        let parsed: Proposal = serde_json::from_str(&after.proposal).unwrap();
+        assert_eq!(parsed.directions.len(), 1, "confirmed directions are preserved (not cleared)");
+        assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "dispatched direction survives the late withdraw");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
