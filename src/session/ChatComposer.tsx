@@ -40,6 +40,8 @@ type SlashItem = {
   argHint?: string;
 };
 
+const IME_ENTER_GRACE_MS = 100;
+
 export function ChatComposer({
   slashCommands,
   localSlash,
@@ -146,6 +148,7 @@ function ChatComposerBody({
   const askedSlashRef = useRef(false);
   const lastSendRef = useRef(0);
   const composingRef = useRef(false);
+  const lastCompositionEndRef = useRef<number | null>(null);
 
   const slashQuery =
     text.startsWith("/") && !text.includes(" ") ? text.slice(1) : null;
@@ -319,7 +322,10 @@ function ChatComposerBody({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && e.nativeEvent.isComposing) return;
+    if (shouldBlockImeEnter(e)) {
+      blockImeEnter(e);
+      return;
+    }
     if (!paletteOpen) return;
 
     if (e.key === "ArrowDown") {
@@ -348,6 +354,19 @@ function ChatComposerBody({
       e.preventDefault();
       setText("");
     }
+  };
+
+  const shouldBlockImeEnter = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== "Enter") return false;
+    if (e.nativeEvent.isComposing || composingRef.current) return true;
+    const endedAt = lastCompositionEndRef.current;
+    if (endedAt == null) return false;
+    return performance.now() - endedAt < IME_ENTER_GRACE_MS;
+  };
+
+  const blockImeEnter = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
   };
 
   const allAttachments = useMemo(() => {
@@ -472,13 +491,15 @@ function ChatComposerBody({
               onFocus={() => setDismissed(false)}
               onCompositionStart={() => {
                 composingRef.current = true;
+                lastCompositionEndRef.current = null;
               }}
               onCompositionEnd={() => {
                 composingRef.current = false;
+                lastCompositionEndRef.current = performance.now();
               }}
               onKeyDownCapture={(e) => {
-                if (e.key === "Enter" && composingRef.current) {
-                  e.stopPropagation();
+                if (shouldBlockImeEnter(e)) {
+                  blockImeEnter(e);
                 }
               }}
               onPaste={onPaste}
