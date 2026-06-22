@@ -177,6 +177,25 @@ fn pep508_name(spec: &str) -> &str {
     &spec[..end]
 }
 
+/// PEP 503 normalisation: lowercase, collapse runs of `-`/`_`/`.` to a single `-`.
+fn normalize_python_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let mut result = String::with_capacity(lower.len());
+    let mut last_was_sep = false;
+    for ch in lower.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !last_was_sep {
+                result.push('-');
+            }
+            last_was_sep = true;
+        } else {
+            result.push(ch);
+            last_was_sep = false;
+        }
+    }
+    result
+}
+
 pub fn parse_pyproject(s: &str) -> ManifestInfo {
     let Ok(val) = s.parse::<toml::Value>() else {
         return ManifestInfo::default();
@@ -186,16 +205,18 @@ pub fn parse_pyproject(s: &str) -> ManifestInfo {
     // PEP 621: [project].name and [project].dependencies
     if let Some(project) = val.get("project") {
         if let Some(name) = project.get("name").and_then(|n| n.as_str()) {
-            if !name.is_empty() {
-                info.provides.push(name.to_string());
+            let norm = normalize_python_name(name);
+            if !norm.is_empty() {
+                info.provides.push(norm);
             }
         }
         if let Some(deps) = project.get("dependencies").and_then(|d| d.as_array()) {
             for item in deps {
                 if let Some(spec) = item.as_str() {
-                    let name = pep508_name(spec);
-                    if !name.is_empty() {
-                        info.requires.push(name.to_string());
+                    let raw = pep508_name(spec);
+                    let norm = normalize_python_name(raw);
+                    if !norm.is_empty() {
+                        info.requires.push(norm);
                     }
                 }
             }
@@ -208,14 +229,15 @@ pub fn parse_pyproject(s: &str) -> ManifestInfo {
         .and_then(|t| t.get("poetry"))
     {
         if let Some(name) = poetry.get("name").and_then(|n| n.as_str()) {
-            if !name.is_empty() && !info.provides.contains(&name.to_string()) {
-                info.provides.push(name.to_string());
+            let norm = normalize_python_name(name);
+            if !norm.is_empty() && !info.provides.contains(&norm) {
+                info.provides.push(norm);
             }
         }
         if let Some(table) = poetry.get("dependencies").and_then(|d| d.as_table()) {
             for key in table.keys() {
                 if key != "python" {
-                    info.requires.push(key.clone());
+                    info.requires.push(normalize_python_name(key));
                 }
             }
         }
@@ -255,6 +277,16 @@ fn pom_coord(node: roxmltree::Node) -> Option<String> {
     Some(coord)
 }
 
+/// Extract the groupId from a `<parent>` element, if present.
+fn pom_parent_group(root: roxmltree::Node) -> Option<String> {
+    for child in root.children() {
+        if child.tag_name().name() == "parent" {
+            return pom_child_text(child, "groupId");
+        }
+    }
+    None
+}
+
 pub fn parse_pom_xml(s: &str) -> ManifestInfo {
     let Ok(doc) = roxmltree::Document::parse(s) else {
         return ManifestInfo::default();
@@ -262,8 +294,16 @@ pub fn parse_pom_xml(s: &str) -> ManifestInfo {
     let mut info = ManifestInfo::default();
 
     let root = doc.root_element();
-    // The root <project> element — provides is groupId:artifactId
-    if let Some(coord) = pom_coord(root) {
+
+    // Build the project's effective provides coordinate.
+    // When own <groupId> is absent, inherit from <parent><groupId>.
+    if let Some(artifact) = pom_child_text(root, "artifactId") {
+        let group = pom_child_text(root, "groupId")
+            .or_else(|| pom_parent_group(root));
+        let coord = match group {
+            Some(g) => format!("{g}:{artifact}"),
+            None => artifact,
+        };
         info.provides.push(coord);
     }
 
@@ -356,6 +396,57 @@ pub fn parse_gradle(s: &str) -> ManifestInfo {
     info
 }
 
+/// Best-effort: read `rootProject.name` from settings.gradle[.kts] and
+/// `group` from build.gradle[.kts], then emit `group:name` (or bare `name`).
+pub fn parse_gradle_provides(settings_src: &str, build_src: &str) -> Vec<String> {
+    let mut name: Option<String> = None;
+    let mut group: Option<String> = None;
+
+    for line in settings_src.lines() {
+        let t = line.trim();
+        if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+            continue;
+        }
+        // rootProject.name = "x"  or  rootProject.name 'x'
+        if let Some(rest) = t.strip_prefix("rootProject.name") {
+            let rest = rest.trim_start_matches(|c: char| c == ' ' || c == '=' || c == '(');
+            let value = rest
+                .trim_start_matches(|c| c == '\'' || c == '"')
+                .trim_end_matches(|c: char| c == '\'' || c == '"' || c == ')' || c == ';');
+            let value = value.trim();
+            if !value.is_empty() {
+                name = Some(value.to_string());
+                break;
+            }
+        }
+    }
+
+    for line in build_src.lines() {
+        let t = line.trim();
+        if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+            continue;
+        }
+        // group = "x"  or  group "x"  or  group 'x'
+        if let Some(rest) = t.strip_prefix("group") {
+            let rest = rest.trim_start_matches(|c: char| c == ' ' || c == '=' || c == '(');
+            let value = rest
+                .trim_start_matches(|c| c == '\'' || c == '"')
+                .trim_end_matches(|c: char| c == '\'' || c == '"' || c == ')' || c == ';');
+            let value = value.trim();
+            if !value.is_empty() {
+                group = Some(value.to_string());
+                break;
+            }
+        }
+    }
+
+    match (group, name) {
+        (Some(g), Some(n)) => vec![format!("{g}:{n}")],
+        (None, Some(n)) => vec![n],
+        _ => vec![],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // scan_repo
 // ---------------------------------------------------------------------------
@@ -398,15 +489,41 @@ fn scan_dir(dir: &Path, result: &mut ManifestInfo) {
 /// Shallow monorepo dirs to check one level into.
 const MONOREPO_DIRS: &[&str] = &["packages", "apps", "services", "crates"];
 
+/// Returns true if `path` is itself a symlink (does not follow the link).
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 pub fn scan_repo(repo_root: &Path) -> ManifestInfo {
     let mut result = ManifestInfo::default();
 
     // Top-level manifests
     scan_dir(repo_root, &mut result);
 
+    // Gradle provides at the repo root (settings.gradle[.kts] + build.gradle[.kts]).
+    let settings_content = ["settings.gradle", "settings.gradle.kts"]
+        .iter()
+        .find_map(|n| std::fs::read_to_string(repo_root.join(n)).ok())
+        .unwrap_or_default();
+    let build_content = ["build.gradle", "build.gradle.kts"]
+        .iter()
+        .find_map(|n| std::fs::read_to_string(repo_root.join(n)).ok())
+        .unwrap_or_default();
+    if !settings_content.is_empty() || !build_content.is_empty() {
+        for p in parse_gradle_provides(&settings_content, &build_content) {
+            result.provides.push(p);
+        }
+    }
+
     // One level into standard monorepo sub-dirs
     for subdir_name in MONOREPO_DIRS {
         let subdir = repo_root.join(subdir_name);
+        // Finding 1: skip when the container dir itself is a symlink.
+        if is_symlink(&subdir) {
+            continue;
+        }
         if !subdir.is_dir() {
             continue;
         }
@@ -415,16 +532,29 @@ pub fn scan_repo(repo_root: &Path) -> ManifestInfo {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // Skip symlinks — they may point outside the repo tree.
-            let meta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.file_type().is_symlink() {
+            // Skip symlinked entries — they may point outside the repo tree.
+            if is_symlink(&path) {
                 continue;
             }
             if path.is_dir() {
-                scan_dir(&path, &mut result);
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if dir_name.starts_with('@') {
+                    // Finding 5: npm scoped dir — descend one more level.
+                    let Ok(scoped_entries) = std::fs::read_dir(&path) else {
+                        continue;
+                    };
+                    for scoped_entry in scoped_entries.flatten() {
+                        let scoped_path = scoped_entry.path();
+                        if is_symlink(&scoped_path) {
+                            continue;
+                        }
+                        if scoped_path.is_dir() {
+                            scan_dir(&scoped_path, &mut result);
+                        }
+                    }
+                } else {
+                    scan_dir(&path, &mut result);
+                }
             }
         }
     }
@@ -499,7 +629,8 @@ mod tests {
     fn pyproject_pep621_name_and_deps() {
         let s = "[project]\nname = \"acme_api\"\ndependencies = [\"acme-shared==1.0\", \"fastapi>=0.1\"]\n";
         let m = parse_pyproject(s);
-        assert!(m.provides.contains(&"acme_api".to_string()));
+        // PEP 503: acme_api normalises to acme-api
+        assert!(m.provides.contains(&"acme-api".to_string()));
         assert!(m.requires.iter().any(|r| r == "acme-shared"));
         assert!(m.requires.iter().any(|r| r == "fastapi"));
     }
@@ -666,6 +797,149 @@ dependencies {
         // serde_json deduplicates object keys, and our dedup handles Vec level
         let react_count = m.requires.iter().filter(|r| *r == "react").count();
         assert_eq!(react_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 1: symlinked CONTAINER dir excluded
+    // -----------------------------------------------------------------------
+    #[test]
+    #[cfg(unix)]
+    fn scan_repo_symlink_container_excluded() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let tmp = std::env::temp_dir()
+            .join(format!("weft_symlink_container_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // An external dir that acts as the "packages" tree.
+        let external = tmp.join("external_packages");
+        fs::create_dir_all(external.join("comp")).unwrap();
+        fs::write(
+            external.join("comp").join("package.json"),
+            r#"{"name":"container-secret","dependencies":{}}"#,
+        )
+        .unwrap();
+
+        // Make packages/ itself a symlink → external.
+        symlink(&external, tmp.join("packages")).unwrap();
+
+        let info = scan_repo(&tmp);
+
+        assert!(
+            !info.provides.contains(&"container-secret".to_string()),
+            "symlinked container must not be descended: {:?}",
+            info.provides
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 2: Maven parent groupId resolution
+    // -----------------------------------------------------------------------
+    #[test]
+    fn pom_inherits_group_from_parent() {
+        let s = r#"<project>
+            <parent><groupId>com.acme</groupId><artifactId>parent</artifactId></parent>
+            <artifactId>core</artifactId>
+            <dependencies></dependencies>
+        </project>"#;
+        let m = parse_pom_xml(s);
+        assert!(
+            m.provides.contains(&"com.acme:core".to_string()),
+            "provides must inherit parent groupId: {:?}",
+            m.provides
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 3: PEP 503 name normalisation
+    // -----------------------------------------------------------------------
+    #[test]
+    fn python_pep503_normalisation() {
+        // provides: acme_shared → acme-shared
+        let provides_src = "[project]\nname = \"acme_shared\"\n";
+        let mp = parse_pyproject(provides_src);
+        assert!(
+            mp.provides.contains(&"acme-shared".to_string()),
+            "provides must be normalised: {:?}",
+            mp.provides
+        );
+
+        // requires: Acme.Shared → acme-shared
+        let requires_src =
+            "[project]\nname = \"other\"\ndependencies = [\"Acme.Shared>=1.0\"]\n";
+        let mr = parse_pyproject(requires_src);
+        assert!(
+            mr.requires.contains(&"acme-shared".to_string()),
+            "requires must be normalised: {:?}",
+            mr.requires
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 4: Gradle provides
+    // -----------------------------------------------------------------------
+    #[test]
+    fn gradle_provides_group_and_name() {
+        let settings = "rootProject.name = \"core\"\n";
+        let build = "group = \"com.acme\"\nversion = \"1.0\"\n";
+        let provides = parse_gradle_provides(settings, build);
+        assert!(
+            provides.contains(&"com.acme:core".to_string()),
+            "gradle provides must be group:name: {:?}",
+            provides
+        );
+    }
+
+    #[test]
+    fn gradle_provides_name_only() {
+        let settings = "rootProject.name = \"mylib\"\n";
+        let provides = parse_gradle_provides(settings, "");
+        assert!(
+            provides.contains(&"mylib".to_string()),
+            "gradle provides bare name when no group: {:?}",
+            provides
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 5: scoped npm package dirs
+    // -----------------------------------------------------------------------
+    #[test]
+    fn scan_repo_scoped_npm_packages() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir()
+            .join(format!("weft_scoped_npm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // packages/@acme/ui/package.json
+        let ui_dir = tmp.join("packages").join("@acme").join("ui");
+        fs::create_dir_all(&ui_dir).unwrap();
+        fs::write(
+            ui_dir.join("package.json"),
+            r#"{"name":"@acme/ui","dependencies":{"react":"^18"}}"#,
+        )
+        .unwrap();
+
+        let info = scan_repo(&tmp);
+
+        assert!(
+            info.provides.contains(&"@acme/ui".to_string()),
+            "scoped package must be found: {:?}",
+            info.provides
+        );
+        assert!(
+            info.requires.contains(&"react".to_string()),
+            "scoped package deps must be found: {:?}",
+            info.requires
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     /// scan_repo must NOT follow symlinked subdirectories under monorepo dirs.
