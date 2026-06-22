@@ -6,10 +6,9 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 
 /**
  * 常驻右栏「会话信息」:Context(token + %,不含花费)、Sub-tasks、Skills、MCP。
- * Skills/MCP/Sub-tasks 共享同一套渐进披露(<Section> 折叠头 + <OverflowList>
- * head+show-more):Skills/MCP 头可整段折叠,Sub-tasks 头常驻(最相关,不可隐藏);
- * 三者都用同一个 head + "Show N more" 控件封长列表。纯展示——数据由 store 的
- * leadMeta/workerMeta + workspaceSkills + directionsByThread 喂。
+ * Sub-tasks/Skills/MCP 共享 <Section> 静态头 + <OverflowList>(head+show-more):
+ * 头常驻只读,长列表用同一个 head + "Show N more" 控件折叠尾部。纯展示——数据由
+ * store 的 leadMeta/workerMeta + workspaceSkills + directionsByThread 喂。
  */
 export function SessionInfoPanel({
   meta,
@@ -131,10 +130,10 @@ export function SessionInfoPanel({
         {/* Sub-tasks — created directions, newest first. Lead-only. The header
             stays put (most task-relevant → not hideable); the list caps at 3. */}
         {sortedSubtasks.length > 0 && (
-          // Stable keys keep each section's disclosure state attached to itself:
-          // these same-type <Section> siblings would otherwise reconcile by
-          // position, so inserting Sub-tasks (0→≥1 live) would migrate Skills'
-          // and MCP's useState to the wrong section.
+          // Stable keys pin each section's nested disclosure state (OverflowList
+          // show-more, McpRow tool-expand) to itself — else inserting Sub-tasks
+          // (0→≥1) reconciles these same-type siblings by position and migrates
+          // Skills'/MCP's state to the wrong section.
           <Section key="subtasks" title={t("sessionInfo.subtasks")} count={sortedSubtasks.length}>
             <OverflowList
               items={sortedSubtasks}
@@ -145,13 +144,8 @@ export function SessionInfoPanel({
           </Section>
         )}
 
-        {/* Skills — collapsible; chips cap at 10 (chips are dense). */}
-        <Section
-          key="skills"
-          title={t("sessionInfo.skills")}
-          count={allSkills.length}
-          collapsible={allSkills.length > 0}
-        >
+        {/* Skills — chips cap at 10 (chips are dense). */}
+        <Section key="skills" title={t("sessionInfo.skills")} count={allSkills.length}>
           {allSkills.length === 0 ? (
             <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
           ) : (
@@ -172,8 +166,8 @@ export function SessionInfoPanel({
           )}
         </Section>
 
-        {/* MCP — collapsible; servers cap at 3, each row expands its tools. */}
-        <Section key="mcp" title={t("sessionInfo.mcp")} count={servers.length} collapsible={servers.length > 0}>
+        {/* MCP — servers cap at 3, each row expands its tools. */}
+        <Section key="mcp" title={t("sessionInfo.mcp")} count={servers.length}>
           {servers.length > 0 ? (
             <OverflowList
               items={servers}
@@ -192,61 +186,23 @@ export function SessionInfoPanel({
   );
 }
 
-/**
- * A panel section: label + count header over a body. When `collapsible`, the
- * header is a button that folds the whole body (chevron, grid-rows animation);
- * otherwise it's a static label and the body always shows. Default expanded.
- */
+/** A panel section: a static label + count header over a body that always shows. */
 function Section({
   title,
   count,
-  collapsible = false,
   children,
 }: {
   title: string;
   count?: number;
-  collapsible?: boolean;
   children: ReactNode;
 }) {
-  const [open, setOpen] = useState(true);
-  const header = (
-    <>
-      <span className="text-[11px] text-ink-faint">{title}</span>
-      {count != null && <span className="ml-auto text-[11px] text-ink-faint">{count}</span>}
-      {collapsible &&
-        (open ? (
-          <ChevronDown size={13} className="ml-1 text-ink-faint" />
-        ) : (
-          <ChevronRight size={13} className="ml-1 text-ink-faint" />
-        ))}
-    </>
-  );
   return (
     <section className="border-b border-border px-4 py-3">
-      {collapsible ? (
-        <button type="button" onClick={() => setOpen((v) => !v)} className="flex w-full items-center">
-          {header}
-        </button>
-      ) : (
-        <div className="flex items-center">{header}</div>
-      )}
-      {collapsible ? (
-        // grid-rows 0fr→1fr animates the body open/closed; inner overflow-hidden
-        // clips it (margins included) mid-anim.
-        <div
-          className={`grid transition-[grid-template-rows] duration-200 ease-out ${
-            open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
-          }`}
-        >
-          {/* `inert` when collapsed: body stays mounted for the animation but
-              leaves the tab order / a11y tree (clipped content isn't focusable). */}
-          <div className="overflow-hidden" inert={!open}>
-            {children}
-          </div>
-        </div>
-      ) : (
-        children
-      )}
+      <div className="flex items-center">
+        <span className="text-[11px] text-ink-faint">{title}</span>
+        {count != null && <span className="ml-auto text-[11px] text-ink-faint">{count}</span>}
+      </div>
+      {children}
     </section>
   );
 }
@@ -293,16 +249,19 @@ function OverflowList<T>({
           <button
             type="button"
             onClick={() => setOpen((v) => !v)}
-            className="mt-1.5 flex w-full items-center gap-1 px-1.5 text-[11px] text-ink-faint transition-colors hover:text-ink"
+            // No left inset; the chevron's -ml-1 cancels the lucide glyph's
+            // internal whitespace so the visible arrow lines up with the section
+            // title and the row dots/icons at the content edge.
+            className="mt-1.5 flex w-full items-center gap-1 text-[11px] text-ink-faint transition-colors hover:text-ink"
           >
             {open ? (
               <>
-                <ChevronDown size={13} />
+                <ChevronDown size={13} className="-ml-1" />
                 {t("sessionInfo.showLess")}
               </>
             ) : (
               <>
-                <ChevronRight size={13} />
+                <ChevronRight size={13} className="-ml-1" />
                 {t("sessionInfo.showMore", { count: rest.length })}
               </>
             )}
@@ -340,7 +299,9 @@ function subtaskDot(status: string): string {
 // status dot.
 function SubtaskRow({ direction }: { direction: Direction }) {
   return (
-    <div className="flex items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1">
+    // -mx-1.5 mirrors McpRow: the tool icon lines up with the section title
+    // (and the show-more chevron) at the content edge.
+    <div className="-mx-1.5 flex items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1">
       <span
         title={toolFullName(direction.tool)}
         className="grid h-5 w-5 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-border bg-bg text-ink-muted"
@@ -365,7 +326,9 @@ function McpRow({ name, status, tools }: { name: string; status: string; tools: 
     status === "connected" ? "bg-running" : status === "failed" ? "bg-danger" : "bg-idle";
   const hasTools = tools.length > 0;
   return (
-    <div>
+    // -mx-1.5 pulls the row out so the status dot lines up with the section
+    // title; the button keeps px-1.5 so the hover pill stays inset.
+    <div className="-mx-1.5">
       <button
         onClick={() => hasTools && setOpen((v) => !v)}
         title={status}
