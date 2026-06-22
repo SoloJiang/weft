@@ -209,6 +209,7 @@ function InputGroupButton({
         variant="primary"
         disabled={disabled}
         title={title}
+        aria-label={title}
         onClick={onClick}
         className="h-8 w-8"
       >
@@ -234,13 +235,15 @@ export function PromptInputButton({
   readonly tooltip?: string;
 }) {
   const ctx = usePromptInput();
+  const accessibleLabel = title ?? tooltip;
   const button = (
     <Button
       type="button"
       size="icon"
       variant="ghost"
       disabled={ctx.disabled || disabled}
-      title={title}
+      title={accessibleLabel}
+      aria-label={accessibleLabel}
       onClick={onClick}
       className={cn("h-7 w-7", className)}
     >
@@ -342,7 +345,7 @@ export function PromptInputAttachment({
           size="icon"
           variant="ghost"
           onClick={onRemove}
-          className="absolute right-0.5 top-1/2 h-5 w-5 -translate-y-1/2 opacity-0 transition-opacity group-hover/attachment:opacity-100"
+          className="absolute right-0.5 top-1/2 h-5 w-5 -translate-y-1/2 opacity-0 transition-opacity group-hover/attachment:opacity-100 group-focus-within/attachment:opacity-100 focus-visible:opacity-100"
           aria-label={removeLabel}
         >
           <X size={12} />

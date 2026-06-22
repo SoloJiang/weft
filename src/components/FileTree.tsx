@@ -232,6 +232,11 @@ function FolderTrigger({ expanded }: { expanded: boolean }) {
         className="grid h-4 w-4 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-faint transition-[color,transform] duration-150 ease-[var(--ease-out-quint)] hover:text-ink"
         aria-label={expanded ? t("files.collapseFolder") : t("files.expandFolder")}
         onClick={stopPropagation}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.stopPropagation();
+          }
+        }}
       >
         <ChevronRightIcon
           size={14}
