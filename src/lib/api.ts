@@ -174,6 +174,18 @@ export const api = {
   chatInterrupt: (sessionId: number) =>
     invoke<void>("chat_interrupt", { sessionId }),
   chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),
+  chatDequeue: (sessionId: number, messageId: number) =>
+    invoke<void>("chat_dequeue", { sessionId, messageId }),
+  chatEditQueued: (sessionId: number, messageId: number, text: string) =>
+    invoke<void>("chat_edit_queued", { sessionId, messageId, text }),
+  chatReorderQueue: (sessionId: number, order: number[]) =>
+    invoke<void>("chat_reorder_queue", { sessionId, order }),
+  leadDequeue: (threadId: number, messageId: number) =>
+    invoke<void>("lead_dequeue", { threadId, messageId }),
+  leadEditQueued: (threadId: number, messageId: number, text: string) =>
+    invoke<void>("lead_edit_queued", { threadId, messageId, text }),
+  leadReorderQueue: (threadId: number, order: number[]) =>
+    invoke<void>("lead_reorder_queue", { threadId, order }),
   sessionFor: (directionId: number, repoId: number) =>
     invoke<ObserveRef | null>("session_for", { directionId, repoId }),
   sessionMeta: (directionId: number, repoId: number) =>

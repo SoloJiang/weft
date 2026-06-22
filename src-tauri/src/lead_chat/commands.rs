@@ -1129,6 +1129,54 @@ pub async fn chat_stop(app: AppHandle, session_id: i32) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub async fn chat_dequeue(app: AppHandle, db: State<'_, Db>, session_id: i32, message_id: i32) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::queue_remove(&app, &db, &eng, message_id).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_edit_queued(app: AppHandle, db: State<'_, Db>, session_id: i32, message_id: i32, text: String) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::queue_edit(&app, &db, &eng, message_id, &text).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_reorder_queue(app: AppHandle, db: State<'_, Db>, session_id: i32, order: Vec<i32>) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::queue_reorder(&app, &db, &eng, order).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lead_dequeue(app: AppHandle, db: State<'_, Db>, thread_id: i32, message_id: i32) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+        engine::queue_remove(&app, &db, &eng, message_id).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lead_edit_queued(app: AppHandle, db: State<'_, Db>, thread_id: i32, message_id: i32, text: String) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+        engine::queue_edit(&app, &db, &eng, message_id, &text).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lead_reorder_queue(app: AppHandle, db: State<'_, Db>, thread_id: i32, order: Vec<i32>) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+        engine::queue_reorder(&app, &db, &eng, order).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// idle-time skill refresh (worker): re-inject the workspace's enabled skills
 /// into the live session's cwd and flag the engine so the next send silently
 /// restarts the resident process to pick them up. No-op if the engine is gone.
