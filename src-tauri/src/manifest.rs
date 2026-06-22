@@ -229,10 +229,10 @@ pub fn parse_pyproject(s: &str) -> ManifestInfo {
 // pom.xml
 // ---------------------------------------------------------------------------
 
-/// Extract `artifactId` text from the immediate children of a node.
-fn pom_artifact_id(node: roxmltree::Node) -> Option<String> {
+/// Extract the text of a named immediate child element.
+fn pom_child_text<'a>(node: roxmltree::Node<'a, 'a>, tag: &str) -> Option<String> {
     for child in node.children() {
-        if child.tag_name().name() == "artifactId" {
+        if child.tag_name().name() == tag {
             if let Some(text) = child.text() {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
@@ -244,6 +244,17 @@ fn pom_artifact_id(node: roxmltree::Node) -> Option<String> {
     None
 }
 
+/// Build a `groupId:artifactId` coordinate from a POM node.
+/// Falls back to bare `artifactId` when `groupId` is absent.
+fn pom_coord(node: roxmltree::Node) -> Option<String> {
+    let artifact = pom_child_text(node, "artifactId")?;
+    let coord = match pom_child_text(node, "groupId") {
+        Some(group) => format!("{group}:{artifact}"),
+        None => artifact,
+    };
+    Some(coord)
+}
+
 pub fn parse_pom_xml(s: &str) -> ManifestInfo {
     let Ok(doc) = roxmltree::Document::parse(s) else {
         return ManifestInfo::default();
@@ -251,18 +262,18 @@ pub fn parse_pom_xml(s: &str) -> ManifestInfo {
     let mut info = ManifestInfo::default();
 
     let root = doc.root_element();
-    // The root <project> element — provides is its artifactId
-    if let Some(artifact_id) = pom_artifact_id(root) {
-        info.provides.push(artifact_id);
+    // The root <project> element — provides is groupId:artifactId
+    if let Some(coord) = pom_coord(root) {
+        info.provides.push(coord);
     }
 
-    // Find <dependencies> → <dependency> → artifactId
+    // Find <dependencies> → <dependency> → groupId:artifactId
     for child in root.children() {
         if child.tag_name().name() == "dependencies" {
             for dep in child.children() {
                 if dep.tag_name().name() == "dependency" {
-                    if let Some(artifact_id) = pom_artifact_id(dep) {
-                        info.requires.push(artifact_id);
+                    if let Some(coord) = pom_coord(dep) {
+                        info.requires.push(coord);
                     }
                 }
             }
@@ -277,8 +288,7 @@ pub fn parse_pom_xml(s: &str) -> ManifestInfo {
 // build.gradle / build.gradle.kts
 // ---------------------------------------------------------------------------
 
-/// Extract the artifact name from a Gradle dependency string like `"g:a:v"`.
-/// Returns the `a` (artifactId) segment.
+/// Extract the `group:artifact` coordinate from a Gradle dependency string like `"g:a:v"`.
 fn gradle_dep_name(raw: &str) -> Option<String> {
     // Strip surrounding quotes
     let inner = raw
@@ -287,9 +297,10 @@ fn gradle_dep_name(raw: &str) -> Option<String> {
         .trim_end_matches(|c| c == '\'' || c == '"');
     let parts: Vec<&str> = inner.split(':').collect();
     if parts.len() >= 2 {
+        let group = parts[0].trim();
         let artifact = parts[1].trim();
-        if !artifact.is_empty() {
-            return Some(artifact.to_string());
+        if !group.is_empty() && !artifact.is_empty() {
+            return Some(format!("{group}:{artifact}"));
         }
     }
     None
@@ -404,6 +415,14 @@ pub fn scan_repo(repo_root: &Path) -> ManifestInfo {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // Skip symlinks — they may point outside the repo tree.
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if path.is_dir() {
                 scan_dir(&path, &mut result);
             }
@@ -501,8 +520,45 @@ mod tests {
             <dependencies><dependency><groupId>com.acme</groupId><artifactId>util</artifactId></dependency>
             </dependencies></project>"#;
         let m = parse_pom_xml(s);
-        assert!(m.provides.iter().any(|p| p.contains("core")));
-        assert!(m.requires.iter().any(|r| r.contains("util")));
+        // Full coordinates expected
+        assert!(
+            m.provides.contains(&"com.acme:core".to_string()),
+            "provides must be full coord: {:?}",
+            m.provides
+        );
+        assert!(
+            m.requires.contains(&"com.acme:util".to_string()),
+            "requires must be full coord: {:?}",
+            m.requires
+        );
+    }
+
+    #[test]
+    fn pom_full_coords_no_collision() {
+        // Two artifacts with the same artifactId but different groupIds must NOT collide.
+        let provides_pom = r#"<project><groupId>com.acme</groupId><artifactId>core</artifactId>
+            <dependencies></dependencies></project>"#;
+        let requires_pom = r#"<project><groupId>org.other</groupId><artifactId>core</artifactId>
+            <dependencies><dependency><groupId>org.other</groupId><artifactId>core</artifactId></dependency>
+            </dependencies></project>"#;
+        let mp = parse_pom_xml(provides_pom);
+        let mr = parse_pom_xml(requires_pom);
+        // com.acme:core should NOT appear in org.other requires
+        assert!(!mr.requires.contains(&"com.acme:core".to_string()));
+        assert!(mr.requires.contains(&"org.other:core".to_string()));
+        assert!(mp.provides.contains(&"com.acme:core".to_string()));
+    }
+
+    #[test]
+    fn pom_fallback_no_group_id() {
+        // When groupId is absent, fall back to bare artifactId.
+        let s = r#"<project><artifactId>mylib</artifactId><dependencies></dependencies></project>"#;
+        let m = parse_pom_xml(s);
+        assert!(
+            m.provides.contains(&"mylib".to_string()),
+            "bare artifactId fallback must work: {:?}",
+            m.provides
+        );
     }
 
     #[test]
@@ -516,9 +572,38 @@ dependencies {
 }
 "#;
         let m = parse_gradle(s);
-        assert!(m.requires.contains(&"core".to_string()));
-        assert!(m.requires.contains(&"junit".to_string()));
-        assert!(m.requires.contains(&"util".to_string()));
+        // Full group:artifact coordinates expected
+        assert!(
+            m.requires.contains(&"com.acme:core".to_string()),
+            "requires must be full coord: {:?}",
+            m.requires
+        );
+        assert!(
+            m.requires.contains(&"junit:junit".to_string()),
+            "requires must be full coord: {:?}",
+            m.requires
+        );
+        assert!(
+            m.requires.contains(&"com.acme:util".to_string()),
+            "requires must be full coord: {:?}",
+            m.requires
+        );
+    }
+
+    #[test]
+    fn gradle_full_coords_no_collision() {
+        // Two jars with the same artifactId from different groups must not collide.
+        let s = r#"
+dependencies {
+    implementation 'com.acme:core:1.0'
+    implementation 'org.other:core:2.0'
+}
+"#;
+        let m = parse_gradle(s);
+        assert!(m.requires.contains(&"com.acme:core".to_string()));
+        assert!(m.requires.contains(&"org.other:core".to_string()));
+        // Bare "core" must not appear
+        assert!(!m.requires.contains(&"core".to_string()));
     }
 
     #[test]
@@ -581,5 +666,56 @@ dependencies {
         // serde_json deduplicates object keys, and our dedup handles Vec level
         let react_count = m.requires.iter().filter(|r| *r == "react").count();
         assert_eq!(react_count, 1);
+    }
+
+    /// scan_repo must NOT follow symlinked subdirectories under monorepo dirs.
+    #[test]
+    #[cfg(unix)]
+    fn scan_repo_symlink_subdir_excluded() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let tmp = std::env::temp_dir()
+            .join(format!("weft_symlink_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // External dir with its own manifest — must NOT be included.
+        let external = tmp.join("external_pkg");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(
+            external.join("package.json"),
+            r#"{"name":"external-secret","dependencies":{}}"#,
+        )
+        .unwrap();
+
+        // packages/<x> is a symlink pointing to the external dir.
+        let packages_dir = tmp.join("packages");
+        fs::create_dir_all(&packages_dir).unwrap();
+        symlink(&external, packages_dir.join("linked")).unwrap();
+
+        // A real (non-symlink) package — must be included.
+        let real_pkg = packages_dir.join("real-pkg");
+        fs::create_dir_all(&real_pkg).unwrap();
+        fs::write(
+            real_pkg.join("package.json"),
+            r#"{"name":"real-pkg","dependencies":{}}"#,
+        )
+        .unwrap();
+
+        let info = scan_repo(&tmp);
+
+        assert!(
+            !info.provides.contains(&"external-secret".to_string()),
+            "symlinked external manifest must not be included: {:?}",
+            info.provides
+        );
+        assert!(
+            info.provides.contains(&"real-pkg".to_string()),
+            "real (non-symlink) package must be included: {:?}",
+            info.provides
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

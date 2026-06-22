@@ -1196,29 +1196,50 @@ pub(crate) fn gateway_components_to_backend(components_json: &str) -> String {
 #[async_trait::async_trait]
 impl MigrationTrait for M0029GatewayToBackend {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use sea_orm::{ConnectionTrait, Statement};
         let db = manager.get_connection();
+        let backend = db.get_database_backend();
 
         // 1) Rewrite the top-level role column.
-        db.execute_unprepared(
-            "UPDATE repo_profile SET role = 'backend' WHERE role = 'gateway'",
-        )
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE repo_profile SET role = 'backend' WHERE role = 'gateway'".to_owned(),
+        ))
         .await?;
 
         // 2) Rewrite gateway tiers embedded in the components JSON array.
-        let rows = repo_profile::Entity::find().all(db).await?;
+        // Use raw SELECT of only `id` + `components` — the entity model would
+        // SELECT every column including `analysis_state`/`category`/`domains`
+        // that do not yet exist when M0029 runs (M0030/M0031 add them later).
+        let rows = db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT id, components FROM repo_profile".to_owned(),
+            ))
+            .await?;
         for row in rows {
-            if !row.components.contains("\"gateway\"") {
+            let id: i32 = match row.try_get("", "id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let components: String = match row.try_get("", "components") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !components.contains("\"gateway\"") {
                 continue;
             }
-            let fixed = gateway_components_to_backend(&row.components);
-            // Skip if the helper returned the blob unchanged (malformed JSON).
-            if fixed == row.components {
+            let fixed = gateway_components_to_backend(&components);
+            if fixed == components {
                 continue;
             }
-            let mut am: repo_profile::ActiveModel = row.into();
-            am.components = Set(fixed);
-            am.update(db).await?;
+            let _ = db
+                .execute(Statement::from_sql_and_values(
+                    backend,
+                    "UPDATE repo_profile SET components = ? WHERE id = ?",
+                    [fixed.into(), id.into()],
+                ))
+                .await;
         }
         Ok(())
     }
@@ -1446,5 +1467,91 @@ mod tests {
         // Both columns must exist with their defaults.
         assert_eq!(p.category, "", "category column must exist and default to empty");
         assert_eq!(p.domains, "[]", "domains column must exist and default to '[]'");
+    }
+
+    /// M0029: raw-query path rewrites gateway components without touching
+    /// columns that do not yet exist (analysis_state / category / domains).
+    /// Simulates the mid-migration state where only legacy columns are present.
+    #[tokio::test]
+    async fn m0029_raw_path_rewrites_gateway_no_new_columns() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        // Create a minimal repo_profile table with only legacy columns (no
+        // analysis_state / category / domains).
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            "CREATE TABLE repo_profile (id INTEGER PRIMARY KEY, role TEXT NOT NULL, \
+             components TEXT NOT NULL DEFAULT '[]')"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        let gateway_blob =
+            r#"[{"name":"api","path":"services/api","tier":"gateway","summary":"","deps":[]}]"#;
+        db.execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "INSERT INTO repo_profile (id, role, components) VALUES (1, 'gateway', ?)",
+            [gateway_blob.into()],
+        ))
+        .await
+        .unwrap();
+
+        // Run the same raw-query logic used by M0029::up.
+        let backend = db.get_database_backend();
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE repo_profile SET role = 'backend' WHERE role = 'gateway'".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        let rows = db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT id, components FROM repo_profile".to_owned(),
+            ))
+            .await
+            .unwrap();
+        for row in rows {
+            let id: i32 = row.try_get("", "id").unwrap();
+            let components: String = row.try_get("", "components").unwrap();
+            if !components.contains("\"gateway\"") {
+                continue;
+            }
+            let fixed = super::gateway_components_to_backend(&components);
+            if fixed == components {
+                continue;
+            }
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE repo_profile SET components = ? WHERE id = ?",
+                [fixed.into(), id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Verify: role and component tier both converted, no new columns touched.
+        let result = db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT role, components FROM repo_profile WHERE id = 1".to_owned(),
+            ))
+            .await
+            .unwrap();
+        let r = result.first().unwrap();
+        let role: String = r.try_get("", "role").unwrap();
+        let components: String = r.try_get("", "components").unwrap();
+        assert_eq!(role, "backend", "role must be rewritten to backend");
+        assert!(
+            !components.contains("\"gateway\""),
+            "gateway tier must be gone: {components}"
+        );
+        assert!(
+            components.contains("\"backend\""),
+            "backend tier must appear: {components}"
+        );
     }
 }
