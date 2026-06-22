@@ -612,12 +612,27 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
 
 /// Persist a repo's analysis run-state (durable across restarts). Clears the
 /// error unless state == "failed".
+///
+/// For a brand-new repo that has no profile row yet, we create a minimal
+/// placeholder (role/summary blank) so running/failed states persist and the
+/// startup resume scan can find this repo. The placeholder has role="" and
+/// summary="" so is_fully_profiled() returns false and it is excluded from the
+/// cross-repo relation pass. When state == "idle" and no row exists we skip the
+/// insert: idle is the column default, so nothing needs to be persisted.
 pub async fn set_analysis_state(
     db: &Db,
     repo_id: i32,
     state: &str,
     error: Option<&str>,
 ) -> Result<()> {
+    if get_repo_profile(db, repo_id).await?.is_none() {
+        if state == "idle" {
+            return Ok(());
+        }
+        // First-ever analysis: create a minimal placeholder so running/failed
+        // persists and the startup resume scan can find this repo.
+        upsert_repo_profile(db, repo_id, "", "[]", "", "[]", "agent", "").await?;
+    }
     if let Some(m) = get_repo_profile(db, repo_id).await? {
         let mut a: repo_profile::ActiveModel = m.into();
         a.analysis_state = Set(state.to_string());
@@ -2856,5 +2871,57 @@ mod tests {
         // But the profiling fields were updated normally.
         assert_eq!(p.role, "frontend");
         assert_eq!(p.profiled_commit, "abc");
+    }
+
+    /// First-run resume: set_analysis_state("running") on a repo with no profile row
+    /// must create a placeholder so the startup resume scan can find it.
+    #[tokio::test]
+    async fn set_analysis_state_creates_placeholder_for_new_repo() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "new-repo", "/tmp/new", "main", "", true)
+            .await
+            .unwrap();
+        // No profile row yet.
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "precondition: no profile row"
+        );
+
+        // set_analysis_state("running") must create a placeholder row.
+        set_analysis_state(&db, r.id, "running", None)
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id)
+            .await
+            .unwrap()
+            .expect("placeholder row must exist after set_analysis_state(running)");
+        assert_eq!(p.analysis_state, "running");
+        assert_eq!(p.analysis_error, None);
+        // Placeholder must NOT count as fully profiled (role and summary are blank).
+        assert!(
+            p.role.is_empty() && p.summary.is_empty(),
+            "placeholder must have blank role/summary"
+        );
+    }
+
+    /// set_analysis_state("idle") on a no-row repo must remain a no-op (idle is the default).
+    #[tokio::test]
+    async fn set_analysis_state_idle_no_row_is_noop() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "other-repo", "/tmp/other", "main", "", true)
+            .await
+            .unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "precondition: no profile row"
+        );
+
+        set_analysis_state(&db, r.id, "idle", None).await.unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "idle on no-row must remain a no-op"
+        );
     }
 }
