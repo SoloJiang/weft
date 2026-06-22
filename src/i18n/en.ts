@@ -233,6 +233,7 @@ export const en = {
     takeOverCopied: "Takeover command copied — paste it in your terminal",
     copyMessage: "Copy",
     copied: "Copied",
+    queueFull: "Queue is full (5/5) — delete a queued message first",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",

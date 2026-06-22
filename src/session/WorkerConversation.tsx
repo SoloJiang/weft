@@ -250,7 +250,7 @@ export function WorkerConversation() {
             slashCommands={(sid != null ? workerSlash[sid] : undefined) ?? []}
             onNeedSlashCommands={() => sid != null && discoverWorkerSlash(sid)}
             busy={busy}
-            queued={turn?.queued ?? 0}
+            queue={turn?.queue ?? []}
             placeholder={loadError ?? t("session.message")}
             onSend={(v, images, fs) => sendToWorker(directionId, repoId, v, images, fs)}
             onStop={() => sid != null && void api.chatInterrupt(sid)}

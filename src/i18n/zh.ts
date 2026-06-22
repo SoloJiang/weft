@@ -228,6 +228,7 @@ export const zh = {
     takeOverCopied: "接管命令已复制，去你的终端粘贴运行",
     copyMessage: "复制",
     copied: "已复制",
+    queueFull: "队列已满 (5/5)，先删一条排队消息",
   },
   scope: {
     addReposFirst: "请先往这个工作区添加仓库。",

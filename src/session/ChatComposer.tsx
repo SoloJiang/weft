@@ -11,8 +11,11 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
-import type { ImageAttachment, SlashCmd } from "../lib/types";
+import type { ImageAttachment, QueuedItem, SlashCmd } from "../lib/types";
 import { api } from "../lib/api";
+import { toast } from "../components/Toast";
+
+const MAX_QUEUED = 5;
 import { cn } from "../lib/cn";
 import { useClickOutside } from "../lib/useClickOutside";
 import { useImeComposition } from "../lib/useImeComposition";
@@ -46,7 +49,7 @@ export function ChatComposer({
   localSlash,
   onLocalSlash,
   busy,
-  queued,
+  queue,
   onSend,
   onStop,
   onTakeOver,
@@ -62,7 +65,7 @@ export function ChatComposer({
   localSlash?: { name: string; label: string }[];
   onLocalSlash?: (name: string) => void;
   busy: boolean;
-  queued: number;
+  queue: QueuedItem[];
   onSend: (
     text: string,
     images: ImageAttachment[],
@@ -183,6 +186,10 @@ export function ChatComposer({
   }, [slashQuery, slashCommands.length, onNeedSlashCommands]);
 
   const send = () => {
+    if (busy && queue.length >= MAX_QUEUED) {
+      toast(t("lead.queueFull"));
+      return; // preserve draft, do not clear
+    }
     const v = text.trim();
     if (!v && images.length === 0 && files.length === 0) return;
     lastSendRef.current = Date.now();
@@ -417,9 +424,9 @@ export function ChatComposer({
             {t("lead.slashHint")}
           </span>
           <span className="ml-auto" />
-          {queued > 0 && (
+          {queue.length > 0 && (
             <span className="rounded-full bg-bg px-2 py-0.5 text-[10.5px] text-ink-faint">
-              {t("lead.queuedN", { count: queued })}
+              {t("lead.queuedN", { count: queue.length })}
             </span>
           )}
           {extraActions}

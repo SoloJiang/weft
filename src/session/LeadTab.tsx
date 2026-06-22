@@ -145,7 +145,7 @@ export function LeadTab({
   if (tid == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
-  const turn = leadTurn[tid] ?? { state: "stopped" as const, queued: 0 };
+  const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
   // The lead engine runs the thread's lead_tool (not always claude).
   const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
 
@@ -217,7 +217,7 @@ export function LeadTab({
           localSlash={localSlash}
           onLocalSlash={onLocalSlash}
           busy={turn.state === "busy"}
-          queued={turn.queued}
+          queue={turn.queue}
           onSend={(text, images, files) =>
             sendLeadChat(tid, text, images, files)
           }
