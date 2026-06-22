@@ -589,6 +589,14 @@ function TimelineRow({
 
   if (m.kind === "proposal") {
     const count = Number(c.count ?? 0);
+    // Count 0 = a withdraw/cancel (the lead's cancel_directions, or a stray empty
+    // propose routed to withdraw). Render a settled "已撤回" line, never the
+    // interactive "查看并创建" card — that opened a dead-end empty ScopeReview.
+    if (count === 0) {
+      return (
+        <SettledLine label={t("lead.proposalWithdrawn", { rationale: String(c.rationale ?? "") })} />
+      );
+    }
     // A proposal card is "open" (interactive) only while it is the latest
     // proposal AND its live plan is still awaiting review. Once confirmed (or
     // superseded by a re-propose, or replayed in a worker host with no live

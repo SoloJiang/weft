@@ -1250,6 +1250,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (list.some((x) => x.id === p.message.id)) return m;
           return { ...m, [p.thread_id]: [...list, p.message] };
         });
+        // A proposal/withdraw row landed: refresh the active thread's proposal so the
+        // review card + scope canvas reflect it at once — a withdraw flips status to
+        // "withdrawn", closing an open ScopeReview — instead of waiting for the 2.5s
+        // poll. Guard on the live active thread (ref, not a stale closure capture).
+        if (p.message.kind === "proposal" && activeThreadIdRef.current === p.thread_id) {
+          const tid = p.thread_id;
+          void api
+            .getProposal(tid)
+            .then((pr) => {
+              // Re-check the active thread AFTER the await: the user may have switched
+              // threads while this was in flight, and writing thread A's proposal (or
+              // clearing A's review flag) into global state would corrupt thread B.
+              if (!pr || activeThreadIdRef.current !== tid) return;
+              setProposal(pr);
+              // A withdrawn/confirmed refresh must also drop a stale review flag: otherwise
+              // a later re-propose in this thread would auto-reopen ScopeReview without the
+              // user clicking the new review card (ThreadBoard gates open on status+flag).
+              if (pr.status !== "proposed") setReviewingProposal(false);
+            })
+            .catch(() => {});
+        }
       } else if (p.type === "delta") {
         setLeadMessages((m) => ({
           ...m,

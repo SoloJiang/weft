@@ -201,6 +201,7 @@ export const en = {
     proposalReady_other: "Proposed {{count}} sub-tasks",
     proposalResolved_one: "Reviewed {{count}} sub-task",
     proposalResolved_other: "Reviewed {{count}} sub-tasks",
+    proposalWithdrawn: "Withdrew directions: {{rationale}}",
     reviewCreate: "Review & create",
     starting: "Starting the lead…",
     stopped: "The lead stopped.",
