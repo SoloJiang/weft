@@ -388,16 +388,32 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         // later MAIN pass. So a blank APPROVED/DENIED lane (in the pre-pass's blank sub-pass) could
         // still consume a PENDING explicit sibling's direction first. Make the blank relaxation
         // order-INDEPENDENT: a blank base must NEVER match a direction whose recorded base is an
-        // EXPLICIT base requested by some OTHER lane in this proposal. Compute that set ONCE
-        // (normalized the SAME way base_compatible compares) and exclude it in the blank branch.
-        let explicit_bases: std::collections::HashSet<String> = resolved
-            .directions
-            .iter()
-            .map(|d| d.base_branch.trim())
-            .filter(|b| !b.is_empty())
-            .map(crate::git::normalize_target)
-            .collect();
-        let base_ok = |existing_base: &str, p: &ResolvedDirection| -> bool {
+        // EXPLICIT base requested by some OTHER lane THAT CAN COMPETE for the SAME direction.
+        // "Can compete" = same (name, repo_id), because the claim `.find` predicates match per
+        // name+repo. Keying the exclusion GLOBALLY (one set across all lanes) over-rejected: an
+        // UNRELATED lane (different name/repo) explicitly basing on `release` would block a blank
+        // lane in a DIFFERENT group whose OWN recorded direction also happens to be `release`,
+        // dropping that lane from `matching`. Group the explicit bases by (name, repo_id) and
+        // exclude only within the candidate direction's own group (normalized the SAME way
+        // base_compatible compares).
+        let mut explicit_bases_by_group: std::collections::HashMap<
+            (String, i32),
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
+        for d in &resolved.directions {
+            let b = d.base_branch.trim();
+            if !b.is_empty() {
+                explicit_bases_by_group
+                    .entry((d.name.clone(), d.repo.repo_id))
+                    .or_default()
+                    .insert(crate::git::normalize_target(b));
+            }
+        }
+        // `d` is the candidate DB direction being matched (it carries the authoritative recorded
+        // base + its OWN name/repo_id), `p` is the proposal lane. The blank exclusion is keyed on
+        // the candidate's (name, repo_id) group, NOT the global proposal.
+        let base_ok = |d: &crate::store::entities::direction::Model, p: &ResolvedDirection| -> bool {
+            let existing_base = d.base_branch.as_str();
             // R54-3: in the CONFIRMED fast-path, a BLANK proposed base matches an already-
             // materialized direction WITHOUT re-resolving the live default. The lane was created
             // from the THEN-default and its direction recorded the ACTUAL base (e.g. `main`); the
@@ -408,10 +424,14 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             // legitimately resolves to the current default at CREATION time — only this confirmed,
             // already-materialized retry treats blank as match-any.)
             if p.base_branch.trim().is_empty() {
-                // ...but NOT a direction an EXPLICIT sibling named (#42r2-1). The blank lane's OWN
-                // recorded base (e.g. `main`) is not another lane's explicit base, so it still
-                // matches; a direction recorded on `release` (an explicit sibling's base) does not.
-                return !explicit_bases.contains(&crate::git::normalize_target(existing_base));
+                // ...but NOT a direction a SAME-(name, repo) EXPLICIT sibling named (#42r2-1). The
+                // blank lane's OWN recorded base (e.g. `main`) is not a competing sibling's explicit
+                // base, so it still matches; a direction recorded on `release` (a same-group
+                // explicit sibling's base) does not. Scoped per (name, repo_id) so an UNRELATED
+                // lane's explicit base in a DIFFERENT group never excludes this candidate.
+                return !explicit_bases_by_group
+                    .get(&(d.name.clone(), d.repo_id))
+                    .is_some_and(|s| s.contains(&crate::git::normalize_target(existing_base)));
             }
             // Fall back to a name+repo-only match when the repo is missing (None), so a missing
             // repo doesn't crash the retry — the same best-effort posture as the pre-pass below.
@@ -447,7 +467,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 if p.repo.known && (p.decision == "approved" || p.decision == "denied") {
                     // Exclude terminal (done) directions from reuse: a completed lane is history,
                     // not a resumable target — a re-proposal must create fresh work.
-                    if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done" && base_ok(&d.base_branch, p)) {
+                    if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done" && base_ok(d, p)) {
                         consumed.insert(d.id);
                     }
                 }
@@ -463,7 +483,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 // Exclude terminal (done) directions from reuse: a completed lane is history,
                 // not a resumable target — a re-proposal must create fresh work. Base-aware (R52-1):
                 // claim this lane's OWN base-matching direction, not a sibling's different-base one.
-                if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done" && base_ok(&d.base_branch, p)) {
+                if let Some(d) = all.iter().find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done" && base_ok(d, p)) {
                     consumed.insert(d.id);
                     matching.push(d.id);
                 }
@@ -3651,6 +3671,82 @@ mod tests {
         let ids = confirm(&db, t.id).await.unwrap();
         assert_eq!(ids, vec![dir_release.id],
             "#42r2-1: the pending explicit `release` lane keeps its own direction; the blank approved sibling must not steal it");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// #42r2-1 follow-up: the blank-base exclusion (a blank lane may not claim a direction whose
+    /// recorded base is an EXPLICIT base requested elsewhere) must be scoped to lanes that can
+    /// actually COMPETE for the same direction — i.e. grouped by (name, repo). An UNRELATED lane
+    /// (different name AND repo) that explicitly bases on `release` must NOT block a blank lane in a
+    /// DIFFERENT repo from claiming its OWN `release`-recorded direction (e.g. that repo's default
+    /// happens to be `release`, so the blank lane materialized onto `release`). A GLOBAL explicit
+    /// set conflates the two `release` strings across groups; the fix keys the exclusion by
+    /// (name, repo_id) so only a SAME-group explicit sibling excludes. Red-first: with the global
+    /// set, the unrelated lane's `release` makes the blank lane's own `release` direction excluded
+    /// → the blank lane is dropped from `matching` and its worker isn't redispatched.
+    #[tokio::test]
+    async fn confirmed_fast_path_blank_lane_unaffected_by_unrelated_lanes_explicit_base() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-blank-unrelated-explicit-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // Repo `api`: the BLANK lane lives here. Its OWN recorded direction's base is `release`
+        // (same STRING as the unrelated lane's explicit base, but a DIFFERENT name+repo group).
+        let api = make_repo(&root, "api");
+        // A real `release` branch so materialize can build a worktree from it.
+        sh(&api, &["git", "branch", "release"]);
+        let api_default = crate::git::current_branch(&api).unwrap();
+        // Repo `web`: the UNRELATED lane lives here and EXPLICITLY bases on `release`.
+        let web = make_repo(&root, "web");
+        sh(&web, &["git", "branch", "release"]);
+        let web_default = crate::git::current_branch(&web).unwrap();
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let ra_api = repo::add_repo_ref(&db, ws.id, "api", api.to_str().unwrap(), &api_default, "", true).await.unwrap();
+        let ra_web = repo::add_repo_ref(&db, ws.id, "web", web.to_str().unwrap(), &web_default, "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Blank lane `A` in repo `api`: create its direction with base `release` (its own recorded
+        // base is `release`) and materialize — the blank proposal lane below has an EMPTY base.
+        let dir_blank = repo::create_direction(&db, t.id, "A", "claude", ra_api.id, "r", "plan+impl", "release").await.unwrap();
+        materialize::materialize_direction(&db, dir_blank.id).await.unwrap();
+        let recorded_blank = repo::list_directions(&db, t.id).await.unwrap()
+            .into_iter().find(|d| d.id == dir_blank.id).unwrap();
+        assert_eq!(recorded_blank.base_branch, "release",
+            "precondition: the blank lane's own recorded direction base is `release`");
+        // Unrelated explicit lane `B` in repo `web`, EXPLICIT base `release` (different name+repo).
+        let dir_unrelated = repo::create_direction(&db, t.id, "B", "claude", ra_web.id, "r", "plan+impl", "release").await.unwrap();
+        materialize::materialize_direction(&db, dir_unrelated.id).await.unwrap();
+
+        // Stored proposal: the UNRELATED explicit `release` lane FIRST (so a global set would be
+        // built from it), then the BLANK lane whose own recorded base is also `release`. Both
+        // PENDING + known → both dispatched. Plan CONFIRMED → confirm takes the fast-path.
+        let stored = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"B".into(), repo:"web".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into() },
+        ]};
+        let json = serde_json::to_string(&stored).unwrap();
+        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
+
+        // Fast-path retry: the blank lane STILL claims its OWN `release`-recorded direction — the
+        // UNRELATED lane's explicit `release` (different group) must NOT exclude it. Both lanes
+        // dispatch. Red-first: a global explicit_bases set drops the blank lane here.
+        let mut ids = confirm(&db, t.id).await.unwrap();
+        ids.sort();
+        let mut expected = vec![dir_blank.id, dir_unrelated.id];
+        expected.sort();
+        assert_eq!(ids, expected,
+            "the blank lane keeps its own `release` direction; an unrelated lane's explicit `release` (different name+repo) must not exclude it");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
