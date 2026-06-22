@@ -9,7 +9,6 @@ import {
   Loader2,
   Maximize2,
   Minus,
-  Network,
   Pencil,
   Plus,
   RefreshCw,
@@ -27,15 +26,14 @@ import { Button } from "../components/ui/Button";
 import { Select } from "../components/ui/Select";
 import { cn } from "../lib/cn";
 
-/** The three architectural tiers laid out left→right, plus the catch-all "other"
+/** The two architectural tiers laid out left→right, plus the catch-all "other"
  *  band that holds unclassified / still-analyzing repos. */
-const TIER_ORDER = ["frontend", "gateway", "backend"] as const;
-const BANDS = ["frontend", "gateway", "backend", "other"] as const;
+const TIER_ORDER = ["frontend", "backend"] as const;
+const BANDS = ["frontend", "backend", "other"] as const;
 type Band = (typeof BANDS)[number];
 
 const TIER_ICON: Record<string, ComponentType<LucideProps>> = {
   frontend: AppWindow,
-  gateway: Network,
   backend: Server,
   other: CircleDashed,
 };
@@ -133,7 +131,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
 
 /**
  * The repo map as a pan/zoom canvas — the whole Repos surface. Nodes are laid
- * out in bands by architectural TIER (frontend → gateway → backend → other),
+ * out in bands by architectural TIER (frontend → backend → other),
  * agent-classified. Switch to the expanded view to break monorepos into their
  * internal components, grouped by tier. Edges are agent-inferred cross-repo
  * relations. Drag to pan, scroll/buttons to zoom.

@@ -448,7 +448,6 @@ export const en = {
     emptyBody:
       "Add repos to this workspace. A read-only agent classifies each — tier, stack, summary — and links them into a dependency graph the lead uses to split work.",
     tier_frontend: "frontend",
-    tier_gateway: "gateway",
     tier_backend: "backend",
     tier_other: "unclassified",
     zoomIn: "Zoom in",

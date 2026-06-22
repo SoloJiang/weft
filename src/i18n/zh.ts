@@ -432,8 +432,7 @@ export const zh = {
     emptyBody:
       "往这个工作区添加仓库。只读 agent 会为每个仓库分类——层级、技术栈、摘要——并连成一张依赖图，供 lead 拆分工作。",
     tier_frontend: "前端",
-    tier_gateway: "接入层",
-    tier_backend: "后端",
+    tier_backend: "服务端",
     tier_other: "未分类",
     zoomIn: "放大",
     zoomOut: "缩小",

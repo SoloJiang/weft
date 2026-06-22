@@ -349,7 +349,7 @@ export interface BusMsg {
 export interface RepoComponent {
   name: string;
   path: string;
-  /** frontend | gateway | backend | "" (unclassified). */
+  /** frontend | backend | "" (unclassified). */
   tier: string;
   summary: string;
   /** Names of sibling components (same repo) this one depends on. */
@@ -362,7 +362,7 @@ export interface RepoComponent {
 export interface RepoProfile {
   repo_id: number;
   repo_name: string;
-  /** frontend | gateway | backend | "" (unclassified / analyzing). */
+  /** frontend | backend | "" (unclassified / analyzing). */
   tier: string;
   stack: string[];
   summary: string;
