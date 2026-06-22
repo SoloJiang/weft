@@ -191,6 +191,8 @@ interface Store {
   openRepoDetail: (repoId: number) => void;
   openCurator: () => void;
   closeRepoDrawer: () => void;
+  /** Drop the drawer's selected repo (e.g. when it was deleted). */
+  clearSelectedRepo: () => void;
   setRepoDrawerTab: (tab: "detail" | "curator") => void;
   setRepoDrawerWidth: (w: number) => void;
   /** Pin a repo's one-line summary (tier ownership untouched). */
@@ -1719,6 +1721,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoDrawerOpen(true);
   }, []);
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
+  const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
   const setRepoDrawerTab = useCallback((tab: "detail" | "curator") => setRepoDrawerTabState(tab), []);
   const setRepoDrawerWidth = useCallback((w: number) => {
     const clamped = Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, Math.round(w)));
@@ -2199,6 +2202,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     openRepoDetail,
     openCurator,
     closeRepoDrawer,
+    clearSelectedRepo,
     setRepoDrawerTab,
     setRepoDrawerWidth,
     editRepoSummary,

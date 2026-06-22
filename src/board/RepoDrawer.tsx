@@ -23,7 +23,11 @@ export function RepoDrawer() {
   useEffect(() => {
     if (!repoDrawerOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeRepoDrawer();
+      if (e.key !== "Escape") return;
+      // A nested Radix modal (e.g. the delete-repo confirm) renders a `.weft-overlay`
+      // and owns Escape — let it close itself first instead of nuking the whole drawer.
+      if (document.querySelector(".weft-overlay")) return;
+      closeRepoDrawer();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -70,7 +74,9 @@ export function RepoDrawer() {
           <PanelRightClose size={14} />
         </button>
       </header>
-      <div className="min-h-0 flex-1">
+      {/* flex-col so the curator LeadTab's flex-1 (timeline + anchored composer)
+          gets the drawer's constrained height; the detail body uses h-full. */}
+      <div className="flex min-h-0 flex-1 flex-col">
         <DrawerBody />
       </div>
     </div>

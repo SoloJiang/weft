@@ -32,6 +32,7 @@ export function AppTopBar() {
     showNeeds,
     homeTab,
     repos,
+    repoProfiles,
     openCurator,
     threads,
     overview,
@@ -219,7 +220,7 @@ export function AppTopBar() {
         )}
       </div>
 
-      {inWorkspaceRepos && activeWorkspaceId != null && repos.length > 0 && (
+      {inWorkspaceRepos && activeWorkspaceId != null && repoProfiles.length > 0 && (
         <Button size="sm" variant="ghost" onClick={openCurator}>
           <Route size={14} />
           {t("repomap.curatorTitle")}
