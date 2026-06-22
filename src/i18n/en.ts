@@ -455,6 +455,10 @@ export const en = {
     zoomIn: "Zoom in",
     zoomOut: "Zoom out",
     fit: "Fit to view",
+    chatTab: "Chat",
+    mapTab: "Map",
+    mapEmpty: "Run analysis to generate the map",
+    regenerateMap: "Regenerate",
   },
   inspect: {
     label: "Inspect — reveal, copy path",

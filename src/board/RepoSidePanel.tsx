@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { X } from "lucide-react";
+import { X, RefreshCw } from "lucide-react";
 import { useStore } from "../state/store";
 import { LeadTab } from "../session/LeadTab";
 import { RepoDetailContent } from "./RepoGraph";
+import { Markdown } from "../components/Markdown";
+import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 
 // Per-surface remembered width (localStorage, like DiffPanel/FileTreePanel — not
@@ -132,16 +134,121 @@ export function RepoSidePanel() {
   );
 }
 
+type CuratorView = "chat" | "map";
+
 /** The curator surface, kept mounted across switches; `hidden` when inactive. */
 function CuratorBody({ active, threadId }: { active: boolean; threadId: number | null }) {
   const { t } = useTranslation();
-  return (
-    <div className={cn("min-h-0 flex-1 flex-col", active ? "flex" : "hidden")}>
-      {threadId != null ? (
-        <LeadTab threadId={threadId} compact onReview={() => {}} />
-      ) : (
+  const { activeWorkspaceId, reanalyzeDeps } = useStore();
+  const [view, setView] = useState<CuratorView>("chat");
+  const [mapDoc, setMapDoc] = useState<string | null | undefined>(undefined);
+  const [regenerating, setRegenerating] = useState(false);
+
+  // Fetch the map doc when switching to map view.
+  useEffect(() => {
+    if (view !== "map" || activeWorkspaceId == null) return;
+    let cancelled = false;
+    void api.getRepoMapDoc(activeWorkspaceId).then((doc) => {
+      if (!cancelled) setMapDoc(doc);
+    });
+    return () => { cancelled = true; };
+  }, [view, activeWorkspaceId]);
+
+  function handleRegenerate() {
+    setRegenerating(true);
+    void reanalyzeDeps().then(() => {
+      if (activeWorkspaceId == null) { setRegenerating(false); return; }
+      void api.getRepoMapDoc(activeWorkspaceId).then((doc) => {
+        setMapDoc(doc);
+        setRegenerating(false);
+      });
+    });
+  }
+
+  function renderMapBody() {
+    if (mapDoc === undefined) {
+      return (
         <div className="flex h-full items-center justify-center text-[12px] text-ink-faint">
           {t("repomap.curatorLoading")}
+        </div>
+      );
+    }
+    if (mapDoc === null) {
+      return (
+        <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
+          <p className="text-[12px] text-ink-faint">{t("repomap.mapEmpty")}</p>
+          <button
+            onClick={handleRegenerate}
+            disabled={regenerating}
+            className="flex items-center gap-1.5 rounded-[var(--radius-md)] bg-brand-ghost px-3 py-1.5 text-[11.5px] font-medium text-brand transition-colors hover:bg-brand/20 disabled:opacity-50"
+          >
+            <RefreshCw size={12} className={regenerating ? "animate-spin" : ""} />
+            {t("repomap.regenerateMap")}
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        <div className="mb-3 flex justify-end">
+          <button
+            onClick={handleRegenerate}
+            disabled={regenerating}
+            title={t("repomap.regenerateMap")}
+            className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-faint transition-colors hover:bg-raised hover:text-ink disabled:opacity-50"
+          >
+            <RefreshCw size={11} className={regenerating ? "animate-spin" : ""} />
+            {t("repomap.regenerateMap")}
+          </button>
+        </div>
+        <Markdown text={mapDoc} />
+      </div>
+    );
+  }
+
+  return (
+    <div className={cn("min-h-0 flex-1 flex-col", active ? "flex" : "hidden")}>
+      {/* chat / map segmented toggle */}
+      <div className="flex shrink-0 gap-0.5 border-b border-border px-3 py-1.5">
+        <button
+          onClick={() => setView("chat")}
+          className={cn(
+            "rounded-[var(--radius-sm)] px-2.5 py-1 text-[11.5px] font-medium transition-colors",
+            view === "chat"
+              ? "bg-raised text-ink"
+              : "text-ink-faint hover:bg-raised/60 hover:text-ink",
+          )}
+        >
+          {t("repomap.chatTab")}
+        </button>
+        <button
+          onClick={() => setView("map")}
+          className={cn(
+            "rounded-[var(--radius-sm)] px-2.5 py-1 text-[11.5px] font-medium transition-colors",
+            view === "map"
+              ? "bg-raised text-ink"
+              : "text-ink-faint hover:bg-raised/60 hover:text-ink",
+          )}
+        >
+          {t("repomap.mapTab")}
+        </button>
+      </div>
+
+      {/* chat view: keep LeadTab mounted so scroll/draft survive toggling */}
+      <div className={cn("min-h-0 flex-1 flex-col", view === "chat" ? "flex" : "hidden")}>
+        {threadId != null ? (
+          <LeadTab threadId={threadId} compact onReview={() => {}} />
+        ) : (
+          <div className="flex h-full items-center justify-center text-[12px] text-ink-faint">
+            {t("repomap.curatorLoading")}
+          </div>
+        )}
+      </div>
+
+      {/* map view */}
+      {view === "map" && (
+        <div className="min-h-0 flex-1 flex flex-col">
+          {renderMapBody()}
         </div>
       )}
     </div>
