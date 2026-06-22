@@ -302,7 +302,17 @@ pub async fn materialize_direction(
     // detached-HEAD case below — record the COMMIT as the target and keep the base blank. (Only
     // the blank path: an EXPLICIT base that took the adopt arm is a resolvable name, and its
     // base_branch isn't rewritten here anyway — see the `!explicit` guard in `finish`.)
-    let blank_base_adopt = !explicit && add.branched_from.is_empty() && !add.base_commit.is_empty();
+    // #42-1: an empty `add.branched_from` ALONE is NOT a detached signal — BOTH adopt arms (the
+    // crash-orphan path-exists reuse AND the `-b`-fallback existing-branch checkout) report it even
+    // when the blank base resolved to a REAL default. Treat the lane as detached ONLY when the
+    // RESOLVED base is genuinely unusable as a named ref ("HEAD", or it doesn't resolve as a ref).
+    // When the base IS a resolvable default, fall through to the NORMAL recording below so
+    // recorded_base/target become the default NAME (raw_recorded → base) — a later reuse then
+    // compares the default branch instead of a frozen commit, and a default advance can't
+    // misclassify the reusable lane through the detached-HEAD checks.
+    let base_unresolvable = base.trim() == "HEAD" || !git::ref_resolves(repo_path, base.trim());
+    let blank_base_adopt =
+        !explicit && add.branched_from.is_empty() && !add.base_commit.is_empty() && base_unresolvable;
     // A bare "HEAD" is the detached / no-default fallback. The BASE and the diff TARGET
     // diverge here:
     //   - base_branch stores EMPTY, because "HEAD" is not a usable named ref — reconcile
@@ -2512,6 +2522,91 @@ mod tests {
         assert!(
             td.files.iter().any(|f| f.path == "task_change.txt"),
             "R54-1: the committed task change must appear in the vs-target diff (target did not collapse to HEAD)"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// R54-1 EDGE (#42-1): a BLANK-base materialization that takes the ADOPT / crash-orphan arm
+    /// (so `add.branched_from` is empty) but whose resolved base IS a REAL default branch must
+    /// record that DEFAULT BRANCH NAME as its base — NOT the detached-HEAD shape (base "" + commit
+    /// target). The R54-1 detached treatment is only correct when the base is unresolvable/HEAD; an
+    /// empty `branched_from` alone is NOT a detached signal (the adopt/`-b`-fallback arms always
+    /// report it). Recording a commit target here would later route a reusable lane through the
+    /// detached-HEAD checks instead of comparing the recorded default, so a default-branch advance
+    /// could misclassify and reject the lane.
+    #[tokio::test]
+    async fn materialize_blank_base_with_default_adopt_records_default_not_detached() {
+        use crate::store::repo;
+        use sea_orm::EntityTrait;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-42-1-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        // A REAL default branch EXISTS (init_repo leaves us on it). Unlike the no-default test we
+        // do NOT detach/delete it, so the blank-base resolution lands on this resolvable default.
+        let default = crate::git::current_branch(&repo_path).unwrap();
+        assert!(
+            crate::git::ref_resolves(&repo_path, &crate::git::local_branch_ref(&default)),
+            "precondition: the default branch resolves"
+        );
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // base_ref = the real default, marked default, so the blank-base fallback resolves to it.
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &default, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // BLANK base → resolves to the live/recorded default during materialize.
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // ① First materialize forks the work branch off the default (create-SUCCESS). Delete the DB
+        // row AND clear the recorded target so the SECOND materialize hits the ADOPT arm
+        // (branched_from empty) — the crash-orphan shape, but with the default still ALIVE.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts.len(), 1, "materialize must create the worktree");
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let branch = wts[0].branch.clone();
+        entities::worktree::Entity::delete_by_id(wts[0].id).exec(&db.0).await.unwrap();
+        repo::set_direction_target_branch(&db, dir.id, "").await.unwrap();
+        repo::set_direction_base_branch(&db, dir.id, "").await.unwrap();
+        assert!(crate::git::is_registered_worktree(&repo_path, &wt_path, &branch),
+            "precondition: the on-disk checkout is still a registered worktree (crash orphan)");
+
+        // ② Re-materialize: the create path runs (no DB row), the path exists+is registered →
+        // the ADOPT arm fires (add.branched_from empty). Because the base RESOLVES, this must
+        // fall through to the NORMAL recording (default branch NAME), NOT the detached shape.
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+
+        let d2 = entities::direction::Entity::find_by_id(dir.id)
+            .one(&db.0).await.unwrap().unwrap();
+        // The recorded base must be the DEFAULT branch NAME (the resolvable default), NOT "".
+        assert_eq!(
+            d2.base_branch, default,
+            "#42-1: blank-base adopt with a resolvable default must record the default branch name, not a detached blank"
+        );
+        // The diff target must be the resolvable default NAME, NOT a 40-hex commit (the detached
+        // shape) — so a later reuse compares the default branch, not a frozen commit.
+        assert_eq!(
+            d2.target_branch, default,
+            "#42-1: target must be the resolvable default name, not a detached-HEAD commit"
+        );
+        assert!(
+            !crate::git::is_full_commit_oid(&repo_path, d2.target_branch.trim()),
+            "#42-1: target must NOT be a commit oid (the detached-HEAD shape)"
         );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
