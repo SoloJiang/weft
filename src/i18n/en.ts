@@ -408,10 +408,7 @@ export const en = {
     reanalyzeHint: "Re-run the agent to classify each repo's tier and infer cross-repo links (read-only)",
     detailTab: "Detail",
     curatorTitle: "Curator",
-    curatorSubtitle: "Calibrate cross-repo dependencies",
     curatorLoading: "Opening curator…",
-    expandCurator: "Open curator",
-    collapseCurator: "Collapse curator",
     deleteRepo: "Remove from workspace",
     deleteRepoTitle: "Remove {{name}}?",
     deleteRepoBody:
@@ -435,7 +432,6 @@ export const en = {
     notAnalyzed: "Not analyzed yet",
     viewOverview: "Overview",
     viewExpanded: "Expanded",
-    filterKind: "Toggle {{kind}} links",
     pkgCount_one: "{{count}} pkg",
     pkgCount_other: "{{count}} pkgs",
     profiledAt: "Profiled commit",
@@ -448,8 +444,6 @@ export const en = {
     yours: "yours",
     selectRepo: "Select a repo",
     selectRepoBody: "Its role, interfaces, dependencies, and profile source appear here.",
-    collapseProfile: "Collapse repo profile",
-    expandProfile: "Expand repo profile",
     emptyTitle: "No repos profiled yet",
     emptyBody:
       "Add repos to this workspace. A read-only agent classifies each — tier, stack, summary — and links them into a dependency graph the lead uses to split work.",
