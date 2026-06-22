@@ -196,6 +196,7 @@ export const zh = {
     send: "发送",
     proposalReady_other: "建议 {{count}} 个子任务",
     proposalResolved_other: "已处理 {{count}} 个子任务",
+    proposalWithdrawn: "已撤回方向：{{rationale}}",
     reviewCreate: "查看并创建",
     starting: "正在启动 lead…",
     stopped: "lead 已停止。",

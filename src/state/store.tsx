@@ -1250,6 +1250,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (list.some((x) => x.id === p.message.id)) return m;
           return { ...m, [p.thread_id]: [...list, p.message] };
         });
+        // A proposal/withdraw row landed: refresh the active thread's proposal so the
+        // review card + scope canvas reflect it at once — a withdraw flips status to
+        // "withdrawn", closing an open ScopeReview — instead of waiting for the 2.5s
+        // poll. Guard on the live active thread (ref, not a stale closure capture).
+        if (p.message.kind === "proposal" && activeThreadIdRef.current === p.thread_id) {
+          const tid = p.thread_id;
+          void api
+            .getProposal(tid)
+            .then((pr) => {
+              if (pr) setProposal(pr);
+            })
+            .catch(() => {});
+        }
       } else if (p.type === "delta") {
         setLeadMessages((m) => ({
           ...m,

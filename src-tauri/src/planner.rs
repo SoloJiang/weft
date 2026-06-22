@@ -299,6 +299,37 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
     Ok(())
 }
 
+/// Withdraw a thread's pending proposal (the lead's first-class "cancel/retract").
+/// Flips the stored plan to status "withdrawn" and CLEARS its directions, so:
+///   - the proposal card collapses and ScopeReview won't open (both gate on "proposed"),
+///   - `confirm` refuses it (see the guard there) and `pending_writes` returns empty,
+///     so no stale write-trigger Needs cards survive the cancel.
+/// `rationale` is kept on the (now empty) proposal for the record. No-op on the plan
+/// when none exists — the caller still emits the timeline row.
+pub async fn withdraw_proposal(db: &Db, thread_id: i32, rationale: &str) -> Result<()> {
+    // Same per-thread gate as save/confirm/approve/deny: a withdraw can't interleave
+    // with them at the DB level (see `thread_gate`).
+    let gate = thread_gate(thread_id);
+    let _gate = gate.lock().await;
+    // Nothing proposed yet → no plan to withdraw; the caller still emits the row.
+    if repo::get_plan(db, thread_id).await?.is_none() {
+        return Ok(());
+    }
+    // Store an EMPTY proposal (keep the rationale for the record): a confirm racing
+    // this withdraw then has nothing to materialize, and `pending_writes` goes empty.
+    let withdrawn = Proposal {
+        rationale: rationale.to_string(),
+        directions: Vec::new(),
+    };
+    let json = serde_json::to_string(&withdrawn)?;
+    // Bump the version (R50-2) just like save_proposal; upsert PRESERVES created_at on
+    // update, so the explicit set applies the fresh version.
+    let version = proposal_version();
+    repo::upsert_plan(db, thread_id, &json, "withdrawn", &version).await?;
+    repo::set_plan_created_at(db, thread_id, &version).await?;
+    Ok(())
+}
+
 /// Resolve a plan ROW (already read) against its workspace repos. Derives the
 /// resolved proposal from exactly the row passed in — so a caller that needs the
 /// resolved form AND a compare-and-swap baseline from the SAME snapshot (confirm)
@@ -374,6 +405,12 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("no proposal to confirm for thread {thread_id}"))?;
     let resolved = resolved_from_plan(db, thread_id, &start_plan).await?;
+    // A withdrawn plan is a cancelled proposal — its directions were cleared on withdraw.
+    // Refuse to confirm so a confirm racing a withdraw (a stale frontend snapshot inside
+    // the poll window) fails cleanly instead of materializing cancelled work.
+    if resolved.status == "withdrawn" {
+        anyhow::bail!("plan was withdrawn; re-propose before confirming");
+    }
     // Idempotent fast-path: the plan was already fully confirmed in a prior call.
     // Return ONLY the ids belonging to lanes that confirm itself creates/dispatches:
     // - known repo, AND
@@ -1599,6 +1636,75 @@ mod tests {
         // Cleanup.
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    // ---- DB-backed: first-class withdraw / cancel ----
+
+    #[tokio::test]
+    async fn withdraw_empties_and_flags_plan() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-withdraw-a-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let proposal = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        let before = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(before.status, "proposed");
+        let parsed_before: Proposal = serde_json::from_str(&before.proposal).unwrap();
+        assert_eq!(parsed_before.directions.len(), 2);
+        assert_eq!(pending_writes(&db, t.id).await.unwrap().len(), 2, "both known-repo writes pending before withdraw");
+
+        withdraw_proposal(&db, t.id, "撤回上一版").await.unwrap();
+
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "withdrawn", "withdraw flips status to withdrawn");
+        let parsed_after: Proposal = serde_json::from_str(&after.proposal).unwrap();
+        assert!(parsed_after.directions.is_empty(), "withdraw clears the directions");
+        assert_ne!(after.created_at, before.created_at, "withdraw bumps the proposal version");
+        assert!(pending_writes(&db, t.id).await.unwrap().is_empty(), "no pending write cards survive a withdraw");
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn withdrawn_plan_refuses_confirm() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-withdraw-b-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let proposal = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"impl-only".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+        ]};
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+        withdraw_proposal(&db, t.id, "撤回").await.unwrap();
+
+        assert!(confirm(&db, t.id).await.is_err(), "a withdrawn plan must not confirm");
+        assert!(repo::list_directions(&db, t.id).await.unwrap().is_empty(), "no direction materialized from a withdrawn plan");
+
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
