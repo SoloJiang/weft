@@ -205,6 +205,20 @@ export const zh = {
     taskEmptyTitle: "从任务开始",
     taskEmptyBody:
       "告诉 lead 要改什么；它会读取仓库地图、推断 scope，并派发合适的 worker。",
+    onboardingCueEyebrow: "规划 · 排队 · 任务",
+    onboardingCueBody:
+      "只需描述一次目标。Lead 会生成计划、排队派发限定范围的 worker，并把每个任务持续展示在这里。",
+    suggestionLabel: "可以试试",
+    suggestionPlan: "先规划实施路径",
+    suggestionQueue: "划定 scope 后排队执行",
+    suggestionTask: "补充验收标准",
+    suggestionDescribe: "描述目标",
+    suggestionAttach: "添加文件或图片",
+    suggestionSlash: "输入 / 调用命令",
+    suggestionImportRepo: "导入本地仓库",
+    suggestionCloneRepo: "从 Git URL 克隆",
+    suggestionCreateRepo: "新建空仓库",
+    imageAttachment: "图片 {{count}}",
     repoGuideTitle: "先接入一个仓库",
     repoGuideBody:
       "这个工作区还没有本地 git 仓库。这里添加后，Weft 会刷新仓库地图，并把结果回灌到这段对话。",
@@ -716,10 +730,14 @@ export const zh = {
     title: "这个界面崩溃了",
     body: "其余界面与后台 agent 不受影响。",
     retry: "重试",
+    stackTrace: "堆栈信息",
     renameDuplicate: "已有同名条目。",
     renameEmpty: "名称不能为空。",
     renameFailed: "重命名失败，请重试。",
     deleteWorktreeFailed: "删除 worktree 失败，请重试。",
+  },
+  ai: {
+    shellSnippet: "Shell 片段",
   },
   kind: {
     feature: "功能",

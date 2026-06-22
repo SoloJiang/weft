@@ -210,6 +210,20 @@ export const en = {
     taskEmptyTitle: "Start with the task",
     taskEmptyBody:
       "Tell the lead what should change. It reads the repo map, infers scope, and dispatches the right workers.",
+    onboardingCueEyebrow: "Plan · queue · task",
+    onboardingCueBody:
+      "Describe the outcome once. The lead turns it into a plan, queues scoped workers, and keeps each task visible here.",
+    suggestionLabel: "Try",
+    suggestionPlan: "Plan the implementation first",
+    suggestionQueue: "Queue worker tasks after scope",
+    suggestionTask: "Summarize acceptance criteria",
+    suggestionDescribe: "Describe the goal",
+    suggestionAttach: "Attach files or images",
+    suggestionSlash: "Use / for commands",
+    suggestionImportRepo: "Import a local repo",
+    suggestionCloneRepo: "Clone from Git URL",
+    suggestionCreateRepo: "Create a blank repo",
+    imageAttachment: "Image {{count}}",
     repoGuideTitle: "Connect a repo before the lead scopes work",
     repoGuideBody:
       "This workspace has no local git repos yet. Add one here; Weft refreshes the repo map and returns the result to this conversation.",
@@ -740,10 +754,14 @@ export const en = {
     title: "This screen crashed",
     body: "Other screens and background agents are unaffected.",
     retry: "Retry",
+    stackTrace: "Stack trace",
     renameDuplicate: "Another item already uses that name.",
     renameEmpty: "Name cannot be empty.",
     renameFailed: "Rename failed. Please try again.",
     deleteWorktreeFailed: "Couldn't delete the worktree. Please try again.",
+  },
+  ai: {
+    shellSnippet: "Shell snippet",
   },
   kind: {
     feature: "Feature",
