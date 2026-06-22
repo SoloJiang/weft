@@ -1278,13 +1278,11 @@ pub async fn mark_incomplete_turns_interrupted(
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Result<()> {
-    // A crash leaves both a half-streamed assistant row and any user message the
-    // user queued behind it (the in-memory FIFO is gone, so a `queued` row has no
-    // live processor and would otherwise show as pending forever). Close both as
-    // interrupted; full queued-message replay is the backend-queue feature (later).
+    // Close only the half-streamed assistant row; orphaned "queued" user messages
+    // are handled separately by fail_queued so they surface as resendable errors.
     let mut q = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(lead_message::Column::Status.is_in(["streaming", "queued"]));
+        .filter(lead_message::Column::Status.eq("streaming"));
     q = match session_id {
         Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
         None => q.filter(lead_message::Column::SessionId.is_null()),
@@ -2184,11 +2182,11 @@ mod tests {
             all.iter().find(|m| m.id == streaming.id).unwrap().status,
             "interrupted"
         );
-        // A queued user message orphaned by the crash (no live FIFO to deliver it)
-        // is closed as interrupted too, so it doesn't show as pending forever.
+        // Orphaned "queued" rows are NOT touched here; fail_queued (called by
+        // revive) flips them to "error" so they surface as resendable, not stuck.
         assert_eq!(
             all.iter().find(|m| m.id == queued.id).unwrap().status,
-            "interrupted"
+            "queued"
         );
     }
 

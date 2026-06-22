@@ -715,9 +715,17 @@ pub async fn list_lead_messages(
         repo::mark_incomplete_turns_interrupted(&db, thread_id, None)
             .await
             .map_err(|e| e.to_string())?;
+        // Un-sent queued rows from a dead session surface as resendable errors, not stuck/invisible.
+        repo::fail_queued(&db, thread_id, None)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     for sid in clean_sessions {
         repo::mark_incomplete_turns_interrupted(&db, thread_id, Some(sid))
+            .await
+            .map_err(|e| e.to_string())?;
+        // Un-sent queued rows from a dead session surface as resendable errors, not stuck/invisible.
+        repo::fail_queued(&db, thread_id, Some(sid))
             .await
             .map_err(|e| e.to_string())?;
     }
