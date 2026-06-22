@@ -120,6 +120,26 @@ pub async fn edit_profile(
         },
         None => existing.as_ref().map(|p| p.role.clone()).unwrap_or_default(),
     };
+    // A manual canonical-tier edit cascades to this repo's components, so the
+    // expanded (per-component) view matches the overview. Tolerate a malformed
+    // components blob (treat as none). Other edits leave components untouched.
+    let components = if let Some(t) = tier {
+        if let Some(canon) = profile::normalize_tier(t) {
+            match serde_json::from_str::<Vec<profile::Component>>(&components) {
+                Ok(mut comps) => {
+                    for c in &mut comps {
+                        c.tier = canon.clone();
+                    }
+                    serde_json::to_string(&comps).unwrap_or(components)
+                }
+                Err(_) => components,
+            }
+        } else {
+            components
+        }
+    } else {
+        components
+    };
     let source = combine_source(
         owns_summary(prior_source) || summary.is_some(),
         owns_tier(prior_source) || tier.is_some(),
@@ -2159,6 +2179,63 @@ mod tests {
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
         assert!(super::edit_profile(&db, r.id, Some("s"), Some("frontend")).await.is_err());
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
+    }
+
+    /// Seed a repo with a profile containing the given components (name, tier pairs).
+    async fn seed_repo_with_components(
+        db: &Db,
+        ws_id: i32,
+        repo_tier: &str,
+        components: &[(&str, &str)],
+    ) -> crate::store::entities::repo_ref::Model {
+        let r = repo::add_repo_ref(db, ws_id, "mono", "/tmp/mono", "main", "", true)
+            .await
+            .unwrap();
+        let comps: Vec<crate::profile::Component> = components
+            .iter()
+            .map(|(name, tier)| crate::profile::Component {
+                name: name.to_string(),
+                tier: tier.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let comps_json = serde_json::to_string(&comps).unwrap();
+        repo::upsert_repo_profile(db, r.id, repo_tier, "[]", "monorepo summary", &comps_json, "agent", "")
+            .await
+            .unwrap();
+        r
+    }
+
+    #[tokio::test]
+    async fn edit_tier_cascades_to_components() {
+        // A canonical-tier edit rewrites every component's tier to match, so the
+        // expanded view (grouping by component tier) stays in sync with the overview.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_cascade").await.unwrap();
+        let r = seed_repo_with_components(
+            &db,
+            ws.id,
+            "frontend",
+            &[("web", "frontend"), ("api", "frontend")],
+        )
+        .await;
+        super::edit_profile(&db, r.id, None, Some("backend")).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        let comps: Vec<crate::profile::Component> = serde_json::from_str(&p.components).unwrap();
+        assert!(comps.iter().all(|c| c.tier == "backend"), "all component tiers cascaded to backend");
+        assert_eq!(p.role, "backend");
+    }
+
+    #[tokio::test]
+    async fn edit_summary_only_keeps_component_tiers() {
+        // A summary-only edit (tier = None) must leave component tiers unchanged.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_summary_only").await.unwrap();
+        let r = seed_repo_with_components(&db, ws.id, "frontend", &[("web", "frontend")]).await;
+        super::edit_profile(&db, r.id, Some("just a summary"), None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        let comps: Vec<crate::profile::Component> = serde_json::from_str(&p.components).unwrap();
+        assert_eq!(comps[0].tier, "frontend", "summary-only edit leaves component tier unchanged");
     }
 
     #[test]
