@@ -326,7 +326,9 @@ pub fn parse_gradle(s: &str) -> ManifestInfo {
             let rest = rest.trim_start_matches(|c: char| c == ' ' || c == '(');
             // Find a quoted string
             if let Some(q_start) = rest.find(|c| c == '\'' || c == '"') {
-                let quote_char = rest.chars().nth(q_start).unwrap_or('"');
+                // `find` returns a BYTE offset; index bytes (the quote is ASCII), not
+                // chars — `chars().nth(byte_offset)` would mis-pick after multi-byte text.
+                let quote_char = rest.as_bytes()[q_start] as char;
                 let after_open = &rest[q_start + 1..];
                 if let Some(q_end) = after_open.find(quote_char) {
                     let coord = &after_open[..q_end];
