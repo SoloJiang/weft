@@ -482,21 +482,29 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "propose_directions" => {
-            // A MALFORMED payload is not a cancel — surface the parse error to the lead
-            // (so it retries) instead of defaulting to an empty proposal that would take
-            // the withdraw path and silently clear an existing pending plan.
+            // `directions` must be a PRESENT, non-empty array. A missing / empty / malformed
+            // payload is NOT a cancel: return an error so the lead retries (cancellation goes
+            // through cancel_directions) rather than silently clearing the pending plan. Note
+            // `Proposal.directions` is `#[serde(default)]`, so a missing/misspelled key would
+            // otherwise deserialize to an empty list — hence the explicit presence check.
+            let has_directions = args
+                .get("directions")
+                .and_then(|d| d.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_directions {
+                return text_result(
+                    "error: propose_directions requires a non-empty `directions` array; \
+                     to withdraw pending directions, call cancel_directions"
+                        .into(),
+                );
+            }
             let proposal: crate::planner::Proposal = match serde_json::from_value(args.clone()) {
                 Ok(p) => p,
                 Err(e) => {
                     return text_result(format!("error: invalid propose_directions payload: {e}"))
                 }
             };
-            // An explicitly EMPTY directions list is a cancel. Route it to the same
-            // withdraw path as `cancel_directions`, so a stray empty propose can never
-            // persist a "proposed" 0-direction plan or the dead-end "查看并创建" card.
-            if proposal.directions.is_empty() {
-                return withdraw_and_emit(db, thread, &proposal.rationale).await;
-            }
             let n = proposal.directions.len();
             match crate::planner::save_proposal(db, thread, &proposal).await {
                 Ok(()) => {
@@ -553,14 +561,20 @@ async fn emit_proposal_row(db: &Db, thread: i32, rationale: &str, count: usize) 
     }
 }
 
-/// Withdraw the pending proposal and emit a count-0 ("已撤回") row. Shared by the
-/// `cancel_directions` tool and an empty `propose_directions` call.
+/// Withdraw the pending proposal (the `cancel_directions` tool). Only records the count-0
+/// ("已撤回") row when a pending proposal was ACTUALLY cleared — a no-op cancel (already
+/// confirmed, a lane approved, or nothing proposed) must not leave a misleading withdrawn
+/// row over live work.
 async fn withdraw_and_emit(db: &Db, thread: i32, rationale: &str) -> Value {
     match crate::planner::withdraw_proposal(db, thread, rationale).await {
-        Ok(()) => {
+        Ok(true) => {
             emit_proposal_row(db, thread, rationale, 0).await;
             text_result("withdrew pending directions".into())
         }
+        Ok(false) => text_result(
+            "nothing to withdraw: no pending proposal (it may be confirmed or already dispatched)"
+                .into(),
+        ),
         Err(e) => text_result(format!("error: {e}")),
     }
 }

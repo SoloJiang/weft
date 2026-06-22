@@ -1259,7 +1259,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           void api
             .getProposal(tid)
             .then((pr) => {
-              if (!pr) return;
+              // Re-check the active thread AFTER the await: the user may have switched
+              // threads while this was in flight, and writing thread A's proposal (or
+              // clearing A's review flag) into global state would corrupt thread B.
+              if (!pr || activeThreadIdRef.current !== tid) return;
               setProposal(pr);
               // A withdrawn/confirmed refresh must also drop a stale review flag: otherwise
               // a later re-propose in this thread would auto-reopen ScopeReview without the
