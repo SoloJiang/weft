@@ -121,7 +121,7 @@ export interface LiveWorkerSlot {
   repo_id: number;
   thread_id: number;
   busy: boolean;
-  queued: number;
+  queue: QueuedItem[];
 }
 
 /** Session ref backing the worker conversation surface (mirrors Rust ObserveRef). */
@@ -238,7 +238,7 @@ export type LeadChatPush =
       thread_id: number;
       session_id: number | null;
       state: "busy" | "idle" | "stopped";
-      queued: number;
+      queue: QueuedItem[];
     }
   | {
       type: "init";
@@ -298,7 +298,7 @@ export interface ImageAttachment {
 /** Snapshot of the lead engine, for mount-time hydration. */
 export interface LeadStateInfo {
   state: "busy" | "idle" | "stopped";
-  queued: number;
+  queue: QueuedItem[];
   native_id: string | null;
   slash_commands: SlashCmd[];
   cwd: string;
@@ -397,6 +397,14 @@ export interface RepoEdge {
 export interface RepoGraph {
   nodes: RepoProfile[];
   edges: RepoEdge[];
+}
+
+/** One item waiting in the engine's send queue (mirrors Rust QueuedItem). */
+export interface QueuedItem {
+  id: number;
+  text: string;
+  images: number;
+  files: number;
 }
 
 /** The lead's proposed split of a Task into directions: ONE write repo each
