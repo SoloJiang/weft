@@ -1,4 +1,5 @@
 import { memo, useEffect, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import ReactMarkdown, { defaultUrlTransform, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { codeToHtml } from "shiki";
@@ -6,6 +7,7 @@ import { api } from "../lib/api";
 import { classifyHref, filePathsRehype, isPathLike } from "../lib/fileLinks";
 import { cn } from "../lib/cn";
 import { FilePathRef, InsideRefContext } from "./FilePathRef";
+import { ShellSnippet } from "./ai-elements";
 
 // Script-y schemes are never handed to the DOM href or the OS opener.
 const UNSAFE_HREF = /^\s*(?:javascript|data|vbscript):/i;
@@ -26,6 +28,10 @@ const fileAwareUrlTransform: NonNullable<Options["urlTransform"]> = (url, key) =
 function parseLanguage(className?: string): string {
   const match = /language-(\w+)/.exec(String(className ?? ""));
   return match?.[1] ?? "text";
+}
+
+function isShellLanguage(language: string): boolean {
+  return ["bash", "console", "sh", "shell", "terminal", "zsh"].includes(language);
 }
 
 function currentShikiTheme(): "github-dark" | "github-light" {
@@ -106,6 +112,7 @@ function CodeBlock({
  * to reveal — resolved against the session's working dir (`cwd`).
  */
 export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cwd?: string }) {
+  const { t } = useTranslation();
   return (
     <div className="weft-md text-[12.5px] leading-relaxed text-ink">
       <ReactMarkdown
@@ -146,7 +153,18 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
             // inline code is eligible to become a file ref — never a fenced block.
             const block = String(className ?? "").includes("language-") || content.includes("\n");
             if (block) {
-              return <CodeBlock code={content} language={parseLanguage(className)} className="my-2" />;
+              const language = parseLanguage(className);
+              if (isShellLanguage(language)) {
+                return (
+                  <ShellSnippet
+                    code={content}
+                    label={t("ai.shellSnippet")}
+                    copyLabel={t("lead.copyMessage")}
+                    copiedLabel={t("lead.copied")}
+                  />
+                );
+              }
+              return <CodeBlock code={content} language={language} className="my-2" />;
             }
             if (isPathLike(content, true)) {
               return (
