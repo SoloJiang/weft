@@ -3,7 +3,7 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, Check, ChevronRight, Copy, FileText, Sparkles } from "lucide-react";
 import type { LeadMessage, ResolvedProposal } from "../lib/types";
-import { Markdown } from "../components/Markdown";
+import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { cn } from "../lib/cn";
 import {
   cleanToolName,
@@ -700,9 +700,11 @@ function TimelineRow({
       </span>
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-          {assistantText && <Markdown text={assistantText} cwd={cwd} />}
-          {m.status === "streaming" && (
-            <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
+          {assistantText && (
+            <Markdown text={assistantText} cwd={cwd} caret={m.status === "streaming"} />
+          )}
+          {m.status === "streaming" && !assistantText && (
+            <span className={STREAM_CARET_CLASS} />
           )}
           {m.status === "interrupted" && (
             <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>

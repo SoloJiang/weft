@@ -26,12 +26,29 @@ const fileAwareUrlTransform: NonNullable<Options["urlTransform"]> = (url, key) =
  * inline code, or prose) become quiet file references — ⌘-click to open, right
  * to reveal — resolved against the session's working dir (`cwd`).
  */
-export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cwd?: string }) {
+/** Streaming caret styling — shared with ChatTimeline's pre-text fallback so the
+ *  inline caret and the empty-state caret stay visually identical. */
+export const STREAM_CARET_CLASS =
+  "ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom";
+
+export const Markdown = memo(function Markdown({
+  text,
+  cwd,
+  caret,
+}: {
+  text: string;
+  cwd?: string;
+  /** While true, a blinking caret is appended inline after the last character. */
+  caret?: boolean;
+}) {
+  const rehypePlugins = (caret
+    ? [filePathsRehype, caretRehype]
+    : [filePathsRehype]) as unknown as Options["rehypePlugins"];
   return (
     <div className="weft-md text-[12.5px] leading-relaxed text-ink">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[filePathsRehype] as unknown as Options["rehypePlugins"]}
+        rehypePlugins={rehypePlugins}
         urlTransform={fileAwareUrlTransform}
         components={{
           a: ({ href, children }) => {
@@ -81,14 +98,18 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
             );
           },
           span: ({ node, children }) => {
-            const fp = (node as { properties?: Record<string, unknown> } | undefined)?.properties
-              ?.dataFilepath;
+            const props = (node as { properties?: Record<string, unknown> } | undefined)
+              ?.properties;
+            const fp = props?.dataFilepath;
             if (typeof fp === "string") {
               return (
                 <FilePathRef token={fp} cwd={cwd} isUrl={/^file:/i.test(fp)}>
                   {children}
                 </FilePathRef>
               );
+            }
+            if (props?.dataStreamCaret) {
+              return <span className={STREAM_CARET_CLASS} aria-hidden />;
             }
             return <span>{children}</span>;
           },
@@ -105,4 +126,46 @@ function nodeText(children: ReactNode): string {
   if (typeof children === "string") return children;
   if (Array.isArray(children)) return children.map(nodeText).join("");
   return "";
+}
+
+interface HNode {
+  type: string;
+  tagName?: string;
+  value?: string;
+  properties?: Record<string, unknown>;
+  children?: HNode[];
+}
+
+/**
+ * rehype plugin: place a caret marker right after the last visible character so
+ * the streaming cursor hugs the text. A plain sibling span would land below the
+ * rendered block (markdown emits block elements), so we descend into the deepest
+ * trailing element and inject the caret inline there. The `span` override paints it.
+ */
+function caretRehype() {
+  return (tree: unknown) => {
+    insertCaret((tree as HNode).children);
+  };
+}
+
+function insertCaret(nodes: HNode[] | undefined): boolean {
+  if (!nodes) return false;
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (n.type === "text") {
+      if ((n.value ?? "").trim() === "") continue; // skip inter-block whitespace
+      nodes.splice(i + 1, 0, caretNode());
+      return true;
+    }
+    if (n.type === "element") {
+      if (insertCaret(n.children)) return true;
+      nodes.splice(i + 1, 0, caretNode()); // empty/void element → caret right after it
+      return true;
+    }
+  }
+  return false;
+}
+
+function caretNode(): HNode {
+  return { type: "element", tagName: "span", properties: { dataStreamCaret: true }, children: [] };
 }
