@@ -562,7 +562,7 @@ pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profi
 }
 
 /// Insert or update a repo's profile from the agent curator. `tier` is the
-/// architectural tier ("frontend"|"gateway"|"backend"|""), `stack`/`components`
+/// architectural tier ("frontend"|"backend"|""), `stack`/`components`
 /// are JSON arrays. The vestigial `published`/`deps` columns are pinned to "[]".
 /// `relations` are left untouched on update so re-analysis of facts never wipes
 /// the agent's cross-repo findings (and stay "[]" on a fresh row).

@@ -12,9 +12,8 @@ pub struct Model {
     #[sea_orm(unique)]
     pub repo_id: i32,
     /// The repo's architectural tier as the agent classified it: "frontend" |
-    /// "gateway" | "backend", or "" when analysis hasn't run yet. (Column name is
-    /// historical — it held the deterministic role before the curator went
-    /// agent-only.)
+    /// "backend", or "" when analysis hasn't run yet. (Column name is historical —
+    /// it held the deterministic role before the curator went agent-only.)
     pub role: String,
     /// JSON array of stack tags (agent-reported).
     pub stack: String,
