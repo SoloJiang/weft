@@ -1343,6 +1343,22 @@ pub async fn complete_queued_by_id(
     Ok(Some(a.update(&db.0).await?))
 }
 
+/// 删除一条消息行（仅用于取消未交付的 queued 行）。
+pub async fn delete_message(db: &Db, message_id: i32) -> Result<()> {
+    lead_message::Entity::delete_by_id(message_id).exec(&db.0).await?;
+    Ok(())
+}
+
+/// 覆盖一条消息行的 content（编辑排队消息文本用）。
+pub async fn update_message_content(db: &Db, message_id: i32, content: &str) -> Result<()> {
+    if let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? {
+        let mut a: lead_message::ActiveModel = m.into();
+        a.content = Set(content.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 pub async fn fail_queued(
     db: &Db,
     thread_id: i32,

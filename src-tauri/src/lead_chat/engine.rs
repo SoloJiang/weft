@@ -244,6 +244,49 @@ impl TurnState {
             },
         }
     }
+
+    /// 删除某条仍排队的消息；true=删掉了。
+    pub fn remove(&mut self, id: i32) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|o| o.queue_id != Some(id));
+        self.queue.len() != before
+    }
+
+    /// 改某条排队消息文本；true=改了。
+    pub fn edit(&mut self, id: i32, text: &str) -> bool {
+        for o in self.queue.iter_mut() {
+            if o.queue_id == Some(id) {
+                o.text = text.to_string();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 按 id 列表重排；order 必须是当前队列 id 的排列，否则不动并返回 false。
+    pub fn reorder(&mut self, order: &[i32]) -> bool {
+        let cur: Vec<i32> = self.queue.iter().filter_map(|o| o.queue_id).collect();
+        if order.len() != cur.len() {
+            return false;
+        }
+        let mut a = order.to_vec();
+        let mut b = cur.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        if a != b {
+            return false;
+        }
+        let mut next: VecDeque<Outgoing> = VecDeque::new();
+        for id in order {
+            if let Some(pos) = self.queue.iter().position(|o| o.queue_id == Some(*id)) {
+                if let Some(item) = self.queue.remove(pos) {
+                    next.push_back(item);
+                }
+            }
+        }
+        self.queue = next;
+        true
+    }
 }
 
 /// Per-turn dialects (codex `exec --json`, opencode `run --format json`) spawn
@@ -1887,6 +1930,48 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
     Ok(())
 }
 
+/// 取消一条还在队列中的消息；幂等（消息已交付则静默成功）。
+pub async fn queue_remove(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32) -> anyhow::Result<()> {
+    {
+        let mut inner = eng.lock().await;
+        if !inner.turn.remove(message_id) {
+            return Ok(());
+        }
+        emit_turn_state(app, inner.thread_id, inner.session_id, inner.turn.busy, queue_items(&inner.turn));
+    }
+    repo::delete_message(db, message_id).await?;
+    Ok(())
+}
+
+/// 编辑一条还在队列中的消息文本；text 为空时返回 Err。
+pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32, text: &str) -> anyhow::Result<()> {
+    if text.trim().is_empty() {
+        return Err(anyhow::anyhow!("empty"));
+    }
+    {
+        let mut inner = eng.lock().await;
+        if !inner.turn.edit(message_id, text) {
+            return Ok(());
+        }
+        let (tid, sid) = (inner.thread_id, inner.session_id);
+        emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
+    }
+    let content = serde_json::json!({ "text": text, "images": [], "files": [] }).to_string();
+    repo::update_message_content(db, message_id, &content).await?;
+    Ok(())
+}
+
+/// 重排队列；order 必须是当前队列 id 的排列，否则返回 Err。
+pub async fn queue_reorder(app: &AppHandle, _db: &Db, eng: &EngineRef, order: Vec<i32>) -> anyhow::Result<()> {
+    let mut inner = eng.lock().await;
+    if !inner.turn.reorder(&order) {
+        return Err(anyhow::anyhow!("bad_order"));
+    }
+    let (tid, sid) = (inner.thread_id, inner.session_id);
+    emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
+    Ok(())
+}
+
 /// Interrupt the current turn: protocol control_request first (verified live:
 /// control_response + result{terminal_reason:aborted_streaming}); kill after 3s
 /// as the hard fallback. Either way `--resume` recovers the session next send.
@@ -3328,5 +3413,31 @@ mod tests {
         let resumed = build_args(&inner);
         let i = resumed.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(resumed[i + 1], "abc");
+    }
+
+    #[test]
+    fn turnstate_remove_edit_reorder() {
+        let mut t = TurnState::default();
+        for id in [10, 20, 30] {
+            t.queue.push_back(Outgoing { text: format!("t{id}"), queue_id: Some(id), ..Default::default() });
+        }
+        assert!(t.edit(20, "edited"));
+        assert_eq!(t.queue[1].text, "edited");
+
+        assert!(t.reorder(&[30, 10, 20]));
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![30, 10, 20]);
+
+        assert!(t.remove(10));
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![30, 20]);
+
+        // 非排列 / 未知 id 被拒
+        assert!(!t.reorder(&[30])); // 长度不符
+        assert!(!t.reorder(&[30, 99])); // same length, unknown id → rejected
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![30, 20]); // queue untouched
+        assert!(!t.remove(999));
+        assert!(!t.edit(999, "x"));
     }
 }
