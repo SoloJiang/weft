@@ -42,6 +42,15 @@ pub struct ProposedDirection {
     /// Human decision on this write declaration: "" (pending) | "approved" | "denied".
     #[serde(default)]
     pub decision: String,
+    /// The id of the direction this lane was materialized into (0 = unset). RECORDED by the
+    /// server when `confirm`/`approve_direction` materialize the lane, so the confirmed
+    /// fast-path can re-dispatch each lane by its EXACT direction id instead of re-matching by
+    /// name+repo+base (which is ambiguous with duplicate lanes / moved defaults / stale rows).
+    /// `#[serde(default)]` so the lead's payloads (which never carry it) deserialize to 0; a
+    /// confirmed proposal stored by the server carries the real ids. The lead must NEVER set it
+    /// — `save_proposal` scrubs it to 0 alongside `decision` (TRUST BOUNDARY).
+    #[serde(default)]
+    pub direction_id: i32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +83,9 @@ pub struct ResolvedDirection {
     pub mandate: String,
     pub base_branch: String,
     pub decision: String,
+    /// The direction id this lane was materialized into (0 = unset). Carried through from the
+    /// stored proposal so the confirmed fast-path can re-dispatch by recorded id (no matching).
+    pub direction_id: i32,
 }
 
 /// Resolve one proposed direction's write-repo name to a workspace repo id.
@@ -94,6 +106,7 @@ pub fn resolve(dir: &ProposedDirection, repos: &[(i32, String)]) -> ResolvedDire
         mandate: repo::normalize_mandate(&dir.mandate).to_string(),
         base_branch: dir.base_branch.clone(),
         decision: dir.decision.clone(),
+        direction_id: dir.direction_id,
     }
 }
 
@@ -268,6 +281,12 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
     let mut p = proposal.clone();
     for d in &mut p.directions {
         d.decision = String::new();
+        // TRUST BOUNDARY (mirror of the decision scrub): the lead must NEVER assign a direction
+        // to a lane. `direction_id` is `#[serde(default)]`, so a hostile `propose_directions`
+        // could inject one — which the confirmed fast-path would then re-dispatch as if the server
+        // had materialized it, dispatching an arbitrary direction with NO human action. The server
+        // sets it only via confirm/approve. Reset to 0 (unset) before storing.
+        d.direction_id = 0;
     }
     let json = serde_json::to_string(&p)?;
     // Bump the proposal VERSION on EVERY re-propose (R50-2). `upsert_plan` uses `version` as the
@@ -366,166 +385,38 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // is idempotent when the dir already exists.
     if resolved.status == "confirmed" {
         let all = repo::list_directions(db, thread_id).await?;
-        // Per-repo cache so BOTH the pre-pass and the per-lane match below can be BASE-AWARE
-        // (R52-1) without re-fetching the repo for every lane. The fast-path must mirror the
-        // non-confirmed path's base-compatible claim: with duplicate same-name/repo lanes on
-        // DIFFERENT bases, a name+repo-only `.find` could pre-claim the wrong base-specific
-        // direction and dispatch the swapped one. On a missing repo (None/Err) we leave the
-        // entry None and fall back to a name+repo-only match so a retry never crashes.
-        let mut repo_cache: std::collections::HashMap<
-            i32,
-            Option<crate::store::entities::repo_ref::Model>,
-        > = std::collections::HashMap::new();
-        for p in &resolved.directions {
-            if p.repo.known && !repo_cache.contains_key(&p.repo.repo_id) {
-                let r = repo::get_repo(db, p.repo.repo_id).await.ok().flatten();
-                repo_cache.insert(p.repo.repo_id, r);
-            }
-        }
-        // `d` is the candidate DB direction being matched (it carries the authoritative recorded
-        // base + its OWN name/repo_id), `p` is the proposal lane.
-        let base_ok = |d: &crate::store::entities::direction::Model, p: &ResolvedDirection| -> bool {
-            let existing_base = d.base_branch.as_str();
-            // R54-3: in the CONFIRMED fast-path, a BLANK proposed base matches an already-
-            // materialized direction WITHOUT re-resolving the live default. The lane was created
-            // from the THEN-default and its direction recorded the ACTUAL base (e.g. `main`); the
-            // direction is materialized, so its recorded base is authoritative. If the live default
-            // later moves (main → develop), re-resolving the blank against `develop` would falsely
-            // mismatch the recorded `main` and DROP the lane, so the dispatcher couldn't resume the
-            // confirmed worker. (Non-confirmed paths keep `base_compatible`, where a blank base
-            // legitimately resolves to the current default at CREATION time — only this confirmed,
-            // already-materialized retry treats blank as match-any.)
-            //
-            // `base_ok` is the EXPLICIT-lane matcher (see pick_explicit_dir); blank lanes route
-            // through pick_blank_dir instead, which biases toward a base-compatible-default / newest
-            // dir (#42r5-2). This blank-true branch is kept as a DEFENSIVE fallback only — if a blank
-            // lane ever reached here it would (as in R54-3) match ANY same-name/repo direction without
-            // re-resolving the moving live default. Stealing of an explicit sibling's base-specific
-            // dir is prevented by claim ORDER + blank-base-compatible bias (explicit lanes bind their
-            // exact base first; a blank lane only takes a base-compatible-default or newest-remaining
-            // dir — see PHASE 1 / PHASE 2 below), not by a per-candidate exclusion.
-            if p.base_branch.trim().is_empty() {
-                return true;
-            }
-            // Fall back to a name+repo-only match when the repo is missing (None), so a missing
-            // repo doesn't crash the retry — the same best-effort posture as the pre-pass below.
-            repo_cache
-                .get(&p.repo.repo_id)
-                .and_then(|r| r.as_ref())
-                .is_none_or(|r| {
-                    base_compatible(
-                        existing_base,
-                        &p.base_branch,
-                        std::path::Path::new(&r.local_git_path),
-                        &r.base_ref,
-                        r.base_ref_is_default,
-                    )
-                })
-        };
+        // ID-BASED DISPATCH (the whole point of this refactor). A confirmed proposal carries, on
+        // each lane, the `direction_id` that confirm/approve RECORDED when they materialized it. So
+        // re-dispatch each lane by its EXACT recorded id — no name+repo+base re-matching. That
+        // matching was fundamentally ambiguous with duplicate same-name/repo lanes, mixed/blank
+        // bases, moved live defaults, and stale leftover rows; every patch surfaced a new
+        // permutation. With recorded ids those edge cases are gone by construction: a lane points
+        // at its OWN direction, period.
+        //
+        // For each lane that confirm itself dispatches — known repo AND decision NOT approved/denied
+        // (those are handled by approve_direction / deny_direction and must not be re-dispatched
+        // here) — look up its recorded direction. Skip it when:
+        //   - direction_id == 0 (unset): no direction was recorded for this lane (e.g. a proposal
+        //     stored before this field existed, or a lane that never materialized), so there is
+        //     nothing to re-dispatch — skip rather than guess.
+        //   - the direction no longer exists (deleted), OR its status == "done": a completed lane is
+        //     history, not a resumable target — a re-proposal must create fresh work.
+        // `consumed` guards against a (malformed) proposal that recorded the SAME id on two lanes,
+        // so a direction is dispatched at most once.
         let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
         let mut matching: Vec<i32> = Vec::new();
-        let lane_is_blank = |p: &ResolvedDirection| p.base_branch.trim().is_empty();
-        // Is direction `d` base-COMPATIBLE with a BLANK lane's resolved default? Mirrors `base_ok`'s
-        // repo_cache lookup but compares `d`'s recorded base against an EMPTY proposed base — i.e. the
-        // live default at confirm time. A blank lane prefers such a direction so it binds its OWN
-        // default-based dir (e.g. `main`) instead of an arbitrary leftover `release` on a stale base.
-        // A missing repo (None) yields FALSE here (no trustworthy base info) so the blank lane falls
-        // through to the newest-same-name/repo fallback rather than crashing.
-        let blank_base_compat_default = |d: &crate::store::entities::direction::Model| -> bool {
-            repo_cache
-                .get(&d.repo_id)
-                .and_then(|r| r.as_ref())
-                .is_some_and(|r| {
-                    base_compatible(
-                        d.base_branch.as_str(),
-                        "",
-                        std::path::Path::new(&r.local_git_path),
-                        &r.base_ref,
-                        r.base_ref_is_default,
-                    )
-                })
-        };
-        // Pick the direction a BLANK lane `p` should claim (#42r5-2): a blank base is match-ANY in the
-        // fast-path (R54-3), so a naive first-match could grab a STALE leftover direction on an
-        // unrelated base (e.g. an old `release` from a superseded proposal) that happens to list first
-        // instead of the lane's own freshly-materialized default dir. Bias toward the lane's OWN dir:
-        //   (a) PREFER a direction whose base is base-compatible with the blank's resolved default;
-        //       among those, `prefer_newest` decides the tiebreak — NEWEST (highest id) for pending
-        //       dispatch (the current proposal's most recently materialized dir), or FIRST (list
-        //       order) for the terminal pre-claim (so a same-base APPROVED sibling reserves the
-        //       lower-id dir and leaves the newer one for a pending explicit sibling — #42r5-1).
-        //   (b) FALLBACK: if none is base-compatible (e.g. the live default MOVED since materialize,
-        //       so the recorded base no longer equals the current default), claim the NEWEST
-        //       same-name/repo non-done dir — still the lane's own most-recent one.
-        let pick_blank_dir = |p: &ResolvedDirection, consumed: &std::collections::HashSet<i32>, prefer_newest: bool| -> Option<i32> {
-            let eligible = |d: &&crate::store::entities::direction::Model| {
-                p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done"
-            };
-            let compat = all.iter().filter(eligible).filter(|d| blank_base_compat_default(d));
-            let chosen = if prefer_newest {
-                compat.max_by_key(|d| d.id)
-            } else {
-                compat.min_by_key(|d| d.id)
-            };
-            chosen
-                .or_else(|| all.iter().filter(eligible).max_by_key(|d| d.id))
-                .map(|d| d.id)
-        };
-        // Pick the direction an EXPLICIT lane `p` should claim: the exact base-compatible first-match
-        // (unchanged) — an explicit lane binds its precise recorded base via `base_ok`.
-        let pick_explicit_dir = |p: &ResolvedDirection, consumed: &std::collections::HashSet<i32>| -> Option<i32> {
-            all.iter()
-                .find(|d| p.name == d.name && p.repo.repo_id == d.repo_id && !consumed.contains(&d.id) && d.status != "done" && base_ok(d, p))
-                .map(|d| d.id)
-        };
-        // Resolve the direction a lane claims, routing blank vs explicit lanes to their matchers.
-        let claim_for = |p: &ResolvedDirection, consumed: &std::collections::HashSet<i32>, prefer_newest: bool| -> Option<i32> {
-            if lane_is_blank(p) {
-                pick_blank_dir(p, consumed, prefer_newest)
-            } else {
-                pick_explicit_dir(p, consumed)
+        for p in &resolved.directions {
+            if !p.repo.known || p.decision == "approved" || p.decision == "denied" {
+                continue;
             }
-        };
-        // #42r5-1: reserve ALL terminal (approved/denied) lanes' directions BEFORE dispatching ANY
-        // pending lane, in TWO outer constructs (not one `blank_pass` wrapping both). The earlier
-        // single-outer order ran the pending DISPATCH (blank_pass == false) before the blank terminal
-        // PRE-CLAIM (blank_pass == true), so with an APPROVED blank lane + a PENDING explicit lane on
-        // the SAME base, the explicit pending `.find` could consume the approved blank lane's dir
-        // before it was reserved. Splitting guarantees every terminal reservation (explicit AND blank)
-        // happens first.
-        //
-        // PHASE 1 — pre-claim ALL terminal lanes (explicit-first, then blank). A blank terminal lane
-        // uses FIRST-match among base-compatible-default dirs (prefer_newest == false) so a same-base
-        // APPROVED sibling reserves the lower-id dir, leaving the newer one for a pending explicit
-        // sibling. #42-tail / #42r2-1: explicit lanes pre-claim before blank lanes, AND a blank lane
-        // only claims a base-compatible-default dir, so it can never steal an explicit sibling's
-        // base-specific (e.g. `release`) direction.
-        for blank_pass in [false, true] {
-            for p in &resolved.directions {
-                if lane_is_blank(p) != blank_pass { continue; }
-                if !p.repo.known || !(p.decision == "approved" || p.decision == "denied") { continue; }
-                // Exclude terminal (done) directions from reuse: a completed lane is history,
-                // not a resumable target — a re-proposal must create fresh work.
-                if let Some(id) = claim_for(p, &consumed, false) {
-                    consumed.insert(id);
-                }
+            if p.direction_id == 0 {
+                continue;
             }
-        }
-        // PHASE 2 — dispatch-claim ALL pending lanes (explicit-first, then blank). Explicit lanes bind
-        // their exact-base dirs; blank lanes then take the NEWEST base-compatible-default dir that
-        // REMAINS (prefer_newest == true) — INCLUDING a second `main` when an explicit-`main` sibling
-        // already took the first. `matching` is pushed in (pending blank_pass, proposal-order) — every
-        // explicit pending id before every blank pending id — so dispatch order is stable.
-        for blank_pass in [false, true] {
-            for p in &resolved.directions {
-                if lane_is_blank(p) != blank_pass { continue; }
-                if !p.repo.known || p.decision == "approved" || p.decision == "denied" { continue; }
-                // Exclude terminal (done) directions from reuse: a completed lane is history,
-                // not a resumable target — a re-proposal must create fresh work.
-                if let Some(id) = claim_for(p, &consumed, true) {
-                    consumed.insert(id);
-                    matching.push(id);
-                }
+            let exists_live = all
+                .iter()
+                .any(|d| d.id == p.direction_id && d.status != "done");
+            if exists_live && consumed.insert(p.direction_id) {
+                matching.push(p.direction_id);
             }
         }
         // Re-materialize each claimed lane (recreating any reclaimed worktree dir). MIRROR the
@@ -558,6 +449,13 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;
     let tool = crate::tools::default_tool(db).await;
+    // Parse the RAW start-snapshot proposal once: we RECORD each materialized lane's direction id
+    // into `proposal.directions[idx].direction_id` as we go, then persist the UPDATED proposal in
+    // the final CAS so the confirmed fast-path can re-dispatch by recorded id (no re-matching). Its
+    // `.directions` indices align 1:1 with `resolved.directions` (both derive from this same row),
+    // so the loop's `idx` indexes both. unwrap_or_default mirrors resolved_from_plan: a corrupt
+    // proposal yields an empty Vec, so the id-recording is a no-op and confirm still proceeds.
+    let mut proposal: Proposal = serde_json::from_str(&start_plan.proposal).unwrap_or_default();
     // dispatch_ids = every lane to dispatch (reused + newly created); returned to caller.
     // created_now  = ONLY lanes created+materialized in THIS attempt; the rollback set.
     // Reused lanes are NEVER in created_now — they must not be torn down on a later
@@ -612,7 +510,7 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             }
         }
     }
-    for d in &resolved.directions {
+    for (idx, d) in resolved.directions.iter().enumerate() {
         if !d.repo.known {
             continue; // unknown repo name never resolved to a worktree-able repo
         }
@@ -693,6 +591,11 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             if was_reclaimed {
                 recreated_reused.push(ex_id);
             }
+            // RECORD the reused direction's id on this lane so the confirmed fast-path re-dispatches
+            // it directly (no re-matching). Persisted by the final commit_confirmed_plan_cas.
+            if let Some(pd) = proposal.directions.get_mut(idx) {
+                pd.direction_id = ex_id;
+            }
             dispatch_ids.push(ex_id);
             continue;
         }
@@ -723,6 +626,11 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             return Err(err);
         }
         created_now.push(dir.id);
+        // RECORD the freshly-created direction's id on this lane so the confirmed fast-path
+        // re-dispatches it directly (no re-matching). Persisted by the final commit_confirmed_plan_cas.
+        if let Some(pd) = proposal.directions.get_mut(idx) {
+            pd.direction_id = dir.id;
+        }
         dispatch_ids.push(dir.id);
     }
     // Test-only seam: let a test land a re-propose in the window before the CAS to exercise the
@@ -730,13 +638,26 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
     // serializes plan mutations, so no save_proposal/confirm can land here — see the CAS note.
     #[cfg(test)]
     tests::confirm_cas_gate(db, thread_id).await;
-    // FINAL commit, after ALL materialization. Now that the per-thread gate serializes every
-    // plan-mutating op, no re-propose (save_proposal) can land between our snapshot read and here,
-    // so this CAS can no longer reject in production — that's why materializing the reused lanes
-    // BEFORE this point is safe (a failure above already bailed without marking confirmed). The
-    // !applied branch is kept purely defensively: should it ever fire, roll back the lanes created
-    // in this attempt and bail so the plan is NOT left "confirmed" with stale lanes.
-    if !repo::mark_plan_confirmed_cas(db, thread_id, &start_plan.proposal, &start_plan.status).await? {
+    // FINAL commit, after ALL materialization. Persists the UPDATED proposal (now carrying each
+    // lane's recorded `direction_id`) AND flips the status to "confirmed" in one atomic CAS. The
+    // CAS baseline is still the START snapshot (start_plan.proposal/.status), so the concurrency
+    // invariant is unchanged: a re-propose that landed in between makes this match 0 rows and
+    // reject. Now that the per-thread gate serializes every plan-mutating op, no re-propose can
+    // land between our snapshot read and here, so this CAS can no longer reject in production —
+    // that's why materializing the reused lanes BEFORE this point is safe (a failure above already
+    // bailed without marking confirmed). The !applied branch is kept purely defensively: should it
+    // ever fire, roll back the lanes created in this attempt and bail so the plan is NOT left
+    // "confirmed" with stale lanes.
+    let new_json = serde_json::to_string(&proposal)?;
+    if !repo::commit_confirmed_plan_cas(
+        db,
+        thread_id,
+        &new_json,
+        &start_plan.proposal,
+        &start_plan.status,
+    )
+    .await?
+    {
         rollback_attempt(db, &created_now, &recreated_reused).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
     }
@@ -899,6 +820,9 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         #[cfg(test)]
         tests::approve_persist_gate(db, thread_id).await;
         proposal.directions[index].decision = "approved".to_string();
+        // RECORD the reused direction's id on this lane (persisted in the same persist_decision
+        // write) so the confirmed fast-path re-dispatches it by id, not by re-matching.
+        proposal.directions[index].direction_id = id;
         // CAS the approval BEFORE any disk side effect: if a re-propose landed in the window the
         // CAS rejects and we bail WITHOUT recreating the reclaimed worktree (which would undo the
         // user's disk-reclaim for an approval that never applied).
@@ -968,6 +892,9 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
     #[cfg(test)]
     tests::approve_persist_gate(db, thread_id).await;
     proposal.directions[index].decision = "approved".to_string();
+    // RECORD the freshly-created direction's id on this lane (persisted in the same persist_decision
+    // write) so the confirmed fast-path re-dispatches it by id, not by re-matching.
+    proposal.directions[index].direction_id = dir.id;
     if let Err(err) = persist_decision(db, thread_id, &proposal, &plan).await {
         // The CAS rejected: a lead re-proposal (or a confirm) landed after we read the
         // plan, so the frontend will dispatch nothing for this approve. The direction +
@@ -1236,6 +1163,7 @@ mod tests {
             mandate: "".into(),
             base_branch: "".into(),
             decision: "".into(),
+            direction_id: 0,
         };
         let r = resolve(&d, &repos());
         assert_eq!(r.name, "Payments");
@@ -1260,6 +1188,7 @@ mod tests {
             mandate: "impl-only".into(),
             base_branch: "".into(),
             decision: "".into(),
+            direction_id: 0,
         };
         let r = resolve(&d, &repos());
         assert!(!r.repo.known);
@@ -1298,6 +1227,7 @@ mod tests {
             mandate: "plan+impl".into(),
             base_branch: "".into(),
             decision: "approved".into(),
+            direction_id: 0,
         };
         let r = resolve(&d, &repos());
         assert_eq!(r.decision, "approved");
@@ -1314,6 +1244,7 @@ mod tests {
                     mandate: "".into(),
                     base_branch: "".into(),
                     decision: "".into(),
+                    direction_id: 0,
                 },
                 &repos(),
             ),
@@ -1325,6 +1256,7 @@ mod tests {
                     mandate: "".into(),
                     base_branch: "".into(),
                     decision: "approved".into(),
+                    direction_id: 0,
                 },
                 &repos(),
             ),
@@ -1336,6 +1268,7 @@ mod tests {
                     mandate: "".into(),
                     base_branch: "".into(),
                     decision: "".into(),
+                    direction_id: 0,
                 },
                 &repos(),
             ),
@@ -1408,6 +1341,7 @@ mod tests {
                     mandate: "impl-only".into(),
                     base_branch: "".into(),
                     decision: "".into(),
+                    direction_id: 0,
                 },
                 ProposedDirection {
                     name: "Ghost".into(),
@@ -1416,6 +1350,7 @@ mod tests {
                     mandate: "".into(),
                     base_branch: "".into(),
                     decision: "".into(),
+                    direction_id: 0,
                 },
             ],
         };
@@ -1508,8 +1443,8 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
-            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         // Simulate a confirmed plan, then a targeted base edit must NOT downgrade status.
@@ -1544,7 +1479,7 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // An explicit base that does not exist locally or on a remote.
         let proposal = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"impl-only".into(), base_branch:"no-such-xyz".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"impl-only".into(), base_branch:"no-such-xyz".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         let res = approve_direction(&db, t.id, 0, "codex").await;
@@ -1581,14 +1516,14 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // The proposal approve will READ (a valid default base → create+materialize succeed).
         let original = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &original).await.unwrap();
         // Arm a re-propose to land in the window between approve's plan read and its CAS:
         // a DIFFERENT stored proposal (extra lane) so the CAS's expected no longer matches.
         let reproposed = Proposal { rationale:"reproposed".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
-            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r2".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r2".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         arm_approve_race(t.id, &serde_json::to_string(&reproposed).unwrap(), "proposed");
 
@@ -1641,7 +1576,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         let first = confirm(&db, t.id).await.unwrap();
@@ -1673,7 +1608,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         let first = confirm(&db, t.id).await.unwrap();
@@ -1716,8 +1651,8 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // Lane A: default base (ok). Lane B: bad explicit base → materialize fails.
         let proposal = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
-            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"no-such-xyz".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"no-such-xyz".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         let res = confirm(&db, t.id).await;
@@ -1752,7 +1687,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let proposal = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         // Correct identity (editing FROM the empty default base) → applies.
@@ -1790,7 +1725,7 @@ mod tests {
         // fresh value). A stale blur-save from the OLD proposal was editing FROM "" → its
         // expected_base ("") no longer matches the lane's current base ("develop").
         let proposal = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"develop".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"develop".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
         // Stale save: same name/repo, but expected_base "" ≠ live "develop" → reject.
@@ -1832,7 +1767,7 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // v1: lane A/api with base "develop".
         let prop = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"develop".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"develop".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
         let v1 = get_resolved(&db, t.id).await.unwrap().unwrap().created_at;
@@ -1884,7 +1819,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into(), direction_id: 0 },
         ]};
         // First approve with empty base → creates + materializes (base ""→default).
         save_proposal(&db, t.id, &mk("")).await.unwrap();
@@ -1922,7 +1857,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &def, "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into(), direction_id: 0 },
         ]};
         // First approve with empty base → materializes off the default.
         save_proposal(&db, t.id, &mk("")).await.unwrap();
@@ -1954,7 +1889,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         // Approve A via the Needs-you path (creates + materializes).
         save_proposal(&db, t.id, &prop).await.unwrap();
@@ -1992,7 +1927,7 @@ mod tests {
         let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // TWO lanes, same name "A" + same repo "api".
-        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 };
         let prop = Proposal { rationale:"r".into(), directions: vec![lane(), lane()] };
         save_proposal(&db, t.id, &prop).await.unwrap();
         // Approve the FIRST lane (index 0): creates + materializes direction #1, sets its decision.
@@ -2034,7 +1969,7 @@ mod tests {
         let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // TWO pending lanes, same name "A" + same repo "api".
-        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 };
         let prop = Proposal { rationale:"r".into(), directions: vec![lane(), lane()] };
         save_proposal(&db, t.id, &prop).await.unwrap();
 
@@ -2082,7 +2017,7 @@ mod tests {
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
-        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 };
         let prop = Proposal { rationale:"r".into(), directions: vec![lane()] };
         // Approve A (creates + materializes the first direction), then mark it terminal ("done").
         save_proposal(&db, t.id, &prop).await.unwrap();
@@ -2142,7 +2077,7 @@ mod tests {
 
         // Re-propose the SAME name+repo lane with base `release`, then Create. confirm must reuse
         // the `release` direction (dir_rel), NOT error on the develop-first base mismatch.
-        let lane = ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"release".into(), decision:"".into() };
+        let lane = ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"release".into(), decision:"".into(), direction_id: 0 };
         let prop = Proposal { rationale:"r".into(), directions: vec![lane] };
         save_proposal(&db, t.id, &prop).await.unwrap();
         let ids = confirm(&db, t.id).await.unwrap();
@@ -2174,7 +2109,7 @@ mod tests {
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
-        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() };
+        let lane = || ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 };
         let prop = Proposal { rationale:"r".into(), directions: vec![lane()] };
         // Approve A (creates + materializes direction #1), then mark it terminal ("done").
         save_proposal(&db, t.id, &prop).await.unwrap();
@@ -2212,7 +2147,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let mk = |base: &str| Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:base.into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &mk("")).await.unwrap();
         let id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
@@ -2259,6 +2194,7 @@ mod tests {
                 mandate: "".into(),
                 base_branch: "develop".into(),
                 decision: "".into(),
+                direction_id: 0,
             }],
         };
         save_proposal(&db, t.id, &proposal).await.unwrap();
@@ -2290,14 +2226,14 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         // Approve A (empty base) via Needs-you → A materialized.
         let prop_a = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop_a).await.unwrap();
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         // Re-propose A (reset) + add B with a bad explicit base.
         let prop2 = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "no-such-xyz".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "no-such-xyz".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop2).await.unwrap();
         let res = confirm(&db, t.id).await;
@@ -2336,7 +2272,7 @@ mod tests {
 
         // Lane A: approved via Needs-you → materialized (a reusable, pre-existing lane).
         let prop_a = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop_a).await.unwrap();
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
@@ -2353,8 +2289,8 @@ mod tests {
         // Re-propose A (reset to pending, so confirm REUSES + RECREATES it) PLUS a NEW lane B with a
         // bad explicit base that fails to materialize AFTER A is recreated.
         let prop_ab = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "no-such-xyz".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "no-such-xyz".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop_ab).await.unwrap();
         let res = confirm(&db, t.id).await;
@@ -2410,8 +2346,8 @@ mod tests {
         // Two pending lanes A then B. A clean confirm creates+materializes both and marks the plan
         // "confirmed". Neither decision is "approved"/"denied", so a retry claims BOTH via the fast-path.
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "ra".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "ra".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
         let first = confirm(&db, t.id).await.unwrap();
@@ -2490,7 +2426,7 @@ mod tests {
 
         // Lane A: approved via Needs-you → materialized (a reusable, pre-existing lane).
         let prop_a = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop_a).await.unwrap();
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
@@ -2498,15 +2434,15 @@ mod tests {
         // Re-propose A (reset to pending) PLUS a brand-new pending lane B → confirm's reuse path
         // handles A and CREATES B (B lands in created_now, so a rejected CAS must roll B back).
         let prop_ab = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop_ab).await.unwrap();
         // Arm a re-propose to land in confirm's CAS window — a DIFFERENT stored proposal so the
         // snapshot's expected proposal no longer matches and the defensive CAS rejects.
         let reproposed = Proposal { rationale: "reproposed".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "C".into(), repo: "api".into(), reason: "rc".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "C".into(), repo: "api".into(), reason: "rc".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         arm_confirm_race(t.id, &serde_json::to_string(&reproposed).unwrap(), "proposed");
 
@@ -2563,7 +2499,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // Approve A via Needs-you → A is materialized (a reusable, pre-existing lane).
@@ -2633,7 +2569,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
 
@@ -2682,7 +2618,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // First confirm: creates and materializes the direction.
@@ -2731,7 +2667,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // First approve: creates and materializes the direction.
@@ -2780,7 +2716,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // First approve: creates and materializes the direction (decision="approved").
@@ -2801,8 +2737,8 @@ mod tests {
         // Arm a re-propose to land in the window between approve's plan read and its CAS — a
         // DIFFERENT stored proposal (extra lane) so the CAS's expected no longer matches.
         let reproposed = Proposal { rationale: "reproposed".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r2".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r2".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         arm_approve_race(t.id, &serde_json::to_string(&reproposed).unwrap(), "proposed");
 
@@ -2848,7 +2784,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // First approve: creates and materializes the direction (decision="approved").
@@ -2915,7 +2851,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // First approve: creates + materializes the direction (decision="approved"), recording the
@@ -2986,8 +2922,8 @@ mod tests {
         // save_proposal scrubs any injected decision, R47-3). The human then approves A
         // individually via approve_direction; B stays pending for confirm to create.
         let prop_ab = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "B".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop_ab).await.unwrap();
         // Lane A is approved via approve_direction (the legitimate decision path) → decision="approved".
@@ -3035,8 +2971,8 @@ mod tests {
         // Propose TWO same-name+repo `A` lanes, BOTH pending (the lead can only emit
         // pending lanes — save_proposal scrubs any injected decision, R47-3).
         let prop_dup = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop_dup).await.unwrap();
         // Approve the FIRST `A` lane individually via approve_direction (the legitimate
@@ -3083,7 +3019,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale:"r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into() },
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
         // First confirm: creates the lane and marks the plan "confirmed".
@@ -3125,7 +3061,7 @@ mod tests {
         let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // First confirm: creates and materializes lane A.
@@ -3198,6 +3134,7 @@ mod tests {
                     mandate: "impl-only".into(),
                     base_branch: "".into(),
                     decision: "approved".into(),
+                    direction_id: 0,
                 },
                 ProposedDirection {
                     name: "Web".into(),
@@ -3206,6 +3143,7 @@ mod tests {
                     mandate: "".into(),
                     base_branch: "".into(),
                     decision: "denied".into(),
+                    direction_id: 0,
                 },
             ],
         };
@@ -3257,7 +3195,7 @@ mod tests {
         repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
         let prop = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into() },
+            ProposedDirection { name: "A".into(), repo: "api".into(), reason: "r".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
 
         // First save → capture the exposed version.
@@ -3439,62 +3377,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo_path);
     }
 
-    /// R52-1: the confirmed (idempotent) fast-path must be BASE-AWARE when it claims existing
-    /// directions, exactly like the non-confirmed path. Two same-name+repo lanes have DIFFERENT
-    /// bases: the `develop` lane is approved (owns its `develop` direction) and the `release` lane
-    /// is pending (owns its `release` direction). Both directions exist; the plan is "confirmed".
-    /// On a retry, the fast-path's consumed PRE-PASS claims the approved `develop` lane's direction
-    /// and its per-lane MAIN match returns the pending `release` lane's direction. Without
-    /// base-awareness the name+repo-only `.find` returns whichever direction the DB lists FIRST:
-    /// with the `release` direction created first, the pre-pass mis-claims it for the approved
-    /// `develop` lane, so the pending `release` lane's per-lane match then returns the `develop`
-    /// direction — the two are SWAPPED and the wrong base-specific lane is dispatched. Red-first:
-    /// before base-aware selection, the fast-path returns the develop direction for the release lane.
+    /// ID-RECORDING: after `confirm` materializes a proposal's lanes, the STORED proposal must
+    /// carry each known-pending lane's `direction_id` (the created/reused direction's id). This is
+    /// the foundation the confirmed fast-path stands on: it re-dispatches by recorded id, so confirm
+    /// must record one per lane it dispatches. Unknown-repo lanes never resolve to a direction, so
+    /// their id stays 0.
     #[tokio::test]
-    async fn confirmed_fast_path_claims_base_compatible_direction() {
+    async fn confirm_records_direction_ids_in_proposal() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-basecompat-{}", std::process::id());
+        let tag = format!("weft-confirm-records-ids-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
         std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-        let repo_path = make_repo(&root, "api");
-        // Two real explicit bases (neither is the git default branch) so each lane materializes
-        // off its own and base_compatible compares non-empty bases by normalized identity.
-        sh(&repo_path, &["git", "branch", "develop"]);
-        sh(&repo_path, &["git", "branch", "release"]);
+        let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true).await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
-        // Seed the PENDING lane's `release` direction FIRST so list_directions returns it before
-        // the `develop` direction — the name+repo-only pre-pass would then mis-claim it for the
-        // approved `develop` lane. Both materialized (live lanes the fast-path re-materializes).
-        let dir_release = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "release").await.unwrap();
-        materialize::materialize_direction(&db, dir_release.id).await.unwrap();
-        let dir_develop = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "develop").await.unwrap();
-        materialize::materialize_direction(&db, dir_develop.id).await.unwrap();
-
-        // Stored proposal: lane[0]=`release` PENDING, lane[1]=`develop` APPROVED. Write the
-        // decision directly (save_proposal scrubs decisions, R47-3) and mark the plan confirmed,
-        // so confirm takes the idempotent fast-path.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"".into() },
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"approved".into() },
+        // Two known-repo PENDING lanes (created by confirm) + one unknown-repo lane (never dispatched).
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"B".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"Ghost".into(), repo:"nope".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
-
-        // Fast-path retry: returns ONLY the pending `release` lane's id, and it must be the
-        // base-MATCHING `release` direction — not the `develop` direction (which belongs to the
-        // approved lane and would be a swap).
+        save_proposal(&db, t.id, &prop).await.unwrap();
         let ids = confirm(&db, t.id).await.unwrap();
-        assert_eq!(ids, vec![dir_release.id],
-            "R52-1: fast-path must return the pending release lane's OWN (base-matching) release direction");
-        assert!(!ids.contains(&dir_develop.id),
-            "R52-1: the approved develop lane's direction must NOT be dispatched for the release lane (no swap)");
+        assert_eq!(ids.len(), 2, "two known pending lanes are dispatched");
+
+        // Re-read the STORED proposal: each known lane records its dispatched direction id; the
+        // unknown lane stays 0.
+        let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored: Proposal = serde_json::from_str(&plan.proposal).unwrap();
+        assert_eq!(stored.directions[0].direction_id, ids[0], "lane A records its created direction id");
+        assert_eq!(stored.directions[1].direction_id, ids[1], "lane B records its created direction id");
+        assert_eq!(stored.directions[2].direction_id, 0, "the unknown-repo lane records no id (0)");
+        // The recorded ids are the REAL direction rows.
+        let dirs = repo::list_directions(&db, t.id).await.unwrap();
+        for id in &ids {
+            assert!(dirs.iter().any(|d| d.id == *id), "recorded id {id} is a real direction");
+        }
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
@@ -3503,18 +3427,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// R54-3: in the CONFIRMED fast-path, a lane created from the THEN-default has proposal
-    /// `base_branch == ""` while its materialized direction recorded the ACTUAL base (e.g. `main`).
-    /// If the repo's LIVE default later moves (main → develop), `base_compatible("main", "", ...)`
-    /// resolves the blank against the NEW default `develop` → mismatch → the fast-path returns no
-    /// id → the dispatcher can't resume the confirmed worker. The direction is already
-    /// materialized, so its recorded base is authoritative: a BLANK proposed base must match it
-    /// WITHOUT re-resolving the moving live default. Red-first: before the fix, the moved default
-    /// makes the fast-path drop the lane (returns []), so confirm can't re-dispatch it.
+    /// THE WHOLE POINT (#42 round-6): the confirmed fast-path re-dispatches each pending lane by its
+    /// OWN RECORDED direction id — NOT by re-matching name+repo+base. This is exactly the permutation
+    /// that bounced the old heuristic for six review rounds: a confirmed plan with an APPROVED blank
+    /// lane + a PENDING explicit sibling on the SAME (default) base, two same-name/repo directions
+    /// both recorded on that base, and the live default MOVED after materialize. Under the old
+    /// name+repo+base heuristic the pending lane could grab the approved lane's direction (a swap),
+    /// drop itself (moved default -> blank no longer base-compatible), or pick a stale duplicate.
+    /// With recorded ids it is unambiguous: the pending explicit lane dispatches ITS OWN id and the
+    /// approved lane's id stays reserved (approved lanes aren't dispatched here). Red-first: against
+    /// the old heuristic this returned the wrong id / nothing; the id path returns exactly main #2.
     #[tokio::test]
-    async fn confirmed_fast_path_blank_base_matches_recorded_base_after_default_change() {
+    async fn confirmed_fast_path_redispatches_by_recorded_id() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-blank-defaultmove-{}", std::process::id());
+        let tag = format!("weft-fastpath-by-id-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
         let _ = std::fs::remove_dir_all(&root);
@@ -3522,12 +3448,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
 
-        // An ORIGIN with `main` (default) + `develop`, then a CLONE registered as the repo. The
-        // live default is read via `ls-remote --symref origin HEAD`, so moving origin's HEAD later
-        // genuinely changes what a blank base resolves to.
+        // ORIGIN with main(default)+develop, then a CLONE registered as the repo - so moving the
+        // origin's HEAD later genuinely changes what a blank base resolves to.
         let origin = make_repo(&root, "origin");
-        // Read make_repo's actual initial branch (init.defaultBranch may be main OR master) rather
-        // than hardcoding — the test must hold under both CI default-branch configs.
         let main = crate::git::current_branch(&origin).unwrap();
         sh(&origin, &["git", "checkout", "-q", "-b", "develop"]);
         sh(&origin, &["git", "commit", "-q", "--allow-empty", "-m", "d"]);
@@ -3537,42 +3460,47 @@ mod tests {
         sh(&root, &["git", "clone", "-q", origin.to_str().unwrap(), repo_path.to_str().unwrap()]);
         sh(&repo_path, &["git", "config", "user.email", "t@t.t"]);
         sh(&repo_path, &["git", "config", "user.name", "t"]);
-        assert_eq!(crate::git::live_default_branch(&repo_path).as_deref(), Some(main.as_str()),
-            "precondition: the clone's live default is the origin's main-family default");
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &main, "", true).await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &main, "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
-        // Create + materialize a BLANK-base lane: it branches off the live default (main) and
-        // records base == "main".
-        let dir = repo::create_direction(&db, t.id, "A", "claude", ra.id, "r", "plan+impl", "").await.unwrap();
-        materialize::materialize_direction(&db, dir.id).await.unwrap();
-        let recorded = repo::list_directions(&db, t.id).await.unwrap()
-            .into_iter().find(|d| d.id == dir.id).unwrap();
-        assert_eq!(recorded.base_branch, main,
-            "precondition: the materialized direction recorded the actual default base ({main})");
-
-        // Stored proposal: ONE lane, BLANK base, plan CONFIRMED → confirm takes the fast-path.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into() },
+        // Two same-name/repo lanes: lane[0] BLANK base (will be approved), lane[1] EXPLICIT `main`
+        // base (stays pending -> confirm creates it). They resolve to the SAME base (the default).
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:main.clone(), decision:"".into(), direction_id: 0 },
         ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
+        save_proposal(&db, t.id, &prop).await.unwrap();
 
-        // The repo's LIVE default MOVES main → develop (origin HEAD repointed). Now a blank base
-        // resolves to `develop`, which differs from the recorded `main`.
+        // Approve the BLANK lane individually (legitimate decision path) -> records a_id, decision=approved.
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        // Confirm -> creates the pending explicit lane (b_id) + records both lanes' ids + marks confirmed.
+        let confirm_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(confirm_ids.len(), 1,
+            "confirm dispatches only the pending explicit lane (the blank lane is already approved)");
+        let b_id = confirm_ids[0];
+        assert_ne!(a_id, b_id, "the two lanes own DISTINCT directions (both on the same base)");
+        // Sanity: the stored proposal recorded BOTH ids on their respective lanes.
+        let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored: Proposal = serde_json::from_str(&plan.proposal).unwrap();
+        assert_eq!(stored.directions[0].direction_id, a_id, "approved blank lane recorded a_id");
+        assert_eq!(stored.directions[1].direction_id, b_id, "pending explicit lane recorded b_id");
+
+        // The live default MOVES main -> develop (this is what broke the blank-base heuristic).
         sh(&origin, &["git", "symbolic-ref", "HEAD", "refs/heads/develop"]);
         assert_eq!(crate::git::live_default_branch(&repo_path).as_deref(), Some("develop"),
             "precondition: the live default moved to develop");
 
-        // Fast-path retry: the blank-base lane must STILL claim its already-materialized `main`
-        // direction (its recorded base is authoritative), not be dropped by re-resolving the
-        // moved live default.
-        let ids = confirm(&db, t.id).await.unwrap();
-        assert_eq!(ids, vec![dir.id],
-            "R54-3: a confirmed blank-base lane must match its recorded-base direction even after the live default moves");
+        // Fast-path retry: dispatch ONLY the pending explicit lane's OWN recorded b_id. The approved
+        // lane's a_id stays reserved (approved lanes are not dispatched here) - no swap, no drop, no
+        // stale pick, even though the default moved and both directions share the same base.
+        let retry = confirm(&db, t.id).await.unwrap();
+        assert_eq!(retry, vec![b_id],
+            "round-6: the pending lane dispatches its OWN recorded id (b_id), unaffected by the moved default / duplicate");
+        assert!(!retry.contains(&a_id),
+            "round-6: the approved lane's recorded direction is NOT re-dispatched by the fast-path");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
@@ -3581,414 +3509,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
-    /// #42-2: the confirmed fast-path's blank-base relaxation (`base_ok` returns true for a BLANK
-    /// proposed base, matching ANY same-name/repo direction) must NOT let a blank lane STEAL an
-    /// explicit sibling's base-specific direction. With two same-name/repo lanes on DIFFERENT bases,
-    /// if `list_directions` returns the EXPLICIT-base sibling's direction FIRST, a blank lane
-    /// processed first would consume it — skipping/mis-dispatching the explicit lane (the base-swap
-    /// regression base_compatible was added to prevent). The fast-path must claim EXPLICIT-base lanes
-    /// before blank-base lanes so each lane gets its OWN direction.
+    /// TRUST BOUNDARY: `save_proposal` is the lead's entry point. `ProposedDirection.direction_id`
+    /// is `#[serde(default)]`, so a hostile/malformed `propose_directions` could inject a
+    /// direction_id - which the confirmed fast-path would then re-dispatch as if the server had
+    /// materialized that direction (dispatching an arbitrary direction with NO human action). The
+    /// lead must NEVER assign a direction; only confirm/approve do. So save_proposal must scrub every
+    /// injected direction_id to 0, exactly as it scrubs injected decisions.
     #[tokio::test]
-    async fn confirmed_fast_path_blank_lane_does_not_steal_explicit_siblings_direction() {
+    async fn save_proposal_scrubs_injected_direction_id() {
         let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-blank-steal-{}", std::process::id());
+        let tag = format!("weft-scrub-dirid-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("{tag}-root"));
         let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
         std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-        let repo_path = make_repo(&root, "api");
-        // Read the ACTUAL default branch (init.defaultBranch may be main OR master) so the test
-        // holds under both CI configs; the blank lane records THIS as its base.
-        let default = crate::git::current_branch(&repo_path).unwrap();
-        // A real explicit base distinct from the default for the explicit lane.
-        sh(&repo_path, &["git", "branch", "release"]);
-
+        let _repo_path = make_repo(&root, "api");
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        // base_ref = the actual default, marked default, so the blank lane resolves to it.
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &default, "", true).await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true).await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
 
-        // Create the EXPLICIT-base `release` direction FIRST (lower id → `list_directions` returns
-        // it BEFORE the blank lane's direction), then the blank lane's direction (records the
-        // default). Both share name `api` + repo `api`, on DIFFERENT bases.
-        let dir_release = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "release").await.unwrap();
-        materialize::materialize_direction(&db, dir_release.id).await.unwrap();
-        let dir_blank = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "").await.unwrap();
-        materialize::materialize_direction(&db, dir_blank.id).await.unwrap();
-        assert!(dir_release.id < dir_blank.id, "precondition: release direction is listed first");
-        let recorded_blank = repo::list_directions(&db, t.id).await.unwrap()
-            .into_iter().find(|d| d.id == dir_blank.id).unwrap();
-        assert_eq!(recorded_blank.base_branch, default,
-            "precondition: the blank lane recorded the default base ({default})");
-
-        // Stored proposal: TWO lanes — the BLANK lane FIRST (so the buggy order processes it first
-        // and lets it grab `release`), then the explicit `release` lane. Plan CONFIRMED → fast-path.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into() },
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"".into() },
+        // Hostile proposal: a lane carrying an injected direction_id the lead must never be able to set.
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 999 },
         ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
+        save_proposal(&db, t.id, &prop).await.unwrap();
 
-        // Fast-path retry: BOTH lanes must be dispatched, each claiming its OWN direction — the
-        // blank lane gets dir_blank (default base), the explicit lane gets dir_release. NO swap.
-        let mut ids = confirm(&db, t.id).await.unwrap();
-        ids.sort();
-        let mut expected = vec![dir_release.id, dir_blank.id];
-        expected.sort();
-        assert_eq!(ids, expected,
-            "#42-2: both lanes dispatched, each with its OWN direction (explicit lane keeps `release`, blank keeps the default)");
-
-        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
-        let _ = materialize::cleanup_worktrees(&db, &removed).await;
-        std::env::remove_var("WEFT_HOME");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-    }
-
-    /// #42r2-1: the two-sub-pass ordering alone (explicit lanes before blank lanes) is NOT enough —
-    /// the consumed PRE-PASS only claims directions owned by APPROVED/DENIED lanes, so a PENDING
-    /// explicit lane is NOT reserved there (it claims only in the later MAIN pass). A blank lane that
-    /// is itself APPROVED/DENIED runs in the pre-pass's blank sub-pass, where `base_ok` returns true
-    /// for a blank base and can therefore STEAL a pending explicit sibling's base-specific direction
-    /// before that pending lane ever runs — regardless of sub-pass order. The order-INDEPENDENT fix:
-    /// a blank-base lane must never match a direction whose recorded base is an EXPLICIT base
-    /// requested by some OTHER lane in the same proposal. Red-first: before the explicit_bases
-    /// exclusion, the blank APPROVED lane's pre-claim consumes the `release` direction (listed first)
-    /// and the pending `release` lane is left undispatched.
-    #[tokio::test]
-    async fn confirmed_fast_path_blank_approved_sibling_does_not_steal_pending_explicit_direction() {
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-blank-approved-steal-{}", std::process::id());
-        let root = std::env::temp_dir().join(format!("{tag}-root"));
-        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-        let repo_path = make_repo(&root, "api");
-        // Read the ACTUAL default branch (init.defaultBranch may be main OR master) so the test
-        // holds under both CI configs; the blank lane records THIS as its base.
-        let default = crate::git::current_branch(&repo_path).unwrap();
-        // A real explicit base distinct from the default for the explicit lane.
-        sh(&repo_path, &["git", "branch", "release"]);
-
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        // base_ref = the actual default, marked default, so the blank lane resolves to it.
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &default, "", true).await.unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
-
-        // Create the EXPLICIT-base `release` direction FIRST (lower id → `list_directions` returns
-        // it BEFORE the blank lane's direction), then the blank lane's direction (records the
-        // default). Both share name `api` + repo `api`, on DIFFERENT bases.
-        let dir_release = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "release").await.unwrap();
-        materialize::materialize_direction(&db, dir_release.id).await.unwrap();
-        let dir_blank = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "").await.unwrap();
-        materialize::materialize_direction(&db, dir_blank.id).await.unwrap();
-        assert!(dir_release.id < dir_blank.id, "precondition: release direction is listed first");
-        let recorded_blank = repo::list_directions(&db, t.id).await.unwrap()
-            .into_iter().find(|d| d.id == dir_blank.id).unwrap();
-        assert_eq!(recorded_blank.base_branch, default,
-            "precondition: the blank lane recorded the default base ({default})");
-
-        // Stored proposal: the BLANK lane is APPROVED (so it runs in the consumed PRE-PASS) + a
-        // PENDING explicit `release` lane (only claimed in the MAIN pass). Inject via upsert_plan
-        // (not save_proposal, which scrubs decisions) — this is the confirmed-retry shape. Order the
-        // blank approved lane FIRST so the buggy pre-pass processes it and grabs `release`.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"approved".into() },
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"".into() },
-        ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
-
-        // Fast-path retry: the PENDING explicit `release` lane must claim its OWN `release` direction
-        // — the blank APPROVED lane's pre-claim must NOT have consumed it. The approved lane is
-        // excluded from dispatch, so the only dispatched id is dir_release.
-        let ids = confirm(&db, t.id).await.unwrap();
-        assert_eq!(ids, vec![dir_release.id],
-            "#42r2-1: the pending explicit `release` lane keeps its own direction; the blank approved sibling must not steal it");
-
-        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
-        let _ = materialize::cleanup_worktrees(&db, &removed).await;
-        std::env::remove_var("WEFT_HOME");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-    }
-
-    /// #42r2-1 follow-up: the blank-base exclusion (a blank lane may not claim a direction whose
-    /// recorded base is an EXPLICIT base requested elsewhere) must be scoped to lanes that can
-    /// actually COMPETE for the same direction — i.e. grouped by (name, repo). An UNRELATED lane
-    /// (different name AND repo) that explicitly bases on `release` must NOT block a blank lane in a
-    /// DIFFERENT repo from claiming its OWN `release`-recorded direction (e.g. that repo's default
-    /// happens to be `release`, so the blank lane materialized onto `release`). A GLOBAL explicit
-    /// set conflates the two `release` strings across groups; the fix keys the exclusion by
-    /// (name, repo_id) so only a SAME-group explicit sibling excludes. Red-first: with the global
-    /// set, the unrelated lane's `release` makes the blank lane's own `release` direction excluded
-    /// → the blank lane is dropped from `matching` and its worker isn't redispatched.
-    #[tokio::test]
-    async fn confirmed_fast_path_blank_lane_unaffected_by_unrelated_lanes_explicit_base() {
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-blank-unrelated-explicit-{}", std::process::id());
-        let root = std::env::temp_dir().join(format!("{tag}-root"));
-        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-
-        // Repo `api`: the BLANK lane lives here. Its OWN recorded direction's base is `release`
-        // (same STRING as the unrelated lane's explicit base, but a DIFFERENT name+repo group).
-        let api = make_repo(&root, "api");
-        // A real `release` branch so materialize can build a worktree from it.
-        sh(&api, &["git", "branch", "release"]);
-        let api_default = crate::git::current_branch(&api).unwrap();
-        // Repo `web`: the UNRELATED lane lives here and EXPLICITLY bases on `release`.
-        let web = make_repo(&root, "web");
-        sh(&web, &["git", "branch", "release"]);
-        let web_default = crate::git::current_branch(&web).unwrap();
-
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let ra_api = repo::add_repo_ref(&db, ws.id, "api", api.to_str().unwrap(), &api_default, "", true).await.unwrap();
-        let ra_web = repo::add_repo_ref(&db, ws.id, "web", web.to_str().unwrap(), &web_default, "", true).await.unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
-
-        // Blank lane `A` in repo `api`: create its direction with base `release` (its own recorded
-        // base is `release`) and materialize — the blank proposal lane below has an EMPTY base.
-        let dir_blank = repo::create_direction(&db, t.id, "A", "claude", ra_api.id, "r", "plan+impl", "release").await.unwrap();
-        materialize::materialize_direction(&db, dir_blank.id).await.unwrap();
-        let recorded_blank = repo::list_directions(&db, t.id).await.unwrap()
-            .into_iter().find(|d| d.id == dir_blank.id).unwrap();
-        assert_eq!(recorded_blank.base_branch, "release",
-            "precondition: the blank lane's own recorded direction base is `release`");
-        // Unrelated explicit lane `B` in repo `web`, EXPLICIT base `release` (different name+repo).
-        let dir_unrelated = repo::create_direction(&db, t.id, "B", "claude", ra_web.id, "r", "plan+impl", "release").await.unwrap();
-        materialize::materialize_direction(&db, dir_unrelated.id).await.unwrap();
-
-        // Stored proposal: the UNRELATED explicit `release` lane FIRST (so a global set would be
-        // built from it), then the BLANK lane whose own recorded base is also `release`. Both
-        // PENDING + known → both dispatched. Plan CONFIRMED → confirm takes the fast-path.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"B".into(), repo:"web".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"".into() },
-            ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into() },
-        ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
-
-        // Fast-path retry: the blank lane STILL claims its OWN `release`-recorded direction — the
-        // UNRELATED lane's explicit `release` (different group) must NOT exclude it. Both lanes
-        // dispatch. Red-first: a global explicit_bases set drops the blank lane here.
-        let mut ids = confirm(&db, t.id).await.unwrap();
-        ids.sort();
-        let mut expected = vec![dir_blank.id, dir_unrelated.id];
-        expected.sort();
-        assert_eq!(ids, expected,
-            "the blank lane keeps its own `release` direction; an unrelated lane's explicit `release` (different name+repo) must not exclude it");
-
-        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
-        let _ = materialize::cleanup_worktrees(&db, &removed).await;
-        std::env::remove_var("WEFT_HOME");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-    }
-
-    /// #42-tail: a blank lane AND an explicit lane that resolve to the SAME base must BOTH claim a
-    /// distinct direction. Two same-name/repo directions are both recorded on the default (`main`):
-    /// one lane is blank (resolves to `main`), one lane is EXPLICIT `main`. The OLD exclusion-based
-    /// approach built an `explicit_bases` set containing `main` (from the explicit lane) and made the
-    /// blank lane's `base_ok` REJECT every `main`-recorded direction — so the explicit lane took one
-    /// `main` direction and the blank lane could claim NEITHER, dropping its worker from `matching`.
-    /// The fix processes ALL explicit lanes first (binding to their exact-base directions), then blank
-    /// lanes take whatever same-name/repo directions remain — including the SECOND `main`. Red-first:
-    /// before the rewrite, the blank lane is excluded from both `main` directions → only 1 dispatched.
-    #[tokio::test]
-    async fn confirmed_fast_path_blank_and_explicit_same_base_both_claim() {
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-blank-explicit-samebase-{}", std::process::id());
-        let root = std::env::temp_dir().join(format!("{tag}-root"));
-        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-        let repo_path = make_repo(&root, "api");
-        // Read the ACTUAL default branch (init.defaultBranch may be main OR master) so the test holds
-        // under both CI configs; BOTH directions record THIS, and the explicit lane names THIS too.
-        let default = crate::git::current_branch(&repo_path).unwrap();
-
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        // base_ref = the actual default, marked default, so the blank lane resolves to it.
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &default, "", true).await.unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
-
-        // TWO same-name/repo directions, BOTH recorded on the default base. dir_a is listed first
-        // (lower id); dir_b second. Both materialized (live lanes the fast-path re-materializes).
-        let dir_a = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", &default).await.unwrap();
-        materialize::materialize_direction(&db, dir_a.id).await.unwrap();
-        let dir_b = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", &default).await.unwrap();
-        materialize::materialize_direction(&db, dir_b.id).await.unwrap();
-        assert!(dir_a.id < dir_b.id, "precondition: dir_a is listed first");
-
-        // Stored proposal: the BLANK lane FIRST, then the EXPLICIT `default` lane. Both PENDING +
-        // known → both must dispatch. Plan CONFIRMED → confirm takes the fast-path. The OLD code's
-        // explicit_bases set (built from the explicit lane's `default`) would reject EVERY
-        // default-recorded direction for the blank lane, dropping it from `matching`.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into() },
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:default.clone(), decision:"".into() },
-        ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
-
-        // Fast-path retry: BOTH lanes dispatch, each claiming a DISTINCT direction — the explicit lane
-        // binds to one `default` direction, the blank lane takes the remaining one. Neither dropped.
-        let mut ids = confirm(&db, t.id).await.unwrap();
-        ids.sort();
-        let mut expected = vec![dir_a.id, dir_b.id];
-        expected.sort();
-        assert_eq!(ids, expected,
-            "#42-tail: blank + explicit lanes on the SAME base both claim a distinct direction; neither is dropped");
-
-        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
-        let _ = materialize::cleanup_worktrees(&db, &removed).await;
-        std::env::remove_var("WEFT_HOME");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-    }
-
-    /// #42r5-1: in the confirmed fast-path, ALL terminal (approved/denied) lanes must be pre-claimed
-    /// (their directions reserved) BEFORE any PENDING lane is dispatch-claimed — otherwise a pending
-    /// lane can consume a terminal sibling's direction. Two same-name/repo `main` directions: one
-    /// owned by an APPROVED+blank lane (main #1, listed FIRST), one owned by a PENDING+explicit `main`
-    /// lane (main #2). The OLD single-`blank_pass`-outer order ran the explicit pending DISPATCH
-    /// (blank_pass == false) BEFORE the blank APPROVED PRE-CLAIM (blank_pass == true), so the pending
-    /// explicit lane's `.find` grabbed main #1 (the approved lane's direction, listed first) instead
-    /// of its own main #2. The fix splits into TWO outer loops — pre-claim ALL terminal lanes, THEN
-    /// dispatch ALL pending lanes — so the approved blank lane reserves main #1 before the pending
-    /// explicit lane runs; the explicit lane then dispatches its OWN main #2. Approved lanes are NOT
-    /// dispatched here, so main #1 stays reserved (never returned). Red-first: before the reorder,
-    /// confirm returns main #1 (the swapped/approved direction) instead of main #2.
-    #[tokio::test]
-    async fn confirmed_fast_path_approved_blank_reserves_before_pending_explicit_same_base() {
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-approved-blank-reserve-{}", std::process::id());
-        let root = std::env::temp_dir().join(format!("{tag}-root"));
-        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-        let repo_path = make_repo(&root, "api");
-        // Read the ACTUAL default branch (init.defaultBranch may be main OR master) so the test holds
-        // under both CI configs; BOTH directions record THIS, and the explicit lane names THIS too.
-        let default = crate::git::current_branch(&repo_path).unwrap();
-
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        // base_ref = the actual default, marked default, so the blank lane resolves to it.
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &default, "", true).await.unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
-
-        // TWO same-name/repo directions, BOTH recorded on the default base. main_1 is listed FIRST
-        // (lower id) — the APPROVED blank lane's direction; main_2 second — the PENDING explicit
-        // lane's direction. Both materialized (live lanes the fast-path re-materializes). List order
-        // is exactly what makes a pending explicit `.find` "otherwise grab main #1".
-        let main_1 = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", &default).await.unwrap();
-        materialize::materialize_direction(&db, main_1.id).await.unwrap();
-        let main_2 = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", &default).await.unwrap();
-        materialize::materialize_direction(&db, main_2.id).await.unwrap();
-        assert!(main_1.id < main_2.id, "precondition: main #1 is listed first");
-
-        // Stored proposal: the APPROVED+blank lane FIRST, then the PENDING+explicit `default` lane.
-        // Inject the approved decision directly via upsert_plan (save_proposal scrubs decisions,
-        // R47-3) and mark the plan confirmed → confirm takes the fast-path. The approved lane is
-        // excluded from dispatch but MUST pre-claim its main #1 so the pending explicit lane can't
-        // swap it.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"approved".into() },
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:default.clone(), decision:"".into() },
-        ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
-
-        // Fast-path retry: the PENDING explicit lane dispatches its OWN direction (main #2). The
-        // approved blank lane's main #1 stays RESERVED (approved lanes aren't dispatched here), so it
-        // must NOT appear in the result and must NOT be swapped onto the explicit lane.
-        let ids = confirm(&db, t.id).await.unwrap();
-        assert_eq!(ids, vec![main_2.id],
-            "#42r5-1: the pending explicit lane dispatches its OWN direction (main #2)");
-        assert!(!ids.contains(&main_1.id),
-            "#42r5-1: the approved blank lane's main #1 stays reserved (not dispatched, not swapped)");
-
-        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
-        let _ = materialize::cleanup_worktrees(&db, &removed).await;
-        std::env::remove_var("WEFT_HOME");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-    }
-
-    /// #42r5-2: a BLANK lane must claim ITS OWN freshly-materialized direction, not a STALE leftover
-    /// direction from a SUPERSEDED proposal on a DIFFERENT base. The confirmed fast-path treats a
-    /// blank base as match-ANY (R54-3), so a leftover `release`-based direction (from an old, since-
-    /// replaced proposal, still queued) that appears FIRST in `list_directions` could be claimed by a
-    /// blank lane instead of the lane's own newly-materialized default (`main`) direction. The fix
-    /// biases a blank lane toward (a) a direction whose base is base-COMPATIBLE with the blank's
-    /// resolved default, then (b) the NEWEST same-name/repo direction — so it skips the stale lower-id
-    /// `release` row and binds the current proposal's `main` direction. Red-first: before the fix, the
-    /// blank lane grabs the stale `release` direction (listed first) and dispatches it.
-    #[tokio::test]
-    async fn confirmed_fast_path_blank_lane_skips_stale_superseded_direction() {
-        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = format!("weft-fastpath-blank-stale-{}", std::process::id());
-        let root = std::env::temp_dir().join(format!("{tag}-root"));
-        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&weft_home);
-        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
-        let repo_path = make_repo(&root, "api");
-        // Read the ACTUAL default branch (init.defaultBranch may be main OR master) so the test holds
-        // under both CI configs; the current blank lane records THIS default as its base.
-        let default = crate::git::current_branch(&repo_path).unwrap();
-        // A real explicit base distinct from the default for the STALE leftover direction.
-        sh(&repo_path, &["git", "branch", "release"]);
-
-        let db = Db::connect("sqlite::memory:").await.unwrap();
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        // base_ref = the actual default, marked default, so the blank lane resolves to it.
-        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &default, "", true).await.unwrap();
-        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
-
-        // An OLD `release`-based direction from a SUPERSEDED proposal, still queued (lower id →
-        // `list_directions` returns it FIRST). It is NOT referenced by the current proposal — it is a
-        // leftover the blank lane must NOT claim.
-        let stale_release = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "release").await.unwrap();
-        materialize::materialize_direction(&db, stale_release.id).await.unwrap();
-        // The CURRENT blank lane's own `default`-based direction (higher id → listed SECOND).
-        let dir_blank = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", &default).await.unwrap();
-        materialize::materialize_direction(&db, dir_blank.id).await.unwrap();
-        assert!(stale_release.id < dir_blank.id, "precondition: the stale release direction is listed first");
-        // Sanity: list_directions returns the stale release row before the blank lane's own.
-        let listed = repo::list_directions(&db, t.id).await.unwrap();
-        let pos_stale = listed.iter().position(|d| d.id == stale_release.id).unwrap();
-        let pos_blank = listed.iter().position(|d| d.id == dir_blank.id).unwrap();
-        assert!(pos_stale < pos_blank, "precondition: stale release direction appears before the blank lane's own");
-
-        // Stored proposal: ONE blank PENDING lane (name/repo `api`). Plan CONFIRMED → fast-path.
-        let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into() },
-        ]};
-        let json = serde_json::to_string(&stored).unwrap();
-        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
-
-        // Fast-path retry: the blank lane dispatches its OWN `default` direction (base-compatible
-        // default / newest), NOT the stale `release` leftover (listed first). Red-first: before the
-        // fix, the blank lane grabs the stale release direction.
-        let ids = confirm(&db, t.id).await.unwrap();
-        assert_eq!(ids, vec![dir_blank.id],
-            "#42r5-2: the blank lane claims its own base-compatible/newest direction, not the stale release row");
-        assert!(!ids.contains(&stale_release.id),
-            "#42r5-2: the stale superseded release direction must NOT be claimed by the blank lane");
+        // The STORED proposal must show direction_id scrubbed to 0.
+        let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let stored: Proposal = serde_json::from_str(&plan.proposal).unwrap();
+        assert_eq!(stored.directions[0].direction_id, 0,
+            "an injected direction_id must be scrubbed to 0 (the lead may not assign a direction)");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
@@ -4037,8 +3589,8 @@ mod tests {
         // made for it), index 1 = `main` lane pending whose base (`develop`) matches dir_main. Both
         // share name `api` + repo `api`. Write the denied decision directly (save_proposal scrubs).
         let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"denied".into() },
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"".into() },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"denied".into(), direction_id: 0 },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"".into(), direction_id: 0 },
         ]};
         let json = serde_json::to_string(&stored).unwrap();
         repo::upsert_plan(&db, t.id, &json, "proposed", &now()).await.unwrap();
@@ -4092,8 +3644,8 @@ mod tests {
         // Stored proposal: index 0 = `release` lane DENIED (base `release`, no direction), index 1
         // = `main` lane pending whose base (`develop`) matches dir_main. Both share name `api` + repo.
         let stored = Proposal { rationale: "r".into(), directions: vec![
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"denied".into() },
-            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"".into() },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"denied".into(), direction_id: 0 },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"develop".into(), decision:"".into(), direction_id: 0 },
         ]};
         let json = serde_json::to_string(&stored).unwrap();
         repo::upsert_plan(&db, t.id, &json, "proposed", &now()).await.unwrap();
