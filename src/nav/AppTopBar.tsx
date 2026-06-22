@@ -8,6 +8,7 @@ import {
   Monitor,
   Moon,
   PanelLeftOpen,
+  Route,
   Sun,
   X,
 } from "lucide-react";
@@ -31,6 +32,7 @@ export function AppTopBar() {
     showNeeds,
     homeTab,
     repos,
+    openCurator,
     threads,
     overview,
     directionsByThread,
@@ -217,6 +219,12 @@ export function AppTopBar() {
         )}
       </div>
 
+      {inWorkspaceRepos && activeWorkspaceId != null && (
+        <Button size="sm" variant="ghost" onClick={openCurator}>
+          <Route size={14} />
+          {t("repomap.curatorTitle")}
+        </Button>
+      )}
       {inWorkspaceRepos && activeWorkspaceId != null && (
         <Button size="sm" variant="primary" onClick={() => setRepoDialogOpen(true)}>
           <FolderPlus size={14} />
