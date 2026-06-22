@@ -289,7 +289,7 @@ function BaseBranchField({
    * name/repo/value still discards an unblurred (dirty) edit. */
   version: string;
   disabled: boolean;
-  onSave: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
+  onSave: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
   const [val, setVal] = useState(value ?? "");
@@ -338,9 +338,20 @@ function BaseBranchField({
     // same-identity (same name+repo) re-propose changed the lane's base meanwhile —
     // optimistic concurrency the name/repo + CAS guards can't catch on their own.
     const expectedOldBase = value ?? "";
-    void onSave(index, name, repo, next, expectedOldBase)
+    // The proposal version this edit was composed against. The backend rejects the save if a
+    // re-propose bumped the version even with the lane's base UNCHANGED (R54-2) — a gap the
+    // name/repo + expectedOldBase + CAS guards can't close on their own.
+    const savedVersion = version;
+    // #42-3: the resolve/reject handlers must ALSO version-gate, not just identity-gate. A
+    // same-name/repo/base re-propose BUMPS the version while this save is in flight; the backend
+    // rejects the stale save, but any NEW edit the user starts on the fresh proposal before that
+    // rejection arrives would be CLOBBERED by the revert below because the identity still matches.
+    // Touch lastLoaded / the input only when the proposal hasn't moved on since THIS save was
+    // issued (savedVersion still current) — otherwise this save's result is stale; leave the
+    // (possibly freshly-edited) input alone.
+    void onSave(index, name, repo, next, expectedOldBase, version)
       .then(() => {
-        if (lastIdentity.current === savedIdentity) {
+        if (lastIdentity.current === savedIdentity && savedVersion === lastVersion.current) {
           lastLoaded.current = next; // mark loaded only after the save actually lands
         }
       })
@@ -348,8 +359,9 @@ function BaseBranchField({
         // Save failed — revert the field to the LATEST persisted value (valueRef, not the
         // stale closure `value`) so a same-identity re-propose's fresh base isn't replaced
         // by this old save's stale one. Only when this row still shows the same lane (see
-        // savedIdentity) — else we'd overwrite a different lane.
-        if (lastIdentity.current === savedIdentity) {
+        // savedIdentity) AND the proposal version hasn't moved on (#42-3) — else we'd
+        // overwrite a different lane or a freshly-edited fresh proposal.
+        if (lastIdentity.current === savedIdentity && savedVersion === lastVersion.current) {
           setVal(valueRef.current ?? "");
         }
       });

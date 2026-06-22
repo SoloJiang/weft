@@ -251,6 +251,12 @@
 }
 
 /* markdown rendering for agent output (scoped + sized to the transcript) */
+/* Long unbreakable tokens (file paths, URLs, hashes) wrap instead of forcing
+   the chat module to scroll sideways. overflow-wrap inherits, so prose, list
+   items, headings and inline code are all covered. */
+.weft-md {
+  overflow-wrap: anywhere;
+}
 .weft-md > :first-child {
   margin-top: 0;
 }
@@ -316,6 +322,11 @@
   border-collapse: collapse;
   margin: 0.5em 0;
   font-size: 0.95em;
+  /* A wide table scrolls inside its own box rather than widening the module.
+     display:block keeps the cells' table layout while letting overflow apply. */
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .weft-md th,
 .weft-md td {

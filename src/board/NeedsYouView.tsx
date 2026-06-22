@@ -19,7 +19,7 @@ export function NeedsYouView() {
   const total = needs.length + asks.length + writeTriggers.length;
 
   return (
-    <section className="flex min-w-0 flex-1 flex-col bg-bg">
+    <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
       <div className="min-h-0 flex-1 overflow-y-auto">
         {total === 0 ? (
           <EmptyNeeds />

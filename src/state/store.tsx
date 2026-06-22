@@ -181,11 +181,20 @@ interface Store {
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
   ensureCuratorThread: () => Promise<void>;
-  /** Curator panel (in Repo Map) open/width, persisted per workspace. */
-  curatorPanelOpen: boolean;
-  setCuratorPanelOpen: (open: boolean) => void;
-  curatorPanelWidth: number;
-  setCuratorPanelWidth: (w: number) => void;
+  /** Repos view right drawer: one of detail/curator at a time. selectedRepoId
+   *  drives both node highlight and the detail tab. Width persists per workspace;
+   *  open does NOT (drawer starts closed each visit). */
+  repoDrawerOpen: boolean;
+  repoDrawerTab: "detail" | "curator";
+  selectedRepoId: number | null;
+  repoDrawerWidth: number;
+  openRepoDetail: (repoId: number) => void;
+  openCurator: () => void;
+  closeRepoDrawer: () => void;
+  /** Drop the drawer's selected repo (e.g. when it was deleted). */
+  clearSelectedRepo: () => void;
+  setRepoDrawerTab: (tab: "detail" | "curator") => void;
+  setRepoDrawerWidth: (w: number) => void;
   /** Pin a repo's one-line summary (tier ownership untouched). */
   editRepoSummary: (repoId: number, summary: string) => Promise<void>;
   /** Pin a repo's tier (summary ownership untouched). */
@@ -196,7 +205,7 @@ interface Store {
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: () => Promise<void>;
-  setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string) => Promise<void>;
+  setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
@@ -317,7 +326,6 @@ export const useStore = () => {
 const CURATOR_WIDTH_DEFAULT = 360;
 const CURATOR_WIDTH_MIN = 280;
 const CURATOR_WIDTH_MAX = 560;
-const curatorOpenKey = (ws: number) => `weft.curatorPanel.${ws}.open`;
 const curatorWidthKey = (ws: number) => `weft.curatorPanel.${ws}.width`;
 
 export function StoreProvider({ children }: { children: ReactNode }) {
@@ -359,8 +367,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
-  const [curatorPanelOpen, setCuratorPanelOpenState] = useState(true);
-  const [curatorPanelWidth, setCuratorPanelWidthState] = useState(CURATOR_WIDTH_DEFAULT);
+  const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
+  const [repoDrawerTab, setRepoDrawerTabState] = useState<"detail" | "curator">("detail");
+  const [selectedRepoId, setSelectedRepoId] = useState<number | null>(null);
+  const [repoDrawerWidth, setRepoDrawerWidthState] = useState(CURATOR_WIDTH_DEFAULT);
   // Coalesce curator-thread creation per workspace: StrictMode double-mounts and
   // the backend get-or-create is not atomic, so concurrent ensures for the SAME
   // workspace could create dupes. Keyed by ws so switching to another workspace
@@ -589,15 +599,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoEdges([]);
     // Remember the choice so a relaunch/reload lands here, not on the first one.
     localStorage.setItem("weft-active-workspace", String(id));
-    // Curator panel: drop the previous workspace's thread id and load this
-    // workspace's remembered panel state (absent = first visit = open).
+    // Drop the previous workspace's curator thread id so it is re-ensured lazily.
     setCuratorThreadId(null);
-    const openRaw = localStorage.getItem(curatorOpenKey(id));
-    setCuratorPanelOpenState(openRaw == null ? true : openRaw === "1");
-    const wRaw = Number(localStorage.getItem(curatorWidthKey(id)));
-    setCuratorPanelWidthState(
-      Number.isFinite(wRaw) && wRaw > 0
-        ? Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, wRaw))
+    // Repos drawer: width persists (shared key with the old curator panel), but
+    // open state does not — each workspace visit starts with the canvas full-width.
+    setRepoDrawerOpen(false);
+    setRepoDrawerTabState("detail");
+    setSelectedRepoId(null);
+    const dwRaw = Number(localStorage.getItem(curatorWidthKey(id)));
+    setRepoDrawerWidthState(
+      Number.isFinite(dwRaw) && dwRaw > 0
+        ? Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, dwRaw))
         : CURATOR_WIDTH_DEFAULT,
     );
     const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
@@ -1238,6 +1250,27 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (list.some((x) => x.id === p.message.id)) return m;
           return { ...m, [p.thread_id]: [...list, p.message] };
         });
+        // A proposal/withdraw row landed: refresh the active thread's proposal so the
+        // review card + scope canvas reflect it at once — a withdraw flips status to
+        // "withdrawn", closing an open ScopeReview — instead of waiting for the 2.5s
+        // poll. Guard on the live active thread (ref, not a stale closure capture).
+        if (p.message.kind === "proposal" && activeThreadIdRef.current === p.thread_id) {
+          const tid = p.thread_id;
+          void api
+            .getProposal(tid)
+            .then((pr) => {
+              // Re-check the active thread AFTER the await: the user may have switched
+              // threads while this was in flight, and writing thread A's proposal (or
+              // clearing A's review flag) into global state would corrupt thread B.
+              if (!pr || activeThreadIdRef.current !== tid) return;
+              setProposal(pr);
+              // A withdrawn/confirmed refresh must also drop a stale review flag: otherwise
+              // a later re-propose in this thread would auto-reopen ScopeReview without the
+              // user clicking the new review card (ThreadBoard gates open on status+flag).
+              if (pr.status !== "proposed") setReviewingProposal(false);
+            })
+            .catch(() => {});
+        }
       } else if (p.type === "delta") {
         setLeadMessages((m) => ({
           ...m,
@@ -1680,7 +1713,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Ensure the workspace's hidden curator thread exists and remember its id —
   // WITHOUT navigating. The curator chat renders embedded in the Repo Map panel
-  // (CuratorPanel), so unlike a normal lead chat we never selectThread.
+  // (RepoDrawer), so unlike a normal lead chat we never selectThread.
   const ensureCuratorThread = useCallback(async () => {
     const ws = activeWorkspaceId;
     if (ws == null || ensuringCuratorRef.current.has(ws)) return;
@@ -1699,15 +1732,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [activeWorkspaceId]);
 
-  const setCuratorPanelOpen = useCallback((open: boolean) => {
-    setCuratorPanelOpenState(open);
-    const ws = activeWorkspaceIdRef.current;
-    if (ws != null) localStorage.setItem(curatorOpenKey(ws), open ? "1" : "0");
+  const openRepoDetail = useCallback((repoId: number) => {
+    setSelectedRepoId(repoId);
+    setRepoDrawerTabState("detail");
+    setRepoDrawerOpen(true);
   }, []);
-
-  const setCuratorPanelWidth = useCallback((w: number) => {
+  const openCurator = useCallback(() => {
+    setRepoDrawerTabState("curator");
+    setRepoDrawerOpen(true);
+  }, []);
+  const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
+  const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
+  const setRepoDrawerTab = useCallback((tab: "detail" | "curator") => setRepoDrawerTabState(tab), []);
+  const setRepoDrawerWidth = useCallback((w: number) => {
     const clamped = Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, Math.round(w)));
-    setCuratorPanelWidthState(clamped);
+    setRepoDrawerWidthState(clamped);
     const ws = activeWorkspaceIdRef.current;
     if (ws != null) localStorage.setItem(curatorWidthKey(ws), String(clamped));
   }, []);
@@ -1772,7 +1811,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
 
   const setProposalDirectionBase = useCallback(
-    (index: number, name: string, repo: string, base: string, expectedOldBase: string): Promise<void> => {
+    (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string): Promise<void> => {
       if (activeThreadId == null) return Promise.resolve();
       const tid = activeThreadId;
       // Include the lane INDEX: a proposal can hold two pending writes with the same
@@ -1785,9 +1824,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // no status downgrade. confirm/approve await pendingBaseSave before acting.
       // `expectedOldBase` is the persisted base the field was editing FROM: the backend
       // rejects the save if a same-identity re-propose changed the lane's base meanwhile.
+      // `version` is the proposal version the edit was composed against: the backend also
+      // rejects a re-propose that kept the SAME base for the lane (R54-2), which the
+      // expectedOldBase + CAS guards can't catch on their own.
       const p = (pendingBaseSave.current.get(tid) ?? Promise.resolve())
         .catch(() => {})
-        .then(() => api.setProposalDirectionBase(tid, index, name, repo, expectedOldBase, base.trim()))
+        .then(() => api.setProposalDirectionBase(tid, index, name, repo, expectedOldBase, version, base.trim()))
         .then(() => {
           // This LANE's save LANDED — clear ONLY this lane's failure (not the whole
           // thread), so a successful retry isn't treated as failed by the next
@@ -2177,10 +2219,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     deleteRepo,
     curatorThreadId,
     ensureCuratorThread,
-    curatorPanelOpen,
-    setCuratorPanelOpen,
-    curatorPanelWidth,
-    setCuratorPanelWidth,
+    repoDrawerOpen,
+    repoDrawerTab,
+    selectedRepoId,
+    repoDrawerWidth,
+    openRepoDetail,
+    openCurator,
+    closeRepoDrawer,
+    clearSelectedRepo,
+    setRepoDrawerTab,
+    setRepoDrawerWidth,
     editRepoSummary,
     editRepoTier,
     proposal,
