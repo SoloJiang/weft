@@ -320,7 +320,11 @@ async fn mark_queued_delivered(
     if !out.tracked {
         return;
     }
-    match repo::complete_queued(db, thread_id, session_id).await {
+    let res = match out.queue_id {
+        Some(id) => repo::complete_queued_by_id(db, id).await,
+        None => repo::complete_queued(db, thread_id, session_id).await,
+    };
+    match res {
         Ok(Some(m)) => emit_finalize(app, thread_id, m.id, "complete"),
         Ok(None) => {}
         Err(e) => eprintln!("[weft] queued message complete failed: {e}"),

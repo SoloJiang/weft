@@ -1326,6 +1326,23 @@ pub async fn complete_queued(
     update_oldest_queued_status(db, thread_id, session_id, "complete").await
 }
 
+/// Flip a specific queued row to complete by id (reorder-safe delivery).
+/// Returns Ok(None) if the row doesn't exist or isn't currently "queued".
+pub async fn complete_queued_by_id(
+    db: &Db,
+    message_id: i32,
+) -> Result<Option<lead_message::Model>> {
+    let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? else {
+        return Ok(None);
+    };
+    if m.status != "queued" {
+        return Ok(None);
+    }
+    let mut a: lead_message::ActiveModel = m.into();
+    a.status = Set("complete".to_string());
+    Ok(Some(a.update(&db.0).await?))
+}
+
 pub async fn fail_queued(
     db: &Db,
     thread_id: i32,
@@ -2790,5 +2807,27 @@ mod tests {
         assert_eq!(d2.target_branch, "", "empty base leaves target empty (= repo default)");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn complete_by_id_targets_the_named_row() {
+        let db = mem().await;
+        let a = insert_lead_message(&db, 2, None, 1, "user", "text", "{}", "queued")
+            .await
+            .unwrap();
+        let b = insert_lead_message(&db, 2, None, 2, "user", "text", "{}", "queued")
+            .await
+            .unwrap();
+        // deliver b first (simulates reorder: b before a)
+        let done = complete_queued_by_id(&db, b.id).await.unwrap().unwrap();
+        assert_eq!(done.id, b.id);
+        assert_eq!(done.status, "complete");
+        // a must still be queued
+        let still = lead_message::Entity::find_by_id(a.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.status, "queued");
     }
 }
