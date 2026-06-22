@@ -482,6 +482,11 @@ function RepoNode({
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
+        {p.category && (
+          <span className="shrink-0 rounded bg-bg px-1.5 py-px text-[9.5px] uppercase text-ink-faint" title={p.category}>
+            {p.category}
+          </span>
+        )}
         {showPkgs && p.components.length > 0 && (
           <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
             {t("repomap.pkgCount", { count: p.components.length })}
@@ -541,6 +546,11 @@ function ExpandedNode({
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
+        {p.category && (
+          <span className="shrink-0 rounded bg-bg px-1.5 py-px text-[9.5px] uppercase text-ink-faint" title={p.category}>
+            {p.category}
+          </span>
+        )}
         <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
           {t("repomap.pkgCount", { count: p.components.length })}
         </span>
