@@ -584,6 +584,36 @@ fn build_manifest_edge_hint(relations_json: &str) -> String {
     out
 }
 
+/// Build the workspace-wide `provides_name → repo_id` map, SKIPPING ambiguous
+/// names (claimed by 2+ distinct repos). A first-wins pick on a duplicated
+/// package/crate/artifact name (forks, copied services, common unscoped names)
+/// would resolve to whichever repo iterated first — a concrete-but-arbitrary
+/// target. A wrong hint is worse than none (the agent infers the real one), so
+/// ambiguous names resolve to nothing. Shared by the deterministic seed pass and
+/// the analyst prompt's hint builder so the two never disagree.
+fn unambiguous_provider_map<'a, I>(repo_infos: I) -> std::collections::HashMap<String, i32>
+where
+    I: IntoIterator<Item = (i32, &'a crate::manifest::ManifestInfo)>,
+{
+    use std::collections::HashMap;
+    let mut providers: HashMap<String, Vec<i32>> = HashMap::new();
+    for (id, info) in repo_infos {
+        for name in &info.provides {
+            let ids = providers.entry(name.clone()).or_default();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    providers
+        .into_iter()
+        .filter_map(|(name, ids)| match ids.as_slice() {
+            [only] => Some((name, *only)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Cross-repo relations prompt: lists every classified repo (id/name/tier/category/
 /// domains/path/summary) along with its already-seeded manifest edges, then asks
 /// for STRICT JSON with relations+rationale and a repo_map_markdown doc.
@@ -601,12 +631,10 @@ fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> Str
         .iter()
         .map(|(r, _)| (r, crate::manifest::scan_repo(Path::new(&r.local_git_path))))
         .collect();
-    let mut provides_map: HashMap<String, i32> = HashMap::new();
-    for (r, info) in &repo_infos {
-        for name in &info.provides {
-            provides_map.entry(name.clone()).or_insert(r.id);
-        }
-    }
+    // Same ambiguity filtering as seed_manifest_relations: the agent consumes
+    // these hints before persistence, so an arbitrary first-wins edge to a
+    // duplicated provider could steer it into persisting a wrong agent relation.
+    let provides_map = unambiguous_provider_map(repo_infos.iter().map(|(r, info)| (r.id, info)));
 
     // For each repo, build a fresh manifest-edge hint from on-disk deps.
     let mut live_manifest_hints: HashMap<i32, String> = HashMap::new();
@@ -1569,7 +1597,6 @@ fn is_too_broad(dir: &Path) -> bool {
 /// Tolerant of missing checkouts, missing manifests, parse errors, and DB
 /// errors — any single failure leaves that repo's prior relations intact.
 pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
-    use std::collections::HashMap;
     use std::path::Path;
 
     let repos = repo::list_repos(db, workspace_id).await?;
@@ -1584,28 +1611,11 @@ pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
         repo_manifests.push((r.clone(), info));
     }
 
-    // Build workspace-wide provides_name → repo_id map, SKIPPING ambiguous names.
-    // When two repos provide the same manifest name (forks, copied services,
-    // common unscoped crate/package names), a first-wins pick would seed a
-    // concrete-but-arbitrary lib edge to whichever repo `list_repos` returned
-    // first — a wrong hint is worse than no hint, since the agent is the source of
-    // truth. So a name claimed by 2+ distinct repos resolves to nothing here.
-    let mut providers: HashMap<String, Vec<i32>> = HashMap::new();
-    for (r, info) in &repo_manifests {
-        for name in &info.provides {
-            let ids = providers.entry(name.clone()).or_default();
-            if !ids.contains(&r.id) {
-                ids.push(r.id);
-            }
-        }
-    }
-    let name_to_repo: HashMap<String, i32> = providers
-        .into_iter()
-        .filter_map(|(name, ids)| match ids.as_slice() {
-            [only] => Some((name, *only)),
-            _ => None,
-        })
-        .collect();
+    // Workspace-wide provides_name → repo_id map, skipping ambiguous names (see
+    // `unambiguous_provider_map`) so a duplicated package never seeds an arbitrary
+    // first-wins lib edge.
+    let name_to_repo =
+        unambiguous_provider_map(repo_manifests.iter().map(|(r, info)| (r.id, info)));
 
     // For each repo, generate manifest lib edges for its requires that resolve to
     // a DIFFERENT workspace repo, then merge with the existing relations.
@@ -1754,6 +1764,16 @@ pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 /// non-blocking. `profile_repo_agent`'s `run_begin` guard dedupes any concurrent pass.
 async fn resume_workspace(db: Db, repos: Vec<repo_ref::Model>, workspace_id: i32) {
     use futures::future::join_all;
+    // Serialize the WHOLE resume (classifiers + relation pass) under the workspace
+    // pass-gate, like reprofile_repo. Otherwise, if a backfill/manual pass already
+    // owns these repos' `run_begin`, the classifier futures return immediately
+    // (deduped) and join_all reaches `analyze_relations` while that pass's own
+    // relation agent is still running — two concurrent relation passes, and the
+    // stale one finishing last would overwrite the newer relations/map doc.
+    // `profile_repo_agent` gates on `run_begin`, not `pass_gate`, so holding the
+    // gate here can't deadlock.
+    let gate = pass_gate(workspace_id);
+    let _g = gate.lock.lock().await;
     let futs = repos.into_iter().map(|r| {
         let db2 = db.clone();
         async move { let _ = profile_repo_agent(&db2, &r).await; }
@@ -3121,6 +3141,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_workspace_serializes_under_pass_gate() {
+        // resume_workspace must hold the workspace pass-gate for its WHOLE run, so
+        // its relation pass can't run concurrently with another pass (and overwrite
+        // newer output). Proof: while we hold the gate, the spawned resume is blocked
+        // and its map-clear side effect can't happen; once released, it proceeds.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_resume_gate").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "solo", "/nonexistent/solo-resume", "main", "", true)
+            .await
+            .unwrap();
+        repo::set_repo_map_doc(&db, ws.id, "## stale").await.unwrap();
+
+        let gate = super::pass_gate(ws.id);
+        let guard = gate.lock.lock().await;
+
+        let db2 = db.clone();
+        let handle = tokio::spawn(async move {
+            super::resume_workspace(db2, vec![r], ws.id).await;
+        });
+
+        // While the gate is held, resume is parked on lock() → stale doc survives.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_some(),
+            "resume must block on the pass-gate while it is held"
+        );
+
+        drop(guard);
+        handle.await.unwrap();
+
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "after the gate is released, resume runs and clears the stale map"
+        );
+    }
+
+    #[tokio::test]
     async fn seed_manifest_relations_skips_ambiguous_providers() {
         // When two repos provide the SAME manifest name, a first-wins pick would
         // seed a concrete-but-arbitrary edge. The ambiguous name must seed nothing
@@ -3293,6 +3352,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_a);
         let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    #[tokio::test]
+    async fn build_curator_prompt_skips_ambiguous_provider_hints() {
+        // The prompt's manifest-edge hints must apply the SAME ambiguity filter as
+        // seed_manifest_relations: a name provided by 2+ repos seeds no hint (else
+        // the agent could be steered into persisting an arbitrary wrong edge), while
+        // a uniquely-provided name still produces a hint.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_amb_hint").await.unwrap();
+
+        let (consumer, tc) = seed_repo_with_manifest(
+            &db, ws.id, "consumer-h",
+            "package.json",
+            r#"{"name":"@acme/consumer-h","dependencies":{"@acme/dup":"*","@acme/uniq":"*"}}"#,
+        ).await;
+        let (_d1, t1) = seed_repo_with_manifest(
+            &db, ws.id, "dup1-h", "package.json", r#"{"name":"@acme/dup","version":"1"}"#,
+        ).await;
+        let (_d2, t2) = seed_repo_with_manifest(
+            &db, ws.id, "dup2-h", "package.json", r#"{"name":"@acme/dup","version":"1"}"#,
+        ).await;
+        let (uniq, tu) = seed_repo_with_manifest(
+            &db, ws.id, "uniq-h", "package.json", r#"{"name":"@acme/uniq","version":"1"}"#,
+        ).await;
+
+        let mut slice = Vec::new();
+        for r in [&consumer, &_d1, &_d2, &uniq] {
+            let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+            slice.push((r.clone(), p));
+        }
+        let prompt = super::build_curator_prompt(&slice);
+
+        assert!(
+            !prompt.contains("@acme/dup"),
+            "ambiguous provider must not produce a manifest-edge hint: {prompt}"
+        );
+        assert!(
+            prompt.contains("@acme/uniq") && prompt.contains(&uniq.id.to_string()),
+            "uniquely-provided dep must still produce a hint: {prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tc);
+        let _ = std::fs::remove_dir_all(&t1);
+        let _ = std::fs::remove_dir_all(&t2);
+        let _ = std::fs::remove_dir_all(&tu);
     }
 
     // ─── parse_repo_class: category/domains/exposed/consumes ───────────────

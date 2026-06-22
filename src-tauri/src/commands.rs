@@ -147,6 +147,11 @@ async fn register_repo(
             // forced and would skip an unchanged classified repo, dropping the failure
             // with no retry.
             crate::curator::clear_failure(r.id);
+            // The auto pass reads the PERSISTED analysis_state (not just the
+            // in-memory map), so clearing only memory would leave the DB column at
+            // "failed" — the non-forced add-pass would skip the now-valid repo and
+            // it would render as failed indefinitely. Persist "idle" too.
+            let _ = repo::set_analysis_state(db, r.id, "idle", None).await;
         }
     }
     // The curator is agent-only now (ARCHITECTURE §4.9): there is no deterministic

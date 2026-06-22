@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { X, RefreshCw } from "lucide-react";
@@ -145,38 +145,37 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
   const [mapDoc, setMapDoc] = useState<string | null | undefined>(undefined);
   const [regenerating, setRegenerating] = useState(false);
 
-  // Fetch the map doc when switching to map view.
-  const fetchMapDoc = useCallback(() => {
-    if (activeWorkspaceId == null) return;
-    void api.getRepoMapDoc(activeWorkspaceId).then((doc) => setMapDoc(doc));
-  }, [activeWorkspaceId]);
-
   useEffect(() => {
     if (view !== "map" || activeWorkspaceId == null) return;
+    const ws = activeWorkspaceId;
     let cancelled = false;
-    // Reset to the loading state immediately: `mapDoc` is kept in the mounted
-    // curator panel, so switching workspaces (or opening Map in a new one) would
-    // otherwise render the PREVIOUS workspace's markdown until the fetch returns,
-    // and indefinitely if it fails. A failed fetch falls back to the empty state
-    // rather than leaving stale content.
+    // Single guarded fetch used by both the initial load and the graph-update
+    // re-fetch. `mapDoc` is kept in the mounted curator panel, so without the
+    // `cancelled` + captured-`ws` guard a late response (initial OR a re-fetch
+    // for the previous workspace) could repopulate the panel with another
+    // workspace's markdown after a switch. A failed fetch falls back to empty.
+    const load = () => {
+      api
+        .getRepoMapDoc(ws)
+        .then((doc) => {
+          if (!cancelled) setMapDoc(doc);
+        })
+        .catch(() => {
+          if (!cancelled) setMapDoc(null);
+        });
+    };
+    // Reset to the loading state immediately so a switch never shows the prior map.
     setMapDoc(undefined);
-    void api
-      .getRepoMapDoc(activeWorkspaceId)
-      .then((doc) => {
-        if (!cancelled) setMapDoc(doc);
-      })
-      .catch(() => {
-        if (!cancelled) setMapDoc(null);
-      });
+    load();
     // Re-fetch when the backend signals a graph update while map is open.
     const unlistenP = listen<number>("repo-graph-updated", (e) => {
-      if (e.payload === activeWorkspaceId) fetchMapDoc();
+      if (e.payload === ws) load();
     });
     return () => {
       cancelled = true;
       void unlistenP.then((f) => f());
     };
-  }, [view, activeWorkspaceId, fetchMapDoc]);
+  }, [view, activeWorkspaceId]);
 
   function handleRegenerate() {
     setRegenerating(true);
