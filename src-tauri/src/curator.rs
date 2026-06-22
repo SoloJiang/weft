@@ -400,8 +400,12 @@ pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
 /// discriminator because the failure mode is SAFE — a misclassified object leaves
 /// the placeholder for retry, rather than persisting a component's tier/summary as
 /// the whole repo (which `needs_classification` would then skip).
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct RepoClassWire {
+    // `tier` has no serde default by design — a reply without one is unparseable.
+    // `Default::default()` yields "" which tests treat as an unparseable tier; that
+    // is acceptable because the struct's `Default` is only used in test constructors
+    // via `..Default::default()` for the new optional fields.
     tier: String,
     #[serde(default)]
     name: Option<String>,
@@ -413,6 +417,18 @@ struct RepoClassWire {
     stack: Option<Vec<String>>,
     #[serde(default)]
     components: Option<Vec<Component>>,
+    // New fields: tolerate omission (default "" / []) so a partial reply never
+    // discards the existing persisted category/domains.
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    domains: Vec<String>,
+    // Transient surface-info fields (not persisted to their own columns in v1;
+    // they enrich the analyst context and may be folded into domains later).
+    #[serde(default)]
+    exposed: Vec<String>,
+    #[serde(default)]
+    consumes: Vec<String>,
 }
 
 /// Extract the per-repo classification from the agent's free-form reply, same
@@ -466,15 +482,19 @@ shared libraries / IDL that back them.";
 
 /// Per-repo DEEP classification prompt. The agent runs with cwd AT this repo and
 /// is told to read widely (subdirectories, monorepo packages) before emitting one
-/// strict-JSON object: the repo's tier + one-line summary + stack, plus any
-/// monorepo sub-components for the map's "expanded" view.
-fn build_repo_class_prompt(repo_name: &str) -> String {
+/// strict-JSON object: tier + summary + stack + components + category + domains +
+/// exposed + consumes. Manifest signals (requires/provides) are injected as hints
+/// so the agent confirms/augments rather than guessing cold.
+fn build_repo_class_prompt(repo_name: &str, cwd: &std::path::Path) -> String {
+    let manifest = crate::manifest::scan_repo(cwd);
+    let manifest_hint = build_manifest_hint(&manifest);
     format!(
         "Analyze the repository at the current working directory (name: {repo_name}) \
 DEEPLY and READ-ONLY. Do NOT stop at the top-level manifest: read the source \
 layout, entry points, configs, and — if this is a monorepo — its packages/apps/\
 services subdirectories, so your classification reflects what the code actually \
-does.\n\n{TIER_GUIDE}\n\nClassify the repository into exactly one top-level tier. \
+does.\n\n{TIER_GUIDE}\n\n{manifest_hint}\
+Classify the repository into exactly one top-level tier. \
 If the repo is a monorepo containing two or more deployable/publishable internal \
 packages or services, list each as a component with its own tier; a single-purpose \
 repo has no components.\n\nAs the LAST thing in your reply, output a single JSON \
@@ -483,11 +503,36 @@ object and nothing after it:\n\
 internal modules if it is a monorepo>\",\"stack\":[\"<language/framework tags>\"],\
 \"components\":[{{\"name\":\"<package/service>\",\"path\":\"<relative path>\",\
 \"tier\":\"frontend|backend\",\"summary\":\"<one line>\",\
-\"deps\":[\"<sibling component name it depends on>\"]}}]}}\n\
+\"deps\":[\"<sibling component name it depends on>\"]}}],\
+\"category\":\"<role within its tier, e.g. gateway|biz|core|common|idl|support|app|sdk|web — best fit, free text>\",\
+\"domains\":[\"<owned feature domains, e.g. orders|payments|auth>\"],\
+\"exposed\":[\"<HTTP/gRPC routes, queues, or dbs this repo offers>\"],\
+\"consumes\":[\"<other services/APIs this repo calls>\"]}}\n\
 Rules: pick the single tier that best fits the repo as a whole. `components` is \
 [] unless this is a monorepo with 2+ internal packages/services. `deps` lists only \
-SIBLING components in THIS repo. Keep summaries to one line."
+SIBLING components in THIS repo. Keep summaries to one line. `category` is \
+free-text — use the examples as guidance, not a constraint. `domains` and `exposed`/\
+`consumes` may be [] if not applicable."
     )
+}
+
+/// Format the manifest signals as a human-readable hint block for the prompt.
+/// Returns an empty string when the manifest carries no signal (no provides/requires).
+fn build_manifest_hint(manifest: &crate::manifest::ManifestInfo) -> String {
+    let has_provides = !manifest.provides.is_empty();
+    let has_requires = !manifest.requires.is_empty();
+    if !has_provides && !has_requires {
+        return String::new();
+    }
+    let mut hint = String::from("Manifest signals (use as starting hints — confirm or augment from the code):\n");
+    if has_provides {
+        hint.push_str(&format!("- This repo provides: {}\n", manifest.provides.join(", ")));
+    }
+    if has_requires {
+        hint.push_str(&format!("- Known declared dependencies: {}\n", manifest.requires.join(", ")));
+    }
+    hint.push('\n');
+    hint
 }
 
 /// Cross-repo relations prompt: lists every classified repo (id/name/tier/path/
@@ -1151,6 +1196,27 @@ async fn persist_repo_class(
         db, repo.id, &tier, &stack_json, &summary, &comps_json, source, &commit,
     )
     .await?;
+
+    // Persist category + domains when the agent provided them. Preserve the
+    // prior values when the agent omitted them (empty string / empty vec =
+    // "not provided" — do not overwrite a previously classified value with blanks).
+    let agent_category = wire.category.trim().to_string();
+    let agent_domains_empty = wire.domains.is_empty();
+    if !agent_category.is_empty() || !agent_domains_empty {
+        let prior_category = prior.as_ref().map(|p| p.category.as_str()).unwrap_or("");
+        let prior_domains_json = prior.as_ref().map(|p| p.domains.as_str()).unwrap_or("[]");
+        let final_category = if !agent_category.is_empty() {
+            agent_category
+        } else {
+            prior_category.to_string()
+        };
+        let final_domains_json = if !agent_domains_empty {
+            json_strs(&wire.domains)
+        } else {
+            prior_domains_json.to_string()
+        };
+        let _ = repo::set_repo_category_domains(db, repo.id, &final_category, &final_domains_json).await;
+    }
     Ok(())
 }
 
@@ -1191,7 +1257,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     // without this, a reprofiled-but-unselected card sits stale for the whole run.
     emit_graph_updated(ws);
     let tool = crate::tools::default_tool(db).await;
-    let prompt = build_repo_class_prompt(&repo.name);
+    let prompt = build_repo_class_prompt(&repo.name, cwd);
     // Capture HEAD BEFORE the (minutes-long) run so the stored `profiled_commit`
     // reflects the tree the agent actually classified. If the checkout advances
     // during the run, a later pass sees HEAD != profiled_commit and reclassifies,
@@ -1992,6 +2058,7 @@ mod tests {
             summary: "agent summary".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2017,6 +2084,7 @@ mod tests {
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2042,6 +2110,7 @@ mod tests {
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2068,6 +2137,7 @@ mod tests {
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, mk("backend"), "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2101,6 +2171,7 @@ mod tests {
             summary: "".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2130,6 +2201,7 @@ mod tests {
             summary: "now monolith".into(),
             stack: Some(vec![]),
             components: Some(vec![]),
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2156,6 +2228,7 @@ mod tests {
             summary: "".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "abc").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2181,6 +2254,7 @@ mod tests {
             summary: "".into(), // agent omitted it
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2205,6 +2279,7 @@ mod tests {
             summary: "agent summary".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2228,6 +2303,7 @@ mod tests {
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
@@ -2254,6 +2330,7 @@ mod tests {
                 Component { name: "api".into(), tier: "backend".into(), ..Default::default() },
                 Component { name: "".into(), tier: "frontend".into(), ..Default::default() },
             ]),
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2308,6 +2385,7 @@ mod tests {
             summary: "fresh agent sum".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2330,6 +2408,7 @@ mod tests {
             summary: "s".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
@@ -2754,5 +2833,95 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_a);
         let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    // ─── parse_repo_class: category/domains/exposed/consumes ───────────────
+
+    #[test]
+    fn parse_repo_class_with_category_and_domains() {
+        // A reply that includes all four new fields: they are parsed correctly.
+        let text = r#"
+Some prose here.
+{"tier":"backend","summary":"order service","stack":["go"],
+ "components":[],"category":"biz","domains":["orders","payments"],
+ "exposed":["POST /orders","GET /orders/:id"],"consumes":["auth-svc","product-svc"]}
+"#;
+        let wire = super::parse_repo_class(text).expect("should parse");
+        assert_eq!(wire.tier, "backend");
+        assert_eq!(wire.category, "biz");
+        assert_eq!(wire.domains, vec!["orders".to_string(), "payments".to_string()]);
+        assert_eq!(wire.exposed, vec!["POST /orders".to_string(), "GET /orders/:id".to_string()]);
+        assert_eq!(wire.consumes, vec!["auth-svc".to_string(), "product-svc".to_string()]);
+    }
+
+    #[test]
+    fn parse_repo_class_missing_new_fields_defaults() {
+        // A reply with only the original fields: category/domains/exposed/consumes
+        // default to "" / [] and the parse still succeeds.
+        let text = r#"{"tier":"frontend","summary":"web app","stack":["react"],"components":[]}"#;
+        let wire = super::parse_repo_class(text).expect("should parse even without new fields");
+        assert_eq!(wire.category, "");
+        assert!(wire.domains.is_empty());
+        assert!(wire.exposed.is_empty());
+        assert!(wire.consumes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_writes_category_and_domains() {
+        // When the agent provides category + domains, they are written to the profile.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_catdom").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            name: None,
+            tier: "backend".into(),
+            summary: "order service".into(),
+            stack: None,
+            components: None,
+            category: "biz".into(),
+            domains: vec!["orders".into(), "payments".into()],
+            exposed: vec!["POST /orders".into()],
+            consumes: vec!["auth-svc".into()],
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "biz");
+        let doms: Vec<String> = serde_json::from_str(&p.domains).unwrap();
+        assert_eq!(doms, vec!["orders".to_string(), "payments".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_preserves_prior_category_domains_on_omission() {
+        // When the agent omits category/domains (empty defaults), the prior values
+        // written by a previous pass are preserved.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_catdom2").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc2", "/tmp/svc2", "main", "", true)
+            .await
+            .unwrap();
+        // Seed an existing profile with category/domains.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "svc2 summary", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_repo_category_domains(&db, r.id, "core", r#"["auth"]"#).await.unwrap();
+        // Now persist a new wire reply that omits category/domains.
+        let wire = super::RepoClassWire {
+            name: None,
+            tier: "backend".into(),
+            summary: "updated summary".into(),
+            stack: None,
+            components: None,
+            category: "".into(),
+            domains: vec![],
+            exposed: vec![],
+            consumes: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire, "sha2").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "core", "prior category preserved when agent omits it");
+        let doms: Vec<String> = serde_json::from_str(&p.domains).unwrap();
+        assert_eq!(doms, vec!["auth".to_string()], "prior domains preserved when agent omits them");
     }
 }
