@@ -23,10 +23,16 @@ export function RepoDrawer() {
   useEffect(() => {
     if (!repoDrawerOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      if (e.key !== "Escape" || e.defaultPrevented) return;
       // A nested Radix modal (e.g. the delete-repo confirm) renders a `.weft-overlay`
       // and owns Escape — let it close itself first instead of nuking the whole drawer.
       if (document.querySelector(".weft-overlay")) return;
+      // An editable field owns Escape too (the inline summary editor, the chat
+      // composer) — let it cancel its own edit instead of dismissing the drawer.
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT")) {
+        return;
+      }
       closeRepoDrawer();
     };
     window.addEventListener("keydown", onKey);
