@@ -1431,6 +1431,24 @@ pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     Ok(())
 }
 
+/// On startup, repos whose `analysis_state` was persisted as "running" at shutdown
+/// have no live process. Re-kick their per-repo classification so a repo
+/// interrupted mid-analysis resumes instead of spinning forever in a stale state.
+/// `profile_repo_agent`'s internal `run_begin` dedupes concurrent calls; spawning
+/// each repo independently keeps startup non-blocking.
+pub async fn resume_running_analyses(db: &Db) {
+    let stuck = match repo::repos_with_analysis_state(db, "running").await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    for r in stuck {
+        let db2 = db.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = profile_repo_agent(&db2, &r).await;
+        });
+    }
+}
+
 /// Per-workspace serialization for analysis passes: an async lock (two passes for
 /// one workspace never overlap) plus a `dirty` flag so a request that lands while
 /// a pass is running coalesces into one rerun instead of a parallel pass.

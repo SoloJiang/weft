@@ -169,6 +169,14 @@ pub fn run() {
             im::spawn(app.handle().clone());
             trail::spawn(app.handle().clone());
             backup::scheduler::spawn(backup_svc.clone());
+            {
+                // APP_HANDLE is set above; access the managed Db via Manager.
+                use tauri::Manager as _;
+                let db = app.state::<store::Db>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    curator::resume_running_analyses(&db).await;
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

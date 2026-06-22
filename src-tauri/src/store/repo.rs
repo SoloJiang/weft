@@ -642,6 +642,23 @@ pub async fn set_analysis_state(
     Ok(())
 }
 
+/// Return all `repo_ref` rows whose `repo_profile.analysis_state` matches `state`.
+/// Queries profile rows first (no SQL join needed: profiles are keyed by repo_id),
+/// then loads the corresponding repo_ref rows, skipping any whose repo was deleted.
+pub async fn repos_with_analysis_state(db: &Db, state: &str) -> Result<Vec<repo_ref::Model>> {
+    let profiles = repo_profile::Entity::find()
+        .filter(repo_profile::Column::AnalysisState.eq(state))
+        .all(&db.0)
+        .await?;
+    let mut out = Vec::with_capacity(profiles.len());
+    for p in profiles {
+        if let Some(r) = repo_ref::Entity::find_by_id(p.repo_id).one(&db.0).await? {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
 /// Set a repo's captured `origin` remote URL. Used to backfill rows added before
 /// the `remote_url` column existed, so workspace remote-dedup can match them.
 /// No-op if the repo is gone.
@@ -2922,6 +2939,38 @@ mod tests {
         assert!(
             get_repo_profile(&db, r.id).await.unwrap().is_none(),
             "idle on no-row must remain a no-op"
+        );
+    }
+
+    /// repos_with_analysis_state returns exactly the repos whose profile has the
+    /// given state, not idle or failed ones.
+    #[tokio::test]
+    async fn repos_with_analysis_state_returns_only_matching() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let running = add_repo_ref(&db, ws.id, "running-repo", "/tmp/running", "main", "", true)
+            .await
+            .unwrap();
+        let idle = add_repo_ref(&db, ws.id, "idle-repo", "/tmp/idle", "main", "", true)
+            .await
+            .unwrap();
+
+        // Seed profiles: running-repo gets analysis_state="running" via the
+        // placeholder-creating path; idle-repo gets a full profile but stays idle.
+        set_analysis_state(&db, running.id, "running", None).await.unwrap();
+        upsert_repo_profile(&db, idle.id, "backend", "[]", "summary", "[]", "agent", "sha")
+            .await
+            .unwrap();
+        // idle-repo's analysis_state column defaults to "idle" — no explicit set needed.
+
+        let got = repos_with_analysis_state(&db, "running").await.unwrap();
+        assert_eq!(got.len(), 1, "only the running repo must be returned");
+        assert_eq!(got[0].id, running.id, "returned repo must be the running one");
+
+        // The idle-repo must NOT appear in the running results.
+        assert!(
+            !got.iter().any(|r| r.id == idle.id),
+            "idle repo must not appear in running results"
         );
     }
 }
