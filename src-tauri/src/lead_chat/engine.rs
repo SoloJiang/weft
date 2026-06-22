@@ -121,6 +121,9 @@ pub enum Push {
     },
 }
 
+/// 进行中 turn 最多排队多少条人类消息（满后 send 拒绝入队）。
+pub const MAX_QUEUED: usize = 5;
+
 /// One outbound human message: text plus optional image attachments
 /// (media_type, base64). Queued whole while a turn is running.
 #[derive(Clone, Default)]
@@ -134,6 +137,8 @@ pub struct Outgoing {
     /// turn's output frames. None for every non-IM send. Rides the queue so a
     /// queued turn keeps its own tag even when emitted after later sends.
     pub origin_tag: Option<String>,
+    /// 入队时持久化的 queued 行 id；删/改/重排和交付落库按它定位。None=直接发送。
+    pub queue_id: Option<i32>,
 }
 
 /// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
@@ -195,6 +200,7 @@ impl TurnState {
                     images: vec![],
                     tracked: false,
                     origin_tag: None,
+                    queue_id: None,
                 })
             }
             // A message queued before the wake goes first; the wake slides up one.
@@ -621,6 +627,7 @@ async fn apply_lead_sentinels(
                         images: Vec::new(),
                         tracked: false,
                         origin_tag: None,
+                        queue_id: None,
                     };
                     queue_hidden_delivery(app, inner, out);
                 }
@@ -1147,6 +1154,9 @@ pub async fn send(
     let is_command = text.trim_start().starts_with('/');
     let kind = if is_command { "command" } else { "text" };
     let direct = inner.turn.try_begin_send();
+    if !direct && inner.turn.queue.len() >= MAX_QUEUED {
+        return Err(anyhow::anyhow!("queue_full"));
+    }
     if direct {
         inner.turn_id += 1;
         inner.clock.begin_turn();
@@ -1215,6 +1225,7 @@ pub async fn send(
         tracked: true,
         // Rides the turn (and the queue, if queued) so output frames recover it.
         origin_tag: origin_tag.clone(),
+        queue_id: if direct { None } else { Some(row_id) },
     };
     // codex (app-server): a per-session connection drives the turn after the lock
     // drops (streaming via item/agentMessage/delta). system_prompt is prepended to
@@ -1976,6 +1987,7 @@ async fn send_hidden_inner(
         images: vec![],
         tracked: false,
         origin_tag: None,
+        queue_id: None,
     };
 
     match hidden_delivery(
@@ -2815,6 +2827,7 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
         });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
@@ -2850,6 +2863,7 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
         });
         t.request_bus_read(); // wake lands AFTER "earlier" was queued
                               // "earlier" preceded the wake, so it drains first, then the read.
@@ -2871,6 +2885,7 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
         });
         // The wake arrived before "later", so the inbox read comes first — the
         // agent can't answer the newer prompt without seeing the bus message.
@@ -2888,6 +2903,20 @@ mod tests {
         assert!(t.request_bus_read()); // idle → caller starts a read turn now
         assert!(t.busy);
         assert!(t.bus_read_pos.is_none()); // consumed by starting the turn, not pending
+    }
+
+    #[test]
+    fn queue_is_capped_at_max() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy（占用一个在飞 turn）
+        for i in 0..MAX_QUEUED {
+            assert!(!t.try_begin_send()); // busy
+            t.queue.push_back(Outgoing { text: format!("m{i}"), ..Default::default() });
+        }
+        assert_eq!(t.queue.len(), MAX_QUEUED);
+        // Full-queue rejection (send() returning Err("queue_full")) is an async/DB path
+        // not exercisable at the TurnState level; this test only asserts the queue fills
+        // to exactly MAX_QUEUED.
     }
 
     #[test]
@@ -3131,6 +3160,7 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
         });
         let turn_id = mark_hidden_turn_started(&mut inner);
 
@@ -3162,6 +3192,7 @@ mod tests {
             images: vec![],
             tracked: false,
             origin_tag: None,
+            queue_id: None,
         };
 
         let err = write_user(&mut inner, &out).await.unwrap_err();
