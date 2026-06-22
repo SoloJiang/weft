@@ -300,6 +300,9 @@ pub struct CuratorRelation {
     // `relations` payload over one bad value.
     #[serde(default, deserialize_with = "lenient_confidence")]
     pub confidence: u8,
+    /// Free-text explanation from the agent for why this dependency exists.
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// Coerce a relation's `confidence` from whatever shape the agent emitted (int,
@@ -322,6 +325,19 @@ struct CuratorWire {
     // Required (no serde default): a reply without a `relations` array is treated
     // as unparseable, so a malformed/timed-out turn never reads as "no relations".
     relations: Vec<CuratorRelation>,
+    /// RedIM-style markdown document synthesized by the analyst. Optional:
+    /// tolerate an agent that omits it — the doc update is skipped, not a failure.
+    #[serde(default)]
+    repo_map_markdown: Option<String>,
+}
+
+/// The parsed result of the curator agent's cross-repo pass. Relations are always
+/// present (possibly empty); the markdown doc may be absent if the agent omitted it.
+pub struct CuratorOutput {
+    pub relations: Vec<CuratorRelation>,
+    /// A RedIM-style workspace doc synthesized by the analyst. `None` when the
+    /// agent did not emit one (degrade gracefully — skip the doc update).
+    pub repo_map_markdown: Option<String>,
 }
 
 /// Every balanced top-level `{...}` substring, in order. Byte-scans for the ASCII
@@ -377,18 +393,24 @@ fn json_objects(text: &str) -> Vec<&str> {
     out
 }
 
-/// Extract the curator agent's relations from its free-form reply (tolerant of
+/// Extract the curator agent's output from its free-form reply (tolerant of
 /// markdown fences / surrounding prose). Scans EVERY balanced object and returns
 /// the LAST that deserializes as a relations payload — the prompt asks for the
 /// JSON as the final thing, and an earlier prose/config `{...}` must not hide it.
 /// `None` when no object has a `relations` array (timed-out/malformed reply) so
-/// the caller leaves the graph intact; `Some([])` is an explicit "no relations".
-pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
+/// the caller leaves the graph intact; `Some` with an empty `relations` is an
+/// explicit "no relations". `repo_map_markdown` defaults to `None` when absent —
+/// the caller skips the doc update gracefully rather than failing.
+pub fn parse_curator_output(text: &str) -> Option<CuratorOutput> {
     json_objects(text)
         .into_iter()
         .rev()
         .find_map(|obj| serde_json::from_str::<CuratorWire>(obj).ok())
-        .map(|w| w.relations)
+        .map(|w| CuratorOutput {
+            relations: w.relations,
+            // Treat an explicit null or omitted key as None (skip doc update).
+            repo_map_markdown: w.repo_map_markdown.filter(|s| !s.trim().is_empty()),
+        })
 }
 
 /// The per-repo deep pass's strict-JSON result. `tier` is required (no serde
@@ -535,17 +557,41 @@ fn build_manifest_hint(manifest: &crate::manifest::ManifestInfo) -> String {
     hint
 }
 
-/// Cross-repo relations prompt: lists every classified repo (id/name/tier/path/
-/// summary) and asks for STRICT JSON relations keyed by repo id — runtime, infra,
-/// AND declared library dependencies (there is no manifest floor, so the agent
-/// reports `lib` edges too).
+/// Format the manifest edges already seeded for a repo as a structured hint block.
+/// Returns an empty string when the repo has no stored agent relations with
+/// source="manifest" (the typical case when no manifests were found).
+fn build_manifest_edge_hint(relations_json: &str) -> String {
+    let rels: Vec<crate::profile::AgentRelation> =
+        serde_json::from_str(relations_json).unwrap_or_default();
+    let manifest: Vec<_> = rels.iter().filter(|r| r.source == "manifest").collect();
+    if manifest.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("  manifest edges (high-confidence lib deps from on-disk manifests):\n");
+    for r in manifest {
+        out.push_str(&format!("    → to={} kind={} via={:?}\n", r.to, r.kind, r.via));
+    }
+    out
+}
+
+/// Cross-repo relations prompt: lists every classified repo (id/name/tier/category/
+/// domains/path/summary) along with its already-seeded manifest edges, then asks
+/// for STRICT JSON with relations+rationale and a repo_map_markdown doc.
 fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> String {
     let mut lines = String::new();
     for (r, p) in repos {
         let tier = if p.role.is_empty() { "unknown" } else { p.role.as_str() };
+        let category = p.category.as_str();
+        let domains: Vec<String> = serde_json::from_str(&p.domains).unwrap_or_default();
+        let domains_str = if domains.is_empty() {
+            String::new()
+        } else {
+            format!(" domains=[{}]", domains.join(", "))
+        };
+        let manifest_hint = build_manifest_edge_hint(&p.relations);
         lines.push_str(&format!(
-            "- id={} name={:?} tier={} path={:?}\n  summary: {}\n",
-            r.id, r.name, tier, r.local_git_path, p.summary
+            "- id={} name={:?} tier={} category={:?}{} path={:?}\n  summary: {}\n{}",
+            r.id, r.name, tier, category, domains_str, r.local_git_path, p.summary, manifest_hint
         ));
     }
     format!(
@@ -565,18 +611,31 @@ routes / handlers, gRPC service definitions, queue consumers, DB schemas. The \
 consumer is `from`, the producer it talks to is `to`. Use the tier flow as a prior: \
 a frontend almost always depends on the backend that serves its data — assert such \
 an edge whenever the code supports it, even with no shared package.\n\n\
-{TIER_GUIDE}\n\nRepositories:\n{lines}\nRead each repo's code and config at its \
-path (READ-ONLY — change nothing). Then, as the LAST thing in your reply, output a \
-single JSON object and nothing after it:\n\
+{TIER_GUIDE}\n\nRepositories (manifest edges are pre-seeded high-confidence hints — \
+confirm, augment, or add runtime edges from code):\n{lines}\n\
+Read each repo's code and config at its path (READ-ONLY — change nothing). Then, as \
+the LAST thing in your reply, output a single JSON object and nothing after it:\n\
 {{\"relations\":[{{\"from\":<id>,\"to\":<id>,\"kind\":\"http|grpc|queue|infra|lib\",\
-\"via\":\"<short evidence>\",\"confidence\":<0-100>}}]}}\n\
+\"via\":\"<short evidence>\",\"confidence\":<0-100>,\
+\"rationale\":\"<one sentence: why this dependency exists>\"}}],\
+\"repo_map_markdown\":\"<markdown string>\"}}\n\
+The `repo_map_markdown` value MUST be a RedIM-style workspace map with these four \
+sections:\n\
+1. **Inventory** — grouped by tier→category; one bullet per repo with its purpose \
+and owned domains.\n\
+2. **Dependency layers** — bullet list of directed dependency flows \
+(frontend→backend, backend→infra, etc.) with a sentence of rationale each.\n\
+3. **Sibling/lateral edges** — same-tier dependencies with rationale.\n\
+4. **Domain-ownership index** — alphabetical: `domain: [repo names]`.\n\
 Rules: `from` and `to` MUST be ids from the list above and must differ. Use kind \
 `lib` for a declared package/module dependency, the runtime kinds otherwise. \
 Include a relation when you have concrete evidence — for a runtime edge that means a \
-matching endpoint / topic / host / contract across the two repos, NOT necessarily a \
-shared import. `via` is a short label (e.g. \"POST /orders\", \"orders-topic\", \
-\"shared postgres\", \"@acme/api-client\"). If you find none, output \
-{{\"relations\":[]}}."
+matching endpoint / topic / host / contract across the two repos. `via` is a short \
+label (e.g. \"POST /orders\", \"orders-topic\", \"shared postgres\", \
+\"@acme/api-client\"). `rationale` is one sentence explaining why the dependency \
+exists. If you find no cross-repo dependencies, output `{{\"relations\":[], \
+\"repo_map_markdown\":\"<still include the inventory and domain index>\"}}`. \
+`repo_map_markdown` must be a JSON string (escape newlines as \\\\n, quotes as \\\\\")."
     )
 }
 
@@ -908,7 +967,7 @@ async fn persist_relations(
                 confidence: rel.confidence,
                 source: "agent".to_string(),
                 rejected: false,
-                ..Default::default()
+                rationale: rel.rationale.clone(),
             });
     }
     for (r, _) in profiled {
@@ -1559,8 +1618,11 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     // The relations pass is workspace-level, not tied to one repo's detail panel,
     // so its stream is discarded — it shares the runner only for the transport fix.
     if let Ok(text) = run_streaming_agent(&tool, &cwd, &prompt, &mut |_| {}).await {
-        if let Some(relations) = parse_curator_output(&text) {
-            persist_relations(db, &profiled, &relations).await?;
+        if let Some(output) = parse_curator_output(&text) {
+            persist_relations(db, &profiled, &output.relations).await?;
+            if let Some(md) = output.repo_map_markdown {
+                let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
+            }
         }
     }
     // Manifest pass AFTER the agent pass: `seed_manifest_relations` reloads the
@@ -2511,10 +2573,10 @@ mod tests {
         let reply = r#"{"relations":[{"from":1,"to":2,"kind":"http","via":"x","confidence":"high"},
             {"from":1,"to":3,"kind":"grpc","via":"y","confidence":0.8},
             {"from":1,"to":4,"kind":"lib","via":"z","confidence":250}]}"#;
-        let rels = super::parse_curator_output(reply).expect("parsed despite bad confidence");
-        assert_eq!(rels.len(), 3);
-        assert_eq!(rels[0].confidence, 0); // "high" → 0
-        assert_eq!(rels[2].confidence, 100); // 250 clamped
+        let out = super::parse_curator_output(reply).expect("parsed despite bad confidence");
+        assert_eq!(out.relations.len(), 3);
+        assert_eq!(out.relations[0].confidence, 0); // "high" → 0
+        assert_eq!(out.relations[2].confidence, 100); // 250 clamped
     }
 
     #[test]
@@ -2569,12 +2631,12 @@ mod tests {
     fn parse_curator_output_extracts_json_from_fenced_prose() {
         let reply = "Here is the analysis:\n```json\n{\"relations\":[{\"from\":1,\"to\":2,\
             \"kind\":\"http\",\"via\":\"GET /orders\",\"confidence\":80}]}\n```\nDone.";
-        let rels = super::parse_curator_output(reply).expect("parsed a relations object");
-        assert_eq!(rels.len(), 1);
-        assert_eq!((rels[0].from, rels[0].to), (Some(1), Some(2)));
-        assert_eq!(rels[0].kind, "http");
-        assert_eq!(rels[0].via, "GET /orders");
-        assert_eq!(rels[0].confidence, 80);
+        let out = super::parse_curator_output(reply).expect("parsed a relations object");
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!((out.relations[0].from, out.relations[0].to), (Some(1), Some(2)));
+        assert_eq!(out.relations[0].kind, "http");
+        assert_eq!(out.relations[0].via, "GET /orders");
+        assert_eq!(out.relations[0].confidence, 80);
     }
 
     #[test]
@@ -2584,9 +2646,9 @@ mod tests {
         assert!(super::parse_curator_output("").is_none());
         // An object without a `relations` array is treated as unparseable too.
         assert!(super::parse_curator_output(r#"{"notes":"none found"}"#).is_none());
-        // An explicit empty relations array → Some([]) (a real "found nothing").
+        // An explicit empty relations array → Some with empty relations.
         let explicit = super::parse_curator_output(r#"{"relations":[]}"#);
-        assert!(explicit.is_some_and(|v| v.is_empty()));
+        assert!(explicit.is_some_and(|o| o.relations.is_empty()));
     }
 
     #[test]
@@ -2595,9 +2657,38 @@ mod tests {
         // earlier brace block must not hide the valid result later in the reply.
         let reply = "I looked at the config `{\"port\": 8080}` and traced the call.\n\n\
             {\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"GET /x\",\"confidence\":70}]}";
-        let rels = super::parse_curator_output(reply).expect("found the later relations object");
-        assert_eq!(rels.len(), 1);
-        assert_eq!((rels[0].from, rels[0].to, rels[0].kind.as_str()), (Some(1), Some(2), "http"));
+        let out = super::parse_curator_output(reply).expect("found the later relations object");
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!((out.relations[0].from, out.relations[0].to, out.relations[0].kind.as_str()), (Some(1), Some(2), "http"));
+    }
+
+    #[test]
+    fn parse_curator_output_reads_rationale_and_repo_map_markdown() {
+        // Relations with rationale + a markdown doc in the same JSON object.
+        // Use a regular string so \n in the JSON value is a literal backslash-n.
+        let reply = "{\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"GET /orders\",\
+            \"confidence\":80,\"rationale\":\"frontend calls the orders API to display the cart\"}],\
+            \"repo_map_markdown\":\"## Inventory\\n- web (frontend)\"}";
+        let out = super::parse_curator_output(reply).expect("parsed with rationale + markdown");
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!(
+            out.relations[0].rationale,
+            "frontend calls the orders API to display the cart"
+        );
+        // The JSON string "## Inventory\n- web (frontend)" deserializes to a real newline.
+        assert_eq!(
+            out.repo_map_markdown.as_deref(),
+            Some("## Inventory\n- web (frontend)")
+        );
+    }
+
+    #[test]
+    fn parse_curator_output_tolerates_absent_rationale_and_markdown() {
+        // An agent that omits rationale and repo_map_markdown must not fail.
+        let reply = r#"{"relations":[{"from":1,"to":2,"kind":"lib","via":"@pkg/core","confidence":90}]}"#;
+        let out = super::parse_curator_output(reply).expect("parsed despite missing optional fields");
+        assert_eq!(out.relations[0].rationale, "");
+        assert!(out.repo_map_markdown.is_none(), "absent markdown → None (skip doc update)");
     }
 
     #[tokio::test]
@@ -2628,6 +2719,7 @@ mod tests {
             kind: "http".into(),
             via: via.into(),
             confidence: 70,
+            rationale: String::new(),
         };
         let rels = vec![
             mk(web.id, api.id, "GET /x"), // kept
@@ -2642,6 +2734,7 @@ mod tests {
                 kind: "http".into(),
                 via: "no-target".into(),
                 confidence: 50,
+                rationale: String::new(),
             },
         ];
         super::persist_relations(&db, &profiled, &rels).await.unwrap();

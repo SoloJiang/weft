@@ -293,6 +293,13 @@ pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
         .map_err(e)
 }
 
+/// Return the analyst-synthesized markdown repo-map for a workspace, or `None`
+/// when no analysis has produced one yet.
+#[tauri::command]
+pub async fn get_repo_map_doc(db: State<'_, Db>, workspace_id: i32) -> R<Option<String>> {
+    repo::get_repo_map_doc(&db, workspace_id).await.map_err(e)
+}
+
 /// Remove a repo from its workspace: delete Weft's reference, the repo's
 /// profile, the directions bound to it (with their sessions), and its worktrees
 /// (physically removed from git). The user's actual repository at its local path

@@ -282,6 +282,22 @@ pub async fn set_tool_command(
     Ok((map, prev))
 }
 
+/// app_setting key for the workspace's synthesized repo-map markdown document.
+fn repo_map_doc_key(workspace_id: i32) -> String {
+    format!("repomap.doc.{workspace_id}")
+}
+
+/// Persist the analyst-synthesized markdown repo-map for a workspace.
+pub async fn set_repo_map_doc(db: &Db, workspace_id: i32, markdown: &str) -> Result<()> {
+    set_setting(db, &repo_map_doc_key(workspace_id), markdown).await
+}
+
+/// Read the analyst-synthesized markdown repo-map for a workspace.
+/// Returns `None` when none has been generated yet.
+pub async fn get_repo_map_doc(db: &Db, workspace_id: i32) -> Result<Option<String>> {
+    get_setting(db, &repo_map_doc_key(workspace_id)).await
+}
+
 /// Workspace container used by per-IM-conversation Concierge threads.
 pub const K_CONCIERGE_WORKSPACE: &str = "concierge.workspace_id";
 
@@ -3048,5 +3064,34 @@ mod tests {
         let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.category, "", "fresh row: category defaults to empty string");
         assert_eq!(p.domains, "[]", "fresh row: domains defaults to '[]'");
+    }
+
+    /// set_repo_map_doc / get_repo_map_doc round-trip: store and retrieve a
+    /// markdown doc keyed per workspace, and confirm absent workspaces return None.
+    #[tokio::test]
+    async fn repo_map_doc_round_trip() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        // Nothing stored yet → None.
+        let doc = get_repo_map_doc(&db, ws.id).await.unwrap();
+        assert!(doc.is_none(), "no doc before first set");
+
+        // Store a markdown document.
+        let md = "## Inventory\n- web (frontend): SPA\n\n## Domain index\n- auth: [api]";
+        set_repo_map_doc(&db, ws.id, md).await.unwrap();
+        let doc = get_repo_map_doc(&db, ws.id).await.unwrap();
+        assert_eq!(doc.as_deref(), Some(md), "retrieved doc must equal stored doc");
+
+        // Overwrite with a new doc (upsert semantics).
+        let md2 = "## Inventory v2\n- api (backend): REST API";
+        set_repo_map_doc(&db, ws.id, md2).await.unwrap();
+        let doc2 = get_repo_map_doc(&db, ws.id).await.unwrap();
+        assert_eq!(doc2.as_deref(), Some(md2), "second set overwrites the first");
+
+        // A different workspace id has its own slot — no cross-workspace bleed.
+        let ws2 = create_workspace(&db, "ws2").await.unwrap();
+        let doc_ws2 = get_repo_map_doc(&db, ws2.id).await.unwrap();
+        assert!(doc_ws2.is_none(), "different workspace has no doc");
     }
 }
