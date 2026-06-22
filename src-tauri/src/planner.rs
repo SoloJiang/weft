@@ -408,16 +408,30 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
         // so a direction is dispatched at most once.
         let mut consumed: std::collections::HashSet<i32> = std::collections::HashSet::new();
         let mut matching: Vec<i32> = Vec::new();
-        // #42r8-1 LEGACY TERMINAL PRE-CLAIM: approved/denied lanes are skipped by the dispatch loop
-        // below (they're handled by approve/deny). A lane WITH a recorded id reserves its direction
-        // by id elsewhere; but a LEGACY (id==0) approved/denied lane reserves NOTHING, so its
-        // direction stays in the candidate pool and a pending same-name/repo legacy sibling's
-        // fallback then sees BOTH rows -> ambiguous -> dispatches nothing (the pending worker is
-        // stranded after upgrade). So pre-claim each legacy terminal lane's direction into `consumed`
-        // FIRST — base-aware so duplicate same-name/repo terminals each take their OWN base-matching
-        // row, mirroring the main confirm path's pre-pass (R50-4 / R52-2). Best-effort repo lookup: if
-        // the repo can't be read we can't compute base_compatible, so fall back to a single unconsumed
-        // name+repo non-done match (claim only when unambiguous).
+        // #42r8-1 / #42r9-1 LEGACY TERMINAL PRE-CLAIM: approved/denied lanes are skipped by the
+        // dispatch loop below (they're handled by approve/deny). A lane WITH a recorded id reserves its
+        // direction by id elsewhere; but a LEGACY (id==0) approved/denied lane reserves NOTHING, so its
+        // direction stays in the candidate pool and a pending same-name/repo legacy sibling's fallback
+        // then sees BOTH rows -> ambiguous -> dispatches nothing (the pending worker is stranded after
+        // upgrade). So pre-claim each legacy terminal lane's direction into `consumed` FIRST.
+        //
+        // EXPLICIT-FIRST in TWO sub-passes (#42r9-1). The single base_compatible pass broke when the
+        // repo default MOVED after a BLANK terminal was materialized: a blank lane recorded its
+        // direction on the OLD default (e.g. `main`), but base_compatible re-resolves the blank lane's
+        // side through the CURRENT live default (e.g. `develop`), so it no longer matches its own
+        // recorded `main` row and reserves nothing — re-stranding the pending sibling. Fix: do NOT
+        // re-resolve a blank lane through the moved default.
+        //   1) EXPLICIT-base terminals first: reserve via base_compatible (their base is known/stable),
+        //      mirroring the main confirm path's terminal pre-pass `.find` (R50-4 / R52-2). Best-effort
+        //      repo lookup: if the repo can't be read, base_compatible is uncomputable, so `is_none_or`
+        //      falls back to a name+repo-only first match.
+        //   2) BLANK-base terminals second: reserve a REMAINING same-name/repo non-done unconsumed
+        //      direction by NAME+REPO only (first match) — WITHOUT base_compatible. Because explicit
+        //      terminals already reserved their exact-base rows, the blank terminal takes one of the
+        //      remaining rows (its own), so it IS reserved and removed from the pending pool.
+        // Neither pass is uniqueness-gated: claiming ONE row per terminal leaves a same-base pending
+        // sibling a single remaining candidate (they're interchangeable on that base). `consumed` is
+        // threaded so each terminal lane takes a DISTINCT row.
         for p in &resolved.directions {
             if !p.repo.known || !(p.decision == "approved" || p.decision == "denied") {
                 continue;
@@ -425,15 +439,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             if p.direction_id != 0 {
                 continue; // recorded-id terminals reserve by id elsewhere / are simply skipped here.
             }
+            if p.base_branch.trim().is_empty() {
+                continue; // blank terminals claimed in the second sub-pass (no moved-default re-resolution).
+            }
             let repo_info = repo::get_repo(db, p.repo.repo_id).await.ok().flatten();
-            // Claim the FIRST unconsumed same-name/repo non-done direction that is base_compatible
-            // with this terminal lane (mirrors the main confirm path's terminal pre-pass `.find`,
-            // lines ~620). When the repo can't be read, base_compatible is uncomputable, so
-            // `is_none_or` falls back to a name+repo-only first match (best-effort) — equivalent to a
-            // single name+repo match when only one such row exists. NOT uniqueness-gated: with two
-            // same-base same-name/repo terminal+pending duplicates, claiming ONE base-compatible row
-            // here leaves the pending sibling a single remaining candidate (they're interchangeable on
-            // the same base). `consumed` is threaded so a second terminal lane takes a DISTINCT row.
             let reserve = all.iter().find(|d| {
                 d.name == p.name
                     && d.repo_id == p.repo.repo_id
@@ -454,6 +463,31 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             }
         }
         for p in &resolved.directions {
+            if !p.repo.known || !(p.decision == "approved" || p.decision == "denied") {
+                continue;
+            }
+            if p.direction_id != 0 {
+                continue; // recorded-id terminals reserve by id elsewhere / are simply skipped here.
+            }
+            if !p.base_branch.trim().is_empty() {
+                continue; // explicit terminals already reserved their exact-base rows above.
+            }
+            // BLANK terminal: claim the FIRST remaining unconsumed same-name/repo non-done direction by
+            // NAME+REPO only — do NOT pass the blank side through base_compatible (that would re-resolve
+            // it via the moved live default and miss its own old-default-recorded row). Explicit
+            // terminals already took their exact-base rows, so what remains for a blank terminal is its
+            // own row; reserving it keeps a pending same-name/repo sibling a single remaining candidate.
+            let reserve = all.iter().find(|d| {
+                d.name == p.name
+                    && d.repo_id == p.repo.repo_id
+                    && d.status != "done"
+                    && !consumed.contains(&d.id)
+            });
+            if let Some(d) = reserve {
+                consumed.insert(d.id);
+            }
+        }
+        for p in &resolved.directions {
             if !p.repo.known || p.decision == "approved" || p.decision == "denied" {
                 continue;
             }
@@ -466,17 +500,23 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 }
                 continue;
             }
-            // #42r7-1 LEGACY FALLBACK: this lane carries no recorded id because the plan was
+            // #42r7-1 / #42r9-1 LEGACY FALLBACK: this lane carries no recorded id because the plan was
             // CONFIRMED BEFORE `direction_id` existed (every lane deserializes id==0). The id-only
             // path above would skip it and strand a live (reclaimed) worktree after upgrade. Recover
-            // ONLY when the mapping is UNAMBIGUOUS and BASE-CORRECT — among unconsumed same-name/repo
-            // non-done candidates, exactly one base_compatible with the lane's base. This is
-            // base-aware even for a LONE candidate (#42r8-2): a single stale `release` row must NOT be
-            // dispatched for an explicit-`main` lane — its base differs, so skip it (the real `main`
-            // row was deleted/completed). Only when the repo CANNOT be read (so base_compatible is
-            // uncomputable) fall back to a single name+repo non-done match (best-effort). This is
-            // intentionally minimal (no blank/explicit/newest heuristic): pre-field plans are the only
-            // case it serves; everything created since records its id and never reaches here.
+            // ONLY when the mapping is UNAMBIGUOUS, splitting on whether the lane's base is EXPLICIT or
+            // BLANK so a blank lane is NEVER re-resolved through the (possibly moved) live default:
+            //   - EXPLICIT base + repo readable: pick the lane's OWN base-compatible direction — EXACTLY
+            //     ONE compatible candidate. Base-aware even for a LONE candidate (#42r8-2): a single
+            //     stale `release` row must NOT be dispatched for an explicit-`main` lane (its base
+            //     differs); still-ambiguous bases yield multiple matches -> skip.
+            //   - BLANK base (or repo unreadable, so base_compatible is uncomputable): a single
+            //     unconsumed name+repo non-done match only (#42r9-1). A blank lane recorded its row on
+            //     the OLD default; if that default MOVED, base_compatible would re-resolve the blank
+            //     side to the NEW default and miss its own row -> strand the worker. Matching by
+            //     name+repo when exactly one candidate remains (terminal pre-claims already removed the
+            //     siblings' rows) reserves its own row without that re-resolution.
+            // Intentionally minimal (no newest/heuristic guess): pre-field plans are the only case this
+            // serves; everything created since records its id and never reaches here.
             let candidates: Vec<&crate::store::entities::direction::Model> = all
                 .iter()
                 .filter(|d| {
@@ -486,12 +526,12 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                         && !consumed.contains(&d.id)
                 })
                 .collect();
-            let chosen: Option<i32> = match repo::get_repo(db, p.repo.repo_id).await.ok().flatten() {
-                Some(r) => {
-                    // Repo readable: pick the lane's OWN base-compatible direction — EXACTLY ONE
-                    // compatible candidate (whether there are one or several by name+repo). A blank
-                    // lane, still-ambiguous bases, or a lone base-INCOMPATIBLE row all yield
-                    // zero/multiple matches -> skip (don't guess / don't dispatch the wrong worker).
+            let repo_info = repo::get_repo(db, p.repo.repo_id).await.ok().flatten();
+            let blank_lane = p.base_branch.trim().is_empty();
+            let chosen: Option<i32> = match repo_info {
+                // Repo readable AND the lane has an EXPLICIT base: pick its OWN base-compatible
+                // direction — exactly one compatible candidate, else skip.
+                Some(r) if !blank_lane => {
                     let repo_path = std::path::Path::new(&r.local_git_path);
                     let compat: Vec<i32> = candidates
                         .iter()
@@ -512,9 +552,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                         None
                     }
                 }
-                // Repo unreadable: can't compute base_compatible, so a single name+repo match only.
-                None if candidates.len() == 1 => Some(candidates[0].id),
-                None => None,
+                // BLANK lane, or repo unreadable: don't re-resolve the blank base through the (moved)
+                // default — a single unconsumed name+repo non-done match only.
+                _ if candidates.len() == 1 => Some(candidates[0].id),
+                _ => None,
             };
             if let Some(id) = chosen {
                 if consumed.insert(id) {
@@ -3767,6 +3808,95 @@ mod tests {
             "#42r8-1: the pending legacy sibling dispatches its OWN direction (approved lane's dir pre-claimed)");
         assert!(!retry.contains(&a_id),
             "#42r8-1: the approved legacy lane's direction is NOT dispatched by the fast-path");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// #42r9-1: a LEGACY (id==0) confirmed plan's approved/denied BLANK-base TERMINAL lane must
+    /// pre-claim its direction by NAME+REPO — NOT by re-resolving the blank side through the MOVED live
+    /// default. The blank lane recorded its direction on base `main` while `main` was the default; the
+    /// repo default then MOVES main->develop. The single-pass `base_compatible(d.base, p.base="" )`
+    /// pre-claim re-resolves the blank lane's side to `develop`, so it fails to match the recorded
+    /// `main` direction and reserves nothing — leaving a pending explicit-`main` sibling staring at BOTH
+    /// `main` rows (ambiguous) and dispatching nothing (stranded after upgrade). The explicit-first
+    /// two-sub-pass pre-claim reserves the blank terminal's `main` row by name+repo, so the pending
+    /// sibling has a single remaining candidate (its OWN `main` direction) and dispatches it. Red-first:
+    /// before the blank-by-name+repo sub-pass, the blank terminal is not reserved and the pending
+    /// sibling is stranded (`[]`).
+    #[tokio::test]
+    async fn confirmed_fast_path_legacy_blank_terminal_reserved_after_default_move() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-legacy-blank-terminal-move-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // ORIGIN with main(default)+develop, then a CLONE registered as the repo — so moving the
+        // origin's HEAD later genuinely changes what a blank base resolves to.
+        let origin = make_repo(&root, "origin");
+        let main = crate::git::current_branch(&origin).unwrap();
+        sh(&origin, &["git", "checkout", "-q", "-b", "develop"]);
+        sh(&origin, &["git", "commit", "-q", "--allow-empty", "-m", "d"]);
+        sh(&origin, &["git", "symbolic-ref", "HEAD", &format!("refs/heads/{main}")]);
+        sh(&origin, &["git", "checkout", "-q", &main]);
+        let repo_path = root.join("clone");
+        sh(&root, &["git", "clone", "-q", origin.to_str().unwrap(), repo_path.to_str().unwrap()]);
+        sh(&repo_path, &["git", "config", "user.email", "t@t.t"]);
+        sh(&repo_path, &["git", "config", "user.name", "t"]);
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &main, "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Two same-name/repo lanes on the SAME (default) base: lane[0] BLANK base (approved while the
+        // default is `main`, so its direction is recorded on `main`), lane[1] EXPLICIT `main` base
+        // (stays pending -> confirm creates it). Two `main` directions exist.
+        let prop = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:main.clone(), decision:"".into(), direction_id: 0 },
+        ]};
+        save_proposal(&db, t.id, &prop).await.unwrap();
+
+        // Approve lane[0] (records a_id on `main`, decision=approved). Confirm creates the pending lane (b_id).
+        let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        let confirm_ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(confirm_ids.len(), 1, "confirm dispatches only the pending explicit lane");
+        let b_id = confirm_ids[0];
+        assert_ne!(a_id, b_id, "the two lanes own DISTINCT directions on the same base");
+
+        // Simulate a PRE-FIELD confirmed plan: rewrite the stored proposal so BOTH lanes deserialize
+        // with direction_id==0, while keeping lane[0]'s approved decision + status "confirmed".
+        let plan = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        let mut stored: Proposal = serde_json::from_str(&plan.proposal).unwrap();
+        assert_eq!(stored.directions[0].direction_id, a_id, "approved blank lane recorded a_id");
+        assert_eq!(stored.directions[1].direction_id, b_id, "pending explicit lane recorded b_id");
+        stored.directions[0].direction_id = 0;
+        stored.directions[1].direction_id = 0;
+        let legacy_json = serde_json::to_string(&stored).unwrap();
+        repo::upsert_plan(&db, t.id, &legacy_json, "confirmed", &plan.created_at).await.unwrap();
+
+        // The live default MOVES main -> develop (this is what breaks the single-pass blank pre-claim:
+        // base_compatible re-resolves the blank lane's side to `develop`, missing its recorded `main`).
+        sh(&origin, &["git", "symbolic-ref", "HEAD", "refs/heads/develop"]);
+        assert_eq!(crate::git::live_default_branch(&repo_path).as_deref(), Some("develop"),
+            "precondition: the live default moved to develop");
+
+        // Fast-path retry on the LEGACY plan: the blank approved terminal's `main` direction is reserved
+        // by name+repo (NOT re-resolved through the moved default), so the pending explicit-`main`
+        // sibling has exactly ONE remaining candidate (b_id) and dispatches its OWN direction.
+        let retry = confirm(&db, t.id).await.unwrap();
+        assert_eq!(retry, vec![b_id],
+            "#42r9-1: the pending legacy sibling dispatches its OWN `main` direction (blank terminal reserved by name+repo)");
+        assert!(!retry.contains(&a_id),
+            "#42r9-1: the blank approved legacy lane's `main` direction is NOT dispatched by the fast-path");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
