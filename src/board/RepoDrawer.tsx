@@ -39,7 +39,7 @@ export function RepoDrawer() {
   return (
     <div
       role="dialog"
-      aria-label={t("repomap.curatorTitle")}
+      aria-label={tabs.find((x) => x.key === repoDrawerTab)?.label}
       className="absolute right-4 top-4 bottom-4 z-30 flex flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface shadow-[0_8px_28px_-8px_rgba(0,0,0,0.6)]"
       style={{ width: repoDrawerWidth }}
     >
