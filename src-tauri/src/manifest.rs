@@ -4,7 +4,7 @@
 //! Every parser takes file content as `&str` and returns empty on any parse
 //! error — never panics.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Public types

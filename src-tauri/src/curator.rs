@@ -445,10 +445,13 @@ struct RepoClassWire {
     category: String,
     #[serde(default)]
     domains: Vec<String>,
-    // Transient surface-info fields (not persisted to their own columns in v1;
-    // they enrich the analyst context and may be folded into domains later).
+    // Transient surface-info fields: parsed so the agent is prompted to reason
+    // about them, but not persisted to their own columns in v1 (may be folded
+    // into domains / fed to the analyst later) — hence allow(dead_code).
+    #[allow(dead_code)]
     #[serde(default)]
     exposed: Vec<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     consumes: Vec<String>,
 }
