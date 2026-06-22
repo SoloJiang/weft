@@ -211,6 +211,10 @@ export function LeadTab({
           promptText={promptText}
           cwd={leadCwd}
           emptyState={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
+          queue={turn.queue}
+          onRemove={(id) => void api.leadDequeue(tid, id)}
+          onEdit={(id, text) => void api.leadEditQueued(tid, id, text)}
+          onReorder={(order) => void api.leadReorderQueue(tid, order)}
         />
         <ChatComposer
           slashCommands={leadSlash[tid] ?? []}

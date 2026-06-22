@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, Check, ChevronRight, Copy, FileText, Sparkles } from "lucide-react";
-import type { LeadMessage, ResolvedProposal } from "../lib/types";
+import type { LeadMessage, QueuedItem, ResolvedProposal } from "../lib/types";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
+import { QueueStack } from "./QueueStack";
 import { cn } from "../lib/cn";
 import {
   cleanToolName,
@@ -42,6 +43,10 @@ export function ChatTimeline({
   promptText,
   cwd,
   emptyState = "default",
+  queue = [],
+  onRemove,
+  onEdit,
+  onReorder,
 }: {
   messages: LeadMessage[];
   busy: boolean;
@@ -61,14 +66,19 @@ export function ChatTimeline({
   cwd?: string;
   /** Lead hosts opt into task/repo guidance; workers keep the default empty state. */
   emptyState?: EmptyStateMode;
+  /** Pending messages waiting in the engine's send queue. */
+  queue?: QueuedItem[];
+  onRemove?: (id: number) => void;
+  onEdit?: (id: number, text: string) => void;
+  onReorder?: (order: number[]) => void;
 }) {
-  const { t } = useTranslation();
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
 
   // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
-  // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
-  const visible = messages.filter((m) => m.kind !== "meta");
+  // (claude/opencode/codex alike); only `meta` bookkeeping rows and pending queued
+  // messages (rendered in QueueStack instead) are hidden.
+  const visible = messages.filter((m) => m.kind !== "meta" && m.status !== "queued");
 
   // Virtuoso's followOutput only fires on item-COUNT changes, so it misses
   // intra-message streaming growth (text appended to the existing last row).
@@ -146,16 +156,17 @@ export function ChatTimeline({
           last message the unambiguous list bottom (so the follow-scroll target
           is exact) and keeps the indicator visible even while the user scrolls
           back through history. */}
-      {busy && (
+      {(busy || queue.length > 0) && (
         <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
-          {activity ? (
-            <ActivityLine name={activity.name} summary={activity.summary} />
-          ) : (
-            <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
-              {t("lead.working")}
-            </div>
-          )}
+          <div className="flex flex-col gap-1.5">
+            {busy && <BusyIndicator activity={activity ?? null} />}
+            <QueueStack
+              items={queue}
+              onRemove={onRemove ?? (() => {})}
+              onEdit={onEdit ?? (() => {})}
+              onReorder={onReorder ?? (() => {})}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -248,6 +259,20 @@ function EmptyLeadState({
   return (
     <div className="flex flex-1 items-center justify-center px-6 text-center">
       <p className="text-[12px] leading-relaxed text-ink-faint">{t("lead.transcriptEmpty")}</p>
+    </div>
+  );
+}
+
+/** Busy status line: shows the specific tool in flight if available, else a generic pulse. */
+function BusyIndicator({ activity }: { activity: { name: string; summary: string } | null }) {
+  const { t } = useTranslation();
+  if (activity) {
+    return <ActivityLine name={activity.name} summary={activity.summary} />;
+  }
+  return (
+    <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
+      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
+      {t("lead.working")}
     </div>
   );
 }
@@ -574,14 +599,8 @@ function TimelineRow({
     const label = [command, args].filter(Boolean).join(" ");
     return (
       <div className="flex justify-end">
-        <span
-          className={cn(
-            "inline-flex max-w-[72%] items-center gap-1.5 rounded-[var(--radius-md)] border border-brand/25 bg-brand-ghost px-3 py-2 font-mono text-[12.5px] text-ink",
-            m.status === "queued" && "opacity-60",
-          )}
-        >
+        <span className="inline-flex max-w-[72%] items-center gap-1.5 rounded-[var(--radius-md)] border border-brand/25 bg-brand-ghost px-3 py-2 font-mono text-[12.5px] text-ink">
           <span className="truncate">{label}</span>
-          {m.status === "queued" && <QueuedChip />}
         </span>
       </div>
     );
@@ -635,12 +654,7 @@ function TimelineRow({
     const text = String(c.text ?? "");
     return (
       <div className="group flex flex-col items-end">
-        <div
-          className={cn(
-            "flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5",
-            m.status === "queued" && "opacity-60",
-          )}
-        >
+        <div className="flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5">
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {images.map((src, i) => (
@@ -670,11 +684,6 @@ function TimelineRow({
             <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-ink">
               {text}
             </p>
-          )}
-          {m.status === "queued" && (
-            <span className="self-end">
-              <QueuedChip />
-            </span>
           )}
           {m.status === "error" && (
             <p className="self-end text-[11px] text-danger">{t("lead.errored")}</p>
@@ -728,15 +737,6 @@ function isActionCardAction(value: unknown): value is ActionCardAction {
     typeof action.id === "string" &&
     typeof action.label === "string" &&
     (action.kind === "add" || action.kind === "new" || action.kind === "clone")
-  );
-}
-
-function QueuedChip() {
-  const { t } = useTranslation();
-  return (
-    <span className="rounded-full bg-bg px-1.5 py-px text-[10px] text-ink-faint">
-      {t("lead.queuedChip")}
-    </span>
   );
 }
 

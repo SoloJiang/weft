@@ -229,6 +229,9 @@ export const zh = {
     copyMessage: "复制",
     copied: "已复制",
     queueFull: "队列已满 (5/5)，先删一条排队消息",
+    queueEdit: "编辑",
+    queueDelete: "删除",
+    queueDrag: "拖动重排",
   },
   scope: {
     addReposFirst: "请先往这个工作区添加仓库。",

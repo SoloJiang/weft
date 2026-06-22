@@ -245,6 +245,10 @@ export function WorkerConversation() {
             activity={sid != null ? workerActivity[sid] : undefined}
             onReviewProposal={() => {}}
             cwd={cwd}
+            queue={turn?.queue ?? []}
+            onRemove={sid != null ? (id) => void api.chatDequeue(sid, id) : undefined}
+            onEdit={sid != null ? (id, text) => void api.chatEditQueued(sid, id, text) : undefined}
+            onReorder={sid != null ? (order) => void api.chatReorderQueue(sid, order) : undefined}
           />
           <ChatComposer
             slashCommands={(sid != null ? workerSlash[sid] : undefined) ?? []}

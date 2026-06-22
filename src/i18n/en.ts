@@ -234,6 +234,9 @@ export const en = {
     copyMessage: "Copy",
     copied: "Copied",
     queueFull: "Queue is full (5/5) — delete a queued message first",
+    queueEdit: "Edit",
+    queueDelete: "Delete",
+    queueDrag: "Reorder",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",

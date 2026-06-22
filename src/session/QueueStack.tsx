@@ -1,0 +1,108 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Reorder } from "motion/react";
+import { GripVertical, Pencil, X } from "lucide-react";
+import type { QueuedItem } from "../lib/types";
+import { useImeComposition } from "../lib/useImeComposition";
+
+export function QueueStack({
+  items,
+  onRemove,
+  onEdit,
+  onReorder,
+}: {
+  items: QueuedItem[];
+  onRemove: (id: number) => void;
+  onEdit: (id: number, text: string) => void;
+  onReorder: (order: number[]) => void;
+}) {
+  const { t } = useTranslation();
+  if (items.length === 0) return null;
+  return (
+    <Reorder.Group
+      axis="y"
+      values={items}
+      onReorder={(next: QueuedItem[]) => onReorder(next.map((i) => i.id))}
+      className="flex flex-col gap-1"
+    >
+      {items.map((it) => (
+        <Reorder.Item
+          key={it.id}
+          value={it}
+          className="flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-bg px-2 py-1"
+        >
+          <GripVertical
+            size={12}
+            className="shrink-0 cursor-grab text-ink-faint"
+            aria-label={t("lead.queueDrag")}
+          />
+          <QueueRowText item={it} onEdit={onEdit} />
+          <button
+            onClick={() => onRemove(it.id)}
+            aria-label={t("lead.queueDelete")}
+            className="shrink-0 text-ink-faint hover:text-ink"
+          >
+            <X size={12} />
+          </button>
+        </Reorder.Item>
+      ))}
+    </Reorder.Group>
+  );
+}
+
+function QueueRowText({
+  item,
+  onEdit,
+}: {
+  item: QueuedItem;
+  onEdit: (id: number, text: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(item.text);
+  const { composition, isComposing } = useImeComposition();
+
+  if (!editing) {
+    return (
+      <>
+        <span className="min-w-0 flex-1 truncate text-[12px] text-ink">{item.text}</span>
+        <button
+          onClick={() => {
+            setVal(item.text);
+            setEditing(true);
+          }}
+          aria-label={t("lead.queueEdit")}
+          className="shrink-0 text-ink-faint hover:text-ink"
+        >
+          <Pencil size={11} />
+        </button>
+      </>
+    );
+  }
+
+  const commit = () => {
+    const v = val.trim();
+    setEditing(false);
+    if (v && v !== item.text) onEdit(item.id, v);
+  };
+
+  return (
+    <input
+      autoFocus
+      value={val}
+      onChange={(e) => setVal(e.target.value)}
+      {...composition}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" && !isComposing(e)) {
+          e.preventDefault();
+          commit();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          setEditing(false);
+        }
+      }}
+      onBlur={commit}
+      className="min-w-0 flex-1 rounded-[var(--radius-sm)] border border-border bg-surface px-1.5 py-0.5 text-[12px] text-ink outline-none"
+    />
+  );
+}
