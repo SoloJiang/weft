@@ -214,7 +214,6 @@ export const zh = {
     working: "处理中…",
     stop: "停止",
     queuedN: "已排队 {{count}}",
-    queuedChip: "已排队",
     interrupted: "已中断",
     errored: "本回合出错",
     terminalErrorBeforeOutput: "Agent 在产出内容前出错，本回合已结束。",

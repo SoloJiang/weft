@@ -219,7 +219,6 @@ export const en = {
     working: "Working…",
     stop: "Stop",
     queuedN: "{{count}} queued",
-    queuedChip: "queued",
     interrupted: "interrupted",
     errored: "This turn errored",
     terminalErrorBeforeOutput: "The agent turn ended with an error before producing output.",

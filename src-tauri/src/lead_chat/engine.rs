@@ -61,7 +61,7 @@ pub struct QueuedItem {
     pub files: usize,
 }
 
-fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
+pub(crate) fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
     turn.queue
         .iter()
         .filter_map(|o| {
@@ -1956,7 +1956,15 @@ pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i
         let (tid, sid) = (inner.thread_id, inner.session_id);
         emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
     }
-    let content = serde_json::json!({ "text": text, "images": [], "files": [] }).to_string();
+    // Preserve existing images/files; only replace the text field.
+    let content = if let Some(row) = repo::get_message(db, message_id).await? {
+        let mut val: serde_json::Value =
+            serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::json!({}));
+        val["text"] = serde_json::Value::String(text.to_string());
+        val.to_string()
+    } else {
+        serde_json::json!({ "text": text, "images": [], "files": [] }).to_string()
+    };
     repo::update_message_content(db, message_id, &content).await?;
     Ok(())
 }
@@ -3439,5 +3447,36 @@ mod tests {
         assert_eq!(ids, vec![30, 20]); // queue untouched
         assert!(!t.remove(999));
         assert!(!t.edit(999, "x"));
+    }
+
+    /// queue_edit must preserve images/files in the persisted row; only text changes.
+    #[tokio::test]
+    async fn queue_edit_preserves_images_and_files_in_persisted_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        // Insert a queued message that has images and files in its content.
+        let original = serde_json::json!({
+            "text": "original text",
+            "images": [{"data": "abc", "media_type": "image/png"}],
+            "files": ["/tmp/attach.txt"]
+        })
+        .to_string();
+        let row = repo::insert_lead_message(&db, 1, None, 1, "user", "text", &original, "queued")
+            .await
+            .unwrap();
+
+        // Simulate what queue_edit now does: read row, update text only.
+        let existing = repo::get_message(&db, row.id).await.unwrap().unwrap();
+        let mut val: serde_json::Value =
+            serde_json::from_str(&existing.content).unwrap();
+        val["text"] = serde_json::Value::String("edited text".into());
+        repo::update_message_content(&db, row.id, &val.to_string()).await.unwrap();
+
+        let updated = repo::get_message(&db, row.id).await.unwrap().unwrap();
+        let content: serde_json::Value = serde_json::from_str(&updated.content).unwrap();
+        assert_eq!(content["text"], "edited text");
+        assert!(content["images"].is_array());
+        assert_eq!(content["images"].as_array().unwrap().len(), 1, "images must be preserved");
+        assert!(content["files"].is_array());
+        assert_eq!(content["files"][0], "/tmp/attach.txt", "files must be preserved");
     }
 }

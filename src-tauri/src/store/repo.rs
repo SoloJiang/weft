@@ -1347,6 +1347,14 @@ pub async fn delete_message(db: &Db, message_id: i32) -> Result<()> {
     Ok(())
 }
 
+/// 查一条消息行（用于读取原始 content 再局部改写）。
+pub async fn get_message(
+    db: &Db,
+    message_id: i32,
+) -> Result<Option<crate::store::entities::lead_message::Model>> {
+    Ok(lead_message::Entity::find_by_id(message_id).one(&db.0).await?)
+}
+
 /// 覆盖一条消息行的 content（编辑排队消息文本用）。
 pub async fn update_message_content(db: &Db, message_id: i32, content: &str) -> Result<()> {
     if let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? {
