@@ -186,6 +186,18 @@ interface Store {
   setCuratorPanelOpen: (open: boolean) => void;
   curatorPanelWidth: number;
   setCuratorPanelWidth: (w: number) => void;
+  /** Repos view right drawer: one of detail/curator at a time. selectedRepoId
+   *  drives both node highlight and the detail tab. Width persists per workspace;
+   *  open does NOT (drawer starts closed each visit). */
+  repoDrawerOpen: boolean;
+  repoDrawerTab: "detail" | "curator";
+  selectedRepoId: number | null;
+  repoDrawerWidth: number;
+  openRepoDetail: (repoId: number) => void;
+  openCurator: () => void;
+  closeRepoDrawer: () => void;
+  setRepoDrawerTab: (tab: "detail" | "curator") => void;
+  setRepoDrawerWidth: (w: number) => void;
   /** Pin a repo's one-line summary (tier ownership untouched). */
   editRepoSummary: (repoId: number, summary: string) => Promise<void>;
   /** Pin a repo's tier (summary ownership untouched). */
@@ -361,6 +373,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [curatorPanelOpen, setCuratorPanelOpenState] = useState(true);
   const [curatorPanelWidth, setCuratorPanelWidthState] = useState(CURATOR_WIDTH_DEFAULT);
+  const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
+  const [repoDrawerTab, setRepoDrawerTabState] = useState<"detail" | "curator">("detail");
+  const [selectedRepoId, setSelectedRepoId] = useState<number | null>(null);
+  const [repoDrawerWidth, setRepoDrawerWidthState] = useState(CURATOR_WIDTH_DEFAULT);
   // Coalesce curator-thread creation per workspace: StrictMode double-mounts and
   // the backend get-or-create is not atomic, so concurrent ensures for the SAME
   // workspace could create dupes. Keyed by ws so switching to another workspace
@@ -598,6 +614,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setCuratorPanelWidthState(
       Number.isFinite(wRaw) && wRaw > 0
         ? Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, wRaw))
+        : CURATOR_WIDTH_DEFAULT,
+    );
+    // Repos drawer: width persists (shared key with the old curator panel), but
+    // open state does not — each workspace visit starts with the canvas full-width.
+    setRepoDrawerOpen(false);
+    setRepoDrawerTabState("detail");
+    setSelectedRepoId(null);
+    const dwRaw = Number(localStorage.getItem(curatorWidthKey(id)));
+    setRepoDrawerWidthState(
+      Number.isFinite(dwRaw) && dwRaw > 0
+        ? Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, dwRaw))
         : CURATOR_WIDTH_DEFAULT,
     );
     const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
@@ -1712,6 +1739,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (ws != null) localStorage.setItem(curatorWidthKey(ws), String(clamped));
   }, []);
 
+  const openRepoDetail = useCallback((repoId: number) => {
+    setSelectedRepoId(repoId);
+    setRepoDrawerTabState("detail");
+    setRepoDrawerOpen(true);
+  }, []);
+  const openCurator = useCallback(() => {
+    setRepoDrawerTabState("curator");
+    setRepoDrawerOpen(true);
+  }, []);
+  const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
+  const setRepoDrawerTab = useCallback((tab: "detail" | "curator") => setRepoDrawerTabState(tab), []);
+  const setRepoDrawerWidth = useCallback((w: number) => {
+    const clamped = Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, Math.round(w)));
+    setRepoDrawerWidthState(clamped);
+    const ws = activeWorkspaceIdRef.current;
+    if (ws != null) localStorage.setItem(curatorWidthKey(ws), String(clamped));
+  }, []);
+
   const refreshProposal = useCallback(async (threadId: number) => {
     try {
       setProposal(await api.getProposal(threadId));
@@ -2181,6 +2226,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setCuratorPanelOpen,
     curatorPanelWidth,
     setCuratorPanelWidth,
+    repoDrawerOpen,
+    repoDrawerTab,
+    selectedRepoId,
+    repoDrawerWidth,
+    openRepoDetail,
+    openCurator,
+    closeRepoDrawer,
+    setRepoDrawerTab,
+    setRepoDrawerWidth,
     editRepoSummary,
     editRepoTier,
     proposal,
