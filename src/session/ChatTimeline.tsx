@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { StickToBottom } from "use-stick-to-bottom";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, ChevronRight, Copy, FileText, Sparkles } from "lucide-react";
+import { ArrowRight, Check, ChevronRight, Copy, ListChecks, Sparkles } from "lucide-react";
 import type { LeadMessage, ResolvedProposal } from "../lib/types";
 import { Markdown } from "../components/Markdown";
+import { Attachment, OnboardingCue, SuggestionChips } from "../components/ai-elements";
 import { cn } from "../lib/cn";
 import {
   cleanToolName,
@@ -225,6 +226,14 @@ function EmptyLeadState({
               })
             }
           />
+          <SuggestionChips
+            label={t("lead.suggestionLabel")}
+            suggestions={[
+              t("lead.suggestionImportRepo"),
+              t("lead.suggestionCloneRepo"),
+              t("lead.suggestionCreateRepo"),
+            ]}
+          />
         </div>
       </div>
     );
@@ -233,14 +242,21 @@ function EmptyLeadState({
   if (mode === "lead-task") {
     return (
       <div className="flex flex-1 items-center justify-center px-6 text-center">
-        <div className="max-w-[420px]">
-          <span className="mx-auto grid h-8 w-8 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
-            <Sparkles size={15} />
-          </span>
-          <p className="mt-3 text-[13px] font-medium text-ink">{t("lead.taskEmptyTitle")}</p>
-          <p className="mt-1.5 text-[12px] leading-relaxed text-ink-faint">
-            {t("lead.taskEmptyBody")}
-          </p>
+        <div className="max-w-[460px]">
+          <OnboardingCue
+            eyebrow={t("lead.onboardingCueEyebrow")}
+            title={t("lead.taskEmptyTitle")}
+            body={t("lead.onboardingCueBody")}
+            icon={<ListChecks size={15} />}
+          />
+          <SuggestionChips
+            label={t("lead.suggestionLabel")}
+            suggestions={[
+              t("lead.suggestionPlan"),
+              t("lead.suggestionQueue"),
+              t("lead.suggestionTask"),
+            ]}
+          />
         </div>
       </div>
     );
@@ -248,7 +264,17 @@ function EmptyLeadState({
 
   return (
     <div className="flex flex-1 items-center justify-center px-6 text-center">
-      <p className="text-[12px] leading-relaxed text-ink-faint">{t("lead.transcriptEmpty")}</p>
+      <div className="max-w-[420px]">
+        <p className="text-[12px] leading-relaxed text-ink-faint">{t("lead.transcriptEmpty")}</p>
+        <SuggestionChips
+          label={t("lead.suggestionLabel")}
+          suggestions={[
+            t("lead.suggestionDescribe"),
+            t("lead.suggestionAttach"),
+            t("lead.suggestionSlash"),
+          ]}
+        />
+      </div>
     </div>
   );
 }
@@ -437,6 +463,11 @@ function safeParseObj(content: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
 }
 
 // Read-only history replay: only the most recent assistant row is interactive.
@@ -654,8 +685,8 @@ function TimelineRow({
   }
 
   if (m.role === "user") {
-    const images = Array.isArray(c.images) ? (c.images as string[]) : [];
-    const files = Array.isArray(c.files) ? (c.files as string[]) : [];
+    const images = stringArray(c.images);
+    const files = stringArray(c.files);
     const text = String(c.text ?? "");
     return (
       <Message role="user">
@@ -667,12 +698,12 @@ function TimelineRow({
         >
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
-              {images.map((src, i) => (
-                <img
-                  key={i}
+              {images.map((src, imageIndex) => (
+                <Attachment
+                  key={`${src}-${imageIndex}`}
+                  kind="image"
+                  label={t("lead.imageAttachment", { count: imageIndex + 1 })}
                   src={src}
-                  alt=""
-                  className="max-h-32 rounded-[var(--radius-md)] border border-border object-cover"
                 />
               ))}
             </div>
@@ -680,13 +711,11 @@ function TimelineRow({
           {files.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {files.map((f) => (
-                <span
+                <Attachment
                   key={f}
-                  className="inline-flex items-center gap-1 rounded-full bg-bg px-2 py-0.5 font-mono text-[10.5px] text-ink-muted"
-                >
-                  <FileText size={10} className="shrink-0" />
-                  {f.split("/").pop()}
-                </span>
+                  kind="file"
+                  label={f}
+                />
               ))}
             </div>
           )}
