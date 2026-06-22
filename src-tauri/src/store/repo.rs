@@ -528,6 +528,32 @@ pub async fn mark_plan_confirmed_cas(
     Ok(res.rows_affected > 0)
 }
 
+/// Like `mark_plan_confirmed_cas`, but ALSO rewrites the proposal to `new_proposal` in the same
+/// atomic update — used by `confirm` to persist the proposal with each lane's RECORDED direction
+/// id while flipping the status to "confirmed". The CAS baseline is still the START snapshot
+/// (`expected_proposal` + `expected_status`), so a re-propose that landed in between still makes
+/// this match 0 rows and reject — the concurrency invariant is unchanged. Returns true when
+/// applied, false when the proposal OR status drifted (or the plan is gone). `created_at`
+/// (the proposal version) is intentionally left untouched.
+pub async fn commit_confirmed_plan_cas(
+    db: &Db,
+    thread_id: i32,
+    new_proposal: &str,
+    expected_proposal: &str,
+    expected_status: &str,
+) -> Result<bool> {
+    use sea_orm::sea_query::Expr;
+    let res = plan::Entity::update_many()
+        .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
+        .col_expr(plan::Column::Status, Expr::value("confirmed"))
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .filter(plan::Column::Proposal.eq(expected_proposal))
+        .filter(plan::Column::Status.eq(expected_status))
+        .exec(&db.0)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
 pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profile::Model>> {
     Ok(repo_profile::Entity::find()
         .filter(repo_profile::Column::RepoId.eq(repo_id))
