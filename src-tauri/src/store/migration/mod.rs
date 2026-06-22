@@ -40,6 +40,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0027RepoRefBaseRefIsDefault),
             Box::new(M0028WorktreeBaseCommit),
             Box::new(M0029GatewayToBackend),
+            Box::new(M0030AnalysisState),
         ]
     }
 }
@@ -1224,6 +1225,76 @@ impl MigrationTrait for M0029GatewayToBackend {
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         // Data merge is irreversible.
         Ok(())
+    }
+}
+
+/// Adds `analysis_state` (TEXT NOT NULL DEFAULT 'idle') and `analysis_error`
+/// (TEXT NULL) to `repo_profile` so run-state survives process restarts.
+/// A fresh db already has these (M0002 reflects the current entity); sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so the duplicate is tolerated.
+pub struct M0030AnalysisState;
+impl MigrationName for M0030AnalysisState {
+    fn name(&self) -> &str {
+        "m0030_analysis_state"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0030AnalysisState {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r1 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("analysis_state"))
+                            .string()
+                            .not_null()
+                            .default("idle"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r1 {
+            Ok(()) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e),
+        }
+        let r2 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("analysis_error"))
+                            .string()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r2 {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("analysis_state"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("analysis_error"))
+                    .to_owned(),
+            )
+            .await
     }
 }
 

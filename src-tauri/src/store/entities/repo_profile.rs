@@ -36,6 +36,12 @@ pub struct Model {
     /// analyzed / for a single-component repo.
     #[sea_orm(default_value = "[]")]
     pub components: String,
+    /// Live analysis run-state, persisted so a repo "running" at shutdown can be
+    /// resumed (not silently dropped to idle). "idle" | "running" | "failed".
+    #[sea_orm(default_value = "idle")]
+    pub analysis_state: String,
+    /// Error from the last failed analysis (NULL unless analysis_state == "failed").
+    pub analysis_error: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

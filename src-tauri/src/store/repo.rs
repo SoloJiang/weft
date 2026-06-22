@@ -610,6 +610,23 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
     Ok(())
 }
 
+/// Persist a repo's analysis run-state (durable across restarts). Clears the
+/// error unless state == "failed".
+pub async fn set_analysis_state(
+    db: &Db,
+    repo_id: i32,
+    state: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    if let Some(m) = get_repo_profile(db, repo_id).await? {
+        let mut a: repo_profile::ActiveModel = m.into();
+        a.analysis_state = Set(state.to_string());
+        a.analysis_error = Set(error.map(|s| s.to_string()));
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// Set a repo's captured `origin` remote URL. Used to backfill rows added before
 /// the `remote_url` column existed, so workspace remote-dedup can match them.
 /// No-op if the repo is gone.
@@ -2790,5 +2807,54 @@ mod tests {
         assert_eq!(d2.target_branch, "", "empty base leaves target empty (= repo default)");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M0030: analysis_state/error round-trip and upsert_repo_profile preserves them.
+    #[tokio::test]
+    async fn analysis_state_roundtrips_and_upsert_preserves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        // Create a minimal profile row.
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+
+        // (1) Set running/None → read back.
+        set_analysis_state(&db, r.id, "running", None)
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.analysis_state, "running");
+        assert_eq!(p.analysis_error, None);
+
+        // (2) Set failed/Some("boom") → read back.
+        set_analysis_state(&db, r.id, "failed", Some("boom"))
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.analysis_state, "failed");
+        assert_eq!(p.analysis_error.as_deref(), Some("boom"));
+
+        // (3) A normal upsert_repo_profile (agent re-classify) must NOT clobber
+        //     the state set above — analysis_state/error are preserved.
+        upsert_repo_profile(&db, r.id, "frontend", "[]", "summary", "[]", "agent", "abc")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.analysis_state, "failed",
+            "upsert must not reset analysis_state"
+        );
+        assert_eq!(
+            p.analysis_error.as_deref(),
+            Some("boom"),
+            "upsert must not reset analysis_error"
+        );
+        // But the profiling fields were updated normally.
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.profiled_commit, "abc");
     }
 }
