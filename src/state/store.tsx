@@ -181,9 +181,9 @@ interface Store {
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
   ensureCuratorThread: () => Promise<void>;
-  /** Repos view right drawer: one of detail/curator at a time. selectedRepoId
-   *  drives both node highlight and the detail tab. Width persists per workspace;
-   *  open does NOT (drawer starts closed each visit). */
+  /** Repos view right side panel: one of detail/curator at a time. selectedRepoId
+   *  drives both node highlight and the detail surface. Open state resets each
+   *  visit; panel width is per-surface in the panel's own localStorage, not here. */
   repoDrawerOpen: boolean;
   repoDrawerTab: "detail" | "curator";
   selectedRepoId: number | null;
@@ -1676,7 +1676,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Ensure the workspace's hidden curator thread exists and remember its id —
   // WITHOUT navigating. The curator chat renders embedded in the Repo Map panel
-  // (RepoDrawer), so unlike a normal lead chat we never selectThread.
+  // (RepoSidePanel), so unlike a normal lead chat we never selectThread.
   const ensureCuratorThread = useCallback(async () => {
     const ws = activeWorkspaceId;
     if (ws == null || ensuringCuratorRef.current.has(ws)) return;
