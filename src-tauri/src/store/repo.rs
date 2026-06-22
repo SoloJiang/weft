@@ -663,6 +663,12 @@ pub async fn set_analysis_state(
         if state == "idle" {
             return Ok(());
         }
+        // Guard against a deletion race: an analysis finishing after
+        // delete_repo_cascade must not recreate an orphaned profile row (repo_profile
+        // has no enforced foreign key). Mirror edit_profile's guard. (Finding 5)
+        if get_repo(db, repo_id).await?.is_none() {
+            return Ok(());
+        }
         // First-ever analysis: create a minimal placeholder so running/failed
         // persists and the startup resume scan can find this repo.
         upsert_repo_profile(db, repo_id, "", "[]", "", "[]", "agent", "").await?;
@@ -2954,6 +2960,43 @@ mod tests {
         assert!(
             p.role.is_empty() && p.summary.is_empty(),
             "placeholder must have blank role/summary"
+        );
+    }
+
+    /// Finding 5: set_analysis_state must not create a placeholder for a deleted repo.
+    /// Simulates the deletion race: analysis finishes after delete_repo_cascade, so
+    /// the repo_ref row is gone but there is no profile row either.
+    #[tokio::test]
+    async fn set_analysis_state_noop_for_deleted_repo() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "gone-repo", "/tmp/gone", "main", "", true)
+            .await
+            .unwrap();
+        // Simulate cascade delete: remove the repo_ref row (no profile row exists).
+        delete_repo_cascade(&db, r.id).await.unwrap();
+        assert!(
+            get_repo(&db, r.id).await.unwrap().is_none(),
+            "precondition: repo_ref must be gone"
+        );
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "precondition: no profile row"
+        );
+
+        // set_analysis_state("running") on a nonexistent repo must be a no-op —
+        // it must NOT create an orphaned profile row.
+        set_analysis_state(&db, r.id, "running", None).await.unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "set_analysis_state must not create a profile row for a deleted repo"
+        );
+
+        // Same for "failed".
+        set_analysis_state(&db, r.id, "failed", Some("timeout")).await.unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "set_analysis_state(failed) must not create a profile row for a deleted repo"
         );
     }
 
