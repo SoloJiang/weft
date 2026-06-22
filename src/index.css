@@ -213,6 +213,18 @@
 .weft-pulse {
   animation: weft-pulse 1.8s var(--ease-out-quint) infinite;
 }
+.weft-shimmer {
+  animation: weft-shimmer 1.6s var(--ease-out-quint) infinite;
+}
+
+@keyframes weft-shimmer {
+  from {
+    transform: translateX(-120%);
+  }
+  to {
+    transform: translateX(240%);
+  }
+}
 
 /* 丝滑: subtle screen-enter when the route changes (keyed wrapper remounts) */
 @keyframes weft-screen-in {
@@ -232,7 +244,8 @@
 /* motion only when something changed; honor reduced-motion everywhere */
 @media (prefers-reduced-motion: reduce) {
   .weft-pulse,
-  .weft-screen-in {
+  .weft-screen-in,
+  .weft-shimmer {
     animation: none;
   }
 }
