@@ -641,6 +641,15 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
         let mut a: repo_profile::ActiveModel = m.into();
         a.relations = Set(relations.to_string());
         a.update(&db.0).await?;
+        // Any relation mutation makes the workspace's synthesized map doc stale (it
+        // narrates the pre-mutation edges). Invalidate it CENTRALLY at this single
+        // chokepoint so every path is covered — the agent pass, the manifest seed,
+        // and manual calibration all write relations through here. `analyze_relations`
+        // re-writes fresh markdown as its LAST step, so the happy path repopulates it;
+        // a pass that omits markdown (or a manual calibration) leaves it cleared.
+        if let Some(r) = get_repo(db, repo_id).await? {
+            let _ = clear_repo_map_doc(db, r.workspace_id).await;
+        }
     }
     Ok(())
 }
@@ -3192,5 +3201,44 @@ mod tests {
 
         // Clearing an already-absent doc is a no-op, not an error.
         clear_repo_map_doc(&db, ws.id).await.unwrap();
+    }
+
+    /// Central invariant: writing relations invalidates the workspace map doc.
+    /// Covers the "successful relation pass omits markdown" case — persist_relations
+    /// writes through here, so with no replacement markdown the doc must not keep
+    /// serving the pre-pass narrative.
+    #[tokio::test]
+    async fn set_repo_relations_invalidates_map_doc() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
+
+        set_repo_relations(&db, r.id, "[]").await.unwrap();
+
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "writing relations must invalidate the stale workspace map doc"
+        );
+    }
+
+    /// A manual edge calibration mutates relations → the stored map doc (describing
+    /// the pre-calibration edges) must be cleared. Goes through set_repo_relations.
+    #[tokio::test]
+    async fn calibrate_repo_relation_invalidates_map_doc() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
+
+        calibrate_repo_relation(&db, a.id, b.id, "http", "GET /x", "add").await.unwrap();
+
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "manual edge calibration must invalidate the stale workspace map doc"
+        );
     }
 }

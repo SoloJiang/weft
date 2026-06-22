@@ -1716,12 +1716,11 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     let tool = crate::tools::default_tool(db).await;
     // The relations pass is workspace-level, not tied to one repo's detail panel,
     // so its stream is discarded — it shares the runner only for the transport fix.
+    let mut fresh_markdown: Option<String> = None;
     if let Ok(text) = run_streaming_agent(&tool, &cwd, &prompt, &mut |_| {}).await {
         if let Some(output) = parse_curator_output(&text) {
             persist_relations(db, &profiled, &output.relations).await?;
-            if let Some(md) = output.repo_map_markdown {
-                let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
-            }
+            fresh_markdown = output.repo_map_markdown;
         }
     }
     // Manifest pass AFTER the agent pass: `seed_manifest_relations` reloads the
@@ -1730,6 +1729,13 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     // the agent pass's `persist_relations` (which calls `merge_relations(&_, &[],
     // &fresh_agent)`) doesn't overwrite the manifest edges.
     let _ = seed_manifest_relations(db, workspace_id).await;
+    // Write the map doc LAST, after every relation mutation above. `set_repo_relations`
+    // invalidates the stored doc on each write, so persisting markdown here is what
+    // repopulates it. If the agent omitted markdown (parse_curator_output permits it),
+    // the doc stays cleared rather than serving the pre-pass narrative.
+    if let Some(md) = fresh_markdown {
+        let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
+    }
     emit_graph_updated(workspace_id);
     Ok(())
 }
