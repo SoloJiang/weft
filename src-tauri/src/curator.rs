@@ -174,8 +174,9 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
             profiled_commit: String::new(),
             analyzed: false,
             components: Vec::new(),
-            analysis_state: run_phase(repo.id).to_string(),
-            analysis_error: run_error(repo.id),
+            // No profile row yet → no persisted state; default to idle.
+            analysis_state: "idle".to_string(),
+            analysis_error: None,
         };
     };
     ProfileView {
@@ -192,8 +193,10 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
         // those must still read as "analyzing", not a finished unclassified node.
         analyzed: profile::normalize_tier(&p.role).is_some(),
         components: comps(&p.components),
-        analysis_state: run_phase(repo.id).to_string(),
-        analysis_error: run_error(repo.id),
+        // Read from the persisted profile columns; in-memory run_phase/run_error
+        // are now only used for the analyze_workspace failed-repo gate.
+        analysis_state: p.analysis_state.clone(),
+        analysis_error: p.analysis_error.clone(),
     }
 }
 
@@ -911,8 +914,8 @@ fn emit_graph_updated(workspace_id: i32) {
 #[derive(Clone)]
 struct RunInfo {
     /// "running" | "failed". Absence in the map == "idle".
+    /// Error details are now persisted to the DB via set_analysis_state.
     phase: &'static str,
-    error: Option<String>,
 }
 
 fn run_states() -> &'static std::sync::Mutex<std::collections::HashMap<i32, RunInfo>> {
@@ -932,7 +935,7 @@ fn run_begin(id: i32) -> bool {
     if matches!(g.get(&id), Some(r) if r.phase == "running") {
         return false;
     }
-    g.insert(id, RunInfo { phase: "running", error: None });
+    g.insert(id, RunInfo { phase: "running" });
     true
 }
 
@@ -942,18 +945,15 @@ fn run_finish_ok(id: i32) {
     run_lock().remove(&id);
 }
 
-/// Analysis failed/timed out: keep a visible `failed` entry with the error, so
-/// the detail panel shows it + a manual retry instead of a silent spinner.
-fn run_finish_err(id: i32, error: String) {
-    run_lock().insert(id, RunInfo { phase: "failed", error: Some(error) });
+/// Analysis failed/timed out: mark the in-memory phase as "failed" so
+/// analyze_workspace skips auto re-runs until a forced (user-initiated) pass.
+/// Error details are persisted to the DB via set_analysis_state.
+fn run_finish_err(id: i32, _error: String) {
+    run_lock().insert(id, RunInfo { phase: "failed" });
 }
 
 fn run_phase(id: i32) -> &'static str {
     run_lock().get(&id).map(|r| r.phase).unwrap_or("idle")
-}
-
-fn run_error(id: i32) -> Option<String> {
-    run_lock().get(&id).and_then(|r| r.error.clone())
 }
 
 /// Forget a repo's FAILED run-state — e.g. after re-adding a live checkout for a
@@ -1165,6 +1165,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
         // localizes it (see `analysisErrorCheckoutMissing` in the i18n files).
         const GONE: &str = "checkout-missing";
         run_finish_err(repo.id, GONE.into());
+        let _ = repo::set_analysis_state(db, repo.id, "failed", Some(GONE)).await;
         emit_repo_analysis(repo.workspace_id, repo.id, "failed", None, Some(GONE));
         return Ok(());
     }
@@ -1174,6 +1175,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
         return Ok(());
     }
     let (ws, rid) = (repo.workspace_id, repo.id);
+    let _ = repo::set_analysis_state(db, rid, "running", None).await;
     emit_repo_analysis(ws, rid, "started", None, None);
     // Also refresh the graph so an UNSELECTED card flips to `running` immediately:
     // the per-repo `started` stream is only observed for the selected repo, and
@@ -1227,6 +1229,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     match outcome {
         Ok(()) => {
             run_finish_ok(rid);
+            let _ = repo::set_analysis_state(db, rid, "idle", None).await;
             emit_repo_analysis(ws, rid, "done", None, None);
         }
         Err(e) => {
@@ -1234,6 +1237,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
             // the placeholder to read as a perpetual "analyzing".
             let msg = e.to_string();
             run_finish_err(rid, msg.clone());
+            let _ = repo::set_analysis_state(db, rid, "failed", Some(&msg)).await;
             emit_repo_analysis(ws, rid, "failed", None, Some(&msg));
         }
     }
@@ -1586,11 +1590,9 @@ mod tests {
         assert_eq!(super::run_phase(101), "running");
         super::run_finish_err(101, "boom".into());
         assert_eq!(super::run_phase(101), "failed");
-        assert_eq!(super::run_error(101).as_deref(), Some("boom"));
         assert!(super::run_begin(101), "a failed repo can be restarted");
         super::run_finish_ok(101);
         assert_eq!(super::run_phase(101), "idle");
-        assert_eq!(super::run_error(101), None);
     }
 
     #[test]
@@ -1688,20 +1690,27 @@ mod tests {
             .await
             .unwrap();
         super::profile_repo_agent(&db, &r).await.unwrap();
-        assert_eq!(super::run_phase(r.id), "failed", "missing checkout stays failed");
-        assert!(super::run_error(r.id).is_some(), "with a reason the UI can show");
+        // The in-memory guard is still "failed" — analyze_workspace uses this to skip
+        // auto re-runs. No profile row exists (never analyzed), so DB state stays at
+        // the default "idle"; the persisted state is irrelevant for the dedupe gate.
+        assert_eq!(super::run_phase(r.id), "failed", "missing checkout stays failed in-memory");
     }
 
     #[tokio::test]
     async fn view_surfaces_failed_analysis_state() {
-        let _g = super::test_run_state_guard();
-        super::run_state_clear_all_for_test();
+        // view_of reads from the persisted profile columns, so the failed state must
+        // be written to the DB (via set_analysis_state) to appear in list()/graph().
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
             .await
             .unwrap();
-        super::run_finish_err(r.id, "codex failed".into());
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "s", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_analysis_state(&db, r.id, "failed", Some("codex failed"))
+            .await
+            .unwrap();
         let views = super::list(&db, ws.id).await.unwrap();
         let v = views.iter().find(|v| v.repo_id == r.id).unwrap();
         assert_eq!(v.analysis_state, "failed");
@@ -1713,6 +1722,51 @@ mod tests {
         repo::upsert_repo_profile(db, repo_id, tier, "[]", "", "[]", "agent", "")
             .await
             .unwrap();
+    }
+
+    /// Drive analysis_state transitions via set_analysis_state and assert that
+    /// graph()/view_of reflects the persisted state — not just the in-memory guard.
+    #[tokio::test]
+    async fn graph_and_view_reflect_persisted_analysis_state() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        // Upsert a profile row so set_analysis_state has a row to update.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "an api", "[]", "agent", "sha1")
+            .await
+            .unwrap();
+
+        // running: graph node reads the persisted "running" state.
+        repo::set_analysis_state(&db, r.id, "running", None).await.unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node = g.nodes.iter().find(|n| n.repo_id == r.id).unwrap();
+        assert_eq!(node.analysis_state, "running");
+        assert_eq!(node.analysis_error, None);
+
+        // failed: graph node reflects the persisted error.
+        repo::set_analysis_state(&db, r.id, "failed", Some("timed out")).await.unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node = g.nodes.iter().find(|n| n.repo_id == r.id).unwrap();
+        assert_eq!(node.analysis_state, "failed");
+        assert_eq!(node.analysis_error.as_deref(), Some("timed out"));
+
+        // idle: graph node reads "idle" and no error after recovery.
+        repo::set_analysis_state(&db, r.id, "idle", None).await.unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node = g.nodes.iter().find(|n| n.repo_id == r.id).unwrap();
+        assert_eq!(node.analysis_state, "idle");
+        assert_eq!(node.analysis_error, None);
+
+        // Placeholder (no profile row): view_of returns "idle"/None by default.
+        let r2 = repo::add_repo_ref(&db, ws.id, "fresh", "/tmp/fresh", "main", "", true)
+            .await
+            .unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node2 = g.nodes.iter().find(|n| n.repo_id == r2.id).unwrap();
+        assert_eq!(node2.analysis_state, "idle", "placeholder defaults to idle");
+        assert_eq!(node2.analysis_error, None);
     }
 
     #[tokio::test]
