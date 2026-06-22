@@ -310,7 +310,18 @@ pub async fn materialize_direction(
     // recorded_base/target become the default NAME (raw_recorded → base) — a later reuse then
     // compares the default branch instead of a frozen commit, and a default advance can't
     // misclassify the reusable lane through the detached-HEAD checks.
-    let base_unresolvable = base.trim() == "HEAD" || !git::ref_resolves(repo_path, base.trim());
+    // #42r2-2: resolve the SAME way add_worktree_synced does — the base counts as resolvable when
+    // EITHER the local branch OR the remote-tracking branch exists. A bare-name `ref_resolves` is
+    // FALSE for a default that lives ONLY as refs/remotes/origin/<name> (a narrowed clone, or the
+    // live default moved to a branch not fetched locally), yet add_worktree_synced branches off that
+    // remote ref fine. Checking only the bare name there wrongly flagged the lane detached and froze
+    // a commit target. Normalize first (strip any origin/ / refs/* prefix) so a qualified base still
+    // matches the bare-named local/remote refs.
+    let nb = git::normalize_target(base.trim());
+    let base_unresolvable = nb == "HEAD"
+        || nb.is_empty()
+        || (!git::ref_resolves(repo_path, &git::local_branch_ref(&nb))
+            && !git::ref_resolves(repo_path, &format!("refs/remotes/origin/{nb}")));
     let blank_base_adopt =
         !explicit && add.branched_from.is_empty() && !add.base_commit.is_empty() && base_unresolvable;
     // A bare "HEAD" is the detached / no-default fallback. The BASE and the diff TARGET
@@ -2607,6 +2618,116 @@ mod tests {
         assert!(
             !crate::git::is_full_commit_oid(&repo_path, d2.target_branch.trim()),
             "#42-1: target must NOT be a commit oid (the detached-HEAD shape)"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// #42r2-2: a BLANK-base materialization that takes the ADOPT / crash-orphan arm must treat the
+    /// default as RESOLVABLE — and thus record the default NAME, NOT the detached shape — even when
+    /// the default exists ONLY as `refs/remotes/origin/<name>` (no local branch), exactly the case
+    /// `add_worktree_synced` can still resolve+branch off. The bare-name `base_unresolvable` check
+    /// (`!ref_resolves(repo, base)`) is FALSE for a bare name that only resolves as a remote-tracking
+    /// ref, so it wrongly flags the lane detached (base "" + commit target) and routes later blank
+    /// re-proposals through detached-HEAD checks instead of comparing the real default. The fix
+    /// checks the QUALIFIED local AND remote refs. Red-first: before the qualified check, the
+    /// remote-only default is misread as unresolvable and the lane is recorded detached.
+    #[tokio::test]
+    async fn materialize_blank_base_remote_only_default_not_detached() {
+        use crate::store::repo;
+        use sea_orm::EntityTrait;
+        use std::process::Command as Cmd;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-42r2-2-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        // An ORIGIN with a default branch, then a CLONE registered as the repo. The clone starts
+        // with BOTH a local default branch and refs/remotes/origin/<default>.
+        let origin = root.join("origin");
+        crate::git::init_repo(&origin).unwrap();
+        let default = crate::git::current_branch(&origin).unwrap();
+        let repo_path = root.join("clone");
+        let go = |dir: &std::path::Path, args: &[&str]| {
+            Cmd::new("git").args(args).current_dir(dir).status().unwrap();
+        };
+        go(&root, &["clone", "-q", origin.to_str().unwrap(), repo_path.to_str().unwrap()]);
+        go(&repo_path, &["config", "user.email", "t@t.t"]);
+        go(&repo_path, &["config", "user.name", "t"]);
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // base_ref = the default, marked default, so the blank-base resolution lands on it.
+        let r = repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &default, "", true)
+            .await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // BLANK base → resolves to the live/recorded default during materialize.
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await.unwrap();
+
+        // ① First materialize forks the work branch off the default (create-SUCCESS). Capture the
+        // resolved branch-off COMMIT so we can prove the recorded target is NOT a frozen commit.
+        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts.len(), 1, "materialize must create the worktree");
+        let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
+        let branch = wts[0].branch.clone();
+
+        // Now make the default REMOTE-ONLY: detach the clone's HEAD and delete the local default, so
+        // it survives ONLY as refs/remotes/origin/<default>. add_worktree_synced can still resolve
+        // and branch off it, but the bare-name `ref_resolves(repo, default)` is now FALSE.
+        go(&repo_path, &["checkout", "-q", "--detach"]);
+        go(&repo_path, &["branch", "-D", &default]);
+        assert!(
+            !crate::git::ref_resolves(&repo_path, &crate::git::local_branch_ref(&default)),
+            "precondition: the local default branch is gone"
+        );
+        assert!(
+            crate::git::ref_resolves(&repo_path, &format!("refs/remotes/origin/{default}")),
+            "precondition: the default survives only as the remote-tracking ref"
+        );
+        assert!(
+            !crate::git::ref_resolves(&repo_path, &default),
+            "precondition: the BARE default name no longer resolves (only origin/<default> does)"
+        );
+
+        // Delete the DB worktree row AND clear the recorded target+base so the SECOND materialize
+        // hits the ADOPT arm (branched_from empty) — the crash-orphan shape, with the default now
+        // resolvable ONLY via the remote-tracking ref.
+        entities::worktree::Entity::delete_by_id(wts[0].id).exec(&db.0).await.unwrap();
+        repo::set_direction_target_branch(&db, dir.id, "").await.unwrap();
+        repo::set_direction_base_branch(&db, dir.id, "").await.unwrap();
+        assert!(crate::git::is_registered_worktree(&repo_path, &wt_path, &branch),
+            "precondition: the on-disk checkout is still a registered worktree (crash orphan)");
+
+        // ② Re-materialize: the create path runs (no DB row), the path exists+is registered → the
+        // ADOPT arm fires (add.branched_from empty). Because the default RESOLVES (as the remote ref),
+        // this must fall through to the NORMAL recording (default branch NAME), NOT the detached shape.
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(wts2.len(), 1);
+
+        let d2 = entities::direction::Entity::find_by_id(dir.id)
+            .one(&db.0).await.unwrap().unwrap();
+        // The recorded base must be the DEFAULT branch NAME (resolvable via origin/<default>), NOT "".
+        assert_eq!(
+            d2.base_branch, default,
+            "#42r2-2: a remote-only default must be treated as resolvable — record the default name, not a detached blank"
+        );
+        // The diff target must be the resolvable default NAME, NOT a 40-hex commit (the detached shape).
+        assert_eq!(
+            d2.target_branch, default,
+            "#42r2-2: target must be the resolvable default name, not a detached-HEAD commit"
+        );
+        assert!(
+            !crate::git::is_full_commit_oid(&repo_path, d2.target_branch.trim()),
+            "#42r2-2: target must NOT be a commit oid (the detached-HEAD shape)"
         );
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();

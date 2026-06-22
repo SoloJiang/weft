@@ -382,6 +382,21 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
                 repo_cache.insert(p.repo.repo_id, r);
             }
         }
+        // #42r2-1: the two-sub-pass ordering (explicit before blank) can't by itself stop a blank
+        // lane from stealing an explicit sibling's direction, because the consumed PRE-PASS reserves
+        // only APPROVED/DENIED lanes' directions — a PENDING explicit lane isn't claimed until the
+        // later MAIN pass. So a blank APPROVED/DENIED lane (in the pre-pass's blank sub-pass) could
+        // still consume a PENDING explicit sibling's direction first. Make the blank relaxation
+        // order-INDEPENDENT: a blank base must NEVER match a direction whose recorded base is an
+        // EXPLICIT base requested by some OTHER lane in this proposal. Compute that set ONCE
+        // (normalized the SAME way base_compatible compares) and exclude it in the blank branch.
+        let explicit_bases: std::collections::HashSet<String> = resolved
+            .directions
+            .iter()
+            .map(|d| d.base_branch.trim())
+            .filter(|b| !b.is_empty())
+            .map(crate::git::normalize_target)
+            .collect();
         let base_ok = |existing_base: &str, p: &ResolvedDirection| -> bool {
             // R54-3: in the CONFIRMED fast-path, a BLANK proposed base matches an already-
             // materialized direction WITHOUT re-resolving the live default. The lane was created
@@ -393,7 +408,10 @@ pub async fn confirm(db: &Db, thread_id: i32) -> Result<Vec<i32>> {
             // legitimately resolves to the current default at CREATION time — only this confirmed,
             // already-materialized retry treats blank as match-any.)
             if p.base_branch.trim().is_empty() {
-                return true;
+                // ...but NOT a direction an EXPLICIT sibling named (#42r2-1). The blank lane's OWN
+                // recorded base (e.g. `main`) is not another lane's explicit base, so it still
+                // matches; a direction recorded on `release` (an explicit sibling's base) does not.
+                return !explicit_bases.contains(&crate::git::normalize_target(existing_base));
             }
             // Fall back to a name+repo-only match when the repo is missing (None), so a missing
             // repo doesn't crash the retry — the same best-effort posture as the pre-pass below.
@@ -3563,6 +3581,76 @@ mod tests {
         expected.sort();
         assert_eq!(ids, expected,
             "#42-2: both lanes dispatched, each with its OWN direction (explicit lane keeps `release`, blank keeps the default)");
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// #42r2-1: the two-sub-pass ordering alone (explicit lanes before blank lanes) is NOT enough —
+    /// the consumed PRE-PASS only claims directions owned by APPROVED/DENIED lanes, so a PENDING
+    /// explicit lane is NOT reserved there (it claims only in the later MAIN pass). A blank lane that
+    /// is itself APPROVED/DENIED runs in the pre-pass's blank sub-pass, where `base_ok` returns true
+    /// for a blank base and can therefore STEAL a pending explicit sibling's base-specific direction
+    /// before that pending lane ever runs — regardless of sub-pass order. The order-INDEPENDENT fix:
+    /// a blank-base lane must never match a direction whose recorded base is an EXPLICIT base
+    /// requested by some OTHER lane in the same proposal. Red-first: before the explicit_bases
+    /// exclusion, the blank APPROVED lane's pre-claim consumes the `release` direction (listed first)
+    /// and the pending `release` lane is left undispatched.
+    #[tokio::test]
+    async fn confirmed_fast_path_blank_approved_sibling_does_not_steal_pending_explicit_direction() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fastpath-blank-approved-steal-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+        // Read the ACTUAL default branch (init.defaultBranch may be main OR master) so the test
+        // holds under both CI configs; the blank lane records THIS as its base.
+        let default = crate::git::current_branch(&repo_path).unwrap();
+        // A real explicit base distinct from the default for the explicit lane.
+        sh(&repo_path, &["git", "branch", "release"]);
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // base_ref = the actual default, marked default, so the blank lane resolves to it.
+        let ra = repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), &default, "", true).await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // Create the EXPLICIT-base `release` direction FIRST (lower id → `list_directions` returns
+        // it BEFORE the blank lane's direction), then the blank lane's direction (records the
+        // default). Both share name `api` + repo `api`, on DIFFERENT bases.
+        let dir_release = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "release").await.unwrap();
+        materialize::materialize_direction(&db, dir_release.id).await.unwrap();
+        let dir_blank = repo::create_direction(&db, t.id, "api", "claude", ra.id, "r", "plan+impl", "").await.unwrap();
+        materialize::materialize_direction(&db, dir_blank.id).await.unwrap();
+        assert!(dir_release.id < dir_blank.id, "precondition: release direction is listed first");
+        let recorded_blank = repo::list_directions(&db, t.id).await.unwrap()
+            .into_iter().find(|d| d.id == dir_blank.id).unwrap();
+        assert_eq!(recorded_blank.base_branch, default,
+            "precondition: the blank lane recorded the default base ({default})");
+
+        // Stored proposal: the BLANK lane is APPROVED (so it runs in the consumed PRE-PASS) + a
+        // PENDING explicit `release` lane (only claimed in the MAIN pass). Inject via upsert_plan
+        // (not save_proposal, which scrubs decisions) — this is the confirmed-retry shape. Order the
+        // blank approved lane FIRST so the buggy pre-pass processes it and grabs `release`.
+        let stored = Proposal { rationale: "r".into(), directions: vec![
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"".into(), decision:"approved".into() },
+            ProposedDirection { name:"api".into(), repo:"api".into(), reason:"r".into(), mandate:"plan+impl".into(), base_branch:"release".into(), decision:"".into() },
+        ]};
+        let json = serde_json::to_string(&stored).unwrap();
+        repo::upsert_plan(&db, t.id, &json, "confirmed", &now()).await.unwrap();
+
+        // Fast-path retry: the PENDING explicit `release` lane must claim its OWN `release` direction
+        // — the blank APPROVED lane's pre-claim must NOT have consumed it. The approved lane is
+        // excluded from dispatch, so the only dispatched id is dir_release.
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert_eq!(ids, vec![dir_release.id],
+            "#42r2-1: the pending explicit `release` lane keeps its own direction; the blank approved sibling must not steal it");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
