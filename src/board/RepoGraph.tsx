@@ -136,7 +136,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * out in bands by architectural TIER (frontend → gateway → backend → other),
  * agent-classified. Switch to the expanded view to break monorepos into their
  * internal components, grouped by tier. Edges are agent-inferred cross-repo
- * relations and can be filtered by kind. Drag to pan, scroll/buttons to zoom.
+ * relations. Drag to pan, scroll/buttons to zoom.
  */
 export function RepoGraph() {
   const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, selectedRepoId, openRepoDetail } = useStore();
@@ -179,7 +179,7 @@ export function RepoGraph() {
 
     const width = Math.max(NODE_W + PAD * 2, PAD * 2 + visibleBands.length * NODE_W + Math.max(0, visibleBands.length - 1) * COL_GAP);
     const height = PAD * 2 + Math.max(NODE_H, maxH);
-    return { pos, width, height, bands: visibleBands };
+    return { pos, width, height };
   }, [repoProfiles, repoEdges, mode]);
 
   const containerRef = useRef<HTMLDivElement>(null);

@@ -1690,7 +1690,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Ensure the workspace's hidden curator thread exists and remember its id —
   // WITHOUT navigating. The curator chat renders embedded in the Repo Map panel
-  // (CuratorPanel), so unlike a normal lead chat we never selectThread.
+  // (RepoDrawer), so unlike a normal lead chat we never selectThread.
   const ensureCuratorThread = useCallback(async () => {
     const ws = activeWorkspaceId;
     if (ws == null || ensuringCuratorRef.current.has(ws)) return;
