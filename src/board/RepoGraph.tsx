@@ -200,6 +200,26 @@ export function RepoGraph() {
     fit();
   }, [fit]);
 
+  // Re-fit when the container itself resizes — e.g. when the side panel (detail /
+  // curator) opens, closes, or is drag-resized and shrinks this canvas. fit() reads
+  // clientWidth/Height, but only ran on first paint / graph-shape change, so without
+  // this the graph stayed scaled for the old width and nodes were clipped until a
+  // manual Fit. rAF-coalesced so a drag-resize doesn't thrash.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => fit());
+    });
+    ro.observe(el);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [fit]);
+
   // zoom toward a point in container space
   const zoomAt = useCallback((cx: number, cy: number, factor: number) => {
     setZoom((z0) => {

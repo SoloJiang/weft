@@ -1686,13 +1686,20 @@ pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
 /// so it must be ignored here too; otherwise a lingering user-pinned edge to a
 /// removed repo would block republishing the map forever.
 ///
-/// Returns false iff any non-rejected edge to a CURRENT repo is incident to a repo
-/// outside the profiled set.
+/// Returns false iff a narrated (profiled) repo no longer exists, or any
+/// non-rejected edge to a CURRENT repo is incident to a repo outside the profiled
+/// set.
 fn markdown_covers_graph(
     profiled_ids: &std::collections::HashSet<i32>,
     current_ids: &std::collections::HashSet<i32>,
     relations: &[(i32, Vec<AgentRelation>)],
 ) -> bool {
+    // A repo the analyst narrated may have been DELETED during the (≤180s) agent
+    // run, after `profiled` was captured. Then the markdown describes a node no
+    // longer in the graph, so it must not be republished.
+    if !profiled_ids.iter().all(|id| current_ids.contains(id)) {
+        return false;
+    }
     for (owner, rels) in relations {
         let owner_profiled = profiled_ids.contains(owner);
         for e in rels {
@@ -1790,11 +1797,17 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     if let Some(md) = fresh_markdown {
         let profiled_ids: std::collections::HashSet<i32> =
             profiled.iter().map(|(r, _)| r.id).collect();
-        // Repos that still exist in the workspace — edges to anything else are stale
-        // (the graph filters them out), so they must not block republishing.
-        let current_ids: std::collections::HashSet<i32> = repos.iter().map(|r| r.id).collect();
+        // Re-read the workspace AFTER the long agent+manifest pass: the pre-run
+        // `repos` snapshot is stale because a repo may have been deleted during the
+        // run (delete_repo_cascade cleared the doc). Building current_ids from the
+        // fresh list lets markdown_covers_graph catch both a narrated repo that
+        // vanished and edges to repos no longer present. Edges to anything outside
+        // current_ids are stale (the graph filters them), so they don't block.
+        let current_repos = repo::list_repos(db, workspace_id).await.unwrap_or_default();
+        let current_ids: std::collections::HashSet<i32> =
+            current_repos.iter().map(|r| r.id).collect();
         let mut final_relations: Vec<(i32, Vec<AgentRelation>)> = Vec::new();
-        for r in &repos {
+        for r in &current_repos {
             if let Ok(Some(p)) = repo::get_repo_profile(db, r.id).await {
                 let rels: Vec<AgentRelation> = serde_json::from_str(&p.relations).unwrap_or_default();
                 final_relations.push((r.id, rels));
@@ -3313,6 +3326,11 @@ mod tests {
         // refused to republish the map forever after deleting an edge target.)
         let to_deleted = vec![(1, vec![edge(99, false)]), (2, vec![])];
         assert!(super::markdown_covers_graph(&profiled, &current, &to_deleted));
+
+        // A NARRATED (profiled) repo deleted mid-run (2 ∉ current) → markdown
+        // describes a missing node → not covered. (Round-10 TOCTOU race.)
+        let profiled_repo_gone: HashSet<i32> = [1, 3].into_iter().collect();
+        assert!(!super::markdown_covers_graph(&profiled, &profiled_repo_gone, &within));
     }
 
     #[tokio::test]

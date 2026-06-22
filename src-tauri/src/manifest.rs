@@ -451,12 +451,22 @@ pub fn parse_gradle_provides(settings_src: &str, build_src: &str) -> Vec<String>
         if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
             continue;
         }
-        // group = "x"  or  group "x"  or  group 'x'
+        // group = "x"  or  group "x"  or  group 'x' — but NOT `groupId`,
+        // `groupVersion`, etc. (common in a maven-publish block). The char after
+        // `group` must be an assignment delimiter / whitespace / quote, not an
+        // identifier char, or the wrong coordinate gets recorded.
         if let Some(rest) = t.strip_prefix("group") {
-            if let Some(value) = extract_first_quoted(rest) {
-                if !value.is_empty() {
-                    group = Some(value);
-                    break;
+            let is_group_assignment = rest
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace() || matches!(c, '=' | '(' | '\'' | '"'))
+                .unwrap_or(false);
+            if is_group_assignment {
+                if let Some(value) = extract_first_quoted(rest) {
+                    if !value.is_empty() {
+                        group = Some(value);
+                        break;
+                    }
                 }
             }
         }
@@ -1033,6 +1043,19 @@ dependencies {
             "group = \"com.acme\" // org\n",
         );
         assert_eq!(full, vec!["com.acme:api".to_string()]);
+    }
+
+    #[test]
+    fn gradle_group_ignores_group_id_prefix() {
+        // A maven-publish `groupId = "com.publish"` must NOT be mistaken for the
+        // project `group`; the real `group` line wins.
+        let build = "groupId = \"com.publish\"\ngroup = \"com.acme\"\n";
+        let provides = parse_gradle_provides("rootProject.name = \"api\"\n", build);
+        assert_eq!(
+            provides,
+            vec!["com.acme:api".to_string()],
+            "groupId must not shadow the real group: {provides:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
