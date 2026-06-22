@@ -610,6 +610,24 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
     Ok(())
 }
 
+/// Persist the agent-assigned `category` and `domains` JSON for a repo. Only
+/// these two columns are touched; all other profile fields (relations, tier, …)
+/// are left unchanged. No-op if the repo has no profile row yet.
+pub async fn set_repo_category_domains(
+    db: &Db,
+    repo_id: i32,
+    category: &str,
+    domains_json: &str,
+) -> Result<()> {
+    if let Some(m) = get_repo_profile(db, repo_id).await? {
+        let mut a: repo_profile::ActiveModel = m.into();
+        a.category = Set(category.to_string());
+        a.domains = Set(domains_json.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// Persist a repo's analysis run-state (durable across restarts). Clears the
 /// error unless state == "failed".
 ///
@@ -745,6 +763,7 @@ pub async fn calibrate_repo_relation(
         confidence: 100,
         source: "user".to_string(),
         rejected: action == "remove",
+        ..Default::default()
     });
     let json = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
     set_repo_relations(db, from_id, &json).await
@@ -2972,5 +2991,62 @@ mod tests {
             !got.iter().any(|r| r.id == idle.id),
             "idle repo must not appear in running results"
         );
+    }
+
+    /// M0031: set_repo_category_domains writes and reads back; upsert_repo_profile
+    /// does NOT touch category/domains (preservation invariant).
+    #[tokio::test]
+    async fn category_domains_roundtrip_and_upsert_preserves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+
+        // (1) Set and read back category/domains.
+        set_repo_category_domains(&db, r.id, "biz", r#"["orders","payments"]"#)
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "biz");
+        assert_eq!(p.domains, r#"["orders","payments"]"#);
+
+        // (2) A subsequent upsert_repo_profile (agent re-classify) must NOT clobber
+        //     category/domains — they are preserved (Unchanged in the ActiveModel).
+        upsert_repo_profile(&db, r.id, "frontend", "[]", "new summary", "[]", "agent", "sha2")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.category, "biz",
+            "upsert must not reset category"
+        );
+        assert_eq!(
+            p.domains, r#"["orders","payments"]"#,
+            "upsert must not reset domains"
+        );
+        // But profiling fields were updated normally.
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.profiled_commit, "sha2");
+    }
+
+    /// M0031: a fresh profile row (first upsert, no prior set_repo_category_domains)
+    /// must default category="" and domains="[]".
+    #[tokio::test]
+    async fn category_domains_default_on_fresh_profile() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "new-svc", "/tmp/new-svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "", "fresh row: category defaults to empty string");
+        assert_eq!(p.domains, "[]", "fresh row: domains defaults to '[]'");
     }
 }

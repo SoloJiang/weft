@@ -19,7 +19,7 @@ pub fn normalize_tier(tier: &str) -> Option<String> {
 
 /// A directed dependency edge: `from` consumes `to`, evidenced by `via`.
 ///
-/// `kind`/`source`/`confidence` are `serde(default)` so payloads written before
+/// `kind`/`source`/`confidence`/`rationale` are `serde(default)` so payloads written before
 /// they existed still deserialize. Every edge now comes from the agent
 /// (`source="agent"`, or `"user"` for a human-pinned relation).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -33,6 +33,9 @@ pub struct Edge {
     pub source: String,
     #[serde(default)]
     pub confidence: u8,
+    /// Free-text rationale explaining why this dependency exists (agent-supplied).
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// The cross-repo relation kinds the curator may assert. Inferred kinds are
@@ -70,6 +73,9 @@ pub struct AgentRelation {
     /// resurrect it, and emits no graph edge.
     #[serde(default)]
     pub rejected: bool,
+    /// Free-text rationale explaining why this dependency exists (agent-supplied).
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// One sub-component of a monorepo, surfaced by the per-repo deep agent pass so
@@ -94,6 +100,9 @@ pub struct Component {
     /// Names of sibling components (within the same repo) this one depends on.
     #[serde(default)]
     pub deps: Vec<String>,
+    /// Feature domains owned by this component (agent-assigned).
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 /// Turn one repo's stored agent relations into edges, dropping self-links, any
@@ -115,6 +124,7 @@ pub fn agent_edges(
             kind: if r.kind.is_empty() { "dep".into() } else { r.kind.clone() },
             source: if r.source.is_empty() { "agent".into() } else { r.source.clone() },
             confidence: r.confidence,
+            rationale: r.rationale.clone(),
         })
         .collect()
 }
@@ -256,6 +266,7 @@ mod tests {
                 confidence: 80,
                 source: "user".into(),
                 rejected: false,
+                ..Default::default()
             },
             super::AgentRelation {
                 to: 2,
@@ -264,6 +275,7 @@ mod tests {
                 confidence: 50,
                 source: "user".into(),
                 rejected: true, // a human-removed edge → no graph edge
+                ..Default::default()
             },
         ];
         let edges = super::agent_edges(1, &relations, &nodes);
@@ -275,21 +287,21 @@ mod tests {
     #[test]
     fn merge_relations_keeps_user_replaces_agent_honors_tombstone() {
         let existing = vec![
-            super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 90, source: "user".into(), rejected: false },
+            super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 90, source: "user".into(), rejected: false, ..Default::default() },
             // A via-scoped tombstone: the user removed exactly the "GET /orders" edge.
-            super::AgentRelation { to: 3, kind: "http".into(), via: "GET /orders".into(), confidence: 40, source: "user".into(), rejected: true },
-            super::AgentRelation { to: 4, kind: "lib".into(), via: "stale-agent".into(), confidence: 100, source: "agent".into(), rejected: false },
+            super::AgentRelation { to: 3, kind: "http".into(), via: "GET /orders".into(), confidence: 40, source: "user".into(), rejected: true, ..Default::default() },
+            super::AgentRelation { to: 4, kind: "lib".into(), via: "stale-agent".into(), confidence: 100, source: "agent".into(), rejected: false, ..Default::default() },
         ];
         let fresh_agent = vec![
             // Re-found the exact removed edge → suppressed by the tombstone.
-            super::AgentRelation { to: 3, kind: "http".into(), via: "GET /orders".into(), confidence: 70, source: "agent".into(), rejected: false },
+            super::AgentRelation { to: 3, kind: "http".into(), via: "GET /orders".into(), confidence: 70, source: "agent".into(), rejected: false, ..Default::default() },
             // A DISTINCT edge to the same repo (different via) → NOT hidden by the tombstone.
-            super::AgentRelation { to: 3, kind: "http".into(), via: "POST /payments".into(), confidence: 70, source: "agent".into(), rejected: false },
-            super::AgentRelation { to: 5, kind: "grpc".into(), via: "new".into(), confidence: 60, source: "agent".into(), rejected: false },
+            super::AgentRelation { to: 3, kind: "http".into(), via: "POST /payments".into(), confidence: 70, source: "agent".into(), rejected: false, ..Default::default() },
+            super::AgentRelation { to: 5, kind: "grpc".into(), via: "new".into(), confidence: 60, source: "agent".into(), rejected: false, ..Default::default() },
             // EXACT duplicate of the user pin (same to/kind/via) → suppressed.
-            super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 80, source: "agent".into(), rejected: false },
+            super::AgentRelation { to: 2, kind: "http".into(), via: "POST /pay".into(), confidence: 80, source: "agent".into(), rejected: false, ..Default::default() },
             // DISTINCT relationship to the pinned repo (different via) → kept.
-            super::AgentRelation { to: 2, kind: "http".into(), via: "GET /orders".into(), confidence: 80, source: "agent".into(), rejected: false },
+            super::AgentRelation { to: 2, kind: "http".into(), via: "GET /orders".into(), confidence: 80, source: "agent".into(), rejected: false, ..Default::default() },
         ];
         let merged = super::merge_relations(&existing, &[], &fresh_agent);
         assert!(merged.iter().any(|r| r.to == 2 && r.source == "user" && r.via == "POST /pay"), "user edge survives");
@@ -323,6 +335,7 @@ mod tests {
             confidence: 100,
             source: "manifest".into(),
             rejected: false,
+            ..Default::default()
         }
     }
 
@@ -334,6 +347,7 @@ mod tests {
             confidence: 0,
             source: "user".into(),
             rejected: true,
+            ..Default::default()
         }
     }
 
@@ -364,6 +378,7 @@ mod tests {
                 confidence: 70,
                 source: "agent".into(),
                 rejected: false,
+                ..Default::default()
             },
             super::AgentRelation {
                 to: 3,
@@ -372,6 +387,7 @@ mod tests {
                 confidence: 80,
                 source: "agent".into(),
                 rejected: false,
+                ..Default::default()
             },
         ];
         let merged = super::merge_relations(&[], &fresh_manifest, &fresh_agent);
@@ -404,6 +420,7 @@ mod tests {
                 confidence: 60,
                 source: "agent".into(),
                 rejected: false,
+                ..Default::default()
             },
             super::AgentRelation {
                 to: 6,
@@ -412,6 +429,7 @@ mod tests {
                 confidence: 75,
                 source: "agent".into(),
                 rejected: false,
+                ..Default::default()
             },
         ];
         let merged = super::merge_relations(&[], &[], &fresh_agent);

@@ -354,6 +354,8 @@ export interface RepoComponent {
   summary: string;
   /** Names of sibling components (same repo) this one depends on. */
   deps: string[];
+  /** Feature domains owned by this component (agent-assigned). */
+  domains?: string[];
 }
 
 /** The curator's profile of one repo, as the UI sees it (ARCHITECTURE §4.9).
@@ -378,6 +380,10 @@ export interface RepoProfile {
   analysis_state: "idle" | "running" | "failed";
   /** Error from the last failed analysis (set only when analysis_state === "failed"). */
   analysis_error?: string | null;
+  /** Role category within the tier (free-text, agent-assigned). "" until classified. */
+  category: string;
+  /** Feature domains owned by this repo (agent-assigned). */
+  domains: string[];
 }
 
 /** A directed dependency edge: `from` consumes `to`, evidenced by `via`. */
@@ -392,6 +398,8 @@ export interface RepoEdge {
   source?: string;
   /** Confidence 0–100. */
   confidence?: number;
+  /** Free-text rationale explaining why this dependency exists (agent-supplied). */
+  rationale?: string;
 }
 
 export interface RepoGraph {

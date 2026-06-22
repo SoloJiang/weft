@@ -42,6 +42,13 @@ pub struct Model {
     pub analysis_state: String,
     /// Error from the last failed analysis (NULL unless analysis_state == "failed").
     pub analysis_error: Option<String>,
+    /// Role category within the tier (free-text, agent-assigned): e.g. backend →
+    /// gateway/biz/core/common/idl/support; frontend → app/sdk/web. "" until classified.
+    #[sea_orm(default_value = "")]
+    pub category: String,
+    /// JSON array of owned feature domains (agent-assigned). "[]" until classified.
+    #[sea_orm(default_value = "[]")]
+    pub domains: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

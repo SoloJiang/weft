@@ -41,6 +41,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0028WorktreeBaseCommit),
             Box::new(M0029GatewayToBackend),
             Box::new(M0030AnalysisState),
+            Box::new(M0031RepoCategoryDomains),
         ]
     }
 }
@@ -1298,6 +1299,76 @@ impl MigrationTrait for M0030AnalysisState {
     }
 }
 
+/// Adds `category` (TEXT NOT NULL DEFAULT '') and `domains` (TEXT NOT NULL DEFAULT '[]')
+/// to `repo_profile`. A fresh db already has these (M0002 reflects the current entity);
+/// sqlite has no ADD COLUMN IF NOT EXISTS, so the duplicate is tolerated.
+pub struct M0031RepoCategoryDomains;
+impl MigrationName for M0031RepoCategoryDomains {
+    fn name(&self) -> &str {
+        "m0031_repo_category_domains"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0031RepoCategoryDomains {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r1 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("category"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r1 {
+            Ok(()) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e),
+        }
+        let r2 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("domains"))
+                            .string()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r2 {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("category"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("domains"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1320,7 +1391,10 @@ mod tests {
     fn non_gateway_tier_untouched() {
         let input = r#"[{"name":"web","path":"apps/web","tier":"frontend","summary":"","deps":[]}]"#;
         let output = gateway_components_to_backend(input);
-        assert_eq!(output, input);
+        // Tier must not be rewritten; name/path must survive round-trip.
+        assert!(output.contains("\"frontend\""), "frontend tier must survive: {output}");
+        assert!(!output.contains("\"backend\""), "backend must not appear: {output}");
+        assert!(output.contains("\"web\""), "name must survive: {output}");
     }
 
     #[test]
@@ -1335,7 +1409,9 @@ mod tests {
         let input =
             r#"[{"name":"api","path":"services/api","tier":"backend","summary":"","deps":[]}]"#;
         let output = gateway_components_to_backend(input);
-        assert_eq!(output, input);
+        // Tier must stay backend; the round-trip is expected to add the new `domains` field.
+        assert!(output.contains("\"backend\""), "backend tier must survive: {output}");
+        assert!(!output.contains("\"gateway\""), "gateway must not appear: {output}");
     }
 
     #[test]
@@ -1350,5 +1426,25 @@ mod tests {
             output.contains("\"frontend\""),
             "frontend should survive: {output}"
         );
+    }
+
+    /// M0031: category and domains columns are present after migration and default correctly.
+    #[tokio::test]
+    async fn m0031_category_domains_columns_added() {
+        use crate::store::Db;
+        use crate::store::repo::{add_repo_ref, create_workspace, get_repo_profile, upsert_repo_profile};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        // Both columns must exist with their defaults.
+        assert_eq!(p.category, "", "category column must exist and default to empty");
+        assert_eq!(p.domains, "[]", "domains column must exist and default to '[]'");
     }
 }

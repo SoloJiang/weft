@@ -36,6 +36,10 @@ pub struct ProfileView {
     /// The error from the last failed analysis (only set when `analysis_state ==
     /// "failed"`), surfaced in the detail panel alongside a manual retry.
     pub analysis_error: Option<String>,
+    /// Role category within the tier (free-text, agent-assigned). "" until classified.
+    pub category: String,
+    /// Feature domains owned by this repo (agent-assigned).
+    pub domains: Vec<String>,
 }
 
 /// The workspace dependency graph: every repo (placeholders included) + the
@@ -176,6 +180,8 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
             // No profile row yet → no persisted state; default to idle.
             analysis_state: "idle".to_string(),
             analysis_error: None,
+            category: String::new(),
+            domains: Vec::new(),
         };
     };
     ProfileView {
@@ -196,6 +202,8 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
         // are now only used for the analyze_workspace failed-repo gate.
         analysis_state: p.analysis_state.clone(),
         analysis_error: p.analysis_error.clone(),
+        category: p.category.clone(),
+        domains: arr(&p.domains),
     }
 }
 
@@ -855,6 +863,7 @@ async fn persist_relations(
                 confidence: rel.confidence,
                 source: "agent".to_string(),
                 rejected: false,
+                ..Default::default()
             });
     }
     for (r, _) in profiled {
@@ -1405,6 +1414,7 @@ pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
                     confidence: 100,
                     source: "manifest".into(),
                     rejected: false,
+                    ..Default::default()
                 });
             }
         }
@@ -2705,6 +2715,7 @@ mod tests {
                 confidence: 70,
                 source: "agent".into(),
                 rejected: false,
+                ..Default::default()
             },
             AgentRelation {
                 to: repo_b.id,
@@ -2713,6 +2724,7 @@ mod tests {
                 confidence: 90,
                 source: "user".into(),
                 rejected: false,
+                ..Default::default()
             },
         ])
         .unwrap();
