@@ -135,7 +135,14 @@ pub fn parse_go_mod(s: &str) -> ManifestInfo {
         let trimmed = line.trim();
 
         if trimmed.starts_with("module ") {
-            let module_path = trimmed.trim_start_matches("module ").trim();
+            // The module path is a single token; a trailing `// comment` (valid
+            // go.mod, accepted by `go list -m`) must not become part of the recorded
+            // module name, or consumers requiring the bare path never match.
+            let module_path = trimmed
+                .trim_start_matches("module ")
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
             if !module_path.is_empty() {
                 info.provides.push(module_path.to_string());
             }
@@ -668,6 +675,24 @@ mod tests {
         let m = parse_go_mod(s);
         assert!(m.provides.contains(&"github.com/foo/bar".to_string()));
         assert!(m.requires.contains(&"github.com/baz/qux".to_string()));
+    }
+
+    #[test]
+    fn go_mod_module_strips_trailing_comment() {
+        // `module x // comment` is valid go.mod; the recorded module must be the bare
+        // path so consumers requiring it still match.
+        let s = "module example.com/foo // deprecated\nrequire github.com/x/y v1.0.0\n";
+        let m = parse_go_mod(s);
+        assert!(
+            m.provides.contains(&"example.com/foo".to_string()),
+            "module comment must be stripped: {:?}",
+            m.provides
+        );
+        assert!(
+            !m.provides.iter().any(|p| p.contains("//") || p.contains("deprecated")),
+            "no comment text in provides: {:?}",
+            m.provides
+        );
     }
 
     #[test]

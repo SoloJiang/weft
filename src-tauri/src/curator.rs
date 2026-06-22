@@ -1674,6 +1674,31 @@ pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
     Ok(())
 }
 
+/// Whether agent-generated markdown built from `profiled_ids` still reflects the
+/// FINAL relation graph. The analyst prompt lists only the fully-profiled repos,
+/// but `seed_manifest_relations` scans every checked-out repo and can add a `lib`
+/// edge to/from an UNPROFILED provider the prompt never saw. When that happens the
+/// markdown omits a node/edge now present in the graph, so it must not be
+/// republished (the doc stays cleared until a later pass profiles everything).
+/// Returns false iff any non-rejected edge is incident to a repo outside the set.
+fn markdown_covers_graph(
+    profiled_ids: &std::collections::HashSet<i32>,
+    relations: &[(i32, Vec<AgentRelation>)],
+) -> bool {
+    for (owner, rels) in relations {
+        let owner_profiled = profiled_ids.contains(owner);
+        for e in rels {
+            if e.rejected {
+                continue;
+            }
+            if !owner_profiled || !profiled_ids.contains(&e.to) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The cross-repo relations pass: reload the (classified) profiles, infer the
 /// runtime/infra/lib relations between them, and persist. Needs ≥2 profiled
 /// repos. A timed-out / unparseable reply leaves existing relations intact
@@ -1743,8 +1768,25 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     // invalidates the stored doc on each write, so persisting markdown here is what
     // repopulates it. If the agent omitted markdown (parse_curator_output permits it),
     // the doc stays cleared rather than serving the pre-pass narrative.
+    //
+    // But only publish when the markdown still covers the FINAL graph: the analyst
+    // saw only `profiled`, while `seed_manifest_relations` may have just added a lib
+    // edge to/from an UNPROFILED provider the prompt never listed. Republishing the
+    // pre-seed markdown would then serve a doc missing that node/edge (permanently,
+    // if the provider is failed). In that case leave the doc cleared for a later pass.
     if let Some(md) = fresh_markdown {
-        let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
+        let profiled_ids: std::collections::HashSet<i32> =
+            profiled.iter().map(|(r, _)| r.id).collect();
+        let mut final_relations: Vec<(i32, Vec<AgentRelation>)> = Vec::new();
+        for r in &repos {
+            if let Ok(Some(p)) = repo::get_repo_profile(db, r.id).await {
+                let rels: Vec<AgentRelation> = serde_json::from_str(&p.relations).unwrap_or_default();
+                final_relations.push((r.id, rels));
+            }
+        }
+        if markdown_covers_graph(&profiled_ids, &final_relations) {
+            let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
+        }
     }
     emit_graph_updated(workspace_id);
     Ok(())
@@ -3215,6 +3257,38 @@ mod tests {
             repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
             "after the gate is released, resume runs and clears the stale map"
         );
+    }
+
+    #[test]
+    fn markdown_covers_graph_detects_unprofiled_edges() {
+        use std::collections::HashSet;
+        let profiled: HashSet<i32> = [1, 2].into_iter().collect();
+        let edge = |to: i32, rejected: bool| AgentRelation {
+            to,
+            kind: "lib".into(),
+            via: "x".into(),
+            confidence: 100,
+            source: "manifest".into(),
+            rejected,
+            ..Default::default()
+        };
+        // All live edges within the profiled set → markdown covers the graph.
+        let within = vec![(1, vec![edge(2, false)]), (2, vec![])];
+        assert!(super::markdown_covers_graph(&profiled, &within));
+
+        // A profiled repo has a live edge to an UNPROFILED repo (3) → not covered
+        // (the target node is missing from the analyst's markdown).
+        let to_unprofiled = vec![(1, vec![edge(3, false)]), (2, vec![])];
+        assert!(!super::markdown_covers_graph(&profiled, &to_unprofiled));
+
+        // An UNPROFILED repo (3) owns a live edge → not covered (its source node is
+        // missing from the markdown).
+        let from_unprofiled = vec![(1, vec![]), (3, vec![edge(1, false)])];
+        assert!(!super::markdown_covers_graph(&profiled, &from_unprofiled));
+
+        // A REJECTED edge to an unprofiled repo is a tombstone, not a live edge → covered.
+        let rejected_only = vec![(1, vec![edge(3, true)]), (2, vec![])];
+        assert!(super::markdown_covers_graph(&profiled, &rejected_only));
     }
 
     #[tokio::test]
