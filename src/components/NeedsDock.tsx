@@ -41,6 +41,7 @@ export function NeedsDock() {
         <PermissionConfirmationCard
           ask={top.item}
           onAnswer={(askId, answer) => void answerPermission(askId, answer)}
+          context={<PermissionDockContext item={top.item} />}
           className="min-w-0 flex-1 flex-row flex-wrap items-center gap-2 rounded-none border-0 bg-transparent p-0"
           titleClassName="text-[12px]"
           actionsClassName="ml-auto shrink-0 gap-1.5"
@@ -117,6 +118,16 @@ function DockSummary({ top }: { top: DockItem }) {
       <HelpCircle size={13} className="shrink-0 text-waiting" />
       <span>{t("needs.question")}</span>
       <ContextText text={[item.thread_title, item.direction_name].filter(Boolean).join(" · ")} />
+    </span>
+  );
+}
+
+function PermissionDockContext({ item }: { item: PermissionAsk }) {
+  const text = [item.thread_title, item.dir_name].filter(Boolean).join(" · ");
+  if (!text) return null;
+  return (
+    <span className="flex min-w-0 items-center gap-1 text-ink-muted">
+      <ContextText text={text} />
     </span>
   );
 }
