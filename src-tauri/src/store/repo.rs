@@ -207,6 +207,16 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove an app_setting row. No-op when the key is absent. Used to clear a
+/// stored value entirely so `get_setting` reads `None` again — distinct from
+/// `set_setting(key, "")`, which would still read as `Some("")`.
+pub async fn delete_setting(db: &Db, key: &str) -> Result<()> {
+    app_setting::Entity::delete_by_id(key.to_string())
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
 /// The user-configured coding-agent command overrides (identity → command),
 /// parsed from the `tool_commands` app_setting. Empty when none are set.
 pub async fn get_tool_commands(db: &Db) -> Result<HashMap<String, String>> {
@@ -296,6 +306,15 @@ pub async fn set_repo_map_doc(db: &Db, workspace_id: i32, markdown: &str) -> Res
 /// Returns `None` when none has been generated yet.
 pub async fn get_repo_map_doc(db: &Db, workspace_id: i32) -> Result<Option<String>> {
     get_setting(db, &repo_map_doc_key(workspace_id)).await
+}
+
+/// Drop a workspace's persisted repo-map doc so `get_repo_map_doc` reads `None`
+/// and the map pane falls back to its empty/regenerate state. Used when the
+/// workspace can no longer produce a meaningful cross-repo map (dropped below the
+/// 2-profiled-repo threshold), so the pane never shows markdown for repos/edges
+/// that are no longer in the graph.
+pub async fn clear_repo_map_doc(db: &Db, workspace_id: i32) -> Result<()> {
+    delete_setting(db, &repo_map_doc_key(workspace_id)).await
 }
 
 /// Workspace container used by per-IM-conversation Concierge threads.
@@ -3136,5 +3155,25 @@ mod tests {
         let ws2 = create_workspace(&db, "ws2").await.unwrap();
         let doc_ws2 = get_repo_map_doc(&db, ws2.id).await.unwrap();
         assert!(doc_ws2.is_none(), "different workspace has no doc");
+    }
+
+    /// clear_repo_map_doc deletes the row so the doc reads None again (the map
+    /// pane falls back to its empty state, not a stale Some("")).
+    #[tokio::test]
+    async fn clear_repo_map_doc_resets_to_none() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        set_repo_map_doc(&db, ws.id, "## Inventory\n- web").await.unwrap();
+        assert!(get_repo_map_doc(&db, ws.id).await.unwrap().is_some());
+
+        clear_repo_map_doc(&db, ws.id).await.unwrap();
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "cleared doc must read as None, not Some(\"\")"
+        );
+
+        // Clearing an already-absent doc is a no-op, not an error.
+        clear_repo_map_doc(&db, ws.id).await.unwrap();
     }
 }

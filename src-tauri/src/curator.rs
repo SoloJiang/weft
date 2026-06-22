@@ -159,6 +159,12 @@ pub async fn edit_profile(
     // no re-run. No-op if it wasn't failed.
     if tier.is_some() && profile::normalize_tier(&new_tier).is_some() {
         clear_failure(repo_id);
+        // The graph/detail views now read `analysis_state` from the PERSISTED
+        // profile row (not the in-memory map), and `upsert_repo_profile` above
+        // preserves that column unchanged. Clearing only the in-memory failure
+        // would leave the DB column at "failed" — the repo keeps rendering as a
+        // retryable failure and stays skipped from auto-passes. Persist "idle" too.
+        let _ = repo::set_analysis_state(db, repo_id, "idle", None).await;
     }
     Ok(saved)
 }
@@ -1578,13 +1584,28 @@ pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
         repo_manifests.push((r.clone(), info));
     }
 
-    // Build workspace-wide provides_name → repo_id map (first-wins on collision).
-    let mut name_to_repo: HashMap<String, i32> = HashMap::new();
+    // Build workspace-wide provides_name → repo_id map, SKIPPING ambiguous names.
+    // When two repos provide the same manifest name (forks, copied services,
+    // common unscoped crate/package names), a first-wins pick would seed a
+    // concrete-but-arbitrary lib edge to whichever repo `list_repos` returned
+    // first — a wrong hint is worse than no hint, since the agent is the source of
+    // truth. So a name claimed by 2+ distinct repos resolves to nothing here.
+    let mut providers: HashMap<String, Vec<i32>> = HashMap::new();
     for (r, info) in &repo_manifests {
         for name in &info.provides {
-            name_to_repo.entry(name.clone()).or_insert(r.id);
+            let ids = providers.entry(name.clone()).or_default();
+            if !ids.contains(&r.id) {
+                ids.push(r.id);
+            }
         }
     }
+    let name_to_repo: HashMap<String, i32> = providers
+        .into_iter()
+        .filter_map(|(name, ids)| match ids.as_slice() {
+            [only] => Some((name, *only)),
+            _ => None,
+        })
+        .collect();
 
     // For each repo, generate manifest lib edges for its requires that resolve to
     // a DIFFERENT workspace repo, then merge with the existing relations.
@@ -1662,6 +1683,11 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
         // with a checkout but pending/partial classification still benefit from
         // deterministic lib edges (the graph shows them as placeholder nodes).
         let _ = seed_manifest_relations(db, workspace_id).await;
+        // A cross-repo map needs ≥2 profiled repos. If the workspace previously had
+        // enough and dropped below (a repo deleted, or classifiers still pending),
+        // any stored map describes repos/edges no longer in the graph — clear it so
+        // the map pane shows the empty/regenerate state instead of stale markdown.
+        let _ = repo::clear_repo_map_doc(db, workspace_id).await;
         emit_graph_updated(workspace_id);
         return Ok(());
     }
@@ -2279,6 +2305,46 @@ mod tests {
         assert_eq!(p.role, "frontend");
         assert_eq!(p.summary, "a web client");
         assert_eq!(p.source, "user");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_manual_tier_clears_persisted_failure() {
+        // A manual canonical-tier edit RECOVERS a failed repo. Since the views now
+        // read `analysis_state` from the persisted row, clearing only the in-memory
+        // map would leave the DB column at "failed" — the edit must persist "idle".
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::set_analysis_state(&db, r.id, "failed", Some("boom")).await.unwrap();
+
+        super::edit_profile(&db, r.id, None, Some("backend")).await.unwrap();
+
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "backend");
+        assert_eq!(p.analysis_state, "idle", "persisted failure must be cleared");
+        assert_eq!(p.analysis_error, None, "persisted error must be cleared");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_summary_only_keeps_persisted_failure() {
+        // A summary-only edit INHERITS the prior tier without re-classifying, so it
+        // must NOT silently clear a real failure (no re-run happened).
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "old", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_analysis_state(&db, r.id, "failed", Some("boom")).await.unwrap();
+
+        super::edit_profile(&db, r.id, Some("new summary"), None).await.unwrap();
+
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.analysis_state, "failed", "summary-only edit must not clear failure");
     }
 
     #[tokio::test]
@@ -3033,6 +3099,78 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp_a);
         let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    #[tokio::test]
+    async fn analyze_relations_clears_stale_map_when_below_threshold() {
+        // A workspace that previously generated a map but now has < 2 fully-profiled
+        // repos (e.g. a repo was deleted) must not keep serving the stale doc.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_stale_map").await.unwrap();
+        let _r = repo::add_repo_ref(&db, ws.id, "solo", "/nonexistent/solo", "main", "", true)
+            .await
+            .unwrap();
+        repo::set_repo_map_doc(&db, ws.id, "## Inventory\n- gone (backend)").await.unwrap();
+
+        super::analyze_relations(&db, ws.id).await.unwrap();
+
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "stale map doc must be cleared when the workspace drops below 2 profiled repos"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_manifest_relations_skips_ambiguous_providers() {
+        // When two repos provide the SAME manifest name, a first-wins pick would
+        // seed a concrete-but-arbitrary edge. The ambiguous name must seed nothing
+        // (let the agent decide), while a uniquely-provided name still seeds.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_seed_dup").await.unwrap();
+
+        let (consumer, tc) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "consumer",
+            "package.json",
+            r#"{"name":"@acme/consumer","dependencies":{"@acme/dup":"^1","@acme/uniq":"^1"}}"#,
+        )
+        .await;
+        // Two repos BOTH provide "@acme/dup" → ambiguous.
+        let (_dup1, t1) = seed_repo_with_manifest(
+            &db, ws.id, "dup1", "package.json", r#"{"name":"@acme/dup","dependencies":{}}"#,
+        )
+        .await;
+        let (_dup2, t2) = seed_repo_with_manifest(
+            &db, ws.id, "dup2", "package.json", r#"{"name":"@acme/dup","dependencies":{}}"#,
+        )
+        .await;
+        // One repo uniquely provides "@acme/uniq".
+        let (uniq, tu) = seed_repo_with_manifest(
+            &db, ws.id, "uniq", "package.json", r#"{"name":"@acme/uniq","dependencies":{}}"#,
+        )
+        .await;
+
+        super::seed_manifest_relations(&db, ws.id).await.unwrap();
+
+        let rels: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, consumer.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        assert!(
+            !rels.iter().any(|r| r.via == "@acme/dup"),
+            "ambiguous provider must not seed an arbitrary lib edge: {rels:?}"
+        );
+        assert!(
+            rels.iter()
+                .any(|r| r.to == uniq.id && r.via == "@acme/uniq" && r.source == "manifest"),
+            "uniquely-provided dep must still seed a lib edge: {rels:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tc);
+        let _ = std::fs::remove_dir_all(&t1);
+        let _ = std::fs::remove_dir_all(&t2);
+        let _ = std::fs::remove_dir_all(&tu);
     }
 
     #[tokio::test]

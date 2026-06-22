@@ -89,9 +89,7 @@ pub fn parse_cargo_toml(s: &str) -> ManifestInfo {
         "build-dependencies",
     ] {
         if let Some(table) = val.get(section).and_then(|t| t.as_table()) {
-            for key in table.keys() {
-                info.requires.push(key.clone());
-            }
+            push_cargo_dep_names(table, &mut info.requires);
         }
     }
 
@@ -101,13 +99,28 @@ pub fn parse_cargo_toml(s: &str) -> ManifestInfo {
         .and_then(|w| w.get("dependencies"))
         .and_then(|t| t.as_table())
     {
-        for key in table.keys() {
-            info.requires.push(key.clone());
-        }
+        push_cargo_dep_names(table, &mut info.requires);
     }
 
     info.dedup();
     info
+}
+
+/// Append the resolved crate identity for each entry in a Cargo dependency table.
+/// A renamed dep (`internal = { package = "acme-core" }`) is recorded under its
+/// real crate name (`acme-core`) — the identity that matches another repo's
+/// `[package].name` — not the local table key.
+fn push_cargo_dep_names(table: &toml::value::Table, out: &mut Vec<String>) {
+    for (key, val) in table.iter() {
+        let name = val
+            .as_table()
+            .and_then(|t| t.get("package"))
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| key.clone());
+        out.push(name);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,8 +464,20 @@ pub fn parse_gradle_provides(settings_src: &str, build_src: &str) -> Vec<String>
 // scan_repo
 // ---------------------------------------------------------------------------
 
+/// Read a manifest file's text, refusing to follow a symlink. A symlinked
+/// `package.json`/`Cargo.toml`/`settings.gradle` → outside the repo would
+/// otherwise import provides/requires from external trees and seed bogus
+/// workspace lib edges. `scan_dir`'s `exists()` follows links, so the guard
+/// has to live at the read point, not the discovery point.
+fn read_manifest_text(path: &Path) -> Option<String> {
+    if is_symlink(path) {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 fn read_and_parse(path: &Path) -> ManifestInfo {
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Some(content) = read_manifest_text(path) else {
         return ManifestInfo::default();
     };
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -505,11 +530,11 @@ pub fn scan_repo(repo_root: &Path) -> ManifestInfo {
     // Gradle provides at the repo root (settings.gradle[.kts] + build.gradle[.kts]).
     let settings_content = ["settings.gradle", "settings.gradle.kts"]
         .iter()
-        .find_map(|n| std::fs::read_to_string(repo_root.join(n)).ok())
+        .find_map(|n| read_manifest_text(&repo_root.join(n)))
         .unwrap_or_default();
     let build_content = ["build.gradle", "build.gradle.kts"]
         .iter()
-        .find_map(|n| std::fs::read_to_string(repo_root.join(n)).ok())
+        .find_map(|n| read_manifest_text(&repo_root.join(n)))
         .unwrap_or_default();
     if !settings_content.is_empty() || !build_content.is_empty() {
         for p in parse_gradle_provides(&settings_content, &build_content) {
@@ -606,6 +631,26 @@ mod tests {
         let m = parse_cargo_toml(s);
         assert!(m.requires.contains(&"criterion".to_string()));
         assert!(m.requires.contains(&"cc".to_string()));
+    }
+
+    #[test]
+    fn cargo_toml_renamed_dep_uses_package_name() {
+        // `internal = { package = "acme-core" }` must record the real crate name
+        // (which matches another repo's [package].name), not the local alias.
+        let s = "[package]\nname = \"foo\"\n[dependencies]\ninternal = { package = \"acme-core\", version = \"1\" }\nplain = { version = \"2\" }\n";
+        let m = parse_cargo_toml(s);
+        assert!(
+            m.requires.contains(&"acme-core".to_string()),
+            "renamed dep should record its `package` name: {:?}",
+            m.requires
+        );
+        assert!(
+            !m.requires.contains(&"internal".to_string()),
+            "the alias key must NOT be recorded: {:?}",
+            m.requires
+        );
+        // A table dep without `package` still falls back to its key.
+        assert!(m.requires.contains(&"plain".to_string()));
     }
 
     #[test]
@@ -987,6 +1032,47 @@ dependencies {
         assert!(
             info.provides.contains(&"real-pkg".to_string()),
             "real (non-symlink) package must be included: {:?}",
+            info.provides
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// scan_repo must NOT follow a symlinked manifest FILE (the dir guards only
+    /// cover containers/child dirs; a `Cargo.toml -> /outside` slips past them).
+    #[test]
+    #[cfg(unix)]
+    fn scan_repo_symlink_manifest_file_excluded() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let tmp = std::env::temp_dir()
+            .join(format!("weft_symlink_file_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // An external manifest outside the repo tree.
+        let external = tmp.join("outside");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("Cargo.toml"), "[package]\nname = \"external-secret\"\n").unwrap();
+
+        // The repo root holds a Cargo.toml that is a SYMLINK to the external file.
+        let repo = tmp.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        symlink(external.join("Cargo.toml"), repo.join("Cargo.toml")).unwrap();
+        // ...plus a real manifest that must still be read.
+        fs::write(repo.join("package.json"), r#"{"name":"real-app","dependencies":{}}"#).unwrap();
+
+        let info = scan_repo(&repo);
+
+        assert!(
+            !info.provides.contains(&"external-secret".to_string()),
+            "symlinked manifest file must not be read: {:?}",
+            info.provides
+        );
+        assert!(
+            info.provides.contains(&"real-app".to_string()),
+            "real (non-symlink) manifest must still be read: {:?}",
             info.provides
         );
 

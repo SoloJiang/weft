@@ -154,9 +154,20 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
   useEffect(() => {
     if (view !== "map" || activeWorkspaceId == null) return;
     let cancelled = false;
-    void api.getRepoMapDoc(activeWorkspaceId).then((doc) => {
-      if (!cancelled) setMapDoc(doc);
-    });
+    // Reset to the loading state immediately: `mapDoc` is kept in the mounted
+    // curator panel, so switching workspaces (or opening Map in a new one) would
+    // otherwise render the PREVIOUS workspace's markdown until the fetch returns,
+    // and indefinitely if it fails. A failed fetch falls back to the empty state
+    // rather than leaving stale content.
+    setMapDoc(undefined);
+    void api
+      .getRepoMapDoc(activeWorkspaceId)
+      .then((doc) => {
+        if (!cancelled) setMapDoc(doc);
+      })
+      .catch(() => {
+        if (!cancelled) setMapDoc(null);
+      });
     // Re-fetch when the backend signals a graph update while map is open.
     const unlistenP = listen<number>("repo-graph-updated", (e) => {
       if (e.payload === activeWorkspaceId) fetchMapDoc();
