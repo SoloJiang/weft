@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Network } from "lucide-react";
 import { useStore } from "../state/store";
 import { RepoGraph } from "./RepoGraph";
-import { RepoDrawer } from "./RepoDrawer";
+import { RepoSidePanel } from "./RepoSidePanel";
 import { useRepoActions } from "../session/useRepoActions";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
@@ -40,9 +40,11 @@ export function RepoMapView({ embedded = false }: { embedded?: boolean }) {
         <EmptyMap />
       </div>
     ) : (
-      <div className="relative min-h-0 flex-1">
-        <RepoGraph />
-        <RepoDrawer />
+      <div className="flex min-h-0 flex-1">
+        <div className="relative min-w-0 flex-1">
+          <RepoGraph />
+        </div>
+        <RepoSidePanel />
       </div>
     );
 
