@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { X, RefreshCw } from "lucide-react";
 import { useStore } from "../state/store";
@@ -145,24 +146,36 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
   const [regenerating, setRegenerating] = useState(false);
 
   // Fetch the map doc when switching to map view.
+  const fetchMapDoc = useCallback(() => {
+    if (activeWorkspaceId == null) return;
+    void api.getRepoMapDoc(activeWorkspaceId).then((doc) => setMapDoc(doc));
+  }, [activeWorkspaceId]);
+
   useEffect(() => {
     if (view !== "map" || activeWorkspaceId == null) return;
     let cancelled = false;
     void api.getRepoMapDoc(activeWorkspaceId).then((doc) => {
       if (!cancelled) setMapDoc(doc);
     });
-    return () => { cancelled = true; };
-  }, [view, activeWorkspaceId]);
+    // Re-fetch when the backend signals a graph update while map is open.
+    const unlistenP = listen<number>("repo-graph-updated", (e) => {
+      if (e.payload === activeWorkspaceId) fetchMapDoc();
+    });
+    return () => {
+      cancelled = true;
+      void unlistenP.then((f) => f());
+    };
+  }, [view, activeWorkspaceId, fetchMapDoc]);
 
   function handleRegenerate() {
     setRegenerating(true);
-    void reanalyzeDeps().then(() => {
-      if (activeWorkspaceId == null) { setRegenerating(false); return; }
-      void api.getRepoMapDoc(activeWorkspaceId).then((doc) => {
-        setMapDoc(doc);
-        setRegenerating(false);
-      });
-    });
+    reanalyzeDeps()
+      .then(() => {
+        if (activeWorkspaceId == null) return;
+        return api.getRepoMapDoc(activeWorkspaceId).then((doc) => setMapDoc(doc));
+      })
+      .catch(() => { /* surface nothing; spinner clears below */ })
+      .finally(() => setRegenerating(false));
   }
 
   function renderMapBody() {

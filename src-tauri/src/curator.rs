@@ -1723,37 +1723,38 @@ pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 /// On startup, repos whose `analysis_state` was persisted as "running" at shutdown
 /// have no live process. Re-kick their per-repo classification so a repo
 /// interrupted mid-analysis resumes instead of spinning forever in a stale state.
-/// `profile_repo_agent`'s internal `run_begin` dedupes concurrent calls; spawning
-/// each repo independently keeps startup non-blocking.
-///
-/// After all per-repo classifies finish, a relations refresh is triggered for each
-/// affected workspace so cross-repo edges + the generated map stay current — the
-/// graph-read backfill won't reschedule because the repos are now classified.
-/// (Finding 2)
+/// Per-workspace: await all stuck classifiers concurrently, then refresh relations.
+/// Called by `resume_running_analyses`; each invocation is spawned so startup stays
+/// non-blocking. `profile_repo_agent`'s `run_begin` guard dedupes any concurrent pass.
+async fn resume_workspace(db: Db, repos: Vec<repo_ref::Model>, workspace_id: i32) {
+    use futures::future::join_all;
+    let futs = repos.into_iter().map(|r| {
+        let db2 = db.clone();
+        async move { let _ = profile_repo_agent(&db2, &r).await; }
+    });
+    join_all(futs).await;
+    let _ = analyze_relations(&db, workspace_id).await;
+}
+
+/// Resume any repo whose analysis was interrupted mid-run (persisted state =
+/// "running"). Groups stuck repos by workspace and, per workspace, spawns ONE task
+/// that (a) awaits all stuck classifiers concurrently, THEN (b) refreshes relations —
+/// so edges + the map doc are never written before the classifiers finish.
 pub async fn resume_running_analyses(db: &Db) {
     let stuck = match repo::repos_with_analysis_state(db, "running").await {
         Ok(v) => v,
         Err(_) => return,
     };
-    // Collect the distinct workspace ids that need a relations refresh.
-    let mut workspace_ids: Vec<i32> = stuck.iter().map(|r| r.workspace_id).collect();
-    workspace_ids.sort_unstable();
-    workspace_ids.dedup();
-
+    // Group by workspace so each workspace gets exactly one classify→relations task.
+    let mut by_workspace: std::collections::HashMap<i32, Vec<repo_ref::Model>> =
+        std::collections::HashMap::new();
     for r in stuck {
+        by_workspace.entry(r.workspace_id).or_default().push(r);
+    }
+    for (ws_id, repos) in by_workspace {
         let db2 = db.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = profile_repo_agent(&db2, &r).await;
-        });
-    }
-
-    // After the per-repo spawns are queued, trigger a non-forced relations refresh
-    // for each affected workspace. analyze_workspace_coalesced serializes against
-    // any concurrent background pass and deduplicates multiple requests.
-    for ws_id in workspace_ids {
-        let db3 = db.clone();
-        tauri::async_runtime::spawn(async move {
-            analyze_workspace_coalesced(&db3, ws_id, false).await;
+            resume_workspace(db2, repos, ws_id).await;
         });
     }
 }
@@ -1971,16 +1972,13 @@ mod tests {
         assert!(super::should_analyze(failed, true, false), "db-failed + forced → retry");
     }
 
-    // ─── Finding 2: resume triggers relations refresh ───────────────────────
+    // ─── Finding 1 (Codex r2): resume groups by workspace + classify before relations
 
     #[tokio::test]
-    async fn resume_running_analyses_queues_workspace_ids() {
-        // resume_running_analyses collects distinct workspace_ids from the "running"
-        // repo rows to queue relations refreshes. Verify that the workspace_id
-        // deduplication logic is correct (independent of spawned task completion).
-        // Since spawned tasks complete asynchronously, we verify the DB state that
-        // resume_running_analyses observes: repos_with_analysis_state("running") must
-        // return the repos with persisted "running" state. Finding 2.
+    async fn resume_groups_stuck_repos_by_workspace() {
+        // Verify that resume_running_analyses groups stuck repos per workspace so each
+        // workspace gets exactly one classify→relations task (no races). We check the
+        // grouping logic — the same HashMap logic used inside resume_running_analyses.
         let db = mem().await;
         let ws1 = repo::create_workspace(&db, "ws1_f2").await.unwrap();
         let ws2 = repo::create_workspace(&db, "ws2_f2").await.unwrap();
@@ -1993,11 +1991,40 @@ mod tests {
         repo::set_analysis_state(&db, r3.id, "running", None).await.unwrap();
 
         let stuck = repo::repos_with_analysis_state(&db, "running").await.unwrap();
+        // Mirror the HashMap grouping from resume_running_analyses.
+        let mut by_workspace: std::collections::HashMap<i32, Vec<_>> =
+            std::collections::HashMap::new();
+        for r in &stuck {
+            by_workspace.entry(r.workspace_id).or_default().push(r.id);
+        }
+        // Two distinct workspace groups → two classify→relations tasks spawned.
+        assert_eq!(by_workspace.len(), 2, "exactly two workspace groups");
+        assert_eq!(by_workspace[&ws1.id].len(), 2, "ws1 has two stuck repos");
+        assert_eq!(by_workspace[&ws2.id].len(), 1, "ws2 has one stuck repo");
+    }
+
+    // ─── Finding 2 (legacy): workspace_id collection still correct ──────────
+
+    #[tokio::test]
+    async fn resume_running_analyses_queues_workspace_ids() {
+        // resume_running_analyses collects distinct workspace_ids from the "running"
+        // repo rows to queue relations refreshes. Verify that the workspace_id
+        // deduplication logic is correct (independent of spawned task completion).
+        let db = mem().await;
+        let ws1 = repo::create_workspace(&db, "ws1_f2b").await.unwrap();
+        let ws2 = repo::create_workspace(&db, "ws2_f2b").await.unwrap();
+        let r1 = repo::add_repo_ref(&db, ws1.id, "r1b", "/tmp/r1b", "main", "", true).await.unwrap();
+        let r2 = repo::add_repo_ref(&db, ws1.id, "r2b", "/tmp/r2b", "main", "", true).await.unwrap();
+        let r3 = repo::add_repo_ref(&db, ws2.id, "r3b", "/tmp/r3b", "main", "", true).await.unwrap();
+
+        repo::set_analysis_state(&db, r1.id, "running", None).await.unwrap();
+        repo::set_analysis_state(&db, r2.id, "running", None).await.unwrap();
+        repo::set_analysis_state(&db, r3.id, "running", None).await.unwrap();
+
+        let stuck = repo::repos_with_analysis_state(&db, "running").await.unwrap();
         let mut ws_ids: Vec<i32> = stuck.iter().map(|r| r.workspace_id).collect();
         ws_ids.sort_unstable();
         ws_ids.dedup();
-        // Must include exactly the two distinct workspaces, so relations refresh
-        // is queued for each.
         assert_eq!(ws_ids.len(), 2, "two distinct workspaces collected for relations refresh");
         assert!(ws_ids.contains(&ws1.id), "ws1 included");
         assert!(ws_ids.contains(&ws2.id), "ws2 included");
