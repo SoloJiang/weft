@@ -141,6 +141,7 @@ export const Markdown = memo(function Markdown({ text, cwd }: { text: string; cw
         rehypePlugins={[filePathsRehype] as unknown as Options["rehypePlugins"]}
         urlTransform={fileAwareUrlTransform}
         components={{
+          pre: ({ children }) => <>{children}</>,
           a: ({ href, children }) => {
             if (!href) return <>{children}</>;
             // In-page anchor: let the DOM handle the jump, never the OS opener.
