@@ -1,10 +1,18 @@
-import { useState } from "react";
-import { StickToBottom } from "use-stick-to-bottom";
+import { useEffect, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, ChevronRight, Copy, ListChecks, Sparkles } from "lucide-react";
+import { ArrowRight, Check, Copy, ListChecks, Sparkles } from "lucide-react";
 import type { LeadMessage, ResolvedProposal } from "../lib/types";
 import { Markdown } from "../components/Markdown";
-import { Attachment, OnboardingCue, SuggestionChips } from "../components/ai-elements";
+import {
+  Attachment,
+  Message,
+  OnboardingCue,
+  SuggestionChips,
+  Tool,
+  ToolActivity,
+  type AiToolStatus,
+} from "../components/ai-elements";
 import { cn } from "../lib/cn";
 import {
   cleanToolName,
@@ -18,57 +26,6 @@ import type { useRepoActions } from "./useRepoActions";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 type EmptyStateMode = "default" | "lead-task" | "lead-repo-guide";
-
-function Message({
-  role,
-  children,
-}: {
-  role: "user" | "assistant";
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      className={cn(
-        "group flex w-full gap-2.5",
-        role === "user" ? "flex-row-reverse" : "flex-row",
-      )}
-    >
-      {role === "assistant" && (
-        <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
-          <Sparkles size={14} />
-        </span>
-      )}
-      <div
-        className={cn(
-          "flex min-w-0 flex-col",
-          role === "user" ? "items-end" : "flex-1 items-start",
-        )}
-      >
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function Messages({ children }: { children: React.ReactNode }) {
-  return (
-    <StickToBottom.Content className="flex flex-col pt-4 pb-4">
-      {children}
-    </StickToBottom.Content>
-  );
-}
-
-function Conversation({ children }: { children: React.ReactNode }) {
-  return (
-    <StickToBottom
-      className="relative flex min-h-0 flex-1 flex-col"
-      initial="smooth"
-      resize="smooth"
-    >
-      {children}
-    </StickToBottom>
-  );
-}
 
 /**
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
@@ -115,10 +72,20 @@ export function ChatTimeline({
   emptyState?: EmptyStateMode;
 }) {
   const { t } = useTranslation();
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const atBottomRef = useRef(true);
 
   // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
   // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
   const visible = messages.filter((m) => m.kind !== "meta");
+
+  const growthLen = visible
+    .filter((m) => m.kind === "text" || m.kind === "tool")
+    .reduce((n, m) => n + m.content.length, 0);
+  useEffect(() => {
+    if (!atBottomRef.current || visible.length === 0) return;
+    virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+  }, [visible.length, growthLen, busy, activity]);
 
   if (visible.length === 0 && !busy) {
     return (
@@ -135,44 +102,63 @@ export function ChatTimeline({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <Conversation>
-        <Messages>
-          {visible.map((m) => (
-            <div key={m.id} className="mx-auto w-full max-w-[820px] px-4 pb-2.5">
-              <TimelineRow
-                m={m}
-                all={visible}
-                onReviewProposal={onReviewProposal}
-                proposal={proposal ?? null}
-                runAction={runAction}
-                actionsBusy={actionsBusy}
-                threadId={threadId ?? null}
-                workspaceId={workspaceId ?? null}
-                promptText={promptText}
-                cwd={cwd}
-              />
-            </div>
-          ))}
-        </Messages>
-        {/* The in-flight tool / working indicator sits OUTSIDE the scrollable
-            content as a fixed bottom bar. Keeping it out of the list makes the
-            last message the unambiguous list bottom and keeps the indicator
-            visible even while the user scrolls back through history. */}
-        {busy && (
-          <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
-            {activity ? (
-              <ToolStatus name={activity.name} summary={activity.summary} />
-            ) : (
-              <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
-                {t("lead.working")}
-              </div>
-            )}
+      <Virtuoso<LeadMessage>
+        ref={virtuosoRef}
+        className="min-h-0 flex-1"
+        data={visible}
+        computeItemKey={(_index, m) => m.id}
+        initialTopMostItemIndex={
+          visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
+        }
+        atBottomThreshold={80}
+        atBottomStateChange={(atBottom) => {
+          atBottomRef.current = atBottom;
+        }}
+        increaseViewportBy={{ top: 600, bottom: 600 }}
+        components={{ Header, Footer }}
+        itemContent={(_index, m) => (
+          <div className="mx-auto w-full max-w-[820px] px-4 pb-2.5">
+            <TimelineRow
+              m={m}
+              all={visible}
+              onReviewProposal={onReviewProposal}
+              proposal={proposal ?? null}
+              runAction={runAction}
+              actionsBusy={actionsBusy}
+              threadId={threadId ?? null}
+              workspaceId={workspaceId ?? null}
+              promptText={promptText}
+              cwd={cwd}
+            />
           </div>
         )}
-      </Conversation>
+      />
+      {/* The in-flight tool / working indicator sits OUTSIDE the virtualized
+          scroller as a fixed bottom bar. Keeping it out of the list makes the
+          last message the unambiguous list bottom and keeps the indicator
+          visible even while the user scrolls back through history. */}
+      {busy && (
+        <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
+          {activity ? (
+            <ToolStatus name={activity.name} summary={activity.summary} />
+          ) : (
+            <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
+              {t("lead.working")}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+function Header() {
+  return <div className="h-4" />;
+}
+
+function Footer() {
+  return <div className="h-4" />;
 }
 
 function EmptyLeadState({
@@ -279,86 +265,10 @@ function EmptyLeadState({
   );
 }
 
-type ToolStatus = "streaming" | "complete" | "error";
-
-function deriveToolStatus(m: LeadMessage, c: Record<string, unknown>): ToolStatus {
+function deriveToolStatus(m: LeadMessage, c: Record<string, unknown>): AiToolStatus {
   if (m.status === "streaming") return "streaming";
   if (c.is_error === true || m.status === "error") return "error";
   return "complete";
-}
-
-function Tool({
-  name,
-  summary,
-  status,
-  input,
-  output,
-}: {
-  name: string;
-  summary: string;
-  status: ToolStatus;
-  input?: string;
-  output?: string;
-}) {
-  const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  const Icon = toolIcon(name);
-  const labelKey = status === "streaming" ? toolLabelKey(name) : toolDoneLabelKey(name);
-  const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
-  const label = generic ? cleanToolName(name) : t(labelKey);
-  const { target, added, removed } = compactToolTarget(name, summary);
-  const hasDetail = (input && input.length > 0) || (output && output.length > 0);
-
-  return (
-    <div>
-      <button
-        type="button"
-        disabled={!hasDetail}
-        onClick={() => setOpen((v) => !v)}
-        className={cn(
-          "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
-          hasDetail && "hover:bg-surface/60",
-        )}
-      >
-        <Icon
-          size={13}
-          className={cn(
-            "shrink-0",
-            status === "streaming" && "animate-pulse text-running",
-            status === "error" && "text-danger",
-            status === "complete" && "text-ink-faint",
-          )}
-        />
-        <span className="shrink-0 text-ink-muted">{label}</span>
-        {(target || summary) && (
-          <span className="min-w-0 truncate font-mono text-ink-faint">{target || summary}</span>
-        )}
-        {added && <span className="shrink-0 font-mono text-running">+{added}</span>}
-        {removed && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
-        {hasDetail && (
-          <ChevronRight
-            size={12}
-            className={cn(
-              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
-              open && "rotate-90",
-            )}
-          />
-        )}
-      </button>
-      {open && hasDetail && (
-        <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
-          {input && <ToolBlock label={t("tool.input")} body={input} />}
-          {output && (
-            <ToolBlock
-              label={t("tool.output")}
-              body={output}
-              tone={status === "error" ? "error" : "default"}
-            />
-          )}
-        </div>
-      )}
-    </div>
-  );
 }
 
 /** The tool call in flight — pulsing, transient, precise about WHAT it calls. */
@@ -371,64 +281,14 @@ function ToolStatus({ name, summary }: { name: string; summary: string }) {
   // show the cleaned tool identity instead.
   const generic = labelKey === "session.toolCalling";
   return (
-    <div className="flex max-w-full items-center gap-2 px-1.5 py-1 text-[13px] text-ink-faint">
-      <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-running" />
-      <Icon size={15} className="shrink-0 text-ink-faint" />
-      <span className="shrink-0 font-medium text-ink-muted">
-        {generic ? cleanToolName(name) : t(labelKey)}
-      </span>
-      {!generic && summary && (
-        <span className="min-w-0 truncate font-mono text-brand">{target}</span>
-      )}
-      {generic && summary && (
-        <span className="min-w-0 truncate font-mono text-brand">{summary}</span>
-      )}
-      {added && <span className="shrink-0 font-mono text-running">+{added}</span>}
-      {removed && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
-    </div>
-  );
-}
-
-/** A labeled monospace block inside an expanded tool row, with show-more past a
- *  line budget so a huge stdout/diff doesn't blow up the timeline. */
-function ToolBlock({
-  label,
-  body,
-  tone = "default",
-}: {
-  label: string;
-  body: string;
-  tone?: "default" | "error";
-}) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  const lines = body.split("\n");
-  const LIMIT = 20;
-  const long = lines.length > LIMIT;
-  const shown = expanded || !long ? body : lines.slice(0, LIMIT).join("\n");
-  return (
-    <div>
-      <p className="mb-1 text-[10.5px] font-medium uppercase tracking-wide text-ink-faint">
-        {label}
-      </p>
-      <pre
-        className={cn(
-          "max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-bg px-2 py-1.5 font-mono text-[11.5px] leading-relaxed",
-          tone === "error" ? "text-danger" : "text-ink-muted",
-        )}
-      >
-        {shown}
-      </pre>
-      {long && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-1 text-[11px] text-brand hover:underline"
-        >
-          {expanded ? t("tool.showLess") : t("tool.showMore", { n: lines.length - LIMIT })}
-        </button>
-      )}
-    </div>
+    <ToolActivity
+      icon={Icon}
+      label={generic ? cleanToolName(name) : t(labelKey)}
+      target={generic ? undefined : target}
+      summary={generic ? summary : undefined}
+      added={added}
+      removed={removed}
+    />
   );
 }
 
@@ -496,6 +356,28 @@ function SettledLine({ label }: { label: string }) {
   );
 }
 
+const permissionAnswerLabelKeys = {
+  allow: "settled.permissionAllow",
+  deny: "settled.permissionDeny",
+  always: "settled.permissionAlways",
+  full: "settled.permissionFull",
+} as const;
+
+type PermissionAnswer = keyof typeof permissionAnswerLabelKeys;
+
+function permissionAnswerOf(answer: string): PermissionAnswer {
+  switch (answer) {
+    case "deny":
+      return "deny";
+    case "always":
+      return "always";
+    case "full":
+      return "full";
+    default:
+      return "allow";
+  }
+}
+
 // The live plan binds to the MOST RECENT proposal row only: a re-propose
 // replaces the stored plan, so older proposal cards are already settled.
 function isLatestProposal(m: LeadMessage, all: LeadMessage[]): boolean {
@@ -537,13 +419,26 @@ function TimelineRow({
     const summary = typeof content.summary === "string" ? content.summary : "";
     const output = typeof content.output === "string" ? content.output : "";
     const inputText = formatToolValue(content.input);
+    const status = deriveToolStatus(m, content);
+    const Icon = toolIcon(name);
+    const labelKey = status === "streaming" ? toolLabelKey(name) : toolDoneLabelKey(name);
+    const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
+    const { target, added, removed } = compactToolTarget(name, summary);
     return (
       <Tool
-        name={name}
+        icon={Icon}
+        label={generic ? cleanToolName(name) : t(labelKey)}
         summary={summary}
-        status={deriveToolStatus(m, content)}
+        status={status}
+        target={target}
+        added={added}
+        removed={removed}
         input={inputText}
         output={output}
+        inputLabel={t("tool.input")}
+        outputLabel={t("tool.output")}
+        showMoreLabel={(hiddenLineCount) => t("tool.showMore", { n: hiddenLineCount })}
+        showLessLabel={t("tool.showLess")}
       />
     );
   }
@@ -605,14 +500,7 @@ function TimelineRow({
     if (variant === "permission") {
       const summary = typeof v.summary === "string" ? v.summary : "";
       const answer = typeof v.answer === "string" ? v.answer : "allow";
-      const key =
-        answer === "deny"
-          ? "settled.permissionDeny"
-          : answer === "always"
-            ? "settled.permissionAlways"
-            : answer === "full"
-              ? "settled.permissionFull"
-              : "settled.permissionAllow";
+      const key = permissionAnswerLabelKeys[permissionAnswerOf(answer)];
       return <SettledLine label={t(key, { summary })} />;
     }
     if (variant === "ask") {

@@ -2,6 +2,7 @@ import * as Collapsible from "@radix-ui/react-collapsible";
 import { ChevronRightIcon, FileIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
 import type { HTMLAttributes, KeyboardEvent, ReactNode, SyntheticEvent } from "react";
 import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { FileNode as AppFileNode } from "../lib/types";
 import { cn } from "../lib/cn";
 
@@ -36,6 +37,7 @@ export const FileTree = ({
   children,
   ...props
 }: FileTreeProps) => {
+  const { t } = useTranslation();
   const [internalExpanded, setInternalExpanded] = useState(() => new Set(defaultExpanded));
   const expandedPaths = controlledExpanded ?? internalExpanded;
   const isControlled = controlledExpanded !== undefined;
@@ -61,7 +63,7 @@ export const FileTree = ({
     <FileTreeContext.Provider value={contextValue}>
       <div
         role="tree"
-        aria-label="File tree"
+        aria-label={t("files.treeLabel")}
         className={cn("rounded-[var(--radius-lg)] border border-border bg-bg font-mono text-[13px] text-ink", className)}
         {...props}
       >
@@ -222,12 +224,13 @@ function renderFileTreeNode(node: FileNode) {
 }
 
 function FolderTrigger({ expanded }: { expanded: boolean }) {
+  const { t } = useTranslation();
   return (
     <Collapsible.Trigger asChild>
       <button
         type="button"
         className="grid h-4 w-4 shrink-0 place-items-center rounded-[var(--radius-sm)] text-ink-faint transition-[color,transform] duration-150 ease-[var(--ease-out-quint)] hover:text-ink"
-        aria-label={expanded ? "Collapse folder" : "Expand folder"}
+        aria-label={expanded ? t("files.collapseFolder") : t("files.expandFolder")}
         onClick={stopPropagation}
       >
         <ChevronRightIcon

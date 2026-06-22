@@ -1,369 +1,30 @@
-import {
-  createContext,
-  forwardRef,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-  type TextareaHTMLAttributes,
-} from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Check,
   ExternalLink,
-  FileText,
   Paperclip,
   Send,
   SlashSquare,
   Square,
   SquareTerminal,
-  X,
 } from "lucide-react";
 import type { ImageAttachment, SlashCmd } from "../lib/types";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { useClickOutside } from "../lib/useClickOutside";
-import { Button } from "../components/ui/Button";
-import { Tooltip } from "../components/ui/Tooltip";
-
-// -----------------------------------------------------------------------------// AI SDK Elements-style PromptInput primitives (self-contained, Weft-skinned)// -----------------------------------------------------------------------------
-
-interface PromptInputAttachmentLike {
-  id?: string;
-  name?: string;
-  url?: string;
-  contentType?: string;
-}
-
-interface PromptInputContextValue {
-  value: string;
-  setValue: (value: string) => void;
-  isLoading: boolean;
-  disabled: boolean;
-  onSubmit?: () => void;
-}
-
-const PromptInputContext = createContext<PromptInputContextValue | null>(
-  null,
-);
-
-function usePromptInput() {
-  const ctx = useContext(PromptInputContext);
-  if (!ctx) {
-    throw new Error("usePromptInput must be used within a PromptInputProvider");
-  }
-  return ctx;
-}
-
-function PromptInputProvider({
-  children,
-  initialValue = "",
-  isLoading = false,
-  disabled = false,
-  onSubmit,
-}: {
-  children: ReactNode;
-  initialValue?: string;
-  isLoading?: boolean;
-  disabled?: boolean;
-  onSubmit?: () => void;
-}) {
-  const [value, setValue] = useState(initialValue);
-  const ctx = useMemo(
-    () => ({ value, setValue, isLoading, disabled, onSubmit }),
-    [value, isLoading, disabled, onSubmit],
-  );
-  return (
-    <PromptInputContext.Provider value={ctx}>
-      {children}
-    </PromptInputContext.Provider>
-  );
-}
-
-function PromptInput({
-  children,
-  className,
-  onSubmit,
-}: {
-  children: ReactNode;
-  className?: string;
-  onSubmit?: (event: React.FormEvent) => void;
-}) {
-  const ctx = useContext(PromptInputContext);
-  const handleSubmit = useCallback(
-    (event: React.FormEvent) => {
-      event.preventDefault();
-      ctx?.onSubmit?.();
-      onSubmit?.(event);
-    },
-    [ctx, onSubmit],
-  );
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className={cn("flex flex-col gap-2", className)}
-    >
-      {children}
-    </form>
-  );
-}
-
-const PromptInputTextarea = forwardRef<
-  HTMLTextAreaElement,
-  Omit<
-    TextareaHTMLAttributes<HTMLTextAreaElement>,
-    "value" | "onChange"
-  >
->(({ className, onKeyDown, ...props }, ref) => {
-  const ctx = usePromptInput();
-  const handleChange = useCallback(
-    (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-      ctx.setValue(event.target.value);
-    },
-    [ctx],
-  );
-  const handleKeyDown = useCallback(
-    (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      onKeyDown?.(event);
-      if (event.defaultPrevented) return;
-      if (
-        event.key === "Enter" &&
-        !event.shiftKey &&
-        !event.nativeEvent.isComposing
-      ) {
-        event.preventDefault();
-        ctx.onSubmit?.();
-      }
-    },
-    [ctx, onKeyDown],
-  );
-  return (
-    <textarea
-      ref={ref}
-      value={ctx.value}
-      onChange={handleChange}
-      onKeyDown={handleKeyDown}
-      disabled={ctx.disabled}
-      className={cn(
-        "min-h-[44px] flex-1 resize-none bg-transparent px-3 py-2.5 text-[13px] leading-relaxed text-ink outline-none placeholder:text-ink-faint",
-        className,
-      )}
-      {...props}
-    />
-  );
-});
-PromptInputTextarea.displayName = "PromptInputTextarea";
-
-function PromptInputActions({
-  children,
-  className,
-}: {
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div
-      className={cn(
-        "flex items-center justify-between gap-2",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
-}
-
-function PromptInputTools({
-  children,
-  className,
-}: {
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={cn("flex flex-wrap items-center gap-1", className)}>
-      {children}
-    </div>
-  );
-}
-
-function InputGroup({
-  children,
-  className,
-}: {
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div
-      className={cn(
-        "flex w-full items-stretch rounded-[var(--radius-md)] border border-border bg-bg transition-colors duration-150 focus-within:border-brand focus-within:ring-2 focus-within:ring-brand/30 hover:border-border-strong",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
-}
-
-function InputGroupButton({
-  children,
-  onClick,
-  disabled,
-  title,
-  type = "button",
-}: {
-  children: ReactNode;
-  onClick?: () => void;
-  disabled?: boolean;
-  title?: string;
-  type?: "button" | "submit";
-}) {
-  return (
-    <div className="flex items-end p-2">
-      <Button
-        type={type}
-        size="icon"
-        variant="primary"
-        disabled={disabled}
-        title={title}
-        onClick={onClick}
-        className="h-8 w-8"
-      >
-        {children}
-      </Button>
-    </div>
-  );
-}
-
-function Spinner({ className }: { className?: string }) {
-  return (
-    <svg
-      className={cn("animate-spin", className)}
-      xmlns="http://www.w3.org/2000/svg"
-      fill="none"
-      viewBox="0 0 24 24"
-      aria-label="Loading"
-    >
-      <circle
-        className="opacity-25"
-        cx="12"
-        cy="12"
-        r="10"
-        stroke="currentColor"
-        strokeWidth="4"
-      />
-      <path
-        className="opacity-75"
-        fill="currentColor"
-        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-      />
-    </svg>
-  );
-}
-
-function PromptInputSubmit({
-  children,
-  disabled,
-  title,
-}: {
-  children?: ReactNode;
-  disabled?: boolean;
-  title?: string;
-}) {
-  const ctx = usePromptInput();
-  return (
-    <InputGroupButton
-      type="submit"
-      disabled={ctx.disabled || disabled || !ctx.value.trim()}
-      title={title}
-    >
-      {ctx.isLoading ? <Spinner className="h-4 w-4" /> : children}
-    </InputGroupButton>
-  );
-}
-
-function PromptInputButton({
-  children,
-  className,
-  disabled,
-  title,
-  onClick,
-  tooltip,
-}: {
-  children: ReactNode;
-  className?: string;
-  disabled?: boolean;
-  title?: string;
-  onClick?: () => void;
-  tooltip?: string;
-}) {
-  const ctx = usePromptInput();
-  const button = (
-    <Button
-      type="button"
-      size="icon"
-      variant="ghost"
-      disabled={ctx.disabled || disabled}
-      title={title}
-      onClick={onClick}
-      className={cn("h-7 w-7", className)}
-    >
-      {children}
-    </Button>
-  );
-  if (tooltip) {
-    return <Tooltip label={tooltip}>{button}</Tooltip>;
-  }
-  return button;
-}
-
-function PromptInputAttachment({
-  attachment,
-  onRemove,
-}: {
-  attachment: PromptInputAttachmentLike;
-  onRemove?: () => void;
-}) {
-  const isImage = attachment.contentType?.startsWith("image/");
-  const name = attachment.name ?? "attachment";
-  return (
-    <div
-      className={cn(
-        "group/attachment relative flex items-center gap-2 overflow-hidden rounded-[var(--radius-md)] border border-border bg-raised p-1.5 pr-7 text-[12px] max-w-[180px]",
-      )}
-      title={name}
-    >
-      {isImage && attachment.url ? (
-        <img
-          src={attachment.url}
-          alt={name}
-          className="h-8 w-8 rounded-[var(--radius-sm)] object-cover"
-        />
-      ) : (
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-sm)] bg-bg text-ink-muted">
-          <FileText size={16} />
-        </div>
-      )}
-      <span className="truncate text-ink-muted">{name}</span>
-      {onRemove && (
-        <Button
-          type="button"
-          size="icon"
-          variant="ghost"
-          onClick={onRemove}
-          className="absolute right-0.5 top-1/2 h-5 w-5 -translate-y-1/2 opacity-0 transition-opacity group-hover/attachment:opacity-100"
-          aria-label={`Remove ${name}`}
-        >
-          <X size={12} />
-        </Button>
-      )}
-    </div>
-  );
-}
+import {
+  InputGroup,
+  PromptInput,
+  PromptInputActions,
+  PromptInputAttachment,
+  PromptInputButton,
+  PromptInputProvider,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputTools,
+  usePromptInput,
+} from "../components/ai-elements";
 
 // -----------------------------------------------------------------------------// ChatComposer// -----------------------------------------------------------------------------
 
@@ -419,7 +80,7 @@ export function ChatComposer({
   onNeedSlashCommands?: () => void;
 }) {
   return (
-    <PromptInputProvider disabled={busy}>
+    <PromptInputProvider>
       <ChatComposerBody
         slashCommands={slashCommands}
         localSlash={localSlash}
@@ -640,6 +301,7 @@ function ChatComposerBody({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && e.nativeEvent.isComposing) return;
     if (!paletteOpen) return;
 
     if (e.key === "ArrowDown") {
@@ -681,7 +343,7 @@ function ChatComposerBody({
   const allAttachments = useMemo(() => {
     const imageAttachments = images.map((img, idx) => ({
       id: `img-${idx}`,
-      name: t("lead.pastedImage"),
+      name: t("lead.pastedImage", { count: idx + 1 }),
       url: img.preview,
       contentType: img.media_type,
     }));
@@ -718,7 +380,11 @@ function ChatComposerBody({
       );
     }
     return (
-      <PromptInputSubmit title={t("lead.send")}>
+      <PromptInputSubmit
+        canSubmit={text.trim().length > 0 || images.length > 0 || files.length > 0}
+        loadingLabel={t("lead.loading")}
+        title={t("lead.send")}
+      >
         <Send size={14} />
       </PromptInputSubmit>
     );
@@ -786,6 +452,7 @@ function ChatComposerBody({
                   key={att.id}
                   attachment={att}
                   onRemove={() => removeAttachment(att.id)}
+                  removeLabel={t("lead.removeAttachment", { name: att.name })}
                 />
               ))}
             </div>
