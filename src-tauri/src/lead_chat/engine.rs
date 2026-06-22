@@ -52,6 +52,30 @@ const STREAM_THROTTLE_MS: u128 = 150;
 /// trips on a wedged/dead child to keep the session from becoming unstoppable.
 const WRITE_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 一条待发排队消息的前端视图。`images`/`files` 仅给个数（栈里显示角标用）。
+#[derive(Clone, serde::Serialize)]
+pub struct QueuedItem {
+    pub id: i32,
+    pub text: String,
+    pub images: usize,
+    pub files: usize,
+}
+
+fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
+    turn.queue
+        .iter()
+        .filter_map(|o| {
+            o.queue_id.map(|id| QueuedItem {
+                id,
+                text: o.text.clone(),
+                images: o.images.len(),
+                // files are appended into text; count is not separately tracked
+                files: 0,
+            })
+        })
+        .collect()
+}
+
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -80,7 +104,7 @@ pub enum Push {
         /// Some(session) for chat-mode workers; None for the lead.
         session_id: Option<i32>,
         state: String,
-        queued: usize,
+        queue: Vec<QueuedItem>,
     },
     Init {
         thread_id: i32,
@@ -329,7 +353,7 @@ fn emit_turn_state(
     thread_id: i32,
     session_id: Option<i32>,
     busy: bool,
-    queued: usize,
+    queue: Vec<QueuedItem>,
 ) {
     let _ = app.emit(
         EVENT,
@@ -337,7 +361,7 @@ fn emit_turn_state(
             thread_id,
             session_id,
             state: if busy { "busy" } else { "idle" }.into(),
-            queued,
+            queue,
         },
     );
 }
@@ -353,7 +377,7 @@ async fn begin_hidden_turn(app: &AppHandle, db: &Db, inner: &mut EngineInner) ->
         inner.thread_id,
         inner.session_id,
         inner.turn.busy,
-        inner.turn.queue.len(),
+        queue_items(&inner.turn),
     );
     turn_id
 }
@@ -365,7 +389,7 @@ fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing
         inner.thread_id,
         inner.session_id,
         inner.turn.busy,
-        inner.turn.queue.len(),
+        queue_items(&inner.turn),
     );
 }
 
@@ -377,7 +401,7 @@ async fn rollback_failed_turn(app: &AppHandle, db: &Db, eng: &EngineRef, turn_id
     let thread_id = inner.thread_id;
     let session_id = inner.session_id;
     persist_activity(db, session_id, thread_id, "idle").await;
-    emit_turn_state(app, thread_id, session_id, false, 0);
+    emit_turn_state(app, thread_id, session_id, false, Vec::new());
     drop(inner);
     mark_queued_failed(app, db, thread_id, session_id).await;
 }
@@ -718,7 +742,7 @@ async fn cleanup_disconnected_turn(
             thread_id,
             session_id,
             state: "stopped".into(),
-            queued: 0,
+            queue: Vec::new(),
         },
     );
     drop(inner);
@@ -1249,7 +1273,7 @@ pub async fn send(
             thread_id,
             session_id: sid,
             state: if inner.turn.busy { "busy" } else { "idle" }.into(),
-            queued: inner.turn.queue.len(),
+            queue: queue_items(&inner.turn),
         },
     );
     drop(inner);
@@ -1603,7 +1627,7 @@ async fn codex_consumer(
                         thread_id,
                         session_id: inner.session_id,
                         state: if still_busy { "busy" } else { "idle" }.into(),
-                        queued: inner.turn.queue.len(),
+                        queue: queue_items(&inner.turn),
                     },
                 );
                 drop(inner);
@@ -2229,7 +2253,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
             thread_id,
             session_id,
             state: "stopped".into(),
-            queued: 0,
+            queue: Vec::new(),
         },
     );
 }
@@ -2595,7 +2619,7 @@ fn spawn_reader(
                             thread_id,
                             session_id: inner.session_id,
                             state: state.into(),
-                            queued: inner.turn.queue.len(),
+                            queue: queue_items(&inner.turn),
                         },
                     );
                 }
@@ -2703,7 +2727,7 @@ fn spawn_reader(
                     thread_id: inner.thread_id,
                     session_id: inner.session_id,
                     state: state.into(),
-                    queued: inner.turn.queue.len(),
+                    queue: queue_items(&inner.turn),
                 },
             );
             return;
@@ -2756,7 +2780,7 @@ fn spawn_reader(
                     thread_id,
                     session_id,
                     state: "stopped".into(),
-                    queued: 0,
+                    queue: Vec::new(),
                 },
             );
             drop(inner);
@@ -3082,6 +3106,17 @@ mod tests {
             codex_change_approval_summary(&serde_json::json!({})),
             "apply file changes"
         );
+    }
+
+    #[test]
+    fn queue_items_preserves_order_and_text() {
+        let mut t = TurnState::default();
+        t.queue.push_back(Outgoing { text: "a".into(), queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { text: "b".into(), queue_id: Some(2), ..Default::default() });
+        let items = queue_items(&t);
+        assert_eq!(items.len(), 2);
+        assert_eq!((items[0].id, items[0].text.as_str()), (1, "a"));
+        assert_eq!((items[1].id, items[1].text.as_str()), (2, "b"));
     }
 
     #[test]
