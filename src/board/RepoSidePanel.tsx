@@ -149,6 +149,10 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
   const activeWsRef = useRef(activeWorkspaceId);
   useEffect(() => {
     activeWsRef.current = activeWorkspaceId;
+    // The spinner state belongs to the workspace that started the regenerate. On a
+    // switch, clear it so the new workspace's Map tab isn't left disabled/spinning
+    // for the previous workspace's (long) analysis.
+    setRegenerating(false);
   }, [activeWorkspaceId]);
 
   useEffect(() => {
@@ -196,7 +200,13 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
         if (activeWsRef.current === ws) setMapDoc(doc);
       })
       .catch(() => { /* surface nothing; spinner clears below */ })
-      .finally(() => setRegenerating(false));
+      .finally(() => {
+        // Only clear the spinner if we're still on the workspace that started it —
+        // otherwise this (old) regenerate's completion would clear a spinner the
+        // new workspace's own regenerate may have just set. A switch already reset
+        // it via the effect above.
+        if (activeWsRef.current === ws) setRegenerating(false);
+      });
   }
 
   function renderMapBody() {

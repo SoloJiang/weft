@@ -166,6 +166,16 @@ pub async fn edit_profile(
         // retryable failure and stays skipped from auto-passes. Persist "idle" too.
         let _ = repo::set_analysis_state(db, repo_id, "idle", None).await;
     }
+    // A manual profile edit changes the map's INVENTORY surface (a tier edit
+    // cascades to component tiers; a summary edit changes the narrative). Relations
+    // have their own invalidation chokepoint in `set_repo_relations`, but inventory
+    // edits don't pass through it, so invalidate the workspace map doc here too.
+    // (Agent-driven inventory writes via `persist_repo_class` are always followed by
+    // `analyze_relations`' fresh-markdown write in the same pass, so this manual path
+    // is the only standalone inventory mutation.) Regenerates on the next pass.
+    if let Some(r) = repo::get_repo(db, repo_id).await? {
+        let _ = repo::clear_repo_map_doc(db, r.workspace_id).await;
+    }
     Ok(saved)
 }
 
@@ -2371,6 +2381,28 @@ mod tests {
 
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.analysis_state, "failed", "summary-only edit must not clear failure");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_invalidates_map_doc() {
+        // A manual profile edit changes the map's INVENTORY surface (a tier edit
+        // cascades to component tiers; summary changes the narrative) without
+        // touching relations, so it must invalidate the workspace map doc — the
+        // relation chokepoint (set_repo_relations) doesn't cover this path.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "old", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
+
+        super::edit_profile(&db, r.id, None, Some("frontend")).await.unwrap();
+
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "a manual profile edit must invalidate the stale workspace map doc"
+        );
     }
 
     #[tokio::test]
