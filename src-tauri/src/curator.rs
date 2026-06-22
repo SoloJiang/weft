@@ -1,6 +1,6 @@
 //! The workspace Curator (ARCHITECTURE §4.9, §4.11), now a PURE AGENT pipeline.
 //! There is no deterministic manifest engine: a bounded, read-only coding agent
-//! reads each repo deeply, classifies its tier (frontend / gateway / backend),
+//! reads each repo deeply, classifies its tier (frontend / backend),
 //! summarizes it, surfaces monorepo sub-components, and reports the cross-repo
 //! relations it sees. Findings persist on `repo_profile`; the graph is rebuilt
 //! from them. A user edit (source = "user") always outranks re-analysis.
@@ -20,7 +20,7 @@ use std::path::Path;
 pub struct ProfileView {
     pub repo_id: i32,
     pub repo_name: String,
-    /// "frontend" | "gateway" | "backend" | "" (unclassified / analyzing).
+    /// "frontend" | "backend" | "" (unclassified / analyzing).
     pub tier: String,
     pub stack: Vec<String>,
     pub summary: String,
@@ -425,17 +425,14 @@ fn codex_exec_read_only_args() -> Vec<String> {
     ]
 }
 
-/// The shared definition of the three architectural tiers, embedded in both the
+/// The shared definition of the two architectural tiers, embedded in both the
 /// per-repo classification prompt and the cross-repo relations prompt so the
 /// agent applies one consistent taxonomy.
 const TIER_GUIDE: &str = "Tiers:\n\
 - frontend: user-facing client — web SPA/MPA, mobile, desktop UI, static site.\n\
-- gateway: the MIDDLE layer between frontend and backend — API gateway, BFF \
-(backend-for-frontend), aggregator, edge service, reverse proxy, GraphQL gateway. \
-It mostly orchestrates/forwards to other services rather than owning core domain \
-data.\n\
-- backend: a service that owns domain logic and/or data — REST/gRPC services, \
-workers, batch jobs, databases-of-record, shared libraries that back them.";
+- backend: anything server-side — API gateways / BFFs / aggregators / edge \
+services, REST/gRPC services, workers, batch jobs, databases-of-record, and the \
+shared libraries / IDL that back them.";
 
 /// Per-repo DEEP classification prompt. The agent runs with cwd AT this repo and
 /// is told to read widely (subdirectories, monorepo packages) before emitting one
@@ -452,10 +449,10 @@ If the repo is a monorepo containing two or more deployable/publishable internal
 packages or services, list each as a component with its own tier; a single-purpose \
 repo has no components.\n\nAs the LAST thing in your reply, output a single JSON \
 object and nothing after it:\n\
-{{\"tier\":\"frontend|gateway|backend\",\"summary\":\"<one line; name the key \
+{{\"tier\":\"frontend|backend\",\"summary\":\"<one line; name the key \
 internal modules if it is a monorepo>\",\"stack\":[\"<language/framework tags>\"],\
 \"components\":[{{\"name\":\"<package/service>\",\"path\":\"<relative path>\",\
-\"tier\":\"frontend|gateway|backend\",\"summary\":\"<one line>\",\
+\"tier\":\"frontend|backend\",\"summary\":\"<one line>\",\
 \"deps\":[\"<sibling component name it depends on>\"]}}]}}\n\
 Rules: pick the single tier that best fits the repo as a whole. `components` is \
 [] unless this is a monorepo with 2+ internal packages/services. `deps` lists only \
@@ -491,9 +488,8 @@ OUTBOUND calls — fetch / HTTP client usage, base URLs or service hosts in conf
 env, gRPC stubs, queue publishes — against another repo's EXPOSED surface — its \
 routes / handlers, gRPC service definitions, queue consumers, DB schemas. The \
 consumer is `from`, the producer it talks to is `to`. Use the tier flow as a prior: \
-a frontend almost always depends on the gateway/backend that serves its data, and a \
-gateway on the backends it aggregates — assert such an edge whenever the code \
-supports it, even with no shared package.\n\n\
+a frontend almost always depends on the backend that serves its data — assert such \
+an edge whenever the code supports it, even with no shared package.\n\n\
 {TIER_GUIDE}\n\nRepositories:\n{lines}\nRead each repo's code and config at its \
 path (READ-ONLY — change nothing). Then, as the LAST thing in your reply, output a \
 single JSON object and nothing after it:\n\
@@ -1822,7 +1818,7 @@ mod tests {
         let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
-        repo::upsert_repo_profile(&db, r.id, "gateway", "[]", "mine", "[]", "user", "")
+        repo::upsert_repo_profile(&db, r.id, "frontend", "[]", "mine", "[]", "user", "")
             .await
             .unwrap();
         let wire = super::RepoClassWire {
@@ -1834,7 +1830,7 @@ mod tests {
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
-        assert_eq!(p.role, "gateway", "a valid user-pinned tier is not overwritten");
+        assert_eq!(p.role, "frontend", "a valid user-pinned tier is not overwritten");
     }
 
     #[tokio::test]
@@ -2038,7 +2034,7 @@ mod tests {
             .unwrap();
         let wire = super::RepoClassWire {
             name: None,
-            tier: "service".into(), // not one of frontend|gateway|backend
+            tier: "service".into(), // not one of frontend|backend
             summary: "agent".into(),
             stack: None,
             components: None,

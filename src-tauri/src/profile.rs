@@ -1,18 +1,18 @@
 //! Cross-repo dependency graph types (ARCHITECTURE §4.9). The curator is now a
 //! pure agent: a read-only coding agent reads each repo deeply, classifies its
-//! tier (frontend / gateway / backend), summarizes it, and reports the cross-repo
+//! tier (frontend / backend), summarizes it, and reports the cross-repo
 //! relations the agent sees. This module holds the shared data types and the
 //! relation-merge logic; there is no deterministic manifest engine anymore (the
 //! pipeline is agent-only — offline is not a supported mode).
 
-/// The three architectural tiers a repo (or a monorepo sub-component) can fall
-/// into. `gateway` is the middle layer — API gateways, BFFs, aggregators, edge
-/// services, reverse proxies. The empty string means "not classified yet"
-/// (analysis pending) and is rendered as an "analyzing" placeholder.
-pub const TIERS: [&str; 3] = ["frontend", "gateway", "backend"];
+/// The architectural tiers a repo (or a monorepo sub-component) can fall into.
+/// `backend` covers everything server-side (gateways/BFFs/aggregators included).
+/// The empty string means "not classified yet" (analysis pending), rendered as
+/// an "analyzing" placeholder.
+pub const TIERS: [&str; 2] = ["frontend", "backend"];
 
 /// Lowercase + validate a tier against `TIERS`. `None` for anything the agent
-/// returns that isn't one of the three canonical tiers (caller stores "").
+/// returns that isn't one of the two canonical tiers (caller stores "").
 pub fn normalize_tier(tier: &str) -> Option<String> {
     let t = tier.trim().to_ascii_lowercase();
     TIERS.contains(&t.as_str()).then_some(t)
@@ -86,7 +86,7 @@ pub struct Component {
     /// Path relative to the repo root (e.g. "packages/api", "apps/web").
     #[serde(default)]
     pub path: String,
-    /// frontend | gateway | backend | "" (unclassified).
+    /// frontend | backend | "" (unclassified).
     #[serde(default)]
     pub tier: String,
     #[serde(default)]
@@ -161,8 +161,9 @@ mod tests {
     #[test]
     fn normalize_tier_accepts_canonical_only() {
         assert_eq!(super::normalize_tier("Frontend"), Some("frontend".into()));
-        assert_eq!(super::normalize_tier(" GATEWAY "), Some("gateway".into()));
         assert_eq!(super::normalize_tier("backend"), Some("backend".into()));
+        // "gateway" is no longer a canonical tier (folded into "backend").
+        assert_eq!(super::normalize_tier("gateway"), None);
         assert_eq!(super::normalize_tier("service"), None);
         assert_eq!(super::normalize_tier(""), None);
     }
