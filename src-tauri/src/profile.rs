@@ -1,9 +1,8 @@
-//! Cross-repo dependency graph types (ARCHITECTURE §4.9). The curator is now a
-//! pure agent: a read-only coding agent reads each repo deeply, classifies its
-//! tier (frontend / backend), summarizes it, and reports the cross-repo
-//! relations the agent sees. This module holds the shared data types and the
-//! relation-merge logic; there is no deterministic manifest engine anymore (the
-//! pipeline is agent-only — offline is not a supported mode).
+//! Cross-repo dependency graph types (ARCHITECTURE §4.9). The curator is a
+//! hybrid pipeline: deterministic manifest edges (source="manifest") provide a
+//! high-confidence floor, and the read-only agent fills in the runtime/infra
+//! relations on top. Precedence: user > manifest > agent. This module holds the
+//! shared data types and the relation-merge logic.
 
 /// The architectural tiers a repo (or a monorepo sub-component) can fall into.
 /// `backend` covers everything server-side (gateways/BFFs/aggregators included).
@@ -63,7 +62,8 @@ pub struct AgentRelation {
     pub via: String,
     #[serde(default)]
     pub confidence: u8,
-    /// "agent" (inferred) | "user" (human calibration — pinned). Empty == agent.
+    /// "agent" (inferred) | "manifest" (deterministic, from on-disk manifests) |
+    /// "user" (human calibration — pinned). Empty == agent.
     #[serde(default)]
     pub source: String,
     /// A human-removed edge: kept as a tombstone so the auto pass won't
@@ -119,40 +119,72 @@ pub fn agent_edges(
         .collect()
 }
 
-/// Merge a repo's current relations with a fresh agent pass: keep every
-/// user-sourced relation (including `rejected` tombstones), drop old agent
-/// relations, and add fresh agent relations EXCEPT any whose (to, kind[, via]) a
-/// user already owns. Both tombstones and positive pins are scoped to `via` when
-/// the user supplied one — so removing one false edge (e.g. `GET /orders`) or
-/// pinning a real one doesn't hide a DISTINCT relationship of the same kind
-/// between the same repos (e.g. `POST /payments`). A user relation with an empty
-/// `via` applies broadly to (to, kind), matching how edges are keyed when no
-/// evidence is recorded.
-pub fn merge_relations(existing: &[AgentRelation], fresh_agent: &[AgentRelation]) -> Vec<AgentRelation> {
+/// Merge a repo's current relations with fresh manifest and agent passes.
+///
+/// Precedence: **user > manifest > agent**. The result is:
+/// - All `user` relations (incl. `rejected` tombstones) — always kept.
+/// - Fresh `manifest` relations, unless a user tombstone suppresses that
+///   `(to, kind)` / `(to, kind, via)`.
+/// - Fresh `agent` relations, unless suppressed by a user OR manifest relation
+///   for that `(to, kind[, via])`.
+///
+/// Suppression scope: a user/manifest relation with an empty `via` suppresses
+/// the entire `(to, kind)` from the lower tier; one with a specific `via`
+/// suppresses only that exact `(to, kind, via)`.
+pub fn merge_relations(
+    existing: &[AgentRelation],
+    fresh_manifest: &[AgentRelation],
+    fresh_agent: &[AgentRelation],
+) -> Vec<AgentRelation> {
     use std::collections::HashSet;
+
+    // Start with every user relation (pins + tombstones).
     let mut out: Vec<AgentRelation> =
         existing.iter().filter(|r| r.source == "user").cloned().collect();
-    // (to, kind) for user relations with no via → suppress that whole kind.
-    let owned_kind: HashSet<(i32, String)> = out
+
+    // Build user-owned suppression sets from the user slice already in `out`.
+    let user_kind: HashSet<(i32, String)> = out
         .iter()
         .filter(|r| r.via.is_empty())
         .map(|r| (r.to, r.kind.clone()))
         .collect();
-    // (to, kind, via) for user relations with specific evidence → suppress only
-    // that exact edge.
-    let owned_exact: HashSet<(i32, String, String)> = out
+    let user_exact: HashSet<(i32, String, String)> = out
         .iter()
         .filter(|r| !r.via.is_empty())
         .map(|r| (r.to, r.kind.clone(), r.via.clone()))
         .collect();
-    for r in fresh_agent {
-        if owned_kind.contains(&(r.to, r.kind.clone()))
-            || owned_exact.contains(&(r.to, r.kind.clone(), r.via.clone()))
+
+    // Add fresh manifest relations not suppressed by a user claim.
+    for r in fresh_manifest {
+        if user_kind.contains(&(r.to, r.kind.clone()))
+            || user_exact.contains(&(r.to, r.kind.clone(), r.via.clone()))
         {
             continue;
         }
         out.push(r.clone());
     }
+
+    // Build manifest-owned suppression set: any manifest edge for (to, kind)
+    // suppresses that entire (to, kind) from the agent tier — manifest is
+    // deterministic, so a single manifest lib edge to repo X means the agent's
+    // lib claim for the same (to, kind) adds no information.
+    let manifest_kind: HashSet<(i32, String)> = out
+        .iter()
+        .filter(|r| r.source == "manifest")
+        .map(|r| (r.to, r.kind.clone()))
+        .collect();
+
+    // Add fresh agent relations not suppressed by a user OR manifest claim.
+    for r in fresh_agent {
+        if user_kind.contains(&(r.to, r.kind.clone()))
+            || user_exact.contains(&(r.to, r.kind.clone(), r.via.clone()))
+            || manifest_kind.contains(&(r.to, r.kind.clone()))
+        {
+            continue;
+        }
+        out.push(r.clone());
+    }
+
     out
 }
 
@@ -259,7 +291,7 @@ mod tests {
             // DISTINCT relationship to the pinned repo (different via) → kept.
             super::AgentRelation { to: 2, kind: "http".into(), via: "GET /orders".into(), confidence: 80, source: "agent".into(), rejected: false },
         ];
-        let merged = super::merge_relations(&existing, &fresh_agent);
+        let merged = super::merge_relations(&existing, &[], &fresh_agent);
         assert!(merged.iter().any(|r| r.to == 2 && r.source == "user" && r.via == "POST /pay"), "user edge survives");
         assert_eq!(
             merged.iter().filter(|r| r.to == 2 && r.kind == "http" && r.via == "POST /pay").count(),
@@ -281,6 +313,116 @@ mod tests {
         );
         assert!(!merged.iter().any(|r| r.to == 4), "stale agent edge dropped");
         assert!(merged.iter().any(|r| r.to == 5 && r.source == "agent"), "new agent edge added");
+    }
+
+    fn manifest_rel(to: i32, kind: &str, via: &str) -> super::AgentRelation {
+        super::AgentRelation {
+            to,
+            kind: kind.into(),
+            via: via.into(),
+            confidence: 100,
+            source: "manifest".into(),
+            rejected: false,
+        }
+    }
+
+    fn user_tombstone(to: i32, kind: &str) -> super::AgentRelation {
+        super::AgentRelation {
+            to,
+            kind: kind.into(),
+            via: "".into(),
+            confidence: 0,
+            source: "user".into(),
+            rejected: true,
+        }
+    }
+
+    #[test]
+    fn merge_manifest_suppressed_by_user_rejected() {
+        // A user-rejected (to=2, kind=lib) tombstone must suppress a fresh manifest
+        // edge with the same (to, kind). User always wins over manifest.
+        let existing = vec![user_tombstone(2, "lib")];
+        let fresh_manifest = vec![manifest_rel(2, "lib", "acme-lib")];
+        let merged = super::merge_relations(&existing, &fresh_manifest, &[]);
+        assert!(merged.iter().any(|r| r.to == 2 && r.rejected), "tombstone survives");
+        assert!(
+            !merged.iter().any(|r| r.to == 2 && r.source == "manifest"),
+            "manifest edge suppressed by user tombstone"
+        );
+    }
+
+    #[test]
+    fn merge_manifest_suppresses_agent_same_kind_not_other() {
+        // A manifest lib edge to repo 3 suppresses an agent lib edge to repo 3,
+        // but NOT an agent http edge to repo 3 (different kind).
+        let fresh_manifest = vec![manifest_rel(3, "lib", "some-lib")];
+        let fresh_agent = vec![
+            super::AgentRelation {
+                to: 3,
+                kind: "lib".into(),
+                via: "agent-lib-evidence".into(),
+                confidence: 70,
+                source: "agent".into(),
+                rejected: false,
+            },
+            super::AgentRelation {
+                to: 3,
+                kind: "http".into(),
+                via: "GET /api".into(),
+                confidence: 80,
+                source: "agent".into(),
+                rejected: false,
+            },
+        ];
+        let merged = super::merge_relations(&[], &fresh_manifest, &fresh_agent);
+        // manifest lib edge is present
+        assert!(
+            merged.iter().any(|r| r.to == 3 && r.kind == "lib" && r.source == "manifest"),
+            "manifest lib edge present"
+        );
+        // agent lib edge to same repo is suppressed by manifest
+        assert!(
+            !merged.iter().any(|r| r.to == 3 && r.kind == "lib" && r.source == "agent"),
+            "agent lib edge suppressed by manifest lib edge"
+        );
+        // agent http edge survives (different kind)
+        assert!(
+            merged.iter().any(|r| r.to == 3 && r.kind == "http" && r.source == "agent"),
+            "agent http edge survives — different kind from manifest lib"
+        );
+    }
+
+    #[test]
+    fn merge_agent_survives_without_user_or_manifest_claim() {
+        // Agent edges to repos that have no user/manifest claim survive.
+        // Use explicit source="agent" so the assertion is unambiguous.
+        let fresh_agent = vec![
+            super::AgentRelation {
+                to: 5,
+                kind: "grpc".into(),
+                via: "Svc.Call".into(),
+                confidence: 60,
+                source: "agent".into(),
+                rejected: false,
+            },
+            super::AgentRelation {
+                to: 6,
+                kind: "queue".into(),
+                via: "orders-topic".into(),
+                confidence: 75,
+                source: "agent".into(),
+                rejected: false,
+            },
+        ];
+        let merged = super::merge_relations(&[], &[], &fresh_agent);
+        assert!(
+            merged.iter().any(|r| r.to == 5 && r.source == "agent"),
+            "unclaimed agent grpc edge survives"
+        );
+        assert!(
+            merged.iter().any(|r| r.to == 6 && r.source == "agent"),
+            "unclaimed agent queue edge survives"
+        );
     }
 
     #[test]

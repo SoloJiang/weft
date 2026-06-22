@@ -1,9 +1,8 @@
-//! The workspace Curator (ARCHITECTURE §4.9, §4.11), now a PURE AGENT pipeline.
-//! There is no deterministic manifest engine: a bounded, read-only coding agent
-//! reads each repo deeply, classifies its tier (frontend / backend),
-//! summarizes it, surfaces monorepo sub-components, and reports the cross-repo
-//! relations it sees. Findings persist on `repo_profile`; the graph is rebuilt
-//! from them. A user edit (source = "user") always outranks re-analysis.
+//! The workspace Curator (ARCHITECTURE §4.9, §4.11): a hybrid pipeline where
+//! deterministic manifest edges (`source="manifest"`) provide the high-confidence
+//! lib floor, and a read-only coding agent fills the runtime/infra relations on
+//! top. Precedence: user > manifest > agent. Findings persist on `repo_profile`;
+//! the graph is rebuilt from them.
 
 use crate::git;
 use crate::profile::{self, AgentRelation, Component, Edge};
@@ -867,7 +866,7 @@ async fn persist_relations(
             .await?
             .map(|p| serde_json::from_str(&p.relations).unwrap_or_default())
             .unwrap_or_default();
-        let merged = crate::profile::merge_relations(&existing, &fresh);
+        let merged = crate::profile::merge_relations(&existing, &[], &fresh);
         let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
         repo::set_repo_relations(db, r.id, &json).await?;
     }
@@ -1358,6 +1357,84 @@ fn is_too_broad(dir: &Path) -> bool {
     }
 }
 
+/// Deterministic manifest edge pass: scan each existing-checkout repo's on-disk
+/// manifests, build a workspace-wide `provides_name → repo_id` map, and for
+/// each repo emit high-confidence `lib` edges to any workspace repo it depends
+/// on. Persists via `merge_relations` (user > manifest > agent), so existing
+/// user/agent relations are preserved.
+///
+/// Tolerant of missing checkouts, missing manifests, parse errors, and DB
+/// errors — any single failure leaves that repo's prior relations intact.
+pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    let repos = repo::list_repos(db, workspace_id).await?;
+
+    // Collect manifest info for every repo that has an existing checkout.
+    let mut repo_manifests: Vec<(repo_ref::Model, crate::manifest::ManifestInfo)> = Vec::new();
+    for r in &repos {
+        if !Path::new(&r.local_git_path).exists() {
+            continue;
+        }
+        let info = crate::manifest::scan_repo(Path::new(&r.local_git_path));
+        repo_manifests.push((r.clone(), info));
+    }
+
+    // Build workspace-wide provides_name → repo_id map (first-wins on collision).
+    let mut name_to_repo: HashMap<String, i32> = HashMap::new();
+    for (r, info) in &repo_manifests {
+        for name in &info.provides {
+            name_to_repo.entry(name.clone()).or_insert(r.id);
+        }
+    }
+
+    // For each repo, generate manifest lib edges for its requires that resolve to
+    // a DIFFERENT workspace repo, then merge with the existing relations.
+    for (r, info) in &repo_manifests {
+        let mut fresh_manifest: Vec<crate::profile::AgentRelation> = Vec::new();
+        for req in &info.requires {
+            if let Some(&target_id) = name_to_repo.get(req) {
+                if target_id == r.id {
+                    continue; // skip self-dependency
+                }
+                fresh_manifest.push(crate::profile::AgentRelation {
+                    to: target_id,
+                    kind: "lib".into(),
+                    via: req.clone(),
+                    confidence: 100,
+                    source: "manifest".into(),
+                    rejected: false,
+                });
+            }
+        }
+
+        // Reload existing relations so user/agent edges accumulated since the
+        // last pass are preserved through the merge.
+        let existing: Vec<crate::profile::AgentRelation> = repo::get_repo_profile(db, r.id)
+            .await
+            .unwrap_or(None)
+            .map(|p| serde_json::from_str(&p.relations).unwrap_or_default())
+            .unwrap_or_default();
+
+        // Keep agent relations from the existing set as "fresh_agent" so they
+        // survive the merge. User relations are already handled by merge_relations.
+        let existing_agent: Vec<crate::profile::AgentRelation> = existing
+            .iter()
+            .filter(|rel| rel.source == "agent" || rel.source.is_empty())
+            .cloned()
+            .collect();
+
+        let merged =
+            crate::profile::merge_relations(&existing, &fresh_manifest, &existing_agent);
+        let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
+        // Only persist if there is a profile row; skip silently if not.
+        let _ = repo::set_repo_relations(db, r.id, &json).await;
+    }
+
+    Ok(())
+}
+
 /// The cross-repo relations pass: reload the (classified) profiles, infer the
 /// runtime/infra/lib relations between them, and persist. Needs ≥2 profiled
 /// repos. A timed-out / unparseable reply leaves existing relations intact
@@ -1383,6 +1460,11 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
         }
     }
     if profiled.len() < 2 {
+        // Still run the manifest pass even with < 2 fully-profiled repos: repos
+        // with a checkout but pending/partial classification still benefit from
+        // deterministic lib edges (the graph shows them as placeholder nodes).
+        let _ = seed_manifest_relations(db, workspace_id).await;
+        emit_graph_updated(workspace_id);
         return Ok(());
     }
     let prompt = build_curator_prompt(&profiled);
@@ -1405,6 +1487,12 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
             persist_relations(db, &profiled, &relations).await?;
         }
     }
+    // Manifest pass AFTER the agent pass: `seed_manifest_relations` reloads the
+    // current relations (now including fresh agent edges) and merges manifest lib
+    // edges on top via the user>manifest>agent precedence. Running it last ensures
+    // the agent pass's `persist_relations` (which calls `merge_relations(&_, &[],
+    // &fresh_agent)`) doesn't overwrite the manifest edges.
+    let _ = seed_manifest_relations(db, workspace_id).await;
     emit_graph_updated(workspace_id);
     Ok(())
 }
@@ -2500,5 +2588,159 @@ mod tests {
         .unwrap();
         repo::set_repo_relations(&db, web.id, &rels).await.unwrap();
         assert!(graph(&db, ws.id).await.unwrap().edges.is_empty());
+    }
+
+    /// Helper: write temp manifests and register a repo with `local_git_path` pointing there.
+    async fn seed_repo_with_manifest(
+        db: &Db,
+        ws_id: i32,
+        name: &str,
+        manifest_filename: &str,
+        manifest_content: &str,
+    ) -> (crate::store::entities::repo_ref::Model, std::path::PathBuf) {
+        let tmp = std::env::temp_dir()
+            .join(format!("weft_seed_test_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(manifest_filename), manifest_content).unwrap();
+        let r = repo::add_repo_ref(db, ws_id, name, tmp.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        // Upsert a minimal profile so set_repo_relations has a row to update.
+        repo::upsert_repo_profile(db, r.id, "backend", "[]", "summary", "[]", "agent", "")
+            .await
+            .unwrap();
+        (r, tmp)
+    }
+
+    #[tokio::test]
+    async fn seed_manifest_relations_emits_lib_edge_between_workspace_repos() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_seed").await.unwrap();
+
+        // Repo A: package.json that requires "@acme/lib" (provided by B).
+        let (repo_a, tmp_a) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-a",
+            "package.json",
+            r#"{"name":"@acme/app","dependencies":{"@acme/lib":"^1","lodash":"^4"}}"#,
+        )
+        .await;
+
+        // Repo B: package.json that provides "@acme/lib".
+        let (repo_b, tmp_b) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-b",
+            "package.json",
+            r#"{"name":"@acme/lib","dependencies":{}}"#,
+        )
+        .await;
+
+        super::seed_manifest_relations(&db, ws.id).await.unwrap();
+
+        let rels_a: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, repo_a.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        // A should have a manifest lib edge to B.
+        assert!(
+            rels_a.iter().any(|r| r.to == repo_b.id
+                && r.kind == "lib"
+                && r.source == "manifest"
+                && r.via == "@acme/lib"
+                && !r.rejected),
+            "A has a manifest lib edge to B via @acme/lib"
+        );
+        // "lodash" is external (not in workspace) — no edge for it.
+        assert!(
+            !rels_a.iter().any(|r| r.via == "lodash"),
+            "external dep 'lodash' produces no edge"
+        );
+
+        // B has no requires that map to workspace repos → no lib edges.
+        let rels_b: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, repo_b.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        assert!(
+            rels_b.iter().all(|r| r.source != "manifest"),
+            "B has no manifest edges (it has no workspace deps)"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp_a);
+        let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    #[tokio::test]
+    async fn seed_manifest_relations_preserves_existing_agent_and_user_relations() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_seed2").await.unwrap();
+
+        let (repo_a, tmp_a) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-a2",
+            "package.json",
+            r#"{"name":"@acme/app2","dependencies":{"@acme/lib2":"^1"}}"#,
+        )
+        .await;
+        let (repo_b, tmp_b) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-b2",
+            "package.json",
+            r#"{"name":"@acme/lib2","dependencies":{}}"#,
+        )
+        .await;
+
+        // Pre-seed repo_a with an existing agent edge (http to B) and a user edge.
+        let pre_rels = serde_json::to_string(&vec![
+            AgentRelation {
+                to: repo_b.id,
+                kind: "http".into(),
+                via: "GET /health".into(),
+                confidence: 70,
+                source: "agent".into(),
+                rejected: false,
+            },
+            AgentRelation {
+                to: repo_b.id,
+                kind: "grpc".into(),
+                via: "Svc.Call".into(),
+                confidence: 90,
+                source: "user".into(),
+                rejected: false,
+            },
+        ])
+        .unwrap();
+        repo::set_repo_relations(&db, repo_a.id, &pre_rels).await.unwrap();
+
+        super::seed_manifest_relations(&db, ws.id).await.unwrap();
+
+        let rels_a: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, repo_a.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        // Manifest lib edge must be present.
+        assert!(
+            rels_a.iter().any(|r| r.source == "manifest" && r.kind == "lib"),
+            "manifest lib edge added"
+        );
+        // Prior user edge must survive.
+        assert!(
+            rels_a.iter().any(|r| r.source == "user" && r.kind == "grpc"),
+            "prior user grpc edge preserved"
+        );
+        // Prior agent http edge must survive (different kind from manifest lib).
+        assert!(
+            rels_a.iter().any(|r| r.source == "agent" && r.kind == "http"),
+            "prior agent http edge preserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_a);
+        let _ = std::fs::remove_dir_all(&tmp_b);
     }
 }
