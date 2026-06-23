@@ -280,6 +280,12 @@ impl TurnState {
 
     /// 按 id 列表重排；order 必须是当前可见(有 queue_id)项的排列，否则不动并返回 false。
     pub fn reorder(&mut self, order: &[i32]) -> bool {
+        // A pending invisible bus wake pins a FIFO index (bus_read_pos); reordering
+        // would mis-place it relative to the wake, so refuse while one is pending
+        // (rare/transient — the composer re-syncs the drag from the re-emitted state).
+        if self.bus_read_pos.is_some() {
+            return false;
+        }
         let tracked: Vec<i32> = self.queue.iter().filter_map(|o| o.queue_id).collect();
         if order.len() != tracked.len() {
             return false;
@@ -2038,11 +2044,14 @@ pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i
 /// 重排队列；order 必须是当前队列 id 的排列，否则返回 Err。
 pub async fn queue_reorder(app: &AppHandle, _db: &Db, eng: &EngineRef, order: Vec<i32>) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
-    if !inner.turn.reorder(&order) {
+    let ok = inner.turn.reorder(&order);
+    let (tid, sid) = (inner.thread_id, inner.session_id);
+    // Re-emit the authoritative order even on rejection, so an optimistic drag the
+    // backend refused (bad permutation / pending bus wake) snaps back in the UI.
+    emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
+    if !ok {
         return Err(anyhow::anyhow!("bad_order"));
     }
-    let (tid, sid) = (inner.thread_id, inner.session_id);
-    emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
     Ok(())
 }
 
@@ -3560,6 +3569,21 @@ mod tests {
         t.queue.push_back(Outgoing { queue_id: Some(4), ..Default::default() });
         assert_eq!(t.queue.len(), 5);
         assert_eq!(visible_queued(&t), 4, "hidden delivery must not eat the cap budget");
+    }
+
+    #[test]
+    fn reorder_refused_while_bus_wake_pending() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy
+        t.queue.push_back(Outgoing { queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(2), ..Default::default() });
+        assert!(!t.request_bus_read()); // wake coalesced at index 2
+        assert!(t.bus_read_pos.is_some());
+        // A valid permutation is still refused while the wake is pending, so the
+        // wake can't be mis-placed relative to a dragged message.
+        assert!(!t.reorder(&[2, 1]));
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![1, 2], "queue untouched on refusal");
     }
 
     /// queue_edit must preserve images/files in the persisted row; only text changes.
