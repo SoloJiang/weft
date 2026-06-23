@@ -142,8 +142,13 @@ fn spawn_shell_path_refresh(file: std::path::PathBuf) {
 /// Whether any known coding-agent CLI resolves on the current process PATH. Used
 /// to tell a healthy cache from one made stale by a newly-installed agent — a
 /// false here is the signal to re-probe synchronously rather than wait a launch.
+/// Resolves the EFFECTIVE command (honoring a configured alias like `claude` →
+/// `cc-claude`), so this must run after `tool_command::set_overrides` — see the
+/// `augment_path()` call site in `lib.rs`.
 fn known_agent_resolves() -> bool {
-    TOOL_PRIORITY.iter().any(|t| resolve_tool_path(t).is_some())
+    TOOL_PRIORITY
+        .iter()
+        .any(|t| resolve_tool_path(&crate::tool_command::command_for(t)).is_some())
 }
 
 /// Run once at startup: fold the user's login-shell PATH into this process's PATH
@@ -474,6 +479,9 @@ mod tests {
         assert!(read_cached_shell_path(&blank).is_none());
     }
 
+    // `:`-joined PATH + split_paths is unix semantics (Windows uses `;`), and the
+    // whole login-shell augmentation is unix-only anyway.
+    #[cfg(unix)]
     #[test]
     fn cached_path_with_nvm_bin_resolves_codex_after_merge() {
         // Reproduces the bug at the cache layer: a cached login-shell PATH that

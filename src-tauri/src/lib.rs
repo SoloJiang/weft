@@ -69,10 +69,6 @@ fn mcp_bridge_enabled() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Make GUI-launched spawns find nvm/fnm/volta/native-installer CLIs by folding
-    // known tool dirs + the login-shell PATH into this process's PATH (see detect.rs).
-    detect::augment_path();
-
     // Pin the rustls CryptoProvider. Several of our transitive deps enable
     // both `ring` and `aws-lc-rs`, which makes rustls 0.23 refuse to auto-pick
     // and panic at the first TLS handshake ("Could not automatically determine
@@ -93,6 +89,13 @@ pub fn run() {
         });
         tool_command::set_overrides(map);
     }
+
+    // Make GUI-launched spawns find nvm/fnm/volta/native-installer CLIs by folding
+    // the login-shell PATH into this process's PATH (see detect.rs). Runs AFTER the
+    // command overrides load so its cache-staleness check can honor aliases
+    // (`claude` → `cc-claude`); nothing between here and the first agent spawn needs
+    // PATH, so the later placement is safe.
+    detect::augment_path();
 
     // App-level backup handle: scheduler + on-exit + commands all share it.
     let backup_svc = backup::BackupService::new(

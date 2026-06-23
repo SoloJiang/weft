@@ -982,9 +982,18 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        // A missing CLI surfaces as the stable `agent-not-found:<tool>` code so
-        // the failed-analysis notice localizes it, not raw "os error 2".
-        .map_err(|e| anyhow::anyhow!("{}", crate::tool_command::spawn_error_message(tool, &command, &e)))?;
+        // A missing CLI surfaces as the stable `agent-not-found:<tool>` code so the
+        // failed-analysis notice localizes it, not raw "os error 2". But a `cwd`
+        // deleted between the earlier `cwd.exists()` check and this spawn ALSO
+        // yields ErrorKind::NotFound — classify that as the existing
+        // `checkout-missing` code, not agent-not-found.
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound && !cwd.exists() {
+                anyhow::anyhow!("checkout-missing")
+            } else {
+                anyhow::anyhow!("{}", crate::tool_command::spawn_error_message(tool, &command, &e))
+            }
+        })?;
     if let Some(mut stdin) = child.stdin.take() {
         // claude reads the message from stdin as a stream-json user envelope
         // (matches engine::write_user); per-turn tools already have it on argv.
