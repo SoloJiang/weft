@@ -283,6 +283,18 @@ pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<(
     // keeps its failed state — we no longer clear failures up front (that dropped
     // such repos to a silent idle).
     crate::curator::analyze_workspace_coalesced(&db, workspace_id, true).await;
+    // If every tracked repo's checkout is gone, the pass analyzes nothing yet the
+    // stale profiles still read as classified — surface that as an error so the UI
+    // reports a failed run instead of a misleading "map updated" (the frontend's
+    // catch maps a rejection to the failed status; the message itself isn't shown).
+    let repos = repo::list_repos(&db, workspace_id).await.map_err(e)?;
+    if !repos.is_empty()
+        && !repos
+            .iter()
+            .any(|r| std::path::Path::new(&r.local_git_path).exists())
+    {
+        return Err("all repository checkouts are missing on disk".to_string());
+    }
     Ok(())
 }
 

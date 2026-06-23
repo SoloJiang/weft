@@ -416,9 +416,12 @@ export const zh = {
     reanalyze: "分析依赖",
     reanalyzing: "分析中…",
     reanalyzeHint: "重新运行 agent，为每个仓库判定层级并推断跨仓关系（只读）",
+    analysisRunning: "正在重新分析依赖…",
+    analysisDone: "依赖分析已完成",
     detailTab: "详情",
     curatorTitle: "依赖助手",
     curatorLoading: "正在打开依赖助手…",
+    curatorCompose: "给依赖助手发消息…",
     deleteRepo: "从工作区移除",
     deleteRepoTitle: "移除 {{name}}？",
     deleteRepoBody:
@@ -467,7 +470,6 @@ export const zh = {
     chatTab: "对话",
     mapTab: "地图",
     mapEmpty: "运行分析后生成依赖地图",
-    regenerateMap: "重新生成",
   },
   inspect: {
     label: "检视 —— 显示、复制路径",

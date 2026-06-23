@@ -431,9 +431,12 @@ export const en = {
     reanalyze: "Analyze deps",
     reanalyzing: "Analyzing…",
     reanalyzeHint: "Re-run the agent to classify each repo's tier and infer cross-repo links (read-only)",
+    analysisRunning: "Re-analyzing dependencies…",
+    analysisDone: "Dependency analysis complete",
     detailTab: "Detail",
     curatorTitle: "Curator",
     curatorLoading: "Opening curator…",
+    curatorCompose: "Message the curator…",
     deleteRepo: "Remove from workspace",
     deleteRepoTitle: "Remove {{name}}?",
     deleteRepoBody:
@@ -483,7 +486,6 @@ export const en = {
     chatTab: "Chat",
     mapTab: "Map",
     mapEmpty: "Run analysis to generate the map",
-    regenerateMap: "Regenerate",
   },
   inspect: {
     label: "Inspect — reveal, copy path",

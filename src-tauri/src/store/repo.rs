@@ -3334,6 +3334,20 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn next_turn_id_increments_from_last_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws_turn").await.unwrap();
+        let t = create_thread(&db, ws.id, "curator", "curator", "claude").await.unwrap();
+        // Empty thread → 1.
+        assert_eq!(next_turn_id(&db, t.id).await.unwrap(), 1);
+        // Insert a row with turn_id 4 → next is 5.
+        insert_lead_message(&db, t.id, None, 4, "user", "text", r#"{"text":"hi"}"#, "complete")
+            .await
+            .unwrap();
+        assert_eq!(next_turn_id(&db, t.id).await.unwrap(), 5);
+    }
+
     /// FIX 4: assign_delivery_seq makes a reordered-then-delivered row sort after
     /// rows with lower ids that were NOT yet assigned a seq.
     /// Insert A (id=low), B (id=mid), C (id=high). Deliver B first (simulating a

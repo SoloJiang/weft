@@ -55,6 +55,17 @@ export interface OpenSession {
   nativeId: string | null;
 }
 
+/** Result of the last dependency-analysis pass for a workspace — drives the
+ *  curator panel's non-conversational status strip. Deliberately coarse: the pass
+ *  RAN (`done`) or it FAILED to run (`failed` = the command rejected). We don't
+ *  claim "map updated with N links" — the pipeline silently skips missing checkouts
+ *  and swallows relation-agent failures, so the frontend can't assert that; per-repo
+ *  state shows on the graph nodes instead. */
+export type AnalysisOutcomeState = "done" | "failed";
+export interface AnalysisOutcome {
+  state: AnalysisOutcomeState;
+}
+
 interface Store {
   workspaces: Workspace[];
   activeWorkspaceId: number | null;
@@ -178,6 +189,12 @@ interface Store {
   refreshReposAndMap: (workspaceId?: number) => Promise<void>;
   reprofileRepo: (repoId: number) => Promise<void>;
   reanalyzeDeps: () => Promise<void>;
+  /** A workspace dependency-analysis run is in flight (shared by every Analyze
+   *  entry so spinners stay in sync and a second click can't double-run). */
+  analyzing: boolean;
+  /** Last completed analysis outcome for the active workspace (null until a run
+   *  finishes) — rendered as the curator panel's status strip, not a chat row. */
+  analysisOutcome: AnalysisOutcome | null;
   deleteRepo: (repoId: number) => Promise<void>;
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
@@ -357,6 +374,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
+  // In-flight dependency analyses, keyed by workspace — the backend serializes per
+  // workspace, so workspace B must not be gated by A's run. `analyzing` exposed in
+  // the context value is derived for the ACTIVE workspace; the ref backs the
+  // synchronous dedup guard.
+  const [analyzingWs, setAnalyzingWs] = useState<ReadonlySet<number>>(() => new Set());
+  const analyzingWsRef = useRef<Set<number>>(new Set());
+  const markAnalyzing = useCallback((ws: number, on: boolean) => {
+    if (on) analyzingWsRef.current.add(ws);
+    else analyzingWsRef.current.delete(ws);
+    setAnalyzingWs(new Set(analyzingWsRef.current));
+  }, []);
+  // Last analysis outcome per workspace (status strip, not a chat row).
+  const [analysisOutcomeWs, setAnalysisOutcomeWs] = useState<Record<number, AnalysisOutcome>>({});
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
@@ -366,7 +396,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // the backend get-or-create is not atomic, so concurrent ensures for the SAME
   // workspace could create dupes. Keyed by ws so switching to another workspace
   // mid-flight still ensures that one (a single boolean would drop it).
-  const ensuringCuratorRef = useRef<Set<number>>(new Set());
+  // Per-workspace in-flight curator-thread ensure, coalesced by a shared PROMISE so a
+  // racing Analyze + drawer-open resolve the SAME thread (the backend get-or-create is
+  // not atomic) and both await the same threads-list sync.
+  const curatorEnsureRef = useRef<Map<number, Promise<number>>>(new Map());
   // Snapshot of the view that was active when the user opened Settings, so
   // the back arrow restores it instead of dropping them on the board.
   const prevHomeRef = useRef<{
@@ -1654,17 +1687,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refreshRepoMap],
   );
 
-  // Manually re-run the agent dependency curator, then refresh the map so the
-  // newly inferred runtime/infra edges appear. Slow (spawns a read-only agent).
-  const reanalyzeDeps = useCallback(async () => {
-    const ws = activeWorkspaceId;
-    if (ws == null) return;
-    await api.analyzeWorkspaceDeps(ws);
-    // The analysis can run up to the curator timeout; if the user switched
-    // workspaces meanwhile, don't overwrite the now-current map with ws's graph.
-    if (activeWorkspaceIdRef.current === ws) await refreshRepoMap();
-  }, [activeWorkspaceId, refreshRepoMap]);
-
   const editRepoSummary = useCallback(
     async (repoId: number, summary: string) => {
       await api.updateRepoProfile(repoId, summary, null);
@@ -1696,26 +1718,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeWorkspaceId, refreshReposAndMap, refreshOverview, activeThreadId, loadThreadChildren],
   );
 
-  // Ensure the workspace's hidden curator thread exists and remember its id —
-  // WITHOUT navigating. The curator chat renders embedded in the Repo Map panel
-  // (RepoSidePanel), so unlike a normal lead chat we never selectThread.
-  const ensureCuratorThread = useCallback(async () => {
-    const ws = activeWorkspaceId;
-    if (ws == null || ensuringCuratorRef.current.has(ws)) return;
-    ensuringCuratorRef.current.add(ws);
-    try {
+  // Get-or-create the workspace's hidden curator thread and return its id, WITHOUT
+  // navigating. Coalesces concurrent callers (drawer open + Analyze) on one promise
+  // so the backend's non-atomic get-or-create can't make two threads, and syncs
+  // `threads` (so the embedded LeadTab resolves the right lead_tool) + `curatorThreadId`
+  // — those global writes gated on ws still being active.
+  const ensureCuratorThreadId = useCallback(async (ws: number): Promise<number> => {
+    const inflight = curatorEnsureRef.current.get(ws);
+    if (inflight) return inflight;
+    const p = (async () => {
       const id = await api.openCuratorChat(ws); // get-or-create; returns the id
       const list = await api.listThreads(ws);
-      // Bail if the user switched workspaces while these requests were in flight.
-      if (activeWorkspaceIdRef.current !== ws) return;
-      // The curator thread may have just been created — sync `threads` so the
-      // embedded LeadTab can resolve its lead_tool.
-      setThreads(list);
-      setCuratorThreadId(id);
+      if (activeWorkspaceIdRef.current === ws) {
+        setThreads(list);
+        setCuratorThreadId(id);
+      }
+      return id;
+    })();
+    curatorEnsureRef.current.set(ws, p);
+    try {
+      return await p;
     } finally {
-      ensuringCuratorRef.current.delete(ws);
+      curatorEnsureRef.current.delete(ws);
     }
-  }, [activeWorkspaceId]);
+  }, []);
+
+  // The curator chat renders embedded in the Repo Map panel (RepoSidePanel), so
+  // unlike a normal lead chat we never selectThread — just ensure it exists.
+  const ensureCuratorThread = useCallback(async () => {
+    const ws = activeWorkspaceId;
+    if (ws == null) return;
+    await ensureCuratorThreadId(ws);
+  }, [activeWorkspaceId, ensureCuratorThreadId]);
 
   const openRepoDetail = useCallback((repoId: number) => {
     setSelectedRepoId(repoId);
@@ -1726,6 +1760,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoDrawerTabState("curator");
     setRepoDrawerOpen(true);
   }, []);
+
+  // The single Analyze entry: open the curator, mirror a trigger message into
+  // its thread, run the real pipeline, then finalize the running line to a summary
+  // (or a failure note if the pass errors). The per-workspace `analyzingWsRef`
+  // dedups concurrent clicks; the derived `analyzing` syncs the active view's spinner.
+  const reanalyzeDeps = useCallback(async () => {
+    const ws = activeWorkspaceId;
+    if (ws == null || analyzingWsRef.current.has(ws)) return;
+    markAnalyzing(ws, true);
+    // Drop any prior outcome for this workspace while the run is in flight (the
+    // status strip shows "running" off `analyzing`).
+    setAnalysisOutcomeWs((m) => {
+      if (!(ws in m)) return m;
+      const next = { ...m };
+      delete next[ws];
+      return next;
+    });
+    // The curator panel is the home of analysis — open it so its status strip shows.
+    if (activeWorkspaceIdRef.current === ws) openCurator();
+    try {
+      // The command is the authority on whether the pass ran: it rejects when the
+      // workspace has no analyzable checkout (all missing). A resolve = it ran.
+      await api.analyzeWorkspaceDeps(ws);
+      setAnalysisOutcomeWs((m) => ({ ...m, [ws]: { state: "done" } }));
+      // Best-effort graph-display refresh; its failure doesn't change the run outcome
+      // (the pass already ran). Skip the write if the user switched away mid-run.
+      try {
+        const g = await api.repoGraph(ws);
+        if (activeWorkspaceIdRef.current === ws) {
+          setRepoProfiles(g.nodes);
+          setRepoEdges(g.edges);
+        }
+      } catch {
+        /* graph refresh is cosmetic; the analysis outcome stands */
+      }
+    } catch {
+      setAnalysisOutcomeWs((m) => ({ ...m, [ws]: { state: "failed" } }));
+    } finally {
+      markAnalyzing(ws, false);
+    }
+  }, [activeWorkspaceId, openCurator, markAnalyzing]);
+
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
 
@@ -2193,6 +2269,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshRepoMap,
     refreshReposAndMap,
     reprofileRepo,
+    analyzing: activeWorkspaceId != null && analyzingWs.has(activeWorkspaceId),
+    analysisOutcome:
+      activeWorkspaceId != null ? (analysisOutcomeWs[activeWorkspaceId] ?? null) : null,
     reanalyzeDeps,
     deleteRepo,
     curatorThreadId,

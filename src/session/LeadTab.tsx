@@ -40,10 +40,14 @@ export function LeadTab({
   onReview,
   threadId,
   compact = false,
+  composePlaceholder,
 }: {
   onReview: () => void;
   threadId?: number;
   compact?: boolean;
+  /** Composer placeholder override — the curator panel passes its own so the
+   *  embedded chat doesn't read "给 lead 发消息…" (lead-chat jargon). */
+  composePlaceholder?: string;
 }) {
   const {
     activeThreadId,
@@ -222,6 +226,7 @@ export function LeadTab({
           slashCommands={leadSlash[tid] ?? []}
           localSlash={localSlash}
           onLocalSlash={onLocalSlash}
+          placeholder={composePlaceholder}
           busy={turn.state === "busy"}
           queued={turn.queue.length}
           onSend={(text, images, files) =>
