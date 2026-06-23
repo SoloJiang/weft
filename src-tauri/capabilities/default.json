@@ -15,6 +15,7 @@
     },
     "dialog:default",
     "notification:default",
-    "updater:default"
+    "updater:default",
+    "mcp-bridge:default"
   ]
 }

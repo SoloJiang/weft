@@ -14,7 +14,6 @@ import type {
   LeadStateInfo,
   LiveWorkerSlot,
   NeedItem,
-  NormEvent,
   ObserveRef,
   ParsedSkill,
   PermissionAsk,
@@ -178,8 +177,6 @@ export const api = {
     invoke<ObserveRef | null>("session_for", { directionId, repoId }),
   sessionMeta: (directionId: number, repoId: number) =>
     invoke<SessionMetaSnapshot>("session_meta", { directionId, repoId }),
-  readTranscript: (cwd: string, tool: string) =>
-    invoke<NormEvent[]>("read_transcript", { cwd, tool }),
   worktreeDiff: (cwd: string) =>
     invoke<WorktreeDiff>("worktree_diff", { cwd }),
   /** PR-style diff against the task's target branch. `fetch` refreshes

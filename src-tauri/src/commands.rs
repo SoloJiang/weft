@@ -692,13 +692,6 @@ pub async fn set_direction_target_branch(
         .map_err(e)
 }
 
-/// Observe-mode (§4.4): the agent's own transcript, normalized to app-native
-/// events so the chat view never depends on rendering the live TUI.
-#[tauri::command]
-pub async fn read_transcript(cwd: String, tool: String) -> R<Vec<crate::sidecar::NormEvent>> {
-    Ok(crate::sidecar::read_transcript(std::path::Path::new(&cwd), &tool).await)
-}
-
 /// A worktree row plus whether its directory is still present on disk. The board
 /// uses `exists` to offer "delete worktree" only when there's actually a directory
 /// to reclaim — a row can outlive its directory if it was removed out-of-band.

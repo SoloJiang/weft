@@ -192,7 +192,6 @@ pub fn run() {
             commands::update_repo_profile,
             commands::list_directions,
             commands::set_task_status,
-            commands::read_transcript,
             commands::worktree_diff,
             commands::worktree_diff_target,
             commands::set_direction_target_branch,

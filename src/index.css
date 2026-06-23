@@ -1,4 +1,53 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is([data-theme="dark"] *));
+
+/* shadcn/ui theme bridge — maps component tokens to Weft's Loom palette. */
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: var(--font-sans);
+
+  --color-background: var(--c-bg);
+  --color-foreground: var(--c-ink);
+  --color-card: var(--c-raised);
+  --color-card-foreground: var(--c-ink);
+  --color-popover: var(--c-surface);
+  --color-popover-foreground: var(--c-ink);
+  --color-primary: var(--c-brand);
+  --color-primary-foreground: var(--c-brand-ink);
+  --color-secondary: var(--c-surface);
+  --color-secondary-foreground: var(--c-ink);
+  --color-muted: var(--c-surface);
+  --color-muted-foreground: var(--c-ink-muted);
+  --color-accent: var(--c-accent);
+  --color-accent-foreground: var(--c-ink);
+  --color-destructive: var(--c-danger);
+  --color-border: var(--c-border);
+  --color-input: var(--c-border);
+  --color-ring: var(--c-brand);
+
+  --color-sidebar: var(--c-surface);
+  --color-sidebar-foreground: var(--c-ink);
+  --color-sidebar-primary: var(--c-brand);
+  --color-sidebar-primary-foreground: var(--c-brand-ink);
+  --color-sidebar-accent: var(--c-hover);
+  --color-sidebar-accent-foreground: var(--c-ink);
+  --color-sidebar-border: var(--c-border);
+  --color-sidebar-ring: var(--c-brand);
+
+  --color-chart-1: var(--c-brand);
+  --color-chart-2: var(--c-accent);
+  --color-chart-3: var(--c-running);
+  --color-chart-4: var(--c-waiting);
+  --color-chart-5: var(--c-success);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}
 
 /* ───────────────────────── weft design tokens (DESIGN.md) ─────────────────────────
    High-density. Brand sourced from public/weft-*.svg: INDIGO = the parallel work
@@ -164,6 +213,18 @@
 .weft-pulse {
   animation: weft-pulse 1.8s var(--ease-out-quint) infinite;
 }
+.weft-shimmer {
+  animation: weft-shimmer 1.6s var(--ease-out-quint) infinite;
+}
+
+@keyframes weft-shimmer {
+  from {
+    transform: translateX(-120%);
+  }
+  to {
+    transform: translateX(240%);
+  }
+}
 
 /* 丝滑: subtle screen-enter when the route changes (keyed wrapper remounts) */
 @keyframes weft-screen-in {
@@ -183,7 +244,8 @@
 /* motion only when something changed; honor reduced-motion everywhere */
 @media (prefers-reduced-motion: reduce) {
   .weft-pulse,
-  .weft-screen-in {
+  .weft-screen-in,
+  .weft-shimmer {
     animation: none;
   }
 }
@@ -340,4 +402,9 @@ body[data-cmd="1"] .weft-file-ref:hover {
   text-decoration: underline;
   text-decoration-color: var(--color-brand);
   text-underline-offset: 2px;
+}
+
+/* shadcn/ui radius scale. */
+:root {
+  --radius: 0.625rem;
 }

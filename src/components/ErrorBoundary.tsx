@@ -1,6 +1,7 @@
 import { Component, type ReactNode } from "react";
 import { TriangleAlert } from "lucide-react";
 import i18n from "../i18n";
+import { StackTrace } from "./ai-elements";
 
 /**
  * A screen crash shows a readable fallback instead of white-screening the whole
@@ -26,9 +27,11 @@ export class ErrorBoundary extends Component<
           </div>
           <h2 className="mt-3 text-[14px] font-semibold text-ink">{i18n.t("error.title")}</h2>
           <p className="mt-1.5 text-[12px] text-ink-faint">{i18n.t("error.body")}</p>
-          <pre className="mt-3 max-h-40 w-full overflow-auto whitespace-pre-wrap rounded-[var(--radius-md)] border border-border bg-bg px-3 py-2 text-left font-mono text-[11px] text-danger">
-            {String(this.state.err.message || this.state.err)}
-          </pre>
+          <StackTrace
+            title={i18n.t("error.stackTrace")}
+            message={String(this.state.err.message || this.state.err)}
+            stack={this.state.err.stack}
+          />
           <button
             onClick={() => this.setState({ err: null })}
             className="mt-3 rounded-[var(--radius-md)] bg-brand px-3 py-1.5 text-[12.5px] font-medium text-brand-ink transition-colors hover:bg-brand/90"
