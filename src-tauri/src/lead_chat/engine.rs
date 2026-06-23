@@ -247,9 +247,18 @@ impl TurnState {
 
     /// 删除某条仍排队的消息；true=删掉了。
     pub fn remove(&mut self, id: i32) -> bool {
-        let before = self.queue.len();
-        self.queue.retain(|o| o.queue_id != Some(id));
-        self.queue.len() != before
+        let Some(pos) = self.queue.iter().position(|o| o.queue_id == Some(id)) else {
+            return false;
+        };
+        self.queue.remove(pos);
+        // A coalesced bus-read sits at a FIFO index; dropping an item before it
+        // shifts that index left, else a later send would jump ahead of the wake.
+        if let Some(n) = self.bus_read_pos {
+            if pos < n {
+                self.bus_read_pos = Some(n - 1);
+            }
+        }
+        true
     }
 
     /// 改某条排队消息文本；true=改了。
@@ -263,25 +272,42 @@ impl TurnState {
         false
     }
 
-    /// 按 id 列表重排；order 必须是当前队列 id 的排列，否则不动并返回 false。
+    /// 按 id 列表重排；order 必须是当前可见(有 queue_id)项的排列，否则不动并返回 false。
     pub fn reorder(&mut self, order: &[i32]) -> bool {
-        let cur: Vec<i32> = self.queue.iter().filter_map(|o| o.queue_id).collect();
-        if order.len() != cur.len() {
+        let tracked: Vec<i32> = self.queue.iter().filter_map(|o| o.queue_id).collect();
+        if order.len() != tracked.len() {
             return false;
         }
         let mut a = order.to_vec();
-        let mut b = cur.clone();
+        let mut b = tracked.clone();
         a.sort_unstable();
         b.sort_unstable();
         if a != b {
             return false;
         }
-        let mut next: VecDeque<Outgoing> = VecDeque::new();
-        for id in order {
-            if let Some(pos) = self.queue.iter().position(|o| o.queue_id == Some(*id)) {
-                if let Some(item) = self.queue.remove(pos) {
-                    next.push_back(item);
+        // Reorder only the visible (user) items; untracked deliveries — internal
+        // nudges / bus replies queued mid-turn — keep their absolute slots so a user
+        // drag never drops or resequences them.
+        let slots: Vec<bool> = self.queue.iter().map(|o| o.queue_id.is_some()).collect();
+        let mut by_id: HashMap<i32, Outgoing> = HashMap::new();
+        let mut untracked: VecDeque<Outgoing> = VecDeque::new();
+        for o in self.queue.drain(..) {
+            match o.queue_id {
+                Some(id) => {
+                    by_id.insert(id, o);
                 }
+                None => untracked.push_back(o),
+            }
+        }
+        let mut order_it = order.iter();
+        let mut next: VecDeque<Outgoing> = VecDeque::new();
+        for is_tracked in slots {
+            if is_tracked {
+                if let Some(o) = order_it.next().and_then(|id| by_id.remove(id)) {
+                    next.push_back(o);
+                }
+            } else if let Some(o) = untracked.pop_front() {
+                next.push_back(o);
             }
         }
         self.queue = next;
@@ -368,10 +394,42 @@ async fn mark_queued_delivered(
         None => repo::complete_queued(db, thread_id, session_id).await,
     };
     match res {
-        Ok(Some(m)) => emit_finalize(app, thread_id, m.id, "complete"),
+        Ok(Some(m)) => {
+            // Carry the (possibly edited) text so the transcript shows what was
+            // delivered, not the stale original Push::Message body.
+            let content = finalize_text_if_plain(&m);
+            let _ = app.emit(
+                EVENT,
+                Push::Finalize {
+                    thread_id,
+                    message_id: m.id,
+                    status: "complete".into(),
+                    content,
+                },
+            );
+        }
         Ok(None) => {}
         Err(e) => eprintln!("[weft] queued message complete failed: {e}"),
     }
+}
+
+/// A delivered row's text, but only for a plain text row with no attachments. The
+/// finalize-content channel wraps content as `{text}`, which would mangle a command
+/// row or drop image/file chips — those keep their original cached body (None).
+fn finalize_text_if_plain(m: &crate::store::entities::lead_message::Model) -> Option<String> {
+    if m.kind != "text" {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&m.content).ok()?;
+    let non_empty = |key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .is_some_and(|a| !a.is_empty())
+    };
+    if non_empty("images") || non_empty("files") {
+        return None;
+    }
+    v.get("text").and_then(|t| t.as_str()).map(String::from)
 }
 
 async fn mark_queued_status(
@@ -3447,6 +3505,40 @@ mod tests {
         assert_eq!(ids, vec![30, 20]); // queue untouched
         assert!(!t.remove(999));
         assert!(!t.edit(999, "x"));
+    }
+
+    #[test]
+    fn reorder_preserves_untracked_items() {
+        // Visible T1, an internal untracked delivery, then visible T2.
+        let mut t = TurnState::default();
+        t.queue.push_back(Outgoing { text: "t1".into(), queue_id: Some(10), ..Default::default() });
+        t.queue.push_back(Outgoing { text: "nudge".into(), tracked: false, queue_id: None, ..Default::default() });
+        t.queue.push_back(Outgoing { text: "t2".into(), queue_id: Some(20), ..Default::default() });
+        // Reorder the two visible items; the untracked nudge must keep its slot.
+        assert!(t.reorder(&[20, 10]));
+        let ids: Vec<Option<i32>> = t.queue.iter().map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![Some(20), None, Some(10)]);
+        assert_eq!(t.queue.len(), 3, "untracked nudge must not be dropped");
+        assert_eq!(t.queue[1].text, "nudge");
+    }
+
+    #[test]
+    fn remove_keeps_bus_read_position_in_sync() {
+        // A, B queued; a bus wake lands (read at index 2); then C queued.
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy
+        t.queue.push_back(Outgoing { text: "a".into(), queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { text: "b".into(), queue_id: Some(2), ..Default::default() });
+        assert!(!t.request_bus_read()); // busy → coalesced at index 2
+        assert_eq!(t.bus_read_pos, Some(2));
+        t.queue.push_back(Outgoing { text: "c".into(), queue_id: Some(3), ..Default::default() });
+        // Deleting A (index 0, before the wake) shifts the wake left so C still
+        // delivers AFTER the inbox-read, not ahead of it.
+        assert!(t.remove(1));
+        assert_eq!(t.bus_read_pos, Some(1));
+        // Deleting C (index 1, == wake index, not before) leaves the wake put.
+        assert!(t.remove(3));
+        assert_eq!(t.bus_read_pos, Some(1));
     }
 
     /// queue_edit must preserve images/files in the persisted row; only text changes.
