@@ -628,6 +628,9 @@ pub async fn upsert_repo_profile(
     source: &str,
     profiled_commit: &str,
 ) -> Result<repo_profile::Model> {
+    if get_repo(db, repo_id).await?.is_none() {
+        anyhow::bail!("repo {repo_id} not found");
+    }
     let mut a = match get_repo_profile(db, repo_id).await? {
         Some(m) => m.into(),
         None => repo_profile::ActiveModel {
@@ -3605,6 +3608,21 @@ mod tests {
 
         let profile = get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(profile.relations, "[]");
+    }
+
+    #[tokio::test]
+    async fn upsert_repo_profile_rejects_deleted_repo_ref() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        repo_ref::Entity::delete_by_id(r.id).exec(&db.0).await.unwrap();
+
+        let err = upsert_repo_profile(&db, r.id, "backend", "[]", "summary", "[]", "agent", "")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+        assert!(get_repo_profile(&db, r.id).await.unwrap().is_none());
     }
 
     /// A manual edge calibration mutates relations → the stored map doc (describing
