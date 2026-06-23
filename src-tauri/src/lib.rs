@@ -69,8 +69,9 @@ fn mcp_bridge_enabled() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Make GUI-launched spawns find nvm/fnm/native-installer CLIs (see detect.rs).
-    detect::augment_path_from_login_shell();
+    // Make GUI-launched spawns find nvm/fnm/volta/native-installer CLIs by folding
+    // known tool dirs + the login-shell PATH into this process's PATH (see detect.rs).
+    detect::augment_path();
 
     // Pin the rustls CryptoProvider. Several of our transitive deps enable
     // both `ring` and `aws-lc-rs`, which makes rustls 0.23 refuse to auto-pick

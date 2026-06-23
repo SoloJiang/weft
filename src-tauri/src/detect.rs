@@ -1,8 +1,10 @@
 //! Tool readiness: make GUI-launched Weft find CLIs installed via nvm/fnm/volta
 //! or native installers, and report each CLI's version. The core fix is
-//! augmenting THIS process's PATH from the user's login shell at startup —
-//! engine spawns inherit this process's env, so one augment makes every later
-//! `claude`/`codex`/`opencode` spawn resolvable.
+//! augmenting THIS process's PATH at startup — engine spawns inherit this
+//! process's env, so one augment makes every later `claude`/`codex`/`opencode`
+//! spawn resolvable. PATH is augmented from two sources: a deterministic scan of
+//! known version-manager / install dirs (fast, can't time out) and the user's
+//! login-shell PATH (best-effort, for custom dirs the scan can't know).
 
 use std::time::Duration;
 
@@ -83,13 +85,43 @@ pub(crate) fn merge_path(base: &str, extra: &str) -> String {
     out.join(":")
 }
 
-/// Run once at startup: fold the login shell's PATH into this process's PATH.
-pub fn augment_path_from_login_shell() {
-    let Some(shell_path) = login_shell_path() else {
-        return;
-    };
+/// Run once at startup: fold known tool-install dirs AND the login shell's PATH
+/// into this process's PATH, so a GUI- or dev-launched Weft can spawn
+/// nvm/fnm/volta/native CLIs even when the inherited PATH is minimal. Engine and
+/// curator spawns inherit this process's env, so one augment fixes every later
+/// `claude`/`codex`/`opencode` spawn.
+///
+/// Two sources, merged with EXISTING entries kept at higher priority (we only
+/// ADD what's missing): (1) a deterministic scan of version-manager + native
+/// install dirs — needs no shell, so it can't time out; (2) the login shell's
+/// full PATH, a best-effort secondary for custom dirs the scan can't know.
+/// Source (2) used to fail SILENTLY on a slow shell (leaving an installed CLI
+/// unresolvable with no clue in the log), so a probe miss now logs a diagnostic.
+pub fn augment_path() {
     let base = std::env::var("PATH").unwrap_or_default();
-    let merged = merge_path(&base, &shell_path);
+    let mut merged = base.clone();
+
+    let scanned = tool_bin_dirs(home_dir().as_deref());
+    if !scanned.is_empty() {
+        let extra = scanned
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        merged = merge_path(&merged, &extra);
+    }
+
+    match login_shell_path() {
+        Some(shell_path) => merged = merge_path(&merged, &shell_path),
+        // Windows GUIs inherit PATH fine and have no `-ilc` probe, so only the
+        // unix probe failing is worth flagging.
+        None if !cfg!(windows) => eprintln!(
+            "[weft] login-shell PATH probe unavailable (unset/unsupported shell or timed out); \
+             relying on direct tool-dir scan for nvm/fnm/volta/native CLIs"
+        ),
+        None => {}
+    }
+
     if merged != base {
         std::env::set_var("PATH", merged);
     }
@@ -261,6 +293,98 @@ fn which_on_path(tool: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// The user's home directory (HOME, or USERPROFILE on Windows). None if unset.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Existing `bin` dirs under an nvm tree (`<nvm_dir>/versions/node/<v>/bin`).
+/// nvm installs each node version's global CLIs there, so a CLI installed under
+/// ANY version is discoverable regardless of which one is "current" — the login
+/// shell may not have run `nvm use`, but the binary is still on disk.
+fn nvm_node_bin_dirs(nvm_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(nvm_dir.join("versions/node")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join("bin"))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Existing node `installation/bin` dirs across fnm's known on-disk layouts
+/// (XDG data dir, `~/.fnm`, macOS Application Support).
+fn fnm_node_bin_dirs(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let roots = [
+        home.join(".local/share/fnm/node-versions"),
+        home.join(".fnm/node-versions"),
+        home.join("Library/Application Support/fnm/node-versions"),
+    ];
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for e in entries.filter_map(|e| e.ok()) {
+            let bin = e.path().join("installation/bin");
+            if bin.is_dir() {
+                out.push(bin);
+            }
+        }
+    }
+    out
+}
+
+/// Home-relative dirs where native installers / package managers drop CLIs.
+/// Pure: returns CANDIDATES (not existence-filtered) so the mapping is testable;
+/// the orchestrator filters to existing dirs.
+fn static_tool_bin_dirs(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    [
+        ".local/bin",
+        ".cargo/bin",
+        ".bun/bin",
+        ".deno/bin",
+        ".volta/bin",
+        ".opencode/bin",
+        ".npm-global/bin",
+        "Library/pnpm",
+    ]
+    .iter()
+    .map(|s| home.join(s))
+    .collect()
+}
+
+/// System bin dirs a minimal GUI PATH often omits (Homebrew, /usr/local).
+const SYSTEM_TOOL_BIN_DIRS: [&str; 4] = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+];
+
+/// All EXISTING tool-install bin dirs discovered WITHOUT a shell: version
+/// managers (nvm/fnm) + native-installer / package-manager dirs + system dirs.
+/// Deterministic and fast — the reliable half of PATH augmentation, so a slow or
+/// timed-out login-shell probe can no longer hide an installed CLI.
+fn tool_bin_dirs(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = home {
+        // nvm respects $NVM_DIR; default to ~/.nvm when the env var is unset
+        // (a GUI launch won't have sourced the shell that exports it).
+        let nvm = std::env::var_os("NVM_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| h.join(".nvm"));
+        out.extend(nvm_node_bin_dirs(&nvm));
+        out.extend(fnm_node_bin_dirs(h));
+        out.extend(static_tool_bin_dirs(h));
+    }
+    out.extend(SYSTEM_TOOL_BIN_DIRS.iter().map(std::path::PathBuf::from));
+    out.into_iter().filter(|p| p.is_dir()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +461,59 @@ mod tests {
     #[test]
     fn default_tool_codex_when_nothing_installed() {
         assert_eq!(pick_default_tool(None, |_| false), "codex");
+    }
+
+    #[test]
+    fn nvm_node_bin_dirs_finds_versioned_bins_and_skips_binless() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nvm = tmp.path();
+        for v in ["v22.22.0", "v18.19.0"] {
+            std::fs::create_dir_all(nvm.join("versions/node").join(v).join("bin")).unwrap();
+        }
+        // A version dir with no bin/ must be skipped, not blindly added.
+        std::fs::create_dir_all(nvm.join("versions/node/v16.0.0")).unwrap();
+        let dirs = nvm_node_bin_dirs(nvm);
+        assert!(dirs.contains(&nvm.join("versions/node/v22.22.0/bin")));
+        assert!(dirs.contains(&nvm.join("versions/node/v18.19.0/bin")));
+        assert!(!dirs.contains(&nvm.join("versions/node/v16.0.0/bin")));
+        // A missing nvm dir yields nothing and never panics.
+        assert!(nvm_node_bin_dirs(&nvm.join("does-not-exist")).is_empty());
+    }
+
+    #[test]
+    fn fnm_node_bin_dirs_finds_installation_bins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let bin = home.join(".local/share/fnm/node-versions/v22.22.0/installation/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert!(fnm_node_bin_dirs(home).contains(&bin));
+    }
+
+    #[test]
+    fn static_tool_bin_dirs_lists_known_home_install_dirs() {
+        let home = std::path::Path::new("/home/u");
+        let dirs = static_tool_bin_dirs(home);
+        for sub in [".cargo/bin", ".local/bin", ".volta/bin", ".bun/bin"] {
+            assert!(dirs.contains(&home.join(sub)), "missing candidate: {sub}");
+        }
+    }
+
+    #[test]
+    fn discovered_nvm_bin_makes_codex_resolvable_after_merge() {
+        // Reproduces the real bug: the inherited PATH lacks the nvm dir where
+        // `codex` lives; after merging the DISCOVERED nvm bin, codex resolves.
+        let tmp = tempfile::tempdir().unwrap();
+        let nvm = tmp.path();
+        let bin = nvm.join("versions/node/v22.22.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        let extra = nvm_node_bin_dirs(nvm)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        let merged = merge_path("/usr/bin:/bin", &extra);
+        let found = std::env::split_paths(&merged).any(|d| d.join("codex").is_file());
+        assert!(found, "codex must resolve after merging the discovered nvm bin");
     }
 }
