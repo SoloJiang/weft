@@ -139,16 +139,16 @@ fn spawn_shell_path_refresh(file: std::path::PathBuf) {
     });
 }
 
-/// Whether any known coding-agent CLI resolves on the current process PATH. Used
-/// to tell a healthy cache from one made stale by a newly-installed agent — a
-/// false here is the signal to re-probe synchronously rather than wait a launch.
-/// Resolves the EFFECTIVE command (honoring a configured alias like `claude` →
-/// `cc-claude`), so this must run after `tool_command::set_overrides` — see the
-/// `augment_path()` call site in `lib.rs`.
+/// Whether any known coding-agent CLI resolves on the current process PATH — a
+/// best-effort "is the cache obviously stale?" signal: false means none of
+/// codex/claude/opencode is found, so re-probe synchronously rather than wait a
+/// launch. It runs early (so the `set_var` in `augment_path` precedes the async
+/// runtime — see `lib.rs`), hence it checks bare identities, NOT aliases or the
+/// per-session selected tool. That precision would require per-`Command` PATH
+/// rather than a process-global env — a deliberate non-goal here; the residual
+/// edge self-heals on the next launch.
 fn known_agent_resolves() -> bool {
-    TOOL_PRIORITY
-        .iter()
-        .any(|t| resolve_tool_path(&crate::tool_command::command_for(t)).is_some())
+    TOOL_PRIORITY.iter().any(|t| resolve_tool_path(t).is_some())
 }
 
 /// Run once at startup: fold the user's login-shell PATH into this process's PATH

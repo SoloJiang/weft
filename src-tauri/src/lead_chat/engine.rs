@@ -1349,24 +1349,22 @@ pub async fn send(
                 .collect();
             let user = serde_json::json!({ "text": text, "images": image_uris, "files": files })
                 .to_string();
-            if let Ok(m) =
+            // Propagate insert failures (e.g. a locked/full DB): if the rows aren't
+            // durably recorded we must NOT clear the composer, so `?` returns Err and
+            // the normal error path preserves the draft. Only the emits are best-effort.
+            let user_row =
                 repo::insert_lead_message(db, thread_id, sid, turn, "user", "text", &user, "error")
-                    .await
-            {
-                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
-            }
+                    .await?;
+            let _ = app.emit(EVENT, Push::Message { thread_id, message: user_row });
             let notice =
                 serde_json::json!({ "terminal": "agent_not_found", "tool": tool }).to_string();
-            if let Ok(m) = repo::insert_lead_message(
+            let notice_row = repo::insert_lead_message(
                 db, thread_id, sid, turn, "assistant", "text", &notice, "error",
             )
-            .await
-            {
-                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
-            }
-            // The failure is now represented in the timeline (user row + notice), so
-            // resolve OK: returning Err would trip the composer's error path and
-            // restore the just-sent draft, leaving a duplicate when the user retries.
+            .await?;
+            let _ = app.emit(EVENT, Push::Message { thread_id, message: notice_row });
+            // Both rows are durably recorded, so resolve OK: returning Err here would
+            // trip the composer's error path and restore the draft → duplicate on retry.
             return Ok(());
         }
     }
