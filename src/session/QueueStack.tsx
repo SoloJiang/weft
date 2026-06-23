@@ -65,6 +65,11 @@ function QueueRowText({
   // An attachment-only queued send (e.g. a pasted image, no prose) has empty text;
   // show a badge so it isn't a blank, indistinguishable row.
   const hasText = item.text.trim().length > 0;
+  // Inline edit is offered only for plain text rows: slash commands ({command,args}
+  // shape) and attachment-bearing rows don't round-trip an edited text body into the
+  // delivered transcript, so they stay delete/reorder-only.
+  const editable =
+    hasText && item.images === 0 && !item.text.trimStart().startsWith("/");
 
   if (!editing) {
     return (
@@ -77,16 +82,18 @@ function QueueRowText({
             {t("lead.queueAttachmentOnly", { count: Math.max(item.images, 1) })}
           </span>
         )}
-        <button
-          onClick={() => {
-            setVal(item.text);
-            setEditing(true);
-          }}
-          aria-label={t("lead.queueEdit")}
-          className="shrink-0 text-ink-faint hover:text-ink"
-        >
-          <Pencil size={11} />
-        </button>
+        {editable && (
+          <button
+            onClick={() => {
+              setVal(item.text);
+              setEditing(true);
+            }}
+            aria-label={t("lead.queueEdit")}
+            className="shrink-0 text-ink-faint hover:text-ink"
+          >
+            <Pencil size={11} />
+          </button>
+        )}
       </>
     );
   }
