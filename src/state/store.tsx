@@ -56,13 +56,14 @@ export interface OpenSession {
 }
 
 /** Result of the last dependency-analysis pass for a workspace — drives the
- *  curator panel's non-conversational status strip. */
+ *  curator panel's non-conversational status strip. Deliberately coarse: the pass
+ *  RAN (`done`) or it FAILED to run (`failed` = the command rejected). We don't
+ *  claim "map updated with N links" — the pipeline silently skips missing checkouts
+ *  and swallows relation-agent failures, so the frontend can't assert that; per-repo
+ *  state shows on the graph nodes instead. */
 export type AnalysisOutcomeState = "done" | "failed";
 export interface AnalysisOutcome {
   state: AnalysisOutcomeState;
-  repos: number;
-  edges: number;
-  failed: number;
 }
 
 interface Store {
@@ -1779,24 +1780,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // The curator panel is the home of analysis — open it so its status strip shows.
     if (activeWorkspaceIdRef.current === ws) openCurator();
     try {
+      // The command is the authority on whether the pass ran: it rejects when the
+      // workspace has no analyzable checkout (all missing). A resolve = it ran.
       await api.analyzeWorkspaceDeps(ws);
-      const g = await api.repoGraph(ws);
-      // Don't write ws's graph into another view if the user switched away mid-run.
-      if (activeWorkspaceIdRef.current === ws) {
-        setRepoProfiles(g.nodes);
-        setRepoEdges(g.edges);
+      setAnalysisOutcomeWs((m) => ({ ...m, [ws]: { state: "done" } }));
+      // Best-effort graph-display refresh; its failure doesn't change the run outcome
+      // (the pass already ran). Skip the write if the user switched away mid-run.
+      try {
+        const g = await api.repoGraph(ws);
+        if (activeWorkspaceIdRef.current === ws) {
+          setRepoProfiles(g.nodes);
+          setRepoEdges(g.edges);
+        }
+      } catch {
+        /* graph refresh is cosmetic; the analysis outcome stands */
       }
-      // A forced pass can finish with repos left "failed" (missing analyzer, unusable
-      // output): all-failed reads as a failure; otherwise done (with any failed count).
-      const failed = g.nodes.filter((n) => n.analysis_state === "failed").length;
-      const state: AnalysisOutcomeState =
-        g.nodes.length > 0 && failed === g.nodes.length ? "failed" : "done";
-      setAnalysisOutcomeWs((m) => ({
-        ...m,
-        [ws]: { state, repos: g.nodes.length, edges: g.edges.length, failed },
-      }));
     } catch {
-      setAnalysisOutcomeWs((m) => ({ ...m, [ws]: { state: "failed", repos: 0, edges: 0, failed: 0 } }));
+      setAnalysisOutcomeWs((m) => ({ ...m, [ws]: { state: "failed" } }));
     } finally {
       markAnalyzing(ws, false);
     }

@@ -278,7 +278,7 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
   );
 }
 
-type AnalysisStatusKind = "running" | "done" | "partial" | "failed";
+type AnalysisStatusKind = "running" | "done" | "failed";
 
 /** One discriminated status from the run-state + last outcome (null = show nothing). */
 function analysisStatusKind(
@@ -287,13 +287,12 @@ function analysisStatusKind(
 ): AnalysisStatusKind | null {
   if (analyzing) return "running";
   if (!outcome) return null;
-  if (outcome.state === "failed") return "failed";
-  if (outcome.failed > 0) return "partial";
-  return "done";
+  return outcome.state;
 }
 
 /** A thin, non-conversational status line for the dependency-analysis pass — the
- *  curator panel's record of analysis (deliberately NOT a chat message). */
+ *  curator panel's record of analysis (deliberately NOT a chat message). Coarse by
+ *  design: "ran" vs "failed to run"; per-repo detail lives on the graph nodes. */
 function AnalysisStatusStrip({
   analyzing,
   outcome,
@@ -304,9 +303,6 @@ function AnalysisStatusStrip({
   const { t } = useTranslation();
   const kind = analysisStatusKind(analyzing, outcome);
   if (kind == null) return null;
-  const repos = outcome?.repos ?? 0;
-  const edges = outcome?.edges ?? 0;
-  const failed = outcome?.failed ?? 0;
   const view: Record<AnalysisStatusKind, { icon: ReactNode; text: string; tone: string }> = {
     running: {
       icon: <RefreshCw size={11} className="shrink-0 animate-spin text-brand" />,
@@ -315,12 +311,7 @@ function AnalysisStatusStrip({
     },
     done: {
       icon: <Check size={12} className="shrink-0 text-running" />,
-      text: t("repomap.analysisDone", { repos, edges }),
-      tone: "text-ink-muted",
-    },
-    partial: {
-      icon: <AlertTriangle size={11} className="shrink-0 text-waiting" />,
-      text: t("repomap.analysisDonePartial", { repos, edges, failed }),
+      text: t("repomap.analysisDone"),
       tone: "text-ink-muted",
     },
     failed: {
