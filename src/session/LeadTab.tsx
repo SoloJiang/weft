@@ -106,8 +106,9 @@ export function LeadTab({
       .catch(() => {});
   }, [activeWorkspaceId, skillsDirtyAt]);
 
-  // 非-claude lead 的带外 meta(model/window/MCP server)。claude lead 命令返回 null →
-  // 不并入(事件流 init/usage 已填,别被空快照覆盖)。开页 + turn 结束 + 重载各拉一次。
+  // 带外 meta:codex/opencode 补 model/window/MCP server;claude 只补 cwd 的 skill(其余
+  // 走事件流 init/usage,空字段不覆盖)。命令返回 null 时不并入。开页 + turn 状态变 +
+  // 重载(skillsDirtyAt)各拉一次。
   useEffect(() => {
     if (tid == null) return;
     // 按 turn state 触发,running/idle 都会跑;用 alive 丢弃被取代的旧请求,避免

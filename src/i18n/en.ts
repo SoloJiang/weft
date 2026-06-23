@@ -388,7 +388,7 @@ export const en = {
     pending: "Available after first message",
     noSkills: "No skills enabled",
     reload: "Reload session",
-    reloadHint: "Picks up new MCP / skills",
+    reloadHint: "Re-scan this session's skills / MCP",
     context: "Context",
     tokens: "tokens",
     reasoning: "Reasoning",

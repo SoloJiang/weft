@@ -91,6 +91,22 @@ pub async fn enabled_for_workspace(db: &Db, ws_id: i32) -> Result<Vec<EnabledSki
     }))
 }
 
+/// The skills present under a session cwd: scan `.claude` and `.agents` (the two
+/// dirs `inject::materialize` writes into and the engines load from) via
+/// `parse_source`, deduped by name across the two. On-demand (no watcher) — used
+/// to surface a claude session's real skills, and reused by codex local discovery.
+pub fn cwd_skills(cwd: &Path) -> Vec<ParsedSkill> {
+    let mut out: Vec<ParsedSkill> = Vec::new();
+    for root in [cwd.join(".claude"), cwd.join(".agents")] {
+        for p in parse_source(&root) {
+            if !out.iter().any(|s| s.name == p.name) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Materialize the ws's enabled (non-overridden) skills into `cwd`. Best-effort.
 pub async fn inject_for(db: &Db, ws_id: i32, cwd: &Path) {
     let Ok(enabled) = enabled_for_workspace(db, ws_id).await else {
@@ -202,5 +218,48 @@ mod tests {
             .any(|e| e.name == "deploy" && e.dir == "/b/deploy" && e.overridden));
         // lint not enabled → absent
         assert!(!resolved.iter().any(|e| e.name == "lint"));
+    }
+
+    fn tmp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("weft-cwdskills-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    fn write_skill(dir: &Path, name: &str, desc: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cwd_skills_scans_claude_and_agents_and_dedupes() {
+        let root = tmp_dir();
+        // weft injects the same skill into BOTH .claude/skills and .agents/skills.
+        write_skill(&root.join(".claude/skills/foo"), "foo", "f");
+        write_skill(&root.join(".agents/skills/foo"), "foo", "f");
+        // a project skill that only lives under .claude (claude-only) and one .agents-only.
+        write_skill(&root.join(".claude/skills/proj"), "proj", "p");
+        write_skill(&root.join(".agents/skills/bar"), "bar", "b");
+        let mut got = cwd_skills(&root);
+        got.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            got.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["bar", "foo", "proj"],
+            "dual-injected `foo` listed once; .claude-only and .agents-only both found"
+        );
+        assert_eq!(got.iter().find(|s| s.name == "foo").unwrap().description, "f");
+    }
+
+    #[test]
+    fn cwd_skills_empty_when_no_skill_dirs() {
+        let root = tmp_dir();
+        assert!(cwd_skills(&root).is_empty());
     }
 }

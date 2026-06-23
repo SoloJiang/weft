@@ -377,7 +377,7 @@ export const zh = {
     pending: "首条消息后可见",
     noSkills: "未启用 skill",
     reload: "重载会话",
-    reloadHint: "加载新的 MCP / skill(下条消息生效)",
+    reloadHint: "重新扫描本会话的 skill / MCP",
     context: "Context",
     tokens: "tokens",
     reasoning: "思考强度",

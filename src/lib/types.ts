@@ -164,7 +164,8 @@ export interface SessionMeta {
   window?: number;
   model?: string;
   mcpServers: McpServerInfo[];
-  /** codex 的真实 skill,带外 `session_meta` 填;claude 不填。 */
+  /** 引擎自有的 skill,带外 `session_meta` 填:codex 走 `skills/list`,claude 扫会话 cwd
+   *  的 skill 目录(`.claude`/`.agents`);opencode 无对等,留空。 */
   engineSkills?: EngineSkill[];
   /** codex 的思考强度(low/medium/high/…)。 */
   reasoningEffort?: string;
@@ -178,7 +179,8 @@ export interface SessionMetaSnapshot {
   window: number | null;
   model: string | null;
   mcp_servers: { name: string; status: string }[] | null;
-  /** codex 真实 skill;`null` = 没探到(保留旧行),非 null = 权威列表。 */
+  /** 引擎 skill(codex `skills/list` / claude 扫 cwd skill 目录);`null` = 没探到
+   *  (保留旧行),非 null = 权威列表(空数组即清空)。 */
   skills: { name: string; description: string }[] | null;
   /** codex 思考强度;`null` = 未配置。 */
   reasoning_effort: string | null;

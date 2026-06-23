@@ -281,7 +281,26 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>, command: &str) -> S
     }
 }
 
-/// 按 tool 分派。claude 不走这里(返回空)。
+/// claude:model/window/MCP 都在事件流(`system/init` + usage)里,带外不重复探;但它的
+/// skill 没有原生「只列 skill」的协议(init 只给混在一起的 slash 命令,无来源标记),所以
+/// 直接读会话 cwd 下的 skill 目录(`.claude`/`.agents` —— weft 注入处、claude 加载处)。
+/// 按点击/挂载/turn 现扫一次(非后台监听)。直接读 fs 即权威,空 cwd 回 `Some(vec![])`
+/// 清掉陈旧行,绝不回 None;model/window/mcp 留空让 `mergeSnapshot` 保住事件流填的值。
+async fn gather_claude(cwd: &str) -> SessionMetaSnapshot {
+    let skills = crate::skills::cwd_skills(std::path::Path::new(cwd))
+        .into_iter()
+        .map(|p| SkillInfo {
+            name: p.name,
+            description: p.description,
+        })
+        .collect();
+    SessionMetaSnapshot {
+        skills: Some(skills),
+        ..Default::default()
+    }
+}
+
+/// 按 tool 分派。claude 只在带外补 skill(其余 meta 走事件流);其他未知 tool 返回空。
 /// `command` is the effective binary for this session (per-session/lead pin, else
 /// the global alias) so MCP/skill probes hit the binary actually driving it.
 pub async fn gather(
@@ -293,6 +312,7 @@ pub async fn gather(
     match tool {
         "codex" => gather_codex(cwd, command).await,
         "opencode" => gather_opencode(cwd, native_id, command).await,
+        "claude" => gather_claude(cwd).await,
         _ => SessionMetaSnapshot::default(),
     }
 }
@@ -430,5 +450,42 @@ mod tests {
         assert_eq!(parse_opencode_mcp(&serde_json::json!({})), Some(vec![])); // {} = 权威空
         assert_eq!(parse_opencode_mcp(&serde_json::json!([])), None); // 非对象 = 没读懂
         assert_eq!(parse_opencode_mcp(&serde_json::json!(null)), None);
+    }
+
+    fn tmp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("weft-gatherclaude-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    #[tokio::test]
+    async fn gather_claude_reads_cwd_skills_authoritatively() {
+        // claude has no out-of-band model/window/MCP probe (those ride the event
+        // stream); its skills are the ones under the session cwd's skill dirs.
+        let root = tmp_dir();
+        std::fs::create_dir_all(root.join(".claude/skills/foo")).unwrap();
+        std::fs::write(
+            root.join(".claude/skills/foo/SKILL.md"),
+            "---\nname: foo\ndescription: f\n---\nbody",
+        )
+        .unwrap();
+        let snap = gather("claude", &root.to_string_lossy(), None, "claude").await;
+        let skills = snap.skills.expect("claude scan is authoritative → Some, never None");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "foo");
+        assert_eq!(skills[0].description, "f");
+        // model/window/mcp stay None so mergeSnapshot's `?? prev` preserves claude's
+        // event-sourced meta (only engineSkills changes).
+        assert!(snap.model.is_none());
+        assert!(snap.window.is_none());
+        assert!(snap.mcp_servers.is_none());
+
+        // empty cwd → authoritative empty (clears any stale list), not None.
+        let empty = tmp_dir();
+        let snap2 = gather("claude", &empty.to_string_lossy(), None, "claude").await;
+        assert!(snap2.skills.map_or(false, |s| s.is_empty()));
     }
 }
