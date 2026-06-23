@@ -10,7 +10,6 @@ import { ChatComposer } from "./ChatComposer";
 import { DiffPanel } from "./DiffPanel";
 import { FileTreePanel } from "./FileTreePanel";
 import { SessionInfoPanel } from "./SessionInfoPanel";
-import { PermissionBar } from "./PermissionBar";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { appLink, resumeCommand } from "../lib/resume";
@@ -246,8 +245,6 @@ export function WorkerConversation() {
           )}
         </header>
 
-        <PermissionBar asks={workerAsks} />
-
         {openAsks.length > 0 && (
           <div className="border-b border-border bg-surface/60 px-3 py-2">
             {openAsks.map((a) => (
@@ -259,6 +256,7 @@ export function WorkerConversation() {
         <div className="flex min-h-0 flex-1 flex-col">
           <ChatTimeline
             messages={msgs}
+            asks={workerAsks}
             busy={busy}
             activity={sid != null ? workerActivity[sid] : undefined}
             onReviewProposal={() => {}}

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, Check, Copy, Sparkles } from "lucide-react";
-import type { LeadMessage, QueuedItem, ResolvedProposal } from "../lib/types";
+import type { LeadMessage, PermissionAsk, QueuedItem, ResolvedProposal } from "../lib/types";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { QueueStack } from "./QueueStack";
 import {
@@ -21,6 +21,7 @@ import {
   toolLabelKey,
 } from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
+import { PermissionBar } from "./PermissionBar";
 import type { useRepoActions } from "./useRepoActions";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
@@ -49,6 +50,7 @@ export function ChatTimeline({
   promptText,
   cwd,
   emptyState,
+  asks = [],
   queue = [],
   onRemove = () => {},
   onEdit = () => {},
@@ -79,6 +81,9 @@ export function ChatTimeline({
    *  (lead/worker pass a LeadEmptyState; the curator panel passes its own line). The
    *  timeline itself stays empty-state-agnostic. */
   emptyState?: ReactNode;
+  /** This session's pending permission asks — rendered as an inline card at the
+   *  bottom of the conversation (the agent's position), not a top banner. */
+  asks?: PermissionAsk[];
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
@@ -96,7 +101,7 @@ export function ChatTimeline({
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
   }, [visible.length, growthLen, busy, activity]);
 
-  if (visible.length === 0 && !busy) {
+  if (visible.length === 0 && !busy && asks.length === 0) {
     return <>{emptyState}</>;
   }
 
@@ -137,9 +142,10 @@ export function ChatTimeline({
           scroller as a fixed bottom bar. Keeping it out of the list makes the
           last message the unambiguous list bottom and keeps the indicator
           visible even while the user scrolls back through history. */}
-      {(busy || queue.length > 0) && (
+      {(busy || queue.length > 0 || asks.length > 0) && (
         <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
           <div className="flex flex-col gap-1.5">
+            <PermissionBar asks={asks} />
             {busy && <BusyIndicator activity={activity} />}
             <QueueStack
               items={queue}
