@@ -146,31 +146,23 @@ export function PermissionConfirmationCard({
 
   // On the in-session card (a single active ask) the keyboard answers it:
   // Enter = allow, ⌘/Ctrl+Enter = always, Esc = deny. Runs in the capture phase
-  // and stops propagation so the card preempts other window keydown handlers —
-  // e.g. an open Diff/FileTree panel also closes on Escape; without this, Esc
-  // would deny AND close the panel. Skipped when focus is on an interactive
-  // element, mid-IME, or the card is hidden (offsetParent null — a host may keep
-  // a compact session mounted under `hidden`, which must not capture keys).
+  // and stops propagation so the card preempts other window keydown handlers
+  // (e.g. an open Diff/FileTree panel that also closes on Escape — otherwise Esc
+  // would deny AND close the panel). It fires ONLY when the card is visible and
+  // focus is neutral (the document body): if the user is interacting with ANY
+  // widget — composer, buttons, the ⋯ menu, the file tree, side panels, … — that
+  // widget keeps its own Enter/Escape. Allow-listing neutral focus (rather than
+  // blocklisting widget roles, which can never be exhaustive) is what makes this
+  // robust.
   useEffect(() => {
     if (!enableShortcuts) return;
     const onKey = (e: KeyboardEvent) => {
-      // One physical press = one answer: ignore IME composition and key-repeat
-      // so a held key can't resolve this ask and then the next one it exposes.
+      // One physical press = one answer: ignore IME composition and key-repeat so
+      // a held key can't resolve this ask and then the next one it exposes.
       if (e.isComposing || e.repeat) return;
       if (rootRef.current?.offsetParent == null) return;
-      const el = e.target as HTMLElement | null;
-      // Skip interactive targets (composer, buttons) and anything inside an open
-      // menu/dialog/listbox — e.g. the ⋯ More dropdown owns Enter/Escape, so the
-      // shortcut must not answer the ask out from under it.
-      const interactive =
-        !!el &&
-        (el.tagName === "INPUT" ||
-          el.tagName === "TEXTAREA" ||
-          el.tagName === "BUTTON" ||
-          el.tagName === "A" ||
-          el.isContentEditable ||
-          !!el.closest('[role="menu"],[role="menuitem"],[role="listbox"],[role="dialog"]'));
-      if (interactive) return;
+      const ae = document.activeElement;
+      if (ae && ae !== document.body && ae !== document.documentElement) return;
       const act = (answer: PermissionAnswer) => {
         e.preventDefault();
         e.stopImmediatePropagation();
