@@ -379,7 +379,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // the backend get-or-create is not atomic, so concurrent ensures for the SAME
   // workspace could create dupes. Keyed by ws so switching to another workspace
   // mid-flight still ensures that one (a single boolean would drop it).
-  const ensuringCuratorRef = useRef<Set<number>>(new Set());
+  // Per-workspace in-flight curator-thread ensure, coalesced by a shared PROMISE so a
+  // racing Analyze + drawer-open resolve the SAME thread (the backend get-or-create is
+  // not atomic) and both await the same threads-list sync.
+  const curatorEnsureRef = useRef<Map<number, Promise<number>>>(new Map());
   // Snapshot of the view that was active when the user opened Settings, so
   // the back arrow restores it instead of dropping them on the board.
   const prevHomeRef = useRef<{
@@ -1698,26 +1701,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeWorkspaceId, refreshReposAndMap, refreshOverview, activeThreadId, loadThreadChildren],
   );
 
-  // Ensure the workspace's hidden curator thread exists and remember its id —
-  // WITHOUT navigating. The curator chat renders embedded in the Repo Map panel
-  // (RepoSidePanel), so unlike a normal lead chat we never selectThread.
-  const ensureCuratorThread = useCallback(async () => {
-    const ws = activeWorkspaceId;
-    if (ws == null || ensuringCuratorRef.current.has(ws)) return;
-    ensuringCuratorRef.current.add(ws);
-    try {
+  // Get-or-create the workspace's hidden curator thread and return its id, WITHOUT
+  // navigating. Coalesces concurrent callers (drawer open + Analyze) on one promise
+  // so the backend's non-atomic get-or-create can't make two threads, and syncs
+  // `threads` (so the embedded LeadTab resolves the right lead_tool) + `curatorThreadId`
+  // — those global writes gated on ws still being active.
+  const ensureCuratorThreadId = useCallback(async (ws: number): Promise<number> => {
+    const inflight = curatorEnsureRef.current.get(ws);
+    if (inflight) return inflight;
+    const p = (async () => {
       const id = await api.openCuratorChat(ws); // get-or-create; returns the id
       const list = await api.listThreads(ws);
-      // Bail if the user switched workspaces while these requests were in flight.
-      if (activeWorkspaceIdRef.current !== ws) return;
-      // The curator thread may have just been created — sync `threads` so the
-      // embedded LeadTab can resolve its lead_tool.
-      setThreads(list);
-      setCuratorThreadId(id);
+      if (activeWorkspaceIdRef.current === ws) {
+        setThreads(list);
+        setCuratorThreadId(id);
+      }
+      return id;
+    })();
+    curatorEnsureRef.current.set(ws, p);
+    try {
+      return await p;
     } finally {
-      ensuringCuratorRef.current.delete(ws);
+      curatorEnsureRef.current.delete(ws);
     }
-  }, [activeWorkspaceId]);
+  }, []);
+
+  // The curator chat renders embedded in the Repo Map panel (RepoSidePanel), so
+  // unlike a normal lead chat we never selectThread — just ensure it exists.
+  const ensureCuratorThread = useCallback(async () => {
+    const ws = activeWorkspaceId;
+    if (ws == null) return;
+    await ensureCuratorThreadId(ws);
+  }, [activeWorkspaceId, ensureCuratorThreadId]);
 
   const openRepoDetail = useCallback((repoId: number) => {
     setSelectedRepoId(repoId);
@@ -1741,10 +1756,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     let tid: number | null = null;
     try {
       try {
-        tid = await api.openCuratorChat(ws); // get-or-create; idempotent
-        // Only adopt this thread as the global curator id if ws is still active — a
-        // mid-flight workspace switch already cleared it for the new workspace.
-        if (activeWorkspaceIdRef.current === ws) setCuratorThreadId(tid);
+        // Coalesced get-or-create — shares the drawer's ensure path, so no duplicate
+        // curator thread, threads list synced (no "claude" lead_tool fallback), and
+        // curatorThreadId adopted only while ws is active (all inside the helper).
+        tid = await ensureCuratorThreadId(ws);
         // Load history BEFORE appending: opening the panel below mounts the chat,
         // whose own initial load would otherwise replace-away these fresh rows.
         await loadLeadChat(tid);
@@ -1801,7 +1816,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } finally {
       markAnalyzing(ws, false);
     }
-  }, [activeWorkspaceId, openCurator, loadLeadChat, markAnalyzing]);
+  }, [activeWorkspaceId, openCurator, loadLeadChat, markAnalyzing, ensureCuratorThreadId]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
