@@ -52,6 +52,39 @@ const STREAM_THROTTLE_MS: u128 = 150;
 /// trips on a wedged/dead child to keep the session from becoming unstoppable.
 const WRITE_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 一条待发排队消息的前端视图。`images`/`files` 仅给个数（栈里显示角标用）。
+#[derive(Clone, serde::Serialize)]
+pub struct QueuedItem {
+    pub id: i32,
+    pub text: String,
+    pub images: usize,
+    pub files: usize,
+    /// True when the original send carried files or images; disables inline edit.
+    pub has_attachments: bool,
+}
+
+pub(crate) fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
+    turn.queue
+        .iter()
+        .filter_map(|o| {
+            o.queue_id.map(|id| QueuedItem {
+                id,
+                text: o.text.clone(),
+                images: o.images.len(),
+                // files are appended into text; count is not separately tracked
+                files: 0,
+                has_attachments: o.has_attachments,
+            })
+        })
+        .collect()
+}
+
+/// How many user-visible (tracked) messages are queued — what the cap counts.
+/// Hidden plumbing deliveries (queue_id == None) are excluded.
+fn visible_queued(turn: &TurnState) -> usize {
+    turn.queue.iter().filter(|o| o.queue_id.is_some()).count()
+}
+
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -80,7 +113,7 @@ pub enum Push {
         /// Some(session) for chat-mode workers; None for the lead.
         session_id: Option<i32>,
         state: String,
-        queued: usize,
+        queue: Vec<QueuedItem>,
     },
     Init {
         thread_id: i32,
@@ -121,6 +154,9 @@ pub enum Push {
     },
 }
 
+/// 进行中 turn 最多排队多少条人类消息（满后 send 拒绝入队）。
+pub const MAX_QUEUED: usize = 5;
+
 /// One outbound human message: text plus optional image attachments
 /// (media_type, base64). Queued whole while a turn is running.
 #[derive(Clone, Default)]
@@ -134,6 +170,11 @@ pub struct Outgoing {
     /// turn's output frames. None for every non-IM send. Rides the queue so a
     /// queued turn keeps its own tag even when emitted after later sends.
     pub origin_tag: Option<String>,
+    /// 入队时持久化的 queued 行 id；删/改/重排和交付落库按它定位。None=直接发送。
+    pub queue_id: Option<i32>,
+    /// True when the original send carried files or images (computed from the
+    /// ORIGINAL inputs before per-turn image-spill clears out.images).
+    pub has_attachments: bool,
 }
 
 /// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
@@ -195,6 +236,8 @@ impl TurnState {
                     images: vec![],
                     tracked: false,
                     origin_tag: None,
+                    queue_id: None,
+                    has_attachments: false,
                 })
             }
             // A message queued before the wake goes first; the wake slides up one.
@@ -213,6 +256,81 @@ impl TurnState {
                 }
             },
         }
+    }
+
+    /// 删除某条仍排队的消息；true=删掉了。
+    pub fn remove(&mut self, id: i32) -> bool {
+        let Some(pos) = self.queue.iter().position(|o| o.queue_id == Some(id)) else {
+            return false;
+        };
+        self.queue.remove(pos);
+        // A coalesced bus-read sits at a FIFO index; dropping an item before it
+        // shifts that index left, else a later send would jump ahead of the wake.
+        if let Some(n) = self.bus_read_pos {
+            if pos < n {
+                self.bus_read_pos = Some(n - 1);
+            }
+        }
+        true
+    }
+
+    /// 改某条排队消息文本；true=改了。
+    pub fn edit(&mut self, id: i32, text: &str) -> bool {
+        for o in self.queue.iter_mut() {
+            if o.queue_id == Some(id) {
+                o.text = text.to_string();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 按 id 列表重排；order 必须是当前可见(有 queue_id)项的排列，否则不动并返回 false。
+    pub fn reorder(&mut self, order: &[i32]) -> bool {
+        // A pending invisible bus wake pins a FIFO index (bus_read_pos); reordering
+        // would mis-place it relative to the wake, so refuse while one is pending
+        // (rare/transient — the composer re-syncs the drag from the re-emitted state).
+        if self.bus_read_pos.is_some() {
+            return false;
+        }
+        let tracked: Vec<i32> = self.queue.iter().filter_map(|o| o.queue_id).collect();
+        if order.len() != tracked.len() {
+            return false;
+        }
+        let mut a = order.to_vec();
+        let mut b = tracked.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        if a != b {
+            return false;
+        }
+        // Reorder only the visible (user) items; untracked deliveries — internal
+        // nudges / bus replies queued mid-turn — keep their absolute slots so a user
+        // drag never drops or resequences them.
+        let slots: Vec<bool> = self.queue.iter().map(|o| o.queue_id.is_some()).collect();
+        let mut by_id: HashMap<i32, Outgoing> = HashMap::new();
+        let mut untracked: VecDeque<Outgoing> = VecDeque::new();
+        for o in self.queue.drain(..) {
+            match o.queue_id {
+                Some(id) => {
+                    by_id.insert(id, o);
+                }
+                None => untracked.push_back(o),
+            }
+        }
+        let mut order_it = order.iter();
+        let mut next: VecDeque<Outgoing> = VecDeque::new();
+        for is_tracked in slots {
+            if is_tracked {
+                if let Some(o) = order_it.next().and_then(|id| by_id.remove(id)) {
+                    next.push_back(o);
+                }
+            } else if let Some(o) = untracked.pop_front() {
+                next.push_back(o);
+            }
+        }
+        self.queue = next;
+        true
     }
 }
 
@@ -290,11 +408,66 @@ async fn mark_queued_delivered(
     if !out.tracked {
         return;
     }
-    match repo::complete_queued(db, thread_id, session_id).await {
-        Ok(Some(m)) => emit_finalize(app, thread_id, m.id, "complete"),
+    let res = match out.queue_id {
+        Some(id) => repo::complete_queued_by_id(db, id).await,
+        None => repo::complete_queued(db, thread_id, session_id).await,
+    };
+    match res {
+        Ok(Some(m)) => {
+            // Stamp a delivery-order seq so reordered rows appear in send order
+            // (not creation order) in the transcript after restart.
+            if let Err(e) = repo::assign_delivery_seq(db, thread_id, m.id).await {
+                eprintln!("[weft] assign_delivery_seq failed: {e}");
+            }
+            // Carry the (possibly edited) text so the transcript shows what was
+            // delivered, not the stale original Push::Message body.
+            let content = finalize_text(&m, out);
+            let _ = app.emit(
+                EVENT,
+                Push::Finalize {
+                    thread_id,
+                    message_id: m.id,
+                    status: "complete".into(),
+                    content,
+                },
+            );
+        }
         Ok(None) => {}
         Err(e) => eprintln!("[weft] queued message complete failed: {e}"),
     }
+}
+
+/// A delivered row's text, but only for a plain text row with no attachments. The
+/// finalize-content channel wraps content as `{text}`, which would mangle a command
+/// row or drop image/file chips — those keep their original cached body (None).
+fn finalize_text(
+    m: &crate::store::entities::lead_message::Model,
+    out: &Outgoing,
+) -> Option<String> {
+    // Only plain text rows round-trip: command rows ({command,args}) and
+    // attachment-bearing rows keep their cached body (finalize wraps as {text},
+    // which would drop the image/file chips).
+    if m.kind != "text" || !out.images.is_empty() {
+        return None;
+    }
+    // Check the PERSISTED attachments too: per-turn dialects spill pasted images to
+    // temp files and clear out.images, but m.content still carries images/files —
+    // replacing such a row with {text} would lose its preview.
+    let attach_free = serde_json::from_str::<serde_json::Value>(&m.content)
+        .ok()
+        .map(|v| {
+            let empty = |k: &str| {
+                v.get(k).and_then(|x| x.as_array()).map(|a| a.is_empty()).unwrap_or(true)
+            };
+            empty("images") && empty("files")
+        })
+        .unwrap_or(true);
+    if !attach_free {
+        return None;
+    }
+    // Source the text from the in-memory Outgoing (already reflects any edit) so a
+    // not-yet-persisted edit can't make the live finalize show stale text.
+    Some(out.text.clone())
 }
 
 async fn mark_queued_status(
@@ -323,7 +496,7 @@ fn emit_turn_state(
     thread_id: i32,
     session_id: Option<i32>,
     busy: bool,
-    queued: usize,
+    queue: Vec<QueuedItem>,
 ) {
     let _ = app.emit(
         EVENT,
@@ -331,7 +504,7 @@ fn emit_turn_state(
             thread_id,
             session_id,
             state: if busy { "busy" } else { "idle" }.into(),
-            queued,
+            queue,
         },
     );
 }
@@ -347,7 +520,7 @@ async fn begin_hidden_turn(app: &AppHandle, db: &Db, inner: &mut EngineInner) ->
         inner.thread_id,
         inner.session_id,
         inner.turn.busy,
-        inner.turn.queue.len(),
+        queue_items(&inner.turn),
     );
     turn_id
 }
@@ -359,7 +532,7 @@ fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing
         inner.thread_id,
         inner.session_id,
         inner.turn.busy,
-        inner.turn.queue.len(),
+        queue_items(&inner.turn),
     );
 }
 
@@ -371,7 +544,7 @@ async fn rollback_failed_turn(app: &AppHandle, db: &Db, eng: &EngineRef, turn_id
     let thread_id = inner.thread_id;
     let session_id = inner.session_id;
     persist_activity(db, session_id, thread_id, "idle").await;
-    emit_turn_state(app, thread_id, session_id, false, 0);
+    emit_turn_state(app, thread_id, session_id, false, Vec::new());
     drop(inner);
     mark_queued_failed(app, db, thread_id, session_id).await;
 }
@@ -621,6 +794,8 @@ async fn apply_lead_sentinels(
                         images: Vec::new(),
                         tracked: false,
                         origin_tag: None,
+                        queue_id: None,
+                        has_attachments: false,
                     };
                     queue_hidden_delivery(app, inner, out);
                 }
@@ -711,7 +886,7 @@ async fn cleanup_disconnected_turn(
             thread_id,
             session_id,
             state: "stopped".into(),
-            queued: 0,
+            queue: Vec::new(),
         },
     );
     drop(inner);
@@ -1147,6 +1322,11 @@ pub async fn send(
     let is_command = text.trim_start().starts_with('/');
     let kind = if is_command { "command" } else { "text" };
     let direct = inner.turn.try_begin_send();
+    // Count only tracked (user-visible) items: hidden plumbing deliveries
+    // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
+    if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
+        return Err(anyhow::anyhow!("queue_full"));
+    }
     if direct {
         inner.turn_id += 1;
         inner.clock.begin_turn();
@@ -1183,6 +1363,9 @@ pub async fn send(
         },
     );
     let mut outbound = text.to_string();
+    // Capture BEFORE images may be spilled to temp files below (per-turn dialects
+    // clear out.images after spill; has_attachments must reflect the original inputs).
+    let has_attachments = !files.is_empty() || !images.is_empty();
     if !files.is_empty() {
         outbound.push_str("\n\nAttached files (read them as needed):\n");
         for f in &files {
@@ -1215,6 +1398,8 @@ pub async fn send(
         tracked: true,
         // Rides the turn (and the queue, if queued) so output frames recover it.
         origin_tag: origin_tag.clone(),
+        queue_id: if direct { None } else { Some(row_id) },
+        has_attachments,
     };
     // codex (app-server): a per-session connection drives the turn after the lock
     // drops (streaming via item/agentMessage/delta). system_prompt is prepended to
@@ -1238,7 +1423,7 @@ pub async fn send(
             thread_id,
             session_id: sid,
             state: if inner.turn.busy { "busy" } else { "idle" }.into(),
-            queued: inner.turn.queue.len(),
+            queue: queue_items(&inner.turn),
         },
     );
     drop(inner);
@@ -1592,7 +1777,7 @@ async fn codex_consumer(
                         thread_id,
                         session_id: inner.session_id,
                         state: if still_busy { "busy" } else { "idle" }.into(),
-                        queued: inner.turn.queue.len(),
+                        queue: queue_items(&inner.turn),
                     },
                 );
                 drop(inner);
@@ -1848,6 +2033,76 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
     Ok(())
 }
 
+/// 取消一条还在队列中的消息；幂等（消息已交付则静默成功）。
+pub async fn queue_remove(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32) -> anyhow::Result<()> {
+    let mut inner = eng.lock().await;
+    if !inner.turn.remove(message_id) {
+        return Ok(());
+    }
+    emit_turn_state(app, inner.thread_id, inner.session_id, inner.turn.busy, queue_items(&inner.turn));
+    // Delete under the lock so a concurrent stop (mark_queued_status also takes
+    // the lock) cannot re-finalize a row we just removed from memory.
+    repo::delete_message(db, message_id).await?;
+    Ok(())
+}
+
+/// 编辑一条还在队列中的消息文本；text 为空或有附件时返回 Err。
+pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32, text: &str) -> anyhow::Result<()> {
+    if text.trim().is_empty() {
+        return Err(anyhow::anyhow!("empty"));
+    }
+    let thread_id = {
+        let mut inner = eng.lock().await;
+        // Reject edits on attachment-bearing rows: they carry image/file chips
+        // in their content that the text-only edit path would silently drop.
+        if inner.turn.queue.iter().any(|o| o.queue_id == Some(message_id) && o.has_attachments) {
+            return Err(anyhow::anyhow!("not_editable"));
+        }
+        if !inner.turn.edit(message_id, text) {
+            return Ok(());
+        }
+        let (tid, sid) = (inner.thread_id, inner.session_id);
+        emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
+        tid
+    };
+    // Preserve existing images/files; only replace the text field.
+    let content = if let Some(row) = repo::get_message(db, message_id).await? {
+        let mut val: serde_json::Value =
+            serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::json!({}));
+        val["text"] = serde_json::Value::String(text.to_string());
+        val.to_string()
+    } else {
+        serde_json::json!({ "text": text, "images": [], "files": [] }).to_string()
+    };
+    repo::update_message_content(db, message_id, &content).await?;
+    // Push the edited text to the FE cache immediately so a subsequent stop/deliver
+    // finalizes the edited version, not the stale original.
+    let _ = app.emit(
+        EVENT,
+        Push::Finalize {
+            thread_id,
+            message_id,
+            status: "queued".into(),
+            content: Some(text.to_string()),
+        },
+    );
+    Ok(())
+}
+
+/// 重排队列；order 必须是当前队列 id 的排列，否则返回 Err。
+pub async fn queue_reorder(app: &AppHandle, _db: &Db, eng: &EngineRef, order: Vec<i32>) -> anyhow::Result<()> {
+    let mut inner = eng.lock().await;
+    let ok = inner.turn.reorder(&order);
+    let (tid, sid) = (inner.thread_id, inner.session_id);
+    // Re-emit the authoritative order even on rejection, so an optimistic drag the
+    // backend refused (bad permutation / pending bus wake) snaps back in the UI.
+    emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
+    if !ok {
+        return Err(anyhow::anyhow!("bad_order"));
+    }
+    Ok(())
+}
+
 /// Interrupt the current turn: protocol control_request first (verified live:
 /// control_response + result{terminal_reason:aborted_streaming}); kill after 3s
 /// as the hard fallback. Either way `--resume` recovers the session next send.
@@ -1976,6 +2231,8 @@ async fn send_hidden_inner(
         images: vec![],
         tracked: false,
         origin_tag: None,
+        queue_id: None,
+        has_attachments: false,
     };
 
     match hidden_delivery(
@@ -2217,7 +2474,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
             thread_id,
             session_id,
             state: "stopped".into(),
-            queued: 0,
+            queue: Vec::new(),
         },
     );
 }
@@ -2583,7 +2840,7 @@ fn spawn_reader(
                             thread_id,
                             session_id: inner.session_id,
                             state: state.into(),
-                            queued: inner.turn.queue.len(),
+                            queue: queue_items(&inner.turn),
                         },
                     );
                 }
@@ -2691,7 +2948,7 @@ fn spawn_reader(
                     thread_id: inner.thread_id,
                     session_id: inner.session_id,
                     state: state.into(),
-                    queued: inner.turn.queue.len(),
+                    queue: queue_items(&inner.turn),
                 },
             );
             return;
@@ -2744,7 +3001,7 @@ fn spawn_reader(
                     thread_id,
                     session_id,
                     state: "stopped".into(),
-                    queued: 0,
+                    queue: Vec::new(),
                 },
             );
             drop(inner);
@@ -2815,6 +3072,8 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
+            has_attachments: false,
         });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
@@ -2850,6 +3109,8 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
+            has_attachments: false,
         });
         t.request_bus_read(); // wake lands AFTER "earlier" was queued
                               // "earlier" preceded the wake, so it drains first, then the read.
@@ -2871,6 +3132,8 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
+            has_attachments: false,
         });
         // The wake arrived before "later", so the inbox read comes first — the
         // agent can't answer the newer prompt without seeing the bus message.
@@ -2888,6 +3151,20 @@ mod tests {
         assert!(t.request_bus_read()); // idle → caller starts a read turn now
         assert!(t.busy);
         assert!(t.bus_read_pos.is_none()); // consumed by starting the turn, not pending
+    }
+
+    #[test]
+    fn queue_is_capped_at_max() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy（占用一个在飞 turn）
+        for i in 0..MAX_QUEUED {
+            assert!(!t.try_begin_send()); // busy
+            t.queue.push_back(Outgoing { text: format!("m{i}"), ..Default::default() });
+        }
+        assert_eq!(t.queue.len(), MAX_QUEUED);
+        // Full-queue rejection (send() returning Err("queue_full")) is an async/DB path
+        // not exercisable at the TurnState level; this test only asserts the queue fills
+        // to exactly MAX_QUEUED.
     }
 
     #[test]
@@ -3056,6 +3333,17 @@ mod tests {
     }
 
     #[test]
+    fn queue_items_preserves_order_and_text() {
+        let mut t = TurnState::default();
+        t.queue.push_back(Outgoing { text: "a".into(), queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { text: "b".into(), queue_id: Some(2), ..Default::default() });
+        let items = queue_items(&t);
+        assert_eq!(items.len(), 2);
+        assert_eq!((items[0].id, items[0].text.as_str()), (1, "a"));
+        assert_eq!((items[1].id, items[1].text.as_str()), (2, "b"));
+    }
+
+    #[test]
     fn tool_row_status_id_less_running_does_not_spin() {
         // a finished row is terminal …
         assert_eq!(tool_row_status(true, false, false), "complete");
@@ -3131,6 +3419,8 @@ mod tests {
             images: vec![],
             tracked: true,
             origin_tag: None,
+            queue_id: None,
+            has_attachments: false,
         });
         let turn_id = mark_hidden_turn_started(&mut inner);
 
@@ -3162,6 +3452,8 @@ mod tests {
             images: vec![],
             tracked: false,
             origin_tag: None,
+            queue_id: None,
+            has_attachments: false,
         };
 
         let err = write_user(&mut inner, &out).await.unwrap_err();
@@ -3258,5 +3550,191 @@ mod tests {
         let resumed = build_args(&inner);
         let i = resumed.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(resumed[i + 1], "abc");
+    }
+
+    #[test]
+    fn turnstate_remove_edit_reorder() {
+        let mut t = TurnState::default();
+        for id in [10, 20, 30] {
+            t.queue.push_back(Outgoing { text: format!("t{id}"), queue_id: Some(id), ..Default::default() });
+        }
+        assert!(t.edit(20, "edited"));
+        assert_eq!(t.queue[1].text, "edited");
+
+        assert!(t.reorder(&[30, 10, 20]));
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![30, 10, 20]);
+
+        assert!(t.remove(10));
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![30, 20]);
+
+        // 非排列 / 未知 id 被拒
+        assert!(!t.reorder(&[30])); // 长度不符
+        assert!(!t.reorder(&[30, 99])); // same length, unknown id → rejected
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![30, 20]); // queue untouched
+        assert!(!t.remove(999));
+        assert!(!t.edit(999, "x"));
+    }
+
+    #[test]
+    fn reorder_preserves_untracked_items() {
+        // Visible T1, an internal untracked delivery, then visible T2.
+        let mut t = TurnState::default();
+        t.queue.push_back(Outgoing { text: "t1".into(), queue_id: Some(10), ..Default::default() });
+        t.queue.push_back(Outgoing { text: "nudge".into(), tracked: false, queue_id: None, ..Default::default() });
+        t.queue.push_back(Outgoing { text: "t2".into(), queue_id: Some(20), ..Default::default() });
+        // Reorder the two visible items; the untracked nudge must keep its slot.
+        assert!(t.reorder(&[20, 10]));
+        let ids: Vec<Option<i32>> = t.queue.iter().map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![Some(20), None, Some(10)]);
+        assert_eq!(t.queue.len(), 3, "untracked nudge must not be dropped");
+        assert_eq!(t.queue[1].text, "nudge");
+    }
+
+    #[test]
+    fn remove_keeps_bus_read_position_in_sync() {
+        // A, B queued; a bus wake lands (read at index 2); then C queued.
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy
+        t.queue.push_back(Outgoing { text: "a".into(), queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { text: "b".into(), queue_id: Some(2), ..Default::default() });
+        assert!(!t.request_bus_read()); // busy → coalesced at index 2
+        assert_eq!(t.bus_read_pos, Some(2));
+        t.queue.push_back(Outgoing { text: "c".into(), queue_id: Some(3), ..Default::default() });
+        // Deleting A (index 0, before the wake) shifts the wake left so C still
+        // delivers AFTER the inbox-read, not ahead of it.
+        assert!(t.remove(1));
+        assert_eq!(t.bus_read_pos, Some(1));
+        // Deleting C (index 1, == wake index, not before) leaves the wake put.
+        assert!(t.remove(3));
+        assert_eq!(t.bus_read_pos, Some(1));
+    }
+
+    #[test]
+    fn cap_counts_only_visible_items() {
+        let mut t = TurnState::default();
+        // 4 visible user sends + 1 hidden plumbing delivery interleaved.
+        t.queue.push_back(Outgoing { queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: None, tracked: false, ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(2), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(3), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(4), ..Default::default() });
+        assert_eq!(t.queue.len(), 5);
+        assert_eq!(visible_queued(&t), 4, "hidden delivery must not eat the cap budget");
+    }
+
+    #[test]
+    fn reorder_refused_while_bus_wake_pending() {
+        let mut t = TurnState::default();
+        assert!(t.try_begin_send()); // idle → busy
+        t.queue.push_back(Outgoing { queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(2), ..Default::default() });
+        assert!(!t.request_bus_read()); // wake coalesced at index 2
+        assert!(t.bus_read_pos.is_some());
+        // A valid permutation is still refused while the wake is pending, so the
+        // wake can't be mis-placed relative to a dragged message.
+        assert!(!t.reorder(&[2, 1]));
+        let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
+        assert_eq!(ids, vec![1, 2], "queue untouched on refusal");
+    }
+
+    #[test]
+    fn finalize_text_only_replaces_plain_rows() {
+        use crate::store::entities::lead_message::Model;
+        let row = |kind: &str, content: &str| Model {
+            id: 1,
+            thread_id: 1,
+            session_id: None,
+            turn_id: 1,
+            role: "user".into(),
+            kind: kind.into(),
+            content: content.into(),
+            status: "complete".into(),
+            created_at: "0".into(),
+            seq: None,
+        };
+        let plain = Outgoing { text: "edited".into(), queue_id: Some(1), ..Default::default() };
+        // Plain text, no attachments → use the (edited) Outgoing text.
+        assert_eq!(
+            finalize_text(&row("text", r#"{"text":"orig","images":[],"files":[]}"#), &plain),
+            Some("edited".to_string()),
+        );
+        // Persisted images but out.images cleared (per-turn spill) → keep cached body.
+        let spilled = Outgoing { text: "/tmp/x.png".into(), images: vec![], queue_id: Some(1), ..Default::default() };
+        assert_eq!(
+            finalize_text(&row("text", r#"{"text":"","images":["data:..."],"files":[]}"#), &spilled),
+            None,
+        );
+        // Resident inline image (out.images non-empty) → keep cached body.
+        let resident = Outgoing {
+            text: "hi".into(),
+            images: vec![("image/png".into(), "abc".into())],
+            queue_id: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(finalize_text(&row("text", r#"{"text":"hi"}"#), &resident), None);
+        // Command row → keep cached body.
+        assert_eq!(finalize_text(&row("command", r#"{"command":"x","args":""}"#), &plain), None);
+    }
+
+    /// queue_edit must preserve images/files in the persisted row; only text changes.
+    #[tokio::test]
+    async fn queue_edit_preserves_images_and_files_in_persisted_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        // Insert a queued message that has images and files in its content.
+        let original = serde_json::json!({
+            "text": "original text",
+            "images": [{"data": "abc", "media_type": "image/png"}],
+            "files": ["/tmp/attach.txt"]
+        })
+        .to_string();
+        let row = repo::insert_lead_message(&db, 1, None, 1, "user", "text", &original, "queued")
+            .await
+            .unwrap();
+
+        // Simulate what queue_edit now does: read row, update text only.
+        let existing = repo::get_message(&db, row.id).await.unwrap().unwrap();
+        let mut val: serde_json::Value =
+            serde_json::from_str(&existing.content).unwrap();
+        val["text"] = serde_json::Value::String("edited text".into());
+        repo::update_message_content(&db, row.id, &val.to_string()).await.unwrap();
+
+        let updated = repo::get_message(&db, row.id).await.unwrap().unwrap();
+        let content: serde_json::Value = serde_json::from_str(&updated.content).unwrap();
+        assert_eq!(content["text"], "edited text");
+        assert!(content["images"].is_array());
+        assert_eq!(content["images"].as_array().unwrap().len(), 1, "images must be preserved");
+        assert!(content["files"].is_array());
+        assert_eq!(content["files"][0], "/tmp/attach.txt", "files must be preserved");
+    }
+
+    /// FIX 1: an Outgoing with files or images exposes has_attachments=true via queue_items.
+    #[test]
+    fn queue_items_exposes_has_attachments() {
+        let mut turn = TurnState::default();
+        turn.busy = true;
+        // One attachment-bearing item.
+        turn.queue.push_back(Outgoing {
+            text: "look at this".into(),
+            images: vec![("image/png".into(), "abc".into())],
+            tracked: true,
+            queue_id: Some(1),
+            has_attachments: true,
+            ..Default::default()
+        });
+        // One plain text item.
+        turn.queue.push_back(Outgoing {
+            text: "just text".into(),
+            tracked: true,
+            queue_id: Some(2),
+            has_attachments: false,
+            ..Default::default()
+        });
+        let items = queue_items(&turn);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].has_attachments, "attachment item must report has_attachments=true");
+        assert!(!items[1].has_attachments, "plain text item must report has_attachments=false");
     }
 }

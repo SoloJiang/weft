@@ -323,7 +323,7 @@ pub async fn lead_stop(app: AppHandle, thread_id: i32) -> Result<(), String> {
 #[derive(serde::Serialize)]
 pub struct LeadStateInfo {
     pub state: String,
-    pub queued: usize,
+    pub queue: Vec<engine::QueuedItem>,
     pub native_id: Option<String>,
     /// Effective binary for the lead's resume command (per-thread pin / alias,
     /// else identity). Empty only when the thread row is missing.
@@ -435,6 +435,31 @@ mod tests {
         assert!(!prompt.contains("feishu_chat_id"));
         assert!(!prompt.contains("ensure_issue_topic"));
     }
+
+    /// Guard against field-name drift: serde must emit `queue` (array) not
+    /// `queued` (count) so the TS side's `LeadStateInfo.queue` hydrates correctly.
+    #[test]
+    fn lead_state_info_serialises_queue_key_not_queued() {
+        use crate::lead_chat::engine::QueuedItem;
+        let info = super::LeadStateInfo {
+            state: "idle".into(),
+            queue: vec![QueuedItem { id: 1, text: "hello".into(), images: 0, files: 0, has_attachments: false }],
+            native_id: None,
+            command: String::new(),
+            slash_commands: vec![],
+            cwd: "/tmp".into(),
+            context_tokens: None,
+            window: None,
+            model: None,
+            mcp_servers: vec![],
+            tools: vec![],
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert!(v.get("queue").is_some(), "must serialize as `queue`");
+        assert!(v.get("queued").is_none(), "must NOT serialize as `queued`");
+        assert!(v["queue"].is_array(), "`queue` must be an array");
+        assert_eq!(v["queue"][0]["id"], 1);
+    }
 }
 
 #[tauri::command]
@@ -447,7 +472,7 @@ pub async fn lead_state(
     match eng {
         None => Ok(LeadStateInfo {
             state: "stopped".into(),
-            queued: 0,
+            queue: vec![],
             native_id: repo::lead_native_id(&db, thread_id).await.ok().flatten(),
             command: repo::get_thread(&db, thread_id)
                 .await
@@ -482,7 +507,7 @@ pub async fn lead_state(
             let command = crate::tool_command::effective(i.command.as_deref(), &i.tool);
             Ok(LeadStateInfo {
                 state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
-                queued: i.turn.queue.len(),
+                queue: engine::queue_items(&i.turn),
                 native_id: i.native_id.clone(),
                 command,
                 slash_commands: i.slash_commands.clone(),
@@ -714,9 +739,17 @@ pub async fn list_lead_messages(
         repo::mark_incomplete_turns_interrupted(&db, thread_id, None)
             .await
             .map_err(|e| e.to_string())?;
+        // Un-sent queued rows from a dead session surface as resendable errors, not stuck/invisible.
+        repo::fail_queued(&db, thread_id, None)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     for sid in clean_sessions {
         repo::mark_incomplete_turns_interrupted(&db, thread_id, Some(sid))
+            .await
+            .map_err(|e| e.to_string())?;
+        // Un-sent queued rows from a dead session surface as resendable errors, not stuck/invisible.
+        repo::fail_queued(&db, thread_id, Some(sid))
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -739,7 +772,7 @@ pub struct LiveWorkerSlot {
     /// assume the active thread.
     pub thread_id: i32,
     pub busy: bool,
-    pub queued: usize,
+    pub queue: Vec<engine::QueuedItem>,
 }
 
 /// A snapshot of one live worker engine taken under its lock. Pure input to
@@ -749,7 +782,7 @@ struct WorkerSnapshot {
     session_id: i32,
     thread_id: i32,
     busy: bool,
-    queued: usize,
+    queue: Vec<engine::QueuedItem>,
 }
 
 /// Keep only the actually-running snapshots (`busy == true`) and assemble each
@@ -786,7 +819,7 @@ async fn build_worker_slots(db: &Db, snaps: Vec<WorkerSnapshot>) -> Vec<LiveWork
             repo_id: sess.repo_id,
             thread_id: s.thread_id,
             busy: s.busy,
-            queued: s.queued,
+            queue: s.queue,
         });
     }
     out
@@ -815,12 +848,12 @@ pub async fn list_live_worker_slots(
     };
     let mut snaps = Vec::new();
     for eng in engines {
-        let (session_id, thread_id, busy, queued) = {
+        let (session_id, thread_id, busy, queue) = {
             let inner = eng.lock().await;
-            (inner.session_id, inner.thread_id, inner.turn.busy, inner.turn.queue.len())
+            (inner.session_id, inner.thread_id, inner.turn.busy, engine::queue_items(&inner.turn))
         };
         if let Some(sid) = session_id {
-            snaps.push(WorkerSnapshot { session_id: sid, thread_id, busy, queued });
+            snaps.push(WorkerSnapshot { session_id: sid, thread_id, busy, queue });
         }
     }
     Ok(build_worker_slots(&db, snaps).await)
@@ -1128,6 +1161,54 @@ pub async fn chat_stop(app: AppHandle, session_id: i32) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub async fn chat_dequeue(app: AppHandle, db: State<'_, Db>, session_id: i32, message_id: i32) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::queue_remove(&app, &db, &eng, message_id).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_edit_queued(app: AppHandle, db: State<'_, Db>, session_id: i32, message_id: i32, text: String) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::queue_edit(&app, &db, &eng, message_id, &text).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_reorder_queue(app: AppHandle, db: State<'_, Db>, session_id: i32, order: Vec<i32>) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(session_id as i64) {
+        engine::queue_reorder(&app, &db, &eng, order).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lead_dequeue(app: AppHandle, db: State<'_, Db>, thread_id: i32, message_id: i32) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+        engine::queue_remove(&app, &db, &eng, message_id).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lead_edit_queued(app: AppHandle, db: State<'_, Db>, thread_id: i32, message_id: i32, text: String) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+        engine::queue_edit(&app, &db, &eng, message_id, &text).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lead_reorder_queue(app: AppHandle, db: State<'_, Db>, thread_id: i32, order: Vec<i32>) -> Result<(), String> {
+    if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+        engine::queue_reorder(&app, &db, &eng, order).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// idle-time skill refresh (worker): re-inject the workspace's enabled skills
 /// into the live session's cwd and flag the engine so the next send silently
 /// restarts the resident process to pick them up. No-op if the engine is gone.
@@ -1272,19 +1353,24 @@ mod live_slot_tests {
     }
 
     fn snap(session_id: i32, thread_id: i32, busy: bool) -> WorkerSnapshot {
-        WorkerSnapshot { session_id, thread_id, busy, queued: 0 }
+        WorkerSnapshot { session_id, thread_id, busy, queue: vec![] }
     }
 
     /// A busy worker is assembled into a full slot carrying its own thread id and
     /// DB-derived SessionInfo.
     #[tokio::test]
     async fn busy_worker_becomes_a_slot() {
+        use crate::lead_chat::engine::QueuedItem;
         let db = mem().await;
         let (th, dir, repo_id, sess) = fixture(&db).await;
 
+        let items = vec![
+            QueuedItem { id: 10, text: "hi".into(), images: 0, files: 0, has_attachments: false },
+            QueuedItem { id: 11, text: "there".into(), images: 1, files: 0, has_attachments: true },
+        ];
         let slots = build_worker_slots(
             &db,
-            vec![WorkerSnapshot { session_id: sess, thread_id: th, busy: true, queued: 2 }],
+            vec![WorkerSnapshot { session_id: sess, thread_id: th, busy: true, queue: items }],
         )
         .await;
 
@@ -1295,7 +1381,9 @@ mod live_slot_tests {
         assert_eq!(s.repo_id, repo_id);
         assert_eq!(s.thread_id, th);
         assert!(s.busy);
-        assert_eq!(s.queued, 2);
+        assert_eq!(s.queue.len(), 2);
+        assert_eq!(s.queue[0].id, 10);
+        assert_eq!(s.queue[1].text.as_str(), "there");
         assert_eq!(s.info.repo, "/tmp/wt");
         assert_eq!(s.info.branch, "feat/alpha");
         assert_eq!(s.info.worktree, "/tmp/wt");

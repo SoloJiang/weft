@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import type { ImageAttachment, SlashCmd } from "../lib/types";
 import { api } from "../lib/api";
+import { toast } from "../components/Toast";
 import { cn } from "../lib/cn";
 import { useClickOutside } from "../lib/useClickOutside";
 import {
@@ -41,6 +42,9 @@ type SlashItem = {
 };
 
 const IME_ENTER_GRACE_MS = 100;
+
+/** Max messages that can wait in the queue while a turn runs. */
+const MAX_QUEUED = 5;
 
 export function ChatComposer({
   slashCommands,
@@ -233,6 +237,11 @@ function ChatComposerBody({
   const send = () => {
     const v = text.trim();
     if (!v && images.length === 0 && files.length === 0) return;
+    // Queue is capped while a turn runs: intercept, keep the draft, tell the user.
+    if (busy && queued >= MAX_QUEUED) {
+      toast(t("lead.queueFull"));
+      return;
+    }
     lastSendRef.current = Date.now();
     const imgs = images.map(({ media_type, data }) => ({ media_type, data }));
     const prevText = text;
@@ -525,11 +534,6 @@ function ChatComposerBody({
           </PromptInputTools>
 
           <div className="ml-auto flex items-center gap-2">
-            {queued > 0 && (
-              <span className="rounded-full bg-bg px-2 py-0.5 text-[10.5px] text-ink-faint">
-                {t("lead.queuedN", { count: queued })}
-              </span>
-            )}
             {extraActions}
             {onOpenApp && (
               <PromptInputButton

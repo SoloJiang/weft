@@ -146,7 +146,7 @@ export function LeadTab({
   if (tid == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
-  const turn = leadTurn[tid] ?? { state: "stopped" as const, queued: 0 };
+  const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
   // The lead engine runs the thread's lead_tool (not always claude).
   const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
 
@@ -213,13 +213,17 @@ export function LeadTab({
           promptText={promptText}
           cwd={leadCwd}
           emptyState={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
+          queue={turn.queue}
+          onRemove={(id) => void api.leadDequeue(tid, id)}
+          onEdit={(id, text) => void api.leadEditQueued(tid, id, text)}
+          onReorder={(order) => void api.leadReorderQueue(tid, order)}
         />
         <ChatComposer
           slashCommands={leadSlash[tid] ?? []}
           localSlash={localSlash}
           onLocalSlash={onLocalSlash}
           busy={turn.state === "busy"}
-          queued={turn.queued}
+          queued={turn.queue.length}
           onSend={(text, images, files) =>
             sendLeadChat(tid, text, images, files)
           }
