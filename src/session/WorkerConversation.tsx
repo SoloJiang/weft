@@ -42,7 +42,6 @@ export function WorkerConversation() {
     skillsDirtyAt,
     markSkillsDirty,
     asks,
-    directionsByThread,
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
@@ -67,19 +66,14 @@ export function WorkerConversation() {
   // the open thread (board path). Covers cross-thread entry from "Needs you".
   const threadId = live?.threadId ?? activeThreadId;
 
-  // This worker's pending permission asks: an ask's `dir` is the direction's
-  // slug, so resolve the viewed direction by id and match on its thread + slug.
-  // Answered in the same in-session bar the lead uses, so an ask is actionable
-  // in one place — the workspace dock only routes here.
-  const viewedDir =
+  // This worker's pending permission asks. A worker ask's `dir` is the direction
+  // id as a string (backend uses direction_id.to_string(); board code matches
+  // String(direction.id) / Number(a.dir)). Answered in the same in-session card
+  // the lead uses, so an ask is actionable in one place — the dock only routes.
+  const workerAsks =
     directionId == null
-      ? undefined
-      : Object.values(directionsByThread)
-          .flat()
-          .find((d) => d.id === directionId);
-  const workerAsks = viewedDir
-    ? asks.filter((a) => a.thread === viewedDir.thread_id && a.dir === viewedDir.slug)
-    : [];
+      ? []
+      : asks.filter((a) => a.dir === String(directionId));
 
   // History lives in the thread timeline; hydrate it (worker rows ride along).
   useEffect(() => {

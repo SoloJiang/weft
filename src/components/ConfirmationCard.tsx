@@ -1,6 +1,6 @@
 import type { ToolUIPart } from "ai";
 import type { ComponentProps, ReactNode } from "react";
-import { createContext, useContext, useEffect, useMemo } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { MoreHorizontal, ShieldQuestion } from "lucide-react";
 import type { PermissionAsk } from "../lib/types";
@@ -142,14 +142,20 @@ export function PermissionConfirmationCard({
   const { t } = useTranslation();
   const detailTitle = ask.detail || ask.summary;
   const isBlockSummary = summaryMode === "block";
+  const rootRef = useRef<HTMLDivElement>(null);
 
-  // On the in-session bar (a single active ask) the keyboard answers it:
-  // Enter = allow, ⌘/Ctrl+Enter = always, Esc = deny. Skip when focus is on an
-  // interactive element (e.g. the composer) or mid-IME-composition.
+  // On the in-session card (a single active ask) the keyboard answers it:
+  // Enter = allow, ⌘/Ctrl+Enter = always, Esc = deny. Runs in the capture phase
+  // and stops propagation so the card preempts other window keydown handlers —
+  // e.g. an open Diff/FileTree panel also closes on Escape; without this, Esc
+  // would deny AND close the panel. Skipped when focus is on an interactive
+  // element, mid-IME, or the card is hidden (offsetParent null — a host may keep
+  // a compact session mounted under `hidden`, which must not capture keys).
   useEffect(() => {
     if (!enableShortcuts) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.isComposing) return;
+      if (rootRef.current?.offsetParent == null) return;
       const el = e.target as HTMLElement | null;
       const interactive =
         !!el &&
@@ -159,22 +165,22 @@ export function PermissionConfirmationCard({
           el.tagName === "A" ||
           el.isContentEditable);
       if (interactive) return;
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+      const act = (answer: PermissionAnswer) => {
         e.preventDefault();
-        onAnswer(ask.id, "always");
-      } else if (e.key === "Enter") {
-        e.preventDefault();
-        onAnswer(ask.id, "allow");
-      } else if (e.key === "Escape") {
-        onAnswer(ask.id, "deny");
-      }
+        e.stopImmediatePropagation();
+        onAnswer(ask.id, answer);
+      };
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) act("always");
+      else if (e.key === "Enter") act("allow");
+      else if (e.key === "Escape") act("deny");
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [enableShortcuts, ask.id, onAnswer]);
 
   return (
     <Confirmation
+      ref={rootRef}
       approval={{ id: String(ask.id) }}
       state="approval-requested"
       className={cn(
