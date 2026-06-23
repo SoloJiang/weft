@@ -137,8 +137,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * relations. Drag to pan, scroll/buttons to zoom.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, selectedRepoId, openRepoDetail } = useStore();
-  const [analyzing, setAnalyzing] = useState(false);
+  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, analyzing, selectedRepoId, openRepoDetail } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<ViewMode>("overview");
 
@@ -362,11 +361,7 @@ export function RepoGraph() {
             <div className="pointer-events-none flex items-center gap-2">
               <button
                 data-graph-controls
-                onClick={() => {
-                  if (analyzing) return;
-                  setAnalyzing(true);
-                  void reanalyzeDeps().finally(() => setAnalyzing(false));
-                }}
+                onClick={() => void reanalyzeDeps()}
                 disabled={analyzing}
                 title={t("repomap.reanalyzeHint")}
                 className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
