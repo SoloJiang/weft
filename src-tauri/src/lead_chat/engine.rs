@@ -1315,6 +1315,53 @@ pub async fn send(
         // defensively so a still-open tool row can't outlive the bounce.
         finalize_orphan_tool_rows(app, db, tid, orphans, "interrupted").await;
     }
+    // Pre-flight agent resolution: if the configured CLI can't be found on PATH, a
+    // spawn would fail deep inside with a raw "No such file or directory (os error
+    // 2)" that surfaces only as a generic "errored" label. Surface a friendly,
+    // localizable row up front instead — this one check covers every transport
+    // (resident, per-turn, codex app-server) — and skip the turn so the user can
+    // install/point the agent and retry. After detect::augment_path this only
+    // fires when the CLI is genuinely absent.
+    {
+        let (tool, command, thread_id, sid) = {
+            let g = eng.lock().await;
+            (
+                g.tool.clone(),
+                crate::tool_command::effective(g.command.as_deref(), &g.tool),
+                g.thread_id,
+                g.session_id,
+            )
+        };
+        if crate::detect::resolve_tool_path(&command).is_none() {
+            let turn = {
+                let mut g = eng.lock().await;
+                g.turn_id += 1;
+                g.turn_id
+            };
+            let image_uris: Vec<String> = images
+                .iter()
+                .map(|(mt, data)| format!("data:{mt};base64,{data}"))
+                .collect();
+            let user = serde_json::json!({ "text": text, "images": image_uris, "files": files })
+                .to_string();
+            if let Ok(m) =
+                repo::insert_lead_message(db, thread_id, sid, turn, "user", "text", &user, "error")
+                    .await
+            {
+                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+            }
+            let notice =
+                serde_json::json!({ "terminal": "agent_not_found", "tool": tool }).to_string();
+            if let Ok(m) = repo::insert_lead_message(
+                db, thread_id, sid, turn, "assistant", "text", &notice, "error",
+            )
+            .await
+            {
+                let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+            }
+            return Err(anyhow::anyhow!("agent-not-found:{tool}"));
+        }
+    }
     ensure_running_for_send(app, db, eng).await?;
     let mut inner = eng.lock().await;
     let thread_id = inner.thread_id;

@@ -981,7 +981,10 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+        // A missing CLI surfaces as the stable `agent-not-found:<tool>` code so
+        // the failed-analysis notice localizes it, not raw "os error 2".
+        .map_err(|e| anyhow::anyhow!("{}", crate::tool_command::spawn_error_message(tool, &command, &e)))?;
     if let Some(mut stdin) = child.stdin.take() {
         // claude reads the message from stdin as a stream-json user envelope
         // (matches engine::write_user); per-turn tools already have it on argv.

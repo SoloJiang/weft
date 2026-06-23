@@ -738,7 +738,14 @@ function FailedNotice({ error, onRetry }: { error: string | null; onRetry: () =>
   const errorCodes: Record<string, string> = {
     "checkout-missing": t("repomap.analysisErrorCheckoutMissing"),
   };
-  const message = error ? (errorCodes[error] ?? error) : null;
+  // Some codes carry a parameter (`agent-not-found:<tool>`); localize those by
+  // prefix, then fall back to the exact-match table, then to the raw diagnostic.
+  const localize = (code: string): string => {
+    const agent = code.match(/^agent-not-found:(.+)$/);
+    if (agent) return t("repomap.analysisErrorAgentNotFound", { tool: agent[1] });
+    return errorCodes[code] ?? code;
+  };
+  const message = error ? localize(error) : null;
   return (
     <div className="mb-4 rounded-[var(--radius-md)] border border-danger/30 bg-danger/5 px-3 py-2.5">
       <div className="flex items-center gap-1.5 text-[12px] font-medium text-danger">
