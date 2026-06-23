@@ -154,16 +154,22 @@ export function PermissionConfirmationCard({
   useEffect(() => {
     if (!enableShortcuts) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.isComposing) return;
+      // One physical press = one answer: ignore IME composition and key-repeat
+      // so a held key can't resolve this ask and then the next one it exposes.
+      if (e.isComposing || e.repeat) return;
       if (rootRef.current?.offsetParent == null) return;
       const el = e.target as HTMLElement | null;
+      // Skip interactive targets (composer, buttons) and anything inside an open
+      // menu/dialog/listbox — e.g. the ⋯ More dropdown owns Enter/Escape, so the
+      // shortcut must not answer the ask out from under it.
       const interactive =
         !!el &&
         (el.tagName === "INPUT" ||
           el.tagName === "TEXTAREA" ||
           el.tagName === "BUTTON" ||
           el.tagName === "A" ||
-          el.isContentEditable);
+          el.isContentEditable ||
+          !!el.closest('[role="menu"],[role="menuitem"],[role="listbox"],[role="dialog"]'));
       if (interactive) return;
       const act = (answer: PermissionAnswer) => {
         e.preventDefault();
