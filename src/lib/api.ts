@@ -67,10 +67,6 @@ export const api = {
     invoke<RepoGraph>("repo_graph", { workspaceId }),
   reprofileRepo: (repoId: number) =>
     invoke<void>("reprofile_repo", { repoId }),
-  // Re-run the read-only agent dependency curator over a workspace. Resolves
-  // when the pass completes, so the caller can refresh the graph after.
-  analyzeWorkspaceDeps: (workspaceId: number) =>
-    invoke<void>("analyze_workspace_deps", { workspaceId }),
   // Remove a repo from its workspace (ref + profile + bound tasks + worktrees).
   // The user's actual repository on disk is left untouched.
   deleteRepo: (repoId: number) =>

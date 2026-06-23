@@ -360,6 +360,11 @@ fn curator_specs() -> Value {
                 "via": { "type": "string" },
                 "action": { "type": "string", "enum": ["add", "remove"] }
             }, "required": ["from", "to", "kind", "action"] }
+        },
+        {
+            "name": "reanalyze",
+            "description": "Run a fresh dependency-analysis pass over the WHOLE workspace: re-classify each repo (tier/stack/summary) and re-infer cross-repo runtime/infra edges, then regenerate the map. Call this when the human asks to re-analyze / regenerate the repo map (e.g. after repos changed). Takes no arguments; returns when the pass completes, with the resulting repo/edge counts. Human-pinned edges survive the pass.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ])
 }
@@ -371,8 +376,39 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "calibrate_edges" => calibrate_edges_tool(db, thread, args).await,
+        "reanalyze" => match reanalyze_tool(db, thread).await {
+            Ok(v) => text_result(v),
+            Err(e) => text_result(format!("error: {e}")),
+        },
         _ => text_result(format!("unknown tool {name}")),
     }
+}
+
+/// Run a full workspace analysis pass for the curator's workspace and return a
+/// summary. Spawned (detached) so the pass completes even if this tool call is
+/// dropped by a client timeout — the coalescing gate dedups concurrent triggers —
+/// then awaited so the agent's turn stays busy for its duration (subsequent user
+/// messages queue) and narrates the result.
+async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
+    let t = crate::store::repo::get_thread(db, thread)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
+    if t.kind != "curator" {
+        anyhow::bail!("reanalyze is only available in the curator chat");
+    }
+    let ws_id = t.workspace_id;
+    let db2 = db.clone();
+    let handle =
+        tauri::async_runtime::spawn(
+            async move { crate::curator::analyze_workspace_coalesced(&db2, ws_id, true).await },
+        );
+    let _ = handle.await;
+    let g = crate::curator::graph(db, ws_id).await?;
+    Ok(format!(
+        "Re-analysis complete: {} repos, {} dependency links. The repo map has been refreshed.",
+        g.nodes.len(),
+        g.edges.len()
+    ))
 }
 
 /// Like `repo_map_json`, but every node carries its full `local_git_path` — the
