@@ -12,9 +12,8 @@ pub struct Model {
     #[sea_orm(unique)]
     pub repo_id: i32,
     /// The repo's architectural tier as the agent classified it: "frontend" |
-    /// "gateway" | "backend", or "" when analysis hasn't run yet. (Column name is
-    /// historical — it held the deterministic role before the curator went
-    /// agent-only.)
+    /// "backend", or "" when analysis hasn't run yet. (Column name is historical —
+    /// it held the deterministic role before the curator went agent-only.)
     pub role: String,
     /// JSON array of stack tags (agent-reported).
     pub stack: String,
@@ -37,6 +36,19 @@ pub struct Model {
     /// analyzed / for a single-component repo.
     #[sea_orm(default_value = "[]")]
     pub components: String,
+    /// Live analysis run-state, persisted so a repo "running" at shutdown can be
+    /// resumed (not silently dropped to idle). "idle" | "running" | "failed".
+    #[sea_orm(default_value = "idle")]
+    pub analysis_state: String,
+    /// Error from the last failed analysis (NULL unless analysis_state == "failed").
+    pub analysis_error: Option<String>,
+    /// Role category within the tier (free-text, agent-assigned): e.g. backend →
+    /// gateway/biz/core/common/idl/support; frontend → app/sdk/web. "" until classified.
+    #[sea_orm(default_value = "")]
+    pub category: String,
+    /// JSON array of owned feature domains (agent-assigned). "[]" until classified.
+    #[sea_orm(default_value = "[]")]
+    pub domains: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

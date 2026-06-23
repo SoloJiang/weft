@@ -181,20 +181,17 @@ interface Store {
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
   ensureCuratorThread: () => Promise<void>;
-  /** Repos view right drawer: one of detail/curator at a time. selectedRepoId
-   *  drives both node highlight and the detail tab. Width persists per workspace;
-   *  open does NOT (drawer starts closed each visit). */
+  /** Repos view right side panel: one of detail/curator at a time. selectedRepoId
+   *  drives both node highlight and the detail surface. Open state resets each
+   *  visit; panel width is per-surface in the panel's own localStorage, not here. */
   repoDrawerOpen: boolean;
   repoDrawerTab: "detail" | "curator";
   selectedRepoId: number | null;
-  repoDrawerWidth: number;
   openRepoDetail: (repoId: number) => void;
   openCurator: () => void;
   closeRepoDrawer: () => void;
   /** Drop the drawer's selected repo (e.g. when it was deleted). */
   clearSelectedRepo: () => void;
-  setRepoDrawerTab: (tab: "detail" | "curator") => void;
-  setRepoDrawerWidth: (w: number) => void;
   /** Pin a repo's one-line summary (tier ownership untouched). */
   editRepoSummary: (repoId: number, summary: string) => Promise<void>;
   /** Pin a repo's tier (summary ownership untouched). */
@@ -322,12 +319,6 @@ export const useStore = () => {
   return s;
 };
 
-// Curator panel (in the Repo Map) UI prefs, persisted per workspace.
-const CURATOR_WIDTH_DEFAULT = 360;
-const CURATOR_WIDTH_MIN = 280;
-const CURATOR_WIDTH_MAX = 560;
-const curatorWidthKey = (ws: number) => `weft.curatorPanel.${ws}.width`;
-
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<number | null>(null);
@@ -370,7 +361,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
   const [repoDrawerTab, setRepoDrawerTabState] = useState<"detail" | "curator">("detail");
   const [selectedRepoId, setSelectedRepoId] = useState<number | null>(null);
-  const [repoDrawerWidth, setRepoDrawerWidthState] = useState(CURATOR_WIDTH_DEFAULT);
   // Coalesce curator-thread creation per workspace: StrictMode double-mounts and
   // the backend get-or-create is not atomic, so concurrent ensures for the SAME
   // workspace could create dupes. Keyed by ws so switching to another workspace
@@ -601,17 +591,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("weft-active-workspace", String(id));
     // Drop the previous workspace's curator thread id so it is re-ensured lazily.
     setCuratorThreadId(null);
-    // Repos drawer: width persists (shared key with the old curator panel), but
-    // open state does not — each workspace visit starts with the canvas full-width.
+    // Repos side panel: open state resets each visit (canvas starts full-width);
+    // per-surface width is remembered in the panel's own localStorage, not here.
     setRepoDrawerOpen(false);
     setRepoDrawerTabState("detail");
     setSelectedRepoId(null);
-    const dwRaw = Number(localStorage.getItem(curatorWidthKey(id)));
-    setRepoDrawerWidthState(
-      Number.isFinite(dwRaw) && dwRaw > 0
-        ? Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, dwRaw))
-        : CURATOR_WIDTH_DEFAULT,
-    );
     const [r, t] = await Promise.all([api.listRepos(id), api.listThreads(id)]);
     setRepos(r);
     setThreads(t);
@@ -1713,7 +1697,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Ensure the workspace's hidden curator thread exists and remember its id —
   // WITHOUT navigating. The curator chat renders embedded in the Repo Map panel
-  // (RepoDrawer), so unlike a normal lead chat we never selectThread.
+  // (RepoSidePanel), so unlike a normal lead chat we never selectThread.
   const ensureCuratorThread = useCallback(async () => {
     const ws = activeWorkspaceId;
     if (ws == null || ensuringCuratorRef.current.has(ws)) return;
@@ -1743,13 +1727,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
-  const setRepoDrawerTab = useCallback((tab: "detail" | "curator") => setRepoDrawerTabState(tab), []);
-  const setRepoDrawerWidth = useCallback((w: number) => {
-    const clamped = Math.min(CURATOR_WIDTH_MAX, Math.max(CURATOR_WIDTH_MIN, Math.round(w)));
-    setRepoDrawerWidthState(clamped);
-    const ws = activeWorkspaceIdRef.current;
-    if (ws != null) localStorage.setItem(curatorWidthKey(ws), String(clamped));
-  }, []);
 
   const refreshProposal = useCallback(async (threadId: number) => {
     try {
@@ -2222,13 +2199,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     repoDrawerOpen,
     repoDrawerTab,
     selectedRepoId,
-    repoDrawerWidth,
     openRepoDetail,
     openCurator,
     closeRepoDrawer,
     clearSelectedRepo,
-    setRepoDrawerTab,
-    setRepoDrawerWidth,
     editRepoSummary,
     editRepoTier,
     proposal,

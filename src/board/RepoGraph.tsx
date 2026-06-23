@@ -9,7 +9,6 @@ import {
   Loader2,
   Maximize2,
   Minus,
-  Network,
   Pencil,
   Plus,
   RefreshCw,
@@ -27,15 +26,14 @@ import { Button } from "../components/ui/Button";
 import { Select } from "../components/ui/Select";
 import { cn } from "../lib/cn";
 
-/** The three architectural tiers laid out left→right, plus the catch-all "other"
+/** The two architectural tiers laid out left→right, plus the catch-all "other"
  *  band that holds unclassified / still-analyzing repos. */
-const TIER_ORDER = ["frontend", "gateway", "backend"] as const;
-const BANDS = ["frontend", "gateway", "backend", "other"] as const;
+const TIER_ORDER = ["frontend", "backend"] as const;
+const BANDS = ["frontend", "backend", "other"] as const;
 type Band = (typeof BANDS)[number];
 
 const TIER_ICON: Record<string, ComponentType<LucideProps>> = {
   frontend: AppWindow,
-  gateway: Network,
   backend: Server,
   other: CircleDashed,
 };
@@ -133,7 +131,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
 
 /**
  * The repo map as a pan/zoom canvas — the whole Repos surface. Nodes are laid
- * out in bands by architectural TIER (frontend → gateway → backend → other),
+ * out in bands by architectural TIER (frontend → backend → other),
  * agent-classified. Switch to the expanded view to break monorepos into their
  * internal components, grouped by tier. Edges are agent-inferred cross-repo
  * relations. Drag to pan, scroll/buttons to zoom.
@@ -200,6 +198,26 @@ export function RepoGraph() {
   // fit on first paint + whenever the graph shape changes
   useLayoutEffect(() => {
     fit();
+  }, [fit]);
+
+  // Re-fit when the container itself resizes — e.g. when the side panel (detail /
+  // curator) opens, closes, or is drag-resized and shrinks this canvas. fit() reads
+  // clientWidth/Height, but only ran on first paint / graph-shape change, so without
+  // this the graph stayed scaled for the old width and nodes were clipped until a
+  // manual Fit. rAF-coalesced so a drag-resize doesn't thrash.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => fit());
+    });
+    ro.observe(el);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
   }, [fit]);
 
   // zoom toward a point in container space
@@ -484,6 +502,11 @@ function RepoNode({
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
+        {p.category && (
+          <span className="shrink-0 rounded bg-bg px-1.5 py-px text-[9.5px] uppercase text-ink-faint" title={p.category}>
+            {p.category}
+          </span>
+        )}
         {showPkgs && p.components.length > 0 && (
           <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
             {t("repomap.pkgCount", { count: p.components.length })}
@@ -543,6 +566,11 @@ function ExpandedNode({
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
+        {p.category && (
+          <span className="shrink-0 rounded bg-bg px-1.5 py-px text-[9.5px] uppercase text-ink-faint" title={p.category}>
+            {p.category}
+          </span>
+        )}
         <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
           {t("repomap.pkgCount", { count: p.components.length })}
         </span>
@@ -787,6 +815,12 @@ function AnalyzedProfileFields({
         <ChipList values={profile.stack} empty={t("repomap.none")} mono />
       </ProfileSection>
 
+      {profile.domains.length > 0 && (
+        <ProfileSection title={t("repomap.domains")}>
+          <ChipList values={profile.domains} empty={t("repomap.none")} />
+        </ProfileSection>
+      )}
+
       {profile.components.length > 0 && (
         <ProfileSection title={t("repomap.components")}>
           <ComponentList components={profile.components} />
@@ -865,6 +899,11 @@ export function RepoDetailContent({ repoId }: { repoId: number | null }) {
             <div className="flex items-center gap-2">
               <h2 className="truncate font-mono text-[16px] font-semibold text-ink">{profile.repo_name}</h2>
               <TierBadge profile={profile} />
+              {profile.category && (
+                <span className="shrink-0 rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-ink-muted">
+                  {profile.category}
+                </span>
+              )}
             </div>
           </div>
           <button

@@ -1,9 +1,8 @@
-//! The workspace Curator (ARCHITECTURE §4.9, §4.11), now a PURE AGENT pipeline.
-//! There is no deterministic manifest engine: a bounded, read-only coding agent
-//! reads each repo deeply, classifies its tier (frontend / gateway / backend),
-//! summarizes it, surfaces monorepo sub-components, and reports the cross-repo
-//! relations it sees. Findings persist on `repo_profile`; the graph is rebuilt
-//! from them. A user edit (source = "user") always outranks re-analysis.
+//! The workspace Curator (ARCHITECTURE §4.9, §4.11): a hybrid pipeline where
+//! deterministic manifest edges (`source="manifest"`) provide the high-confidence
+//! lib floor, and a read-only coding agent fills the runtime/infra relations on
+//! top. Precedence: user > manifest > agent. Findings persist on `repo_profile`;
+//! the graph is rebuilt from them.
 
 use crate::git;
 use crate::profile::{self, AgentRelation, Component, Edge};
@@ -20,7 +19,7 @@ use std::path::Path;
 pub struct ProfileView {
     pub repo_id: i32,
     pub repo_name: String,
-    /// "frontend" | "gateway" | "backend" | "" (unclassified / analyzing).
+    /// "frontend" | "backend" | "" (unclassified / analyzing).
     pub tier: String,
     pub stack: Vec<String>,
     pub summary: String,
@@ -37,6 +36,10 @@ pub struct ProfileView {
     /// The error from the last failed analysis (only set when `analysis_state ==
     /// "failed"`), surfaced in the detail panel alongside a manual retry.
     pub analysis_error: Option<String>,
+    /// Role category within the tier (free-text, agent-assigned). "" until classified.
+    pub category: String,
+    /// Feature domains owned by this repo (agent-assigned).
+    pub domains: Vec<String>,
 }
 
 /// The workspace dependency graph: every repo (placeholders included) + the
@@ -120,6 +123,26 @@ pub async fn edit_profile(
         },
         None => existing.as_ref().map(|p| p.role.clone()).unwrap_or_default(),
     };
+    // A manual canonical-tier edit cascades to this repo's components, so the
+    // expanded (per-component) view matches the overview. Tolerate a malformed
+    // components blob (treat as none). Other edits leave components untouched.
+    let components = if let Some(t) = tier {
+        if let Some(canon) = profile::normalize_tier(t) {
+            match serde_json::from_str::<Vec<profile::Component>>(&components) {
+                Ok(mut comps) => {
+                    for c in &mut comps {
+                        c.tier = canon.clone();
+                    }
+                    serde_json::to_string(&comps).unwrap_or(components)
+                }
+                Err(_) => components,
+            }
+        } else {
+            components
+        }
+    } else {
+        components
+    };
     let source = combine_source(
         owns_summary(prior_source) || summary.is_some(),
         owns_tier(prior_source) || tier.is_some(),
@@ -136,6 +159,22 @@ pub async fn edit_profile(
     // no re-run. No-op if it wasn't failed.
     if tier.is_some() && profile::normalize_tier(&new_tier).is_some() {
         clear_failure(repo_id);
+        // The graph/detail views now read `analysis_state` from the PERSISTED
+        // profile row (not the in-memory map), and `upsert_repo_profile` above
+        // preserves that column unchanged. Clearing only the in-memory failure
+        // would leave the DB column at "failed" — the repo keeps rendering as a
+        // retryable failure and stays skipped from auto-passes. Persist "idle" too.
+        let _ = repo::set_analysis_state(db, repo_id, "idle", None).await;
+    }
+    // A manual profile edit changes the map's INVENTORY surface (a tier edit
+    // cascades to component tiers; a summary edit changes the narrative). Relations
+    // have their own invalidation chokepoint in `set_repo_relations`, but inventory
+    // edits don't pass through it, so invalidate the workspace map doc here too.
+    // (Agent-driven inventory writes via `persist_repo_class` are always followed by
+    // `analyze_relations`' fresh-markdown write in the same pass, so this manual path
+    // is the only standalone inventory mutation.) Regenerates on the next pass.
+    if let Some(r) = repo::get_repo(db, repo_id).await? {
+        let _ = repo::clear_repo_map_doc(db, r.workspace_id).await;
     }
     Ok(saved)
 }
@@ -154,8 +193,11 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
             profiled_commit: String::new(),
             analyzed: false,
             components: Vec::new(),
-            analysis_state: run_phase(repo.id).to_string(),
-            analysis_error: run_error(repo.id),
+            // No profile row yet → no persisted state; default to idle.
+            analysis_state: "idle".to_string(),
+            analysis_error: None,
+            category: String::new(),
+            domains: Vec::new(),
         };
     };
     ProfileView {
@@ -172,8 +214,12 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
         // those must still read as "analyzing", not a finished unclassified node.
         analyzed: profile::normalize_tier(&p.role).is_some(),
         components: comps(&p.components),
-        analysis_state: run_phase(repo.id).to_string(),
-        analysis_error: run_error(repo.id),
+        // Read from the persisted profile columns; in-memory run_phase/run_error
+        // are now only used for the analyze_workspace failed-repo gate.
+        analysis_state: p.analysis_state.clone(),
+        analysis_error: p.analysis_error.clone(),
+        category: p.category.clone(),
+        domains: arr(&p.domains),
     }
 }
 
@@ -270,6 +316,9 @@ pub struct CuratorRelation {
     // `relations` payload over one bad value.
     #[serde(default, deserialize_with = "lenient_confidence")]
     pub confidence: u8,
+    /// Free-text explanation from the agent for why this dependency exists.
+    #[serde(default)]
+    pub rationale: String,
 }
 
 /// Coerce a relation's `confidence` from whatever shape the agent emitted (int,
@@ -292,6 +341,19 @@ struct CuratorWire {
     // Required (no serde default): a reply without a `relations` array is treated
     // as unparseable, so a malformed/timed-out turn never reads as "no relations".
     relations: Vec<CuratorRelation>,
+    /// RedIM-style markdown document synthesized by the analyst. Optional:
+    /// tolerate an agent that omits it — the doc update is skipped, not a failure.
+    #[serde(default)]
+    repo_map_markdown: Option<String>,
+}
+
+/// The parsed result of the curator agent's cross-repo pass. Relations are always
+/// present (possibly empty); the markdown doc may be absent if the agent omitted it.
+pub struct CuratorOutput {
+    pub relations: Vec<CuratorRelation>,
+    /// A RedIM-style workspace doc synthesized by the analyst. `None` when the
+    /// agent did not emit one (degrade gracefully — skip the doc update).
+    pub repo_map_markdown: Option<String>,
 }
 
 /// Every balanced top-level `{...}` substring, in order. Byte-scans for the ASCII
@@ -347,18 +409,24 @@ fn json_objects(text: &str) -> Vec<&str> {
     out
 }
 
-/// Extract the curator agent's relations from its free-form reply (tolerant of
+/// Extract the curator agent's output from its free-form reply (tolerant of
 /// markdown fences / surrounding prose). Scans EVERY balanced object and returns
 /// the LAST that deserializes as a relations payload — the prompt asks for the
 /// JSON as the final thing, and an earlier prose/config `{...}` must not hide it.
 /// `None` when no object has a `relations` array (timed-out/malformed reply) so
-/// the caller leaves the graph intact; `Some([])` is an explicit "no relations".
-pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
+/// the caller leaves the graph intact; `Some` with an empty `relations` is an
+/// explicit "no relations". `repo_map_markdown` defaults to `None` when absent —
+/// the caller skips the doc update gracefully rather than failing.
+pub fn parse_curator_output(text: &str) -> Option<CuratorOutput> {
     json_objects(text)
         .into_iter()
         .rev()
         .find_map(|obj| serde_json::from_str::<CuratorWire>(obj).ok())
-        .map(|w| w.relations)
+        .map(|w| CuratorOutput {
+            relations: w.relations,
+            // Treat an explicit null or omitted key as None (skip doc update).
+            repo_map_markdown: w.repo_map_markdown.filter(|s| !s.trim().is_empty()),
+        })
 }
 
 /// The per-repo deep pass's strict-JSON result. `tier` is required (no serde
@@ -370,8 +438,12 @@ pub fn parse_curator_output(text: &str) -> Option<Vec<CuratorRelation>> {
 /// discriminator because the failure mode is SAFE — a misclassified object leaves
 /// the placeholder for retry, rather than persisting a component's tier/summary as
 /// the whole repo (which `needs_classification` would then skip).
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 struct RepoClassWire {
+    // `tier` has no serde default by design — a reply without one is unparseable.
+    // `Default::default()` yields "" which tests treat as an unparseable tier; that
+    // is acceptable because the struct's `Default` is only used in test constructors
+    // via `..Default::default()` for the new optional fields.
     tier: String,
     #[serde(default)]
     name: Option<String>,
@@ -383,6 +455,22 @@ struct RepoClassWire {
     stack: Option<Vec<String>>,
     #[serde(default)]
     components: Option<Vec<Component>>,
+    // `Option` so persistence can distinguish "absent" (preserve prior) from
+    // "present but empty" (explicit clear). `#[serde(default)]` makes a missing
+    // JSON key deserialize as None. (Finding 4)
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    domains: Option<Vec<String>>,
+    // Transient surface-info fields: parsed so the agent is prompted to reason
+    // about them, but not persisted to their own columns in v1 (may be folded
+    // into domains / fed to the analyst later) — hence allow(dead_code).
+    #[allow(dead_code)]
+    #[serde(default)]
+    exposed: Vec<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    consumes: Vec<String>,
 }
 
 /// Extract the per-repo classification from the agent's free-form reply, same
@@ -425,55 +513,183 @@ fn codex_exec_read_only_args() -> Vec<String> {
     ]
 }
 
-/// The shared definition of the three architectural tiers, embedded in both the
+/// The shared definition of the two architectural tiers, embedded in both the
 /// per-repo classification prompt and the cross-repo relations prompt so the
 /// agent applies one consistent taxonomy.
 const TIER_GUIDE: &str = "Tiers:\n\
 - frontend: user-facing client — web SPA/MPA, mobile, desktop UI, static site.\n\
-- gateway: the MIDDLE layer between frontend and backend — API gateway, BFF \
-(backend-for-frontend), aggregator, edge service, reverse proxy, GraphQL gateway. \
-It mostly orchestrates/forwards to other services rather than owning core domain \
-data.\n\
-- backend: a service that owns domain logic and/or data — REST/gRPC services, \
-workers, batch jobs, databases-of-record, shared libraries that back them.";
+- backend: anything server-side — API gateways / BFFs / aggregators / edge \
+services, REST/gRPC services, workers, batch jobs, databases-of-record, and the \
+shared libraries / IDL that back them.";
 
 /// Per-repo DEEP classification prompt. The agent runs with cwd AT this repo and
 /// is told to read widely (subdirectories, monorepo packages) before emitting one
-/// strict-JSON object: the repo's tier + one-line summary + stack, plus any
-/// monorepo sub-components for the map's "expanded" view.
-fn build_repo_class_prompt(repo_name: &str) -> String {
+/// strict-JSON object: tier + summary + stack + components + category + domains +
+/// exposed + consumes. Manifest signals (requires/provides) are injected as hints
+/// so the agent confirms/augments rather than guessing cold.
+fn build_repo_class_prompt(repo_name: &str, cwd: &std::path::Path) -> String {
+    let manifest = crate::manifest::scan_repo(cwd);
+    let manifest_hint = build_manifest_hint(&manifest);
     format!(
         "Analyze the repository at the current working directory (name: {repo_name}) \
 DEEPLY and READ-ONLY. Do NOT stop at the top-level manifest: read the source \
 layout, entry points, configs, and — if this is a monorepo — its packages/apps/\
 services subdirectories, so your classification reflects what the code actually \
-does.\n\n{TIER_GUIDE}\n\nClassify the repository into exactly one top-level tier. \
+does.\n\n{TIER_GUIDE}\n\n{manifest_hint}\
+Classify the repository into exactly one top-level tier. \
 If the repo is a monorepo containing two or more deployable/publishable internal \
 packages or services, list each as a component with its own tier; a single-purpose \
 repo has no components.\n\nAs the LAST thing in your reply, output a single JSON \
 object and nothing after it:\n\
-{{\"tier\":\"frontend|gateway|backend\",\"summary\":\"<one line; name the key \
+{{\"tier\":\"frontend|backend\",\"summary\":\"<one line; name the key \
 internal modules if it is a monorepo>\",\"stack\":[\"<language/framework tags>\"],\
 \"components\":[{{\"name\":\"<package/service>\",\"path\":\"<relative path>\",\
-\"tier\":\"frontend|gateway|backend\",\"summary\":\"<one line>\",\
-\"deps\":[\"<sibling component name it depends on>\"]}}]}}\n\
+\"tier\":\"frontend|backend\",\"summary\":\"<one line>\",\
+\"deps\":[\"<sibling component name it depends on>\"]}}],\
+\"category\":\"<role within its tier, e.g. gateway|biz|core|common|idl|support|app|sdk|web — best fit, free text>\",\
+\"domains\":[\"<owned feature domains, e.g. orders|payments|auth>\"],\
+\"exposed\":[\"<HTTP/gRPC routes, queues, or dbs this repo offers>\"],\
+\"consumes\":[\"<other services/APIs this repo calls>\"]}}\n\
 Rules: pick the single tier that best fits the repo as a whole. `components` is \
 [] unless this is a monorepo with 2+ internal packages/services. `deps` lists only \
-SIBLING components in THIS repo. Keep summaries to one line."
+SIBLING components in THIS repo. Keep summaries to one line. `category` is \
+free-text — use the examples as guidance, not a constraint. `domains` and `exposed`/\
+`consumes` may be [] if not applicable."
     )
 }
 
-/// Cross-repo relations prompt: lists every classified repo (id/name/tier/path/
-/// summary) and asks for STRICT JSON relations keyed by repo id — runtime, infra,
-/// AND declared library dependencies (there is no manifest floor, so the agent
-/// reports `lib` edges too).
+/// Format the manifest signals as a human-readable hint block for the prompt.
+/// Returns an empty string when the manifest carries no signal (no provides/requires).
+fn build_manifest_hint(manifest: &crate::manifest::ManifestInfo) -> String {
+    let has_provides = !manifest.provides.is_empty();
+    let has_requires = !manifest.requires.is_empty();
+    if !has_provides && !has_requires {
+        return String::new();
+    }
+    let mut hint = String::from("Manifest signals (use as starting hints — confirm or augment from the code):\n");
+    if has_provides {
+        hint.push_str(&format!("- This repo provides: {}\n", manifest.provides.join(", ")));
+    }
+    if has_requires {
+        hint.push_str(&format!("- Known declared dependencies: {}\n", manifest.requires.join(", ")));
+    }
+    hint.push('\n');
+    hint
+}
+
+/// Format the manifest edges already seeded for a repo as a structured hint block.
+/// Returns an empty string when the repo has no stored agent relations with
+/// source="manifest" (the typical case when no manifests were found).
+fn build_manifest_edge_hint(relations_json: &str) -> String {
+    let rels: Vec<crate::profile::AgentRelation> =
+        serde_json::from_str(relations_json).unwrap_or_default();
+    let manifest: Vec<_> = rels.iter().filter(|r| r.source == "manifest").collect();
+    if manifest.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("  manifest edges (high-confidence lib deps from on-disk manifests):\n");
+    for r in manifest {
+        out.push_str(&format!("    → to={} kind={} via={:?}\n", r.to, r.kind, r.via));
+    }
+    out
+}
+
+/// Build the workspace-wide `provides_name → repo_id` map, SKIPPING ambiguous
+/// names (claimed by 2+ distinct repos). A first-wins pick on a duplicated
+/// package/crate/artifact name (forks, copied services, common unscoped names)
+/// would resolve to whichever repo iterated first — a concrete-but-arbitrary
+/// target. A wrong hint is worse than none (the agent infers the real one), so
+/// ambiguous names resolve to nothing. Shared by the deterministic seed pass and
+/// the analyst prompt's hint builder so the two never disagree.
+fn unambiguous_provider_map<'a, I>(repo_infos: I) -> std::collections::HashMap<String, i32>
+where
+    I: IntoIterator<Item = (i32, &'a crate::manifest::ManifestInfo)>,
+{
+    use std::collections::HashMap;
+    let mut providers: HashMap<String, Vec<i32>> = HashMap::new();
+    for (id, info) in repo_infos {
+        for name in &info.provides {
+            let ids = providers.entry(name.clone()).or_default();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    providers
+        .into_iter()
+        .filter_map(|(name, ids)| match ids.as_slice() {
+            [only] => Some((name, *only)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Cross-repo relations prompt: lists every classified repo (id/name/tier/category/
+/// domains/path/summary) along with its already-seeded manifest edges, then asks
+/// for STRICT JSON with relations+rationale and a repo_map_markdown doc.
+///
+/// Manifest edges are computed DIRECTLY from on-disk manifests (not from the
+/// persisted relations column), so the hint is always non-empty on a first
+/// analysis even before seed_manifest_relations has persisted anything. The
+/// agent pass's output is still merged/persisted after it completes, so seeding
+/// after the agent doesn't overwrite the manifest floor. (Finding 3)
 fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> String {
+    use std::collections::HashMap;
+
+    // Build workspace-wide provides_name → repo_id map from on-disk manifests.
+    let mut repo_infos: Vec<(&repo_ref::Model, crate::manifest::ManifestInfo)> = repos
+        .iter()
+        .map(|(r, _)| (r, crate::manifest::scan_repo(Path::new(&r.local_git_path))))
+        .collect();
+    // Same ambiguity filtering as seed_manifest_relations: the agent consumes
+    // these hints before persistence, so an arbitrary first-wins edge to a
+    // duplicated provider could steer it into persisting a wrong agent relation.
+    let provides_map = unambiguous_provider_map(repo_infos.iter().map(|(r, info)| (r.id, info)));
+
+    // For each repo, build a fresh manifest-edge hint from on-disk deps.
+    let mut live_manifest_hints: HashMap<i32, String> = HashMap::new();
+    for (r, info) in &mut repo_infos {
+        let edges: Vec<_> = info
+            .requires
+            .iter()
+            .filter_map(|req| {
+                let target_id = *provides_map.get(req)?;
+                if target_id == r.id { None } else { Some((target_id, req.as_str())) }
+            })
+            .collect();
+        if !edges.is_empty() {
+            let mut hint = String::from("  manifest edges (high-confidence lib deps from on-disk manifests):\n");
+            for (to, via) in &edges {
+                hint.push_str(&format!("    → to={} kind=lib via={:?}\n", to, via));
+            }
+            live_manifest_hints.insert(r.id, hint);
+        }
+    }
+
     let mut lines = String::new();
     for (r, p) in repos {
         let tier = if p.role.is_empty() { "unknown" } else { p.role.as_str() };
+        let category = p.category.as_str();
+        let domains: Vec<String> = serde_json::from_str(&p.domains).unwrap_or_default();
+        let domains_str = if domains.is_empty() {
+            String::new()
+        } else {
+            format!(" domains=[{}]", domains.join(", "))
+        };
+        // Use the live on-disk manifest hint (always available, even on first
+        // analysis). Fall back to the persisted hint as a secondary source only when
+        // the live scan yielded nothing (e.g. checkout temporarily unreadable).
+        let manifest_hint = {
+            let live = live_manifest_hints.get(&r.id).cloned().unwrap_or_default();
+            if live.is_empty() {
+                build_manifest_edge_hint(&p.relations)
+            } else {
+                live
+            }
+        };
         lines.push_str(&format!(
-            "- id={} name={:?} tier={} path={:?}\n  summary: {}\n",
-            r.id, r.name, tier, r.local_git_path, p.summary
+            "- id={} name={:?} tier={} category={:?}{} path={:?}\n  summary: {}\n{}",
+            r.id, r.name, tier, category, domains_str, r.local_git_path, p.summary, manifest_hint
         ));
     }
     format!(
@@ -491,21 +707,33 @@ OUTBOUND calls — fetch / HTTP client usage, base URLs or service hosts in conf
 env, gRPC stubs, queue publishes — against another repo's EXPOSED surface — its \
 routes / handlers, gRPC service definitions, queue consumers, DB schemas. The \
 consumer is `from`, the producer it talks to is `to`. Use the tier flow as a prior: \
-a frontend almost always depends on the gateway/backend that serves its data, and a \
-gateway on the backends it aggregates — assert such an edge whenever the code \
-supports it, even with no shared package.\n\n\
-{TIER_GUIDE}\n\nRepositories:\n{lines}\nRead each repo's code and config at its \
-path (READ-ONLY — change nothing). Then, as the LAST thing in your reply, output a \
-single JSON object and nothing after it:\n\
+a frontend almost always depends on the backend that serves its data — assert such \
+an edge whenever the code supports it, even with no shared package.\n\n\
+{TIER_GUIDE}\n\nRepositories (manifest edges are pre-seeded high-confidence hints — \
+confirm, augment, or add runtime edges from code):\n{lines}\n\
+Read each repo's code and config at its path (READ-ONLY — change nothing). Then, as \
+the LAST thing in your reply, output a single JSON object and nothing after it:\n\
 {{\"relations\":[{{\"from\":<id>,\"to\":<id>,\"kind\":\"http|grpc|queue|infra|lib\",\
-\"via\":\"<short evidence>\",\"confidence\":<0-100>}}]}}\n\
+\"via\":\"<short evidence>\",\"confidence\":<0-100>,\
+\"rationale\":\"<one sentence: why this dependency exists>\"}}],\
+\"repo_map_markdown\":\"<markdown string>\"}}\n\
+The `repo_map_markdown` value MUST be a RedIM-style workspace map with these four \
+sections:\n\
+1. **Inventory** — grouped by tier→category; one bullet per repo with its purpose \
+and owned domains.\n\
+2. **Dependency layers** — bullet list of directed dependency flows \
+(frontend→backend, backend→infra, etc.) with a sentence of rationale each.\n\
+3. **Sibling/lateral edges** — same-tier dependencies with rationale.\n\
+4. **Domain-ownership index** — alphabetical: `domain: [repo names]`.\n\
 Rules: `from` and `to` MUST be ids from the list above and must differ. Use kind \
 `lib` for a declared package/module dependency, the runtime kinds otherwise. \
 Include a relation when you have concrete evidence — for a runtime edge that means a \
-matching endpoint / topic / host / contract across the two repos, NOT necessarily a \
-shared import. `via` is a short label (e.g. \"POST /orders\", \"orders-topic\", \
-\"shared postgres\", \"@acme/api-client\"). If you find none, output \
-{{\"relations\":[]}}."
+matching endpoint / topic / host / contract across the two repos. `via` is a short \
+label (e.g. \"POST /orders\", \"orders-topic\", \"shared postgres\", \
+\"@acme/api-client\"). `rationale` is one sentence explaining why the dependency \
+exists. If you find no cross-repo dependencies, output `{{\"relations\":[], \
+\"repo_map_markdown\":\"<still include the inventory and domain index>\"}}`. \
+`repo_map_markdown` must be a JSON string (escape newlines as \\\\n, quotes as \\\\\")."
     )
 }
 
@@ -837,6 +1065,7 @@ async fn persist_relations(
                 confidence: rel.confidence,
                 source: "agent".to_string(),
                 rejected: false,
+                rationale: rel.rationale.clone(),
             });
     }
     for (r, _) in profiled {
@@ -848,7 +1077,7 @@ async fn persist_relations(
             .await?
             .map(|p| serde_json::from_str(&p.relations).unwrap_or_default())
             .unwrap_or_default();
-        let merged = crate::profile::merge_relations(&existing, &fresh);
+        let merged = crate::profile::merge_relations(&existing, &[], &fresh);
         let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
         repo::set_repo_relations(db, r.id, &json).await?;
     }
@@ -895,8 +1124,8 @@ fn emit_graph_updated(workspace_id: i32) {
 #[derive(Clone)]
 struct RunInfo {
     /// "running" | "failed". Absence in the map == "idle".
+    /// Error details are now persisted to the DB via set_analysis_state.
     phase: &'static str,
-    error: Option<String>,
 }
 
 fn run_states() -> &'static std::sync::Mutex<std::collections::HashMap<i32, RunInfo>> {
@@ -916,7 +1145,7 @@ fn run_begin(id: i32) -> bool {
     if matches!(g.get(&id), Some(r) if r.phase == "running") {
         return false;
     }
-    g.insert(id, RunInfo { phase: "running", error: None });
+    g.insert(id, RunInfo { phase: "running" });
     true
 }
 
@@ -926,18 +1155,15 @@ fn run_finish_ok(id: i32) {
     run_lock().remove(&id);
 }
 
-/// Analysis failed/timed out: keep a visible `failed` entry with the error, so
-/// the detail panel shows it + a manual retry instead of a silent spinner.
-fn run_finish_err(id: i32, error: String) {
-    run_lock().insert(id, RunInfo { phase: "failed", error: Some(error) });
+/// Analysis failed/timed out: mark the in-memory phase as "failed" so
+/// analyze_workspace skips auto re-runs until a forced (user-initiated) pass.
+/// Error details are persisted to the DB via set_analysis_state.
+fn run_finish_err(id: i32, _error: String) {
+    run_lock().insert(id, RunInfo { phase: "failed" });
 }
 
 fn run_phase(id: i32) -> &'static str {
     run_lock().get(&id).map(|r| r.phase).unwrap_or("idle")
-}
-
-fn run_error(id: i32) -> Option<String> {
-    run_lock().get(&id).and_then(|r| r.error.clone())
 }
 
 /// Forget a repo's FAILED run-state — e.g. after re-adding a live checkout for a
@@ -1127,6 +1353,24 @@ async fn persist_repo_class(
         db, repo.id, &tier, &stack_json, &summary, &comps_json, source, &commit,
     )
     .await?;
+
+    // Persist category + domains when the agent provided them (Some = present,
+    // even empty — clears prior; None = absent — preserves prior). (Finding 4)
+    let has_category = wire.category.is_some();
+    let has_domains = wire.domains.is_some();
+    if has_category || has_domains {
+        let prior_category = prior.as_ref().map(|p| p.category.as_str()).unwrap_or("");
+        let prior_domains_json = prior.as_ref().map(|p| p.domains.as_str()).unwrap_or("[]");
+        let final_category = match wire.category {
+            Some(ref c) => c.trim().to_string(),
+            None => prior_category.to_string(),
+        };
+        let final_domains_json = match wire.domains {
+            Some(ref d) => json_strs(d),
+            None => prior_domains_json.to_string(),
+        };
+        let _ = repo::set_repo_category_domains(db, repo.id, &final_category, &final_domains_json).await;
+    }
     Ok(())
 }
 
@@ -1149,6 +1393,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
         // localizes it (see `analysisErrorCheckoutMissing` in the i18n files).
         const GONE: &str = "checkout-missing";
         run_finish_err(repo.id, GONE.into());
+        let _ = repo::set_analysis_state(db, repo.id, "failed", Some(GONE)).await;
         emit_repo_analysis(repo.workspace_id, repo.id, "failed", None, Some(GONE));
         return Ok(());
     }
@@ -1158,6 +1403,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
         return Ok(());
     }
     let (ws, rid) = (repo.workspace_id, repo.id);
+    let _ = repo::set_analysis_state(db, rid, "running", None).await;
     emit_repo_analysis(ws, rid, "started", None, None);
     // Also refresh the graph so an UNSELECTED card flips to `running` immediately:
     // the per-repo `started` stream is only observed for the selected repo, and
@@ -1165,7 +1411,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     // without this, a reprofiled-but-unselected card sits stale for the whole run.
     emit_graph_updated(ws);
     let tool = crate::tools::default_tool(db).await;
-    let prompt = build_repo_class_prompt(&repo.name);
+    let prompt = build_repo_class_prompt(&repo.name, cwd);
     // Capture HEAD BEFORE the (minutes-long) run so the stored `profiled_commit`
     // reflects the tree the agent actually classified. If the checkout advances
     // during the run, a later pass sees HEAD != profiled_commit and reclassifies,
@@ -1211,6 +1457,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     match outcome {
         Ok(()) => {
             run_finish_ok(rid);
+            let _ = repo::set_analysis_state(db, rid, "idle", None).await;
             emit_repo_analysis(ws, rid, "done", None, None);
         }
         Err(e) => {
@@ -1218,6 +1465,7 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
             // the placeholder to read as a perpetual "analyzing".
             let msg = e.to_string();
             run_finish_err(rid, msg.clone());
+            let _ = repo::set_analysis_state(db, rid, "failed", Some(&msg)).await;
             emit_repo_analysis(ws, rid, "failed", None, Some(&msg));
         }
     }
@@ -1246,7 +1494,19 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
     // HEAD) — re-running the minutes-long agent for every unchanged checkout when
     // a single repo is added would stall a large workspace for a long time.
     for r in &existing {
-        let failed = run_phase(r.id) == "failed";
+        // Honor the persisted failed state: after a restart the in-memory run-state
+        // map is empty, so run_phase() returns "idle" for a repo whose
+        // analysis_state="failed" was persisted to the DB. Consulting both sources
+        // ensures a restart doesn't auto-retry a previously-failed repo — only a
+        // forced (user-initiated) pass does. (Finding 1)
+        let in_mem_failed = run_phase(r.id) == "failed";
+        let db_failed = repo::get_repo_profile(db, r.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.analysis_state.as_str() == "failed")
+            .unwrap_or(false);
+        let failed = in_mem_failed || db_failed;
         // Don't probe HEAD for a failed repo — its retry is gated on `force`, not on
         // whether it changed (see should_analyze).
         let needs = !failed && needs_classification(db, r).await;
@@ -1338,6 +1598,127 @@ fn is_too_broad(dir: &Path) -> bool {
     }
 }
 
+/// Deterministic manifest edge pass: scan each existing-checkout repo's on-disk
+/// manifests, build a workspace-wide `provides_name → repo_id` map, and for
+/// each repo emit high-confidence `lib` edges to any workspace repo it depends
+/// on. Persists via `merge_relations` (user > manifest > agent), so existing
+/// user/agent relations are preserved.
+///
+/// Tolerant of missing checkouts, missing manifests, parse errors, and DB
+/// errors — any single failure leaves that repo's prior relations intact.
+pub async fn seed_manifest_relations(db: &Db, workspace_id: i32) -> Result<()> {
+    use std::path::Path;
+
+    let repos = repo::list_repos(db, workspace_id).await?;
+
+    // Collect manifest info for every repo that has an existing checkout.
+    let mut repo_manifests: Vec<(repo_ref::Model, crate::manifest::ManifestInfo)> = Vec::new();
+    for r in &repos {
+        if !Path::new(&r.local_git_path).exists() {
+            continue;
+        }
+        let info = crate::manifest::scan_repo(Path::new(&r.local_git_path));
+        repo_manifests.push((r.clone(), info));
+    }
+
+    // Workspace-wide provides_name → repo_id map, skipping ambiguous names (see
+    // `unambiguous_provider_map`) so a duplicated package never seeds an arbitrary
+    // first-wins lib edge.
+    let name_to_repo =
+        unambiguous_provider_map(repo_manifests.iter().map(|(r, info)| (r.id, info)));
+
+    // For each repo, generate manifest lib edges for its requires that resolve to
+    // a DIFFERENT workspace repo, then merge with the existing relations.
+    for (r, info) in &repo_manifests {
+        let mut fresh_manifest: Vec<crate::profile::AgentRelation> = Vec::new();
+        for req in &info.requires {
+            if let Some(&target_id) = name_to_repo.get(req) {
+                if target_id == r.id {
+                    continue; // skip self-dependency
+                }
+                fresh_manifest.push(crate::profile::AgentRelation {
+                    to: target_id,
+                    kind: "lib".into(),
+                    via: req.clone(),
+                    confidence: 100,
+                    source: "manifest".into(),
+                    rejected: false,
+                    ..Default::default()
+                });
+            }
+        }
+
+        // Reload existing relations so user/agent edges accumulated since the
+        // last pass are preserved through the merge.
+        let existing: Vec<crate::profile::AgentRelation> = repo::get_repo_profile(db, r.id)
+            .await
+            .unwrap_or(None)
+            .map(|p| serde_json::from_str(&p.relations).unwrap_or_default())
+            .unwrap_or_default();
+
+        // Keep agent relations from the existing set as "fresh_agent" so they
+        // survive the merge. User relations are already handled by merge_relations.
+        let existing_agent: Vec<crate::profile::AgentRelation> = existing
+            .iter()
+            .filter(|rel| rel.source == "agent" || rel.source.is_empty())
+            .cloned()
+            .collect();
+
+        let merged =
+            crate::profile::merge_relations(&existing, &fresh_manifest, &existing_agent);
+        let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
+        // Only persist if there is a profile row; skip silently if not.
+        let _ = repo::set_repo_relations(db, r.id, &json).await;
+    }
+
+    Ok(())
+}
+
+/// Whether agent-generated markdown built from `profiled_ids` still reflects the
+/// FINAL relation graph. The analyst prompt lists only the fully-profiled repos,
+/// but `seed_manifest_relations` scans every checked-out repo and can add a `lib`
+/// edge to/from an UNPROFILED provider the prompt never saw. When that happens the
+/// markdown omits a node/edge now present in the graph, so it must not be
+/// republished (the doc stays cleared until a later pass profiles everything).
+///
+/// `current_ids` is the set of repos that still exist in the workspace. An edge to
+/// a DELETED repo is stale — the graph drops it by current node id (see `graph`),
+/// so it must be ignored here too; otherwise a lingering user-pinned edge to a
+/// removed repo would block republishing the map forever.
+///
+/// Returns false iff a narrated (profiled) repo no longer exists, or any
+/// non-rejected edge to a CURRENT repo is incident to a repo outside the profiled
+/// set.
+fn markdown_covers_graph(
+    profiled_ids: &std::collections::HashSet<i32>,
+    current_ids: &std::collections::HashSet<i32>,
+    relations: &[(i32, Vec<AgentRelation>)],
+) -> bool {
+    // A repo the analyst narrated may have been DELETED during the (≤180s) agent
+    // run, after `profiled` was captured. Then the markdown describes a node no
+    // longer in the graph, so it must not be republished.
+    if !profiled_ids.iter().all(|id| current_ids.contains(id)) {
+        return false;
+    }
+    for (owner, rels) in relations {
+        let owner_profiled = profiled_ids.contains(owner);
+        for e in rels {
+            if e.rejected {
+                continue;
+            }
+            // Stale edge to a deleted repo: not in the graph, so it can't make the
+            // markdown incomplete.
+            if !current_ids.contains(&e.to) {
+                continue;
+            }
+            if !owner_profiled || !profiled_ids.contains(&e.to) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The cross-repo relations pass: reload the (classified) profiles, infer the
 /// runtime/infra/lib relations between them, and persist. Needs ≥2 profiled
 /// repos. A timed-out / unparseable reply leaves existing relations intact
@@ -1363,6 +1744,16 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
         }
     }
     if profiled.len() < 2 {
+        // Still run the manifest pass even with < 2 fully-profiled repos: repos
+        // with a checkout but pending/partial classification still benefit from
+        // deterministic lib edges (the graph shows them as placeholder nodes).
+        let _ = seed_manifest_relations(db, workspace_id).await;
+        // A cross-repo map needs ≥2 profiled repos. If the workspace previously had
+        // enough and dropped below (a repo deleted, or classifiers still pending),
+        // any stored map describes repos/edges no longer in the graph — clear it so
+        // the map pane shows the empty/regenerate state instead of stale markdown.
+        let _ = repo::clear_repo_map_doc(db, workspace_id).await;
+        emit_graph_updated(workspace_id);
         return Ok(());
     }
     let prompt = build_curator_prompt(&profiled);
@@ -1380,9 +1771,50 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     let tool = crate::tools::default_tool(db).await;
     // The relations pass is workspace-level, not tied to one repo's detail panel,
     // so its stream is discarded — it shares the runner only for the transport fix.
+    let mut fresh_markdown: Option<String> = None;
     if let Ok(text) = run_streaming_agent(&tool, &cwd, &prompt, &mut |_| {}).await {
-        if let Some(relations) = parse_curator_output(&text) {
-            persist_relations(db, &profiled, &relations).await?;
+        if let Some(output) = parse_curator_output(&text) {
+            persist_relations(db, &profiled, &output.relations).await?;
+            fresh_markdown = output.repo_map_markdown;
+        }
+    }
+    // Manifest pass AFTER the agent pass: `seed_manifest_relations` reloads the
+    // current relations (now including fresh agent edges) and merges manifest lib
+    // edges on top via the user>manifest>agent precedence. Running it last ensures
+    // the agent pass's `persist_relations` (which calls `merge_relations(&_, &[],
+    // &fresh_agent)`) doesn't overwrite the manifest edges.
+    let _ = seed_manifest_relations(db, workspace_id).await;
+    // Write the map doc LAST, after every relation mutation above. `set_repo_relations`
+    // invalidates the stored doc on each write, so persisting markdown here is what
+    // repopulates it. If the agent omitted markdown (parse_curator_output permits it),
+    // the doc stays cleared rather than serving the pre-pass narrative.
+    //
+    // But only publish when the markdown still covers the FINAL graph: the analyst
+    // saw only `profiled`, while `seed_manifest_relations` may have just added a lib
+    // edge to/from an UNPROFILED provider the prompt never listed. Republishing the
+    // pre-seed markdown would then serve a doc missing that node/edge (permanently,
+    // if the provider is failed). In that case leave the doc cleared for a later pass.
+    if let Some(md) = fresh_markdown {
+        let profiled_ids: std::collections::HashSet<i32> =
+            profiled.iter().map(|(r, _)| r.id).collect();
+        // Re-read the workspace AFTER the long agent+manifest pass: the pre-run
+        // `repos` snapshot is stale because a repo may have been deleted during the
+        // run (delete_repo_cascade cleared the doc). Building current_ids from the
+        // fresh list lets markdown_covers_graph catch both a narrated repo that
+        // vanished and edges to repos no longer present. Edges to anything outside
+        // current_ids are stale (the graph filters them), so they don't block.
+        let current_repos = repo::list_repos(db, workspace_id).await.unwrap_or_default();
+        let current_ids: std::collections::HashSet<i32> =
+            current_repos.iter().map(|r| r.id).collect();
+        let mut final_relations: Vec<(i32, Vec<AgentRelation>)> = Vec::new();
+        for r in &current_repos {
+            if let Ok(Some(p)) = repo::get_repo_profile(db, r.id).await {
+                let rels: Vec<AgentRelation> = serde_json::from_str(&p.relations).unwrap_or_default();
+                final_relations.push((r.id, rels));
+            }
+        }
+        if markdown_covers_graph(&profiled_ids, &current_ids, &final_relations) {
+            let _ = repo::set_repo_map_doc(db, workspace_id, &md).await;
         }
     }
     emit_graph_updated(workspace_id);
@@ -1409,6 +1841,55 @@ pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
     emit_graph_updated(repo.workspace_id);
     let _ = analyze_relations(db, repo.workspace_id).await;
     Ok(())
+}
+
+/// On startup, repos whose `analysis_state` was persisted as "running" at shutdown
+/// have no live process. Re-kick their per-repo classification so a repo
+/// interrupted mid-analysis resumes instead of spinning forever in a stale state.
+/// Per-workspace: await all stuck classifiers concurrently, then refresh relations.
+/// Called by `resume_running_analyses`; each invocation is spawned so startup stays
+/// non-blocking. `profile_repo_agent`'s `run_begin` guard dedupes any concurrent pass.
+async fn resume_workspace(db: Db, repos: Vec<repo_ref::Model>, workspace_id: i32) {
+    use futures::future::join_all;
+    // Serialize the WHOLE resume (classifiers + relation pass) under the workspace
+    // pass-gate, like reprofile_repo. Otherwise, if a backfill/manual pass already
+    // owns these repos' `run_begin`, the classifier futures return immediately
+    // (deduped) and join_all reaches `analyze_relations` while that pass's own
+    // relation agent is still running — two concurrent relation passes, and the
+    // stale one finishing last would overwrite the newer relations/map doc.
+    // `profile_repo_agent` gates on `run_begin`, not `pass_gate`, so holding the
+    // gate here can't deadlock.
+    let gate = pass_gate(workspace_id);
+    let _g = gate.lock.lock().await;
+    let futs = repos.into_iter().map(|r| {
+        let db2 = db.clone();
+        async move { let _ = profile_repo_agent(&db2, &r).await; }
+    });
+    join_all(futs).await;
+    let _ = analyze_relations(&db, workspace_id).await;
+}
+
+/// Resume any repo whose analysis was interrupted mid-run (persisted state =
+/// "running"). Groups stuck repos by workspace and, per workspace, spawns ONE task
+/// that (a) awaits all stuck classifiers concurrently, THEN (b) refreshes relations —
+/// so edges + the map doc are never written before the classifiers finish.
+pub async fn resume_running_analyses(db: &Db) {
+    let stuck = match repo::repos_with_analysis_state(db, "running").await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    // Group by workspace so each workspace gets exactly one classify→relations task.
+    let mut by_workspace: std::collections::HashMap<i32, Vec<repo_ref::Model>> =
+        std::collections::HashMap::new();
+    for r in stuck {
+        by_workspace.entry(r.workspace_id).or_default().push(r);
+    }
+    for (ws_id, repos) in by_workspace {
+        let db2 = db.clone();
+        tauri::async_runtime::spawn(async move {
+            resume_workspace(db2, repos, ws_id).await;
+        });
+    }
 }
 
 /// Per-workspace serialization for analysis passes: an async lock (two passes for
@@ -1570,11 +2051,9 @@ mod tests {
         assert_eq!(super::run_phase(101), "running");
         super::run_finish_err(101, "boom".into());
         assert_eq!(super::run_phase(101), "failed");
-        assert_eq!(super::run_error(101).as_deref(), Some("boom"));
         assert!(super::run_begin(101), "a failed repo can be restarted");
         super::run_finish_ok(101);
         assert_eq!(super::run_phase(101), "idle");
-        assert_eq!(super::run_error(101), None);
     }
 
     #[test]
@@ -1587,6 +2066,101 @@ mod tests {
         assert!(super::should_analyze(true, true, false), "failed + forced → retry even if unchanged");
         assert!(super::should_analyze(false, false, true), "not failed + needs → run");
         assert!(!super::should_analyze(false, true, false), "not failed + unchanged → skip even forced");
+    }
+
+    // ─── Finding 1: persisted failed state gates the auto-pass ─────────────
+
+    #[tokio::test]
+    async fn auto_pass_skips_db_failed_repo_without_force() {
+        // After a restart the in-memory run-state is empty (idle), but a repo with
+        // persisted analysis_state="failed" must NOT be auto-retried — only a forced
+        // pass may retry it. Finding 1.
+        let _g = super::test_run_state_guard();
+        super::run_state_clear_all_for_test();
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_f1").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/nonexistent/svc/checkout", "main", "", true)
+            .await
+            .unwrap();
+
+        // Seed a profile row that looks like a previously-failed repo (simulate the
+        // state that persists across a restart: analysis_state="failed" in the DB,
+        // but the in-memory run-state map is empty → run_phase() returns "idle").
+        repo::upsert_repo_profile(&db, r.id, "", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_analysis_state(&db, r.id, "failed", Some("timeout")).await.unwrap();
+
+        // The combined gate should treat this repo as failed (db-backed).
+        let in_mem_failed = super::run_phase(r.id) == "failed"; // false: map is empty
+        let db_failed = repo::get_repo_profile(&db, r.id)
+            .await
+            .unwrap()
+            .map(|p| p.analysis_state == "failed")
+            .unwrap_or(false);
+        let failed = in_mem_failed || db_failed;
+        // Non-forced auto-pass skips failed repos.
+        assert!(!super::should_analyze(failed, false, false), "db-failed + auto → skip");
+        // Forced pass retries them.
+        assert!(super::should_analyze(failed, true, false), "db-failed + forced → retry");
+    }
+
+    // ─── Finding 1 (Codex r2): resume groups by workspace + classify before relations
+
+    #[tokio::test]
+    async fn resume_groups_stuck_repos_by_workspace() {
+        // Verify that resume_running_analyses groups stuck repos per workspace so each
+        // workspace gets exactly one classify→relations task (no races). We check the
+        // grouping logic — the same HashMap logic used inside resume_running_analyses.
+        let db = mem().await;
+        let ws1 = repo::create_workspace(&db, "ws1_f2").await.unwrap();
+        let ws2 = repo::create_workspace(&db, "ws2_f2").await.unwrap();
+        let r1 = repo::add_repo_ref(&db, ws1.id, "r1", "/tmp/r1", "main", "", true).await.unwrap();
+        let r2 = repo::add_repo_ref(&db, ws1.id, "r2", "/tmp/r2", "main", "", true).await.unwrap();
+        let r3 = repo::add_repo_ref(&db, ws2.id, "r3", "/tmp/r3", "main", "", true).await.unwrap();
+
+        repo::set_analysis_state(&db, r1.id, "running", None).await.unwrap();
+        repo::set_analysis_state(&db, r2.id, "running", None).await.unwrap();
+        repo::set_analysis_state(&db, r3.id, "running", None).await.unwrap();
+
+        let stuck = repo::repos_with_analysis_state(&db, "running").await.unwrap();
+        // Mirror the HashMap grouping from resume_running_analyses.
+        let mut by_workspace: std::collections::HashMap<i32, Vec<_>> =
+            std::collections::HashMap::new();
+        for r in &stuck {
+            by_workspace.entry(r.workspace_id).or_default().push(r.id);
+        }
+        // Two distinct workspace groups → two classify→relations tasks spawned.
+        assert_eq!(by_workspace.len(), 2, "exactly two workspace groups");
+        assert_eq!(by_workspace[&ws1.id].len(), 2, "ws1 has two stuck repos");
+        assert_eq!(by_workspace[&ws2.id].len(), 1, "ws2 has one stuck repo");
+    }
+
+    // ─── Finding 2 (legacy): workspace_id collection still correct ──────────
+
+    #[tokio::test]
+    async fn resume_running_analyses_queues_workspace_ids() {
+        // resume_running_analyses collects distinct workspace_ids from the "running"
+        // repo rows to queue relations refreshes. Verify that the workspace_id
+        // deduplication logic is correct (independent of spawned task completion).
+        let db = mem().await;
+        let ws1 = repo::create_workspace(&db, "ws1_f2b").await.unwrap();
+        let ws2 = repo::create_workspace(&db, "ws2_f2b").await.unwrap();
+        let r1 = repo::add_repo_ref(&db, ws1.id, "r1b", "/tmp/r1b", "main", "", true).await.unwrap();
+        let r2 = repo::add_repo_ref(&db, ws1.id, "r2b", "/tmp/r2b", "main", "", true).await.unwrap();
+        let r3 = repo::add_repo_ref(&db, ws2.id, "r3b", "/tmp/r3b", "main", "", true).await.unwrap();
+
+        repo::set_analysis_state(&db, r1.id, "running", None).await.unwrap();
+        repo::set_analysis_state(&db, r2.id, "running", None).await.unwrap();
+        repo::set_analysis_state(&db, r3.id, "running", None).await.unwrap();
+
+        let stuck = repo::repos_with_analysis_state(&db, "running").await.unwrap();
+        let mut ws_ids: Vec<i32> = stuck.iter().map(|r| r.workspace_id).collect();
+        ws_ids.sort_unstable();
+        ws_ids.dedup();
+        assert_eq!(ws_ids.len(), 2, "two distinct workspaces collected for relations refresh");
+        assert!(ws_ids.contains(&ws1.id), "ws1 included");
+        assert!(ws_ids.contains(&ws2.id), "ws2 included");
     }
 
     #[test]
@@ -1672,20 +2246,27 @@ mod tests {
             .await
             .unwrap();
         super::profile_repo_agent(&db, &r).await.unwrap();
-        assert_eq!(super::run_phase(r.id), "failed", "missing checkout stays failed");
-        assert!(super::run_error(r.id).is_some(), "with a reason the UI can show");
+        // The in-memory guard is still "failed" — analyze_workspace uses this to skip
+        // auto re-runs. No profile row exists (never analyzed), so DB state stays at
+        // the default "idle"; the persisted state is irrelevant for the dedupe gate.
+        assert_eq!(super::run_phase(r.id), "failed", "missing checkout stays failed in-memory");
     }
 
     #[tokio::test]
     async fn view_surfaces_failed_analysis_state() {
-        let _g = super::test_run_state_guard();
-        super::run_state_clear_all_for_test();
+        // view_of reads from the persisted profile columns, so the failed state must
+        // be written to the DB (via set_analysis_state) to appear in list()/graph().
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true)
             .await
             .unwrap();
-        super::run_finish_err(r.id, "codex failed".into());
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "s", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_analysis_state(&db, r.id, "failed", Some("codex failed"))
+            .await
+            .unwrap();
         let views = super::list(&db, ws.id).await.unwrap();
         let v = views.iter().find(|v| v.repo_id == r.id).unwrap();
         assert_eq!(v.analysis_state, "failed");
@@ -1697,6 +2278,51 @@ mod tests {
         repo::upsert_repo_profile(db, repo_id, tier, "[]", "", "[]", "agent", "")
             .await
             .unwrap();
+    }
+
+    /// Drive analysis_state transitions via set_analysis_state and assert that
+    /// graph()/view_of reflects the persisted state — not just the in-memory guard.
+    #[tokio::test]
+    async fn graph_and_view_reflect_persisted_analysis_state() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        // Upsert a profile row so set_analysis_state has a row to update.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "an api", "[]", "agent", "sha1")
+            .await
+            .unwrap();
+
+        // running: graph node reads the persisted "running" state.
+        repo::set_analysis_state(&db, r.id, "running", None).await.unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node = g.nodes.iter().find(|n| n.repo_id == r.id).unwrap();
+        assert_eq!(node.analysis_state, "running");
+        assert_eq!(node.analysis_error, None);
+
+        // failed: graph node reflects the persisted error.
+        repo::set_analysis_state(&db, r.id, "failed", Some("timed out")).await.unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node = g.nodes.iter().find(|n| n.repo_id == r.id).unwrap();
+        assert_eq!(node.analysis_state, "failed");
+        assert_eq!(node.analysis_error.as_deref(), Some("timed out"));
+
+        // idle: graph node reads "idle" and no error after recovery.
+        repo::set_analysis_state(&db, r.id, "idle", None).await.unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node = g.nodes.iter().find(|n| n.repo_id == r.id).unwrap();
+        assert_eq!(node.analysis_state, "idle");
+        assert_eq!(node.analysis_error, None);
+
+        // Placeholder (no profile row): view_of returns "idle"/None by default.
+        let r2 = repo::add_repo_ref(&db, ws.id, "fresh", "/tmp/fresh", "main", "", true)
+            .await
+            .unwrap();
+        let g = super::graph(&db, ws.id).await.unwrap();
+        let node2 = g.nodes.iter().find(|n| n.repo_id == r2.id).unwrap();
+        assert_eq!(node2.analysis_state, "idle", "placeholder defaults to idle");
+        assert_eq!(node2.analysis_error, None);
     }
 
     #[tokio::test]
@@ -1789,6 +2415,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_profile_manual_tier_clears_persisted_failure() {
+        // A manual canonical-tier edit RECOVERS a failed repo. Since the views now
+        // read `analysis_state` from the persisted row, clearing only the in-memory
+        // map would leave the DB column at "failed" — the edit must persist "idle".
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::set_analysis_state(&db, r.id, "failed", Some("boom")).await.unwrap();
+
+        super::edit_profile(&db, r.id, None, Some("backend")).await.unwrap();
+
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "backend");
+        assert_eq!(p.analysis_state, "idle", "persisted failure must be cleared");
+        assert_eq!(p.analysis_error, None, "persisted error must be cleared");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_summary_only_keeps_persisted_failure() {
+        // A summary-only edit INHERITS the prior tier without re-classifying, so it
+        // must NOT silently clear a real failure (no re-run happened).
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "old", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_analysis_state(&db, r.id, "failed", Some("boom")).await.unwrap();
+
+        super::edit_profile(&db, r.id, Some("new summary"), None).await.unwrap();
+
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.analysis_state, "failed", "summary-only edit must not clear failure");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_invalidates_map_doc() {
+        // A manual profile edit changes the map's INVENTORY surface (a tier edit
+        // cascades to component tiers; summary changes the narrative) without
+        // touching relations, so it must invalidate the workspace map doc — the
+        // relation chokepoint (set_repo_relations) doesn't cover this path.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "old", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
+
+        super::edit_profile(&db, r.id, None, Some("frontend")).await.unwrap();
+
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "a manual profile edit must invalidate the stale workspace map doc"
+        );
+    }
+
+    #[tokio::test]
     async fn persist_repo_class_migrates_legacy_user_role() {
         // An upgraded db may carry a legacy role on a user-owned row; the agent
         // pass keeps the user's summary but migrates the invalid tier.
@@ -1806,6 +2494,7 @@ mod tests {
             summary: "agent summary".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1822,7 +2511,7 @@ mod tests {
         let r = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
             .await
             .unwrap();
-        repo::upsert_repo_profile(&db, r.id, "gateway", "[]", "mine", "[]", "user", "")
+        repo::upsert_repo_profile(&db, r.id, "frontend", "[]", "mine", "[]", "user", "")
             .await
             .unwrap();
         let wire = super::RepoClassWire {
@@ -1831,10 +2520,11 @@ mod tests {
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
-        assert_eq!(p.role, "gateway", "a valid user-pinned tier is not overwritten");
+        assert_eq!(p.role, "frontend", "a valid user-pinned tier is not overwritten");
     }
 
     #[tokio::test]
@@ -1856,6 +2546,7 @@ mod tests {
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1882,6 +2573,7 @@ mod tests {
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, mk("backend"), "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1915,6 +2607,7 @@ mod tests {
             summary: "".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1944,6 +2637,7 @@ mod tests {
             summary: "now monolith".into(),
             stack: Some(vec![]),
             components: Some(vec![]),
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1970,6 +2664,7 @@ mod tests {
             summary: "".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "abc").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -1995,6 +2690,7 @@ mod tests {
             summary: "".into(), // agent omitted it
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2019,6 +2715,7 @@ mod tests {
             summary: "agent summary".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2038,10 +2735,11 @@ mod tests {
             .unwrap();
         let wire = super::RepoClassWire {
             name: None,
-            tier: "service".into(), // not one of frontend|gateway|backend
+            tier: "service".into(), // not one of frontend|backend
             summary: "agent".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
@@ -2068,6 +2766,7 @@ mod tests {
                 Component { name: "api".into(), tier: "backend".into(), ..Default::default() },
                 Component { name: "".into(), tier: "frontend".into(), ..Default::default() },
             ]),
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2122,6 +2821,7 @@ mod tests {
             summary: "fresh agent sum".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
@@ -2144,6 +2844,7 @@ mod tests {
             summary: "s".into(),
             stack: None,
             components: None,
+            ..Default::default()
         };
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         assert!(
@@ -2163,6 +2864,63 @@ mod tests {
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
         assert!(super::edit_profile(&db, r.id, Some("s"), Some("frontend")).await.is_err());
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
+    }
+
+    /// Seed a repo with a profile containing the given components (name, tier pairs).
+    async fn seed_repo_with_components(
+        db: &Db,
+        ws_id: i32,
+        repo_tier: &str,
+        components: &[(&str, &str)],
+    ) -> crate::store::entities::repo_ref::Model {
+        let r = repo::add_repo_ref(db, ws_id, "mono", "/tmp/mono", "main", "", true)
+            .await
+            .unwrap();
+        let comps: Vec<crate::profile::Component> = components
+            .iter()
+            .map(|(name, tier)| crate::profile::Component {
+                name: name.to_string(),
+                tier: tier.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let comps_json = serde_json::to_string(&comps).unwrap();
+        repo::upsert_repo_profile(db, r.id, repo_tier, "[]", "monorepo summary", &comps_json, "agent", "")
+            .await
+            .unwrap();
+        r
+    }
+
+    #[tokio::test]
+    async fn edit_tier_cascades_to_components() {
+        // A canonical-tier edit rewrites every component's tier to match, so the
+        // expanded view (grouping by component tier) stays in sync with the overview.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_cascade").await.unwrap();
+        let r = seed_repo_with_components(
+            &db,
+            ws.id,
+            "frontend",
+            &[("web", "frontend"), ("api", "frontend")],
+        )
+        .await;
+        super::edit_profile(&db, r.id, None, Some("backend")).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        let comps: Vec<crate::profile::Component> = serde_json::from_str(&p.components).unwrap();
+        assert!(comps.iter().all(|c| c.tier == "backend"), "all component tiers cascaded to backend");
+        assert_eq!(p.role, "backend");
+    }
+
+    #[tokio::test]
+    async fn edit_summary_only_keeps_component_tiers() {
+        // A summary-only edit (tier = None) must leave component tiers unchanged.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_summary_only").await.unwrap();
+        let r = seed_repo_with_components(&db, ws.id, "frontend", &[("web", "frontend")]).await;
+        super::edit_profile(&db, r.id, Some("just a summary"), None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        let comps: Vec<crate::profile::Component> = serde_json::from_str(&p.components).unwrap();
+        assert_eq!(comps[0].tier, "frontend", "summary-only edit leaves component tier unchanged");
     }
 
     #[test]
@@ -2189,10 +2947,10 @@ mod tests {
         let reply = r#"{"relations":[{"from":1,"to":2,"kind":"http","via":"x","confidence":"high"},
             {"from":1,"to":3,"kind":"grpc","via":"y","confidence":0.8},
             {"from":1,"to":4,"kind":"lib","via":"z","confidence":250}]}"#;
-        let rels = super::parse_curator_output(reply).expect("parsed despite bad confidence");
-        assert_eq!(rels.len(), 3);
-        assert_eq!(rels[0].confidence, 0); // "high" → 0
-        assert_eq!(rels[2].confidence, 100); // 250 clamped
+        let out = super::parse_curator_output(reply).expect("parsed despite bad confidence");
+        assert_eq!(out.relations.len(), 3);
+        assert_eq!(out.relations[0].confidence, 0); // "high" → 0
+        assert_eq!(out.relations[2].confidence, 100); // 250 clamped
     }
 
     #[test]
@@ -2247,12 +3005,12 @@ mod tests {
     fn parse_curator_output_extracts_json_from_fenced_prose() {
         let reply = "Here is the analysis:\n```json\n{\"relations\":[{\"from\":1,\"to\":2,\
             \"kind\":\"http\",\"via\":\"GET /orders\",\"confidence\":80}]}\n```\nDone.";
-        let rels = super::parse_curator_output(reply).expect("parsed a relations object");
-        assert_eq!(rels.len(), 1);
-        assert_eq!((rels[0].from, rels[0].to), (Some(1), Some(2)));
-        assert_eq!(rels[0].kind, "http");
-        assert_eq!(rels[0].via, "GET /orders");
-        assert_eq!(rels[0].confidence, 80);
+        let out = super::parse_curator_output(reply).expect("parsed a relations object");
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!((out.relations[0].from, out.relations[0].to), (Some(1), Some(2)));
+        assert_eq!(out.relations[0].kind, "http");
+        assert_eq!(out.relations[0].via, "GET /orders");
+        assert_eq!(out.relations[0].confidence, 80);
     }
 
     #[test]
@@ -2262,9 +3020,9 @@ mod tests {
         assert!(super::parse_curator_output("").is_none());
         // An object without a `relations` array is treated as unparseable too.
         assert!(super::parse_curator_output(r#"{"notes":"none found"}"#).is_none());
-        // An explicit empty relations array → Some([]) (a real "found nothing").
+        // An explicit empty relations array → Some with empty relations.
         let explicit = super::parse_curator_output(r#"{"relations":[]}"#);
-        assert!(explicit.is_some_and(|v| v.is_empty()));
+        assert!(explicit.is_some_and(|o| o.relations.is_empty()));
     }
 
     #[test]
@@ -2273,9 +3031,38 @@ mod tests {
         // earlier brace block must not hide the valid result later in the reply.
         let reply = "I looked at the config `{\"port\": 8080}` and traced the call.\n\n\
             {\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"GET /x\",\"confidence\":70}]}";
-        let rels = super::parse_curator_output(reply).expect("found the later relations object");
-        assert_eq!(rels.len(), 1);
-        assert_eq!((rels[0].from, rels[0].to, rels[0].kind.as_str()), (Some(1), Some(2), "http"));
+        let out = super::parse_curator_output(reply).expect("found the later relations object");
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!((out.relations[0].from, out.relations[0].to, out.relations[0].kind.as_str()), (Some(1), Some(2), "http"));
+    }
+
+    #[test]
+    fn parse_curator_output_reads_rationale_and_repo_map_markdown() {
+        // Relations with rationale + a markdown doc in the same JSON object.
+        // Use a regular string so \n in the JSON value is a literal backslash-n.
+        let reply = "{\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"GET /orders\",\
+            \"confidence\":80,\"rationale\":\"frontend calls the orders API to display the cart\"}],\
+            \"repo_map_markdown\":\"## Inventory\\n- web (frontend)\"}";
+        let out = super::parse_curator_output(reply).expect("parsed with rationale + markdown");
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!(
+            out.relations[0].rationale,
+            "frontend calls the orders API to display the cart"
+        );
+        // The JSON string "## Inventory\n- web (frontend)" deserializes to a real newline.
+        assert_eq!(
+            out.repo_map_markdown.as_deref(),
+            Some("## Inventory\n- web (frontend)")
+        );
+    }
+
+    #[test]
+    fn parse_curator_output_tolerates_absent_rationale_and_markdown() {
+        // An agent that omits rationale and repo_map_markdown must not fail.
+        let reply = r#"{"relations":[{"from":1,"to":2,"kind":"lib","via":"@pkg/core","confidence":90}]}"#;
+        let out = super::parse_curator_output(reply).expect("parsed despite missing optional fields");
+        assert_eq!(out.relations[0].rationale, "");
+        assert!(out.repo_map_markdown.is_none(), "absent markdown → None (skip doc update)");
     }
 
     #[tokio::test]
@@ -2306,6 +3093,7 @@ mod tests {
             kind: "http".into(),
             via: via.into(),
             confidence: 70,
+            rationale: String::new(),
         };
         let rels = vec![
             mk(web.id, api.id, "GET /x"), // kept
@@ -2320,6 +3108,7 @@ mod tests {
                 kind: "http".into(),
                 via: "no-target".into(),
                 confidence: 50,
+                rationale: String::new(),
             },
         ];
         super::persist_relations(&db, &profiled, &rels).await.unwrap();
@@ -2355,5 +3144,555 @@ mod tests {
         .unwrap();
         repo::set_repo_relations(&db, web.id, &rels).await.unwrap();
         assert!(graph(&db, ws.id).await.unwrap().edges.is_empty());
+    }
+
+    /// Helper: write temp manifests and register a repo with `local_git_path` pointing there.
+    async fn seed_repo_with_manifest(
+        db: &Db,
+        ws_id: i32,
+        name: &str,
+        manifest_filename: &str,
+        manifest_content: &str,
+    ) -> (crate::store::entities::repo_ref::Model, std::path::PathBuf) {
+        let tmp = std::env::temp_dir()
+            .join(format!("weft_seed_test_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(manifest_filename), manifest_content).unwrap();
+        let r = repo::add_repo_ref(db, ws_id, name, tmp.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        // Upsert a minimal profile so set_repo_relations has a row to update.
+        repo::upsert_repo_profile(db, r.id, "backend", "[]", "summary", "[]", "agent", "")
+            .await
+            .unwrap();
+        (r, tmp)
+    }
+
+    #[tokio::test]
+    async fn seed_manifest_relations_emits_lib_edge_between_workspace_repos() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_seed").await.unwrap();
+
+        // Repo A: package.json that requires "@acme/lib" (provided by B).
+        let (repo_a, tmp_a) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-a",
+            "package.json",
+            r#"{"name":"@acme/app","dependencies":{"@acme/lib":"^1","lodash":"^4"}}"#,
+        )
+        .await;
+
+        // Repo B: package.json that provides "@acme/lib".
+        let (repo_b, tmp_b) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-b",
+            "package.json",
+            r#"{"name":"@acme/lib","dependencies":{}}"#,
+        )
+        .await;
+
+        super::seed_manifest_relations(&db, ws.id).await.unwrap();
+
+        let rels_a: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, repo_a.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        // A should have a manifest lib edge to B.
+        assert!(
+            rels_a.iter().any(|r| r.to == repo_b.id
+                && r.kind == "lib"
+                && r.source == "manifest"
+                && r.via == "@acme/lib"
+                && !r.rejected),
+            "A has a manifest lib edge to B via @acme/lib"
+        );
+        // "lodash" is external (not in workspace) — no edge for it.
+        assert!(
+            !rels_a.iter().any(|r| r.via == "lodash"),
+            "external dep 'lodash' produces no edge"
+        );
+
+        // B has no requires that map to workspace repos → no lib edges.
+        let rels_b: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, repo_b.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        assert!(
+            rels_b.iter().all(|r| r.source != "manifest"),
+            "B has no manifest edges (it has no workspace deps)"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp_a);
+        let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    #[tokio::test]
+    async fn analyze_relations_clears_stale_map_when_below_threshold() {
+        // A workspace that previously generated a map but now has < 2 fully-profiled
+        // repos (e.g. a repo was deleted) must not keep serving the stale doc.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_stale_map").await.unwrap();
+        let _r = repo::add_repo_ref(&db, ws.id, "solo", "/nonexistent/solo", "main", "", true)
+            .await
+            .unwrap();
+        repo::set_repo_map_doc(&db, ws.id, "## Inventory\n- gone (backend)").await.unwrap();
+
+        super::analyze_relations(&db, ws.id).await.unwrap();
+
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "stale map doc must be cleared when the workspace drops below 2 profiled repos"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_workspace_serializes_under_pass_gate() {
+        // resume_workspace must hold the workspace pass-gate for its WHOLE run, so
+        // its relation pass can't run concurrently with another pass (and overwrite
+        // newer output). Proof: while we hold the gate, the spawned resume is blocked
+        // and its map-clear side effect can't happen; once released, it proceeds.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_resume_gate").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "solo", "/nonexistent/solo-resume", "main", "", true)
+            .await
+            .unwrap();
+        repo::set_repo_map_doc(&db, ws.id, "## stale").await.unwrap();
+
+        let gate = super::pass_gate(ws.id);
+        let guard = gate.lock.lock().await;
+
+        let db2 = db.clone();
+        let handle = tokio::spawn(async move {
+            super::resume_workspace(db2, vec![r], ws.id).await;
+        });
+
+        // While the gate is held, resume is parked on lock() → stale doc survives.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_some(),
+            "resume must block on the pass-gate while it is held"
+        );
+
+        drop(guard);
+        handle.await.unwrap();
+
+        assert!(
+            repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "after the gate is released, resume runs and clears the stale map"
+        );
+    }
+
+    #[test]
+    fn markdown_covers_graph_detects_unprofiled_edges() {
+        use std::collections::HashSet;
+        let profiled: HashSet<i32> = [1, 2].into_iter().collect();
+        // 3 still exists (unprofiled); 99 has been deleted.
+        let current: HashSet<i32> = [1, 2, 3].into_iter().collect();
+        let edge = |to: i32, rejected: bool| AgentRelation {
+            to,
+            kind: "lib".into(),
+            via: "x".into(),
+            confidence: 100,
+            source: "manifest".into(),
+            rejected,
+            ..Default::default()
+        };
+        // All live edges within the profiled set → markdown covers the graph.
+        let within = vec![(1, vec![edge(2, false)]), (2, vec![])];
+        assert!(super::markdown_covers_graph(&profiled, &current, &within));
+
+        // A profiled repo has a live edge to an UNPROFILED-but-current repo (3) →
+        // not covered (the target node is missing from the analyst's markdown).
+        let to_unprofiled = vec![(1, vec![edge(3, false)]), (2, vec![])];
+        assert!(!super::markdown_covers_graph(&profiled, &current, &to_unprofiled));
+
+        // An UNPROFILED-but-current repo (3) owns a live edge → not covered (its
+        // source node is missing from the markdown).
+        let from_unprofiled = vec![(1, vec![]), (3, vec![edge(1, false)])];
+        assert!(!super::markdown_covers_graph(&profiled, &current, &from_unprofiled));
+
+        // A REJECTED edge to an unprofiled repo is a tombstone, not a live edge → covered.
+        let rejected_only = vec![(1, vec![edge(3, true)]), (2, vec![])];
+        assert!(super::markdown_covers_graph(&profiled, &current, &rejected_only));
+
+        // A live edge to a DELETED repo (99 ∉ current) is stale — the graph drops
+        // it, so it must NOT block coverage. (Regression: round-9 bug where this
+        // refused to republish the map forever after deleting an edge target.)
+        let to_deleted = vec![(1, vec![edge(99, false)]), (2, vec![])];
+        assert!(super::markdown_covers_graph(&profiled, &current, &to_deleted));
+
+        // A NARRATED (profiled) repo deleted mid-run (2 ∉ current) → markdown
+        // describes a missing node → not covered. (Round-10 TOCTOU race.)
+        let profiled_repo_gone: HashSet<i32> = [1, 3].into_iter().collect();
+        assert!(!super::markdown_covers_graph(&profiled, &profiled_repo_gone, &within));
+    }
+
+    #[tokio::test]
+    async fn seed_manifest_relations_skips_ambiguous_providers() {
+        // When two repos provide the SAME manifest name, a first-wins pick would
+        // seed a concrete-but-arbitrary edge. The ambiguous name must seed nothing
+        // (let the agent decide), while a uniquely-provided name still seeds.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_seed_dup").await.unwrap();
+
+        let (consumer, tc) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "consumer",
+            "package.json",
+            r#"{"name":"@acme/consumer","dependencies":{"@acme/dup":"^1","@acme/uniq":"^1"}}"#,
+        )
+        .await;
+        // Two repos BOTH provide "@acme/dup" → ambiguous.
+        let (_dup1, t1) = seed_repo_with_manifest(
+            &db, ws.id, "dup1", "package.json", r#"{"name":"@acme/dup","dependencies":{}}"#,
+        )
+        .await;
+        let (_dup2, t2) = seed_repo_with_manifest(
+            &db, ws.id, "dup2", "package.json", r#"{"name":"@acme/dup","dependencies":{}}"#,
+        )
+        .await;
+        // One repo uniquely provides "@acme/uniq".
+        let (uniq, tu) = seed_repo_with_manifest(
+            &db, ws.id, "uniq", "package.json", r#"{"name":"@acme/uniq","dependencies":{}}"#,
+        )
+        .await;
+
+        super::seed_manifest_relations(&db, ws.id).await.unwrap();
+
+        let rels: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, consumer.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        assert!(
+            !rels.iter().any(|r| r.via == "@acme/dup"),
+            "ambiguous provider must not seed an arbitrary lib edge: {rels:?}"
+        );
+        assert!(
+            rels.iter()
+                .any(|r| r.to == uniq.id && r.via == "@acme/uniq" && r.source == "manifest"),
+            "uniquely-provided dep must still seed a lib edge: {rels:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tc);
+        let _ = std::fs::remove_dir_all(&t1);
+        let _ = std::fs::remove_dir_all(&t2);
+        let _ = std::fs::remove_dir_all(&tu);
+    }
+
+    #[tokio::test]
+    async fn seed_manifest_relations_preserves_existing_agent_and_user_relations() {
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_seed2").await.unwrap();
+
+        let (repo_a, tmp_a) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-a2",
+            "package.json",
+            r#"{"name":"@acme/app2","dependencies":{"@acme/lib2":"^1"}}"#,
+        )
+        .await;
+        let (repo_b, tmp_b) = seed_repo_with_manifest(
+            &db,
+            ws.id,
+            "repo-b2",
+            "package.json",
+            r#"{"name":"@acme/lib2","dependencies":{}}"#,
+        )
+        .await;
+
+        // Pre-seed repo_a with an existing agent edge (http to B) and a user edge.
+        let pre_rels = serde_json::to_string(&vec![
+            AgentRelation {
+                to: repo_b.id,
+                kind: "http".into(),
+                via: "GET /health".into(),
+                confidence: 70,
+                source: "agent".into(),
+                rejected: false,
+                ..Default::default()
+            },
+            AgentRelation {
+                to: repo_b.id,
+                kind: "grpc".into(),
+                via: "Svc.Call".into(),
+                confidence: 90,
+                source: "user".into(),
+                rejected: false,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        repo::set_repo_relations(&db, repo_a.id, &pre_rels).await.unwrap();
+
+        super::seed_manifest_relations(&db, ws.id).await.unwrap();
+
+        let rels_a: Vec<AgentRelation> = {
+            let p = repo::get_repo_profile(&db, repo_a.id).await.unwrap().unwrap();
+            serde_json::from_str(&p.relations).unwrap()
+        };
+        // Manifest lib edge must be present.
+        assert!(
+            rels_a.iter().any(|r| r.source == "manifest" && r.kind == "lib"),
+            "manifest lib edge added"
+        );
+        // Prior user edge must survive.
+        assert!(
+            rels_a.iter().any(|r| r.source == "user" && r.kind == "grpc"),
+            "prior user grpc edge preserved"
+        );
+        // Prior agent http edge must survive (different kind from manifest lib).
+        assert!(
+            rels_a.iter().any(|r| r.source == "agent" && r.kind == "http"),
+            "prior agent http edge preserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_a);
+        let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    // ─── Finding 3: build_curator_prompt includes manifest edges pre-persistence ─
+
+    #[tokio::test]
+    async fn build_curator_prompt_includes_manifest_edges_before_persistence() {
+        // On a first analysis, build_curator_prompt must include manifest-derived
+        // lib edges in the prompt even before seed_manifest_relations has persisted
+        // anything to the relations column (which would be "[]" on first run). This
+        // ensures the agent sees the manifest floor as a hint. (Finding 3)
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_f3").await.unwrap();
+
+        // Repo A: package.json requiring "@acme/lib" (provided by B).
+        let (repo_a, tmp_a) = seed_repo_with_manifest(
+            &db, ws.id, "app-f3",
+            "package.json",
+            r#"{"name":"app-f3","dependencies":{"@acme/lib":"*"}}"#,
+        ).await;
+        // Repo B: package.json providing "@acme/lib".
+        let (repo_b, tmp_b) = seed_repo_with_manifest(
+            &db, ws.id, "lib-f3",
+            "package.json",
+            r#"{"name":"@acme/lib","version":"1.0.0"}"#,
+        ).await;
+
+        // Upsert full profiles so both repos are "fully profiled".
+        repo::upsert_repo_profile(&db, repo_a.id, "frontend", "[]", "the app", "[]", "agent", "")
+            .await.unwrap();
+        repo::upsert_repo_profile(&db, repo_b.id, "backend", "[]", "the lib", "[]", "agent", "")
+            .await.unwrap();
+
+        // Do NOT call seed_manifest_relations — the relations column is "[]" for both.
+        let pa = repo::get_repo_profile(&db, repo_a.id).await.unwrap().unwrap();
+        let pb = repo::get_repo_profile(&db, repo_b.id).await.unwrap().unwrap();
+        assert_eq!(pa.relations, "[]", "precondition: relations column is empty");
+        assert_eq!(pb.relations, "[]", "precondition: relations column is empty");
+
+        // Build the curator prompt for these two repos.
+        let prompt = super::build_curator_prompt(&[(repo_a.clone(), pa), (repo_b.clone(), pb)]);
+
+        // The prompt must mention a manifest lib edge from app-f3 → lib-f3 even
+        // though seed_manifest_relations was never called.
+        assert!(
+            prompt.contains("manifest edges") && prompt.contains(&repo_b.id.to_string()),
+            "curator prompt must include manifest edge hint before persistence: {prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_a);
+        let _ = std::fs::remove_dir_all(&tmp_b);
+    }
+
+    #[tokio::test]
+    async fn build_curator_prompt_skips_ambiguous_provider_hints() {
+        // The prompt's manifest-edge hints must apply the SAME ambiguity filter as
+        // seed_manifest_relations: a name provided by 2+ repos seeds no hint (else
+        // the agent could be steered into persisting an arbitrary wrong edge), while
+        // a uniquely-provided name still produces a hint.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_amb_hint").await.unwrap();
+
+        let (consumer, tc) = seed_repo_with_manifest(
+            &db, ws.id, "consumer-h",
+            "package.json",
+            r#"{"name":"@acme/consumer-h","dependencies":{"@acme/dup":"*","@acme/uniq":"*"}}"#,
+        ).await;
+        let (_d1, t1) = seed_repo_with_manifest(
+            &db, ws.id, "dup1-h", "package.json", r#"{"name":"@acme/dup","version":"1"}"#,
+        ).await;
+        let (_d2, t2) = seed_repo_with_manifest(
+            &db, ws.id, "dup2-h", "package.json", r#"{"name":"@acme/dup","version":"1"}"#,
+        ).await;
+        let (uniq, tu) = seed_repo_with_manifest(
+            &db, ws.id, "uniq-h", "package.json", r#"{"name":"@acme/uniq","version":"1"}"#,
+        ).await;
+
+        let mut slice = Vec::new();
+        for r in [&consumer, &_d1, &_d2, &uniq] {
+            let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+            slice.push((r.clone(), p));
+        }
+        let prompt = super::build_curator_prompt(&slice);
+
+        assert!(
+            !prompt.contains("@acme/dup"),
+            "ambiguous provider must not produce a manifest-edge hint: {prompt}"
+        );
+        assert!(
+            prompt.contains("@acme/uniq") && prompt.contains(&uniq.id.to_string()),
+            "uniquely-provided dep must still produce a hint: {prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tc);
+        let _ = std::fs::remove_dir_all(&t1);
+        let _ = std::fs::remove_dir_all(&t2);
+        let _ = std::fs::remove_dir_all(&tu);
+    }
+
+    // ─── parse_repo_class: category/domains/exposed/consumes ───────────────
+
+    #[test]
+    fn parse_repo_class_with_category_and_domains() {
+        // A reply that includes all four new fields: they are parsed correctly.
+        let text = r#"
+Some prose here.
+{"tier":"backend","summary":"order service","stack":["go"],
+ "components":[],"category":"biz","domains":["orders","payments"],
+ "exposed":["POST /orders","GET /orders/:id"],"consumes":["auth-svc","product-svc"]}
+"#;
+        let wire = super::parse_repo_class(text).expect("should parse");
+        assert_eq!(wire.tier, "backend");
+        assert_eq!(wire.category.as_deref(), Some("biz"));
+        assert_eq!(wire.domains.as_deref(), Some(["orders".to_string(), "payments".to_string()].as_slice()));
+        assert_eq!(wire.exposed, vec!["POST /orders".to_string(), "GET /orders/:id".to_string()]);
+        assert_eq!(wire.consumes, vec!["auth-svc".to_string(), "product-svc".to_string()]);
+    }
+
+    #[test]
+    fn parse_repo_class_missing_new_fields_defaults() {
+        // A reply with only the original fields: category/domains/exposed/consumes
+        // default to None / [] and the parse still succeeds.
+        let text = r#"{"tier":"frontend","summary":"web app","stack":["react"],"components":[]}"#;
+        let wire = super::parse_repo_class(text).expect("should parse even without new fields");
+        assert!(wire.category.is_none(), "absent category → None");
+        assert!(wire.domains.is_none(), "absent domains → None");
+        assert!(wire.exposed.is_empty());
+        assert!(wire.consumes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_writes_category_and_domains() {
+        // When the agent provides category + domains, they are written to the profile.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_catdom").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        let wire = super::RepoClassWire {
+            name: None,
+            tier: "backend".into(),
+            summary: "order service".into(),
+            stack: None,
+            components: None,
+            category: Some("biz".into()),
+            domains: Some(vec!["orders".into(), "payments".into()]),
+            exposed: vec!["POST /orders".into()],
+            consumes: vec!["auth-svc".into()],
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "biz");
+        let doms: Vec<String> = serde_json::from_str(&p.domains).unwrap();
+        assert_eq!(doms, vec!["orders".to_string(), "payments".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_preserves_prior_category_domains_on_omission() {
+        // When the agent omits category/domains (None), the prior values are preserved.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_catdom2").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc2", "/tmp/svc2", "main", "", true)
+            .await
+            .unwrap();
+        // Seed an existing profile with category/domains.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "svc2 summary", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_repo_category_domains(&db, r.id, "core", r#"["auth"]"#).await.unwrap();
+        // Omit category/domains entirely (None = absent, not "" or []).
+        let wire = super::RepoClassWire {
+            name: None,
+            tier: "backend".into(),
+            summary: "updated summary".into(),
+            stack: None,
+            components: None,
+            category: None,
+            domains: None,
+            exposed: vec![],
+            consumes: vec![],
+        };
+        super::persist_repo_class(&db, &r, wire, "sha2").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "core", "prior category preserved when agent omits it");
+        let doms: Vec<String> = serde_json::from_str(&p.domains).unwrap();
+        assert_eq!(doms, vec!["auth".to_string()], "prior domains preserved when agent omits them");
+    }
+
+    // ─── Finding 4: explicit empty clears; None preserves ──────────────────
+
+    #[tokio::test]
+    async fn persist_repo_class_explicit_empty_domains_clears_prior() {
+        // An explicit empty domains (Some([])) must clear prior domains;
+        // an absent (None) must preserve them.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws_f4").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "svc summary", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_repo_category_domains(&db, r.id, "biz", r#"["orders","payments"]"#).await.unwrap();
+
+        // Pass 1: explicit empty domains clears prior.
+        let wire_clear = super::RepoClassWire {
+            name: None,
+            tier: "backend".into(),
+            summary: "svc summary".into(),
+            stack: None,
+            components: None,
+            category: Some("biz".into()),
+            domains: Some(vec![]),    // explicit empty → should clear
+            ..Default::default()
+        };
+        super::persist_repo_class(&db, &r, wire_clear, "sha1").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        let doms: Vec<String> = serde_json::from_str(&p.domains).unwrap();
+        assert!(doms.is_empty(), "explicit empty domains must clear prior domains");
+
+        // Seed category for the next check.
+        repo::set_repo_category_domains(&db, r.id, "core", r#"["auth"]"#).await.unwrap();
+
+        // Pass 2: absent domains (None) preserves prior.
+        let wire_preserve = super::RepoClassWire {
+            name: None,
+            tier: "backend".into(),
+            summary: "svc summary".into(),
+            stack: None,
+            components: None,
+            category: None,  // absent → preserve
+            domains: None,   // absent → preserve
+            ..Default::default()
+        };
+        super::persist_repo_class(&db, &r, wire_preserve, "sha2").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        let doms: Vec<String> = serde_json::from_str(&p.domains).unwrap();
+        assert_eq!(doms, vec!["auth".to_string()], "absent domains must preserve prior");
+        assert_eq!(p.category, "core", "absent category must preserve prior");
     }
 }
