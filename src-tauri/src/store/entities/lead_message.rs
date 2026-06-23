@@ -20,6 +20,9 @@ pub struct Model {
     /// streaming | complete | interrupted | error | queued
     pub status: String,
     pub created_at: String,
+    /// Delivery-order key: set when a queued row is delivered so reordered
+    /// messages appear in send (not creation) order. NULL = use id for ordering.
+    pub seq: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

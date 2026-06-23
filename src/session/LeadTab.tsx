@@ -110,8 +110,9 @@ export function LeadTab({
       .catch(() => {});
   }, [activeWorkspaceId, skillsDirtyAt]);
 
-  // 非-claude lead 的带外 meta(model/window/MCP server)。claude lead 命令返回 null →
-  // 不并入(事件流 init/usage 已填,别被空快照覆盖)。开页 + turn 结束 + 重载各拉一次。
+  // 带外 meta:codex/opencode 补 model/window/MCP server;claude 只补 cwd 的 skill(其余
+  // 走事件流 init/usage,空字段不覆盖)。命令返回 null 时不并入。开页 + turn 状态变 +
+  // 重载(skillsDirtyAt)各拉一次。
   useEffect(() => {
     if (tid == null) return;
     // 按 turn state 触发,running/idle 都会跑;用 alive 丢弃被取代的旧请求,避免
@@ -149,14 +150,15 @@ export function LeadTab({
   if (tid == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
-  const turn = leadTurn[tid] ?? { state: "stopped" as const, queued: 0 };
+  const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
   // The lead engine runs the thread's lead_tool (not always claude).
   const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
 
-  // 重载会话:重拉 skills + 标记静默 re-spawn(claude 下条消息拾取新 MCP/skill)。
+  // 重载会话:先注入新启用的 skill 到 lead cwd(并标记静默 re-spawn,claude 下条消息拾取),
+  // **注入完成后**再 bump skillsDirtyAt,让带外 meta effect 重扫 cwd —— 避免重扫抢在
+  // inject_for 之前把陈旧列表当权威合并。
   const onReload = () => {
-    markSkillsDirty();
-    void api.flagLeadSkillRefresh(tid);
+    void api.flagLeadSkillRefresh(tid).finally(() => markSkillsDirty());
   };
 
   const onLocalSlash = (name: string) => {
@@ -215,6 +217,10 @@ export function LeadTab({
           promptText={promptText}
           cwd={leadCwd}
           emptyState={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
+          queue={turn.queue}
+          onRemove={(id) => void api.leadDequeue(tid, id)}
+          onEdit={(id, text) => void api.leadEditQueued(tid, id, text)}
+          onReorder={(order) => void api.leadReorderQueue(tid, order)}
         />
         <ChatComposer
           slashCommands={leadSlash[tid] ?? []}
@@ -222,7 +228,7 @@ export function LeadTab({
           onLocalSlash={onLocalSlash}
           placeholder={composePlaceholder}
           busy={turn.state === "busy"}
-          queued={turn.queued}
+          queued={turn.queue.length}
           onSend={(text, images, files) =>
             sendLeadChat(tid, text, images, files)
           }

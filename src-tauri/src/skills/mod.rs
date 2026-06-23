@@ -91,6 +91,24 @@ pub async fn enabled_for_workspace(db: &Db, ws_id: i32) -> Result<Vec<EnabledSki
     }))
 }
 
+/// The skills present under a session cwd, scanning the given relative skill-dir
+/// `roots` via `parse_source`, deduped by name. Roots are tool-specific because
+/// each engine only loads from its own dir: Claude reads `.claude/skills`, while
+/// Codex/OpenCode read `.agents/skills` (`inject::materialize` writes both). They
+/// must NOT be merged for a single tool — a Codex-only `.agents/skills/foo` would
+/// otherwise be surfaced as a Claude skill Claude never loads. On-demand (no watcher).
+pub fn cwd_skills(cwd: &Path, roots: &[&str]) -> Vec<ParsedSkill> {
+    let mut out: Vec<ParsedSkill> = Vec::new();
+    for root in roots {
+        for p in parse_source(&cwd.join(root)) {
+            if !out.iter().any(|s| s.name == p.name) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Materialize the ws's enabled (non-overridden) skills into `cwd`. Best-effort.
 pub async fn inject_for(db: &Db, ws_id: i32, cwd: &Path) {
     let Ok(enabled) = enabled_for_workspace(db, ws_id).await else {
@@ -202,5 +220,59 @@ mod tests {
             .any(|e| e.name == "deploy" && e.dir == "/b/deploy" && e.overridden));
         // lint not enabled → absent
         assert!(!resolved.iter().any(|e| e.name == "lint"));
+    }
+
+    fn tmp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("weft-cwdskills-{}-{}", std::process::id(), id));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    fn write_skill(dir: &Path, name: &str, desc: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\nbody"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cwd_skills_scans_given_roots_and_dedupes() {
+        let root = tmp_dir();
+        // weft injects the same skill into BOTH .claude/skills and .agents/skills.
+        write_skill(&root.join(".claude/skills/foo"), "foo", "f");
+        write_skill(&root.join(".agents/skills/foo"), "foo", "f");
+        // a project skill that only lives under .claude (claude-only) and one .agents-only.
+        write_skill(&root.join(".claude/skills/proj"), "proj", "p");
+        write_skill(&root.join(".agents/skills/bar"), "bar", "b");
+        let mut got = cwd_skills(&root, &[".claude", ".agents"]);
+        got.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            got.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["bar", "foo", "proj"],
+            "dual-injected `foo` listed once; .claude-only and .agents-only both found"
+        );
+        assert_eq!(got.iter().find(|s| s.name == "foo").unwrap().description, "f");
+    }
+
+    #[test]
+    fn cwd_skills_claude_roots_exclude_agents() {
+        // Claude scans only `.claude`: a Codex-only `.agents/skills/codexonly` must
+        // NOT surface as a claude skill (claude won't load it).
+        let root = tmp_dir();
+        write_skill(&root.join(".claude/skills/foo"), "foo", "f");
+        write_skill(&root.join(".agents/skills/codexonly"), "codexonly", "c");
+        let got = cwd_skills(&root, &[".claude"]);
+        assert_eq!(got.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["foo"]);
+    }
+
+    #[test]
+    fn cwd_skills_empty_when_no_skill_dirs() {
+        let root = tmp_dir();
+        assert!(cwd_skills(&root, &[".claude", ".agents"]).is_empty());
     }
 }

@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, Check, Copy, ListChecks, Sparkles } from "lucide-react";
-import type { LeadMessage, ResolvedProposal } from "../lib/types";
-import { Markdown } from "../components/Markdown";
+import type { LeadMessage, QueuedItem, ResolvedProposal } from "../lib/types";
+import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
+import { QueueStack } from "./QueueStack";
 import {
   Attachment,
   Message,
@@ -51,9 +52,18 @@ export function ChatTimeline({
   promptText,
   cwd,
   emptyState = "default",
+  queue = [],
+  onRemove = () => {},
+  onEdit = () => {},
+  onReorder = () => {},
 }: {
   messages: LeadMessage[];
   busy: boolean;
+  /** Pending (not-yet-sent) queued messages, shown in the bottom stack. */
+  queue?: QueuedItem[];
+  onRemove?: (id: number) => void;
+  onEdit?: (id: number, text: string) => void;
+  onReorder?: (order: number[]) => void;
   /** The tool call executing right now (transient), if any. */
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
@@ -71,13 +81,13 @@ export function ChatTimeline({
   /** Lead hosts opt into task/repo guidance; workers keep the default empty state. */
   emptyState?: EmptyStateMode;
 }) {
-  const { t } = useTranslation();
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
 
   // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
   // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
-  const visible = messages.filter((m) => m.kind !== "meta");
+  // Pending queued messages live in the bottom QueueStack, not the timeline.
+  const visible = messages.filter((m) => m.kind !== "meta" && m.status !== "queued");
 
   const growthLen = visible
     .filter((m) => m.kind === "text" || m.kind === "tool")
@@ -137,18 +147,34 @@ export function ChatTimeline({
           scroller as a fixed bottom bar. Keeping it out of the list makes the
           last message the unambiguous list bottom and keeps the indicator
           visible even while the user scrolls back through history. */}
-      {busy && (
+      {(busy || queue.length > 0) && (
         <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
-          {activity ? (
-            <ToolStatus name={activity.name} summary={activity.summary} />
-          ) : (
-            <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
-              {t("lead.working")}
-            </div>
-          )}
+          <div className="flex flex-col gap-1.5">
+            {busy && <BusyIndicator activity={activity} />}
+            <QueueStack
+              items={queue}
+              onRemove={onRemove}
+              onEdit={onEdit}
+              onReorder={onReorder}
+            />
+          </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function BusyIndicator({
+  activity,
+}: {
+  activity?: { name: string; summary: string } | null;
+}) {
+  const { t } = useTranslation();
+  if (activity) return <ToolStatus name={activity.name} summary={activity.summary} />;
+  return (
+    <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
+      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
+      {t("lead.working")}
     </div>
   );
 }
@@ -517,14 +543,8 @@ function TimelineRow({
     const label = [command, args].filter(Boolean).join(" ");
     return (
       <div className="flex justify-end">
-        <span
-          className={cn(
-            "inline-flex max-w-[72%] items-center gap-1.5 rounded-[var(--radius-md)] border border-brand/25 bg-brand-ghost px-3 py-2 font-mono text-[12.5px] text-ink",
-            m.status === "queued" && "opacity-60",
-          )}
-        >
+        <span className="inline-flex max-w-[72%] items-center gap-1.5 rounded-[var(--radius-md)] border border-brand/25 bg-brand-ghost px-3 py-2 font-mono text-[12.5px] text-ink">
           <span className="truncate">{label}</span>
-          {m.status === "queued" && <QueuedChip />}
         </span>
       </div>
     );
@@ -586,12 +606,7 @@ function TimelineRow({
     const text = String(c.text ?? "");
     return (
       <Message role="user">
-        <div
-          className={cn(
-            "flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5",
-            m.status === "queued" && "opacity-60",
-          )}
-        >
+        <div className="flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5">
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {images.map((src, imageIndex) => (
@@ -620,11 +635,6 @@ function TimelineRow({
               {text}
             </p>
           )}
-          {m.status === "queued" && (
-            <span className="self-end">
-              <QueuedChip />
-            </span>
-          )}
           {m.status === "error" && (
             <p className="self-end text-[11px] text-danger">{t("lead.errored")}</p>
           )}
@@ -647,9 +657,11 @@ function TimelineRow({
   return (
     <Message role="assistant">
       <div className="min-w-0 max-w-full overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-        {assistantText && <Markdown text={assistantText} cwd={cwd} />}
-        {m.status === "streaming" && (
-          <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
+        {assistantText && (
+          <Markdown text={assistantText} cwd={cwd} caret={m.status === "streaming"} />
+        )}
+        {m.status === "streaming" && !assistantText && (
+          <span className={STREAM_CARET_CLASS} />
         )}
         {m.status === "interrupted" && (
           <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>
@@ -672,15 +684,6 @@ function isActionCardAction(value: unknown): value is ActionCardAction {
     typeof action.id === "string" &&
     typeof action.label === "string" &&
     (action.kind === "add" || action.kind === "new" || action.kind === "clone")
-  );
-}
-
-function QueuedChip() {
-  const { t } = useTranslation();
-  return (
-    <span className="rounded-full bg-bg px-1.5 py-px text-[10px] text-ink-faint">
-      {t("lead.queuedChip")}
-    </span>
   );
 }
 

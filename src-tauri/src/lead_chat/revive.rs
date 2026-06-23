@@ -133,6 +133,9 @@ async fn revive_worker(app: &AppHandle, w: WorkerTarget) {
 
 async fn try_revive_worker(app: &AppHandle, db: &Db, w: WorkerTarget) -> anyhow::Result<()> {
     repo::mark_incomplete_turns_interrupted(db, w.thread_id, Some(w.session_id)).await?;
+    // Un-sent queued messages must not stay stuck; surface them as errors so the
+    // user can see and resend them.
+    let _ = repo::fail_queued(db, w.thread_id, Some(w.session_id)).await?;
     // Re-open the EXACT repo the selected running session belongs to (the session
     // row carries `repo_id`). Resolving via the direction's worktree could pick a
     // different repo if a direction ever has multiple worktree rows, opening the
@@ -157,6 +160,9 @@ async fn revive_lead(app: &AppHandle, thread_id: i32) {
 
 async fn try_revive_lead(app: &AppHandle, db: &Db, thread_id: i32) -> anyhow::Result<()> {
     repo::mark_incomplete_turns_interrupted(db, thread_id, None).await?;
+    // Un-sent queued messages must not stay stuck; surface them as errors so the
+    // user can see and resend them.
+    let _ = repo::fail_queued(db, thread_id, None).await?;
     let eng = lead_engine(app, db, thread_id, "en").await?;
     engine::ensure_running(app, db, &eng).await?;
     if has_open_ask(app, "lead", thread_id) {
@@ -414,6 +420,75 @@ mod tests {
         live.insert(lead_key(th));
         let (leads, _) = collect_targets(&db, &live).await.unwrap();
         assert!(leads.is_empty());
+    }
+
+    /// Leftover queued user messages must surface as "error" (un-sent, resendable)
+    /// after revive, not stay stuck as "queued" with no live processor to deliver them.
+    #[tokio::test]
+    async fn fail_queued_flips_worker_queued_rows_to_error() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        let dir = mk_direction(&db, th, repo_id, "alpha").await;
+        let sess = running_session(&db, dir, repo_id).await;
+        // A user message queued before the crash, now orphaned (no live FIFO).
+        let queued = repo::insert_lead_message(
+            &db,
+            th,
+            Some(sess),
+            1,
+            "user",
+            "text",
+            r#"{"text":"pending send"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
+
+        // Simulate the revive path: mark_incomplete first, then fail_queued.
+        repo::mark_incomplete_turns_interrupted(&db, th, Some(sess))
+            .await
+            .unwrap();
+        repo::fail_queued(&db, th, Some(sess)).await.unwrap();
+
+        let all = repo::list_lead_messages(&db, th).await.unwrap();
+        assert_eq!(
+            all.iter().find(|m| m.id == queued.id).unwrap().status,
+            "error"
+        );
+    }
+
+    /// Same for lead threads (session_id == None).
+    #[tokio::test]
+    async fn fail_queued_flips_lead_queued_rows_to_error() {
+        let db = mem().await;
+        let (th, _) = fixture(&db).await;
+        // Lead has a native id and running status so revive would select it.
+        repo::set_lead_native_id(&db, th, "lead-nat").await.unwrap();
+        repo::set_lead_status(&db, th, "running").await.unwrap();
+        // A user message queued on the lead (no session_id).
+        let queued = repo::insert_lead_message(
+            &db,
+            th,
+            None,
+            1,
+            "user",
+            "text",
+            r#"{"text":"lead queued"}"#,
+            "queued",
+        )
+        .await
+        .unwrap();
+
+        repo::mark_incomplete_turns_interrupted(&db, th, None)
+            .await
+            .unwrap();
+        repo::fail_queued(&db, th, None).await.unwrap();
+
+        let all = repo::list_lead_messages(&db, th).await.unwrap();
+        assert_eq!(
+            all.iter().find(|m| m.id == queued.id).unwrap().status,
+            "error"
+        );
     }
 
     /// Failure reporting surfaces in 「待你处理」: posting via the bus's ask_human

@@ -21,6 +21,7 @@ import type {
   NeedItem,
   PermissionAsk,
   Proposal,
+  QueuedItem,
   RepoChecks,
   RepoEdge,
   RepoProfile,
@@ -79,8 +80,8 @@ interface Store {
 
   /** Lead chat: weft-owned timeline per thread (engine pushes, no polling). */
   leadMessages: Record<number, LeadMessage[]>;
-  /** Lead engine turn state per thread: busy/idle/stopped + queue depth. */
-  leadTurn: Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>;
+  /** Lead engine turn state per thread: busy/idle/stopped + queued items. */
+  leadTurn: Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>;
   /** Slash commands the lead's CLI reports as available (init event). */
   leadSlash: Record<number, SlashCmd[]>;
   /** Hydrate a thread's timeline from DB + make sure the engine runs. */
@@ -97,7 +98,7 @@ interface Store {
   /** Interrupt the lead's current turn. */
   interruptLead: (threadId: number) => Promise<void>;
   /** Chat-mode worker engine state, keyed by session id. */
-  workerTurn: Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>;
+  workerTurn: Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>;
   workerSlash: Record<number, SlashCmd[]>;
   discoverWorkerSlash: (sessionId: number) => void;
   /** The tool call running right now (transient): lead by thread, worker by session. */
@@ -1038,7 +1039,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // seeded. Guard on absence so a raced idle/stopped value the listener already
       // recorded wins. (Verify is backend-driven, so this seeds UI state only.)
       setWorkerTurn((t) =>
-        t[sid] ? t : { ...t, [sid]: { state: "busy", queued: slot.queued } },
+        t[sid] ? t : { ...t, [sid]: { state: "busy", queue: slot.queue ?? [] } },
       );
     }
     if (sessionsRef.current[sid]) return;
@@ -1219,11 +1220,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // ── Lead chat (weft-owned conversation; engine pushes via `lead-chat`) ──
   const [leadMessages, setLeadMessages] = useState<Record<number, LeadMessage[]>>({});
   const [leadTurn, setLeadTurn] = useState<
-    Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
+    Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>
   >({});
   const [leadSlash, setLeadSlash] = useState<Record<number, SlashCmd[]>>({});
   const [workerTurn, setWorkerTurn] = useState<
-    Record<number, { state: "busy" | "idle" | "stopped"; queued: number }>
+    Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>
   >({});
   const workerTurnRef = useRef(workerTurn);
   workerTurnRef.current = workerTurn;
@@ -1346,7 +1347,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           const prevTurn = lastWorkerTurnRef.current[sid];
           lastWorkerTurnRef.current[sid] = p.state;
           setWorkerActivity((a) => ({ ...a, [sid]: null }));
-          setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queued: p.queued } }));
+          setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queue: p.queue } }));
           setSessions((m) =>
             m[sid]
               ? {
@@ -1379,7 +1380,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
             ...t,
-            [p.thread_id]: { state: p.state, queued: p.queued },
+            [p.thread_id]: { state: p.state, queue: p.queue },
           }));
         }
       } else if (p.type === "init") {
@@ -1403,13 +1404,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           const sid = p.session_id;
           setWorkerTurn((t) =>
             (t[sid]?.state ?? "stopped") === "stopped"
-              ? { ...t, [sid]: { state: "idle", queued: 0 } }
+              ? { ...t, [sid]: { state: "idle", queue: [] } }
               : t,
           );
         } else {
           setLeadTurn((t) =>
             (t[p.thread_id]?.state ?? "stopped") === "stopped"
-              ? { ...t, [p.thread_id]: { state: "idle", queued: 0 } }
+              ? { ...t, [p.thread_id]: { state: "idle", queue: [] } }
               : t,
           );
         }
@@ -1457,7 +1458,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const st = await api.leadState(threadId);
       setLeadTurn((t) => ({
         ...t,
-        [threadId]: { state: st.state, queued: st.queued },
+        [threadId]: { state: st.state, queue: st.queue ?? [] },
       }));
       if (st.slash_commands.length > 0) {
         setLeadSlash((s) => ({ ...s, [threadId]: st.slash_commands }));

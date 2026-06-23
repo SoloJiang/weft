@@ -65,22 +65,21 @@ jobs:
           brew install protobuf
           protoc --version
 
+      # winget is flaky on the hosted Windows runner: it mutates the registry
+      # PATH, but Actions only honors $GITHUB_PATH between steps, so protoc often
+      # isn't visible to the later build step and prost-build (used by
+      # lark-websocket-protobuf via openlark's websocket feature) can't find it.
+      # Install via the dedicated action instead — it works on every image and
+      # adds protoc (with its include dir) to PATH. Mirrors ci.yml.
       - name: Install Windows dependencies
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          winget install -e --id Google.Protobuf --accept-package-agreements --accept-source-agreements
-          $protoc = Get-Command protoc -ErrorAction SilentlyContinue
-          if ($protoc) {
-            protoc --version
-          } else {
-            $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter protoc.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $installed) {
-              throw "protoc.exe not found after winget install"
-            }
-            $installed.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-            & $installed.FullName --version
-          }
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify protoc (Windows)
+        if: runner.os == 'Windows'
+        run: protoc --version
 
       - name: Install dependencies
         run: pnpm install

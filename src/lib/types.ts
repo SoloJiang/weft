@@ -121,7 +121,7 @@ export interface LiveWorkerSlot {
   repo_id: number;
   thread_id: number;
   busy: boolean;
-  queued: number;
+  queue: QueuedItem[];
 }
 
 /** Session ref backing the worker conversation surface (mirrors Rust ObserveRef). */
@@ -164,7 +164,8 @@ export interface SessionMeta {
   window?: number;
   model?: string;
   mcpServers: McpServerInfo[];
-  /** codex 的真实 skill,带外 `session_meta` 填;claude 不填。 */
+  /** 引擎自有的 skill,带外 `session_meta` 填:codex 走 `skills/list`,claude 扫会话 cwd
+   *  的 skill 目录(`.claude`/`.agents`);opencode 无对等,留空。 */
   engineSkills?: EngineSkill[];
   /** codex 的思考强度(low/medium/high/…)。 */
   reasoningEffort?: string;
@@ -178,7 +179,8 @@ export interface SessionMetaSnapshot {
   window: number | null;
   model: string | null;
   mcp_servers: { name: string; status: string }[] | null;
-  /** codex 真实 skill;`null` = 没探到(保留旧行),非 null = 权威列表。 */
+  /** 引擎 skill(codex `skills/list` / claude 扫 cwd skill 目录);`null` = 没探到
+   *  (保留旧行),非 null = 权威列表(空数组即清空)。 */
   skills: { name: string; description: string }[] | null;
   /** codex 思考强度;`null` = 未配置。 */
   reasoning_effort: string | null;
@@ -238,7 +240,7 @@ export type LeadChatPush =
       thread_id: number;
       session_id: number | null;
       state: "busy" | "idle" | "stopped";
-      queued: number;
+      queue: QueuedItem[];
     }
   | {
       type: "init";
@@ -298,7 +300,7 @@ export interface ImageAttachment {
 /** Snapshot of the lead engine, for mount-time hydration. */
 export interface LeadStateInfo {
   state: "busy" | "idle" | "stopped";
-  queued: number;
+  queue: QueuedItem[];
   native_id: string | null;
   slash_commands: SlashCmd[];
   cwd: string;
@@ -405,6 +407,16 @@ export interface RepoEdge {
 export interface RepoGraph {
   nodes: RepoProfile[];
   edges: RepoEdge[];
+}
+
+/** One item waiting in the engine's send queue (mirrors Rust QueuedItem). */
+export interface QueuedItem {
+  id: number;
+  text: string;
+  images: number;
+  files: number;
+  /** True when the original send carried files or images; disables inline edit. */
+  has_attachments: boolean;
 }
 
 /** The lead's proposed split of a Task into directions: ONE write repo each
