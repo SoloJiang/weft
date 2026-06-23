@@ -140,20 +140,9 @@ type CuratorView = "chat" | "map";
 /** The curator surface, kept mounted across switches; `hidden` when inactive. */
 function CuratorBody({ active, threadId }: { active: boolean; threadId: number | null }) {
   const { t } = useTranslation();
-  const { activeWorkspaceId, reanalyzeDeps } = useStore();
+  const { activeWorkspaceId, reanalyzeDeps, analyzing } = useStore();
   const [view, setView] = useState<CuratorView>("chat");
   const [mapDoc, setMapDoc] = useState<string | null | undefined>(undefined);
-  const [regenerating, setRegenerating] = useState(false);
-  // Latest active workspace, readable inside async continuations so a result that
-  // resolves after a workspace switch can be discarded (this panel is kept mounted).
-  const activeWsRef = useRef(activeWorkspaceId);
-  useEffect(() => {
-    activeWsRef.current = activeWorkspaceId;
-    // The spinner state belongs to the workspace that started the regenerate. On a
-    // switch, clear it so the new workspace's Map tab isn't left disabled/spinning
-    // for the previous workspace's (long) analysis.
-    setRegenerating(false);
-  }, [activeWorkspaceId]);
 
   useEffect(() => {
     // Gate on `active` too: this panel stays mounted while hidden behind the detail
@@ -191,27 +180,10 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
     };
   }, [active, view, activeWorkspaceId]);
 
-  function handleRegenerate() {
-    const ws = activeWorkspaceId;
-    if (ws == null) return;
-    setRegenerating(true);
-    reanalyzeDeps()
-      .then(() => api.getRepoMapDoc(ws))
-      .then((doc) => {
-        // Ignore the result if the user switched workspaces mid-regenerate — else
-        // this would overwrite the new workspace's map with the old one's (the
-        // switch effect above has already reset/loaded it). Mirrors the load() guard.
-        if (activeWsRef.current === ws) setMapDoc(doc);
-      })
-      .catch(() => { /* surface nothing; spinner clears below */ })
-      .finally(() => {
-        // Only clear the spinner if we're still on the workspace that started it —
-        // otherwise this (old) regenerate's completion would clear a spinner the
-        // new workspace's own regenerate may have just set. A switch already reset
-        // it via the effect above.
-        if (activeWsRef.current === ws) setRegenerating(false);
-      });
-  }
+  // Analysis means the chat is live with progress: switch to chat so the user sees it.
+  useEffect(() => {
+    if (analyzing) setView("chat");
+  }, [analyzing]);
 
   function renderMapBody() {
     if (mapDoc === undefined) {
@@ -226,12 +198,12 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
         <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
           <p className="text-[12px] text-ink-faint">{t("repomap.mapEmpty")}</p>
           <button
-            onClick={handleRegenerate}
-            disabled={regenerating}
+            onClick={() => void reanalyzeDeps()}
+            disabled={analyzing}
             className="flex items-center gap-1.5 rounded-[var(--radius-md)] bg-brand-ghost px-3 py-1.5 text-[11.5px] font-medium text-brand transition-colors hover:bg-brand/20 disabled:opacity-50"
           >
-            <RefreshCw size={12} className={regenerating ? "animate-spin" : ""} />
-            {t("repomap.regenerateMap")}
+            <RefreshCw size={12} className={analyzing ? "animate-spin" : ""} />
+            {t("repomap.reanalyze")}
           </button>
         </div>
       );
@@ -240,13 +212,13 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
       <div className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-3">
         <div className="mb-3 flex justify-end">
           <button
-            onClick={handleRegenerate}
-            disabled={regenerating}
-            title={t("repomap.regenerateMap")}
+            onClick={() => void reanalyzeDeps()}
+            disabled={analyzing}
+            title={t("repomap.reanalyze")}
             className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-faint transition-colors hover:bg-raised hover:text-ink disabled:opacity-50"
           >
-            <RefreshCw size={11} className={regenerating ? "animate-spin" : ""} />
-            {t("repomap.regenerateMap")}
+            <RefreshCw size={11} className={analyzing ? "animate-spin" : ""} />
+            {t("repomap.reanalyze")}
           </button>
         </div>
         <Markdown text={mapDoc} />
