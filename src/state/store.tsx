@@ -1743,18 +1743,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // strip — the chat itself is the record of the analysis. The buttons disable while
   // the curator turn is busy (see `analyzing` in the value); this ref additionally
   // blocks the brief send window so a fast double-click can't queue a second pass.
-  const reanalyzeSendingRef = useRef(false);
+  // Keyed by workspace so an in-flight send for one workspace never swallows a click
+  // in another.
+  const reanalyzeSendingRef = useRef<Set<number>>(new Set());
   const reanalyzeDeps = useCallback(async () => {
     const ws = activeWorkspaceId;
-    if (ws == null || reanalyzeSendingRef.current) return;
-    reanalyzeSendingRef.current = true;
+    if (ws == null || reanalyzeSendingRef.current.has(ws)) return;
+    reanalyzeSendingRef.current.add(ws);
     try {
       const tid = await ensureCuratorThreadId(ws);
-      if (activeWorkspaceIdRef.current !== ws) return;
-      openCurator();
+      // `tid` is ws's curator thread — deliver the reanalysis turn even if the user
+      // navigated away while the thread was being ensured; only opening the drawer
+      // (which targets the *active* workspace's curator) is gated on still being on ws.
+      if (activeWorkspaceIdRef.current === ws) openCurator();
       await sendLeadChat(tid, i18n.t("repomap.reanalyzeMessage"));
     } finally {
-      reanalyzeSendingRef.current = false;
+      reanalyzeSendingRef.current.delete(ws);
     }
   }, [activeWorkspaceId, ensureCuratorThreadId, openCurator, sendLeadChat]);
 
