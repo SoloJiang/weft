@@ -139,6 +139,13 @@ fn spawn_shell_path_refresh(file: std::path::PathBuf) {
     });
 }
 
+/// Whether any known coding-agent CLI resolves on the current process PATH. Used
+/// to tell a healthy cache from one made stale by a newly-installed agent — a
+/// false here is the signal to re-probe synchronously rather than wait a launch.
+fn known_agent_resolves() -> bool {
+    TOOL_PRIORITY.iter().any(|t| resolve_tool_path(t).is_some())
+}
+
 /// Run once at startup: fold the user's login-shell PATH into this process's PATH
 /// so a GUI- or dev-launched Weft can spawn nvm/fnm/volta/native CLIs even when
 /// the inherited PATH is minimal. Engine and curator spawns inherit this
@@ -149,17 +156,32 @@ fn spawn_shell_path_refresh(file: std::path::PathBuf) {
 /// slow on a heavy shell. So the result is CACHED on disk: a cache hit augments
 /// instantly and refreshes the cache in the background (disk only — no
 /// cross-thread setenv race) for next launch; a cache miss (first launch) pays
-/// the probe once, synchronously, and seeds the cache. A tool installed between
-/// launches is therefore picked up on the following launch.
+/// the probe once, synchronously, and seeds the cache.
+///
+/// Staleness: if a cache hit leaves NO known agent resolvable (e.g. one was
+/// installed since the cache was written), the cache is treated as stale and
+/// re-probed synchronously HERE — on the main thread, before other threads spawn,
+/// so applying it is race-free — so a freshly-installed agent is picked up this
+/// session, not only after a restart.
 pub fn augment_path() {
     let base = std::env::var("PATH").unwrap_or_default();
     let cache = shell_path_cache_file();
 
-    // Fast path: reuse a previous launch's probe, then refresh it in the background.
+    // Fast path: reuse a previous launch's probe.
     if let Some(file) = cache.as_ref() {
         if let Some(cached) = read_cached_shell_path(file) {
             apply_shell_path(&base, &cached);
-            spawn_shell_path_refresh(file.clone());
+            if known_agent_resolves() {
+                // Cache looks good — refresh in the background for next launch.
+                spawn_shell_path_refresh(file.clone());
+            } else if let Some(fresh) = login_shell_path() {
+                // Stale cache (or a newly-installed agent): re-probe now, merge into
+                // the just-applied PATH, and rewrite the cache so the next launch is
+                // correct too.
+                let now = std::env::var("PATH").unwrap_or_default();
+                apply_shell_path(&now, &fresh);
+                write_cached_shell_path(file, &fresh);
+            }
             return;
         }
     }
