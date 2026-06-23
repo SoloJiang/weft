@@ -430,6 +430,7 @@ export const en = {
     analysisTrigger: "Re-analyze dependencies",
     analysisRunning: "Re-analyzing dependencies…",
     analysisDone: "Dependency map updated: {{repos}} repos · {{edges}} links",
+    analysisDonePartial: "Dependency map updated: {{repos}} repos · {{edges}} links ({{failed}} failed)",
     detailTab: "Detail",
     curatorTitle: "Curator",
     curatorLoading: "Opening curator…",

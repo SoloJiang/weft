@@ -415,6 +415,7 @@ export const zh = {
     analysisTrigger: "重新分析依赖关系",
     analysisRunning: "正在重新分析依赖…",
     analysisDone: "已更新依赖地图：{{repos}} 个仓库 · {{edges}} 条关系",
+    analysisDonePartial: "已更新依赖地图：{{repos}} 个仓库 · {{edges}} 条关系（{{failed}} 个分析失败）",
     detailTab: "详情",
     curatorTitle: "依赖助手",
     curatorLoading: "正在打开依赖助手…",

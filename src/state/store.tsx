@@ -1742,7 +1742,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     try {
       try {
         tid = await api.openCuratorChat(ws); // get-or-create; idempotent
-        setCuratorThreadId(tid);
+        // Only adopt this thread as the global curator id if ws is still active — a
+        // mid-flight workspace switch already cleared it for the new workspace.
+        if (activeWorkspaceIdRef.current === ws) setCuratorThreadId(tid);
         // Load history BEFORE appending: opening the panel below mounts the chat,
         // whose own initial load would otherwise replace-away these fresh rows.
         await loadLeadChat(tid);
@@ -1756,8 +1758,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         tid = null; // mirror is best-effort; the pipeline still runs
         runningId = null;
       }
-      // Open the panel only after the trigger/running rows exist in the thread.
-      openCurator();
+      // Open the panel only after the trigger/running rows exist — and only if ws is
+      // still active, so a switch mid-flight doesn't open the new workspace's drawer
+      // backed by the old workspace's thread.
+      if (activeWorkspaceIdRef.current === ws) openCurator();
       try {
         await api.analyzeWorkspaceDeps(ws);
       } catch {
@@ -1776,11 +1780,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setRepoEdges(g.edges);
       }
       if (tid != null && runningId != null) {
-        await api.curatorFinalizeMessage(
-          tid,
-          runningId,
-          i18n.t("repomap.analysisDone", { repos: g.nodes.length, edges: g.edges.length }),
-        );
+        // A forced pass can finish with repos left "failed" (missing analyzer,
+        // unusable output): don't claim a clean update. All-failed reads as a
+        // failure; a partial run names the failed count.
+        const failed = g.nodes.filter((n) => n.analysis_state === "failed").length;
+        let summary: string;
+        if (g.nodes.length > 0 && failed === g.nodes.length) {
+          summary = i18n.t("repomap.analysisFailed");
+        } else if (failed > 0) {
+          summary = i18n.t("repomap.analysisDonePartial", {
+            repos: g.nodes.length,
+            edges: g.edges.length,
+            failed,
+          });
+        } else {
+          summary = i18n.t("repomap.analysisDone", { repos: g.nodes.length, edges: g.edges.length });
+        }
+        await api.curatorFinalizeMessage(tid, runningId, summary);
       }
     } finally {
       markAnalyzing(ws, false);
