@@ -8,6 +8,8 @@ use std::process::Command;
 
 fn run(dir: Option<&Path>, args: &[&str]) -> Result<()> {
     let mut cmd = Command::new("git");
+    // Resolve git from a GUI launch's minimal PATH (see detect::tool_path).
+    cmd.env("PATH", crate::detect::tool_path());
     if let Some(d) = dir {
         cmd.current_dir(d);
     }

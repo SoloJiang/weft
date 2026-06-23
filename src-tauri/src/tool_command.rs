@@ -84,6 +84,20 @@ pub fn to_json(map: &HashMap<String, String>) -> String {
     serde_json::to_string(map).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// A surfacing-ready message for a coding-agent spawn failure. A missing binary
+/// (`ErrorKind::NotFound`/ENOENT) becomes the stable `agent-not-found:<tool>`
+/// code the UI localizes into an actionable message; any other spawn error keeps
+/// the resolved command + OS text so it stays diagnosable. `tool` is the stable
+/// identity (codex/claude/opencode), NOT the alias, so the message reads the same
+/// whether or not a command override is set. Callers wrap this in their error type.
+pub fn spawn_error_message(tool: &str, command: &str, err: &std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        format!("agent-not-found:{tool}")
+    } else {
+        format!("could not run {command}: {err}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +140,27 @@ mod tests {
     fn parse_tolerates_malformed_json() {
         assert!(parse_overrides("not json").is_empty());
         assert!(parse_overrides("").is_empty());
+    }
+
+    #[test]
+    fn spawn_error_message_maps_missing_binary_to_stable_code() {
+        let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            spawn_error_message("codex", "codex", &enoent),
+            "agent-not-found:codex"
+        );
+        // The stable identity drives the code, not the resolved (aliased) binary.
+        assert_eq!(
+            spawn_error_message("claude", "cc-claude", &enoent),
+            "agent-not-found:claude"
+        );
+    }
+
+    #[test]
+    fn spawn_error_message_keeps_other_failures_diagnosable() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = spawn_error_message("codex", "/opt/codex", &denied);
+        assert!(msg.contains("/opt/codex"), "{msg}");
+        assert!(!msg.contains("agent-not-found"), "{msg}");
     }
 }

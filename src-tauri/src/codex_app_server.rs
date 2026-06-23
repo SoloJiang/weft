@@ -587,6 +587,9 @@ impl Client {
         if let Some(c) = cwd {
             command.current_dir(c);
         }
+        // Resolve nvm/fnm/volta CLIs from a GUI launch's minimal PATH without
+        // mutating the global env (see detect::tool_path).
+        command.env("PATH", crate::detect::tool_path());
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -69,8 +69,11 @@ fn mcp_bridge_enabled() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Make GUI-launched spawns find nvm/fnm/native-installer CLIs (see detect.rs).
-    detect::augment_path_from_login_shell();
+    // Prewarm the augmented tool PATH (login-shell probe + disk cache) so the first
+    // agent spawn doesn't pay the probe. This no longer mutates the global env —
+    // each agent spawn passes `detect::tool_path()` per-`Command` (see detect.rs) —
+    // so the placement is a latency choice, not a correctness constraint.
+    detect::augment_path();
 
     // Pin the rustls CryptoProvider. Several of our transitive deps enable
     // both `ring` and `aws-lc-rs`, which makes rustls 0.23 refuse to auto-pick

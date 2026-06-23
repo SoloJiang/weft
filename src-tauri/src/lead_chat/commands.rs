@@ -22,7 +22,7 @@ fn ensure_lead_cwd(thread_id: i32) -> anyhow::Result<std::path::PathBuf> {
     std::fs::create_dir_all(&cwd)?;
     // git-init so claude's session store (keyed by cwd) behaves like any other
     // cwd; harmless if it already exists.
-    let _ = std::process::Command::new("git")
+    let _ = std::process::Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["init", "-q"])
         .current_dir(&cwd)
         .status();

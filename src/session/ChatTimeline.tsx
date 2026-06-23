@@ -532,14 +532,16 @@ function TimelineRow({
 
   // assistant / system text
   const terminal = typeof c.terminal === "string" ? c.terminal : "";
-  let assistantText: string;
-  if (terminal === "error_before_output") {
-    assistantText = t("lead.terminalErrorBeforeOutput");
-  } else if (terminal === "interrupted_before_output") {
-    assistantText = t("lead.terminalInterruptedBeforeOutput");
-  } else {
-    assistantText = String(c.text ?? "");
-  }
+  // A terminal reason maps to a fixed notice; anything else renders the streamed
+  // text. One lookup keyed by the reason (not an if-chain) — a new reason is a
+  // single entry, and the param-carrying case stays uniform via a thunk.
+  const terminalNotice: Record<string, () => string> = {
+    error_before_output: () => t("lead.terminalErrorBeforeOutput"),
+    agent_not_found: () =>
+      t("lead.terminalAgentNotFound", { tool: typeof c.tool === "string" ? c.tool : "" }),
+    interrupted_before_output: () => t("lead.terminalInterruptedBeforeOutput"),
+  };
+  const assistantText = terminalNotice[terminal]?.() ?? String(c.text ?? "");
   return (
     <Message role="assistant">
       <div className="min-w-0 max-w-full overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">

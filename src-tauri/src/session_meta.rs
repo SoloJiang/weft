@@ -209,6 +209,7 @@ async fn gather_codex(cwd: &str, command: &str) -> SessionMetaSnapshot {
     let probe = tokio::process::Command::new(command)
         .args(["mcp", "list", "--json"])
         .current_dir(cwd)
+        .env("PATH", crate::detect::tool_path())
         .kill_on_drop(true)
         .output();
     let mcp_servers = match tokio::time::timeout(std::time::Duration::from_secs(10), probe).await {

@@ -15,6 +15,8 @@ const COMMITTER_EMAIL: &str = "weft@local";
 fn git() -> Command {
     let mut c = Command::new("git");
     c.env("GIT_TERMINAL_PROMPT", "0");
+    // Resolve git from a GUI launch's minimal PATH (see detect::tool_path).
+    c.env("PATH", crate::detect::tool_path());
     c
 }
 

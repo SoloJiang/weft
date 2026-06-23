@@ -41,7 +41,13 @@ fn probe(tool: &str) -> ToolStatus {
     let path_str = path.to_string_lossy().to_string();
     // Classify the --version probe: it ran (with/without a version), or it
     // couldn't spawn (not executable vs other OS error).
-    let (installed, version) = match std::process::Command::new(&path).arg("--version").output() {
+    // nvm/fnm shims are `#!/usr/bin/env node` — the --version probe needs the
+    // augmented PATH to find that node, or it false-reports the tool as missing.
+    let (installed, version) = match std::process::Command::new(&path)
+        .arg("--version")
+        .env("PATH", crate::detect::tool_path())
+        .output()
+    {
         Ok(o) if o.status.success() => {
             let v = String::from_utf8_lossy(&o.stdout)
                 .trim()
