@@ -1234,6 +1234,14 @@ async fn consume_human_event(
                 }
             }
         }
+        crate::bus::state::HumanAskEvent::Cancelled { thread, ask_id } => {
+            if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
+                let card = outbound::human_cancelled_card(IM_LANG);
+                if let Err(e) = ch.patch_card(&mid, card).await {
+                    eprintln!("[weft][im] patch human cancelled card: {e}");
+                }
+            }
+        }
     }
 }
 

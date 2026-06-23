@@ -141,6 +141,18 @@ pub fn human_resolved_card(answer: &str, lang: &str) -> Value {
     })
 }
 
+/// 提问因其 thread/workspace 被删除而取消后的终态卡。
+pub fn human_cancelled_card(lang: &str) -> Value {
+    json!({
+        "config": {"wide_screen_mode": true},
+        "header": {"template": "grey",
+            "title": {"tag": "plain_text", "content": t(lang, "已取消", "Cancelled")}},
+        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": t(lang,
+            "该 workspace 已删除，提问已取消。",
+            "The workspace was deleted, so this question was cancelled.")}}]
+    })
+}
+
 /// M2-4：lead/Concierge 回流飞书话题的纯文本渲染。前缀「Lead：/Lead: 」
 /// 让人在话题里一眼区分「自己说的」vs「agent 说的」（飞书话题里不显示
 /// 发送方的角色徽章——bot 名字默认折叠成应用名）。空 body 不上桥，由

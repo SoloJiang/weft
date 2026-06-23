@@ -1381,6 +1381,10 @@ async fn persist_repo_class(
 /// — a timed-out/unparseable reply leaves the prior profile (or placeholder)
 /// intact. No-op if the checkout is gone, or if this repo is already analyzing.
 pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
+    if repo::get_repo(db, repo.id).await?.is_none() {
+        run_forget(repo.id);
+        return Ok(());
+    }
     let cwd = Path::new(&repo.local_git_path);
     if !cwd.exists() {
         // The checkout is gone (e.g. a retry after it was moved/deleted). Don't
@@ -1454,6 +1458,10 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
             }
         }
     };
+    if repo::get_repo(db, rid).await?.is_none() {
+        run_forget(rid);
+        return Ok(());
+    }
     match outcome {
         Ok(()) => {
             run_finish_ok(rid);

@@ -48,6 +48,12 @@ pub enum HumanAskEvent {
         question: String,
         text: String,
     },
+    /// The backing thread/workspace is gone; clear any external cards without
+    /// delivering a synthetic answer back to an agent that is being stopped.
+    Cancelled {
+        thread: i32,
+        ask_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -331,6 +337,33 @@ impl BusRegistry {
             None => false,
         }
     }
+
+    /// Resolve every open human ask in a thread as cancelled. Used when deleting
+    /// the owning workspace: no message is delivered back to the asking direction
+    /// because its engine is being stopped and its thread rows are about to go
+    /// away.
+    pub fn cancel_open_asks(&self, thread: i32) -> usize {
+        let cancelled = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let bus = g.entry(thread).or_default();
+            let mut cancelled = Vec::new();
+            for ask in &mut bus.asks {
+                if ask.answered {
+                    continue;
+                }
+                ask.answered = true;
+                cancelled.push(ask.id);
+            }
+            cancelled
+        };
+        for ask_id in &cancelled {
+            self.emit_ask_event(HumanAskEvent::Cancelled {
+                thread,
+                ask_id: *ask_id,
+            });
+        }
+        cancelled.len()
+    }
 }
 
 #[cfg(test)]
@@ -494,5 +527,36 @@ mod tests {
         // 未命中/重复作答不发事件
         assert!(!r.answer_ask(1, id, "again"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_open_asks_marks_thread_asks_and_notifies() {
+        let r = BusRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_ask_notifier(tx);
+        let first = r.ask_human(1, "10", "first?");
+        let second = r.ask_human(1, "20", "second?");
+        let keep = r.ask_human(2, "30", "keep?");
+        for _ in 0..3 {
+            assert!(matches!(
+                rx.recv().await.unwrap(),
+                HumanAskEvent::Asked { .. }
+            ));
+        }
+
+        assert_eq!(r.cancel_open_asks(1), 2);
+
+        assert!(r.open_asks(1).is_empty());
+        assert_eq!(r.open_asks(2)[0].id, keep);
+        let mut cancelled = vec![];
+        for _ in 0..2 {
+            match rx.recv().await.unwrap() {
+                HumanAskEvent::Cancelled { thread: 1, ask_id } => cancelled.push(ask_id),
+                ev => panic!("unexpected: {ev:?}"),
+            }
+        }
+        cancelled.sort_unstable();
+        assert_eq!(cancelled, vec![first, second]);
+        assert_eq!(r.cancel_open_asks(1), 0);
     }
 }

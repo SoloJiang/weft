@@ -363,11 +363,20 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   async function pickLocalFolders() {
     const dirs = await api.pickFolders(t("dialog.addRepoTitle"));
     if (dirs.length === 0) return;
+    const appendLocalFolders = (picked: string[]) => {
+      setPath("");
+      setName("");
+      setLocalPaths((prev) => {
+        const out = [...prev];
+        for (const d of [path.trim(), ...picked]) {
+          if (d && !out.includes(d)) out.push(d);
+        }
+        return out;
+      });
+    };
     if (dirs.length === 1) {
       if (localPaths.length > 0) {
-        setPath("");
-        setName("");
-        setLocalPaths((prev) => (prev.includes(dirs[0]) ? prev : [...prev, dirs[0]]));
+        appendLocalFolders(dirs);
         return;
       }
       setPath(dirs[0]);
@@ -375,13 +384,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
       setName("");
       return;
     }
-    setPath("");
-    setName("");
-    setLocalPaths((prev) => {
-      const out = [...prev];
-      for (const d of dirs) if (!out.includes(d)) out.push(d);
-      return out;
-    });
+    appendLocalFolders(dirs);
   }
 
   function localCta() {

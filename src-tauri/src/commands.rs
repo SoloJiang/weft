@@ -36,18 +36,24 @@ pub async fn delete_workspace(
     stop_workspace_engines(&app, &db, workspace_id).await?;
     cancel_workspace_asks(&db, app.state::<crate::ask::AskRegistry>().inner(), workspace_id)
         .await?;
+    cancel_workspace_human_asks(
+        &db,
+        app.state::<crate::bus::BusRegistry>().inner(),
+        workspace_id,
+    )
+    .await?;
     let repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(&db, workspace_id)
         .await
         .map_err(e)?
         .into_iter()
         .map(|repo| (repo.id, repo.local_git_path))
         .collect();
-    let removed = repo::delete_workspace_cascade(&db, workspace_id)
-        .await
-        .map_err(e)?;
     for repo_id in repo_paths.keys() {
         crate::curator::run_forget(*repo_id);
     }
+    let removed = repo::delete_workspace_cascade(&db, workspace_id)
+        .await
+        .map_err(e)?;
     for (repo_id, path, branch, created_branch, created_checkout) in &removed {
         let Some(repo_path) = repo_paths.get(repo_id) else {
             continue;
@@ -65,6 +71,17 @@ pub async fn delete_workspace(
                 eprintln!("[weft] branch delete failed for {branch}: {err}");
             }
         }
+    }
+    Ok(())
+}
+
+async fn cancel_workspace_human_asks(
+    db: &Db,
+    bus: &crate::bus::BusRegistry,
+    workspace_id: i32,
+) -> R<()> {
+    for thread in repo::list_threads(db, workspace_id).await.map_err(e)? {
+        bus.cancel_open_asks(thread.id);
     }
     Ok(())
 }
@@ -424,10 +441,10 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
-    let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
-    // Drop any in-memory analysis run-state so the process-global registry doesn't
-    // keep a stale failed/running entry for a repo that no longer exists.
+    // Forget before the cascade so any in-flight curator pass sees the deletion
+    // as early as possible and does not publish stale running/done state.
     crate::curator::run_forget(repo_id);
+    let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
     // Gate worktree removal on created_checkout (a reused pre-existing path must
     // survive) and branch deletion on created_branch (a pre-existing branch reused
     // by the -b fallback survives repo deletion). cleanup_worktrees cannot be used
@@ -2135,5 +2152,27 @@ mod tests {
             vec![keep_id]
         );
         assert!(!asks.open().iter().any(|ask| ask.id == remove_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_human_asks_only_clears_deleted_workspace_threads() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        let remove_id = bus.ask_human(thread.id, "lead", "delete?");
+        let keep_id = bus.ask_human(keep_thread.id, "lead", "keep?");
+
+        cancel_workspace_human_asks(&db, &bus, ws.id).await.unwrap();
+
+        assert!(bus.open_asks(thread.id).is_empty());
+        assert_eq!(bus.open_asks(keep_thread.id)[0].id, keep_id);
+        assert_ne!(remove_id, keep_id);
     }
 }

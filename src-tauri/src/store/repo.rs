@@ -653,6 +653,9 @@ pub async fn upsert_repo_profile(
 /// `profile::AgentRelation`) for a repo, leaving its deterministic facts intact.
 /// No-op if the repo has no profile row yet (profiling is eager on add).
 pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Result<()> {
+    let Some(repo) = get_repo(db, repo_id).await? else {
+        return Ok(());
+    };
     if let Some(m) = get_repo_profile(db, repo_id).await? {
         let mut a: repo_profile::ActiveModel = m.into();
         a.relations = Set(relations.to_string());
@@ -663,9 +666,7 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
         // and manual calibration all write relations through here. `analyze_relations`
         // re-writes fresh markdown as its LAST step, so the happy path repopulates it;
         // a pass that omits markdown (or a manual calibration) leaves it cleared.
-        if let Some(r) = get_repo(db, repo_id).await? {
-            let _ = clear_repo_map_doc(db, r.workspace_id).await;
-        }
+        let _ = clear_repo_map_doc(db, repo.workspace_id).await;
     }
     Ok(())
 }
@@ -3586,6 +3587,24 @@ mod tests {
             get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
             "writing relations must invalidate the stale workspace map doc"
         );
+    }
+
+    #[tokio::test]
+    async fn set_repo_relations_noops_when_repo_ref_was_deleted() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo_ref::Entity::delete_by_id(r.id).exec(&db.0).await.unwrap();
+
+        set_repo_relations(&db, r.id, r#"[{"to":99,"kind":"http"}]"#)
+            .await
+            .unwrap();
+
+        let profile = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(profile.relations, "[]");
     }
 
     /// A manual edge calibration mutates relations → the stored map doc (describing
