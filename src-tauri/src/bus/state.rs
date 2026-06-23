@@ -338,17 +338,17 @@ impl BusRegistry {
         }
     }
 
-    /// Resolve every open human ask in a thread as cancelled. Used when deleting
-    /// the owning workspace: no message is delivered back to the asking direction
-    /// because its engine is being stopped and its thread rows are about to go
-    /// away.
-    pub fn cancel_open_asks(&self, thread: i32) -> usize {
+    fn cancel_open_asks_matching(
+        &self,
+        thread: i32,
+        mut should_cancel: impl FnMut(&Ask) -> bool,
+    ) -> usize {
         let cancelled = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
             let mut cancelled = Vec::new();
             for ask in &mut bus.asks {
-                if ask.answered {
+                if ask.answered || !should_cancel(ask) {
                     continue;
                 }
                 ask.answered = true;
@@ -363,6 +363,21 @@ impl BusRegistry {
             });
         }
         cancelled.len()
+    }
+
+    /// Resolve every open human ask in a thread as cancelled. Used when deleting
+    /// the owning workspace: no message is delivered back to the asking direction
+    /// because its engine is being stopped and its thread rows are about to go
+    /// away.
+    pub fn cancel_open_asks(&self, thread: i32) -> usize {
+        self.cancel_open_asks_matching(thread, |_| true)
+    }
+
+    /// Resolve open human asks from a specific direction in a thread. This covers
+    /// historical repo-scoped sessions whose thread belongs to a different
+    /// workspace than the repo being deleted.
+    pub fn cancel_open_asks_from(&self, thread: i32, from: &str) -> usize {
+        self.cancel_open_asks_matching(thread, |ask| ask.from.as_str() == from)
     }
 }
 
@@ -558,5 +573,29 @@ mod tests {
         cancelled.sort_unstable();
         assert_eq!(cancelled, vec![first, second]);
         assert_eq!(r.cancel_open_asks(1), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_open_asks_from_marks_only_that_direction() {
+        let r = BusRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_ask_notifier(tx);
+        let first = r.ask_human(1, "10", "first?");
+        let keep_same_thread = r.ask_human(1, "20", "second?");
+        let keep_other_thread = r.ask_human(2, "10", "keep?");
+        for _ in 0..3 {
+            assert!(matches!(
+                rx.recv().await.unwrap(),
+                HumanAskEvent::Asked { .. }
+            ));
+        }
+
+        assert_eq!(r.cancel_open_asks_from(1, "10"), 1);
+
+        assert_eq!(r.open_asks(1)[0].id, keep_same_thread);
+        assert_eq!(r.open_asks(2)[0].id, keep_other_thread);
+        assert!(matches!(rx.recv().await.unwrap(),
+            HumanAskEvent::Cancelled { thread: 1, ask_id } if ask_id == first));
+        assert_eq!(r.cancel_open_asks_from(1, "10"), 0);
     }
 }

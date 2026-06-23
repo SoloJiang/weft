@@ -95,6 +95,29 @@ async fn hidden_concierge_workspace_id(db: &Db) -> Result<Option<i32>> {
         .and_then(|value| value.parse::<i32>().ok()))
 }
 
+async fn ensure_workspace_exists(db: &Db, workspace_id: i32) -> Result<()> {
+    if workspace::Entity::find_by_id(workspace_id)
+        .one(&db.0)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("workspace {workspace_id} not found");
+    }
+    Ok(())
+}
+
+fn workspace_deleting_key(workspace_id: i32) -> String {
+    format!("workspace.deleting.{workspace_id}")
+}
+
+async fn ensure_workspace_accepts_writes(db: &Db, workspace_id: i32) -> Result<()> {
+    ensure_workspace_exists(db, workspace_id).await?;
+    if get_setting(db, &workspace_deleting_key(workspace_id)).await?.is_some() {
+        anyhow::bail!("workspace {workspace_id} is being deleted");
+    }
+    Ok(())
+}
+
 /// The most-recently created workspace (highest id), if any. Used as the
 /// default-workspace bootstrap target for first-run onboarding.
 pub async fn latest_workspace(db: &Db) -> Result<Option<workspace::Model>> {
@@ -373,6 +396,7 @@ pub async fn add_repo_ref(
     remote_url: &str,
     base_ref_is_default: bool,
 ) -> Result<repo_ref::Model> {
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let existing = repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
         .all(&db.0)
@@ -419,6 +443,7 @@ pub async fn create_thread(
 ) -> Result<thread::Model> {
     let title = validate_display_name(title, "issue title")?;
     let kind = validate_display_name(kind, "issue kind")?;
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let existing: Vec<String> = thread::Entity::find()
         .filter(thread::Column::WorkspaceId.eq(workspace_id))
         .all(&db.0)
@@ -1212,13 +1237,9 @@ pub async fn delete_workspace_cascade(
     db: &Db,
     workspace_id: i32,
 ) -> Result<Vec<(i32, String, String, bool, bool)>> {
-    if workspace::Entity::find_by_id(workspace_id)
-        .one(&db.0)
-        .await?
-        .is_none()
-    {
-        anyhow::bail!("workspace {workspace_id} not found");
-    }
+    ensure_workspace_exists(db, workspace_id).await?;
+    let deleting_key = workspace_deleting_key(workspace_id);
+    set_setting(db, &deleting_key, "1").await?;
 
     let repos = list_repos(db, workspace_id).await?;
     let repo_ids: Vec<i32> = repos.iter().map(|r| r.id).collect();
@@ -1301,6 +1322,7 @@ pub async fn delete_workspace_cascade(
     let _ = clear_repo_map_doc(db, workspace_id).await;
     let _ = delete_setting(db, &curator_thread_key(workspace_id)).await;
     workspace::Entity::delete_by_id(workspace_id).exec(&db.0).await?;
+    let _ = delete_setting(db, &deleting_key).await;
 
     Ok(removed)
 }
@@ -2893,6 +2915,48 @@ mod tests {
             .map(|row| row.scope)
             .collect();
         assert_eq!(scopes, vec![format!("ws:{}", keep_ws.id)]);
+    }
+
+    #[tokio::test]
+    async fn workspace_owned_writes_reject_deleted_workspace() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let deleting_key = workspace_deleting_key(ws.id);
+        set_setting(&db, &deleting_key, "1").await.unwrap();
+
+        let deleting_add_err = add_repo_ref(&db, ws.id, "late", "/tmp/late", "main", "", true)
+            .await
+            .unwrap_err();
+        assert!(deleting_add_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_thread_err = create_thread(&db, ws.id, "late issue", "feature", "claude")
+            .await
+            .unwrap_err();
+        assert!(deleting_thread_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        delete_setting(&db, &deleting_key).await.unwrap();
+
+        delete_workspace_cascade(&db, ws.id).await.unwrap();
+        assert!(get_setting(&db, &deleting_key).await.unwrap().is_none());
+
+        let add_err = add_repo_ref(&db, ws.id, "late", "/tmp/late", "main", "", true)
+            .await
+            .unwrap_err();
+        assert!(add_err
+            .to_string()
+            .contains(&format!("workspace {} not found", ws.id)));
+
+        let thread_err = create_thread(&db, ws.id, "late issue", "feature", "claude")
+            .await
+            .unwrap_err();
+        assert!(thread_err
+            .to_string()
+            .contains(&format!("workspace {} not found", ws.id)));
+        assert!(list_repos(&db, ws.id).await.unwrap().is_empty());
+        assert!(list_threads(&db, ws.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
