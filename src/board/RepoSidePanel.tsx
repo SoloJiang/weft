@@ -285,7 +285,12 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
       {/* chat view: keep LeadTab mounted so scroll/draft survive toggling */}
       <div className={cn("min-h-0 flex-1 flex-col", view === "chat" ? "flex" : "hidden")}>
         {threadId != null ? (
-          <LeadTab threadId={threadId} compact onReview={() => {}} />
+          <LeadTab
+            threadId={threadId}
+            compact
+            composePlaceholder={t("repomap.curatorCompose")}
+            onReview={() => {}}
+          />
         ) : (
           <div className="flex h-full items-center justify-center text-[12px] text-ink-faint">
             {t("repomap.curatorLoading")}

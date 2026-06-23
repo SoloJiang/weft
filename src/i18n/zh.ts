@@ -415,6 +415,7 @@ export const zh = {
     detailTab: "详情",
     curatorTitle: "依赖助手",
     curatorLoading: "正在打开依赖助手…",
+    curatorCompose: "给依赖助手发消息…",
     deleteRepo: "从工作区移除",
     deleteRepoTitle: "移除 {{name}}？",
     deleteRepoBody:

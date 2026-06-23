@@ -430,6 +430,7 @@ export const en = {
     detailTab: "Detail",
     curatorTitle: "Curator",
     curatorLoading: "Opening curator…",
+    curatorCompose: "Message the curator…",
     deleteRepo: "Remove from workspace",
     deleteRepoTitle: "Remove {{name}}?",
     deleteRepoBody:
