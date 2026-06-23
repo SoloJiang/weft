@@ -44,6 +44,8 @@ export const api = {
     invoke<Workspace>("create_workspace", { name }),
   renameWorkspace: (workspaceId: number, name: string) =>
     invoke<Workspace>("rename_workspace", { workspaceId, name }),
+  deleteWorkspace: (workspaceId: number) =>
+    invoke<void>("delete_workspace", { workspaceId }),
   ensureDefaultWorkspace: () =>
     invoke<number>("ensure_default_workspace"),
 

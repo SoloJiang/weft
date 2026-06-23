@@ -28,6 +28,180 @@ pub async fn rename_workspace(
 }
 
 #[tauri::command]
+pub async fn delete_workspace(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<()> {
+    repo::mark_workspace_deleting(&db, workspace_id)
+        .await
+        .map_err(e)?;
+    let result = delete_workspace_after_fence(app, &db, workspace_id).await;
+    if result.is_err() {
+        let _ = repo::clear_workspace_deleting(&db, workspace_id).await;
+    }
+    result
+}
+
+async fn delete_workspace_after_fence(
+    app: tauri::AppHandle,
+    db: &Db,
+    workspace_id: i32,
+) -> R<()> {
+    stop_workspace_engines(&app, db, workspace_id).await?;
+    cancel_workspace_asks(db, app.state::<crate::ask::AskRegistry>().inner(), workspace_id)
+        .await?;
+    cancel_workspace_human_asks(
+        db,
+        app.state::<crate::bus::BusRegistry>().inner(),
+        workspace_id,
+    )
+    .await?;
+    let mut repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(db, workspace_id)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .map(|repo| (repo.id, repo.local_git_path))
+        .collect();
+    for repo_id in repo_paths.keys() {
+        crate::curator::run_forget(*repo_id);
+    }
+    let removed = repo::delete_workspace_cascade(db, workspace_id)
+        .await
+        .map_err(e)?;
+    extend_removed_repo_paths(db, &mut repo_paths, &removed).await?;
+    for (repo_id, path, branch, created_branch, created_checkout) in &removed {
+        let Some(repo_path) = repo_paths.get(repo_id) else {
+            continue;
+        };
+        let repo_path = std::path::Path::new(repo_path);
+        if *created_checkout {
+            if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
+                eprintln!("[weft] worktree remove failed for {path}: {err}");
+            }
+        } else {
+            let _ = crate::git::lock_worktree(repo_path, std::path::Path::new(path));
+        }
+        if *created_branch {
+            if let Err(err) = crate::git::delete_branch(repo_path, branch) {
+                eprintln!("[weft] branch delete failed for {branch}: {err}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn extend_removed_repo_paths(
+    db: &Db,
+    repo_paths: &mut std::collections::HashMap<i32, String>,
+    removed: &[(i32, String, String, bool, bool)],
+) -> R<()> {
+    for (repo_id, _, _, _, _) in removed {
+        if repo_paths.contains_key(repo_id) {
+            continue;
+        }
+        if let Some(repo_ref) = repo::get_repo(db, *repo_id).await.map_err(e)? {
+            repo_paths.insert(*repo_id, repo_ref.local_git_path);
+        }
+    }
+    Ok(())
+}
+
+async fn cancel_workspace_human_asks(
+    db: &Db,
+    bus: &crate::bus::BusRegistry,
+    workspace_id: i32,
+) -> R<()> {
+    let scope = workspace_ask_scope(db, workspace_id).await?;
+    for thread_id in &scope.thread_ids {
+        bus.cancel_open_asks(*thread_id);
+    }
+    for (thread_id, from) in &scope.direction_routes {
+        if !scope.thread_ids.contains(thread_id) {
+            bus.cancel_open_asks_from(*thread_id, from);
+        }
+    }
+    Ok(())
+}
+
+async fn cancel_workspace_asks(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    workspace_id: i32,
+) -> R<()> {
+    let scope = workspace_ask_scope(db, workspace_id).await?;
+    for ask in asks.open() {
+        if scope.thread_ids.contains(&ask.thread)
+            || scope.direction_routes.contains(&(ask.thread, ask.dir.clone()))
+        {
+            asks.cancel(ask.id);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct WorkspaceAskScope {
+    thread_ids: std::collections::BTreeSet<i32>,
+    direction_routes: std::collections::BTreeSet<(i32, String)>,
+}
+
+async fn workspace_ask_scope(db: &Db, workspace_id: i32) -> R<WorkspaceAskScope> {
+    let threads = repo::list_threads(db, workspace_id).await.map_err(e)?;
+    let repos = repo::list_repos(db, workspace_id).await.map_err(e)?;
+    let mut scope = WorkspaceAskScope::default();
+    for thread in threads {
+        scope.thread_ids.insert(thread.id);
+    }
+    for repo_ref in repos {
+        for session in repo::sessions_for_repo(db, repo_ref.id).await.map_err(e)? {
+            if let Some(direction) = repo::get_direction(db, session.direction_id)
+                .await
+                .map_err(e)?
+            {
+                scope
+                    .direction_routes
+                    .insert((direction.thread_id, direction.id.to_string()));
+            }
+        }
+    }
+    Ok(scope)
+}
+
+async fn stop_workspace_engines(app: &tauri::AppHandle, db: &Db, workspace_id: i32) -> R<()> {
+    let state = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let keys = workspace_engine_keys(db, workspace_id).await?;
+    for key in keys {
+        if let Some(eng) = state.get(key) {
+            crate::lead_chat::engine::stop(app, &eng).await;
+        }
+    }
+    Ok(())
+}
+
+async fn workspace_engine_keys(
+    db: &Db,
+    workspace_id: i32,
+) -> R<std::collections::BTreeSet<i64>> {
+    let threads = repo::list_threads(db, workspace_id).await.map_err(e)?;
+    let repos = repo::list_repos(db, workspace_id).await.map_err(e)?;
+    let mut keys = std::collections::BTreeSet::<i64>::new();
+
+    for thread in &threads {
+        keys.insert(crate::lead_chat::commands::lead_key(thread.id));
+        for session in repo::sessions_for_thread(db, thread.id).await.map_err(e)? {
+            keys.insert(session.id as i64);
+        }
+    }
+    for repo in &repos {
+        for session in repo::sessions_for_repo(db, repo.id).await.map_err(e)? {
+            keys.insert(session.id as i64);
+        }
+    }
+    Ok(keys)
+}
+
+#[tauri::command]
 pub async fn list_workspaces(db: State<'_, Db>) -> R<Vec<entities::workspace::Model>> {
     let hidden = repo::get_setting(&db, repo::K_CONCIERGE_WORKSPACE)
         .await
@@ -303,10 +477,10 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
-    let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
-    // Drop any in-memory analysis run-state so the process-global registry doesn't
-    // keep a stale failed/running entry for a repo that no longer exists.
+    // Forget before the cascade so any in-flight curator pass sees the deletion
+    // as early as possible and does not publish stale running/done state.
     crate::curator::run_forget(repo_id);
+    let removed = repo::delete_repo_cascade(&db, repo_id).await.map_err(e)?;
     // Gate worktree removal on created_checkout (a reused pre-existing path must
     // survive) and branch deletion on created_branch (a pre-existing branch reused
     // by the -b fallback survives repo deletion). cleanup_worktrees cannot be used
@@ -1922,5 +2096,224 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn workspace_engine_keys_cover_workspace_leads_workers_and_repo_sessions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "web task",
+            "claude",
+            repo_ref.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let keep_direction = repo::create_direction(
+            &db,
+            keep_thread.id,
+            "api task",
+            "claude",
+            keep_repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let worker = repo::create_session(&db, direction.id, repo_ref.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        let keep_worker =
+            repo::create_session(&db, keep_direction.id, keep_repo.id, "claude", "/tmp/keep")
+                .await
+                .unwrap();
+        let repo_scoped_worker =
+            repo::create_session(&db, keep_direction.id, repo_ref.id, "claude", "/tmp/orphan")
+                .await
+                .unwrap();
+
+        let keys = workspace_engine_keys(&db, ws.id).await.unwrap();
+
+        let expected = std::collections::BTreeSet::from([
+            crate::lead_chat::commands::lead_key(thread.id),
+            worker.id as i64,
+            repo_scoped_worker.id as i64,
+        ]);
+        assert_eq!(keys, expected);
+        assert!(!keys.contains(&crate::lead_chat::commands::lead_key(keep_thread.id)));
+        assert!(!keys.contains(&(keep_worker.id as i64)));
+    }
+
+    #[tokio::test]
+    async fn extend_removed_repo_paths_loads_external_repo_refs() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let external_repo =
+            repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+                .await
+                .unwrap();
+        let mut repo_paths = std::collections::HashMap::from([(
+            repo_ref.id,
+            repo_ref.local_git_path.clone(),
+        )]);
+        let removed = vec![(
+            external_repo.id,
+            "/tmp/api-wt".to_string(),
+            "feature/api".to_string(),
+            true,
+            true,
+        )];
+
+        extend_removed_repo_paths(&db, &mut repo_paths, &removed)
+            .await
+            .unwrap();
+
+        assert_eq!(repo_paths.get(&repo_ref.id).map(String::as_str), Some("/tmp/web"));
+        assert_eq!(
+            repo_paths.get(&external_repo.id).map(String::as_str),
+            Some("/tmp/api")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_asks_only_clears_deleted_workspace_threads() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_direction = repo::create_direction(
+            &db,
+            keep_thread.id,
+            "api task",
+            "claude",
+            keep_repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        repo::create_session(
+            &db,
+            keep_direction.id,
+            repo_ref.id,
+            "claude",
+            "/tmp/orphan",
+        )
+        .await
+        .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let (remove_id, remove_rx) =
+            asks.request(thread.id, "", "claude", "Run: rm", "rm -rf tmp");
+        let (repo_scoped_id, repo_scoped_rx) = asks.request(
+            keep_thread.id,
+            &keep_direction.id.to_string(),
+            "claude",
+            "Run: clean",
+            "rm -rf tmp",
+        );
+        let (keep_id, _keep_rx) =
+            asks.request(keep_thread.id, "20", "claude", "Run: test", "pnpm test");
+
+        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+
+        assert!(remove_rx.await.is_err());
+        assert!(repo_scoped_rx.await.is_err());
+        assert_eq!(
+            asks.open().iter().map(|ask| ask.id).collect::<Vec<_>>(),
+            vec![keep_id]
+        );
+        assert!(!asks.open().iter().any(|ask| ask.id == remove_id));
+        assert!(!asks.open().iter().any(|ask| ask.id == repo_scoped_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_human_asks_only_clears_deleted_workspace_threads() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_direction = repo::create_direction(
+            &db,
+            keep_thread.id,
+            "api task",
+            "claude",
+            keep_repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        repo::create_session(
+            &db,
+            keep_direction.id,
+            repo_ref.id,
+            "claude",
+            "/tmp/orphan",
+        )
+        .await
+        .unwrap();
+        let bus = crate::bus::BusRegistry::new();
+        let remove_id = bus.ask_human(thread.id, "lead", "delete?");
+        let repo_scoped_id =
+            bus.ask_human(keep_thread.id, &keep_direction.id.to_string(), "delete repo?");
+        let keep_id = bus.ask_human(keep_thread.id, "lead", "keep?");
+
+        cancel_workspace_human_asks(&db, &bus, ws.id).await.unwrap();
+
+        assert!(bus.open_asks(thread.id).is_empty());
+        assert_eq!(bus.open_asks(keep_thread.id)[0].id, keep_id);
+        assert!(!bus
+            .open_asks(keep_thread.id)
+            .iter()
+            .any(|ask| ask.id == repo_scoped_id));
+        assert_ne!(remove_id, keep_id);
+        assert_ne!(repo_scoped_id, keep_id);
     }
 }

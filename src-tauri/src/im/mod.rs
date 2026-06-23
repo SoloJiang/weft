@@ -20,6 +20,8 @@ pub const K_ENABLED: &str = "im.feishu.enabled";
 pub const K_REMOTE_STANDBY: &str = "im.remote_standby";
 /// 飞书 👀「看我看我」表情的 reaction key。
 const INBOUND_ACK_EMOJI: &str = "MeMeMe";
+const CONCIERGE_WORKSPACE_NAME: &str = "Concierge";
+const CONCIERGE_INTERNAL_WORKSPACE_NAME: &str = "Concierge (internal)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImProviderCapabilities {
@@ -168,6 +170,45 @@ async fn latest_pending_ack_message(
 /// (replying to an `om_*` message succeeds where the `omt_*` topic id would not).
 fn issue_topic_seed_key(thread_id: i32) -> String {
     format!("im.issue_topic_seed.{thread_id}")
+}
+
+async fn set_issue_topic_seed(
+    db: &crate::store::Db,
+    thread_id: i32,
+    seed_message_id: &str,
+) -> anyhow::Result<()> {
+    crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let key = issue_topic_seed_key(thread_id);
+    crate::store::repo::set_setting(db, &key, seed_message_id).await?;
+    if let Err(err) =
+        crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await
+    {
+        let _ = crate::store::repo::delete_setting(db, &key).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn unique_concierge_workspace_name(
+    workspaces: &[crate::store::entities::workspace::Model],
+) -> String {
+    if !workspaces.iter().any(|workspace| workspace.name == CONCIERGE_WORKSPACE_NAME) {
+        return CONCIERGE_WORKSPACE_NAME.to_string();
+    }
+    if !workspaces
+        .iter()
+        .any(|workspace| workspace.name == CONCIERGE_INTERNAL_WORKSPACE_NAME)
+    {
+        return CONCIERGE_INTERNAL_WORKSPACE_NAME.to_string();
+    }
+    let mut i = 2;
+    loop {
+        let candidate = format!("Concierge (internal {i})");
+        if !workspaces.iter().any(|workspace| workspace.name == candidate) {
+            return candidate;
+        }
+        i += 1;
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -468,13 +509,13 @@ pub async fn execute(
                 }
                 return Ok(());
             };
+            crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
             crate::store::repo::bind_im_route(db, thread_id, "feishu", &chat_id, &im_thread_ref)
                 .await?;
             // Record the /bind message as the topic's replyable seed (a member of
             // this topic), so a later desktop-driven / no-ack lead reply has a valid
             // om_ target rather than the non-replyable omt_ topic id.
-            crate::store::repo::set_setting(db, &issue_topic_seed_key(thread_id), &seed_message_id)
-                .await?;
+            set_issue_topic_seed(db, thread_id, &seed_message_id).await?;
             if let Err(e) = channel
                 .send_text(
                     sender,
@@ -1210,6 +1251,14 @@ async fn consume_human_event(
                 }
             }
         }
+        crate::bus::state::HumanAskEvent::Cancelled { thread, ask_id } => {
+            if let Some(mid) = cards.lock().await.take_human(thread, ask_id) {
+                let card = outbound::human_cancelled_card(IM_LANG);
+                if let Err(e) = ch.patch_card(&mid, card).await {
+                    eprintln!("[weft][im] patch human cancelled card: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -1276,6 +1325,7 @@ pub async fn ensure_issue_topic(
         }
         return Ok(());
     };
+    crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
 
     if let Some(route) = crate::store::repo::im_route_of_thread(db, thread_id).await? {
         if let Some(reply_to) = reply_to {
@@ -1316,7 +1366,7 @@ pub async fn ensure_issue_topic(
     crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
     // Persist a replyable seed message id (an `om_*` member of the topic) for the
     // no-ack / no-origin_tag fallback (Finding C).
-    crate::store::repo::set_setting(db, &issue_topic_seed_key(thread.id), &seed_message_id).await?;
+    set_issue_topic_seed(db, thread.id, &seed_message_id).await?;
     if let Some(reply_to) = reply_to {
         if let Err(e) = ch
             .reply_text(
@@ -1549,19 +1599,17 @@ pub async fn consume_lead_out(
 }
 
 async fn ensure_concierge_workspace(db: &crate::store::Db) -> anyhow::Result<i32> {
+    let workspaces = crate::store::repo::list_workspaces(db).await?;
     if let Some(id) = crate::store::repo::get_setting(db, crate::store::repo::K_CONCIERGE_WORKSPACE)
         .await?
         .and_then(|s| s.parse::<i32>().ok())
     {
-        if crate::store::repo::list_workspaces(db)
-            .await?
-            .into_iter()
-            .any(|ws| ws.id == id)
-        {
+        if workspaces.iter().any(|ws| ws.id == id) {
             return Ok(id);
         }
     }
-    let ws = crate::store::repo::create_workspace(db, "Concierge").await?;
+    let name = unique_concierge_workspace_name(&workspaces);
+    let ws = crate::store::repo::create_workspace(db, &name).await?;
     crate::store::repo::set_setting(
         db,
         crate::store::repo::K_CONCIERGE_WORKSPACE,
@@ -1760,6 +1808,30 @@ mod tests {
             .unwrap();
         // DB 错误必须传播为 Err（fail-closed），不得折叠成默认设置
         assert!(ImSettings::load(&db).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concierge_workspace_uses_unique_internal_name_when_name_taken() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let visible = crate::store::repo::create_workspace(&db, "Concierge")
+            .await
+            .unwrap();
+
+        let hidden_id = ensure_concierge_workspace(&db).await.unwrap();
+
+        assert_ne!(hidden_id, visible.id);
+        let workspaces = crate::store::repo::list_workspaces(&db).await.unwrap();
+        let hidden = workspaces
+            .iter()
+            .find(|workspace| workspace.id == hidden_id)
+            .unwrap();
+        assert_eq!(hidden.name, "Concierge (internal)");
+        assert_eq!(
+            crate::store::repo::get_setting(&db, crate::store::repo::K_CONCIERGE_WORKSPACE)
+                .await
+                .unwrap(),
+            Some(hidden_id.to_string())
+        );
     }
 
     #[test]
@@ -1995,6 +2067,44 @@ mod tests {
                 .any(|(_, body)| body.contains("Lead agent") || body.contains("Lead Agent")),
             "topic creation message should tell users this topic is connected to the issue Lead agent: {created:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn issue_topic_seed_rolls_back_when_delete_marker_appears_after_write() {
+        use sea_orm::ConnectionTrait;
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        let seed_key = issue_topic_seed_key(issue.id);
+        db.0
+            .execute(sea_orm::Statement::from_string(
+                db.0.get_database_backend(),
+                format!(
+                    "CREATE TRIGGER issue_seed_mark_deleting AFTER INSERT ON app_setting \
+                     WHEN NEW.key = '{}' BEGIN INSERT OR REPLACE INTO app_setting(key, value) \
+                     VALUES ('workspace.deleting.{}', '1'); END",
+                    seed_key, ws.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let err = set_issue_topic_seed(&db, issue.id, "om_seed")
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        assert!(crate::store::repo::get_setting(&db, &seed_key)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[derive(Default)]

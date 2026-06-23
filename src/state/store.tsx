@@ -223,6 +223,7 @@ interface Store {
 
   createWorkspace: (name: string) => Promise<void>;
   renameWorkspace: (workspaceId: number, name: string) => Promise<void>;
+  deleteWorkspace: (workspaceId: number) => Promise<void>;
   renameThread: (threadId: number, title: string) => Promise<void>;
   renameDirection: (directionId: number, name: string) => Promise<void>;
   addRepo: (name: string, path: string) => Promise<void>;
@@ -712,6 +713,50 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const ws = await api.renameWorkspace(workspaceId, name);
     setWorkspaces((cur) => cur.map((w) => (w.id === ws.id ? ws : w)));
   }, []);
+
+  const deleteWorkspace = useCallback(
+    async (workspaceId: number) => {
+      await api.deleteWorkspace(workspaceId);
+      const ws = await api.listWorkspaces();
+      setWorkspaces(ws);
+      setNeedsByWorkspace((cur) => {
+        const next = { ...cur };
+        delete next[workspaceId];
+        return next;
+      });
+      if (Number(localStorage.getItem("weft-active-workspace")) === workspaceId) {
+        localStorage.removeItem("weft-active-workspace");
+      }
+      if (activeWorkspaceIdRef.current !== workspaceId) return;
+
+      const nextWorkspace = ws[0] ?? null;
+      if (nextWorkspace) {
+        await selectWorkspace(nextWorkspace.id);
+        return;
+      }
+
+      setActiveWorkspaceId(null);
+      setRepos([]);
+      setThreads([]);
+      setDirections({});
+      setWorktrees({});
+      setRepoProfiles([]);
+      setRepoEdges([]);
+      setActiveThreadId(null);
+      setViewing(null);
+      setShowNeeds(false);
+      setNeeds([]);
+      setWriteTriggers([]);
+      setHomeTab("board");
+      setCuratorThreadId(null);
+      setRepoDrawerOpen(false);
+      setRepoDrawerTabState("detail");
+      setSelectedRepoId(null);
+      setProposal(null);
+      setOverview([]);
+    },
+    [selectWorkspace],
+  );
 
   const renameThread = useCallback(
     async (threadId: number, title: string) => {
@@ -2264,6 +2309,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     backToWorkspace,
     createWorkspace,
     renameWorkspace,
+    deleteWorkspace,
     renameThread,
     renameDirection,
     addRepo,

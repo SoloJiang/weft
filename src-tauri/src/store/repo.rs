@@ -29,6 +29,14 @@ pub fn now_unix() -> String {
 
 pub async fn create_workspace(db: &Db, name: &str) -> Result<workspace::Model> {
     let name = validate_display_name(name, "workspace name")?;
+    let mut dup_query = workspace::Entity::find().filter(workspace::Column::Name.eq(name));
+    if let Some(hidden_id) = hidden_concierge_workspace_id(db).await? {
+        dup_query = dup_query.filter(workspace::Column::Id.ne(hidden_id));
+    }
+    let dup = dup_query.one(&db.0).await?;
+    if dup.is_some() {
+        anyhow::bail!("another workspace already named {name:?}");
+    }
     let existing: Vec<String> = workspace::Entity::find()
         .all(&db.0)
         .await?
@@ -52,11 +60,13 @@ pub async fn list_workspaces(db: &Db) -> Result<Vec<workspace::Model>> {
 /// worktree paths) is a stable identifier and never changes after creation.
 pub async fn rename_workspace(db: &Db, workspace_id: i32, name: &str) -> Result<workspace::Model> {
     let name = validate_display_name(name, "workspace name")?;
-    let dup = workspace::Entity::find()
+    let mut dup_query = workspace::Entity::find()
         .filter(workspace::Column::Name.eq(name))
-        .filter(workspace::Column::Id.ne(workspace_id))
-        .one(&db.0)
-        .await?;
+        .filter(workspace::Column::Id.ne(workspace_id));
+    if let Some(hidden_id) = hidden_concierge_workspace_id(db).await? {
+        dup_query = dup_query.filter(workspace::Column::Id.ne(hidden_id));
+    }
+    let dup = dup_query.one(&db.0).await?;
     if dup.is_some() {
         anyhow::bail!("another workspace already named {name:?}");
     }
@@ -77,6 +87,80 @@ fn validate_display_name<'a>(input: &'a str, what: &str) -> Result<&'a str> {
         anyhow::bail!("{what} cannot be empty");
     }
     Ok(trimmed)
+}
+
+async fn hidden_concierge_workspace_id(db: &Db) -> Result<Option<i32>> {
+    Ok(get_setting(db, K_CONCIERGE_WORKSPACE)
+        .await?
+        .and_then(|value| value.parse::<i32>().ok()))
+}
+
+async fn ensure_workspace_exists(db: &Db, workspace_id: i32) -> Result<()> {
+    if workspace::Entity::find_by_id(workspace_id)
+        .one(&db.0)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("workspace {workspace_id} not found");
+    }
+    Ok(())
+}
+
+fn workspace_deleting_key(workspace_id: i32) -> String {
+    format!("workspace.deleting.{workspace_id}")
+}
+
+pub async fn mark_workspace_deleting(db: &Db, workspace_id: i32) -> Result<()> {
+    ensure_workspace_exists(db, workspace_id).await?;
+    set_setting(db, &workspace_deleting_key(workspace_id), "1").await
+}
+
+pub async fn clear_workspace_deleting(db: &Db, workspace_id: i32) -> Result<()> {
+    delete_setting(db, &workspace_deleting_key(workspace_id)).await
+}
+
+async fn ensure_workspace_accepts_writes(db: &Db, workspace_id: i32) -> Result<()> {
+    ensure_workspace_exists(db, workspace_id).await?;
+    if get_setting(db, &workspace_deleting_key(workspace_id)).await?.is_some() {
+        anyhow::bail!("workspace {workspace_id} is being deleted");
+    }
+    Ok(())
+}
+
+pub async fn ensure_thread_workspace_accepts_writes(
+    db: &Db,
+    thread_id: i32,
+) -> Result<thread::Model> {
+    let t = thread::Entity::find_by_id(thread_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+    ensure_workspace_accepts_writes(db, t.workspace_id).await?;
+    Ok(t)
+}
+
+pub async fn ensure_repo_workspace_accepts_writes(
+    db: &Db,
+    repo_id: i32,
+) -> Result<repo_ref::Model> {
+    let repo_ref = repo_ref::Entity::find_by_id(repo_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
+    ensure_workspace_accepts_writes(db, repo_ref.workspace_id).await?;
+    Ok(repo_ref)
+}
+
+pub async fn ensure_direction_workspace_accepts_writes(
+    db: &Db,
+    direction_id: i32,
+) -> Result<direction::Model> {
+    let d = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+    ensure_thread_workspace_accepts_writes(db, d.thread_id).await?;
+    Ok(d)
 }
 
 /// The most-recently created workspace (highest id), if any. Used as the
@@ -357,6 +441,7 @@ pub async fn add_repo_ref(
     remote_url: &str,
     base_ref_is_default: bool,
 ) -> Result<repo_ref::Model> {
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let existing = repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
         .all(&db.0)
@@ -373,14 +458,17 @@ pub async fn add_repo_ref(
         // (or a stale base_ref), which makes later blank-base materialization ignore the known
         // default and fall through to main/master.
         if base_ref_is_default && (!dup.base_ref_is_default || dup.base_ref != base_ref) {
+            ensure_workspace_accepts_writes(db, workspace_id).await?;
             let mut am: repo_ref::ActiveModel = dup.clone().into();
             am.base_ref = Set(base_ref.to_string());
             am.base_ref_is_default = Set(true);
             return Ok(am.update(&db.0).await?);
         }
+        ensure_workspace_accepts_writes(db, workspace_id).await?;
         return Ok(dup.clone());
     }
     let slugs: Vec<String> = existing.into_iter().map(|r| r.slug).collect();
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let m = repo_ref::ActiveModel {
         workspace_id: Set(workspace_id),
         name: Set(name.to_string()),
@@ -391,7 +479,12 @@ pub async fn add_repo_ref(
         base_ref_is_default: Set(base_ref_is_default),
         ..Default::default()
     };
-    Ok(m.insert(&db.0).await?)
+    let inserted = m.insert(&db.0).await?;
+    if let Err(err) = ensure_workspace_accepts_writes(db, workspace_id).await {
+        let _ = repo_ref::Entity::delete_by_id(inserted.id).exec(&db.0).await;
+        return Err(err);
+    }
+    Ok(inserted)
 }
 
 pub async fn create_thread(
@@ -403,6 +496,7 @@ pub async fn create_thread(
 ) -> Result<thread::Model> {
     let title = validate_display_name(title, "issue title")?;
     let kind = validate_display_name(kind, "issue kind")?;
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let existing: Vec<String> = thread::Entity::find()
         .filter(thread::Column::WorkspaceId.eq(workspace_id))
         .all(&db.0)
@@ -410,6 +504,7 @@ pub async fn create_thread(
         .into_iter()
         .map(|t| t.slug)
         .collect();
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let m = thread::ActiveModel {
         workspace_id: Set(workspace_id),
         title: Set(title.to_string()),
@@ -419,7 +514,12 @@ pub async fn create_thread(
         created_at: Set(now()),
         ..Default::default()
     };
-    Ok(m.insert(&db.0).await?)
+    let inserted = m.insert(&db.0).await?;
+    if let Err(err) = ensure_workspace_accepts_writes(db, workspace_id).await {
+        let _ = thread::Entity::delete_by_id(inserted.id).exec(&db.0).await;
+        return Err(err);
+    }
+    Ok(inserted)
 }
 
 pub async fn list_threads(db: &Db, workspace_id: i32) -> Result<Vec<thread::Model>> {
@@ -472,6 +572,17 @@ pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
         .await?)
 }
 
+async fn ensure_plan_write_survived_workspace_fence(db: &Db, thread_id: i32) -> Result<()> {
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = plan::Entity::delete_many()
+            .filter(plan::Column::ThreadId.eq(thread_id))
+            .exec(&db.0)
+            .await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Insert or update a thread's plan/proposal.
 pub async fn upsert_plan(
     db: &Db,
@@ -480,6 +591,7 @@ pub async fn upsert_plan(
     status: &str,
     created_at: &str,
 ) -> Result<plan::Model> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let mut a = match get_plan(db, thread_id).await? {
         Some(m) => m.into(),
         None => plan::ActiveModel {
@@ -490,7 +602,10 @@ pub async fn upsert_plan(
     };
     a.proposal = Set(proposal.to_string());
     a.status = Set(status.to_string());
-    Ok(a.save(&db.0).await?.try_into_model()?)
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let saved = a.save(&db.0).await?.try_into_model()?;
+    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    Ok(saved)
 }
 
 /// Set a plan's `created_at`, which doubles as the proposal VERSION ("last proposed at").
@@ -500,11 +615,15 @@ pub async fn upsert_plan(
 /// plan row is absent.
 pub async fn set_plan_created_at(db: &Db, thread_id: i32, created_at: &str) -> Result<()> {
     use sea_orm::sea_query::Expr;
-    plan::Entity::update_many()
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let res = plan::Entity::update_many()
         .col_expr(plan::Column::CreatedAt, Expr::value(created_at.to_string()))
         .filter(plan::Column::ThreadId.eq(thread_id))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(())
 }
 
@@ -523,6 +642,7 @@ pub async fn update_plan_proposal_cas(
     status: &str,
 ) -> Result<bool> {
     use sea_orm::sea_query::Expr;
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let res = plan::Entity::update_many()
         .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
         .col_expr(plan::Column::Status, Expr::value(status.to_string()))
@@ -537,6 +657,9 @@ pub async fn update_plan_proposal_cas(
         .filter(plan::Column::Status.eq(status))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(res.rows_affected > 0)
 }
 
@@ -553,6 +676,7 @@ pub async fn mark_plan_confirmed_cas(
     expected_status: &str,
 ) -> Result<bool> {
     use sea_orm::sea_query::Expr;
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let res = plan::Entity::update_many()
         .col_expr(plan::Column::Status, Expr::value("confirmed"))
         .filter(plan::Column::ThreadId.eq(thread_id))
@@ -560,6 +684,9 @@ pub async fn mark_plan_confirmed_cas(
         .filter(plan::Column::Status.eq(expected_status))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(res.rows_affected > 0)
 }
 
@@ -578,6 +705,7 @@ pub async fn commit_confirmed_plan_cas(
     expected_status: &str,
 ) -> Result<bool> {
     use sea_orm::sea_query::Expr;
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let res = plan::Entity::update_many()
         .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
         .col_expr(plan::Column::Status, Expr::value("confirmed"))
@@ -586,6 +714,9 @@ pub async fn commit_confirmed_plan_cas(
         .filter(plan::Column::Status.eq(expected_status))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(res.rows_affected > 0)
 }
 
@@ -612,6 +743,9 @@ pub async fn upsert_repo_profile(
     source: &str,
     profiled_commit: &str,
 ) -> Result<repo_profile::Model> {
+    if get_repo(db, repo_id).await?.is_none() {
+        anyhow::bail!("repo {repo_id} not found");
+    }
     let mut a = match get_repo_profile(db, repo_id).await? {
         Some(m) => m.into(),
         None => repo_profile::ActiveModel {
@@ -637,6 +771,9 @@ pub async fn upsert_repo_profile(
 /// `profile::AgentRelation`) for a repo, leaving its deterministic facts intact.
 /// No-op if the repo has no profile row yet (profiling is eager on add).
 pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Result<()> {
+    let Some(repo) = get_repo(db, repo_id).await? else {
+        return Ok(());
+    };
     if let Some(m) = get_repo_profile(db, repo_id).await? {
         let mut a: repo_profile::ActiveModel = m.into();
         a.relations = Set(relations.to_string());
@@ -647,9 +784,7 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
         // and manual calibration all write relations through here. `analyze_relations`
         // re-writes fresh markdown as its LAST step, so the happy path repopulates it;
         // a pass that omits markdown (or a manual calibration) leaves it cleared.
-        if let Some(r) = get_repo(db, repo_id).await? {
-            let _ = clear_repo_map_doc(db, r.workspace_id).await;
-        }
+        let _ = clear_repo_map_doc(db, repo.workspace_id).await;
     }
     Ok(())
 }
@@ -853,10 +988,7 @@ pub async fn create_direction(
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-    let _ws = workspace::Entity::find_by_id(t.workspace_id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("workspace missing"))?;
+    ensure_workspace_accepts_writes(db, t.workspace_id).await?;
     let existing: Vec<String> = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&db.0)
@@ -864,10 +996,7 @@ pub async fn create_direction(
         .into_iter()
         .map(|d| d.slug)
         .collect();
-    let repo_ref = repo_ref::Entity::find_by_id(repo_id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
+    let repo_ref = ensure_repo_workspace_accepts_writes(db, repo_id).await?;
     let slug = unique_slug(name, &existing);
     let branch_title = if t.title.trim().is_empty() {
         name
@@ -892,6 +1021,7 @@ pub async fn create_direction(
         branch_title,
         &reserved,
     );
+    ensure_workspace_accepts_writes(db, t.workspace_id).await?;
     let dir = direction::ActiveModel {
         thread_id: Set(thread_id),
         name: Set(name.to_string()),
@@ -909,6 +1039,14 @@ pub async fn create_direction(
     }
     .insert(&db.0)
     .await?;
+    let accepted = match ensure_workspace_accepts_writes(db, t.workspace_id).await {
+        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = accepted {
+        let _ = delete_direction(db, dir.id).await;
+        return Err(err);
+    }
     Ok(dir)
 }
 
@@ -1045,7 +1183,17 @@ pub async fn record_worktree(
     created_checkout: bool,
     base_commit: &str,
 ) -> Result<worktree::Model> {
-    Ok(worktree::ActiveModel {
+    let direction = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+    let thread = thread::Entity::find_by_id(direction.thread_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {} not found", direction.thread_id))?;
+    ensure_workspace_accepts_writes(db, thread.workspace_id).await?;
+    ensure_repo_workspace_accepts_writes(db, repo_id).await?;
+    let inserted = worktree::ActiveModel {
         repo_id: Set(repo_id),
         direction_id: Set(direction_id),
         branch: Set(branch.to_string()),
@@ -1057,7 +1205,16 @@ pub async fn record_worktree(
         ..Default::default()
     }
     .insert(&db.0)
-    .await?)
+    .await?;
+    let accepted = match ensure_workspace_accepts_writes(db, thread.workspace_id).await {
+        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = accepted {
+        let _ = worktree::Entity::delete_by_id(inserted.id).exec(&db.0).await;
+        return Err(err);
+    }
+    Ok(inserted)
 }
 
 /// Persist the recorded fork-point commit on a worktree row. Used on RE-materialize when a
@@ -1185,6 +1342,118 @@ pub async fn delete_repo_cascade(
     Ok(removed)
 }
 
+/// Delete a workspace and every Weft-owned row under it. Returns worktree
+/// cleanup tuples for the command layer, which still owns filesystem cleanup.
+/// The canonical user repos at `repo_ref.local_git_path` are never removed.
+pub async fn delete_workspace_cascade(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<(i32, String, String, bool, bool)>> {
+    mark_workspace_deleting(db, workspace_id).await?;
+
+    let repos = list_repos(db, workspace_id).await?;
+    let repo_ids: Vec<i32> = repos.iter().map(|r| r.id).collect();
+    let threads = list_threads(db, workspace_id).await?;
+    let thread_ids: Vec<i32> = threads.iter().map(|t| t.id).collect();
+    let mut directions = Vec::new();
+    for thread_id in &thread_ids {
+        directions.extend(list_directions(db, *thread_id).await?);
+    }
+    let direction_ids: Vec<i32> = directions.iter().map(|d| d.id).collect();
+    let repo_session_ids: Vec<i32> = if repo_ids.is_empty() {
+        Vec::new()
+    } else {
+        session::Entity::find()
+            .filter(session::Column::RepoId.is_in(repo_ids.clone()))
+            .all(&db.0)
+            .await?
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    };
+
+    let mut removed = Vec::new();
+    for worktree in worktree::Entity::find().all(&db.0).await? {
+        if repo_ids.contains(&worktree.repo_id) || direction_ids.contains(&worktree.direction_id) {
+            removed.push((
+                worktree.repo_id,
+                worktree.path,
+                worktree.branch,
+                worktree.created_branch,
+                worktree.created_checkout,
+            ));
+        }
+    }
+
+    for thread_id in &thread_ids {
+        im_route::Entity::delete_many()
+            .filter(im_route::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+        lead_message::Entity::delete_many()
+            .filter(lead_message::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+        plan::Entity::delete_many()
+            .filter(plan::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+    }
+    if !repo_session_ids.is_empty() {
+        lead_message::Entity::delete_many()
+            .filter(lead_message::Column::SessionId.is_in(repo_session_ids.clone()))
+            .exec(&db.0)
+            .await?;
+    }
+
+    for direction_id in &direction_ids {
+        session::Entity::delete_many()
+            .filter(session::Column::DirectionId.eq(*direction_id))
+            .exec(&db.0)
+            .await?;
+        worktree::Entity::delete_many()
+            .filter(worktree::Column::DirectionId.eq(*direction_id))
+            .exec(&db.0)
+            .await?;
+        direction::Entity::delete_by_id(*direction_id).exec(&db.0).await?;
+    }
+
+    for repo_id in &repo_ids {
+        session::Entity::delete_many()
+            .filter(session::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        worktree::Entity::delete_many()
+            .filter(worktree::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        direction::Entity::delete_many()
+            .filter(direction::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        repo_profile::Entity::delete_many()
+            .filter(repo_profile::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        repo_ref::Entity::delete_by_id(*repo_id).exec(&db.0).await?;
+    }
+
+    for thread_id in &thread_ids {
+        thread::Entity::delete_by_id(*thread_id).exec(&db.0).await?;
+    }
+
+    skill_enable::Entity::delete_many()
+        .filter(skill_enable::Column::Scope.eq(format!("ws:{workspace_id}")))
+        .exec(&db.0)
+        .await?;
+    let _ = clear_repo_map_doc(db, workspace_id).await;
+    let _ = delete_setting(db, &curator_thread_key(workspace_id)).await;
+    workspace::Entity::delete_by_id(workspace_id).exec(&db.0).await?;
+    let _ = clear_workspace_deleting(db, workspace_id).await;
+
+    Ok(removed)
+}
+
 /// Delete a thread and everything under it. Returns the worktree paths that the
 /// caller must physically remove via git (DB rows are gone after this).
 /// Each tuple is (repo_id, path, branch, created_branch, created_checkout):
@@ -1226,7 +1495,9 @@ pub async fn create_session(
     tool: &str,
     cwd: &str,
 ) -> Result<session::Model> {
-    Ok(session::ActiveModel {
+    let direction = ensure_direction_workspace_accepts_writes(db, direction_id).await?;
+    ensure_repo_workspace_accepts_writes(db, repo_id).await?;
+    let inserted = session::ActiveModel {
         direction_id: Set(direction_id),
         repo_id: Set(repo_id),
         tool: Set(tool.to_string()),
@@ -1237,7 +1508,16 @@ pub async fn create_session(
         ..Default::default()
     }
     .insert(&db.0)
-    .await?)
+    .await?;
+    let accepted = match ensure_thread_workspace_accepts_writes(db, direction.thread_id).await {
+        Ok(_) => ensure_repo_workspace_accepts_writes(db, repo_id).await.map(|_| ()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = accepted {
+        let _ = session::Entity::delete_by_id(inserted.id).exec(&db.0).await;
+        return Err(err);
+    }
+    Ok(inserted)
 }
 
 pub async fn set_session_native_id(db: &Db, session_id: i32, native_id: &str) -> Result<()> {
@@ -1335,6 +1615,13 @@ pub async fn sessions_for_thread(db: &Db, thread_id: i32) -> Result<Vec<session:
     }
     Ok(session::Entity::find()
         .filter(session::Column::DirectionId.is_in(direction_ids))
+        .all(&db.0)
+        .await?)
+}
+
+pub async fn sessions_for_repo(db: &Db, repo_id: i32) -> Result<Vec<session::Model>> {
+    Ok(session::Entity::find()
+        .filter(session::Column::RepoId.eq(repo_id))
         .all(&db.0)
         .await?)
 }
@@ -1675,6 +1962,17 @@ pub async fn set_lead_status(db: &Db, thread_id: i32, status: &str) -> Result<()
 
 // ─────────────────────────── im_route (M2) ───────────────────────────
 
+async fn ensure_im_route_write_survived_workspace_fence(db: &Db, thread_id: i32) -> Result<()> {
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = im_route::Entity::delete_many()
+            .filter(im_route::Column::ThreadId.eq(thread_id))
+            .exec(&db.0)
+            .await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Bind an issue (thread) to an IM thread. Upserts on `thread_id`: re-binding the
 /// same issue replaces its target. Returns the resulting row.
 pub async fn bind_im_route(
@@ -1684,6 +1982,7 @@ pub async fn bind_im_route(
     chat_id: &str,
     im_thread_ref: &str,
 ) -> Result<im_route::Model> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     if let Some(existing) = im_route::Entity::find()
         .filter(im_route::Column::ThreadId.eq(thread_id))
         .one(&db.0)
@@ -1693,10 +1992,13 @@ pub async fn bind_im_route(
         a.channel = Set(channel.to_string());
         a.chat_id = Set(chat_id.to_string());
         a.im_thread_ref = Set(im_thread_ref.to_string());
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
         let m = a.update(&db.0).await?;
+        ensure_im_route_write_survived_workspace_fence(db, thread_id).await?;
         return Ok(m);
     }
     let now = now();
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let am = im_route::ActiveModel {
         channel: Set(channel.to_string()),
         chat_id: Set(chat_id.to_string()),
@@ -1706,6 +2008,7 @@ pub async fn bind_im_route(
         ..Default::default()
     };
     let m = am.insert(&db.0).await?.try_into_model()?;
+    ensure_im_route_write_survived_workspace_fence(db, thread_id).await?;
     Ok(m)
 }
 
@@ -1764,6 +2067,23 @@ mod tests {
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    async fn worker_fixture(
+        db: &Db,
+    ) -> (workspace::Model, repo_ref::Model, thread::Model, direction::Model) {
+        let ws = create_workspace(db, "ws").await.unwrap();
+        let repo = add_repo_ref(db, ws.id, "repo", "/tmp/repo", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        let direction =
+            create_direction(db, thread.id, "task", "codex", repo.id, "why", "impl-only", "")
+                .await
+                .unwrap();
+        (ws, repo, thread, direction)
     }
 
     #[tokio::test]
@@ -2012,8 +2332,11 @@ mod tests {
         assert_eq!(p.status, "confirmed");
         assert_eq!(p.proposal, "P1", "proposal left untouched by the status CAS");
         // Absent plan -> false.
+        let no_plan = create_thread(&db, ws.id, "no plan", "feature", "claude")
+            .await
+            .unwrap();
         assert!(
-            !mark_plan_confirmed_cas(&db, t.id + 999, "P1", "scoped").await.unwrap(),
+            !mark_plan_confirmed_cas(&db, no_plan.id, "P1", "scoped").await.unwrap(),
             "must be false when the plan is absent"
         );
     }
@@ -2367,17 +2690,24 @@ mod tests {
     #[tokio::test]
     async fn reset_stale_running_sessions_idles_legacy_rows() {
         let db = mem().await;
+        let (_, repo, _, dir) = worker_fixture(&db).await;
         // Pre-fix rows: status was a write-once high-water-mark, so an idle worker
         // reads "running" (or "starting" before it ever attached).
-        let running = create_session(&db, 1, 1, "codex", "/tmp/a").await.unwrap();
+        let running = create_session(&db, dir.id, repo.id, "codex", "/tmp/a")
+            .await
+            .unwrap();
         set_session_status(&db, running.id, "running")
             .await
             .unwrap();
-        let starting = create_session(&db, 2, 1, "codex", "/tmp/b").await.unwrap();
+        let starting = create_session(&db, dir.id, repo.id, "codex", "/tmp/b")
+            .await
+            .unwrap();
         set_session_status(&db, starting.id, "starting")
             .await
             .unwrap();
-        let idle = create_session(&db, 3, 1, "codex", "/tmp/c").await.unwrap();
+        let idle = create_session(&db, dir.id, repo.id, "codex", "/tmp/c")
+            .await
+            .unwrap();
         set_session_status(&db, idle.id, "idle").await.unwrap();
 
         reset_stale_running_sessions(&db.0).await.unwrap();
@@ -2482,7 +2812,10 @@ mod tests {
     #[tokio::test]
     async fn session_status_round_trips() {
         let db = mem().await;
-        let s = create_session(&db, 1, 1, "codex", "/tmp/wt").await.unwrap();
+        let (_, repo, _, dir) = worker_fixture(&db).await;
+        let s = create_session(&db, dir.id, repo.id, "codex", "/tmp/wt")
+            .await
+            .unwrap();
         set_session_status(&db, s.id, "idle").await.unwrap();
         assert_eq!(
             get_session(&db, s.id).await.unwrap().unwrap().status,
@@ -2521,21 +2854,25 @@ mod tests {
     #[tokio::test]
     async fn im_route_bind_and_lookup() {
         let db = mem().await;
-        let r = bind_im_route(&db, 7, "feishu", "oc_chat", "th_1")
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        assert_eq!(r.thread_id, 7);
+        let r = bind_im_route(&db, thread.id, "feishu", "oc_chat", "th_1")
+            .await
+            .unwrap();
+        assert_eq!(r.thread_id, thread.id);
         // forward lookup by thread_id
-        let got = im_route_of_thread(&db, 7).await.unwrap().unwrap();
+        let got = im_route_of_thread(&db, thread.id).await.unwrap().unwrap();
         assert_eq!(got.im_thread_ref, "th_1");
         // reverse lookup by (channel, chat_id, im_thread_ref)
         let got = im_route_of_thread_ref(&db, "feishu", "oc_chat", "th_1")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.thread_id, 7);
+        assert_eq!(got.thread_id, thread.id);
         // re-bind same issue: row count stays 1, target replaced
-        bind_im_route(&db, 7, "feishu", "oc_chat", "th_2")
+        bind_im_route(&db, thread.id, "feishu", "oc_chat", "th_2")
             .await
             .unwrap();
         assert_eq!(list_im_routes(&db).await.unwrap().len(), 1);
@@ -2544,18 +2881,25 @@ mod tests {
             .unwrap()
             .is_none());
         // unbind
-        unbind_im_route(&db, 7).await.unwrap();
-        assert!(im_route_of_thread(&db, 7).await.unwrap().is_none());
+        unbind_im_route(&db, thread.id).await.unwrap();
+        assert!(im_route_of_thread(&db, thread.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn im_route_thread_ref_is_unique_across_issues() {
         // Same (channel, chat_id, im_thread_ref) cannot bind to two different issues.
         let db = mem().await;
-        bind_im_route(&db, 1, "feishu", "oc_chat", "th_1")
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let first = create_thread(&db, ws.id, "first issue", "feature", "claude")
             .await
             .unwrap();
-        let err = bind_im_route(&db, 2, "feishu", "oc_chat", "th_1").await;
+        let second = create_thread(&db, ws.id, "second issue", "feature", "claude")
+            .await
+            .unwrap();
+        bind_im_route(&db, first.id, "feishu", "oc_chat", "th_1")
+            .await
+            .unwrap();
+        let err = bind_im_route(&db, second.id, "feishu", "oc_chat", "th_1").await;
         assert!(err.is_err(), "second bind should violate unique index");
     }
 
@@ -2616,6 +2960,498 @@ mod tests {
 
         assert!(create_workspace(&db, "   ").await.is_err());
         assert!(list_workspaces(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_workspace_rejects_duplicate_name() {
+        let db = mem().await;
+        create_workspace(&db, "Demo WS").await.unwrap();
+
+        let err = create_workspace(&db, "Demo WS").await.unwrap_err();
+
+        assert!(err.to_string().contains("already named"));
+        assert_eq!(list_workspaces(&db).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_name_collision_ignores_hidden_concierge() {
+        let db = mem().await;
+        let hidden = create_workspace(&db, "Concierge").await.unwrap();
+        set_setting(&db, K_CONCIERGE_WORKSPACE, &hidden.id.to_string())
+            .await
+            .unwrap();
+
+        let visible = create_workspace(&db, "Concierge").await.unwrap();
+
+        assert_ne!(visible.id, hidden.id);
+        assert_eq!(list_workspaces(&db).await.unwrap().len(), 2);
+        let err = create_workspace(&db, "Concierge").await.unwrap_err();
+        assert!(err.to_string().contains("already named"));
+
+        let db = mem().await;
+        let hidden = create_workspace(&db, "Concierge").await.unwrap();
+        set_setting(&db, K_CONCIERGE_WORKSPACE, &hidden.id.to_string())
+            .await
+            .unwrap();
+        let rename_target = create_workspace(&db, "Demo").await.unwrap();
+        let renamed = rename_workspace(&db, rename_target.id, "Concierge")
+            .await
+            .unwrap();
+
+        assert_eq!(renamed.name, "Concierge");
+        assert_eq!(list_workspaces(&db).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn add_repo_ref_rolls_back_when_delete_marker_appears_after_insert() {
+        use sea_orm::ConnectionTrait;
+
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        db.0.execute(sea_orm::Statement::from_string(
+            db.0.get_database_backend(),
+            format!(
+                "CREATE TRIGGER repo_ref_mark_deleting AFTER INSERT ON repo_ref BEGIN \
+                 INSERT OR REPLACE INTO app_setting(key, value) \
+                 VALUES ('{}', '1'); END",
+                workspace_deleting_key(ws.id)
+            ),
+        ))
+        .await
+        .unwrap();
+
+        let err = add_repo_ref(&db, ws.id, "late", "/tmp/late", "main", "", true)
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        assert!(list_repos(&db, ws.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_plan_rolls_back_when_delete_marker_appears_after_insert() {
+        use sea_orm::ConnectionTrait;
+
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        db.0
+            .execute(sea_orm::Statement::from_string(
+                db.0.get_database_backend(),
+                format!(
+                    "CREATE TRIGGER plan_mark_deleting AFTER INSERT ON plan BEGIN \
+                     INSERT OR REPLACE INTO app_setting(key, value) \
+                     VALUES ('{}', '1'); END",
+                    workspace_deleting_key(ws.id)
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let err = upsert_plan(&db, thread.id, "{}", "proposed", "1")
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        assert!(get_plan(&db, thread.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_im_route_rolls_back_when_delete_marker_appears_after_insert() {
+        use sea_orm::ConnectionTrait;
+
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        db.0
+            .execute(sea_orm::Statement::from_string(
+                db.0.get_database_backend(),
+                format!(
+                    "CREATE TRIGGER im_route_mark_deleting AFTER INSERT ON im_route BEGIN \
+                     INSERT OR REPLACE INTO app_setting(key, value) \
+                     VALUES ('{}', '1'); END",
+                    workspace_deleting_key(ws.id)
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let err = bind_im_route(&db, thread.id, "feishu", "chat", "thread")
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        assert!(im_route_of_thread(&db, thread.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_cascade_removes_workspace_owned_state() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = create_workspace(&db, "keep me").await.unwrap();
+        let source = add_skill_source(&db, "https://example.com/skills.git", None)
+            .await
+            .unwrap();
+        set_skill_enable(&db, source.id, "ship", &format!("ws:{}", ws.id), true)
+            .await
+            .unwrap();
+        set_skill_enable(&db, source.id, "keep", &format!("ws:{}", keep_ws.id), true)
+            .await
+            .unwrap();
+        set_repo_map_doc(&db, ws.id, "stale map").await.unwrap();
+        set_repo_map_doc(&db, keep_ws.id, "keep map").await.unwrap();
+
+        let repo = add_repo_ref(&db, ws.id, "web", "/tmp/delete-web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = add_repo_ref(&db, keep_ws.id, "api", "/tmp/keep-api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "remove issue", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = create_thread(&db, keep_ws.id, "keep issue", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "web task",
+            "claude",
+            repo.id,
+            "change web",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let external_direction = create_direction(
+            &db,
+            keep_thread.id,
+            "external repo task",
+            "claude",
+            repo.id,
+            "change deleted repo",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let external_session =
+            create_session(&db, external_direction.id, repo.id, "claude", "/tmp/external-wt")
+                .await
+                .unwrap();
+        upsert_plan(&db, thread.id, "{}", "proposed", "1")
+            .await
+            .unwrap();
+        insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"hi"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        insert_lead_message(
+            &db,
+            keep_thread.id,
+            Some(external_session.id),
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"worker"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        let keep_lead_message = insert_lead_message(
+            &db,
+            keep_thread.id,
+            None,
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"keep lead"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        bind_im_route(&db, thread.id, "feishu", "chat", "thread")
+            .await
+            .unwrap();
+        record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "feature/remove",
+            "/tmp/delete-wt",
+            true,
+            true,
+            "abc",
+        )
+        .await
+        .unwrap();
+
+        let removed = delete_workspace_cascade(&db, ws.id).await.unwrap();
+
+        assert_eq!(
+            removed,
+            vec![(
+                repo.id,
+                "/tmp/delete-wt".to_string(),
+                "feature/remove".to_string(),
+                true,
+                true,
+            )]
+        );
+        assert_eq!(list_workspaces(&db).await.unwrap(), vec![keep_ws.clone()]);
+        assert_eq!(list_repos(&db, keep_ws.id).await.unwrap(), vec![keep_repo]);
+        assert_eq!(
+            list_threads(&db, keep_ws.id).await.unwrap(),
+            vec![keep_thread.clone()]
+        );
+        assert!(list_repos(&db, ws.id).await.unwrap().is_empty());
+        assert!(list_threads(&db, ws.id).await.unwrap().is_empty());
+        assert!(list_worktrees(&db, None).await.unwrap().is_empty());
+        assert!(get_plan(&db, thread.id).await.unwrap().is_none());
+        assert!(list_lead_messages(&db, thread.id).await.unwrap().is_empty());
+        let keep_messages = list_lead_messages(&db, keep_thread.id).await.unwrap();
+        assert_eq!(keep_messages.len(), 1);
+        assert_eq!(keep_messages[0].id, keep_lead_message.id);
+        assert_eq!(keep_messages[0].session_id, None);
+        assert!(list_im_routes(&db).await.unwrap().is_empty());
+        assert!(get_repo_map_doc(&db, ws.id).await.unwrap().is_none());
+        assert_eq!(
+            get_repo_map_doc(&db, keep_ws.id).await.unwrap().as_deref(),
+            Some("keep map"),
+        );
+        let scopes: Vec<String> = list_skill_enable(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.scope)
+            .collect();
+        assert_eq!(scopes, vec![format!("ws:{}", keep_ws.id)]);
+    }
+
+    #[tokio::test]
+    async fn workspace_owned_writes_reject_deleted_workspace() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "task",
+            "claude",
+            repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let keep_ws = create_workspace(&db, "keep me").await.unwrap();
+        let keep_thread = create_thread(&db, keep_ws.id, "keep issue", "feature", "claude")
+            .await
+            .unwrap();
+        let external_direction = create_direction(
+            &db,
+            keep_thread.id,
+            "external task",
+            "claude",
+            repo.id,
+            "change deleted repo",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        upsert_plan(&db, thread.id, r#"{"directions":[]}"#, "proposed", "1")
+            .await
+            .unwrap();
+        bind_im_route(&db, thread.id, "feishu", "chat", "thread")
+            .await
+            .unwrap();
+        let deleting_key = workspace_deleting_key(ws.id);
+        set_setting(&db, &deleting_key, "1").await.unwrap();
+
+        let deleting_add_err = add_repo_ref(&db, ws.id, "late", "/tmp/late", "main", "", true)
+            .await
+            .unwrap_err();
+        assert!(deleting_add_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_thread_err = create_thread(&db, ws.id, "late issue", "feature", "claude")
+            .await
+            .unwrap_err();
+        assert!(deleting_thread_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_direction_err = create_direction(
+            &db,
+            thread.id,
+            "late task",
+            "claude",
+            repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(deleting_direction_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_repo_direction_err = create_direction(
+            &db,
+            keep_thread.id,
+            "late external task",
+            "claude",
+            repo.id,
+            "change deleted repo",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(deleting_repo_direction_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_worktree_err = record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "feature/task",
+            "/tmp/wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(deleting_worktree_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_repo_worktree_err = record_worktree(
+            &db,
+            repo.id,
+            external_direction.id,
+            "feature/external",
+            "/tmp/external-wt",
+            true,
+            true,
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(deleting_repo_worktree_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_session_err = create_session(&db, direction.id, repo.id, "claude", "/tmp/wt")
+            .await
+            .unwrap_err();
+        assert!(deleting_session_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_repo_session_err =
+            create_session(&db, external_direction.id, repo.id, "claude", "/tmp/external-wt")
+                .await
+                .unwrap_err();
+        assert!(deleting_repo_session_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_err = upsert_plan(&db, thread.id, "{}", "withdrawn", "2")
+            .await
+            .unwrap_err();
+        assert!(deleting_plan_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_created_at_err = set_plan_created_at(&db, thread.id, "2")
+            .await
+            .unwrap_err();
+        assert!(deleting_plan_created_at_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_cas_err =
+            update_plan_proposal_cas(&db, thread.id, "{}", r#"{"directions":[]}"#, "proposed")
+                .await
+                .unwrap_err();
+        assert!(deleting_plan_cas_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_mark_confirmed_err =
+            mark_plan_confirmed_cas(&db, thread.id, r#"{"directions":[]}"#, "proposed")
+                .await
+                .unwrap_err();
+        assert!(deleting_mark_confirmed_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_confirm_err =
+            commit_confirmed_plan_cas(&db, thread.id, "{}", r#"{"directions":[]}"#, "proposed")
+                .await
+                .unwrap_err();
+        assert!(deleting_plan_confirm_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_route_err = bind_im_route(&db, thread.id, "feishu", "chat", "thread-2")
+            .await
+            .unwrap_err();
+        assert!(deleting_route_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        delete_setting(&db, &deleting_key).await.unwrap();
+
+        delete_workspace_cascade(&db, ws.id).await.unwrap();
+        assert!(get_setting(&db, &deleting_key).await.unwrap().is_none());
+
+        let add_err = add_repo_ref(&db, ws.id, "late", "/tmp/late", "main", "", true)
+            .await
+            .unwrap_err();
+        assert!(add_err
+            .to_string()
+            .contains(&format!("workspace {} not found", ws.id)));
+
+        let thread_err = create_thread(&db, ws.id, "late issue", "feature", "claude")
+            .await
+            .unwrap_err();
+        assert!(thread_err
+            .to_string()
+            .contains(&format!("workspace {} not found", ws.id)));
+        assert!(list_repos(&db, ws.id).await.unwrap().is_empty());
+        assert!(list_threads(&db, ws.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3313,6 +4149,39 @@ mod tests {
             get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
             "writing relations must invalidate the stale workspace map doc"
         );
+    }
+
+    #[tokio::test]
+    async fn set_repo_relations_noops_when_repo_ref_was_deleted() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo_ref::Entity::delete_by_id(r.id).exec(&db.0).await.unwrap();
+
+        set_repo_relations(&db, r.id, r#"[{"to":99,"kind":"http"}]"#)
+            .await
+            .unwrap();
+
+        let profile = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(profile.relations, "[]");
+    }
+
+    #[tokio::test]
+    async fn upsert_repo_profile_rejects_deleted_repo_ref() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        repo_ref::Entity::delete_by_id(r.id).exec(&db.0).await.unwrap();
+
+        let err = upsert_repo_profile(&db, r.id, "backend", "[]", "summary", "[]", "agent", "")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+        assert!(get_repo_profile(&db, r.id).await.unwrap().is_none());
     }
 
     /// A manual edge calibration mutates relations → the stored map doc (describing
