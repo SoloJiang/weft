@@ -180,6 +180,9 @@ interface Store {
   /** Trigger a re-analysis: posts a message to the 仓库分析助手, which runs the one
    *  `reanalyze` tool. Used by the graph button and the map's regenerate. */
   reanalyzeDeps: () => Promise<void>;
+  /** The active workspace's 仓库分析助手 is mid-turn (e.g. running `reanalyze`) — the
+   *  Analyze entries disable while true so a click can't queue a redundant pass. */
+  analyzing: boolean;
   deleteRepo: (repoId: number) => Promise<void>;
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
@@ -1737,14 +1740,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // request — funnels to the ONE reanalyze tool: post a real user message to the
   // 仓库分析助手 thread and open it. The agent runs `reanalyze` for that turn (you
   // watch the tool work) and further messages queue normally. No out-of-band status
-  // strip — the chat itself is the record of the analysis.
+  // strip — the chat itself is the record of the analysis. The buttons disable while
+  // the curator turn is busy (see `analyzing` in the value); this ref additionally
+  // blocks the brief send window so a fast double-click can't queue a second pass.
+  const reanalyzeSendingRef = useRef(false);
   const reanalyzeDeps = useCallback(async () => {
     const ws = activeWorkspaceId;
-    if (ws == null) return;
-    const tid = await ensureCuratorThreadId(ws);
-    if (activeWorkspaceIdRef.current !== ws) return;
-    openCurator();
-    await sendLeadChat(tid, i18n.t("repomap.reanalyzeMessage"));
+    if (ws == null || reanalyzeSendingRef.current) return;
+    reanalyzeSendingRef.current = true;
+    try {
+      const tid = await ensureCuratorThreadId(ws);
+      if (activeWorkspaceIdRef.current !== ws) return;
+      openCurator();
+      await sendLeadChat(tid, i18n.t("repomap.reanalyzeMessage"));
+    } finally {
+      reanalyzeSendingRef.current = false;
+    }
   }, [activeWorkspaceId, ensureCuratorThreadId, openCurator, sendLeadChat]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
@@ -2215,6 +2226,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshReposAndMap,
     reprofileRepo,
     reanalyzeDeps,
+    analyzing: curatorThreadId != null && leadTurn[curatorThreadId]?.state === "busy",
     deleteRepo,
     curatorThreadId,
     ensureCuratorThread,

@@ -137,7 +137,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * relations. Drag to pan, scroll/buttons to zoom.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, selectedRepoId, openRepoDetail } = useStore();
+  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, analyzing, selectedRepoId, openRepoDetail } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<ViewMode>("overview");
 
@@ -362,10 +362,11 @@ export function RepoGraph() {
               <button
                 data-graph-controls
                 onClick={() => void reanalyzeDeps()}
+                disabled={analyzing}
                 title={t("repomap.reanalyzeHint")}
-                className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink"
+                className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
               >
-                <RefreshCw size={12} />
+                <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
                 {t("repomap.reanalyze")}
               </button>
               {anyComponents && (

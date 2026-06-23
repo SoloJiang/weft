@@ -397,6 +397,19 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
         anyhow::bail!("reanalyze is only available in the curator chat");
     }
     let ws_id = t.workspace_id;
+    // Every tracked repo's checkout gone → the pass filters them all out and would
+    // analyze nothing, leaving the stale graph to read as a clean "complete". Tell
+    // the human instead (matches the behavior of the removed analyze command).
+    let repos = crate::store::repo::list_repos(db, ws_id).await?;
+    if !repos.is_empty()
+        && !repos
+            .iter()
+            .any(|r| std::path::Path::new(&r.local_git_path).exists())
+    {
+        return Ok("Could not re-analyze: every repository's checkout is missing on disk \
+                   (moved or deleted). Restore the repos and try again."
+            .to_string());
+    }
     let db2 = db.clone();
     let handle =
         tauri::async_runtime::spawn(

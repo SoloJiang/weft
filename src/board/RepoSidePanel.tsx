@@ -140,7 +140,7 @@ type CuratorView = "chat" | "map";
 /** The curator surface, kept mounted across switches; `hidden` when inactive. */
 function CuratorBody({ active, threadId }: { active: boolean; threadId: number | null }) {
   const { t } = useTranslation();
-  const { activeWorkspaceId, reanalyzeDeps } = useStore();
+  const { activeWorkspaceId, reanalyzeDeps, analyzing } = useStore();
   const [view, setView] = useState<CuratorView>("chat");
   const [mapDoc, setMapDoc] = useState<string | null | undefined>(undefined);
 
@@ -197,9 +197,10 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
               setView("chat");
               void reanalyzeDeps();
             }}
-            className="flex items-center gap-1.5 rounded-[var(--radius-md)] bg-brand-ghost px-3 py-1.5 text-[11.5px] font-medium text-brand transition-colors hover:bg-brand/20"
+            disabled={analyzing}
+            className="flex items-center gap-1.5 rounded-[var(--radius-md)] bg-brand-ghost px-3 py-1.5 text-[11.5px] font-medium text-brand transition-colors hover:bg-brand/20 disabled:opacity-50"
           >
-            <RefreshCw size={12} />
+            <RefreshCw size={12} className={analyzing ? "animate-spin" : ""} />
             {t("repomap.reanalyze")}
           </button>
         </div>
@@ -213,10 +214,11 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
               setView("chat");
               void reanalyzeDeps();
             }}
+            disabled={analyzing}
             title={t("repomap.reanalyze")}
-            className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-faint transition-colors hover:bg-raised hover:text-ink"
+            className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-faint transition-colors hover:bg-raised hover:text-ink disabled:opacity-50"
           >
-            <RefreshCw size={11} />
+            <RefreshCw size={11} className={analyzing ? "animate-spin" : ""} />
             {t("repomap.reanalyze")}
           </button>
         </div>
