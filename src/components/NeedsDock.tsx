@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import type { PermissionAsk, WriteTrigger, NeedItem } from "../lib/types";
 import { cn } from "../lib/cn";
 import { useStore } from "../state/store";
-import { ToolIcon, toolFullName } from "./ToolIcon";
+import { PermissionConfirmationCard } from "./ConfirmationCard";
 
 type DockItem =
   | { kind: "write"; item: WriteTrigger }
@@ -11,21 +11,51 @@ type DockItem =
   | { kind: "question"; item: NeedItem };
 
 export function NeedsDock() {
-  const { needs, asks, writeTriggers, openNeeds } = useStore();
+  const { needs, asks, writeTriggers, openNeeds, answerPermission } = useStore();
   const { t } = useTranslation();
   const total = needs.length + asks.length + writeTriggers.length;
-  const top: DockItem | null =
-    writeTriggers[0] != null
-      ? { kind: "write", item: writeTriggers[0] }
-      : asks[0] != null
-        ? { kind: "permission", item: asks[0] }
-        : needs[0] != null
-          ? { kind: "question", item: needs[0] }
-          : null;
+  const top = topDockItem(writeTriggers, asks, needs);
 
   // Nothing needs the human → no banner at all: "flowing automatically" is the
   // default state, not an announcement worth a permanent strip on every screen.
   if (total === 0) return null;
+
+  if (top?.kind === "permission") {
+    return (
+      <div className="flex min-h-10 shrink-0 items-center gap-2 border-b border-waiting/30 bg-waiting/10 px-5 py-1.5 text-left text-[12px]">
+        <button
+          type="button"
+          onClick={openNeeds}
+          className="grid h-5 min-w-5 place-items-center rounded-full bg-waiting text-[11px] font-semibold tabular-nums text-bg transition-opacity hover:opacity-90"
+          title={t("needs.openQueue")}
+        >
+          {total}
+        </button>
+        <button
+          type="button"
+          onClick={openNeeds}
+          className="shrink-0 font-semibold text-waiting transition-colors hover:text-ink"
+        >
+          {t("needs.title")}
+        </button>
+        <PermissionConfirmationCard
+          ask={top.item}
+          onAnswer={(askId, answer) => void answerPermission(askId, answer)}
+          context={<PermissionDockContext item={top.item} />}
+          className="min-w-0 flex-1 flex-row flex-wrap items-center gap-2 rounded-none border-0 bg-transparent p-0"
+          titleClassName="text-[12px]"
+          actionsClassName="ml-auto shrink-0 gap-1.5"
+        />
+        <button
+          type="button"
+          onClick={openNeeds}
+          className="text-[11.5px] text-ink-faint transition-colors hover:text-ink"
+        >
+          {t("needs.openQueue")}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <button
@@ -43,6 +73,17 @@ export function NeedsDock() {
       </span>
     </button>
   );
+}
+
+function topDockItem(
+  writeTriggers: WriteTrigger[],
+  asks: PermissionAsk[],
+  needs: NeedItem[],
+): DockItem | null {
+  if (writeTriggers[0] != null) return { kind: "write", item: writeTriggers[0] };
+  if (asks[0] != null) return { kind: "permission", item: asks[0] };
+  if (needs[0] != null) return { kind: "question", item: needs[0] };
+  return null;
 }
 
 function DockSummary({ top }: { top: DockItem }) {
@@ -64,8 +105,7 @@ function DockSummary({ top }: { top: DockItem }) {
     return (
       <span className="flex min-w-0 items-center gap-1.5 text-ink-muted">
         <ShieldQuestion size={13} className="shrink-0 text-approval" />
-        <ToolIcon tool={item.tool} size={13} />
-        <span className="text-ink">{toolFullName(item.tool)}</span>
+        <span className="text-ink">{item.tool}</span>
         <span>{t("needs.wantsPermission")}</span>
         <ContextText text={[item.thread_title, item.dir_name].filter(Boolean).join(" · ")} />
       </span>
@@ -78,6 +118,16 @@ function DockSummary({ top }: { top: DockItem }) {
       <HelpCircle size={13} className="shrink-0 text-waiting" />
       <span>{t("needs.question")}</span>
       <ContextText text={[item.thread_title, item.direction_name].filter(Boolean).join(" · ")} />
+    </span>
+  );
+}
+
+function PermissionDockContext({ item }: { item: PermissionAsk }) {
+  const text = [item.thread_title, item.dir_name].filter(Boolean).join(" · ");
+  if (!text) return null;
+  return (
+    <span className="flex min-w-0 items-center gap-1 text-ink-muted">
+      <ContextText text={text} />
     </span>
   );
 }

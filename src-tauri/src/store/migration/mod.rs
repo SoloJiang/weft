@@ -39,6 +39,9 @@ impl MigratorTrait for Migrator {
             Box::new(M0026WorktreeCreatedCheckout),
             Box::new(M0027RepoRefBaseRefIsDefault),
             Box::new(M0028WorktreeBaseCommit),
+            Box::new(M0029GatewayToBackend),
+            Box::new(M0030AnalysisState),
+            Box::new(M0031RepoCategoryDomains),
         ]
     }
 }
@@ -1157,5 +1160,401 @@ impl MigrationTrait for M0028WorktreeBaseCommit {
                     .to_owned(),
             )
             .await
+    }
+}
+
+/// Rewrite any `repo_profile` rows that still carry the old "gateway" tier value
+/// (removed from the model in B-T1). Both the top-level `role` column and
+/// per-component `tier` fields inside the `components` JSON blob are updated.
+/// `down` is a no-op — the merge is irreversible.
+pub struct M0029GatewayToBackend;
+impl MigrationName for M0029GatewayToBackend {
+    fn name(&self) -> &str {
+        "m0029_gateway_to_backend"
+    }
+}
+
+/// Pure helper: rewrite any component tiers that equal "gateway" to "backend".
+/// Returns the input string unchanged on any parse error so a malformed blob
+/// never aborts the migration.
+pub(crate) fn gateway_components_to_backend(components_json: &str) -> String {
+    let mut comps: Vec<crate::profile::Component> = match serde_json::from_str(components_json) {
+        Ok(v) => v,
+        Err(_) => return components_json.to_string(),
+    };
+    for c in &mut comps {
+        if c.tier == "gateway" {
+            c.tier = "backend".to_string();
+        }
+    }
+    match serde_json::to_string(&comps) {
+        Ok(s) => s,
+        Err(_) => components_json.to_string(),
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0029GatewayToBackend {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db = manager.get_connection();
+        let backend = db.get_database_backend();
+
+        // 1) Rewrite the top-level role column.
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE repo_profile SET role = 'backend' WHERE role = 'gateway'".to_owned(),
+        ))
+        .await?;
+
+        // 2) Rewrite gateway tiers embedded in the components JSON array.
+        // Use raw SELECT of only `id` + `components` — the entity model would
+        // SELECT every column including `analysis_state`/`category`/`domains`
+        // that do not yet exist when M0029 runs (M0030/M0031 add them later).
+        let rows = db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT id, components FROM repo_profile".to_owned(),
+            ))
+            .await?;
+        for row in rows {
+            let id: i32 = match row.try_get("", "id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let components: String = match row.try_get("", "components") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !components.contains("\"gateway\"") {
+                continue;
+            }
+            let fixed = gateway_components_to_backend(&components);
+            if fixed == components {
+                continue;
+            }
+            // Propagate a write failure rather than swallowing it: if this UPDATE
+            // errors, the migration must fail so it is NOT recorded as applied and
+            // retries on the next startup. Discarding the error would leave these
+            // component blobs permanently on the removed "gateway" tier.
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE repo_profile SET components = ? WHERE id = ?",
+                [fixed.into(), id.into()],
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Data merge is irreversible.
+        Ok(())
+    }
+}
+
+/// Adds `analysis_state` (TEXT NOT NULL DEFAULT 'idle') and `analysis_error`
+/// (TEXT NULL) to `repo_profile` so run-state survives process restarts.
+/// A fresh db already has these (M0002 reflects the current entity); sqlite has
+/// no ADD COLUMN IF NOT EXISTS, so the duplicate is tolerated.
+pub struct M0030AnalysisState;
+impl MigrationName for M0030AnalysisState {
+    fn name(&self) -> &str {
+        "m0030_analysis_state"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0030AnalysisState {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r1 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("analysis_state"))
+                            .string()
+                            .not_null()
+                            .default("idle"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r1 {
+            Ok(()) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e),
+        }
+        let r2 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("analysis_error"))
+                            .string()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r2 {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("analysis_state"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("analysis_error"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds `category` (TEXT NOT NULL DEFAULT '') and `domains` (TEXT NOT NULL DEFAULT '[]')
+/// to `repo_profile`. A fresh db already has these (M0002 reflects the current entity);
+/// sqlite has no ADD COLUMN IF NOT EXISTS, so the duplicate is tolerated.
+pub struct M0031RepoCategoryDomains;
+impl MigrationName for M0031RepoCategoryDomains {
+    fn name(&self) -> &str {
+        "m0031_repo_category_domains"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0031RepoCategoryDomains {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r1 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("category"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r1 {
+            Ok(()) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e),
+        }
+        let r2 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("domains"))
+                            .string()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r2 {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("category"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("domains"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gateway_components_to_backend;
+
+    #[test]
+    fn gateway_tier_rewritten_to_backend() {
+        let input = r#"[{"name":"api","path":"services/api","tier":"gateway","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        assert!(
+            !output.contains("\"gateway\""),
+            "gateway should be gone: {output}"
+        );
+        assert!(
+            output.contains("\"backend\""),
+            "backend should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn non_gateway_tier_untouched() {
+        let input = r#"[{"name":"web","path":"apps/web","tier":"frontend","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        // Tier must not be rewritten; name/path must survive round-trip.
+        assert!(output.contains("\"frontend\""), "frontend tier must survive: {output}");
+        assert!(!output.contains("\"backend\""), "backend must not appear: {output}");
+        assert!(output.contains("\"web\""), "name must survive: {output}");
+    }
+
+    #[test]
+    fn malformed_json_returned_unchanged() {
+        let input = "not valid json {{";
+        let output = gateway_components_to_backend(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn idempotent_already_backend() {
+        let input =
+            r#"[{"name":"api","path":"services/api","tier":"backend","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        // Tier must stay backend; the round-trip is expected to add the new `domains` field.
+        assert!(output.contains("\"backend\""), "backend tier must survive: {output}");
+        assert!(!output.contains("\"gateway\""), "gateway must not appear: {output}");
+    }
+
+    #[test]
+    fn mixed_tiers_only_gateway_rewritten() {
+        let input = r#"[{"name":"a","path":"a","tier":"gateway","summary":"","deps":[]},{"name":"b","path":"b","tier":"frontend","summary":"","deps":[]}]"#;
+        let output = gateway_components_to_backend(input);
+        assert!(
+            !output.contains("\"gateway\""),
+            "no gateway should remain: {output}"
+        );
+        assert!(
+            output.contains("\"frontend\""),
+            "frontend should survive: {output}"
+        );
+    }
+
+    /// M0031: category and domains columns are present after migration and default correctly.
+    #[tokio::test]
+    async fn m0031_category_domains_columns_added() {
+        use crate::store::Db;
+        use crate::store::repo::{add_repo_ref, create_workspace, get_repo_profile, upsert_repo_profile};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        // Both columns must exist with their defaults.
+        assert_eq!(p.category, "", "category column must exist and default to empty");
+        assert_eq!(p.domains, "[]", "domains column must exist and default to '[]'");
+    }
+
+    /// M0029: raw-query path rewrites gateway components without touching
+    /// columns that do not yet exist (analysis_state / category / domains).
+    /// Simulates the mid-migration state where only legacy columns are present.
+    #[tokio::test]
+    async fn m0029_raw_path_rewrites_gateway_no_new_columns() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        // Create a minimal repo_profile table with only legacy columns (no
+        // analysis_state / category / domains).
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            "CREATE TABLE repo_profile (id INTEGER PRIMARY KEY, role TEXT NOT NULL, \
+             components TEXT NOT NULL DEFAULT '[]')"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        let gateway_blob =
+            r#"[{"name":"api","path":"services/api","tier":"gateway","summary":"","deps":[]}]"#;
+        db.execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "INSERT INTO repo_profile (id, role, components) VALUES (1, 'gateway', ?)",
+            [gateway_blob.into()],
+        ))
+        .await
+        .unwrap();
+
+        // Run the same raw-query logic used by M0029::up.
+        let backend = db.get_database_backend();
+        db.execute(Statement::from_string(
+            backend,
+            "UPDATE repo_profile SET role = 'backend' WHERE role = 'gateway'".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        let rows = db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT id, components FROM repo_profile".to_owned(),
+            ))
+            .await
+            .unwrap();
+        for row in rows {
+            let id: i32 = row.try_get("", "id").unwrap();
+            let components: String = row.try_get("", "components").unwrap();
+            if !components.contains("\"gateway\"") {
+                continue;
+            }
+            let fixed = super::gateway_components_to_backend(&components);
+            if fixed == components {
+                continue;
+            }
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE repo_profile SET components = ? WHERE id = ?",
+                [fixed.into(), id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Verify: role and component tier both converted, no new columns touched.
+        let result = db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT role, components FROM repo_profile WHERE id = 1".to_owned(),
+            ))
+            .await
+            .unwrap();
+        let r = result.first().unwrap();
+        let role: String = r.try_get("", "role").unwrap();
+        let components: String = r.try_get("", "components").unwrap();
+        assert_eq!(role, "backend", "role must be rewritten to backend");
+        assert!(
+            !components.contains("\"gateway\""),
+            "gateway tier must be gone: {components}"
+        );
+        assert!(
+            components.contains("\"backend\""),
+            "backend tier must appear: {components}"
+        );
     }
 }

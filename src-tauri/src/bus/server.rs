@@ -482,45 +482,35 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "propose_directions" => {
-            let proposal: crate::planner::Proposal =
-                serde_json::from_value(args.clone()).unwrap_or_default();
+            // `directions` must be a PRESENT, non-empty array. A missing / empty / malformed
+            // payload is NOT a cancel: return an error so the lead retries (cancellation goes
+            // through cancel_directions) rather than silently clearing the pending plan. Note
+            // `Proposal.directions` is `#[serde(default)]`, so a missing/misspelled key would
+            // otherwise deserialize to an empty list — hence the explicit presence check.
+            let has_directions = args
+                .get("directions")
+                .and_then(|d| d.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_directions {
+                return text_result(
+                    "error: propose_directions requires a non-empty `directions` array; \
+                     to withdraw pending directions, call cancel_directions"
+                        .into(),
+                );
+            }
+            let proposal: crate::planner::Proposal = match serde_json::from_value(args.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return text_result(format!("error: invalid propose_directions payload: {e}"))
+                }
+            };
             let n = proposal.directions.len();
             match crate::planner::save_proposal(db, thread, &proposal).await {
                 Ok(()) => {
                     // Anchor the proposal in the chat timeline at the moment it
                     // happened — the console renders it as an interactive card.
-                    let content = serde_json::json!({
-                        "rationale": proposal.rationale,
-                        "count": n,
-                    })
-                    .to_string();
-                    let turn = crate::store::repo::next_turn_id(db, thread)
-                        .await
-                        .unwrap_or(1)
-                        - 1;
-                    if let Ok(m) = crate::store::repo::insert_lead_message(
-                        db,
-                        thread,
-                        None,
-                        turn.max(1),
-                        "system",
-                        "proposal",
-                        &content,
-                        "complete",
-                    )
-                    .await
-                    {
-                        if let Some(app) = crate::APP_HANDLE.get() {
-                            use tauri::Emitter;
-                            let _ = app.emit(
-                                crate::lead_chat::engine::EVENT,
-                                crate::lead_chat::engine::Push::Message {
-                                    thread_id: thread,
-                                    message: m,
-                                },
-                            );
-                        }
-                    }
+                    emit_proposal_row(db, thread, &proposal.rationale, n).await;
                     text_result(format!(
                         "proposed {n} direction(s); the human will review and confirm in weft"
                     ))
@@ -528,7 +518,64 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
                 Err(e) => text_result(format!("error: {e}")),
             }
         }
+        "cancel_directions" => {
+            let rationale = args
+                .get("rationale")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            withdraw_and_emit(db, thread, &rationale).await
+        }
         _ => text_result(format!("unknown tool: {name}")),
+    }
+}
+
+/// Insert + emit a proposal-shaped timeline row (kind:"proposal", content
+/// {rationale, count}). The console renders count>0 as the interactive review card
+/// and count==0 as the settled "已撤回" line. Shared by propose + withdraw.
+async fn emit_proposal_row(db: &Db, thread: i32, rationale: &str, count: usize) {
+    let content = serde_json::json!({ "rationale": rationale, "count": count }).to_string();
+    let turn = crate::store::repo::next_turn_id(db, thread).await.unwrap_or(1) - 1;
+    if let Ok(m) = crate::store::repo::insert_lead_message(
+        db,
+        thread,
+        None,
+        turn.max(1),
+        "system",
+        "proposal",
+        &content,
+        "complete",
+    )
+    .await
+    {
+        if let Some(app) = crate::APP_HANDLE.get() {
+            use tauri::Emitter;
+            let _ = app.emit(
+                crate::lead_chat::engine::EVENT,
+                crate::lead_chat::engine::Push::Message {
+                    thread_id: thread,
+                    message: m,
+                },
+            );
+        }
+    }
+}
+
+/// Withdraw the pending proposal (the `cancel_directions` tool). Only records the count-0
+/// ("已撤回") row when a pending proposal was ACTUALLY cleared — a no-op cancel (already
+/// confirmed, a lane approved, or nothing proposed) must not leave a misleading withdrawn
+/// row over live work.
+async fn withdraw_and_emit(db: &Db, thread: i32, rationale: &str) -> Value {
+    match crate::planner::withdraw_proposal(db, thread, rationale).await {
+        Ok(true) => {
+            emit_proposal_row(db, thread, rationale, 0).await;
+            text_result("withdrew pending directions".into())
+        }
+        Ok(false) => text_result(
+            "nothing to withdraw: no pending proposal (it may be confirmed or already dispatched)"
+                .into(),
+        ),
+        Err(e) => text_result(format!("error: {e}")),
     }
 }
 
@@ -568,6 +615,13 @@ fn planner_specs() -> Value {
                         "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." }
                 }, "required": ["name", "repo", "reason"] } }
             }, "required": ["directions"] }
+        },
+        {
+            "name": "cancel_directions",
+            "description": "Withdraw the pending proposed directions. Use when the human says to hold off / cancel, or the write boundary is no longer settled — it clears the current proposal so nothing is dispatched and the review card collapses. Provide a short rationale. Do NOT call propose_directions with an empty directions list to cancel; use this.",
+            "inputSchema": { "type": "object", "properties": {
+                "rationale": str_prop()
+            }, "required": ["rationale"] }
         }
     ])
 }

@@ -28,6 +28,7 @@ pub mod im;
 mod inspect;
 pub mod lead_chat;
 pub mod materialize;
+pub mod manifest;
 mod opencode;
 pub mod paths;
 mod planner;
@@ -169,6 +170,14 @@ pub fn run() {
             im::spawn(app.handle().clone());
             trail::spawn(app.handle().clone());
             backup::scheduler::spawn(backup_svc.clone());
+            {
+                // APP_HANDLE is set above; access the managed Db via Manager.
+                use tauri::Manager as _;
+                let db = app.state::<store::Db>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    curator::resume_running_analyses(&db).await;
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -188,11 +197,11 @@ pub fn run() {
             commands::reprofile_repo,
             commands::analyze_workspace_deps,
             commands::open_curator_chat,
+            commands::get_repo_map_doc,
             commands::delete_repo,
             commands::update_repo_profile,
             commands::list_directions,
             commands::set_task_status,
-            commands::read_transcript,
             commands::worktree_diff,
             commands::worktree_diff_target,
             commands::set_direction_target_branch,

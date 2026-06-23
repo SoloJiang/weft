@@ -40,3 +40,5 @@ docs/
 # Local Tauri signing keys
 src-tauri/weft.key
 src-tauri/weft.key.pub
+.opencode
+.omo/

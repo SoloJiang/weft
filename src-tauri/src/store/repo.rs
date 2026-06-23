@@ -207,6 +207,16 @@ pub async fn set_setting(db: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove an app_setting row. No-op when the key is absent. Used to clear a
+/// stored value entirely so `get_setting` reads `None` again — distinct from
+/// `set_setting(key, "")`, which would still read as `Some("")`.
+pub async fn delete_setting(db: &Db, key: &str) -> Result<()> {
+    app_setting::Entity::delete_by_id(key.to_string())
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
 /// The user-configured coding-agent command overrides (identity → command),
 /// parsed from the `tool_commands` app_setting. Empty when none are set.
 pub async fn get_tool_commands(db: &Db) -> Result<HashMap<String, String>> {
@@ -280,6 +290,31 @@ pub async fn set_tool_command(
     )
     .await?;
     Ok((map, prev))
+}
+
+/// app_setting key for the workspace's synthesized repo-map markdown document.
+fn repo_map_doc_key(workspace_id: i32) -> String {
+    format!("repomap.doc.{workspace_id}")
+}
+
+/// Persist the analyst-synthesized markdown repo-map for a workspace.
+pub async fn set_repo_map_doc(db: &Db, workspace_id: i32, markdown: &str) -> Result<()> {
+    set_setting(db, &repo_map_doc_key(workspace_id), markdown).await
+}
+
+/// Read the analyst-synthesized markdown repo-map for a workspace.
+/// Returns `None` when none has been generated yet.
+pub async fn get_repo_map_doc(db: &Db, workspace_id: i32) -> Result<Option<String>> {
+    get_setting(db, &repo_map_doc_key(workspace_id)).await
+}
+
+/// Drop a workspace's persisted repo-map doc so `get_repo_map_doc` reads `None`
+/// and the map pane falls back to its empty/regenerate state. Used when the
+/// workspace can no longer produce a meaningful cross-repo map (dropped below the
+/// 2-profiled-repo threshold), so the pane never shows markdown for repos/edges
+/// that are no longer in the graph.
+pub async fn clear_repo_map_doc(db: &Db, workspace_id: i32) -> Result<()> {
+    delete_setting(db, &repo_map_doc_key(workspace_id)).await
 }
 
 /// Workspace container used by per-IM-conversation Concierge threads.
@@ -562,7 +597,7 @@ pub async fn get_repo_profile(db: &Db, repo_id: i32) -> Result<Option<repo_profi
 }
 
 /// Insert or update a repo's profile from the agent curator. `tier` is the
-/// architectural tier ("frontend"|"gateway"|"backend"|""), `stack`/`components`
+/// architectural tier ("frontend"|"backend"|""), `stack`/`components`
 /// are JSON arrays. The vestigial `published`/`deps` columns are pinned to "[]".
 /// `relations` are left untouched on update so re-analysis of facts never wipes
 /// the agent's cross-repo findings (and stay "[]" on a fresh row).
@@ -606,8 +641,90 @@ pub async fn set_repo_relations(db: &Db, repo_id: i32, relations: &str) -> Resul
         let mut a: repo_profile::ActiveModel = m.into();
         a.relations = Set(relations.to_string());
         a.update(&db.0).await?;
+        // Any relation mutation makes the workspace's synthesized map doc stale (it
+        // narrates the pre-mutation edges). Invalidate it CENTRALLY at this single
+        // chokepoint so every path is covered — the agent pass, the manifest seed,
+        // and manual calibration all write relations through here. `analyze_relations`
+        // re-writes fresh markdown as its LAST step, so the happy path repopulates it;
+        // a pass that omits markdown (or a manual calibration) leaves it cleared.
+        if let Some(r) = get_repo(db, repo_id).await? {
+            let _ = clear_repo_map_doc(db, r.workspace_id).await;
+        }
     }
     Ok(())
+}
+
+/// Persist the agent-assigned `category` and `domains` JSON for a repo. Only
+/// these two columns are touched; all other profile fields (relations, tier, …)
+/// are left unchanged. No-op if the repo has no profile row yet.
+pub async fn set_repo_category_domains(
+    db: &Db,
+    repo_id: i32,
+    category: &str,
+    domains_json: &str,
+) -> Result<()> {
+    if let Some(m) = get_repo_profile(db, repo_id).await? {
+        let mut a: repo_profile::ActiveModel = m.into();
+        a.category = Set(category.to_string());
+        a.domains = Set(domains_json.to_string());
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// Persist a repo's analysis run-state (durable across restarts). Clears the
+/// error unless state == "failed".
+///
+/// For a brand-new repo that has no profile row yet, we create a minimal
+/// placeholder (role/summary blank) so running/failed states persist and the
+/// startup resume scan can find this repo. The placeholder has role="" and
+/// summary="" so is_fully_profiled() returns false and it is excluded from the
+/// cross-repo relation pass. When state == "idle" and no row exists we skip the
+/// insert: idle is the column default, so nothing needs to be persisted.
+pub async fn set_analysis_state(
+    db: &Db,
+    repo_id: i32,
+    state: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    if get_repo_profile(db, repo_id).await?.is_none() {
+        if state == "idle" {
+            return Ok(());
+        }
+        // Guard against a deletion race: an analysis finishing after
+        // delete_repo_cascade must not recreate an orphaned profile row (repo_profile
+        // has no enforced foreign key). Mirror edit_profile's guard. (Finding 5)
+        if get_repo(db, repo_id).await?.is_none() {
+            return Ok(());
+        }
+        // First-ever analysis: create a minimal placeholder so running/failed
+        // persists and the startup resume scan can find this repo.
+        upsert_repo_profile(db, repo_id, "", "[]", "", "[]", "agent", "").await?;
+    }
+    if let Some(m) = get_repo_profile(db, repo_id).await? {
+        let mut a: repo_profile::ActiveModel = m.into();
+        a.analysis_state = Set(state.to_string());
+        a.analysis_error = Set(error.map(|s| s.to_string()));
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
+/// Return all `repo_ref` rows whose `repo_profile.analysis_state` matches `state`.
+/// Queries profile rows first (no SQL join needed: profiles are keyed by repo_id),
+/// then loads the corresponding repo_ref rows, skipping any whose repo was deleted.
+pub async fn repos_with_analysis_state(db: &Db, state: &str) -> Result<Vec<repo_ref::Model>> {
+    let profiles = repo_profile::Entity::find()
+        .filter(repo_profile::Column::AnalysisState.eq(state))
+        .all(&db.0)
+        .await?;
+    let mut out = Vec::with_capacity(profiles.len());
+    for p in profiles {
+        if let Some(r) = repo_ref::Entity::find_by_id(p.repo_id).one(&db.0).await? {
+            out.push(r);
+        }
+    }
+    Ok(out)
 }
 
 /// Set a repo's captured `origin` remote URL. Used to backfill rows added before
@@ -696,6 +813,7 @@ pub async fn calibrate_repo_relation(
         confidence: 100,
         source: "user".to_string(),
         rejected: action == "remove",
+        ..Default::default()
     });
     let json = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
     set_repo_relations(db, from_id, &json).await
@@ -1017,6 +1135,12 @@ pub async fn delete_repo_cascade(
     db: &Db,
     repo_id: i32,
 ) -> Result<Vec<(i32, String, String, bool, bool)>> {
+    // The workspace's repo-map doc enumerates repos/edges, so removing a repo makes
+    // it stale. Capture the workspace before the repo_ref row is deleted below; the
+    // doc is invalidated at the end (it regenerates on the next analysis pass or a
+    // manual Regenerate). Nothing else clears it on delete, so without this the map
+    // pane keeps showing the deleted repo until a later manual analysis.
+    let workspace_id = get_repo(db, repo_id).await?.map(|r| r.workspace_id);
     // Worktrees registered for this repo (each direction's worktree is keyed to
     // its write repo, so this covers the bound directions' worktrees too).
     let removed: Vec<(i32, String, String, bool, bool)> = worktree::Entity::find()
@@ -1054,6 +1178,10 @@ pub async fn delete_repo_cascade(
         .exec(&db.0)
         .await?;
     repo_ref::Entity::delete_by_id(repo_id).exec(&db.0).await?;
+    // Best-effort: invalidate the now-stale workspace map doc (see top of fn).
+    if let Some(ws) = workspace_id {
+        let _ = clear_repo_map_doc(db, ws).await;
+    }
     Ok(removed)
 }
 
@@ -1769,6 +1897,8 @@ mod tests {
         let dir_b = create_direction(&db, t.id, "db", "claude", b.id, "reason", "plan+impl", "")
             .await
             .unwrap();
+        // A stored workspace map doc (enumerates repos) must be invalidated on delete.
+        set_repo_map_doc(&db, ws.id, "## Inventory\n- a (backend)\n- b (backend)").await.unwrap();
 
         let removed = delete_repo_cascade(&db, a.id).await.unwrap();
         // returns repo `a`'s worktree(s) for the caller to physically remove
@@ -1785,6 +1915,11 @@ mod tests {
         assert!(get_repo(&db, b.id).await.unwrap().is_some());
         assert!(get_repo_profile(&db, b.id).await.unwrap().is_some());
         assert!(get_direction(&db, dir_b.id).await.unwrap().is_some());
+        // …and the stale workspace map doc was cleared (regenerates on next analysis).
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "deleting a repo must invalidate the workspace map doc"
+        );
     }
 
     /// R15-1: delete_repo_cascade must carry created_branch in its 4-tuple so
@@ -2851,5 +2986,320 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(still.status, "queued");
+    }
+
+    /// M0030: analysis_state/error round-trip and upsert_repo_profile preserves them.
+    #[tokio::test]
+    async fn analysis_state_roundtrips_and_upsert_preserves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        // Create a minimal profile row.
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+
+        // (1) Set running/None → read back.
+        set_analysis_state(&db, r.id, "running", None)
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.analysis_state, "running");
+        assert_eq!(p.analysis_error, None);
+
+        // (2) Set failed/Some("boom") → read back.
+        set_analysis_state(&db, r.id, "failed", Some("boom"))
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.analysis_state, "failed");
+        assert_eq!(p.analysis_error.as_deref(), Some("boom"));
+
+        // (3) A normal upsert_repo_profile (agent re-classify) must NOT clobber
+        //     the state set above — analysis_state/error are preserved.
+        upsert_repo_profile(&db, r.id, "frontend", "[]", "summary", "[]", "agent", "abc")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.analysis_state, "failed",
+            "upsert must not reset analysis_state"
+        );
+        assert_eq!(
+            p.analysis_error.as_deref(),
+            Some("boom"),
+            "upsert must not reset analysis_error"
+        );
+        // But the profiling fields were updated normally.
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.profiled_commit, "abc");
+    }
+
+    /// First-run resume: set_analysis_state("running") on a repo with no profile row
+    /// must create a placeholder so the startup resume scan can find it.
+    #[tokio::test]
+    async fn set_analysis_state_creates_placeholder_for_new_repo() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "new-repo", "/tmp/new", "main", "", true)
+            .await
+            .unwrap();
+        // No profile row yet.
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "precondition: no profile row"
+        );
+
+        // set_analysis_state("running") must create a placeholder row.
+        set_analysis_state(&db, r.id, "running", None)
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id)
+            .await
+            .unwrap()
+            .expect("placeholder row must exist after set_analysis_state(running)");
+        assert_eq!(p.analysis_state, "running");
+        assert_eq!(p.analysis_error, None);
+        // Placeholder must NOT count as fully profiled (role and summary are blank).
+        assert!(
+            p.role.is_empty() && p.summary.is_empty(),
+            "placeholder must have blank role/summary"
+        );
+    }
+
+    /// Finding 5: set_analysis_state must not create a placeholder for a deleted repo.
+    /// Simulates the deletion race: analysis finishes after delete_repo_cascade, so
+    /// the repo_ref row is gone but there is no profile row either.
+    #[tokio::test]
+    async fn set_analysis_state_noop_for_deleted_repo() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "gone-repo", "/tmp/gone", "main", "", true)
+            .await
+            .unwrap();
+        // Simulate cascade delete: remove the repo_ref row (no profile row exists).
+        delete_repo_cascade(&db, r.id).await.unwrap();
+        assert!(
+            get_repo(&db, r.id).await.unwrap().is_none(),
+            "precondition: repo_ref must be gone"
+        );
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "precondition: no profile row"
+        );
+
+        // set_analysis_state("running") on a nonexistent repo must be a no-op —
+        // it must NOT create an orphaned profile row.
+        set_analysis_state(&db, r.id, "running", None).await.unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "set_analysis_state must not create a profile row for a deleted repo"
+        );
+
+        // Same for "failed".
+        set_analysis_state(&db, r.id, "failed", Some("timeout")).await.unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "set_analysis_state(failed) must not create a profile row for a deleted repo"
+        );
+    }
+
+    /// set_analysis_state("idle") on a no-row repo must remain a no-op (idle is the default).
+    #[tokio::test]
+    async fn set_analysis_state_idle_no_row_is_noop() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "other-repo", "/tmp/other", "main", "", true)
+            .await
+            .unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "precondition: no profile row"
+        );
+
+        set_analysis_state(&db, r.id, "idle", None).await.unwrap();
+        assert!(
+            get_repo_profile(&db, r.id).await.unwrap().is_none(),
+            "idle on no-row must remain a no-op"
+        );
+    }
+
+    /// repos_with_analysis_state returns exactly the repos whose profile has the
+    /// given state, not idle or failed ones.
+    #[tokio::test]
+    async fn repos_with_analysis_state_returns_only_matching() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let running = add_repo_ref(&db, ws.id, "running-repo", "/tmp/running", "main", "", true)
+            .await
+            .unwrap();
+        let idle = add_repo_ref(&db, ws.id, "idle-repo", "/tmp/idle", "main", "", true)
+            .await
+            .unwrap();
+
+        // Seed profiles: running-repo gets analysis_state="running" via the
+        // placeholder-creating path; idle-repo gets a full profile but stays idle.
+        set_analysis_state(&db, running.id, "running", None).await.unwrap();
+        upsert_repo_profile(&db, idle.id, "backend", "[]", "summary", "[]", "agent", "sha")
+            .await
+            .unwrap();
+        // idle-repo's analysis_state column defaults to "idle" — no explicit set needed.
+
+        let got = repos_with_analysis_state(&db, "running").await.unwrap();
+        assert_eq!(got.len(), 1, "only the running repo must be returned");
+        assert_eq!(got[0].id, running.id, "returned repo must be the running one");
+
+        // The idle-repo must NOT appear in the running results.
+        assert!(
+            !got.iter().any(|r| r.id == idle.id),
+            "idle repo must not appear in running results"
+        );
+    }
+
+    /// M0031: set_repo_category_domains writes and reads back; upsert_repo_profile
+    /// does NOT touch category/domains (preservation invariant).
+    #[tokio::test]
+    async fn category_domains_roundtrip_and_upsert_preserves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+
+        // (1) Set and read back category/domains.
+        set_repo_category_domains(&db, r.id, "biz", r#"["orders","payments"]"#)
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "biz");
+        assert_eq!(p.domains, r#"["orders","payments"]"#);
+
+        // (2) A subsequent upsert_repo_profile (agent re-classify) must NOT clobber
+        //     category/domains — they are preserved (Unchanged in the ActiveModel).
+        upsert_repo_profile(&db, r.id, "frontend", "[]", "new summary", "[]", "agent", "sha2")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(
+            p.category, "biz",
+            "upsert must not reset category"
+        );
+        assert_eq!(
+            p.domains, r#"["orders","payments"]"#,
+            "upsert must not reset domains"
+        );
+        // But profiling fields were updated normally.
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.profiled_commit, "sha2");
+    }
+
+    /// M0031: a fresh profile row (first upsert, no prior set_repo_category_domains)
+    /// must default category="" and domains="[]".
+    #[tokio::test]
+    async fn category_domains_default_on_fresh_profile() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "new-svc", "/tmp/new-svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "", "fresh row: category defaults to empty string");
+        assert_eq!(p.domains, "[]", "fresh row: domains defaults to '[]'");
+    }
+
+    /// set_repo_map_doc / get_repo_map_doc round-trip: store and retrieve a
+    /// markdown doc keyed per workspace, and confirm absent workspaces return None.
+    #[tokio::test]
+    async fn repo_map_doc_round_trip() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        // Nothing stored yet → None.
+        let doc = get_repo_map_doc(&db, ws.id).await.unwrap();
+        assert!(doc.is_none(), "no doc before first set");
+
+        // Store a markdown document.
+        let md = "## Inventory\n- web (frontend): SPA\n\n## Domain index\n- auth: [api]";
+        set_repo_map_doc(&db, ws.id, md).await.unwrap();
+        let doc = get_repo_map_doc(&db, ws.id).await.unwrap();
+        assert_eq!(doc.as_deref(), Some(md), "retrieved doc must equal stored doc");
+
+        // Overwrite with a new doc (upsert semantics).
+        let md2 = "## Inventory v2\n- api (backend): REST API";
+        set_repo_map_doc(&db, ws.id, md2).await.unwrap();
+        let doc2 = get_repo_map_doc(&db, ws.id).await.unwrap();
+        assert_eq!(doc2.as_deref(), Some(md2), "second set overwrites the first");
+
+        // A different workspace id has its own slot — no cross-workspace bleed.
+        let ws2 = create_workspace(&db, "ws2").await.unwrap();
+        let doc_ws2 = get_repo_map_doc(&db, ws2.id).await.unwrap();
+        assert!(doc_ws2.is_none(), "different workspace has no doc");
+    }
+
+    /// clear_repo_map_doc deletes the row so the doc reads None again (the map
+    /// pane falls back to its empty state, not a stale Some("")).
+    #[tokio::test]
+    async fn clear_repo_map_doc_resets_to_none() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        set_repo_map_doc(&db, ws.id, "## Inventory\n- web").await.unwrap();
+        assert!(get_repo_map_doc(&db, ws.id).await.unwrap().is_some());
+
+        clear_repo_map_doc(&db, ws.id).await.unwrap();
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "cleared doc must read as None, not Some(\"\")"
+        );
+
+        // Clearing an already-absent doc is a no-op, not an error.
+        clear_repo_map_doc(&db, ws.id).await.unwrap();
+    }
+
+    /// Central invariant: writing relations invalidates the workspace map doc.
+    /// Covers the "successful relation pass omits markdown" case — persist_relations
+    /// writes through here, so with no replacement markdown the doc must not keep
+    /// serving the pre-pass narrative.
+    #[tokio::test]
+    async fn set_repo_relations_invalidates_map_doc() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
+
+        set_repo_relations(&db, r.id, "[]").await.unwrap();
+
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "writing relations must invalidate the stale workspace map doc"
+        );
+    }
+
+    /// A manual edge calibration mutates relations → the stored map doc (describing
+    /// the pre-calibration edges) must be cleared. Goes through set_repo_relations.
+    #[tokio::test]
+    async fn calibrate_repo_relation_invalidates_map_doc() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let a = add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true).await.unwrap();
+        let b = add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, a.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
+
+        calibrate_repo_relation(&db, a.id, b.id, "http", "GET /x", "add").await.unwrap();
+
+        assert!(
+            get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
+            "manual edge calibration must invalidate the stale workspace map doc"
+        );
     }
 }

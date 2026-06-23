@@ -1,10 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, ChevronRight, Copy, FileText, Sparkles } from "lucide-react";
+import { ArrowRight, Check, Copy, ListChecks, Sparkles } from "lucide-react";
 import type { LeadMessage, QueuedItem, ResolvedProposal } from "../lib/types";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { QueueStack } from "./QueueStack";
+import {
+  Attachment,
+  Message,
+  OnboardingCue,
+  SuggestionChips,
+  Tool,
+  ToolActivity,
+  type AiToolStatus,
+} from "../components/ai-elements";
 import { cn } from "../lib/cn";
 import {
   cleanToolName,
@@ -44,12 +53,17 @@ export function ChatTimeline({
   cwd,
   emptyState = "default",
   queue = [],
-  onRemove,
-  onEdit,
-  onReorder,
+  onRemove = () => {},
+  onEdit = () => {},
+  onReorder = () => {},
 }: {
   messages: LeadMessage[];
   busy: boolean;
+  /** Pending (not-yet-sent) queued messages, shown in the bottom stack. */
+  queue?: QueuedItem[];
+  onRemove?: (id: number) => void;
+  onEdit?: (id: number, text: string) => void;
+  onReorder?: (order: number[]) => void;
   /** The tool call executing right now (transient), if any. */
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
@@ -66,30 +80,15 @@ export function ChatTimeline({
   cwd?: string;
   /** Lead hosts opt into task/repo guidance; workers keep the default empty state. */
   emptyState?: EmptyStateMode;
-  /** Pending messages waiting in the engine's send queue. */
-  queue?: QueuedItem[];
-  onRemove?: (id: number) => void;
-  onEdit?: (id: number, text: string) => void;
-  onReorder?: (order: number[]) => void;
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
 
   // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
-  // (claude/opencode/codex alike); only `meta` bookkeeping rows and pending queued
-  // messages (rendered in QueueStack instead) are hidden.
+  // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
+  // Pending queued messages live in the bottom QueueStack, not the timeline.
   const visible = messages.filter((m) => m.kind !== "meta" && m.status !== "queued");
 
-  // Virtuoso's followOutput only fires on item-COUNT changes, so it misses
-  // intra-message streaming growth (text appended to the existing last row).
-  // Follow the bottom ourselves on every growth signal, but only while the user
-  // is parked at the bottom. atBottomThreshold (set on Virtuoso below) restores
-  // the old ~80px tolerance, so a reader a few px short of the exact bottom still
-  // auto-follows while one who scrolled up to read history is left alone.
-  // scrollToIndex is measurement-aware — it renders and measures the target row
-  // before scrolling — so there is no scrollTo(MAX)/rAF drift to correct, and
-  // because the activity bar lives OUTSIDE the scroller the last row is the
-  // unambiguous bottom.
   const growthLen = visible
     .filter((m) => m.kind === "text" || m.kind === "tool")
     .reduce((n, m) => n + m.content.length, 0);
@@ -118,16 +117,9 @@ export function ChatTimeline({
         className="min-h-0 flex-1"
         data={visible}
         computeItemKey={(_index, m) => m.id}
-        // Open at the BOTTOM of the last message (align "end"), so a final
-        // message taller than the viewport opens at its latest line, not its top.
-        // Omitted while empty (busy-only turn): index 0 is out of range for
-        // data=[] and would misinitialize Virtuoso.
         initialTopMostItemIndex={
           visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
         }
-        // Restore the old 80px "close enough to the bottom" tolerance: a reader a
-        // few px up (e.g. a trackpad nudge) still counts as at-bottom and keeps
-        // auto-following. Virtuoso's default is only a few px.
         atBottomThreshold={80}
         atBottomStateChange={(atBottom) => {
           atBottomRef.current = atBottom;
@@ -153,18 +145,17 @@ export function ChatTimeline({
       />
       {/* The in-flight tool / working indicator sits OUTSIDE the virtualized
           scroller as a fixed bottom bar. Keeping it out of the list makes the
-          last message the unambiguous list bottom (so the follow-scroll target
-          is exact) and keeps the indicator visible even while the user scrolls
-          back through history. */}
+          last message the unambiguous list bottom and keeps the indicator
+          visible even while the user scrolls back through history. */}
       {(busy || queue.length > 0) && (
         <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
           <div className="flex flex-col gap-1.5">
-            {busy && <BusyIndicator activity={activity ?? null} />}
+            {busy && <BusyIndicator activity={activity} />}
             <QueueStack
               items={queue}
-              onRemove={onRemove ?? (() => {})}
-              onEdit={onEdit ?? (() => {})}
-              onReorder={onReorder ?? (() => {})}
+              onRemove={onRemove}
+              onEdit={onEdit}
+              onReorder={onReorder}
             />
           </div>
         </div>
@@ -173,13 +164,25 @@ export function ChatTimeline({
   );
 }
 
-/** Top breathing room — mirrors the old scroll container's py-4 top padding. */
+function BusyIndicator({
+  activity,
+}: {
+  activity?: { name: string; summary: string } | null;
+}) {
+  const { t } = useTranslation();
+  if (activity) return <ToolStatus name={activity.name} summary={activity.summary} />;
+  return (
+    <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
+      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
+      {t("lead.working")}
+    </div>
+  );
+}
+
 function Header() {
   return <div className="h-4" />;
 }
 
-/** Bottom breathing room inside the scroller; the activity bar now renders
- *  outside the virtualized list (see ChatTimeline). */
 function Footer() {
   return <div className="h-4" />;
 }
@@ -235,6 +238,14 @@ function EmptyLeadState({
               })
             }
           />
+          <SuggestionChips
+            label={t("lead.suggestionLabel")}
+            suggestions={[
+              t("lead.suggestionImportRepo"),
+              t("lead.suggestionCloneRepo"),
+              t("lead.suggestionCreateRepo"),
+            ]}
+          />
         </div>
       </div>
     );
@@ -243,14 +254,21 @@ function EmptyLeadState({
   if (mode === "lead-task") {
     return (
       <div className="flex flex-1 items-center justify-center px-6 text-center">
-        <div className="max-w-[420px]">
-          <span className="mx-auto grid h-8 w-8 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
-            <Sparkles size={15} />
-          </span>
-          <p className="mt-3 text-[13px] font-medium text-ink">{t("lead.taskEmptyTitle")}</p>
-          <p className="mt-1.5 text-[12px] leading-relaxed text-ink-faint">
-            {t("lead.taskEmptyBody")}
-          </p>
+        <div className="max-w-[460px]">
+          <OnboardingCue
+            eyebrow={t("lead.onboardingCueEyebrow")}
+            title={t("lead.taskEmptyTitle")}
+            body={t("lead.onboardingCueBody")}
+            icon={<ListChecks size={15} />}
+          />
+          <SuggestionChips
+            label={t("lead.suggestionLabel")}
+            suggestions={[
+              t("lead.suggestionPlan"),
+              t("lead.suggestionQueue"),
+              t("lead.suggestionTask"),
+            ]}
+          />
         </div>
       </div>
     );
@@ -258,27 +276,29 @@ function EmptyLeadState({
 
   return (
     <div className="flex flex-1 items-center justify-center px-6 text-center">
-      <p className="text-[12px] leading-relaxed text-ink-faint">{t("lead.transcriptEmpty")}</p>
+      <div className="max-w-[420px]">
+        <p className="text-[12px] leading-relaxed text-ink-faint">{t("lead.transcriptEmpty")}</p>
+        <SuggestionChips
+          label={t("lead.suggestionLabel")}
+          suggestions={[
+            t("lead.suggestionDescribe"),
+            t("lead.suggestionAttach"),
+            t("lead.suggestionSlash"),
+          ]}
+        />
+      </div>
     </div>
   );
 }
 
-/** Busy status line: shows the specific tool in flight if available, else a generic pulse. */
-function BusyIndicator({ activity }: { activity: { name: string; summary: string } | null }) {
-  const { t } = useTranslation();
-  if (activity) {
-    return <ActivityLine name={activity.name} summary={activity.summary} />;
-  }
-  return (
-    <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
-      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
-      {t("lead.working")}
-    </div>
-  );
+function deriveToolStatus(m: LeadMessage, c: Record<string, unknown>): AiToolStatus {
+  if (m.status === "streaming") return "streaming";
+  if (c.is_error === true || m.status === "error") return "error";
+  return "complete";
 }
 
 /** The tool call in flight — pulsing, transient, precise about WHAT it calls. */
-function ActivityLine({ name, summary }: { name: string; summary: string }) {
+function ToolStatus({ name, summary }: { name: string; summary: string }) {
   const { t } = useTranslation();
   const Icon = toolIcon(name);
   const labelKey = toolLabelKey(name);
@@ -287,136 +307,14 @@ function ActivityLine({ name, summary }: { name: string; summary: string }) {
   // show the cleaned tool identity instead.
   const generic = labelKey === "session.toolCalling";
   return (
-    <div className="flex max-w-full items-center gap-2 px-1.5 py-1 text-[13px] text-ink-faint">
-      <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-running" />
-      <Icon size={15} className="shrink-0 text-ink-faint" />
-      <span className="shrink-0 font-medium text-ink-muted">
-        {generic ? cleanToolName(name) : t(labelKey)}
-      </span>
-      {!generic && summary && (
-        <span className="min-w-0 truncate font-mono text-brand">{target}</span>
-      )}
-      {generic && summary && (
-        <span className="min-w-0 truncate font-mono text-brand">{summary}</span>
-      )}
-      {added && <span className="shrink-0 font-mono text-running">+{added}</span>}
-      {removed && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
-    </div>
-  );
-}
-
-/**
- * A persisted tool call: a low-weight, borderless line (codex-style) — a
- * state-colored icon + label + target — that expands to show the full input and
- * the tool's output. `status` mirrors the row: "streaming" = running,
- * "complete"/"error" = finished.
- */
-function ToolRow({ m }: { m: LeadMessage }) {
-  const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  const c = parse(m.content);
-  const name = typeof c.name === "string" ? c.name : "tool";
-  const summary = typeof c.summary === "string" ? c.summary : "";
-  const output = typeof c.output === "string" ? c.output : "";
-  const inputText = formatToolValue(c.input);
-  const running = m.status === "streaming";
-  const isError = c.is_error === true || m.status === "error";
-  const Icon = toolIcon(name);
-  // Finished rows read past-tense ("Ran"/"已运行"); a running row stays "Running".
-  const labelKey = running ? toolLabelKey(name) : toolDoneLabelKey(name);
-  const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
-  const label = generic ? cleanToolName(name) : t(labelKey);
-  const { target } = compactToolTarget(name, summary);
-  const hasDetail = inputText.length > 0 || output.length > 0;
-
-  return (
-    <div>
-      <button
-        type="button"
-        disabled={!hasDetail}
-        onClick={() => setOpen((v) => !v)}
-        className={cn(
-          "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
-          hasDetail && "hover:bg-surface/60",
-        )}
-      >
-        <Icon
-          size={13}
-          className={cn(
-            "shrink-0",
-            running
-              ? "animate-pulse text-running"
-              : isError
-                ? "text-danger"
-                : "text-ink-faint",
-          )}
-        />
-        <span className="shrink-0 text-ink-muted">{label}</span>
-        {(target || summary) && (
-          <span className="min-w-0 truncate font-mono text-ink-faint">{target || summary}</span>
-        )}
-        {hasDetail && (
-          <ChevronRight
-            size={12}
-            className={cn(
-              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
-              open && "rotate-90",
-            )}
-          />
-        )}
-      </button>
-      {open && hasDetail && (
-        <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
-          {inputText && <ToolBlock label={t("tool.input")} body={inputText} />}
-          {output && (
-            <ToolBlock label={t("tool.output")} body={output} tone={isError ? "error" : "default"} />
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** A labeled monospace block inside an expanded tool row, with show-more past a
- *  line budget so a huge stdout/diff doesn't blow up the timeline. */
-function ToolBlock({
-  label,
-  body,
-  tone = "default",
-}: {
-  label: string;
-  body: string;
-  tone?: "default" | "error";
-}) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  const lines = body.split("\n");
-  const LIMIT = 20;
-  const long = lines.length > LIMIT;
-  const shown = expanded || !long ? body : lines.slice(0, LIMIT).join("\n");
-  return (
-    <div>
-      <p className="mb-1 text-[10.5px] font-medium uppercase tracking-wide text-ink-faint">
-        {label}
-      </p>
-      <pre
-        className={cn(
-          "max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-bg px-2 py-1.5 font-mono text-[11.5px] leading-relaxed",
-          tone === "error" ? "text-danger" : "text-ink-muted",
-        )}
-      >
-        {shown}
-      </pre>
-      {long && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-1 text-[11px] text-brand hover:underline"
-        >
-          {expanded ? t("tool.showLess") : t("tool.showMore", { n: lines.length - LIMIT })}
-        </button>
-      )}
-    </div>
+    <ToolActivity
+      icon={Icon}
+      label={generic ? cleanToolName(name) : t(labelKey)}
+      target={generic ? undefined : target}
+      summary={generic ? summary : undefined}
+      added={added}
+      removed={removed}
+    />
   );
 }
 
@@ -453,6 +351,11 @@ function safeParseObj(content: string): Record<string, unknown> {
   }
 }
 
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
 // Read-only history replay: only the most recent assistant row is interactive.
 // Older action_cards stay rendered for context but their buttons are disabled.
 // Tool rows are role:"assistant" too: skip only those from m's OWN turn (a card
@@ -477,6 +380,28 @@ function SettledLine({ label }: { label: string }) {
       <span className="truncate">{label}</span>
     </div>
   );
+}
+
+const permissionAnswerLabelKeys = {
+  allow: "settled.permissionAllow",
+  deny: "settled.permissionDeny",
+  always: "settled.permissionAlways",
+  full: "settled.permissionFull",
+} as const;
+
+type PermissionAnswer = keyof typeof permissionAnswerLabelKeys;
+
+function permissionAnswerOf(answer: string): PermissionAnswer {
+  switch (answer) {
+    case "deny":
+      return "deny";
+    case "always":
+      return "always";
+    case "full":
+      return "full";
+    default:
+      return "allow";
+  }
 }
 
 // The live plan binds to the MOST RECENT proposal row only: a re-propose
@@ -515,7 +440,33 @@ function TimelineRow({
   const c = parse(m.content);
 
   if (m.kind === "tool") {
-    return <ToolRow m={m} />;
+    const content = parse(m.content);
+    const name = typeof content.name === "string" ? content.name : "tool";
+    const summary = typeof content.summary === "string" ? content.summary : "";
+    const output = typeof content.output === "string" ? content.output : "";
+    const inputText = formatToolValue(content.input);
+    const status = deriveToolStatus(m, content);
+    const Icon = toolIcon(name);
+    const labelKey = status === "streaming" ? toolLabelKey(name) : toolDoneLabelKey(name);
+    const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
+    const { target, added, removed } = compactToolTarget(name, summary);
+    return (
+      <Tool
+        icon={Icon}
+        label={generic ? cleanToolName(name) : t(labelKey)}
+        summary={summary}
+        status={status}
+        target={target}
+        added={added}
+        removed={removed}
+        input={inputText}
+        output={output}
+        inputLabel={t("tool.input")}
+        outputLabel={t("tool.output")}
+        showMoreLabel={(hiddenLineCount) => t("tool.showMore", { n: hiddenLineCount })}
+        showLessLabel={t("tool.showLess")}
+      />
+    );
   }
 
   if (m.kind === "action_card") {
@@ -575,14 +526,7 @@ function TimelineRow({
     if (variant === "permission") {
       const summary = typeof v.summary === "string" ? v.summary : "";
       const answer = typeof v.answer === "string" ? v.answer : "allow";
-      const key =
-        answer === "deny"
-          ? "settled.permissionDeny"
-          : answer === "always"
-            ? "settled.permissionAlways"
-            : answer === "full"
-              ? "settled.permissionFull"
-              : "settled.permissionAllow";
+      const key = permissionAnswerLabelKeys[permissionAnswerOf(answer)];
       return <SettledLine label={t(key, { summary })} />;
     }
     if (variant === "ask") {
@@ -608,6 +552,14 @@ function TimelineRow({
 
   if (m.kind === "proposal") {
     const count = Number(c.count ?? 0);
+    // Count 0 = a withdraw/cancel (the lead's cancel_directions, or a stray empty
+    // propose routed to withdraw). Render a settled "已撤回" line, never the
+    // interactive "查看并创建" card — that opened a dead-end empty ScopeReview.
+    if (count === 0) {
+      return (
+        <SettledLine label={t("lead.proposalWithdrawn", { rationale: String(c.rationale ?? "") })} />
+      );
+    }
     // A proposal card is "open" (interactive) only while it is the latest
     // proposal AND its live plan is still awaiting review. Once confirmed (or
     // superseded by a re-propose, or replayed in a worker host with no live
@@ -649,20 +601,20 @@ function TimelineRow({
   }
 
   if (m.role === "user") {
-    const images = Array.isArray(c.images) ? (c.images as string[]) : [];
-    const files = Array.isArray(c.files) ? (c.files as string[]) : [];
+    const images = stringArray(c.images);
+    const files = stringArray(c.files);
     const text = String(c.text ?? "");
     return (
-      <div className="group flex flex-col items-end">
+      <Message role="user">
         <div className="flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5">
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
-              {images.map((src, i) => (
-                <img
-                  key={i}
+              {images.map((src, imageIndex) => (
+                <Attachment
+                  key={`${src}-${imageIndex}`}
+                  kind="image"
+                  label={t("lead.imageAttachment", { count: imageIndex + 1 })}
                   src={src}
-                  alt=""
-                  className="max-h-32 rounded-[var(--radius-md)] border border-border object-cover"
                 />
               ))}
             </div>
@@ -670,13 +622,11 @@ function TimelineRow({
           {files.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {files.map((f) => (
-                <span
+                <Attachment
                   key={f}
-                  className="inline-flex items-center gap-1 rounded-full bg-bg px-2 py-0.5 font-mono text-[10.5px] text-ink-muted"
-                >
-                  <FileText size={10} className="shrink-0" />
-                  {f.split("/").pop()}
-                </span>
+                  kind="file"
+                  label={f}
+                />
               ))}
             </div>
           )}
@@ -690,43 +640,40 @@ function TimelineRow({
           )}
         </div>
         {text && <CopyMessageButton text={text} align="end" />}
-      </div>
+      </Message>
     );
   }
 
   // assistant / system text
   const terminal = typeof c.terminal === "string" ? c.terminal : "";
-  const assistantText =
-    terminal === "error_before_output"
-      ? t("lead.terminalErrorBeforeOutput")
-      : terminal === "interrupted_before_output"
-        ? t("lead.terminalInterruptedBeforeOutput")
-        : String(c.text ?? "");
+  let assistantText: string;
+  if (terminal === "error_before_output") {
+    assistantText = t("lead.terminalErrorBeforeOutput");
+  } else if (terminal === "interrupted_before_output") {
+    assistantText = t("lead.terminalInterruptedBeforeOutput");
+  } else {
+    assistantText = String(c.text ?? "");
+  }
   return (
-    <div className="group flex items-start gap-2.5">
-      <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
-        <Sparkles size={14} />
-      </span>
-      <div className="flex min-w-0 flex-1 flex-col">
-        <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
-          {assistantText && (
-            <Markdown text={assistantText} cwd={cwd} caret={m.status === "streaming"} />
-          )}
-          {m.status === "streaming" && !assistantText && (
-            <span className={STREAM_CARET_CLASS} />
-          )}
-          {m.status === "interrupted" && (
-            <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>
-          )}
-          {m.status === "error" && (
-            <p className="mt-1.5 text-[11px] text-danger">{t("lead.errored")}</p>
-          )}
-        </div>
-        {assistantText && m.status !== "streaming" && (
-          <CopyMessageButton text={assistantText} align="start" />
+    <Message role="assistant">
+      <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
+        {assistantText && (
+          <Markdown text={assistantText} cwd={cwd} caret={m.status === "streaming"} />
+        )}
+        {m.status === "streaming" && !assistantText && (
+          <span className={STREAM_CARET_CLASS} />
+        )}
+        {m.status === "interrupted" && (
+          <p className="mt-1.5 text-[11px] text-waiting">{t("lead.interrupted")}</p>
+        )}
+        {m.status === "error" && (
+          <p className="mt-1.5 text-[11px] text-danger">{t("lead.errored")}</p>
         )}
       </div>
-    </div>
+      {assistantText && m.status !== "streaming" && (
+        <CopyMessageButton text={assistantText} align="start" />
+      )}
+    </Message>
   );
 }
 
@@ -744,9 +691,9 @@ function isActionCardAction(value: unknown): value is ActionCardAction {
  * Per-message copy affordance: a small icon button under a chat bubble, revealed
  * on hover of the row (the parent carries `group`) or on keyboard focus. The
  * action row reserves a fixed height even while hidden so hovering never changes
- * row geometry — Virtuoso measures rows by height, and a hover-driven reflow
- * would jump the scroll position. Copies the raw message text (markdown source
- * for assistant turns), matching the rest of the app's clipboard affordances.
+ * row geometry and a hover-driven reflow can't jump the scroll position. Copies
+ * the raw message text (markdown source for assistant turns), matching the rest
+ * of the app's clipboard affordances.
  */
 function CopyMessageButton({ text, align }: { text: string; align: "start" | "end" }) {
   const { t } = useTranslation();

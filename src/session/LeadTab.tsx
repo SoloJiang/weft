@@ -170,7 +170,7 @@ export function LeadTab({
   };
 
   return (
-    <div className="flex min-h-0 flex-1">
+    <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
         {!compact && (
           <header className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2">
@@ -221,7 +221,7 @@ export function LeadTab({
           localSlash={localSlash}
           onLocalSlash={onLocalSlash}
           busy={turn.state === "busy"}
-          queue={turn.queue}
+          queued={turn.queue.length}
           onSend={(text, images, files) =>
             sendLeadChat(tid, text, images, files)
           }

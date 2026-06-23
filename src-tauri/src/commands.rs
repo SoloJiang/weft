@@ -147,6 +147,11 @@ async fn register_repo(
             // forced and would skip an unchanged classified repo, dropping the failure
             // with no retry.
             crate::curator::clear_failure(r.id);
+            // The auto pass reads the PERSISTED analysis_state (not just the
+            // in-memory map), so clearing only memory would leave the DB column at
+            // "failed" — the non-forced add-pass would skip the now-valid repo and
+            // it would render as failed indefinitely. Persist "idle" too.
+            let _ = repo::set_analysis_state(db, r.id, "idle", None).await;
         }
     }
     // The curator is agent-only now (ARCHITECTURE §4.9): there is no deterministic
@@ -291,6 +296,13 @@ pub async fn open_curator_chat(db: State<'_, Db>, workspace_id: i32) -> R<i32> {
     repo::ensure_curator_thread(&db, workspace_id, &tool)
         .await
         .map_err(e)
+}
+
+/// Return the analyst-synthesized markdown repo-map for a workspace, or `None`
+/// when no analysis has produced one yet.
+#[tauri::command]
+pub async fn get_repo_map_doc(db: State<'_, Db>, workspace_id: i32) -> R<Option<String>> {
+    repo::get_repo_map_doc(&db, workspace_id).await.map_err(e)
 }
 
 /// Remove a repo from its workspace: delete Weft's reference, the repo's
@@ -690,13 +702,6 @@ pub async fn set_direction_target_branch(
     repo::set_direction_target_branch(&db, direction_id, &target)
         .await
         .map_err(e)
-}
-
-/// Observe-mode (§4.4): the agent's own transcript, normalized to app-native
-/// events so the chat view never depends on rendering the live TUI.
-#[tauri::command]
-pub async fn read_transcript(cwd: String, tool: String) -> R<Vec<crate::sidecar::NormEvent>> {
-    Ok(crate::sidecar::read_transcript(std::path::Path::new(&cwd), &tool).await)
 }
 
 /// A worktree row plus whether its directory is still present on disk. The board
