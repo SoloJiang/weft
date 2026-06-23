@@ -76,6 +76,12 @@ pub(crate) fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
         .collect()
 }
 
+/// How many user-visible (tracked) messages are queued — what the cap counts.
+/// Hidden plumbing deliveries (queue_id == None) are excluded.
+fn visible_queued(turn: &TurnState) -> usize {
+    turn.queue.iter().filter(|o| o.queue_id.is_some()).count()
+}
+
 /// Incremental pushes to the frontend. snake_case-tagged to match the TS side.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1283,7 +1289,9 @@ pub async fn send(
     let is_command = text.trim_start().starts_with('/');
     let kind = if is_command { "command" } else { "text" };
     let direct = inner.turn.try_begin_send();
-    if !direct && inner.turn.queue.len() >= MAX_QUEUED {
+    // Count only tracked (user-visible) items: hidden plumbing deliveries
+    // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
+    if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
         return Err(anyhow::anyhow!("queue_full"));
     }
     if direct {
@@ -3539,6 +3547,19 @@ mod tests {
         // Deleting C (index 1, == wake index, not before) leaves the wake put.
         assert!(t.remove(3));
         assert_eq!(t.bus_read_pos, Some(1));
+    }
+
+    #[test]
+    fn cap_counts_only_visible_items() {
+        let mut t = TurnState::default();
+        // 4 visible user sends + 1 hidden plumbing delivery interleaved.
+        t.queue.push_back(Outgoing { queue_id: Some(1), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: None, tracked: false, ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(2), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(3), ..Default::default() });
+        t.queue.push_back(Outgoing { queue_id: Some(4), ..Default::default() });
+        assert_eq!(t.queue.len(), 5);
+        assert_eq!(visible_queued(&t), 4, "hidden delivery must not eat the cap budget");
     }
 
     /// queue_edit must preserve images/files in the persisted row; only text changes.

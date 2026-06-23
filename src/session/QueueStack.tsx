@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Reorder } from "motion/react";
-import { GripVertical, Pencil, X } from "lucide-react";
+import { GripVertical, Image as ImageIcon, Pencil, X } from "lucide-react";
 import type { QueuedItem } from "../lib/types";
 import { useImeComposition } from "../lib/useImeComposition";
 
@@ -62,10 +62,21 @@ function QueueRowText({
   const [val, setVal] = useState(item.text);
   const { composition, isComposing } = useImeComposition();
 
+  // An attachment-only queued send (e.g. a pasted image, no prose) has empty text;
+  // show a badge so it isn't a blank, indistinguishable row.
+  const hasText = item.text.trim().length > 0;
+
   if (!editing) {
     return (
       <>
-        <span className="min-w-0 flex-1 truncate text-[12px] text-ink">{item.text}</span>
+        {hasText ? (
+          <span className="min-w-0 flex-1 truncate text-[12px] text-ink">{item.text}</span>
+        ) : (
+          <span className="inline-flex min-w-0 flex-1 items-center gap-1 truncate text-[12px] text-ink-faint">
+            <ImageIcon size={12} className="shrink-0" />
+            {t("lead.queueAttachmentOnly", { count: Math.max(item.images, 1) })}
+          </span>
+        )}
         <button
           onClick={() => {
             setVal(item.text);

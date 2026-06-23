@@ -254,6 +254,7 @@ export const en = {
     queueEdit: "Edit",
     queueDelete: "Delete",
     queueDrag: "Reorder",
+    queueAttachmentOnly: "{{count}} image",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",

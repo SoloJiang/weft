@@ -249,6 +249,7 @@ export const zh = {
     queueEdit: "编辑",
     queueDelete: "删除",
     queueDrag: "拖动重排",
+    queueAttachmentOnly: "{{count}} 张图片",
   },
   scope: {
     addReposFirst: "请先往这个工作区添加仓库。",
