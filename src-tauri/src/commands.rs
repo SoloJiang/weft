@@ -287,8 +287,11 @@ pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<(
 }
 
 /// Append a message to a thread's timeline from outside the chat engine (used by
-/// the deterministic analysis mirror). `role` is "user" or "assistant"; assistant
-/// rows start "streaming" so a later finalize can replace their text in place.
+/// the deterministic analysis mirror). `role` is "user" or "assistant". Rows are
+/// inserted "complete" — NOT "streaming" — because no lead engine is busy for this
+/// synthetic turn, so `list_lead_messages`' stale-streaming cleanup would otherwise
+/// flip a "streaming" row to "interrupted" the moment the panel mounts. A later
+/// `curator_finalize_message` replaces the body in place (the row is still mutable).
 #[tauri::command]
 pub async fn curator_append_message(
     db: State<'_, Db>,
@@ -296,10 +299,9 @@ pub async fn curator_append_message(
     role: String,
     text: String,
 ) -> R<i32> {
-    let turn = repo::next_lead_turn_id(&db, thread_id).await.map_err(e)?;
+    let turn = repo::next_turn_id(&db, thread_id).await.map_err(e)?;
     let content = serde_json::json!({ "text": text }).to_string();
-    let status = if role == "assistant" { "streaming" } else { "complete" };
-    let m = repo::insert_lead_message(&db, thread_id, None, turn, &role, "text", &content, status)
+    let m = repo::insert_lead_message(&db, thread_id, None, turn, &role, "text", &content, "complete")
         .await
         .map_err(e)?;
     if let Some(app) = crate::APP_HANDLE.get() {
@@ -312,8 +314,8 @@ pub async fn curator_append_message(
     Ok(m.id)
 }
 
-/// Replace a streaming curator message's body with a final summary and mark it
-/// complete (pairs with curator_append_message for the "running → done" line).
+/// Replace the running curator message's body with a final summary, in place
+/// (pairs with curator_append_message for the "running → done" line).
 #[tauri::command]
 pub async fn curator_finalize_message(
     db: State<'_, Db>,

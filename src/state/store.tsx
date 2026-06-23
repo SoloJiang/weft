@@ -359,8 +359,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
-  const [analyzing, setAnalyzing] = useState(false);
-  const analyzingRef = useRef(false);
+  // In-flight dependency analyses, keyed by workspace — the backend serializes per
+  // workspace, so workspace B must not be gated by A's run. `analyzing` exposed in
+  // the context value is derived for the ACTIVE workspace; the ref backs the
+  // synchronous dedup guard.
+  const [analyzingWs, setAnalyzingWs] = useState<ReadonlySet<number>>(() => new Set());
+  const analyzingWsRef = useRef<Set<number>>(new Set());
+  const markAnalyzing = useCallback((ws: number, on: boolean) => {
+    if (on) analyzingWsRef.current.add(ws);
+    else analyzingWsRef.current.delete(ws);
+    setAnalyzingWs(new Set(analyzingWsRef.current));
+  }, []);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
@@ -1722,13 +1731,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // The single Analyze entry: open the curator, mirror a trigger message into
   // its thread, run the real pipeline, then finalize the running line to a summary
-  // (or a failure note if the pass errors). `analyzingRef` dedups concurrent
-  // clicks; `analyzing` syncs every button's spinner.
+  // (or a failure note if the pass errors). The per-workspace `analyzingWsRef`
+  // dedups concurrent clicks; the derived `analyzing` syncs the active view's spinner.
   const reanalyzeDeps = useCallback(async () => {
     const ws = activeWorkspaceId;
-    if (ws == null || analyzingRef.current) return;
-    analyzingRef.current = true;
-    setAnalyzing(true);
+    if (ws == null || analyzingWsRef.current.has(ws)) return;
+    markAnalyzing(ws, true);
     let runningId: number | null = null;
     let tid: number | null = null;
     try {
@@ -1753,17 +1761,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         await api.analyzeWorkspaceDeps(ws);
       } catch {
-        // Pipeline failed: don't leave the running line streaming forever.
+        // Pipeline failed: close the running line so it doesn't read as unfinished.
         if (tid != null && runningId != null) {
           await api.curatorFinalizeMessage(tid, runningId, i18n.t("repomap.analysisFailed"));
         }
         return; // `finally` still clears the spinner
       }
-      // Switched workspaces mid-run → don't write ws's graph into another view.
-      if (activeWorkspaceIdRef.current !== ws) return;
+      // ws's curator line still needs its completion summary even if the user
+      // switched away (it belongs to ws's thread); only the visible graph write is
+      // gated on ws still being the active view.
       const g = await api.repoGraph(ws);
-      setRepoProfiles(g.nodes);
-      setRepoEdges(g.edges);
+      if (activeWorkspaceIdRef.current === ws) {
+        setRepoProfiles(g.nodes);
+        setRepoEdges(g.edges);
+      }
       if (tid != null && runningId != null) {
         await api.curatorFinalizeMessage(
           tid,
@@ -1772,10 +1783,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         );
       }
     } finally {
-      analyzingRef.current = false;
-      setAnalyzing(false);
+      markAnalyzing(ws, false);
     }
-  }, [activeWorkspaceId, openCurator, loadLeadChat]);
+  }, [activeWorkspaceId, openCurator, loadLeadChat, markAnalyzing]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
@@ -2244,7 +2254,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshRepoMap,
     refreshReposAndMap,
     reprofileRepo,
-    analyzing,
+    analyzing: activeWorkspaceId != null && analyzingWs.has(activeWorkspaceId),
     reanalyzeDeps,
     deleteRepo,
     curatorThreadId,
