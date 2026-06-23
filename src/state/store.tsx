@@ -2150,6 +2150,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [activeThreadId, directionsByThread, reviveDirection]);
 
+  // The active workspace's hidden curator thread, resolved from `threads` (NOT the
+  // lazily-ensured `curatorThreadId`, which selectWorkspace clears on switch) so the
+  // Analyze entries stay disabled while its turn is busy even right after a switch.
+  const activeCuratorTid =
+    activeWorkspaceId == null
+      ? null
+      : (threads.find((th) => th.kind === "curator" && th.workspace_id === activeWorkspaceId)?.id ??
+        null);
+  const analyzing = activeCuratorTid != null && leadTurn[activeCuratorTid]?.state === "busy";
+
   const value: Store = {
     workspaces,
     activeWorkspaceId,
@@ -2226,7 +2236,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshReposAndMap,
     reprofileRepo,
     reanalyzeDeps,
-    analyzing: curatorThreadId != null && leadTurn[curatorThreadId]?.state === "busy",
+    analyzing,
     deleteRepo,
     curatorThreadId,
     ensureCuratorThread,
