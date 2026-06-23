@@ -146,13 +146,11 @@ pub async fn lead_engine(
     thread_id: i32,
     lang: &str,
 ) -> anyhow::Result<EngineRef> {
+    let t = repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let state = app.state::<LeadChatState>();
     if let Some(e) = state.get(lead_key(thread_id)) {
         return Ok(e);
     }
-    let t = repo::get_thread(db, thread_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
     let cwd = ensure_lead_cwd(thread_id)?;
     let base = app.state::<crate::BusBase>().0.clone();
     let is_concierge = t.kind == "concierge";
@@ -922,14 +920,11 @@ pub(crate) async fn chat_open_worker_impl(
     repo_id: i32,
     lang: &str,
 ) -> anyhow::Result<SessionInfo> {
-    use sea_orm::EntityTrait;
     let wt = repo::worktree_for(db, direction_id, repo_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no materialized worktree for that direction+repo"))?;
-    let dir = crate::store::entities::direction::Entity::find_by_id(direction_id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("direction not found"))?;
+    let dir = repo::ensure_direction_workspace_accepts_writes(db, direction_id).await?;
+    repo::ensure_repo_workspace_accepts_writes(db, repo_id).await?;
     let cwd = std::path::PathBuf::from(&wt.path);
     // A worktree row can outlive its directory (reclaimed via the Done-card
     // delete, or removed out of band). Never spawn a worker in a missing cwd —
@@ -971,6 +966,7 @@ pub(crate) async fn chat_open_worker_impl(
 
     let state = app.state::<LeadChatState>();
     let key = sess.id as i64;
+    repo::ensure_thread_workspace_accepts_writes(db, dir.thread_id).await?;
     let eng = match state.get(key) {
         Some(e) => e,
         None => {
@@ -1050,18 +1046,15 @@ pub(crate) async fn chat_open_worker_impl(
 /// Get-or-rebuild a worker's engine from its session row — so a chat worker
 /// survives app restarts the same way the lead does: sending resumes it.
 async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Result<EngineRef> {
+    let sess = repo::get_session(db, session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no such session"))?;
+    let dir = repo::ensure_direction_workspace_accepts_writes(db, sess.direction_id).await?;
+    repo::ensure_repo_workspace_accepts_writes(db, sess.repo_id).await?;
     let state = app.state::<LeadChatState>();
     if let Some(e) = state.get(session_id as i64) {
         return Ok(e);
     }
-    use sea_orm::EntityTrait;
-    let sess = repo::get_session(db, session_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no such session"))?;
-    let dir = crate::store::entities::direction::Entity::find_by_id(sess.direction_id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("direction not found"))?;
     let cwd = std::path::PathBuf::from(&sess.cwd);
     let base = app.state::<crate::BusBase>().0.clone();
     let inj = crate::bus::inject::inject(
