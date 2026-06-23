@@ -1446,6 +1446,13 @@ pub async fn sessions_for_thread(db: &Db, thread_id: i32) -> Result<Vec<session:
         .await?)
 }
 
+pub async fn sessions_for_repo(db: &Db, repo_id: i32) -> Result<Vec<session::Model>> {
+    Ok(session::Entity::find()
+        .filter(session::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?)
+}
+
 // ---- chat timeline (lead console + chat-mode workers) ----
 
 #[allow(clippy::too_many_arguments)]

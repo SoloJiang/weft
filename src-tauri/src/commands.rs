@@ -28,7 +28,12 @@ pub async fn rename_workspace(
 }
 
 #[tauri::command]
-pub async fn delete_workspace(db: State<'_, Db>, workspace_id: i32) -> R<()> {
+pub async fn delete_workspace(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<()> {
+    stop_workspace_engines(&app, &db, workspace_id).await?;
     let repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(&db, workspace_id)
         .await
         .map_err(e)?
@@ -60,6 +65,39 @@ pub async fn delete_workspace(db: State<'_, Db>, workspace_id: i32) -> R<()> {
         }
     }
     Ok(())
+}
+
+async fn stop_workspace_engines(app: &tauri::AppHandle, db: &Db, workspace_id: i32) -> R<()> {
+    let state = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let keys = workspace_engine_keys(db, workspace_id).await?;
+    for key in keys {
+        if let Some(eng) = state.get(key) {
+            crate::lead_chat::engine::stop(app, &eng).await;
+        }
+    }
+    Ok(())
+}
+
+async fn workspace_engine_keys(
+    db: &Db,
+    workspace_id: i32,
+) -> R<std::collections::BTreeSet<i64>> {
+    let threads = repo::list_threads(db, workspace_id).await.map_err(e)?;
+    let repos = repo::list_repos(db, workspace_id).await.map_err(e)?;
+    let mut keys = std::collections::BTreeSet::<i64>::new();
+
+    for thread in &threads {
+        keys.insert(crate::lead_chat::commands::lead_key(thread.id));
+        for session in repo::sessions_for_thread(db, thread.id).await.map_err(e)? {
+            keys.insert(session.id as i64);
+        }
+    }
+    for repo in &repos {
+        for session in repo::sessions_for_repo(db, repo.id).await.map_err(e)? {
+            keys.insert(session.id as i64);
+        }
+    }
+    Ok(keys)
 }
 
 #[tauri::command]
@@ -1983,5 +2021,70 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn workspace_engine_keys_cover_workspace_leads_workers_and_repo_sessions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "web task",
+            "claude",
+            repo_ref.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let keep_direction = repo::create_direction(
+            &db,
+            keep_thread.id,
+            "api task",
+            "claude",
+            keep_repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        let worker = repo::create_session(&db, direction.id, repo_ref.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        let keep_worker =
+            repo::create_session(&db, keep_direction.id, keep_repo.id, "claude", "/tmp/keep")
+                .await
+                .unwrap();
+        let repo_scoped_worker =
+            repo::create_session(&db, keep_direction.id, repo_ref.id, "claude", "/tmp/orphan")
+                .await
+                .unwrap();
+
+        let keys = workspace_engine_keys(&db, ws.id).await.unwrap();
+
+        let expected = std::collections::BTreeSet::from([
+            crate::lead_chat::commands::lead_key(thread.id),
+            worker.id as i64,
+            repo_scoped_worker.id as i64,
+        ]);
+        assert_eq!(keys, expected);
+        assert!(!keys.contains(&crate::lead_chat::commands::lead_key(keep_thread.id)));
+        assert!(!keys.contains(&(keep_worker.id as i64)));
     }
 }
