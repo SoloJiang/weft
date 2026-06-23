@@ -117,7 +117,7 @@ export function ChatTimeline({
         increaseViewportBy={{ top: 600, bottom: 600 }}
         components={{ Header, Footer }}
         itemContent={(_index, m) => (
-          <div className="mx-auto w-full max-w-[820px] px-4 pb-2.5">
+          <div className="mx-auto w-full min-w-0 max-w-[820px] px-4 pb-2.5">
             <TimelineRow
               m={m}
               all={visible}
@@ -646,7 +646,7 @@ function TimelineRow({
   }
   return (
     <Message role="assistant">
-      <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
+      <div className="min-w-0 max-w-full overflow-hidden rounded-[var(--radius-lg)] border border-border bg-surface px-3.5 py-3 shadow-[0_12px_34px_-28px_rgba(0,0,0,0.65)]">
         {assistantText && <Markdown text={assistantText} cwd={cwd} />}
         {m.status === "streaming" && (
           <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse rounded bg-brand align-text-bottom" />
