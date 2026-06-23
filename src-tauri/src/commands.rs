@@ -286,6 +286,60 @@ pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<(
     Ok(())
 }
 
+/// Append a message to a thread's timeline from outside the chat engine (used by
+/// the deterministic analysis mirror). `role` is "user" or "assistant"; assistant
+/// rows start "streaming" so a later finalize can replace their text in place.
+#[tauri::command]
+pub async fn curator_append_message(
+    db: State<'_, Db>,
+    thread_id: i32,
+    role: String,
+    text: String,
+) -> R<i32> {
+    let turn = repo::next_lead_turn_id(&db, thread_id).await.map_err(e)?;
+    let content = serde_json::json!({ "text": text }).to_string();
+    let status = if role == "assistant" { "streaming" } else { "complete" };
+    let m = repo::insert_lead_message(&db, thread_id, None, turn, &role, "text", &content, status)
+        .await
+        .map_err(e)?;
+    if let Some(app) = crate::APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = app.emit(
+            crate::lead_chat::engine::EVENT,
+            crate::lead_chat::engine::Push::Message { thread_id, message: m.clone() },
+        );
+    }
+    Ok(m.id)
+}
+
+/// Replace a streaming curator message's body with a final summary and mark it
+/// complete (pairs with curator_append_message for the "running → done" line).
+#[tauri::command]
+pub async fn curator_finalize_message(
+    db: State<'_, Db>,
+    thread_id: i32,
+    message_id: i32,
+    text: String,
+) -> R<()> {
+    let content = serde_json::json!({ "text": text }).to_string();
+    repo::update_lead_message(&db, message_id, &content, "complete")
+        .await
+        .map_err(e)?;
+    if let Some(app) = crate::APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = app.emit(
+            crate::lead_chat::engine::EVENT,
+            crate::lead_chat::engine::Push::Finalize {
+                thread_id,
+                message_id,
+                status: "complete".into(),
+                content: Some(text),
+            },
+        );
+    }
+    Ok(())
+}
+
 /// Get-or-create this workspace's hidden curator-chat thread and return its id,
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]
