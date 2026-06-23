@@ -360,6 +360,11 @@ fn curator_specs() -> Value {
                 "via": { "type": "string" },
                 "action": { "type": "string", "enum": ["add", "remove"] }
             }, "required": ["from", "to", "kind", "action"] }
+        },
+        {
+            "name": "reanalyze",
+            "description": "Run a fresh dependency-analysis pass over the WHOLE workspace: re-classify each repo (tier/stack/summary) and re-infer cross-repo runtime/infra edges, then regenerate the map. Call this when the human asks to re-analyze / regenerate the repo map (e.g. after repos changed). Takes no arguments; returns when the pass completes, with the resulting repo/edge counts. Human-pinned edges survive the pass.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ])
 }
@@ -371,8 +376,50 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "calibrate_edges" => calibrate_edges_tool(db, thread, args).await,
+        "reanalyze" => match reanalyze_tool(db, thread).await {
+            Ok(v) => text_result(v),
+            Err(e) => text_result(format!("error: {e}")),
+        },
         _ => text_result(format!("unknown tool {name}")),
     }
+}
+
+/// Run a full workspace analysis pass for the curator's workspace and return a
+/// summary. Awaited inline (NOT detached) so the agent's turn stays busy for the
+/// pass's whole duration — subsequent user messages queue, and the UI's `analyzing`
+/// flag (derived from the lead turn) accurately tracks it. A detached spawn would
+/// outlive an interrupted/timed-out turn while still holding the coalescing gate,
+/// re-enabling the Analyze buttons mid-pass and inviting a duplicate forced run;
+/// awaiting inline means an interrupted turn drops the pass with it (the gate's lock
+/// is an RAII guard, so it releases cleanly and the next trigger re-runs).
+async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
+    let t = crate::store::repo::get_thread(db, thread)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
+    if t.kind != "curator" {
+        anyhow::bail!("reanalyze is only available in the curator chat");
+    }
+    let ws_id = t.workspace_id;
+    // Every tracked repo's checkout gone → the pass filters them all out and would
+    // analyze nothing, leaving the stale graph to read as a clean "complete". Tell
+    // the human instead (matches the behavior of the removed analyze command).
+    let repos = crate::store::repo::list_repos(db, ws_id).await?;
+    if !repos.is_empty()
+        && !repos
+            .iter()
+            .any(|r| std::path::Path::new(&r.local_git_path).exists())
+    {
+        return Ok("Could not re-analyze: every repository's checkout is missing on disk \
+                   (moved or deleted). Restore the repos and try again."
+            .to_string());
+    }
+    crate::curator::analyze_workspace_coalesced(db, ws_id, true).await;
+    let g = crate::curator::graph(db, ws_id).await?;
+    Ok(format!(
+        "Re-analysis complete: {} repos, {} dependency links. The repo map has been refreshed.",
+        g.nodes.len(),
+        g.edges.len()
+    ))
 }
 
 /// Like `repo_map_json`, but every node carries its full `local_git_path` — the

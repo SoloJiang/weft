@@ -24,8 +24,12 @@ export function Message({
       )}
       <div
         className={cn(
-          "flex min-w-0 flex-col",
-          role === "user" ? "items-end" : "flex-1 items-start",
+          // flex-1 on BOTH roles: the column needs a definite width, else its
+          // nested-flex bubble + break-words text collapses to min-content (one
+          // char per line) under WKWebView. items-end still right-aligns the user
+          // bubble within the full-width column.
+          "flex min-w-0 flex-1 flex-col",
+          role === "user" ? "items-end" : "items-start",
         )}
       >
         {children}

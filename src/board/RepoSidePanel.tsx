@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
-import { X, RefreshCw, Check, AlertTriangle } from "lucide-react";
-import { useStore, type AnalysisOutcome } from "../state/store";
+import { X, RefreshCw } from "lucide-react";
+import { useStore } from "../state/store";
 import { LeadTab } from "../session/LeadTab";
 import { RepoDetailContent } from "./RepoGraph";
 import { Markdown } from "../components/Markdown";
@@ -140,7 +140,7 @@ type CuratorView = "chat" | "map";
 /** The curator surface, kept mounted across switches; `hidden` when inactive. */
 function CuratorBody({ active, threadId }: { active: boolean; threadId: number | null }) {
   const { t } = useTranslation();
-  const { activeWorkspaceId, reanalyzeDeps, analyzing, analysisOutcome } = useStore();
+  const { activeWorkspaceId, reanalyzeDeps, analyzing } = useStore();
   const [view, setView] = useState<CuratorView>("chat");
   const [mapDoc, setMapDoc] = useState<string | null | undefined>(undefined);
 
@@ -193,7 +193,10 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
         <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
           <p className="text-[12px] text-ink-faint">{t("repomap.mapEmpty")}</p>
           <button
-            onClick={() => void reanalyzeDeps()}
+            onClick={() => {
+              setView("chat");
+              void reanalyzeDeps();
+            }}
             disabled={analyzing}
             className="flex items-center gap-1.5 rounded-[var(--radius-md)] bg-brand-ghost px-3 py-1.5 text-[11.5px] font-medium text-brand transition-colors hover:bg-brand/20 disabled:opacity-50"
           >
@@ -207,7 +210,10 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
       <div className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-3">
         <div className="mb-3 flex justify-end">
           <button
-            onClick={() => void reanalyzeDeps()}
+            onClick={() => {
+              setView("chat");
+              void reanalyzeDeps();
+            }}
             disabled={analyzing}
             title={t("repomap.reanalyze")}
             className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-faint transition-colors hover:bg-raised hover:text-ink disabled:opacity-50"
@@ -223,9 +229,6 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
 
   return (
     <div className={cn("min-h-0 flex-1 flex-col", active ? "flex" : "hidden")}>
-      {/* Non-conversational analysis status (NOT a chat row): the curator is the home
-          of analysis, so its progress/result shows here, above both sub-tabs. */}
-      <AnalysisStatusStrip analyzing={analyzing} outcome={analysisOutcome} />
       {/* chat / map segmented toggle */}
       <div className="flex shrink-0 gap-0.5 border-b border-border px-3 py-1.5">
         <button
@@ -259,6 +262,13 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
             threadId={threadId}
             compact
             composePlaceholder={t("repomap.curatorCompose")}
+            emptyState={
+              <div className="flex flex-1 items-center justify-center px-6 text-center">
+                <p className="max-w-[420px] text-[12px] leading-relaxed text-ink-faint">
+                  {t("repomap.curatorEmpty")}
+                </p>
+              </div>
+            }
             onReview={() => {}}
           />
         ) : (
@@ -274,57 +284,6 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
           {renderMapBody()}
         </div>
       )}
-    </div>
-  );
-}
-
-type AnalysisStatusKind = "running" | "done" | "failed";
-
-/** One discriminated status from the run-state + last outcome (null = show nothing). */
-function analysisStatusKind(
-  analyzing: boolean,
-  outcome: AnalysisOutcome | null,
-): AnalysisStatusKind | null {
-  if (analyzing) return "running";
-  if (!outcome) return null;
-  return outcome.state;
-}
-
-/** A thin, non-conversational status line for the dependency-analysis pass — the
- *  curator panel's record of analysis (deliberately NOT a chat message). Coarse by
- *  design: "ran" vs "failed to run"; per-repo detail lives on the graph nodes. */
-function AnalysisStatusStrip({
-  analyzing,
-  outcome,
-}: {
-  analyzing: boolean;
-  outcome: AnalysisOutcome | null;
-}) {
-  const { t } = useTranslation();
-  const kind = analysisStatusKind(analyzing, outcome);
-  if (kind == null) return null;
-  const view: Record<AnalysisStatusKind, { icon: ReactNode; text: string; tone: string }> = {
-    running: {
-      icon: <RefreshCw size={11} className="shrink-0 animate-spin text-brand" />,
-      text: t("repomap.analysisRunning"),
-      tone: "text-ink-muted",
-    },
-    done: {
-      icon: <Check size={12} className="shrink-0 text-running" />,
-      text: t("repomap.analysisDone"),
-      tone: "text-ink-muted",
-    },
-    failed: {
-      icon: <AlertTriangle size={11} className="shrink-0 text-danger" />,
-      text: t("repomap.analysisFailed"),
-      tone: "text-danger",
-    },
-  };
-  const v = view[kind];
-  return (
-    <div className="flex shrink-0 items-center gap-1.5 border-b border-border bg-surface px-3 py-1.5 text-[11px]">
-      {v.icon}
-      <span className={cn("min-w-0 truncate", v.tone)}>{v.text}</span>
     </div>
   );
 }

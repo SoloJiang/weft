@@ -272,32 +272,6 @@ pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     Ok(())
 }
 
-/// Manually re-run the agent dependency curator over a workspace (the same
-/// read-only pass that fires after each add). Returns when it completes so the
-/// caller can refresh the graph; coalesced with any in-flight pass.
-#[tauri::command]
-pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
-    // An EXPLICIT user re-run: `force` so repos whose last classify failed are
-    // retried even if unchanged (the auto anti-storm skip otherwise ignores them).
-    // A failed repo whose checkout is gone is still filtered out by the pass and
-    // keeps its failed state — we no longer clear failures up front (that dropped
-    // such repos to a silent idle).
-    crate::curator::analyze_workspace_coalesced(&db, workspace_id, true).await;
-    // If every tracked repo's checkout is gone, the pass analyzes nothing yet the
-    // stale profiles still read as classified — surface that as an error so the UI
-    // reports a failed run instead of a misleading "map updated" (the frontend's
-    // catch maps a rejection to the failed status; the message itself isn't shown).
-    let repos = repo::list_repos(&db, workspace_id).await.map_err(e)?;
-    if !repos.is_empty()
-        && !repos
-            .iter()
-            .any(|r| std::path::Path::new(&r.local_git_path).exists())
-    {
-        return Err("all repository checkouts are missing on disk".to_string());
-    }
-    Ok(())
-}
-
 /// Get-or-create this workspace's hidden curator-chat thread and return its id,
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]

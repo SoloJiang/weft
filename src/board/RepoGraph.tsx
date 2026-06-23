@@ -367,7 +367,7 @@ export function RepoGraph() {
                 className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
               >
                 <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
-                {analyzing ? t("repomap.reanalyzing") : t("repomap.reanalyze")}
+                {t("repomap.reanalyze")}
               </button>
               {anyComponents && (
                 <div

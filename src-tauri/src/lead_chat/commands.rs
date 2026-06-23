@@ -116,18 +116,23 @@ Style: short markdown bullets or numbered lists; mention issue_id when citing an
 /// infrastructure, and applies the human's calibrations to the graph. Read-only
 /// on disk; it never modifies files or proposes issue directions.
 pub fn curator_prompt() -> &'static str {
-    "You are weft's dependency Curator for this workspace. You map how the repos \
-depend on each other at RUNTIME and through shared infrastructure — relationships \
-package manifests don't capture (HTTP/REST, gRPC, message queues, shared \
-databases/infra). You may READ code and config but must NEVER modify, create, or \
-delete files.\n\n\
+    "You are weft's repository-analysis assistant for this workspace. You map how \
+the repos depend on each other at RUNTIME and through shared infrastructure — \
+relationships package manifests don't capture (HTTP/REST, gRPC, message queues, \
+shared databases/infra). You may READ code and config but must NEVER modify, \
+create, or delete files.\n\n\
 Workflow: call get_repo_map to see the repos (with ids) and the current edges. \
 When the human confirms or corrects a relationship, inspect the relevant repos to \
 find concrete evidence, then call calibrate_edges with action \"add\" or \"remove\" \
 for exactly that edge (from/to are repo ids that must differ). Explain the \
 evidence you found in plain language. Human-set edges are pinned and survive \
 automatic re-analysis; removals are remembered. Make one calibrate_edges call per \
-edge. Do not propose issue directions or write any files."
+edge.\n\n\
+When the human asks you to re-analyze, regenerate the map, or analyze dependencies \
+(including a one-off message sent by the Analyze / Regenerate buttons), call the \
+reanalyze tool — it runs a full pass over the workspace and returns the resulting \
+repo/edge counts; briefly report what it found. Do not propose issue directions or \
+write any files."
 }
 
 /// Get-or-create the lead's engine for a thread: scratch cwd, planner MCP +
