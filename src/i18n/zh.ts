@@ -24,6 +24,7 @@ export const zh = {
     deleteThread: "删除 issue",
     renameThread: "重命名 issue",
     renameWorkspace: "重命名工作区",
+    deleteWorkspace: "删除工作区",
     collapseSidebar: "收起侧边栏",
     expandSidebar: "展开侧边栏",
     noThreads: "还没有 issue。新建一个开始。",
@@ -490,6 +491,12 @@ export const zh = {
     workspaceName: "名称",
     workspaceNamePlaceholder: "工作区名称",
     createWorkspace: "创建工作区",
+    deleteWorkspaceTitle: "删除工作区？",
+    deleteWorkspaceBody:
+      "将删除工作区“{{name}}”及其 issue、仓库引用、任务状态和 Weft 创建的 worktree。你的原始本地仓库不会被删除。",
+    deleteWorkspaceNameLabel: "输入 {{name}} 确认",
+    deleteWorkspaceConfirm: "删除工作区",
+    deletingWorkspace: "删除中…",
     addRepoTitle: "添加仓库",
     addRepoDesc: "引用本地仓库、克隆一个地址，或新建一个。",
     repoName: "名称",
@@ -747,6 +754,7 @@ export const zh = {
     renameDuplicate: "已有同名条目。",
     renameEmpty: "名称不能为空。",
     renameFailed: "重命名失败，请重试。",
+    deleteWorkspaceFailed: "删除工作区失败，请重试。",
     deleteWorktreeFailed: "删除 worktree 失败，请重试。",
   },
   ai: {

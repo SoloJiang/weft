@@ -20,6 +20,8 @@ pub const K_ENABLED: &str = "im.feishu.enabled";
 pub const K_REMOTE_STANDBY: &str = "im.remote_standby";
 /// 飞书 👀「看我看我」表情的 reaction key。
 const INBOUND_ACK_EMOJI: &str = "MeMeMe";
+const CONCIERGE_WORKSPACE_NAME: &str = "Concierge";
+const CONCIERGE_INTERNAL_WORKSPACE_NAME: &str = "Concierge (internal)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImProviderCapabilities {
@@ -168,6 +170,28 @@ async fn latest_pending_ack_message(
 /// (replying to an `om_*` message succeeds where the `omt_*` topic id would not).
 fn issue_topic_seed_key(thread_id: i32) -> String {
     format!("im.issue_topic_seed.{thread_id}")
+}
+
+fn unique_concierge_workspace_name(
+    workspaces: &[crate::store::entities::workspace::Model],
+) -> String {
+    if !workspaces.iter().any(|workspace| workspace.name == CONCIERGE_WORKSPACE_NAME) {
+        return CONCIERGE_WORKSPACE_NAME.to_string();
+    }
+    if !workspaces
+        .iter()
+        .any(|workspace| workspace.name == CONCIERGE_INTERNAL_WORKSPACE_NAME)
+    {
+        return CONCIERGE_INTERNAL_WORKSPACE_NAME.to_string();
+    }
+    let mut i = 2;
+    loop {
+        let candidate = format!("Concierge (internal {i})");
+        if !workspaces.iter().any(|workspace| workspace.name == candidate) {
+            return candidate;
+        }
+        i += 1;
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -1549,19 +1573,17 @@ pub async fn consume_lead_out(
 }
 
 async fn ensure_concierge_workspace(db: &crate::store::Db) -> anyhow::Result<i32> {
+    let workspaces = crate::store::repo::list_workspaces(db).await?;
     if let Some(id) = crate::store::repo::get_setting(db, crate::store::repo::K_CONCIERGE_WORKSPACE)
         .await?
         .and_then(|s| s.parse::<i32>().ok())
     {
-        if crate::store::repo::list_workspaces(db)
-            .await?
-            .into_iter()
-            .any(|ws| ws.id == id)
-        {
+        if workspaces.iter().any(|ws| ws.id == id) {
             return Ok(id);
         }
     }
-    let ws = crate::store::repo::create_workspace(db, "Concierge").await?;
+    let name = unique_concierge_workspace_name(&workspaces);
+    let ws = crate::store::repo::create_workspace(db, &name).await?;
     crate::store::repo::set_setting(
         db,
         crate::store::repo::K_CONCIERGE_WORKSPACE,
@@ -1760,6 +1782,30 @@ mod tests {
             .unwrap();
         // DB 错误必须传播为 Err（fail-closed），不得折叠成默认设置
         assert!(ImSettings::load(&db).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concierge_workspace_uses_unique_internal_name_when_name_taken() {
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let visible = crate::store::repo::create_workspace(&db, "Concierge")
+            .await
+            .unwrap();
+
+        let hidden_id = ensure_concierge_workspace(&db).await.unwrap();
+
+        assert_ne!(hidden_id, visible.id);
+        let workspaces = crate::store::repo::list_workspaces(&db).await.unwrap();
+        let hidden = workspaces
+            .iter()
+            .find(|workspace| workspace.id == hidden_id)
+            .unwrap();
+        assert_eq!(hidden.name, "Concierge (internal)");
+        assert_eq!(
+            crate::store::repo::get_setting(&db, crate::store::repo::K_CONCIERGE_WORKSPACE)
+                .await
+                .unwrap(),
+            Some(hidden_id.to_string())
+        );
     }
 
     #[test]

@@ -29,6 +29,13 @@ pub fn now_unix() -> String {
 
 pub async fn create_workspace(db: &Db, name: &str) -> Result<workspace::Model> {
     let name = validate_display_name(name, "workspace name")?;
+    let dup = workspace::Entity::find()
+        .filter(workspace::Column::Name.eq(name))
+        .one(&db.0)
+        .await?;
+    if dup.is_some() {
+        anyhow::bail!("another workspace already named {name:?}");
+    }
     let existing: Vec<String> = workspace::Entity::find()
         .all(&db.0)
         .await?
@@ -1182,6 +1189,106 @@ pub async fn delete_repo_cascade(
     if let Some(ws) = workspace_id {
         let _ = clear_repo_map_doc(db, ws).await;
     }
+    Ok(removed)
+}
+
+/// Delete a workspace and every Weft-owned row under it. Returns worktree
+/// cleanup tuples for the command layer, which still owns filesystem cleanup.
+/// The canonical user repos at `repo_ref.local_git_path` are never removed.
+pub async fn delete_workspace_cascade(
+    db: &Db,
+    workspace_id: i32,
+) -> Result<Vec<(i32, String, String, bool, bool)>> {
+    if workspace::Entity::find_by_id(workspace_id)
+        .one(&db.0)
+        .await?
+        .is_none()
+    {
+        anyhow::bail!("workspace {workspace_id} not found");
+    }
+
+    let repos = list_repos(db, workspace_id).await?;
+    let repo_ids: Vec<i32> = repos.iter().map(|r| r.id).collect();
+    let threads = list_threads(db, workspace_id).await?;
+    let thread_ids: Vec<i32> = threads.iter().map(|t| t.id).collect();
+    let mut directions = Vec::new();
+    for thread_id in &thread_ids {
+        directions.extend(list_directions(db, *thread_id).await?);
+    }
+    let direction_ids: Vec<i32> = directions.iter().map(|d| d.id).collect();
+
+    let mut removed = Vec::new();
+    for worktree in worktree::Entity::find().all(&db.0).await? {
+        if repo_ids.contains(&worktree.repo_id) || direction_ids.contains(&worktree.direction_id) {
+            removed.push((
+                worktree.repo_id,
+                worktree.path,
+                worktree.branch,
+                worktree.created_branch,
+                worktree.created_checkout,
+            ));
+        }
+    }
+
+    for thread_id in &thread_ids {
+        im_route::Entity::delete_many()
+            .filter(im_route::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+        lead_message::Entity::delete_many()
+            .filter(lead_message::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+        plan::Entity::delete_many()
+            .filter(plan::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
+    }
+
+    for direction_id in &direction_ids {
+        session::Entity::delete_many()
+            .filter(session::Column::DirectionId.eq(*direction_id))
+            .exec(&db.0)
+            .await?;
+        worktree::Entity::delete_many()
+            .filter(worktree::Column::DirectionId.eq(*direction_id))
+            .exec(&db.0)
+            .await?;
+        direction::Entity::delete_by_id(*direction_id).exec(&db.0).await?;
+    }
+
+    for repo_id in &repo_ids {
+        session::Entity::delete_many()
+            .filter(session::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        worktree::Entity::delete_many()
+            .filter(worktree::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        direction::Entity::delete_many()
+            .filter(direction::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        repo_profile::Entity::delete_many()
+            .filter(repo_profile::Column::RepoId.eq(*repo_id))
+            .exec(&db.0)
+            .await?;
+        repo_ref::Entity::delete_by_id(*repo_id).exec(&db.0).await?;
+    }
+
+    for thread_id in &thread_ids {
+        thread::Entity::delete_by_id(*thread_id).exec(&db.0).await?;
+    }
+
+    skill_enable::Entity::delete_many()
+        .filter(skill_enable::Column::Scope.eq(format!("ws:{workspace_id}")))
+        .exec(&db.0)
+        .await?;
+    let _ = clear_repo_map_doc(db, workspace_id).await;
+    let _ = delete_setting(db, &curator_thread_key(workspace_id)).await;
+    workspace::Entity::delete_by_id(workspace_id).exec(&db.0).await?;
+
     Ok(removed)
 }
 
@@ -2616,6 +2723,127 @@ mod tests {
 
         assert!(create_workspace(&db, "   ").await.is_err());
         assert!(list_workspaces(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_workspace_rejects_duplicate_name() {
+        let db = mem().await;
+        create_workspace(&db, "Demo WS").await.unwrap();
+
+        let err = create_workspace(&db, "Demo WS").await.unwrap_err();
+
+        assert!(err.to_string().contains("already named"));
+        assert_eq!(list_workspaces(&db).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_cascade_removes_workspace_owned_state() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = create_workspace(&db, "keep me").await.unwrap();
+        let source = add_skill_source(&db, "https://example.com/skills.git", None)
+            .await
+            .unwrap();
+        set_skill_enable(&db, source.id, "ship", &format!("ws:{}", ws.id), true)
+            .await
+            .unwrap();
+        set_skill_enable(&db, source.id, "keep", &format!("ws:{}", keep_ws.id), true)
+            .await
+            .unwrap();
+        set_repo_map_doc(&db, ws.id, "stale map").await.unwrap();
+        set_repo_map_doc(&db, keep_ws.id, "keep map").await.unwrap();
+
+        let repo = add_repo_ref(&db, ws.id, "web", "/tmp/delete-web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = add_repo_ref(&db, keep_ws.id, "api", "/tmp/keep-api", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "remove issue", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = create_thread(&db, keep_ws.id, "keep issue", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "web task",
+            "claude",
+            repo.id,
+            "change web",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        upsert_plan(&db, thread.id, "{}", "proposed", "1")
+            .await
+            .unwrap();
+        insert_lead_message(
+            &db,
+            thread.id,
+            None,
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"hi"}"#,
+            "complete",
+        )
+        .await
+        .unwrap();
+        bind_im_route(&db, thread.id, "feishu", "chat", "thread")
+            .await
+            .unwrap();
+        record_worktree(
+            &db,
+            repo.id,
+            direction.id,
+            "feature/remove",
+            "/tmp/delete-wt",
+            true,
+            true,
+            "abc",
+        )
+        .await
+        .unwrap();
+
+        let removed = delete_workspace_cascade(&db, ws.id).await.unwrap();
+
+        assert_eq!(
+            removed,
+            vec![(
+                repo.id,
+                "/tmp/delete-wt".to_string(),
+                "feature/remove".to_string(),
+                true,
+                true,
+            )]
+        );
+        assert_eq!(list_workspaces(&db).await.unwrap(), vec![keep_ws.clone()]);
+        assert_eq!(list_repos(&db, keep_ws.id).await.unwrap(), vec![keep_repo]);
+        assert_eq!(
+            list_threads(&db, keep_ws.id).await.unwrap(),
+            vec![keep_thread]
+        );
+        assert!(list_repos(&db, ws.id).await.unwrap().is_empty());
+        assert!(list_threads(&db, ws.id).await.unwrap().is_empty());
+        assert!(list_worktrees(&db, None).await.unwrap().is_empty());
+        assert!(get_plan(&db, thread.id).await.unwrap().is_none());
+        assert!(list_lead_messages(&db, thread.id).await.unwrap().is_empty());
+        assert!(list_im_routes(&db).await.unwrap().is_empty());
+        assert!(get_repo_map_doc(&db, ws.id).await.unwrap().is_none());
+        assert_eq!(
+            get_repo_map_doc(&db, keep_ws.id).await.unwrap().as_deref(),
+            Some("keep map"),
+        );
+        let scopes: Vec<String> = list_skill_enable(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.scope)
+            .collect();
+        assert_eq!(scopes, vec![format!("ws:{}", keep_ws.id)]);
     }
 
     #[tokio::test]

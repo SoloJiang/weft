@@ -28,6 +28,41 @@ pub async fn rename_workspace(
 }
 
 #[tauri::command]
+pub async fn delete_workspace(db: State<'_, Db>, workspace_id: i32) -> R<()> {
+    let repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(&db, workspace_id)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .map(|repo| (repo.id, repo.local_git_path))
+        .collect();
+    let removed = repo::delete_workspace_cascade(&db, workspace_id)
+        .await
+        .map_err(e)?;
+    for repo_id in repo_paths.keys() {
+        crate::curator::run_forget(*repo_id);
+    }
+    for (repo_id, path, branch, created_branch, created_checkout) in &removed {
+        let Some(repo_path) = repo_paths.get(repo_id) else {
+            continue;
+        };
+        let repo_path = std::path::Path::new(repo_path);
+        if *created_checkout {
+            if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
+                eprintln!("[weft] worktree remove failed for {path}: {err}");
+            }
+        } else {
+            let _ = crate::git::lock_worktree(repo_path, std::path::Path::new(path));
+        }
+        if *created_branch {
+            if let Err(err) = crate::git::delete_branch(repo_path, branch) {
+                eprintln!("[weft] branch delete failed for {branch}: {err}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn list_workspaces(db: State<'_, Db>) -> R<Vec<entities::workspace::Model>> {
     let hidden = repo::get_setting(&db, repo::K_CONCIERGE_WORKSPACE)
         .await

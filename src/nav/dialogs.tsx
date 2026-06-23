@@ -9,7 +9,7 @@ import { Select } from "../components/ui/Select";
 import { toast } from "../components/Toast";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
-import type { Worktree } from "../lib/types";
+import type { Workspace, Worktree } from "../lib/types";
 import { parseCloneSources, repoNameFromUrl } from "../lib/gitUrl";
 import { cn } from "../lib/cn";
 
@@ -36,7 +36,9 @@ export function CreateWorkspaceDialog({ open, onOpenChange }: DProps) {
       await createWorkspace(value.trim());
       onOpenChange(false);
     } catch (e) {
-      setErr(String(e));
+      const raw = String(e);
+      if (/already/i.test(raw)) setErr(t("error.renameDuplicate"));
+      else setErr(raw);
     } finally {
       setBusy(false);
     }
@@ -211,13 +213,13 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     onOpenChange(o);
   }
 
-  const canSubmit =
-    !busy &&
-    (mode === "local"
-      ? localTargets.length >= 1
-      : mode === "clone"
-        ? cloneTargets.length >= 1 && !!dest.trim()
-        : !!name.trim() && !!dest.trim());
+  function canSubmitMode(m: RepoMode) {
+    if (busy) return false;
+    if (m === "local") return localTargets.length >= 1;
+    if (m === "clone") return cloneTargets.length >= 1 && !!dest.trim();
+    return !!name.trim() && !!dest.trim();
+  }
+  const canSubmit = canSubmitMode(mode);
 
   // Shared sequential-batch harness for clone & local-add. `targets` is the full
   // ordered set (for indexing + count); `run` does the work for the not-yet-ok
@@ -361,6 +363,14 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
   async function pickLocalFolders() {
     const dirs = await api.pickFolders(t("dialog.addRepoTitle"));
     if (dirs.length === 0) return;
+    if (dirs.length === 1) {
+      setPath(dirs[0]);
+      setLocalPaths([]);
+      setName("");
+      return;
+    }
+    setPath("");
+    setName("");
     setLocalPaths((prev) => {
       const out = [...prev];
       for (const d of dirs) if (!out.includes(d)) out.push(d);
@@ -368,22 +378,26 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     });
   }
 
-  const cta =
-    mode === "local"
-      ? busy
-        ? t("dialog.adding")
-        : localTargets.length > 1
-          ? t("dialog.addReposCta", { count: localTargets.length })
-          : t("dialog.addRepo")
-      : mode === "clone"
-        ? busy
-          ? t("dialog.cloning")
-          : cloneTargets.length > 1
-            ? t("dialog.cloneReposCta", { count: cloneTargets.length })
-            : t("dialog.cloneRepo")
-        : busy
-          ? t("dialog.creating")
-          : t("dialog.createRepoCta");
+  function localCta() {
+    if (busy) return t("dialog.adding");
+    if (localTargets.length > 1) return t("dialog.addReposCta", { count: localTargets.length });
+    return t("dialog.addRepo");
+  }
+  function cloneCta() {
+    if (busy) return t("dialog.cloning");
+    if (cloneTargets.length > 1) return t("dialog.cloneReposCta", { count: cloneTargets.length });
+    return t("dialog.cloneRepo");
+  }
+  function newCta() {
+    if (busy) return t("dialog.creating");
+    return t("dialog.createRepoCta");
+  }
+  const ctaByMode: Record<RepoMode, string> = {
+    local: localCta(),
+    clone: cloneCta(),
+    new: newCta(),
+  };
+  const cta = ctaByMode[mode];
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -773,6 +787,90 @@ export function RenameDialog({
             </Button>
             <Button type="submit" variant="primary" disabled={!value.trim() || busy}>
               {busy ? t("dialog.renaming") : t("common.rename")}
+            </Button>
+          </div>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Type-to-confirm destructive dialog for deleting an entire workspace. */
+export function DeleteWorkspaceDialog({
+  workspace,
+  onOpenChange,
+  onConfirm,
+}: {
+  workspace: Workspace | null;
+  onOpenChange: (o: boolean) => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const shownRef = useRef(workspace);
+  if (workspace) shownRef.current = workspace;
+  const open = workspace != null;
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (open && !wasOpen.current) {
+      setValue("");
+      setBusy(false);
+      setErr(null);
+    }
+    wasOpen.current = open;
+  }, [open]);
+  const ws = shownRef.current;
+  const canDelete = ws != null && value.trim() === ws.name && !busy;
+
+  async function confirm() {
+    if (!canDelete) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onConfirm();
+      onOpenChange(false);
+    } catch (e) {
+      setErr(t("error.deleteWorkspaceFailed"));
+      if (import.meta.env.DEV) console.error("delete workspace failed:", String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent title={t("dialog.deleteWorkspaceTitle")}>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void confirm();
+          }}
+          className="flex flex-col gap-4"
+        >
+          <p className="text-[13px] leading-relaxed text-ink-muted">
+            {ws ? t("dialog.deleteWorkspaceBody", { name: ws.name }) : ""}
+          </p>
+          <Field label={t("dialog.deleteWorkspaceNameLabel", { name: ws?.name ?? "" })}>
+            <Input
+              autoFocus
+              value={value}
+              onChange={(e) => setValue(e.currentTarget.value)}
+              disabled={busy}
+            />
+          </Field>
+          {err && <p className="text-[12px] text-danger">{err}</p>}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={busy}
+              onClick={() => onOpenChange(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button type="submit" variant="danger" disabled={!canDelete}>
+              {busy ? t("dialog.deletingWorkspace") : t("dialog.deleteWorkspaceConfirm")}
             </Button>
           </div>
         </form>

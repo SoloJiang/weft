@@ -24,6 +24,7 @@ export const en = {
     deleteThread: "Delete issue",
     renameThread: "Rename issue",
     renameWorkspace: "Rename workspace",
+    deleteWorkspace: "Delete workspace",
     collapseSidebar: "Collapse sidebar",
     expandSidebar: "Show sidebar",
     noThreads: "No issues yet. Create one to start.",
@@ -506,6 +507,12 @@ export const en = {
     workspaceName: "Name",
     workspaceNamePlaceholder: "Workspace name",
     createWorkspace: "Create workspace",
+    deleteWorkspaceTitle: "Delete workspace?",
+    deleteWorkspaceBody:
+      "This removes the workspace “{{name}}”, its issues, repo references, task state, and Weft-created worktrees. Your original local repos are not deleted.",
+    deleteWorkspaceNameLabel: "Type {{name}} to confirm",
+    deleteWorkspaceConfirm: "Delete workspace",
+    deletingWorkspace: "Deleting…",
     addRepoTitle: "Add a repo",
     addRepoDesc: "Reference a local repo, clone a URL, or create a new one.",
     repoName: "Name",
@@ -771,6 +778,7 @@ export const en = {
     renameDuplicate: "Another item already uses that name.",
     renameEmpty: "Name cannot be empty.",
     renameFailed: "Rename failed. Please try again.",
+    deleteWorkspaceFailed: "Couldn't delete the workspace. Please try again.",
     deleteWorktreeFailed: "Couldn't delete the worktree. Please try again.",
   },
   ai: {

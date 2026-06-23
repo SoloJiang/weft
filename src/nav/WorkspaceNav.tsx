@@ -21,7 +21,13 @@ import { useStore } from "../state/store";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
 import { openCommandPalette } from "../components/CommandPalette";
-import { AddRepoDialog, CreateThreadDialog, CreateWorkspaceDialog, RenameDialog } from "./dialogs";
+import {
+  AddRepoDialog,
+  CreateThreadDialog,
+  CreateWorkspaceDialog,
+  DeleteWorkspaceDialog,
+  RenameDialog,
+} from "./dialogs";
 
 export function WorkspaceNav() {
   const {
@@ -30,6 +36,7 @@ export function WorkspaceNav() {
     threads,
     selectWorkspace,
     renameWorkspace,
+    deleteWorkspace,
     renameThread,
     backToWorkspace,
     needsByWorkspace,
@@ -50,10 +57,13 @@ export function WorkspaceNav() {
   // Both rename surfaces store only an id and derive `initial` from the live
   // slice — so concurrent updates flow through instead of being captured.
   const [renamingWsId, setRenamingWsId] = useState<number | null>(null);
+  const [deletingWsId, setDeletingWsId] = useState<number | null>(null);
   const [renamingThreadId, setRenamingThreadId] = useState<number | null>(null);
   const active = workspaces.find((w) => w.id === activeWorkspaceId);
   const renamingWs =
     renamingWsId != null ? workspaces.find((w) => w.id === renamingWsId) ?? null : null;
+  const deletingWs =
+    deletingWsId != null ? workspaces.find((w) => w.id === deletingWsId) ?? null : null;
   const renamingThread =
     renamingThreadId != null ? threads.find((th) => th.id === renamingThreadId) ?? null : null;
   // The hidden curator-chat thread is in `threads` (so its chat can render) but
@@ -98,6 +108,7 @@ export function WorkspaceNav() {
             onSelect={(id) => void selectWorkspace(id)}
             onNew={() => setDlg("ws")}
             onRename={(w) => setRenamingWsId(w.id)}
+            onDelete={(w) => setDeletingWsId(w.id)}
           />
         </div>
       </div>
@@ -237,6 +248,14 @@ export function WorkspaceNav() {
           onSubmit={(v) => renameWorkspace(renamingWs.id, v)}
         />
       )}
+      <DeleteWorkspaceDialog
+        workspace={deletingWs}
+        onOpenChange={(o) => !o && setDeletingWsId(null)}
+        onConfirm={() => {
+          if (!deletingWs) return Promise.resolve();
+          return deleteWorkspace(deletingWs.id);
+        }}
+      />
       {renamingThread && (
         <RenameDialog
           open={renamingThreadId != null}
@@ -403,6 +422,7 @@ function WorkspacePicker({
   onSelect,
   onNew,
   onRename,
+  onDelete,
 }: {
   workspaces: { id: number; name: string }[];
   activeId: number | null;
@@ -411,6 +431,7 @@ function WorkspacePicker({
   onSelect: (id: number) => void;
   onNew: () => void;
   onRename: (w: { id: number; name: string }) => void;
+  onDelete: (w: { id: number; name: string }) => void;
 }) {
   const active = workspaces.find((w) => w.id === activeId);
   const { t } = useTranslation();
@@ -473,12 +494,20 @@ function WorkspacePicker({
           })}
           <DM.Separator className="my-1 h-px bg-border" />
           {active && (
-            <DM.Item
-              onSelect={() => onRename(active)}
-              className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[13px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
-            >
-              <Pencil size={13} /> {t("nav.renameWorkspace")}
-            </DM.Item>
+            <>
+              <DM.Item
+                onSelect={() => onRename(active)}
+                className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[13px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
+              >
+                <Pencil size={13} /> {t("nav.renameWorkspace")}
+              </DM.Item>
+              <DM.Item
+                onSelect={() => onDelete(active)}
+                className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[13px] text-danger outline-none data-[highlighted]:bg-[oklch(0.64_0.2_25/0.15)]"
+              >
+                <Trash2 size={13} /> {t("nav.deleteWorkspace")}
+              </DM.Item>
+            </>
           )}
           <DM.Item
             onSelect={onNew}
