@@ -1320,19 +1320,24 @@ pub async fn send(
     // 2)" that surfaces only as a generic "errored" label. Surface a friendly,
     // localizable row up front instead — this one check covers every transport
     // (resident, per-turn, codex app-server) — and skip the turn so the user can
-    // install/point the agent and retry. After detect::augment_path this only
-    // fires when the CLI is genuinely absent.
-    {
-        let (tool, command, thread_id, sid) = {
+    // install/point the agent and retry.
+    //
+    // Guards: (a) IDLE only — a busy engine means a turn already resolved+spawned
+    // the CLI, so a follow-up must queue via try_begin_send(), not advance turn_id
+    // here. (b) unix only — Windows GUIs inherit PATH fine, and which_on_path has
+    // no PATHEXT/.exe lookup, so it would false-negative a valid `codex.exe`.
+    if !cfg!(windows) {
+        let (tool, command, thread_id, sid, busy) = {
             let g = eng.lock().await;
             (
                 g.tool.clone(),
                 crate::tool_command::effective(g.command.as_deref(), &g.tool),
                 g.thread_id,
                 g.session_id,
+                g.turn.busy,
             )
         };
-        if crate::detect::resolve_tool_path(&command).is_none() {
+        if !busy && crate::detect::resolve_tool_path(&command).is_none() {
             let turn = {
                 let mut g = eng.lock().await;
                 g.turn_id += 1;
@@ -1359,7 +1364,10 @@ pub async fn send(
             {
                 let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
             }
-            return Err(anyhow::anyhow!("agent-not-found:{tool}"));
+            // The failure is now represented in the timeline (user row + notice), so
+            // resolve OK: returning Err would trip the composer's error path and
+            // restore the just-sent draft, leaving a duplicate when the user retries.
+            return Ok(());
         }
     }
     ensure_running_for_send(app, db, eng).await?;
