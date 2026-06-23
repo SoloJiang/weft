@@ -1721,20 +1721,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // The single Analyze entry: open the curator, mirror a trigger message into
-  // its thread, run the real pipeline, then finalize the running line to a summary.
-  // `analyzingRef` dedups concurrent clicks; `analyzing` syncs every button's spinner.
+  // its thread, run the real pipeline, then finalize the running line to a summary
+  // (or a failure note if the pass errors). `analyzingRef` dedups concurrent
+  // clicks; `analyzing` syncs every button's spinner.
   const reanalyzeDeps = useCallback(async () => {
     const ws = activeWorkspaceId;
     if (ws == null || analyzingRef.current) return;
     analyzingRef.current = true;
     setAnalyzing(true);
-    openCurator();
     let runningId: number | null = null;
     let tid: number | null = null;
     try {
       try {
         tid = await api.openCuratorChat(ws); // get-or-create; idempotent
         setCuratorThreadId(tid);
+        // Load history BEFORE appending: opening the panel below mounts the chat,
+        // whose own initial load would otherwise replace-away these fresh rows.
+        await loadLeadChat(tid);
         await api.curatorAppendMessage(tid, "user", i18n.t("repomap.analysisTrigger"));
         runningId = await api.curatorAppendMessage(
           tid,
@@ -1743,8 +1746,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         );
       } catch {
         tid = null; // mirror is best-effort; the pipeline still runs
+        runningId = null;
       }
-      await api.analyzeWorkspaceDeps(ws);
+      // Open the panel only after the trigger/running rows exist in the thread.
+      openCurator();
+      try {
+        await api.analyzeWorkspaceDeps(ws);
+      } catch {
+        // Pipeline failed: don't leave the running line streaming forever.
+        if (tid != null && runningId != null) {
+          await api.curatorFinalizeMessage(tid, runningId, i18n.t("repomap.analysisFailed"));
+        }
+        return; // `finally` still clears the spinner
+      }
       // Switched workspaces mid-run → don't write ws's graph into another view.
       if (activeWorkspaceIdRef.current !== ws) return;
       const g = await api.repoGraph(ws);
@@ -1761,7 +1775,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       analyzingRef.current = false;
       setAnalyzing(false);
     }
-  }, [activeWorkspaceId, openCurator]);
+  }, [activeWorkspaceId, openCurator, loadLeadChat]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);

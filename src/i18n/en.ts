@@ -483,7 +483,6 @@ export const en = {
     chatTab: "Chat",
     mapTab: "Map",
     mapEmpty: "Run analysis to generate the map",
-    regenerateMap: "Regenerate",
   },
   inspect: {
     label: "Inspect — reveal, copy path",

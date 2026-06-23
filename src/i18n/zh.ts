@@ -467,7 +467,6 @@ export const zh = {
     chatTab: "对话",
     mapTab: "地图",
     mapEmpty: "运行分析后生成依赖地图",
-    regenerateMap: "重新生成",
   },
   inspect: {
     label: "检视 —— 显示、复制路径",
