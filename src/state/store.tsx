@@ -2150,15 +2150,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [activeThreadId, directionsByThread, reviveDirection]);
 
-  // The active workspace's hidden curator thread, resolved from `threads` (NOT the
-  // lazily-ensured `curatorThreadId`, which selectWorkspace clears on switch) so the
-  // Analyze entries stay disabled while its turn is busy even right after a switch.
-  const activeCuratorTid =
-    activeWorkspaceId == null
-      ? null
-      : (threads.find((th) => th.kind === "curator" && th.workspace_id === activeWorkspaceId)?.id ??
-        null);
-  const analyzing = activeCuratorTid != null && leadTurn[activeCuratorTid]?.state === "busy";
+  // The active workspace's hidden curator thread, from `threads` (already loaded
+  // per-active-workspace) — not the lazily-ensured `curatorThreadId`, which
+  // selectWorkspace clears on switch — so the Analyze entries stay disabled while
+  // its turn is busy even right after a switch.
+  const curatorTid = threads.find((th) => th.kind === "curator")?.id;
+  const analyzing = curatorTid != null && leadTurn[curatorTid]?.state === "busy";
 
   const value: Store = {
     workspaces,
