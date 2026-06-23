@@ -110,6 +110,15 @@ fn workspace_deleting_key(workspace_id: i32) -> String {
     format!("workspace.deleting.{workspace_id}")
 }
 
+pub async fn mark_workspace_deleting(db: &Db, workspace_id: i32) -> Result<()> {
+    ensure_workspace_exists(db, workspace_id).await?;
+    set_setting(db, &workspace_deleting_key(workspace_id), "1").await
+}
+
+pub async fn clear_workspace_deleting(db: &Db, workspace_id: i32) -> Result<()> {
+    delete_setting(db, &workspace_deleting_key(workspace_id)).await
+}
+
 async fn ensure_workspace_accepts_writes(db: &Db, workspace_id: i32) -> Result<()> {
     ensure_workspace_exists(db, workspace_id).await?;
     if get_setting(db, &workspace_deleting_key(workspace_id)).await?.is_some() {
@@ -413,14 +422,17 @@ pub async fn add_repo_ref(
         // (or a stale base_ref), which makes later blank-base materialization ignore the known
         // default and fall through to main/master.
         if base_ref_is_default && (!dup.base_ref_is_default || dup.base_ref != base_ref) {
+            ensure_workspace_accepts_writes(db, workspace_id).await?;
             let mut am: repo_ref::ActiveModel = dup.clone().into();
             am.base_ref = Set(base_ref.to_string());
             am.base_ref_is_default = Set(true);
             return Ok(am.update(&db.0).await?);
         }
+        ensure_workspace_accepts_writes(db, workspace_id).await?;
         return Ok(dup.clone());
     }
     let slugs: Vec<String> = existing.into_iter().map(|r| r.slug).collect();
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let m = repo_ref::ActiveModel {
         workspace_id: Set(workspace_id),
         name: Set(name.to_string()),
@@ -451,6 +463,7 @@ pub async fn create_thread(
         .into_iter()
         .map(|t| t.slug)
         .collect();
+    ensure_workspace_accepts_writes(db, workspace_id).await?;
     let m = thread::ActiveModel {
         workspace_id: Set(workspace_id),
         title: Set(title.to_string()),
@@ -898,10 +911,7 @@ pub async fn create_direction(
         .one(&db.0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
-    let _ws = workspace::Entity::find_by_id(t.workspace_id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("workspace missing"))?;
+    ensure_workspace_accepts_writes(db, t.workspace_id).await?;
     let existing: Vec<String> = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
         .all(&db.0)
@@ -937,6 +947,7 @@ pub async fn create_direction(
         branch_title,
         &reserved,
     );
+    ensure_workspace_accepts_writes(db, t.workspace_id).await?;
     let dir = direction::ActiveModel {
         thread_id: Set(thread_id),
         name: Set(name.to_string()),
@@ -1090,6 +1101,15 @@ pub async fn record_worktree(
     created_checkout: bool,
     base_commit: &str,
 ) -> Result<worktree::Model> {
+    let direction = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+    let thread = thread::Entity::find_by_id(direction.thread_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {} not found", direction.thread_id))?;
+    ensure_workspace_accepts_writes(db, thread.workspace_id).await?;
     Ok(worktree::ActiveModel {
         repo_id: Set(repo_id),
         direction_id: Set(direction_id),
@@ -1237,9 +1257,7 @@ pub async fn delete_workspace_cascade(
     db: &Db,
     workspace_id: i32,
 ) -> Result<Vec<(i32, String, String, bool, bool)>> {
-    ensure_workspace_exists(db, workspace_id).await?;
-    let deleting_key = workspace_deleting_key(workspace_id);
-    set_setting(db, &deleting_key, "1").await?;
+    mark_workspace_deleting(db, workspace_id).await?;
 
     let repos = list_repos(db, workspace_id).await?;
     let repo_ids: Vec<i32> = repos.iter().map(|r| r.id).collect();
@@ -1322,7 +1340,7 @@ pub async fn delete_workspace_cascade(
     let _ = clear_repo_map_doc(db, workspace_id).await;
     let _ = delete_setting(db, &curator_thread_key(workspace_id)).await;
     workspace::Entity::delete_by_id(workspace_id).exec(&db.0).await?;
-    let _ = delete_setting(db, &deleting_key).await;
+    let _ = clear_workspace_deleting(db, workspace_id).await;
 
     Ok(removed)
 }
@@ -2921,6 +2939,24 @@ mod tests {
     async fn workspace_owned_writes_reject_deleted_workspace() {
         let db = mem().await;
         let ws = create_workspace(&db, "delete me").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = create_direction(
+            &db,
+            thread.id,
+            "task",
+            "claude",
+            repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
         let deleting_key = workspace_deleting_key(ws.id);
         set_setting(&db, &deleting_key, "1").await.unwrap();
 
@@ -2935,6 +2971,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(deleting_thread_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_direction_err = create_direction(
+            &db,
+            thread.id,
+            "late task",
+            "claude",
+            repo.id,
+            "change",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap_err();
+        assert!(deleting_direction_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_worktree_err =
+            record_worktree(&db, repo.id, direction.id, "feature/task", "/tmp/wt", true, true, "")
+                .await
+                .unwrap_err();
+        assert!(deleting_worktree_err
             .to_string()
             .contains(&format!("workspace {} is being deleted", ws.id)));
         delete_setting(&db, &deleting_key).await.unwrap();

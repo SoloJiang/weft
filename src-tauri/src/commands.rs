@@ -33,16 +33,31 @@ pub async fn delete_workspace(
     db: State<'_, Db>,
     workspace_id: i32,
 ) -> R<()> {
-    stop_workspace_engines(&app, &db, workspace_id).await?;
-    cancel_workspace_asks(&db, app.state::<crate::ask::AskRegistry>().inner(), workspace_id)
+    repo::mark_workspace_deleting(&db, workspace_id)
+        .await
+        .map_err(e)?;
+    let result = delete_workspace_after_fence(app, &db, workspace_id).await;
+    if result.is_err() {
+        let _ = repo::clear_workspace_deleting(&db, workspace_id).await;
+    }
+    result
+}
+
+async fn delete_workspace_after_fence(
+    app: tauri::AppHandle,
+    db: &Db,
+    workspace_id: i32,
+) -> R<()> {
+    stop_workspace_engines(&app, db, workspace_id).await?;
+    cancel_workspace_asks(db, app.state::<crate::ask::AskRegistry>().inner(), workspace_id)
         .await?;
     cancel_workspace_human_asks(
-        &db,
+        db,
         app.state::<crate::bus::BusRegistry>().inner(),
         workspace_id,
     )
     .await?;
-    let repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(&db, workspace_id)
+    let mut repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(db, workspace_id)
         .await
         .map_err(e)?
         .into_iter()
@@ -51,9 +66,10 @@ pub async fn delete_workspace(
     for repo_id in repo_paths.keys() {
         crate::curator::run_forget(*repo_id);
     }
-    let removed = repo::delete_workspace_cascade(&db, workspace_id)
+    let removed = repo::delete_workspace_cascade(db, workspace_id)
         .await
         .map_err(e)?;
+    extend_removed_repo_paths(db, &mut repo_paths, &removed).await?;
     for (repo_id, path, branch, created_branch, created_checkout) in &removed {
         let Some(repo_path) = repo_paths.get(repo_id) else {
             continue;
@@ -70,6 +86,22 @@ pub async fn delete_workspace(
             if let Err(err) = crate::git::delete_branch(repo_path, branch) {
                 eprintln!("[weft] branch delete failed for {branch}: {err}");
             }
+        }
+    }
+    Ok(())
+}
+
+async fn extend_removed_repo_paths(
+    db: &Db,
+    repo_paths: &mut std::collections::HashMap<i32, String>,
+    removed: &[(i32, String, String, bool, bool)],
+) -> R<()> {
+    for (repo_id, _, _, _, _) in removed {
+        if repo_paths.contains_key(repo_id) {
+            continue;
+        }
+        if let Some(repo_ref) = repo::get_repo(db, *repo_id).await.map_err(e)? {
+            repo_paths.insert(*repo_id, repo_ref.local_git_path);
         }
     }
     Ok(())
@@ -2155,6 +2187,41 @@ mod tests {
         assert_eq!(keys, expected);
         assert!(!keys.contains(&crate::lead_chat::commands::lead_key(keep_thread.id)));
         assert!(!keys.contains(&(keep_worker.id as i64)));
+    }
+
+    #[tokio::test]
+    async fn extend_removed_repo_paths_loads_external_repo_refs() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let external_repo =
+            repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+                .await
+                .unwrap();
+        let mut repo_paths = std::collections::HashMap::from([(
+            repo_ref.id,
+            repo_ref.local_git_path.clone(),
+        )]);
+        let removed = vec![(
+            external_repo.id,
+            "/tmp/api-wt".to_string(),
+            "feature/api".to_string(),
+            true,
+            true,
+        )];
+
+        extend_removed_repo_paths(&db, &mut repo_paths, &removed)
+            .await
+            .unwrap();
+
+        assert_eq!(repo_paths.get(&repo_ref.id).map(String::as_str), Some("/tmp/web"));
+        assert_eq!(
+            repo_paths.get(&external_repo.id).map(String::as_str),
+            Some("/tmp/api")
+        );
     }
 
     #[tokio::test]
