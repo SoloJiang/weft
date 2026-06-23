@@ -1,11 +1,13 @@
 //! Tool readiness: make GUI-launched Weft find CLIs installed via nvm/fnm/volta
-//! or native installers, and report each CLI's version. The core fix is
-//! augmenting THIS process's PATH at startup — engine spawns inherit this
-//! process's env, so one augment makes every later `claude`/`codex`/`opencode`
-//! spawn resolvable. PATH is augmented from two sources: a deterministic scan of
-//! known version-manager / install dirs (fast, can't time out) and the user's
-//! login-shell PATH (best-effort, for custom dirs the scan can't know).
+//! or native installers, and report each CLI's version. The login shell is the
+//! single authoritative source of the user's PATH; we probe it once (`zsh -ilc`),
+//! cache the result on disk, and expose the augmented PATH via [`tool_path`].
+//! Agent spawns pass it per-`Command` (`.env("PATH", detect::tool_path())`)
+//! rather than mutating the global env with `set_var` — which is unsound once the
+//! async runtime has worker threads.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 /// Budget for the `zsh -ilc` PATH probe. Generous because the result is cached on
@@ -118,19 +120,8 @@ fn write_cached_shell_path(file: &std::path::Path, value: &str) {
     }
 }
 
-/// Merge `extra` into the process PATH, keeping existing entries' priority (only
-/// missing dirs are appended).
-fn apply_shell_path(base: &str, extra: &str) {
-    let merged = merge_path(base, extra);
-    if merged != base {
-        std::env::set_var("PATH", merged);
-    }
-}
-
-/// Re-probe the login shell off the critical path and rewrite the cache — DISK
-/// ONLY, never the live process env (mutating env from another thread would race
-/// concurrent `Command::spawn`s) — so the NEXT launch reflects a tool installed
-/// since this one.
+/// Re-probe the login shell off the critical path and rewrite the cache (DISK
+/// ONLY) so the NEXT launch reflects a tool installed since this one.
 fn spawn_shell_path_refresh(file: std::path::PathBuf) {
     std::thread::spawn(move || {
         if let Some(shell_path) = login_shell_path() {
@@ -139,74 +130,87 @@ fn spawn_shell_path_refresh(file: std::path::PathBuf) {
     });
 }
 
-/// Whether any known coding-agent CLI resolves on the current process PATH — a
-/// best-effort "is the cache obviously stale?" signal: false means none of
-/// codex/claude/opencode is found, so re-probe synchronously rather than wait a
-/// launch. It runs early (so the `set_var` in `augment_path` precedes the async
-/// runtime — see `lib.rs`), hence it checks bare identities, NOT aliases or the
-/// per-session selected tool. That precision would require per-`Command` PATH
-/// rather than a process-global env — a deliberate non-goal here; the residual
-/// edge self-heals on the next launch.
-fn known_agent_resolves() -> bool {
-    TOOL_PRIORITY.iter().any(|t| resolve_tool_path(t).is_some())
+/// Process-global augmented PATH: the inherited PATH folded with the user's
+/// login-shell PATH (cached). Passed to each agent spawn via `.env("PATH", ...)`
+/// instead of mutating the global env with `set_var` (unsound once the async
+/// runtime has worker threads).
+static TOOL_PATH: OnceLock<RwLock<String>> = OnceLock::new();
+
+/// Whether the on-miss re-probe already ran this process — bounds the cost so a
+/// genuinely-absent agent doesn't re-probe on every resolution miss.
+static REFRESHED: AtomicBool = AtomicBool::new(false);
+
+fn tool_path_cell() -> &'static RwLock<String> {
+    TOOL_PATH.get_or_init(|| RwLock::new(compute_tool_path()))
 }
 
-/// Run once at startup: fold the user's login-shell PATH into this process's PATH
-/// so a GUI- or dev-launched Weft can spawn nvm/fnm/volta/native CLIs even when
-/// the inherited PATH is minimal. Engine and curator spawns inherit this
-/// process's env, so one augment fixes every later `claude`/`codex`/`opencode`.
-///
-/// The login shell is the single authoritative source of what's on the user's
-/// PATH — it already knows every version manager — but probing it (`zsh -ilc`) is
-/// slow on a heavy shell. So the result is CACHED on disk: a cache hit augments
-/// instantly and refreshes the cache in the background (disk only — no
-/// cross-thread setenv race) for next launch; a cache miss (first launch) pays
-/// the probe once, synchronously, and seeds the cache.
-///
-/// Staleness: if a cache hit leaves NO known agent resolvable (e.g. one was
-/// installed since the cache was written), the cache is treated as stale and
-/// re-probed synchronously HERE — on the main thread, before other threads spawn,
-/// so applying it is race-free — so a freshly-installed agent is picked up this
-/// session, not only after a restart.
-pub fn augment_path() {
-    let base = std::env::var("PATH").unwrap_or_default();
-    let cache = shell_path_cache_file();
+/// The PATH every agent spawn / tool resolution should use: the inherited PATH
+/// folded with the user's (cached) login-shell PATH. Memoized; safe from any
+/// thread. Pass it per-`Command`: `.env("PATH", detect::tool_path())`.
+pub fn tool_path() -> String {
+    match tool_path_cell().read() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    }
+}
 
-    // Fast path: reuse a previous launch's probe.
-    if let Some(file) = cache.as_ref() {
-        if let Some(cached) = read_cached_shell_path(file) {
-            apply_shell_path(&base, &cached);
-            if known_agent_resolves() {
-                // Cache looks good — refresh in the background for next launch.
-                spawn_shell_path_refresh(file.clone());
-            } else if let Some(fresh) = login_shell_path() {
-                // Stale cache (or a newly-installed agent): re-probe now, merge into
-                // the just-applied PATH, and rewrite the cache so the next launch is
-                // correct too.
-                let now = std::env::var("PATH").unwrap_or_default();
-                apply_shell_path(&now, &fresh);
-                write_cached_shell_path(file, &fresh);
-            }
-            return;
+/// Compute the augmented PATH from the cache (fast) or, on a cold cache, a
+/// synchronous login-shell probe (then seed + background-refresh the cache).
+fn compute_tool_path() -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
+    if let Some(file) = shell_path_cache_file() {
+        if let Some(cached) = read_cached_shell_path(&file) {
+            // Keep the cache fresh for next launch without touching this session.
+            spawn_shell_path_refresh(file);
+            return merge_path(&base, &cached);
         }
     }
+    probe_and_merge(&base)
+}
 
-    // Cold path (first launch / no cache): probe synchronously once, augment, seed.
+/// Probe the login shell now, merge into `base`, and seed the cache. Returns
+/// `base` unchanged (with a diagnostic) when the probe is unavailable.
+fn probe_and_merge(base: &str) -> String {
     match login_shell_path() {
         Some(shell_path) => {
-            apply_shell_path(&base, &shell_path);
-            if let Some(file) = cache.as_ref() {
-                write_cached_shell_path(file, &shell_path);
+            if let Some(file) = shell_path_cache_file() {
+                write_cached_shell_path(&file, &shell_path);
             }
+            merge_path(base, &shell_path)
         }
         // Windows GUIs inherit PATH fine and have no `-ilc` probe, so only the unix
         // probe failing (unset/unsupported shell or timeout) is worth flagging.
-        None if !cfg!(windows) => eprintln!(
-            "[weft] login-shell PATH probe unavailable (unset/unsupported shell or timed out); \
-             GUI-launched spawns may not find nvm/fnm/volta CLIs until it succeeds"
-        ),
-        None => {}
+        None if !cfg!(windows) => {
+            eprintln!(
+                "[weft] login-shell PATH probe unavailable (unset/unsupported shell or timed out); \
+                 GUI-launched spawns may not find nvm/fnm/volta CLIs until it succeeds"
+            );
+            base.to_string()
+        }
+        None => base.to_string(),
     }
+}
+
+/// Force a fresh login-shell re-probe and replace the memoized PATH — the cache
+/// may predate a just-installed agent. Bounded to once per process so a
+/// genuinely-absent agent doesn't re-probe on every miss.
+fn refresh_tool_path() -> String {
+    if REFRESHED.swap(true, Ordering::SeqCst) {
+        return tool_path();
+    }
+    let base = std::env::var("PATH").unwrap_or_default();
+    let fresh = probe_and_merge(&base);
+    match tool_path_cell().write() {
+        Ok(mut g) => *g = fresh.clone(),
+        Err(p) => *p.into_inner() = fresh.clone(),
+    }
+    fresh
+}
+
+/// Prewarm the augmented PATH at startup so the first agent spawn doesn't pay the
+/// probe. Pure: it does NOT mutate the global env (see [`tool_path`]).
+pub fn augment_path() {
+    let _ = tool_path();
 }
 
 /// Soft minimum versions — surfaced as an "update recommended" hint in Settings,
@@ -348,10 +352,11 @@ fn codex_app_bundle_paths() -> Vec<std::path::PathBuf> {
     v
 }
 
-/// Resolve a tool to an executable path: PATH first (now augmented), then the
-/// Codex app-bundle fallback. None if not found.
+/// Resolve a tool to an executable path: the augmented [`tool_path`] first, then
+/// the Codex app-bundle fallback, then a one-shot re-probe (the cache may predate
+/// a just-installed agent). None if still not found.
 pub fn resolve_tool_path(tool: &str) -> Option<std::path::PathBuf> {
-    if let Some(p) = which_on_path(tool) {
+    if let Some(p) = which_on_path(tool, &tool_path()) {
         return Some(p);
     }
     if tool == "codex" {
@@ -361,12 +366,11 @@ pub fn resolve_tool_path(tool: &str) -> Option<std::path::PathBuf> {
             }
         }
     }
-    None
+    which_on_path(tool, &refresh_tool_path())
 }
 
-fn which_on_path(tool: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
+fn which_on_path(tool: &str, path: &str) -> Option<std::path::PathBuf> {
+    for dir in std::env::split_paths(path) {
         let cand = dir.join(tool);
         if cand.is_file() {
             return Some(cand);
@@ -494,5 +498,18 @@ mod tests {
         let cached = format!("/usr/bin:{}", nvm_bin.display());
         let merged = merge_path("/usr/bin:/bin", &cached);
         assert!(std::env::split_paths(&merged).any(|d| d.join("codex").is_file()));
+    }
+
+    // `:`-separated PATH is unix semantics (Windows uses `;`).
+    #[cfg(unix)]
+    #[test]
+    fn which_on_path_resolves_against_the_given_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        let path = format!("/usr/bin:{}", bin.display());
+        assert_eq!(which_on_path("codex", &path), Some(bin.join("codex")));
+        assert!(which_on_path("absent", &path).is_none());
     }
 }

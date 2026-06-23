@@ -128,6 +128,9 @@ pub fn run_check(cwd: &Path, c: &Check) -> CheckResult {
     let out = Command::new(&c.program)
         .args(&c.args)
         .current_dir(cwd)
+        // Checks run user tooling (e.g. nvm's `npm`) that a GUI launch's minimal
+        // PATH can't resolve; use the augmented PATH (see detect::tool_path).
+        .env("PATH", crate::detect::tool_path())
         .output();
     match out {
         Ok(o) => {

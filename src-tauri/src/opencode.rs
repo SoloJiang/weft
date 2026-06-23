@@ -174,6 +174,9 @@ async fn ensure_base(command: &str) -> anyhow::Result<String> {
 
     let mut child = Command::new(command)
         .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+        // Resolve nvm/fnm/volta CLIs from a GUI launch's minimal PATH without
+        // mutating the global env (see detect::tool_path).
+        .env("PATH", crate::detect::tool_path())
         // Force an unsecured server on our private localhost port: we never set a
         // password, so the user's global OPENCODE_SERVER_PASSWORD (if any) does
         // not apply and discovery needs no auth.

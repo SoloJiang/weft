@@ -1159,6 +1159,7 @@ async fn ensure_running_locked(
     let mut child = Command::new(&program)
         .args(build_args(inner))
         .current_dir(&inner.cwd)
+        .env("PATH", crate::detect::tool_path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -2066,6 +2067,7 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
     let mut child = Command::new(&program)
         .args(&args)
         .current_dir(&inner.cwd)
+        .env("PATH", crate::detect::tool_path())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         // stderr → app log: a per-turn CLI that dies prints its reason there.

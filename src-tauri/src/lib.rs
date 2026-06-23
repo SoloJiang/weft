@@ -69,11 +69,10 @@ fn mcp_bridge_enabled() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Augment this process's PATH from the user's login shell FIRST — BEFORE any
-    // `block_on` spins up the async runtime's worker threads, because
-    // `std::env::set_var` is only sound while the process is single-threaded. The
-    // GUI's minimal PATH otherwise can't resolve nvm/fnm/volta CLIs; every later
-    // spawn inherits this env (see detect.rs).
+    // Prewarm the augmented tool PATH (login-shell probe + disk cache) so the first
+    // agent spawn doesn't pay the probe. This no longer mutates the global env —
+    // each agent spawn passes `detect::tool_path()` per-`Command` (see detect.rs) —
+    // so the placement is a latency choice, not a correctness constraint.
     detect::augment_path();
 
     // Pin the rustls CryptoProvider. Several of our transitive deps enable

@@ -977,6 +977,7 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
     let mut child = tokio::process::Command::new(&command)
         .args(&argv)
         .current_dir(cwd)
+        .env("PATH", crate::detect::tool_path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
