@@ -172,6 +172,23 @@ fn issue_topic_seed_key(thread_id: i32) -> String {
     format!("im.issue_topic_seed.{thread_id}")
 }
 
+async fn set_issue_topic_seed(
+    db: &crate::store::Db,
+    thread_id: i32,
+    seed_message_id: &str,
+) -> anyhow::Result<()> {
+    crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let key = issue_topic_seed_key(thread_id);
+    crate::store::repo::set_setting(db, &key, seed_message_id).await?;
+    if let Err(err) =
+        crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await
+    {
+        let _ = crate::store::repo::delete_setting(db, &key).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn unique_concierge_workspace_name(
     workspaces: &[crate::store::entities::workspace::Model],
 ) -> String {
@@ -492,13 +509,13 @@ pub async fn execute(
                 }
                 return Ok(());
             };
+            crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
             crate::store::repo::bind_im_route(db, thread_id, "feishu", &chat_id, &im_thread_ref)
                 .await?;
             // Record the /bind message as the topic's replyable seed (a member of
             // this topic), so a later desktop-driven / no-ack lead reply has a valid
             // om_ target rather than the non-replyable omt_ topic id.
-            crate::store::repo::set_setting(db, &issue_topic_seed_key(thread_id), &seed_message_id)
-                .await?;
+            set_issue_topic_seed(db, thread_id, &seed_message_id).await?;
             if let Err(e) = channel
                 .send_text(
                     sender,
@@ -1308,6 +1325,7 @@ pub async fn ensure_issue_topic(
         }
         return Ok(());
     };
+    crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
 
     if let Some(route) = crate::store::repo::im_route_of_thread(db, thread_id).await? {
         if let Some(reply_to) = reply_to {
@@ -1348,7 +1366,7 @@ pub async fn ensure_issue_topic(
     crate::store::repo::bind_im_route(db, thread.id, "feishu", chat_id, &topic_id).await?;
     // Persist a replyable seed message id (an `om_*` member of the topic) for the
     // no-ack / no-origin_tag fallback (Finding C).
-    crate::store::repo::set_setting(db, &issue_topic_seed_key(thread.id), &seed_message_id).await?;
+    set_issue_topic_seed(db, thread.id, &seed_message_id).await?;
     if let Some(reply_to) = reply_to {
         if let Err(e) = ch
             .reply_text(
@@ -2049,6 +2067,44 @@ mod tests {
                 .any(|(_, body)| body.contains("Lead agent") || body.contains("Lead Agent")),
             "topic creation message should tell users this topic is connected to the issue Lead agent: {created:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn issue_topic_seed_rolls_back_when_delete_marker_appears_after_write() {
+        use sea_orm::ConnectionTrait;
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let issue = crate::store::repo::create_thread(&db, ws.id, "登录修复", "bugfix", "claude")
+            .await
+            .unwrap();
+        let seed_key = issue_topic_seed_key(issue.id);
+        db.0
+            .execute(sea_orm::Statement::from_string(
+                db.0.get_database_backend(),
+                format!(
+                    "CREATE TRIGGER issue_seed_mark_deleting AFTER INSERT ON app_setting \
+                     WHEN NEW.key = '{}' BEGIN INSERT OR REPLACE INTO app_setting(key, value) \
+                     VALUES ('workspace.deleting.{}', '1'); END",
+                    seed_key, ws.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let err = set_issue_topic_seed(&db, issue.id, "om_seed")
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        assert!(crate::store::repo::get_setting(&db, &seed_key)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[derive(Default)]

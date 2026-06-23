@@ -572,6 +572,17 @@ pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
         .await?)
 }
 
+async fn ensure_plan_write_survived_workspace_fence(db: &Db, thread_id: i32) -> Result<()> {
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = plan::Entity::delete_many()
+            .filter(plan::Column::ThreadId.eq(thread_id))
+            .exec(&db.0)
+            .await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Insert or update a thread's plan/proposal.
 pub async fn upsert_plan(
     db: &Db,
@@ -580,6 +591,7 @@ pub async fn upsert_plan(
     status: &str,
     created_at: &str,
 ) -> Result<plan::Model> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let mut a = match get_plan(db, thread_id).await? {
         Some(m) => m.into(),
         None => plan::ActiveModel {
@@ -590,7 +602,10 @@ pub async fn upsert_plan(
     };
     a.proposal = Set(proposal.to_string());
     a.status = Set(status.to_string());
-    Ok(a.save(&db.0).await?.try_into_model()?)
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let saved = a.save(&db.0).await?.try_into_model()?;
+    ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    Ok(saved)
 }
 
 /// Set a plan's `created_at`, which doubles as the proposal VERSION ("last proposed at").
@@ -600,11 +615,15 @@ pub async fn upsert_plan(
 /// plan row is absent.
 pub async fn set_plan_created_at(db: &Db, thread_id: i32, created_at: &str) -> Result<()> {
     use sea_orm::sea_query::Expr;
-    plan::Entity::update_many()
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let res = plan::Entity::update_many()
         .col_expr(plan::Column::CreatedAt, Expr::value(created_at.to_string()))
         .filter(plan::Column::ThreadId.eq(thread_id))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(())
 }
 
@@ -623,6 +642,7 @@ pub async fn update_plan_proposal_cas(
     status: &str,
 ) -> Result<bool> {
     use sea_orm::sea_query::Expr;
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let res = plan::Entity::update_many()
         .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
         .col_expr(plan::Column::Status, Expr::value(status.to_string()))
@@ -637,6 +657,9 @@ pub async fn update_plan_proposal_cas(
         .filter(plan::Column::Status.eq(status))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(res.rows_affected > 0)
 }
 
@@ -653,6 +676,7 @@ pub async fn mark_plan_confirmed_cas(
     expected_status: &str,
 ) -> Result<bool> {
     use sea_orm::sea_query::Expr;
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let res = plan::Entity::update_many()
         .col_expr(plan::Column::Status, Expr::value("confirmed"))
         .filter(plan::Column::ThreadId.eq(thread_id))
@@ -660,6 +684,9 @@ pub async fn mark_plan_confirmed_cas(
         .filter(plan::Column::Status.eq(expected_status))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(res.rows_affected > 0)
 }
 
@@ -678,6 +705,7 @@ pub async fn commit_confirmed_plan_cas(
     expected_status: &str,
 ) -> Result<bool> {
     use sea_orm::sea_query::Expr;
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let res = plan::Entity::update_many()
         .col_expr(plan::Column::Proposal, Expr::value(new_proposal.to_string()))
         .col_expr(plan::Column::Status, Expr::value("confirmed"))
@@ -686,6 +714,9 @@ pub async fn commit_confirmed_plan_cas(
         .filter(plan::Column::Status.eq(expected_status))
         .exec(&db.0)
         .await?;
+    if res.rows_affected > 0 {
+        ensure_plan_write_survived_workspace_fence(db, thread_id).await?;
+    }
     Ok(res.rows_affected > 0)
 }
 
@@ -1931,6 +1962,17 @@ pub async fn set_lead_status(db: &Db, thread_id: i32, status: &str) -> Result<()
 
 // ─────────────────────────── im_route (M2) ───────────────────────────
 
+async fn ensure_im_route_write_survived_workspace_fence(db: &Db, thread_id: i32) -> Result<()> {
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = im_route::Entity::delete_many()
+            .filter(im_route::Column::ThreadId.eq(thread_id))
+            .exec(&db.0)
+            .await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Bind an issue (thread) to an IM thread. Upserts on `thread_id`: re-binding the
 /// same issue replaces its target. Returns the resulting row.
 pub async fn bind_im_route(
@@ -1940,6 +1982,7 @@ pub async fn bind_im_route(
     chat_id: &str,
     im_thread_ref: &str,
 ) -> Result<im_route::Model> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     if let Some(existing) = im_route::Entity::find()
         .filter(im_route::Column::ThreadId.eq(thread_id))
         .one(&db.0)
@@ -1949,10 +1992,13 @@ pub async fn bind_im_route(
         a.channel = Set(channel.to_string());
         a.chat_id = Set(chat_id.to_string());
         a.im_thread_ref = Set(im_thread_ref.to_string());
+        ensure_thread_workspace_accepts_writes(db, thread_id).await?;
         let m = a.update(&db.0).await?;
+        ensure_im_route_write_survived_workspace_fence(db, thread_id).await?;
         return Ok(m);
     }
     let now = now();
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let am = im_route::ActiveModel {
         channel: Set(channel.to_string()),
         chat_id: Set(chat_id.to_string()),
@@ -1962,6 +2008,7 @@ pub async fn bind_im_route(
         ..Default::default()
     };
     let m = am.insert(&db.0).await?.try_into_model()?;
+    ensure_im_route_write_survived_workspace_fence(db, thread_id).await?;
     Ok(m)
 }
 
@@ -2285,8 +2332,11 @@ mod tests {
         assert_eq!(p.status, "confirmed");
         assert_eq!(p.proposal, "P1", "proposal left untouched by the status CAS");
         // Absent plan -> false.
+        let no_plan = create_thread(&db, ws.id, "no plan", "feature", "claude")
+            .await
+            .unwrap();
         assert!(
-            !mark_plan_confirmed_cas(&db, t.id + 999, "P1", "scoped").await.unwrap(),
+            !mark_plan_confirmed_cas(&db, no_plan.id, "P1", "scoped").await.unwrap(),
             "must be false when the plan is absent"
         );
     }
@@ -2804,21 +2854,25 @@ mod tests {
     #[tokio::test]
     async fn im_route_bind_and_lookup() {
         let db = mem().await;
-        let r = bind_im_route(&db, 7, "feishu", "oc_chat", "th_1")
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
             .await
             .unwrap();
-        assert_eq!(r.thread_id, 7);
+        let r = bind_im_route(&db, thread.id, "feishu", "oc_chat", "th_1")
+            .await
+            .unwrap();
+        assert_eq!(r.thread_id, thread.id);
         // forward lookup by thread_id
-        let got = im_route_of_thread(&db, 7).await.unwrap().unwrap();
+        let got = im_route_of_thread(&db, thread.id).await.unwrap().unwrap();
         assert_eq!(got.im_thread_ref, "th_1");
         // reverse lookup by (channel, chat_id, im_thread_ref)
         let got = im_route_of_thread_ref(&db, "feishu", "oc_chat", "th_1")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.thread_id, 7);
+        assert_eq!(got.thread_id, thread.id);
         // re-bind same issue: row count stays 1, target replaced
-        bind_im_route(&db, 7, "feishu", "oc_chat", "th_2")
+        bind_im_route(&db, thread.id, "feishu", "oc_chat", "th_2")
             .await
             .unwrap();
         assert_eq!(list_im_routes(&db).await.unwrap().len(), 1);
@@ -2827,18 +2881,25 @@ mod tests {
             .unwrap()
             .is_none());
         // unbind
-        unbind_im_route(&db, 7).await.unwrap();
-        assert!(im_route_of_thread(&db, 7).await.unwrap().is_none());
+        unbind_im_route(&db, thread.id).await.unwrap();
+        assert!(im_route_of_thread(&db, thread.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn im_route_thread_ref_is_unique_across_issues() {
         // Same (channel, chat_id, im_thread_ref) cannot bind to two different issues.
         let db = mem().await;
-        bind_im_route(&db, 1, "feishu", "oc_chat", "th_1")
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let first = create_thread(&db, ws.id, "first issue", "feature", "claude")
             .await
             .unwrap();
-        let err = bind_im_route(&db, 2, "feishu", "oc_chat", "th_1").await;
+        let second = create_thread(&db, ws.id, "second issue", "feature", "claude")
+            .await
+            .unwrap();
+        bind_im_route(&db, first.id, "feishu", "oc_chat", "th_1")
+            .await
+            .unwrap();
+        let err = bind_im_route(&db, second.id, "feishu", "oc_chat", "th_1").await;
         assert!(err.is_err(), "second bind should violate unique index");
     }
 
@@ -2967,6 +3028,70 @@ mod tests {
             .to_string()
             .contains(&format!("workspace {} is being deleted", ws.id)));
         assert!(list_repos(&db, ws.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_plan_rolls_back_when_delete_marker_appears_after_insert() {
+        use sea_orm::ConnectionTrait;
+
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        db.0
+            .execute(sea_orm::Statement::from_string(
+                db.0.get_database_backend(),
+                format!(
+                    "CREATE TRIGGER plan_mark_deleting AFTER INSERT ON plan BEGIN \
+                     INSERT OR REPLACE INTO app_setting(key, value) \
+                     VALUES ('{}', '1'); END",
+                    workspace_deleting_key(ws.id)
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let err = upsert_plan(&db, thread.id, "{}", "proposed", "1")
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        assert!(get_plan(&db, thread.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_im_route_rolls_back_when_delete_marker_appears_after_insert() {
+        use sea_orm::ConnectionTrait;
+
+        let db = mem().await;
+        let ws = create_workspace(&db, "delete me").await.unwrap();
+        let thread = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        db.0
+            .execute(sea_orm::Statement::from_string(
+                db.0.get_database_backend(),
+                format!(
+                    "CREATE TRIGGER im_route_mark_deleting AFTER INSERT ON im_route BEGIN \
+                     INSERT OR REPLACE INTO app_setting(key, value) \
+                     VALUES ('{}', '1'); END",
+                    workspace_deleting_key(ws.id)
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let err = bind_im_route(&db, thread.id, "feishu", "chat", "thread")
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+        assert!(im_route_of_thread(&db, thread.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3161,6 +3286,12 @@ mod tests {
         )
         .await
         .unwrap();
+        upsert_plan(&db, thread.id, r#"{"directions":[]}"#, "proposed", "1")
+            .await
+            .unwrap();
+        bind_im_route(&db, thread.id, "feishu", "chat", "thread")
+            .await
+            .unwrap();
         let deleting_key = workspace_deleting_key(ws.id);
         set_setting(&db, &deleting_key, "1").await.unwrap();
 
@@ -3254,6 +3385,51 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(deleting_repo_session_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_err = upsert_plan(&db, thread.id, "{}", "withdrawn", "2")
+            .await
+            .unwrap_err();
+        assert!(deleting_plan_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_created_at_err = set_plan_created_at(&db, thread.id, "2")
+            .await
+            .unwrap_err();
+        assert!(deleting_plan_created_at_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_cas_err =
+            update_plan_proposal_cas(&db, thread.id, "{}", r#"{"directions":[]}"#, "proposed")
+                .await
+                .unwrap_err();
+        assert!(deleting_plan_cas_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_mark_confirmed_err =
+            mark_plan_confirmed_cas(&db, thread.id, r#"{"directions":[]}"#, "proposed")
+                .await
+                .unwrap_err();
+        assert!(deleting_mark_confirmed_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_plan_confirm_err =
+            commit_confirmed_plan_cas(&db, thread.id, "{}", r#"{"directions":[]}"#, "proposed")
+                .await
+                .unwrap_err();
+        assert!(deleting_plan_confirm_err
+            .to_string()
+            .contains(&format!("workspace {} is being deleted", ws.id)));
+
+        let deleting_route_err = bind_im_route(&db, thread.id, "feishu", "chat", "thread-2")
+            .await
+            .unwrap_err();
+        assert!(deleting_route_err
             .to_string()
             .contains(&format!("workspace {} is being deleted", ws.id)));
         delete_setting(&db, &deleting_key).await.unwrap();
