@@ -433,16 +433,24 @@ fn finalize_text(
     out: &Outgoing,
 ) -> Option<String> {
     // Only plain text rows round-trip: command rows ({command,args}) and
-    // attachment-bearing rows keep their cached body (finalize wraps as {text}).
+    // attachment-bearing rows keep their cached body (finalize wraps as {text},
+    // which would drop the image/file chips).
     if m.kind != "text" || !out.images.is_empty() {
         return None;
     }
-    // files are appended into the text; skip files-bearing rows.
-    let files_empty = serde_json::from_str::<serde_json::Value>(&m.content)
+    // Check the PERSISTED attachments too: per-turn dialects spill pasted images to
+    // temp files and clear out.images, but m.content still carries images/files —
+    // replacing such a row with {text} would lose its preview.
+    let attach_free = serde_json::from_str::<serde_json::Value>(&m.content)
         .ok()
-        .and_then(|v| v.get("files").and_then(|f| f.as_array()).map(|a| a.is_empty()))
+        .map(|v| {
+            let empty = |k: &str| {
+                v.get(k).and_then(|x| x.as_array()).map(|a| a.is_empty()).unwrap_or(true)
+            };
+            empty("images") && empty("files")
+        })
         .unwrap_or(true);
-    if !files_empty {
+    if !attach_free {
         return None;
     }
     // Source the text from the in-memory Outgoing (already reflects any edit) so a
@@ -3590,6 +3598,44 @@ mod tests {
         assert!(!t.reorder(&[2, 1]));
         let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
         assert_eq!(ids, vec![1, 2], "queue untouched on refusal");
+    }
+
+    #[test]
+    fn finalize_text_only_replaces_plain_rows() {
+        use crate::store::entities::lead_message::Model;
+        let row = |kind: &str, content: &str| Model {
+            id: 1,
+            thread_id: 1,
+            session_id: None,
+            turn_id: 1,
+            role: "user".into(),
+            kind: kind.into(),
+            content: content.into(),
+            status: "complete".into(),
+            created_at: "0".into(),
+        };
+        let plain = Outgoing { text: "edited".into(), queue_id: Some(1), ..Default::default() };
+        // Plain text, no attachments → use the (edited) Outgoing text.
+        assert_eq!(
+            finalize_text(&row("text", r#"{"text":"orig","images":[],"files":[]}"#), &plain),
+            Some("edited".to_string()),
+        );
+        // Persisted images but out.images cleared (per-turn spill) → keep cached body.
+        let spilled = Outgoing { text: "/tmp/x.png".into(), images: vec![], queue_id: Some(1), ..Default::default() };
+        assert_eq!(
+            finalize_text(&row("text", r#"{"text":"","images":["data:..."],"files":[]}"#), &spilled),
+            None,
+        );
+        // Resident inline image (out.images non-empty) → keep cached body.
+        let resident = Outgoing {
+            text: "hi".into(),
+            images: vec![("image/png".into(), "abc".into())],
+            queue_id: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(finalize_text(&row("text", r#"{"text":"hi"}"#), &resident), None);
+        // Command row → keep cached body.
+        assert_eq!(finalize_text(&row("command", r#"{"command":"x","args":""}"#), &plain), None);
     }
 
     /// queue_edit must preserve images/files in the persisted row; only text changes.
