@@ -9,7 +9,7 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
-import i18n, { currentLang } from "../i18n";
+import { currentLang } from "../i18n";
 import { mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -52,6 +52,16 @@ export interface OpenSession {
   /** the thread this session belongs to (the worker's parent). */
   threadId: number;
   nativeId: string | null;
+}
+
+/** Result of the last dependency-analysis pass for a workspace — drives the
+ *  curator panel's non-conversational status strip. */
+export type AnalysisOutcomeState = "done" | "failed";
+export interface AnalysisOutcome {
+  state: AnalysisOutcomeState;
+  repos: number;
+  edges: number;
+  failed: number;
 }
 
 interface Store {
@@ -180,6 +190,9 @@ interface Store {
   /** A workspace dependency-analysis run is in flight (shared by every Analyze
    *  entry so spinners stay in sync and a second click can't double-run). */
   analyzing: boolean;
+  /** Last completed analysis outcome for the active workspace (null until a run
+   *  finishes) — rendered as the curator panel's status strip, not a chat row. */
+  analysisOutcome: AnalysisOutcome | null;
   deleteRepo: (repoId: number) => Promise<void>;
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
@@ -370,6 +383,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     else analyzingWsRef.current.delete(ws);
     setAnalyzingWs(new Set(analyzingWsRef.current));
   }, []);
+  // Last analysis outcome per workspace (status strip, not a chat row).
+  const [analysisOutcomeWs, setAnalysisOutcomeWs] = useState<Record<number, AnalysisOutcome>>({});
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
@@ -1752,71 +1767,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const ws = activeWorkspaceId;
     if (ws == null || analyzingWsRef.current.has(ws)) return;
     markAnalyzing(ws, true);
-    let runningId: number | null = null;
-    let tid: number | null = null;
+    // Drop any prior outcome for this workspace while the run is in flight (the
+    // status strip shows "running" off `analyzing`).
+    setAnalysisOutcomeWs((m) => {
+      if (!(ws in m)) return m;
+      const next = { ...m };
+      delete next[ws];
+      return next;
+    });
+    // The curator panel is the home of analysis — open it so its status strip shows.
+    if (activeWorkspaceIdRef.current === ws) openCurator();
     try {
-      try {
-        // Coalesced get-or-create — shares the drawer's ensure path, so no duplicate
-        // curator thread, threads list synced (no "claude" lead_tool fallback), and
-        // curatorThreadId adopted only while ws is active (all inside the helper).
-        tid = await ensureCuratorThreadId(ws);
-        // Load history BEFORE appending: opening the panel below mounts the chat,
-        // whose own initial load would otherwise replace-away these fresh rows.
-        await loadLeadChat(tid);
-        await api.curatorAppendMessage(tid, "user", i18n.t("repomap.analysisTrigger"));
-        runningId = await api.curatorAppendMessage(
-          tid,
-          "assistant",
-          i18n.t("repomap.analysisRunning"),
-        );
-      } catch {
-        tid = null; // mirror is best-effort; the pipeline still runs
-        runningId = null;
+      await api.analyzeWorkspaceDeps(ws);
+      const g = await api.repoGraph(ws);
+      // Don't write ws's graph into another view if the user switched away mid-run.
+      if (activeWorkspaceIdRef.current === ws) {
+        setRepoProfiles(g.nodes);
+        setRepoEdges(g.edges);
       }
-      // Open the panel only after the trigger/running rows exist — and only if ws is
-      // still active, so a switch mid-flight doesn't open the new workspace's drawer
-      // backed by the old workspace's thread.
-      if (activeWorkspaceIdRef.current === ws) openCurator();
-      try {
-        await api.analyzeWorkspaceDeps(ws);
-        // ws's curator line still needs its completion summary even if the user
-        // switched away (it belongs to ws's thread); only the visible graph write is
-        // gated on ws still being the active view.
-        const g = await api.repoGraph(ws);
-        if (activeWorkspaceIdRef.current === ws) {
-          setRepoProfiles(g.nodes);
-          setRepoEdges(g.edges);
-        }
-        if (tid != null && runningId != null) {
-          // A forced pass can finish with repos left "failed" (missing analyzer,
-          // unusable output): don't claim a clean update. All-failed reads as a
-          // failure; a partial run names the failed count.
-          const failed = g.nodes.filter((n) => n.analysis_state === "failed").length;
-          let summary: string;
-          if (g.nodes.length > 0 && failed === g.nodes.length) {
-            summary = i18n.t("repomap.analysisFailed");
-          } else if (failed > 0) {
-            summary = i18n.t("repomap.analysisDonePartial", {
-              repos: g.nodes.length,
-              edges: g.edges.length,
-              failed,
-            });
-          } else {
-            summary = i18n.t("repomap.analysisDone", { repos: g.nodes.length, edges: g.edges.length });
-          }
-          await api.curatorFinalizeMessage(tid, runningId, summary);
-        }
-      } catch {
-        // Pipeline OR graph-refresh failed: close the running line so it never hangs
-        // on "Re-analyzing…" forever.
-        if (tid != null && runningId != null) {
-          await api.curatorFinalizeMessage(tid, runningId, i18n.t("repomap.analysisFailed"));
-        }
-      }
+      // A forced pass can finish with repos left "failed" (missing analyzer, unusable
+      // output): all-failed reads as a failure; otherwise done (with any failed count).
+      const failed = g.nodes.filter((n) => n.analysis_state === "failed").length;
+      const state: AnalysisOutcomeState =
+        g.nodes.length > 0 && failed === g.nodes.length ? "failed" : "done";
+      setAnalysisOutcomeWs((m) => ({
+        ...m,
+        [ws]: { state, repos: g.nodes.length, edges: g.edges.length, failed },
+      }));
+    } catch {
+      setAnalysisOutcomeWs((m) => ({ ...m, [ws]: { state: "failed", repos: 0, edges: 0, failed: 0 } }));
     } finally {
       markAnalyzing(ws, false);
     }
-  }, [activeWorkspaceId, openCurator, loadLeadChat, markAnalyzing, ensureCuratorThreadId]);
+  }, [activeWorkspaceId, openCurator, markAnalyzing]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
@@ -2286,6 +2269,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshReposAndMap,
     reprofileRepo,
     analyzing: activeWorkspaceId != null && analyzingWs.has(activeWorkspaceId),
+    analysisOutcome:
+      activeWorkspaceId != null ? (analysisOutcomeWs[activeWorkspaceId] ?? null) : null,
     reanalyzeDeps,
     deleteRepo,
     curatorThreadId,

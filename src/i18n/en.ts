@@ -427,7 +427,6 @@ export const en = {
     reanalyze: "Analyze deps",
     reanalyzing: "Analyzing…",
     reanalyzeHint: "Re-run the agent to classify each repo's tier and infer cross-repo links (read-only)",
-    analysisTrigger: "Re-analyze dependencies",
     analysisRunning: "Re-analyzing dependencies…",
     analysisDone: "Dependency map updated: {{repos}} repos · {{edges}} links",
     analysisDonePartial: "Dependency map updated: {{repos}} repos · {{edges}} links ({{failed}} failed)",

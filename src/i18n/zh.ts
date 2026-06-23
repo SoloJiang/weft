@@ -412,7 +412,6 @@ export const zh = {
     reanalyze: "分析依赖",
     reanalyzing: "分析中…",
     reanalyzeHint: "重新运行 agent，为每个仓库判定层级并推断跨仓关系（只读）",
-    analysisTrigger: "重新分析依赖关系",
     analysisRunning: "正在重新分析依赖…",
     analysisDone: "已更新依赖地图：{{repos}} 个仓库 · {{edges}} 条关系",
     analysisDonePartial: "已更新依赖地图：{{repos}} 个仓库 · {{edges}} 条关系（{{failed}} 个分析失败）",

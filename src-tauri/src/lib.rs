@@ -196,8 +196,6 @@ pub fn run() {
             commands::repo_graph,
             commands::reprofile_repo,
             commands::analyze_workspace_deps,
-            commands::curator_append_message,
-            commands::curator_finalize_message,
             commands::open_curator_chat,
             commands::get_repo_map_doc,
             commands::delete_repo,

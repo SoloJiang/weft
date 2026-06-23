@@ -71,13 +71,6 @@ export const api = {
   // when the pass completes, so the caller can refresh the graph after.
   analyzeWorkspaceDeps: (workspaceId: number) =>
     invoke<void>("analyze_workspace_deps", { workspaceId }),
-  // Mirror an analysis trigger into the curator thread (deterministic; the chat is
-  // the home of analysis). Returns the new message id so a streaming "running"
-  // row can be finalized to a summary on completion.
-  curatorAppendMessage: (threadId: number, role: "user" | "assistant", text: string) =>
-    invoke<number>("curator_append_message", { threadId, role, text }),
-  curatorFinalizeMessage: (threadId: number, messageId: number, text: string) =>
-    invoke<void>("curator_finalize_message", { threadId, messageId, text }),
   // Remove a repo from its workspace (ref + profile + bound tasks + worktrees).
   // The user's actual repository on disk is left untouched.
   deleteRepo: (repoId: number) =>
