@@ -287,7 +287,9 @@ async fn gather_opencode(cwd: &str, native_id: Option<&str>, command: &str) -> S
 /// 按点击/挂载/turn 现扫一次(非后台监听)。直接读 fs 即权威,空 cwd 回 `Some(vec![])`
 /// 清掉陈旧行,绝不回 None;model/window/mcp 留空让 `mergeSnapshot` 保住事件流填的值。
 async fn gather_claude(cwd: &str) -> SessionMetaSnapshot {
-    let skills = crate::skills::cwd_skills(std::path::Path::new(cwd))
+    // 只扫 `.claude`(claude 的项目 skill 目录),不扫 `.agents`(那是 codex/opencode 的约
+    // 定)—— 否则会把 codex-only 的 `.agents/skills/foo` 误当成 claude skill 列出来。
+    let skills = crate::skills::cwd_skills(std::path::Path::new(cwd), &[".claude"])
         .into_iter()
         .map(|p| SkillInfo {
             name: p.name,
@@ -472,9 +474,16 @@ mod tests {
             "---\nname: foo\ndescription: f\n---\nbody",
         )
         .unwrap();
+        // a codex-only skill under `.agents` must NOT surface as a claude skill.
+        std::fs::create_dir_all(root.join(".agents/skills/codexonly")).unwrap();
+        std::fs::write(
+            root.join(".agents/skills/codexonly/SKILL.md"),
+            "---\nname: codexonly\ndescription: c\n---\nbody",
+        )
+        .unwrap();
         let snap = gather("claude", &root.to_string_lossy(), None, "claude").await;
         let skills = snap.skills.expect("claude scan is authoritative → Some, never None");
-        assert_eq!(skills.len(), 1);
+        assert_eq!(skills.len(), 1, "only the .claude skill, not the .agents one");
         assert_eq!(skills[0].name, "foo");
         assert_eq!(skills[0].description, "f");
         // model/window/mcp stay None so mergeSnapshot's `?? prev` preserves claude's

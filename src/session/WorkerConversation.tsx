@@ -163,12 +163,15 @@ export function WorkerConversation() {
   // unlike the async `ref` — so relative file refs resolve against this worker.
   const cwd = live?.info.worktree ?? ref?.worktree;
 
-  // 重载会话:bump skillsDirtyAt(上面的带外 meta effect 据此重拉 session_meta,面板即时
-  // 反映新 skill)+ 标记静默 re-spawn(下条消息让引擎拾取新 MCP/skill)。
+  // 重载会话:先让 flagSessionSkillRefresh 把新启用的 skill 注入 cwd(并标记静默 re-spawn),
+  // **注入完成后**再 bump skillsDirtyAt —— 上面的带外 meta effect 据此重扫 cwd。若先 bump,
+  // 重扫会抢在 inject_for 之前跑、把陈旧/空列表当权威合并,且之后没有触发再纠正。
   const onReload = () => {
-    markSkillsDirty();
-    if (sid == null) return;
-    void api.flagSessionSkillRefresh(sid);
+    if (sid == null) {
+      markSkillsDirty();
+      return;
+    }
+    void api.flagSessionSkillRefresh(sid).finally(() => markSkillsDirty());
   };
 
   return (

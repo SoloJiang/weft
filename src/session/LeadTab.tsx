@@ -150,10 +150,11 @@ export function LeadTab({
   // The lead engine runs the thread's lead_tool (not always claude).
   const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
 
-  // 重载会话:重拉 skills + 标记静默 re-spawn(claude 下条消息拾取新 MCP/skill)。
+  // 重载会话:先注入新启用的 skill 到 lead cwd(并标记静默 re-spawn,claude 下条消息拾取),
+  // **注入完成后**再 bump skillsDirtyAt,让带外 meta effect 重扫 cwd —— 避免重扫抢在
+  // inject_for 之前把陈旧列表当权威合并。
   const onReload = () => {
-    markSkillsDirty();
-    void api.flagLeadSkillRefresh(tid);
+    void api.flagLeadSkillRefresh(tid).finally(() => markSkillsDirty());
   };
 
   const onLocalSlash = (name: string) => {
