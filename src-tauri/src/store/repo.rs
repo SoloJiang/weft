@@ -1367,6 +1367,17 @@ pub async fn insert_lead_message(
     .await?)
 }
 
+/// Next turn id for a thread's synthetic (non-engine) messages: one past the
+/// latest row. Group a trigger + its progress reply under the same id.
+pub async fn next_lead_turn_id(db: &Db, thread_id: i32) -> Result<i32> {
+    let last = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .order_by_desc(lead_message::Column::Id)
+        .one(&db.0)
+        .await?;
+    Ok(last.map(|m| m.turn_id + 1).unwrap_or(1))
+}
+
 pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) -> Result<()> {
     if let Some(m) = lead_message::Entity::find_by_id(id).one(&db.0).await? {
         let mut a: lead_message::ActiveModel = m.into();
@@ -3240,5 +3251,19 @@ mod tests {
             get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
             "manual edge calibration must invalidate the stale workspace map doc"
         );
+    }
+
+    #[tokio::test]
+    async fn next_lead_turn_id_increments_from_last_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws_turn").await.unwrap();
+        let t = create_thread(&db, ws.id, "curator", "curator", "claude").await.unwrap();
+        // Empty thread → 1.
+        assert_eq!(next_lead_turn_id(&db, t.id).await.unwrap(), 1);
+        // Insert a row with turn_id 4 → next is 5.
+        insert_lead_message(&db, t.id, None, 4, "user", "text", r#"{"text":"hi"}"#, "complete")
+            .await
+            .unwrap();
+        assert_eq!(next_lead_turn_id(&db, t.id).await.unwrap(), 5);
     }
 }
