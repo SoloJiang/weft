@@ -227,8 +227,12 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
     );
   }
 
+  // min-w-0 on this column and the chat/map wrappers below: without it these flex
+  // children adopt their wide descendant's min-content width (a long code/mermaid
+  // line in the chat) and grow past the fixed-width aside, shifting and clipping the
+  // tab row. LeadTab's own root already has min-w-0; the leak was these wrappers.
   return (
-    <div className={cn("min-h-0 flex-1 flex-col", active ? "flex" : "hidden")}>
+    <div className={cn("min-h-0 min-w-0 flex-1 flex-col", active ? "flex" : "hidden")}>
       {/* chat / map segmented toggle */}
       <div className="flex shrink-0 gap-0.5 border-b border-border px-3 py-1.5">
         <button
@@ -256,7 +260,7 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
       </div>
 
       {/* chat view: keep LeadTab mounted so scroll/draft survive toggling */}
-      <div className={cn("min-h-0 flex-1 flex-col", view === "chat" ? "flex" : "hidden")}>
+      <div className={cn("min-h-0 min-w-0 flex-1 flex-col", view === "chat" ? "flex" : "hidden")}>
         {threadId != null ? (
           <LeadTab
             threadId={threadId}
@@ -280,7 +284,7 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
 
       {/* map view */}
       {view === "map" && (
-        <div className="min-h-0 flex-1 flex flex-col">
+        <div className="min-h-0 min-w-0 flex-1 flex flex-col">
           {renderMapBody()}
         </div>
       )}
