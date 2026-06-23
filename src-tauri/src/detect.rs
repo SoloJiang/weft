@@ -198,13 +198,33 @@ fn refresh_tool_path() -> String {
     if REFRESHED.swap(true, Ordering::SeqCst) {
         return tool_path();
     }
+    // Only replace the memoized PATH on a SUCCESSFUL probe — a failed/timed-out
+    // re-probe must not clobber a working cached PATH with the minimal base PATH
+    // (that would make an already-resolved agent vanish for the rest of the session).
+    let Some(shell_path) = login_shell_path() else {
+        return tool_path();
+    };
     let base = std::env::var("PATH").unwrap_or_default();
-    let fresh = probe_and_merge(&base);
-    match tool_path_cell().write() {
-        Ok(mut g) => *g = fresh.clone(),
-        Err(p) => *p.into_inner() = fresh.clone(),
+    let merged = merge_path(&base, &shell_path);
+    if let Some(file) = shell_path_cache_file() {
+        write_cached_shell_path(&file, &shell_path);
     }
-    fresh
+    match tool_path_cell().write() {
+        Ok(mut g) => *g = merged.clone(),
+        Err(p) => *p.into_inner() = merged.clone(),
+    }
+    merged
+}
+
+/// Does `program` resolve on the augmented PATH — the SAME way a bare
+/// `Command::new(program)` spawn will? Re-probes once on a miss (like
+/// [`resolve_tool_path`]) but does NOT consult the Codex app-bundle fallback,
+/// which a bare PATH spawn can't reach.
+pub fn resolves_on_path(program: &str) -> bool {
+    if which_on_path(program, &tool_path()).is_some() {
+        return true;
+    }
+    which_on_path(program, &refresh_tool_path()).is_some()
 }
 
 /// Prewarm the augmented PATH at startup so the first agent spawn doesn't pay the

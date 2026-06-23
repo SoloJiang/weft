@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
+    let out = Command::new("git").env("PATH", crate::detect::tool_path())
         .args(args)
         .current_dir(dir)
         .output()
@@ -25,7 +25,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// True if `path` is inside a git work tree.
 pub fn is_git_repo(path: &Path) -> bool {
-    Command::new("git")
+    Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
         .output()
@@ -36,7 +36,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 /// True if `r` resolves to a commit in `dir` (non-empty + `rev-parse` verifies).
 pub fn ref_resolves(dir: &Path, r: &str) -> bool {
     !r.is_empty()
-        && Command::new("git")
+        && Command::new("git").env("PATH", crate::detect::tool_path())
             .args(["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")])
             .current_dir(dir)
             .output()
@@ -133,7 +133,7 @@ fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
     if ref_resolves(repo, recorded) {
         return recorded.to_string();
     }
-    if let Ok(out) = Command::new("git")
+    if let Ok(out) = Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .current_dir(repo)
         .output()
@@ -257,7 +257,7 @@ fn resolve_target_ref(worktree: &Path, target: &str) -> String {
 /// or None when no remote-tracking HEAD is set locally (no remote, or a repo added
 /// by path that was never cloned / `git remote set-head`). Local-only; no network.
 fn remote_default_branch(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .current_dir(repo)
         .output()
@@ -353,7 +353,7 @@ pub fn recorded_base_or_default(repo: &Path, base_ref: &str, is_default: bool) -
 /// which needs the ref already fetched). None offline / no remote / parse miss.
 /// GIT_TERMINAL_PROMPT=0 fails fast instead of prompting.
 pub fn live_default_branch(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["ls-remote", "--symref", "origin", "HEAD"])
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -456,7 +456,7 @@ pub fn fetch_origin_branch(dir: &Path, branch: &str) -> bool {
     // on origin lands in refs/remotes/origin/<b>; a same-named TAG no longer leaks
     // into the remote-tracking branch namespace and can't be mistaken for a base.
     let refspec = format!("+refs/heads/{b}:refs/remotes/origin/{b}");
-    Command::new("git")
+    Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["fetch", "--quiet", "origin", &refspec])
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1179,7 +1179,7 @@ pub fn head_commit(repo: &Path) -> Result<String> {
 /// ambiguous as the repo accumulates commits, breaking later ref resolution, so the
 /// stored target must be the unabbreviated sha. None on an empty repo (no HEAD yet).
 pub fn head_commit_full(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)
         .output()
@@ -1196,7 +1196,7 @@ pub fn head_commit_full(repo: &Path) -> Option<String> {
 /// Resolves the real exclude path via git (worktrees use a separate gitdir).
 /// Best-effort: silently does nothing if git isn't available.
 pub fn git_exclude(cwd: &std::path::Path, name: &str) {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new("git").env("PATH", crate::detect::tool_path())
         .args([
             "-C",
             &cwd.to_string_lossy(),

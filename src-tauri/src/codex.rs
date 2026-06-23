@@ -54,7 +54,7 @@ fn codex_home() -> Option<PathBuf> {
 
 /// The git repository root Codex trusts (a worktree → its main repo root).
 fn repo_root(cwd: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new("git").env("PATH", crate::detect::tool_path())
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(cwd)
         .output()

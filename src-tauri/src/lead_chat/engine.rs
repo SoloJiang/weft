@@ -1338,7 +1338,10 @@ pub async fn send(
                 g.turn.busy,
             )
         };
-        if !busy && crate::detect::resolve_tool_path(&command).is_none() {
+        // Match how the actual turn spawns: a bare `Command::new(command)` on the
+        // augmented PATH. resolve_tool_path's Codex app-bundle fallback would say
+        // "found" for a bundle the bare spawn can't reach, so use the PATH-only check.
+        if !busy && !crate::detect::resolves_on_path(&command) {
             let turn = {
                 let mut g = eng.lock().await;
                 g.turn_id += 1;
