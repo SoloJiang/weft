@@ -8,6 +8,12 @@
 
 use std::time::Duration;
 
+/// Budget for the `zsh -ilc` PATH probe. Generous because the result is cached on
+/// disk — this runs at most once per shell-config change (and off the critical
+/// path on a cache hit), so a heavy interactive shell no longer loses the race a
+/// tight 3s budget did.
+const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// POSIX shells we will invoke as `-ilc`. fish has different syntax → excluded.
 fn is_supported_login_shell(shell: &str) -> bool {
     matches!(
@@ -35,7 +41,7 @@ fn login_shell_path() -> Option<String> {
         .stdin(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let out = wait_with_timeout(&mut child, Duration::from_secs(3))?;
+    let out = wait_with_timeout(&mut child, SHELL_PROBE_TIMEOUT)?;
     let path = String::from_utf8_lossy(&out).trim().to_string();
     if path.is_empty() {
         None
@@ -85,45 +91,94 @@ pub(crate) fn merge_path(base: &str, extra: &str) -> String {
     out.join(":")
 }
 
-/// Run once at startup: fold known tool-install dirs AND the login shell's PATH
-/// into this process's PATH, so a GUI- or dev-launched Weft can spawn
-/// nvm/fnm/volta/native CLIs even when the inherited PATH is minimal. Engine and
-/// curator spawns inherit this process's env, so one augment fixes every later
-/// `claude`/`codex`/`opencode` spawn.
-///
-/// Two sources, merged with EXISTING entries kept at higher priority (we only
-/// ADD what's missing): (1) a deterministic scan of version-manager + native
-/// install dirs — needs no shell, so it can't time out; (2) the login shell's
-/// full PATH, a best-effort secondary for custom dirs the scan can't know.
-/// Source (2) used to fail SILENTLY on a slow shell (leaving an installed CLI
-/// unresolvable with no clue in the log), so a probe miss now logs a diagnostic.
-pub fn augment_path() {
-    let base = std::env::var("PATH").unwrap_or_default();
-    let mut merged = base.clone();
+/// Cache file for the probed login-shell PATH, under the weft home so it follows
+/// the same dev/release/`$WEFT_HOME` split as the rest of weft's data.
+fn shell_path_cache_file() -> Option<std::path::PathBuf> {
+    crate::paths::weft_home()
+        .ok()
+        .map(|h| h.join("login-shell-path"))
+}
 
-    let scanned = tool_bin_dirs(home_dir().as_deref());
-    if !scanned.is_empty() {
-        let extra = scanned
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(":");
-        merged = merge_path(&merged, &extra);
+/// A cached login-shell PATH, if present and non-empty.
+fn read_cached_shell_path(file: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(file).ok()?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Write the login-shell PATH cache atomically (tmp + rename) so a crash — or a
+/// background refresh killed at app exit — can't leave a torn cache file.
+fn write_cached_shell_path(file: &std::path::Path, value: &str) {
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-
-    match login_shell_path() {
-        Some(shell_path) => merged = merge_path(&merged, &shell_path),
-        // Windows GUIs inherit PATH fine and have no `-ilc` probe, so only the
-        // unix probe failing is worth flagging.
-        None if !cfg!(windows) => eprintln!(
-            "[weft] login-shell PATH probe unavailable (unset/unsupported shell or timed out); \
-             relying on direct tool-dir scan for nvm/fnm/volta/native CLIs"
-        ),
-        None => {}
+    let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, value).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
     }
+}
 
+/// Merge `extra` into the process PATH, keeping existing entries' priority (only
+/// missing dirs are appended).
+fn apply_shell_path(base: &str, extra: &str) {
+    let merged = merge_path(base, extra);
     if merged != base {
         std::env::set_var("PATH", merged);
+    }
+}
+
+/// Re-probe the login shell off the critical path and rewrite the cache — DISK
+/// ONLY, never the live process env (mutating env from another thread would race
+/// concurrent `Command::spawn`s) — so the NEXT launch reflects a tool installed
+/// since this one.
+fn spawn_shell_path_refresh(file: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        if let Some(shell_path) = login_shell_path() {
+            write_cached_shell_path(&file, &shell_path);
+        }
+    });
+}
+
+/// Run once at startup: fold the user's login-shell PATH into this process's PATH
+/// so a GUI- or dev-launched Weft can spawn nvm/fnm/volta/native CLIs even when
+/// the inherited PATH is minimal. Engine and curator spawns inherit this
+/// process's env, so one augment fixes every later `claude`/`codex`/`opencode`.
+///
+/// The login shell is the single authoritative source of what's on the user's
+/// PATH — it already knows every version manager — but probing it (`zsh -ilc`) is
+/// slow on a heavy shell. So the result is CACHED on disk: a cache hit augments
+/// instantly and refreshes the cache in the background (disk only — no
+/// cross-thread setenv race) for next launch; a cache miss (first launch) pays
+/// the probe once, synchronously, and seeds the cache. A tool installed between
+/// launches is therefore picked up on the following launch.
+pub fn augment_path() {
+    let base = std::env::var("PATH").unwrap_or_default();
+    let cache = shell_path_cache_file();
+
+    // Fast path: reuse a previous launch's probe, then refresh it in the background.
+    if let Some(file) = cache.as_ref() {
+        if let Some(cached) = read_cached_shell_path(file) {
+            apply_shell_path(&base, &cached);
+            spawn_shell_path_refresh(file.clone());
+            return;
+        }
+    }
+
+    // Cold path (first launch / no cache): probe synchronously once, augment, seed.
+    match login_shell_path() {
+        Some(shell_path) => {
+            apply_shell_path(&base, &shell_path);
+            if let Some(file) = cache.as_ref() {
+                write_cached_shell_path(file, &shell_path);
+            }
+        }
+        // Windows GUIs inherit PATH fine and have no `-ilc` probe, so only the unix
+        // probe failing (unset/unsupported shell or timeout) is worth flagging.
+        None if !cfg!(windows) => eprintln!(
+            "[weft] login-shell PATH probe unavailable (unset/unsupported shell or timed out); \
+             GUI-launched spawns may not find nvm/fnm/volta CLIs until it succeeds"
+        ),
+        None => {}
     }
 }
 
@@ -293,98 +348,6 @@ fn which_on_path(tool: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// The user's home directory (HOME, or USERPROFILE on Windows). None if unset.
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-}
-
-/// Existing `bin` dirs under an nvm tree (`<nvm_dir>/versions/node/<v>/bin`).
-/// nvm installs each node version's global CLIs there, so a CLI installed under
-/// ANY version is discoverable regardless of which one is "current" — the login
-/// shell may not have run `nvm use`, but the binary is still on disk.
-fn nvm_node_bin_dirs(nvm_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = std::fs::read_dir(nvm_dir.join("versions/node")) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().join("bin"))
-        .filter(|p| p.is_dir())
-        .collect()
-}
-
-/// Existing node `installation/bin` dirs across fnm's known on-disk layouts
-/// (XDG data dir, `~/.fnm`, macOS Application Support).
-fn fnm_node_bin_dirs(home: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let roots = [
-        home.join(".local/share/fnm/node-versions"),
-        home.join(".fnm/node-versions"),
-        home.join("Library/Application Support/fnm/node-versions"),
-    ];
-    let mut out = Vec::new();
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for e in entries.filter_map(|e| e.ok()) {
-            let bin = e.path().join("installation/bin");
-            if bin.is_dir() {
-                out.push(bin);
-            }
-        }
-    }
-    out
-}
-
-/// Home-relative dirs where native installers / package managers drop CLIs.
-/// Pure: returns CANDIDATES (not existence-filtered) so the mapping is testable;
-/// the orchestrator filters to existing dirs.
-fn static_tool_bin_dirs(home: &std::path::Path) -> Vec<std::path::PathBuf> {
-    [
-        ".local/bin",
-        ".cargo/bin",
-        ".bun/bin",
-        ".deno/bin",
-        ".volta/bin",
-        ".opencode/bin",
-        ".npm-global/bin",
-        "Library/pnpm",
-    ]
-    .iter()
-    .map(|s| home.join(s))
-    .collect()
-}
-
-/// System bin dirs a minimal GUI PATH often omits (Homebrew, /usr/local).
-const SYSTEM_TOOL_BIN_DIRS: [&str; 4] = [
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/local/sbin",
-];
-
-/// All EXISTING tool-install bin dirs discovered WITHOUT a shell: version
-/// managers (nvm/fnm) + native-installer / package-manager dirs + system dirs.
-/// Deterministic and fast — the reliable half of PATH augmentation, so a slow or
-/// timed-out login-shell probe can no longer hide an installed CLI.
-fn tool_bin_dirs(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
-    let mut out: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(h) = home {
-        // nvm respects $NVM_DIR; default to ~/.nvm when the env var is unset
-        // (a GUI launch won't have sourced the shell that exports it).
-        let nvm = std::env::var_os("NVM_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| h.join(".nvm"));
-        out.extend(nvm_node_bin_dirs(&nvm));
-        out.extend(fnm_node_bin_dirs(h));
-        out.extend(static_tool_bin_dirs(h));
-    }
-    out.extend(SYSTEM_TOOL_BIN_DIRS.iter().map(std::path::PathBuf::from));
-    out.into_iter().filter(|p| p.is_dir()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,56 +427,42 @@ mod tests {
     }
 
     #[test]
-    fn nvm_node_bin_dirs_finds_versioned_bins_and_skips_binless() {
+    fn cached_shell_path_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let nvm = tmp.path();
-        for v in ["v22.22.0", "v18.19.0"] {
-            std::fs::create_dir_all(nvm.join("versions/node").join(v).join("bin")).unwrap();
-        }
-        // A version dir with no bin/ must be skipped, not blindly added.
-        std::fs::create_dir_all(nvm.join("versions/node/v16.0.0")).unwrap();
-        let dirs = nvm_node_bin_dirs(nvm);
-        assert!(dirs.contains(&nvm.join("versions/node/v22.22.0/bin")));
-        assert!(dirs.contains(&nvm.join("versions/node/v18.19.0/bin")));
-        assert!(!dirs.contains(&nvm.join("versions/node/v16.0.0/bin")));
-        // A missing nvm dir yields nothing and never panics.
-        assert!(nvm_node_bin_dirs(&nvm.join("does-not-exist")).is_empty());
+        let file = tmp.path().join("login-shell-path");
+        // Missing cache → None (cold path: probe synchronously).
+        assert!(read_cached_shell_path(&file).is_none());
+        write_cached_shell_path(&file, "/opt/homebrew/bin:/usr/bin");
+        assert_eq!(
+            read_cached_shell_path(&file).as_deref(),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
     }
 
     #[test]
-    fn fnm_node_bin_dirs_finds_installation_bins() {
+    fn cached_shell_path_rejects_blank_and_creates_parents() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let bin = home.join(".local/share/fnm/node-versions/v22.22.0/installation/bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        assert!(fnm_node_bin_dirs(home).contains(&bin));
+        // Parent dirs are created on write.
+        let nested = tmp.path().join("a/b/login-shell-path");
+        write_cached_shell_path(&nested, "/usr/bin");
+        assert_eq!(read_cached_shell_path(&nested).as_deref(), Some("/usr/bin"));
+        // A blank/whitespace cache reads back as None, not "".
+        let blank = tmp.path().join("blank");
+        write_cached_shell_path(&blank, "  \n");
+        assert!(read_cached_shell_path(&blank).is_none());
     }
 
     #[test]
-    fn static_tool_bin_dirs_lists_known_home_install_dirs() {
-        let home = std::path::Path::new("/home/u");
-        let dirs = static_tool_bin_dirs(home);
-        for sub in [".cargo/bin", ".local/bin", ".volta/bin", ".bun/bin"] {
-            assert!(dirs.contains(&home.join(sub)), "missing candidate: {sub}");
-        }
-    }
-
-    #[test]
-    fn discovered_nvm_bin_makes_codex_resolvable_after_merge() {
-        // Reproduces the real bug: the inherited PATH lacks the nvm dir where
-        // `codex` lives; after merging the DISCOVERED nvm bin, codex resolves.
+    fn cached_path_with_nvm_bin_resolves_codex_after_merge() {
+        // Reproduces the bug at the cache layer: a cached login-shell PATH that
+        // includes the nvm bin makes `codex` resolvable when merged into a minimal
+        // process PATH that lacked it.
         let tmp = tempfile::tempdir().unwrap();
-        let nvm = tmp.path();
-        let bin = nvm.join("versions/node/v22.22.0/bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("codex"), b"#!/bin/sh\n").unwrap();
-        let extra = nvm_node_bin_dirs(nvm)
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(":");
-        let merged = merge_path("/usr/bin:/bin", &extra);
-        let found = std::env::split_paths(&merged).any(|d| d.join("codex").is_file());
-        assert!(found, "codex must resolve after merging the discovered nvm bin");
+        let nvm_bin = tmp.path().join("nvm/versions/node/v22.22.0/bin");
+        std::fs::create_dir_all(&nvm_bin).unwrap();
+        std::fs::write(nvm_bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        let cached = format!("/usr/bin:{}", nvm_bin.display());
+        let merged = merge_path("/usr/bin:/bin", &cached);
+        assert!(std::env::split_paths(&merged).any(|d| d.join("codex").is_file()));
     }
 }
