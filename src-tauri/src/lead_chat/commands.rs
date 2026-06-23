@@ -443,7 +443,7 @@ mod tests {
         use crate::lead_chat::engine::QueuedItem;
         let info = super::LeadStateInfo {
             state: "idle".into(),
-            queue: vec![QueuedItem { id: 1, text: "hello".into(), images: 0, files: 0 }],
+            queue: vec![QueuedItem { id: 1, text: "hello".into(), images: 0, files: 0, has_attachments: false }],
             native_id: None,
             command: String::new(),
             slash_commands: vec![],
@@ -1367,8 +1367,8 @@ mod live_slot_tests {
         let (th, dir, repo_id, sess) = fixture(&db).await;
 
         let items = vec![
-            QueuedItem { id: 10, text: "hi".into(), images: 0, files: 0 },
-            QueuedItem { id: 11, text: "there".into(), images: 1, files: 0 },
+            QueuedItem { id: 10, text: "hi".into(), images: 0, files: 0, has_attachments: false },
+            QueuedItem { id: 11, text: "there".into(), images: 1, files: 0, has_attachments: true },
         ];
         let slots = build_worker_slots(
             &db,

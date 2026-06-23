@@ -1424,8 +1424,12 @@ pub async fn mark_incomplete_turns_interrupted(
 }
 
 pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_message::Model>> {
+    use sea_orm::Order;
+    // COALESCE(seq, id) ensures delivered-queued rows appear in send order while
+    // all other rows keep creation order. id ASC breaks same-effective-key ties.
     Ok(lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .order_by(Expr::cust("COALESCE(seq, id)"), Order::Asc)
         .order_by_asc(lead_message::Column::Id)
         .all(&db.0)
         .await?)
@@ -1472,6 +1476,33 @@ pub async fn complete_queued_by_id(
 /// 删除一条消息行（仅用于取消未交付的 queued 行）。
 pub async fn delete_message(db: &Db, message_id: i32) -> Result<()> {
     lead_message::Entity::delete_by_id(message_id).exec(&db.0).await?;
+    Ok(())
+}
+
+/// Stamp a delivered queued row with seq = max(COALESCE(seq, id)) + 1 over its
+/// thread so it sorts after all currently-ordered rows in list_lead_messages.
+/// Called for every tracked queued delivery to preserve reorder-then-deliver order.
+pub async fn assign_delivery_seq(db: &Db, thread_id: i32, message_id: i32) -> Result<()> {
+    use sea_orm::{ConnectionTrait, Order, QuerySelect};
+    // Find the current max effective sort key for this thread.
+    let rows = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .order_by(Expr::cust("COALESCE(seq, id)"), Order::Desc)
+        .limit(1)
+        .all(&db.0)
+        .await?;
+    let next_seq: i64 = rows
+        .first()
+        .map(|m| m.seq.unwrap_or(m.id as i64) + 1)
+        .unwrap_or(1);
+    // Raw UPDATE: seq is not in the entity's ActiveModel update path in older
+    // SeaORM versions; use a raw statement to avoid depending on the column ordering.
+    db.0.execute(sea_orm::Statement::from_sql_and_values(
+        db.0.get_database_backend(),
+        "UPDATE lead_message SET seq = ? WHERE id = ?",
+        [next_seq.into(), message_id.into()],
+    ))
+    .await?;
     Ok(())
 }
 
@@ -3301,5 +3332,32 @@ mod tests {
             get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
             "manual edge calibration must invalidate the stale workspace map doc"
         );
+    }
+
+    /// FIX 4: assign_delivery_seq makes a reordered-then-delivered row sort after
+    /// rows with lower ids that were NOT yet assigned a seq.
+    /// Insert A (id=low), B (id=mid), C (id=high). Deliver B first (simulating a
+    /// reorder). list_lead_messages must show A, C, B (B's seq > C's effective key).
+    #[tokio::test]
+    async fn delivery_seq_overrides_id_order() {
+        let db = mem().await;
+        let a = insert_lead_message(&db, 5, None, 1, "user", "text", r#"{"text":"A"}"#, "complete")
+            .await
+            .unwrap();
+        let b = insert_lead_message(&db, 5, None, 2, "user", "text", r#"{"text":"B"}"#, "complete")
+            .await
+            .unwrap();
+        let c = insert_lead_message(&db, 5, None, 3, "user", "text", r#"{"text":"C"}"#, "complete")
+            .await
+            .unwrap();
+
+        // Assign a delivery seq to B as if it was delivered after C (reorder scenario).
+        // max(COALESCE(seq,id)) over [a.id, b.id, c.id] = c.id, so B.seq = c.id + 1.
+        assign_delivery_seq(&db, 5, b.id).await.unwrap();
+
+        let msgs = list_lead_messages(&db, 5).await.unwrap();
+        let ids: Vec<i32> = msgs.iter().map(|m| m.id).collect();
+        // COALESCE(seq, id) ordering: A → a.id, C → c.id, B → c.id+1
+        assert_eq!(ids, vec![a.id, c.id, b.id], "B must sort after C once its seq > C.id");
     }
 }

@@ -42,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0029GatewayToBackend),
             Box::new(M0030AnalysisState),
             Box::new(M0031RepoCategoryDomains),
+            Box::new(M0032LeadMessageSeq),
         ]
     }
 }
@@ -1387,6 +1388,46 @@ impl MigrationTrait for M0031RepoCategoryDomains {
                 Table::alter()
                     .table(Alias::new("repo_profile"))
                     .drop_column(Alias::new("domains"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds nullable `seq` (BIGINT) to `lead_message`. When a queued row is
+/// delivered, `assign_delivery_seq` sets seq to max(COALESCE(seq,id)) + 1 so
+/// reordered-then-delivered rows appear in send order, not creation order.
+/// Existing rows stay NULL and sort by id (COALESCE(seq, id) = id).
+pub struct M0032LeadMessageSeq;
+impl MigrationName for M0032LeadMessageSeq {
+    fn name(&self) -> &str {
+        "m0032_lead_message_seq"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0032LeadMessageSeq {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("lead_message"))
+                    .add_column(ColumnDef::new(Alias::new("seq")).big_integer().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("lead_message"))
+                    .drop_column(Alias::new("seq"))
                     .to_owned(),
             )
             .await

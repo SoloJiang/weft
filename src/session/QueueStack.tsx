@@ -85,7 +85,10 @@ function QueueRowText({
   // shape) and attachment-bearing rows don't round-trip an edited text body into the
   // delivered transcript, so they stay delete/reorder-only.
   const editable =
-    hasText && item.images === 0 && !item.text.trimStart().startsWith("/");
+    hasText &&
+    item.images === 0 &&
+    !item.has_attachments &&
+    !item.text.trimStart().startsWith("/");
 
   if (!editing) {
     return (

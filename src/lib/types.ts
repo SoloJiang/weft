@@ -413,6 +413,8 @@ export interface QueuedItem {
   text: string;
   images: number;
   files: number;
+  /** True when the original send carried files or images; disables inline edit. */
+  has_attachments: boolean;
 }
 
 /** The lead's proposed split of a Task into directions: ONE write repo each

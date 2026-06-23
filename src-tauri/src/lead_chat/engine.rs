@@ -59,6 +59,8 @@ pub struct QueuedItem {
     pub text: String,
     pub images: usize,
     pub files: usize,
+    /// True when the original send carried files or images; disables inline edit.
+    pub has_attachments: bool,
 }
 
 pub(crate) fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
@@ -71,6 +73,7 @@ pub(crate) fn queue_items(turn: &TurnState) -> Vec<QueuedItem> {
                 images: o.images.len(),
                 // files are appended into text; count is not separately tracked
                 files: 0,
+                has_attachments: o.has_attachments,
             })
         })
         .collect()
@@ -169,6 +172,9 @@ pub struct Outgoing {
     pub origin_tag: Option<String>,
     /// 入队时持久化的 queued 行 id；删/改/重排和交付落库按它定位。None=直接发送。
     pub queue_id: Option<i32>,
+    /// True when the original send carried files or images (computed from the
+    /// ORIGINAL inputs before per-turn image-spill clears out.images).
+    pub has_attachments: bool,
 }
 
 /// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
@@ -231,6 +237,7 @@ impl TurnState {
                     tracked: false,
                     origin_tag: None,
                     queue_id: None,
+                    has_attachments: false,
                 })
             }
             // A message queued before the wake goes first; the wake slides up one.
@@ -407,6 +414,11 @@ async fn mark_queued_delivered(
     };
     match res {
         Ok(Some(m)) => {
+            // Stamp a delivery-order seq so reordered rows appear in send order
+            // (not creation order) in the transcript after restart.
+            if let Err(e) = repo::assign_delivery_seq(db, thread_id, m.id).await {
+                eprintln!("[weft] assign_delivery_seq failed: {e}");
+            }
             // Carry the (possibly edited) text so the transcript shows what was
             // delivered, not the stale original Push::Message body.
             let content = finalize_text(&m, out);
@@ -783,6 +795,7 @@ async fn apply_lead_sentinels(
                         tracked: false,
                         origin_tag: None,
                         queue_id: None,
+                        has_attachments: false,
                     };
                     queue_hidden_delivery(app, inner, out);
                 }
@@ -1350,6 +1363,9 @@ pub async fn send(
         },
     );
     let mut outbound = text.to_string();
+    // Capture BEFORE images may be spilled to temp files below (per-turn dialects
+    // clear out.images after spill; has_attachments must reflect the original inputs).
+    let has_attachments = !files.is_empty() || !images.is_empty();
     if !files.is_empty() {
         outbound.push_str("\n\nAttached files (read them as needed):\n");
         for f in &files {
@@ -1383,6 +1399,7 @@ pub async fn send(
         // Rides the turn (and the queue, if queued) so output frames recover it.
         origin_tag: origin_tag.clone(),
         queue_id: if direct { None } else { Some(row_id) },
+        has_attachments,
     };
     // codex (app-server): a per-session connection drives the turn after the lock
     // drops (streaming via item/agentMessage/delta). system_prompt is prepended to
@@ -2018,30 +2035,36 @@ async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> an
 
 /// 取消一条还在队列中的消息；幂等（消息已交付则静默成功）。
 pub async fn queue_remove(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32) -> anyhow::Result<()> {
-    {
-        let mut inner = eng.lock().await;
-        if !inner.turn.remove(message_id) {
-            return Ok(());
-        }
-        emit_turn_state(app, inner.thread_id, inner.session_id, inner.turn.busy, queue_items(&inner.turn));
+    let mut inner = eng.lock().await;
+    if !inner.turn.remove(message_id) {
+        return Ok(());
     }
+    emit_turn_state(app, inner.thread_id, inner.session_id, inner.turn.busy, queue_items(&inner.turn));
+    // Delete under the lock so a concurrent stop (mark_queued_status also takes
+    // the lock) cannot re-finalize a row we just removed from memory.
     repo::delete_message(db, message_id).await?;
     Ok(())
 }
 
-/// 编辑一条还在队列中的消息文本；text 为空时返回 Err。
+/// 编辑一条还在队列中的消息文本；text 为空或有附件时返回 Err。
 pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i32, text: &str) -> anyhow::Result<()> {
     if text.trim().is_empty() {
         return Err(anyhow::anyhow!("empty"));
     }
-    {
+    let thread_id = {
         let mut inner = eng.lock().await;
+        // Reject edits on attachment-bearing rows: they carry image/file chips
+        // in their content that the text-only edit path would silently drop.
+        if inner.turn.queue.iter().any(|o| o.queue_id == Some(message_id) && o.has_attachments) {
+            return Err(anyhow::anyhow!("not_editable"));
+        }
         if !inner.turn.edit(message_id, text) {
             return Ok(());
         }
         let (tid, sid) = (inner.thread_id, inner.session_id);
         emit_turn_state(app, tid, sid, inner.turn.busy, queue_items(&inner.turn));
-    }
+        tid
+    };
     // Preserve existing images/files; only replace the text field.
     let content = if let Some(row) = repo::get_message(db, message_id).await? {
         let mut val: serde_json::Value =
@@ -2052,6 +2075,17 @@ pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i
         serde_json::json!({ "text": text, "images": [], "files": [] }).to_string()
     };
     repo::update_message_content(db, message_id, &content).await?;
+    // Push the edited text to the FE cache immediately so a subsequent stop/deliver
+    // finalizes the edited version, not the stale original.
+    let _ = app.emit(
+        EVENT,
+        Push::Finalize {
+            thread_id,
+            message_id,
+            status: "queued".into(),
+            content: Some(text.to_string()),
+        },
+    );
     Ok(())
 }
 
@@ -2198,6 +2232,7 @@ async fn send_hidden_inner(
         tracked: false,
         origin_tag: None,
         queue_id: None,
+        has_attachments: false,
     };
 
     match hidden_delivery(
@@ -3038,6 +3073,7 @@ mod tests {
             tracked: true,
             origin_tag: None,
             queue_id: None,
+            has_attachments: false,
         });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
@@ -3074,6 +3110,7 @@ mod tests {
             tracked: true,
             origin_tag: None,
             queue_id: None,
+            has_attachments: false,
         });
         t.request_bus_read(); // wake lands AFTER "earlier" was queued
                               // "earlier" preceded the wake, so it drains first, then the read.
@@ -3096,6 +3133,7 @@ mod tests {
             tracked: true,
             origin_tag: None,
             queue_id: None,
+            has_attachments: false,
         });
         // The wake arrived before "later", so the inbox read comes first — the
         // agent can't answer the newer prompt without seeing the bus message.
@@ -3382,6 +3420,7 @@ mod tests {
             tracked: true,
             origin_tag: None,
             queue_id: None,
+            has_attachments: false,
         });
         let turn_id = mark_hidden_turn_started(&mut inner);
 
@@ -3414,6 +3453,7 @@ mod tests {
             tracked: false,
             origin_tag: None,
             queue_id: None,
+            has_attachments: false,
         };
 
         let err = write_user(&mut inner, &out).await.unwrap_err();
@@ -3613,6 +3653,7 @@ mod tests {
             content: content.into(),
             status: "complete".into(),
             created_at: "0".into(),
+            seq: None,
         };
         let plain = Outgoing { text: "edited".into(), queue_id: Some(1), ..Default::default() };
         // Plain text, no attachments → use the (edited) Outgoing text.
@@ -3667,5 +3708,33 @@ mod tests {
         assert_eq!(content["images"].as_array().unwrap().len(), 1, "images must be preserved");
         assert!(content["files"].is_array());
         assert_eq!(content["files"][0], "/tmp/attach.txt", "files must be preserved");
+    }
+
+    /// FIX 1: an Outgoing with files or images exposes has_attachments=true via queue_items.
+    #[test]
+    fn queue_items_exposes_has_attachments() {
+        let mut turn = TurnState::default();
+        turn.busy = true;
+        // One attachment-bearing item.
+        turn.queue.push_back(Outgoing {
+            text: "look at this".into(),
+            images: vec![("image/png".into(), "abc".into())],
+            tracked: true,
+            queue_id: Some(1),
+            has_attachments: true,
+            ..Default::default()
+        });
+        // One plain text item.
+        turn.queue.push_back(Outgoing {
+            text: "just text".into(),
+            tracked: true,
+            queue_id: Some(2),
+            has_attachments: false,
+            ..Default::default()
+        });
+        let items = queue_items(&turn);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].has_attachments, "attachment item must report has_attachments=true");
+        assert!(!items[1].has_attachments, "plain text item must report has_attachments=false");
     }
 }
