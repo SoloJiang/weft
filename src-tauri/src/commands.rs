@@ -34,6 +34,8 @@ pub async fn delete_workspace(
     workspace_id: i32,
 ) -> R<()> {
     stop_workspace_engines(&app, &db, workspace_id).await?;
+    cancel_workspace_asks(&db, app.state::<crate::ask::AskRegistry>().inner(), workspace_id)
+        .await?;
     let repo_paths: std::collections::HashMap<i32, String> = repo::list_repos(&db, workspace_id)
         .await
         .map_err(e)?
@@ -62,6 +64,26 @@ pub async fn delete_workspace(
             if let Err(err) = crate::git::delete_branch(repo_path, branch) {
                 eprintln!("[weft] branch delete failed for {branch}: {err}");
             }
+        }
+    }
+    Ok(())
+}
+
+async fn cancel_workspace_asks(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    workspace_id: i32,
+) -> R<()> {
+    let thread_ids: std::collections::BTreeSet<i32> =
+        repo::list_threads(db, workspace_id)
+            .await
+            .map_err(e)?
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect();
+    for ask in asks.open() {
+        if thread_ids.contains(&ask.thread) {
+            asks.cancel(ask.id);
         }
     }
     Ok(())
@@ -2086,5 +2108,32 @@ mod tests {
         assert_eq!(keys, expected);
         assert!(!keys.contains(&crate::lead_chat::commands::lead_key(keep_thread.id)));
         assert!(!keys.contains(&(keep_worker.id as i64)));
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_asks_only_clears_deleted_workspace_threads() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        let (remove_id, remove_rx) =
+            asks.request(thread.id, "", "claude", "Run: rm", "rm -rf tmp");
+        let (keep_id, _keep_rx) =
+            asks.request(keep_thread.id, "20", "claude", "Run: test", "pnpm test");
+
+        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+
+        assert!(remove_rx.await.is_err());
+        assert_eq!(
+            asks.open().iter().map(|ask| ask.id).collect::<Vec<_>>(),
+            vec![keep_id]
+        );
+        assert!(!asks.open().iter().any(|ask| ask.id == remove_id));
     }
 }

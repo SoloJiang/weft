@@ -29,10 +29,11 @@ pub fn now_unix() -> String {
 
 pub async fn create_workspace(db: &Db, name: &str) -> Result<workspace::Model> {
     let name = validate_display_name(name, "workspace name")?;
-    let dup = workspace::Entity::find()
-        .filter(workspace::Column::Name.eq(name))
-        .one(&db.0)
-        .await?;
+    let mut dup_query = workspace::Entity::find().filter(workspace::Column::Name.eq(name));
+    if let Some(hidden_id) = hidden_concierge_workspace_id(db).await? {
+        dup_query = dup_query.filter(workspace::Column::Id.ne(hidden_id));
+    }
+    let dup = dup_query.one(&db.0).await?;
     if dup.is_some() {
         anyhow::bail!("another workspace already named {name:?}");
     }
@@ -59,11 +60,13 @@ pub async fn list_workspaces(db: &Db) -> Result<Vec<workspace::Model>> {
 /// worktree paths) is a stable identifier and never changes after creation.
 pub async fn rename_workspace(db: &Db, workspace_id: i32, name: &str) -> Result<workspace::Model> {
     let name = validate_display_name(name, "workspace name")?;
-    let dup = workspace::Entity::find()
+    let mut dup_query = workspace::Entity::find()
         .filter(workspace::Column::Name.eq(name))
-        .filter(workspace::Column::Id.ne(workspace_id))
-        .one(&db.0)
-        .await?;
+        .filter(workspace::Column::Id.ne(workspace_id));
+    if let Some(hidden_id) = hidden_concierge_workspace_id(db).await? {
+        dup_query = dup_query.filter(workspace::Column::Id.ne(hidden_id));
+    }
+    let dup = dup_query.one(&db.0).await?;
     if dup.is_some() {
         anyhow::bail!("another workspace already named {name:?}");
     }
@@ -84,6 +87,12 @@ fn validate_display_name<'a>(input: &'a str, what: &str) -> Result<&'a str> {
         anyhow::bail!("{what} cannot be empty");
     }
     Ok(trimmed)
+}
+
+async fn hidden_concierge_workspace_id(db: &Db) -> Result<Option<i32>> {
+    Ok(get_setting(db, K_CONCIERGE_WORKSPACE)
+        .await?
+        .and_then(|value| value.parse::<i32>().ok()))
 }
 
 /// The most-recently created workspace (highest id), if any. Used as the
@@ -2741,6 +2750,35 @@ mod tests {
 
         assert!(err.to_string().contains("already named"));
         assert_eq!(list_workspaces(&db).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_name_collision_ignores_hidden_concierge() {
+        let db = mem().await;
+        let hidden = create_workspace(&db, "Concierge").await.unwrap();
+        set_setting(&db, K_CONCIERGE_WORKSPACE, &hidden.id.to_string())
+            .await
+            .unwrap();
+
+        let visible = create_workspace(&db, "Concierge").await.unwrap();
+
+        assert_ne!(visible.id, hidden.id);
+        assert_eq!(list_workspaces(&db).await.unwrap().len(), 2);
+        let err = create_workspace(&db, "Concierge").await.unwrap_err();
+        assert!(err.to_string().contains("already named"));
+
+        let db = mem().await;
+        let hidden = create_workspace(&db, "Concierge").await.unwrap();
+        set_setting(&db, K_CONCIERGE_WORKSPACE, &hidden.id.to_string())
+            .await
+            .unwrap();
+        let rename_target = create_workspace(&db, "Demo").await.unwrap();
+        let renamed = rename_workspace(&db, rename_target.id, "Concierge")
+            .await
+            .unwrap();
+
+        assert_eq!(renamed.name, "Concierge");
+        assert_eq!(list_workspaces(&db).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

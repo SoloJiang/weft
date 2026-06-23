@@ -364,6 +364,12 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
     const dirs = await api.pickFolders(t("dialog.addRepoTitle"));
     if (dirs.length === 0) return;
     if (dirs.length === 1) {
+      if (localPaths.length > 0) {
+        setPath("");
+        setName("");
+        setLocalPaths((prev) => (prev.includes(dirs[0]) ? prev : [...prev, dirs[0]]));
+        return;
+      }
       setPath(dirs[0]);
       setLocalPaths([]);
       setName("");
