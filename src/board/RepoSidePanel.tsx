@@ -259,6 +259,13 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
             threadId={threadId}
             compact
             composePlaceholder={t("repomap.curatorCompose")}
+            emptyState={
+              <div className="flex flex-1 items-center justify-center px-6 text-center">
+                <p className="max-w-[420px] text-[12px] leading-relaxed text-ink-faint">
+                  {t("repomap.curatorEmpty")}
+                </p>
+              </div>
+            }
             onReview={() => {}}
           />
         ) : (

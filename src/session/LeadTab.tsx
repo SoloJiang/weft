@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Info } from "lucide-react";
 import { useStore } from "../state/store";
 import { ChatTimeline } from "./ChatTimeline";
+import { LeadEmptyState } from "./LeadEmptyState";
 import { ChatComposer } from "./ChatComposer";
 import { PermissionBar } from "./PermissionBar";
 import { SessionInfoPanel } from "./SessionInfoPanel";
@@ -41,6 +42,7 @@ export function LeadTab({
   threadId,
   compact = false,
   composePlaceholder,
+  emptyState,
 }: {
   onReview: () => void;
   threadId?: number;
@@ -48,6 +50,10 @@ export function LeadTab({
   /** Composer placeholder override — the curator panel passes its own so the
    *  embedded chat doesn't read "给 lead 发消息…" (lead-chat jargon). */
   composePlaceholder?: string;
+  /** Empty-state slot override — the curator panel injects its own node so its
+   *  embedded chat doesn't show the issue console's task-planning cue. Defaults to
+   *  the issue-console LeadEmptyState built below. */
+  emptyState?: ReactNode;
 }) {
   const {
     activeThreadId,
@@ -216,7 +222,18 @@ export function LeadTab({
           workspaceId={activeWorkspaceId}
           promptText={promptText}
           cwd={leadCwd}
-          emptyState={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
+          emptyState={
+            emptyState ?? (
+              <LeadEmptyState
+                mode={repos.length === 0 ? "lead-repo-guide" : "lead-task"}
+                runAction={run}
+                actionsBusy={actionsBusy}
+                threadId={tid}
+                workspaceId={activeWorkspaceId}
+                promptText={promptText}
+              />
+            )
+          }
           queue={turn.queue}
           onRemove={(id) => void api.leadDequeue(tid, id)}
           onEdit={(id, text) => void api.leadEditQueued(tid, id, text)}

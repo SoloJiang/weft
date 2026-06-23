@@ -5,6 +5,7 @@ import { useStore } from "../state/store";
 import { api } from "../lib/api";
 import type { EnabledSkill, ObserveRef } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
+import { LeadEmptyState } from "./LeadEmptyState";
 import { ChatComposer } from "./ChatComposer";
 import { DiffPanel } from "./DiffPanel";
 import { FileTreePanel } from "./FileTreePanel";
@@ -243,6 +244,7 @@ export function WorkerConversation() {
             activity={sid != null ? workerActivity[sid] : undefined}
             onReviewProposal={() => {}}
             cwd={cwd}
+            emptyState={<LeadEmptyState mode="default" threadId={null} workspaceId={null} />}
             queue={turn?.queue ?? []}
             onRemove={sid != null ? (id) => void api.chatDequeue(sid, id) : undefined}
             onEdit={sid != null ? (id, text) => void api.chatEditQueued(sid, id, text) : undefined}

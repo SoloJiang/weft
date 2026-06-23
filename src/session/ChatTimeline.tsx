@@ -1,15 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, Copy, ListChecks, Sparkles } from "lucide-react";
+import { ArrowRight, Check, Copy, Sparkles } from "lucide-react";
 import type { LeadMessage, QueuedItem, ResolvedProposal } from "../lib/types";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { QueueStack } from "./QueueStack";
 import {
   Attachment,
   Message,
-  OnboardingCue,
-  SuggestionChips,
   Tool,
   ToolActivity,
   type AiToolStatus,
@@ -26,7 +24,6 @@ import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock
 import type { useRepoActions } from "./useRepoActions";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
-type EmptyStateMode = "default" | "lead-task" | "lead-repo-guide";
 
 /**
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
@@ -51,7 +48,7 @@ export function ChatTimeline({
   workspaceId,
   promptText,
   cwd,
-  emptyState = "default",
+  emptyState,
   queue = [],
   onRemove = () => {},
   onEdit = () => {},
@@ -78,8 +75,10 @@ export function ChatTimeline({
   promptText?: (title: string, placeholder?: string) => Promise<string | null>;
   /** Session working dir — resolves relative file paths agents mention. */
   cwd?: string;
-  /** Lead hosts opt into task/repo guidance; workers keep the default empty state. */
-  emptyState?: EmptyStateMode;
+  /** Empty-state slot: the host injects whatever to show when the timeline is empty
+   *  (lead/worker pass a LeadEmptyState; the curator panel passes its own line). The
+   *  timeline itself stays empty-state-agnostic. */
+  emptyState?: ReactNode;
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
@@ -98,16 +97,7 @@ export function ChatTimeline({
   }, [visible.length, growthLen, busy, activity]);
 
   if (visible.length === 0 && !busy) {
-    return (
-      <EmptyLeadState
-        mode={emptyState}
-        runAction={runAction}
-        actionsBusy={actionsBusy}
-        threadId={threadId ?? null}
-        workspaceId={workspaceId ?? null}
-        promptText={promptText}
-      />
-    );
+    return <>{emptyState}</>;
   }
 
   return (
@@ -185,110 +175,6 @@ function Header() {
 
 function Footer() {
   return <div className="h-4" />;
-}
-
-function EmptyLeadState({
-  mode,
-  runAction,
-  actionsBusy,
-  threadId,
-  workspaceId,
-  promptText,
-}: {
-  mode: EmptyStateMode;
-  runAction?: RunAction;
-  actionsBusy?: Record<string, boolean>;
-  threadId: number | null;
-  workspaceId: number | null;
-  promptText?: (title: string, placeholder?: string) => Promise<string | null>;
-}) {
-  const { t } = useTranslation();
-
-  if (mode === "lead-repo-guide" && runAction && promptText) {
-    const actions: ActionCardAction[] = [
-      { id: "empty-add-repo", kind: "add", label: t("actionCard.addRepoLabel") },
-      { id: "empty-new-repo", kind: "new", label: t("actionCard.newRepoLabel") },
-      { id: "empty-clone-repo", kind: "clone", label: t("actionCard.cloneRepoLabel") },
-    ];
-    const steps = [
-      t("lead.repoGuideStepChoose"),
-      t("lead.repoGuideStepMap"),
-      t("lead.repoGuideStepReturn"),
-    ];
-
-    return (
-      <div className="flex flex-1 items-center justify-center px-4 py-6">
-        <div className="w-full max-w-[620px]">
-          <ActionCardBlock
-            title={t("lead.repoGuideTitle")}
-            body={t("lead.repoGuideBody")}
-            steps={steps}
-            actions={actions}
-            readOnly={false}
-            busy={actionsBusy ?? {}}
-            onAction={(action) =>
-              void runAction({
-                actionId: action.id,
-                kind: action.kind,
-                ctx: {
-                  threadId: threadId ?? undefined,
-                  preferredWorkspaceId: workspaceId,
-                },
-                promptText,
-              })
-            }
-          />
-          <SuggestionChips
-            label={t("lead.suggestionLabel")}
-            suggestions={[
-              t("lead.suggestionImportRepo"),
-              t("lead.suggestionCloneRepo"),
-              t("lead.suggestionCreateRepo"),
-            ]}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  if (mode === "lead-task") {
-    return (
-      <div className="flex flex-1 items-center justify-center px-6 text-center">
-        <div className="max-w-[460px]">
-          <OnboardingCue
-            eyebrow={t("lead.onboardingCueEyebrow")}
-            title={t("lead.taskEmptyTitle")}
-            body={t("lead.onboardingCueBody")}
-            icon={<ListChecks size={15} />}
-          />
-          <SuggestionChips
-            label={t("lead.suggestionLabel")}
-            suggestions={[
-              t("lead.suggestionPlan"),
-              t("lead.suggestionQueue"),
-              t("lead.suggestionTask"),
-            ]}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-1 items-center justify-center px-6 text-center">
-      <div className="max-w-[420px]">
-        <p className="text-[12px] leading-relaxed text-ink-faint">{t("lead.transcriptEmpty")}</p>
-        <SuggestionChips
-          label={t("lead.suggestionLabel")}
-          suggestions={[
-            t("lead.suggestionDescribe"),
-            t("lead.suggestionAttach"),
-            t("lead.suggestionSlash"),
-          ]}
-        />
-      </div>
-    </div>
-  );
 }
 
 function deriveToolStatus(m: LeadMessage, c: Record<string, unknown>): AiToolStatus {

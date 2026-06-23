@@ -437,6 +437,7 @@ export const en = {
     curatorTitle: "Curator",
     curatorLoading: "Opening curator…",
     curatorCompose: "Message the curator…",
+    curatorEmpty: "Chat with the curator about how your repos depend on each other",
     deleteRepo: "Remove from workspace",
     deleteRepoTitle: "Remove {{name}}?",
     deleteRepoBody:

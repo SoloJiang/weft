@@ -422,6 +422,7 @@ export const zh = {
     curatorTitle: "依赖助手",
     curatorLoading: "正在打开依赖助手…",
     curatorCompose: "给依赖助手发消息…",
+    curatorEmpty: "和依赖助手聊聊仓库间的依赖关系",
     deleteRepo: "从工作区移除",
     deleteRepoTitle: "移除 {{name}}？",
     deleteRepoBody:
