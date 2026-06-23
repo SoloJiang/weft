@@ -294,6 +294,7 @@ pub async fn analyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<(
 /// `curator_finalize_message` replaces the body in place (the row is still mutable).
 #[tauri::command]
 pub async fn curator_append_message(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
     role: String,
@@ -304,7 +305,22 @@ pub async fn curator_append_message(
     let m = repo::insert_lead_message(&db, thread_id, None, turn, &role, "text", &content, "complete")
         .await
         .map_err(e)?;
-    if let Some(app) = crate::APP_HANDLE.get() {
+    // A resident curator engine seeded its turn counter at spawn from the THEN-current
+    // DB max; this synthetic row advances that max. Bump the live counter so the next
+    // REAL curator message increments past this turn id instead of reusing it (which
+    // would corrupt per-turn grouping). No-op if no engine is resident (it seeds fresh
+    // from the DB on its next spawn).
+    {
+        use tauri::Manager;
+        let key = crate::lead_chat::commands::lead_key(thread_id);
+        if let Some(eng) = app.state::<crate::lead_chat::engine::LeadChatState>().get(key) {
+            let mut inner = eng.lock().await;
+            if inner.turn_id < turn {
+                inner.turn_id = turn;
+            }
+        }
+    }
+    {
         use tauri::Emitter;
         let _ = app.emit(
             crate::lead_chat::engine::EVENT,

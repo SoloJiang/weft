@@ -1779,39 +1779,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (activeWorkspaceIdRef.current === ws) openCurator();
       try {
         await api.analyzeWorkspaceDeps(ws);
+        // ws's curator line still needs its completion summary even if the user
+        // switched away (it belongs to ws's thread); only the visible graph write is
+        // gated on ws still being the active view.
+        const g = await api.repoGraph(ws);
+        if (activeWorkspaceIdRef.current === ws) {
+          setRepoProfiles(g.nodes);
+          setRepoEdges(g.edges);
+        }
+        if (tid != null && runningId != null) {
+          // A forced pass can finish with repos left "failed" (missing analyzer,
+          // unusable output): don't claim a clean update. All-failed reads as a
+          // failure; a partial run names the failed count.
+          const failed = g.nodes.filter((n) => n.analysis_state === "failed").length;
+          let summary: string;
+          if (g.nodes.length > 0 && failed === g.nodes.length) {
+            summary = i18n.t("repomap.analysisFailed");
+          } else if (failed > 0) {
+            summary = i18n.t("repomap.analysisDonePartial", {
+              repos: g.nodes.length,
+              edges: g.edges.length,
+              failed,
+            });
+          } else {
+            summary = i18n.t("repomap.analysisDone", { repos: g.nodes.length, edges: g.edges.length });
+          }
+          await api.curatorFinalizeMessage(tid, runningId, summary);
+        }
       } catch {
-        // Pipeline failed: close the running line so it doesn't read as unfinished.
+        // Pipeline OR graph-refresh failed: close the running line so it never hangs
+        // on "Re-analyzing…" forever.
         if (tid != null && runningId != null) {
           await api.curatorFinalizeMessage(tid, runningId, i18n.t("repomap.analysisFailed"));
         }
-        return; // `finally` still clears the spinner
-      }
-      // ws's curator line still needs its completion summary even if the user
-      // switched away (it belongs to ws's thread); only the visible graph write is
-      // gated on ws still being the active view.
-      const g = await api.repoGraph(ws);
-      if (activeWorkspaceIdRef.current === ws) {
-        setRepoProfiles(g.nodes);
-        setRepoEdges(g.edges);
-      }
-      if (tid != null && runningId != null) {
-        // A forced pass can finish with repos left "failed" (missing analyzer,
-        // unusable output): don't claim a clean update. All-failed reads as a
-        // failure; a partial run names the failed count.
-        const failed = g.nodes.filter((n) => n.analysis_state === "failed").length;
-        let summary: string;
-        if (g.nodes.length > 0 && failed === g.nodes.length) {
-          summary = i18n.t("repomap.analysisFailed");
-        } else if (failed > 0) {
-          summary = i18n.t("repomap.analysisDonePartial", {
-            repos: g.nodes.length,
-            edges: g.edges.length,
-            failed,
-          });
-        } else {
-          summary = i18n.t("repomap.analysisDone", { repos: g.nodes.length, edges: g.edges.length });
-        }
-        await api.curatorFinalizeMessage(tid, runningId, summary);
       }
     } finally {
       markAnalyzing(ws, false);
