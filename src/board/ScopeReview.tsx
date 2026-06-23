@@ -102,7 +102,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
               <span className="rounded-full border border-brand/35 bg-brand-ghost px-2 py-0.5 text-[11px] font-medium text-brand">
                 {thread?.kind ? t(`kind.${thread.kind}`, thread.kind) : t("palette.issue")}
               </span>
-              <span className="hidden rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-ink-faint sm:inline">
+              <span className="inline rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-ink-faint">
                 {t("scope.notMaterialized")}
               </span>
             </div>
@@ -228,7 +228,7 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
             <ToolIcon tool={defaultTool} size={12} />
             {toolFullName(defaultTool)}
           </span>
-          <span className="hidden shrink-0 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] text-ink-faint sm:inline">
+          <span className="inline shrink-0 rounded-full border border-border bg-bg px-2 py-0.5 text-[10.5px] text-ink-faint">
             {lane.direction.mandate === "impl-only"
               ? t("scope.mandateImpl")
               : t("scope.mandatePlan")}
@@ -243,7 +243,7 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
             onSave={setProposalDirectionBase}
           />
           {index > 0 && (
-            <span className="hidden shrink-0 items-center gap-1 rounded-full border border-brand/30 bg-brand-ghost px-2 py-0.5 text-[10.5px] text-brand lg:flex">
+            <span className="flex shrink-0 items-center gap-1 rounded-full border border-brand/30 bg-brand-ghost px-2 py-0.5 text-[10.5px] text-brand">
               <Clock size={11} />
               {t("scope.afterPrevious")}
             </span>

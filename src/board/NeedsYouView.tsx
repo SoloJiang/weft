@@ -6,6 +6,7 @@ import {
   PermissionRow,
   WriteTriggerRow,
 } from "./NeedsRows";
+import { needsRowMotion } from "../lib/motion";
 
 /**
  * The "Needs-you" surface (PRODUCT §7): every open agent→human question across
@@ -29,11 +30,7 @@ export function NeedsYouView() {
               {writeTriggers.map((wt) => (
                 <motion.div
                   key={`wt-${wt.thread_id}-${wt.index}`}
-                  layout={!reduce}
-                  initial={reduce ? false : { opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={reduce ? { opacity: 0 } : { opacity: 0, height: 0, marginBottom: -10, scale: 0.98 }}
-                  transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                  {...needsRowMotion(!!reduce)}
                 >
                   <WriteTriggerRow item={wt} />
                 </motion.div>
@@ -41,11 +38,7 @@ export function NeedsYouView() {
               {asks.map((ask) => (
                 <motion.div
                   key={`ask-${ask.id}`}
-                  layout={!reduce}
-                  initial={reduce ? false : { opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={reduce ? { opacity: 0 } : { opacity: 0, height: 0, marginBottom: -10, scale: 0.98 }}
-                  transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                  {...needsRowMotion(!!reduce)}
                 >
                   <PermissionRow ask={ask} />
                 </motion.div>
@@ -53,11 +46,7 @@ export function NeedsYouView() {
               {needs.map((item) => (
                 <motion.div
                   key={`need-${item.ask_id}`}
-                  layout={!reduce}
-                  initial={reduce ? false : { opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={reduce ? { opacity: 0 } : { opacity: 0, height: 0, marginBottom: -10, scale: 0.98 }}
-                  transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                  {...needsRowMotion(!!reduce)}
                 >
                   <AskRow item={item} />
                 </motion.div>

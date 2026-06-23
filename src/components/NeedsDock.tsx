@@ -1,77 +1,55 @@
 import { GitBranch, HelpCircle, Layers, ShieldQuestion } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type { PermissionAsk, WriteTrigger, NeedItem } from "../lib/types";
 import { cn } from "../lib/cn";
 import { useStore } from "../state/store";
-import { PermissionConfirmationCard } from "./ConfirmationCard";
+import { needsBarMotion } from "../lib/motion";
 
 type DockItem =
   | { kind: "write"; item: WriteTrigger }
   | { kind: "permission"; item: PermissionAsk }
   | { kind: "question"; item: NeedItem };
 
+/**
+ * Workspace-wide "Needs you" strip: a quiet indicator + router only. It shows
+ * the pending count and a one-line summary of the top item, and routes to the
+ * queue on click — it never renders answer buttons. Answering happens in-context
+ * (the session's PermissionBar) or in the queue, so an ask is never actionable
+ * in two places at once.
+ */
 export function NeedsDock() {
-  const { needs, asks, writeTriggers, openNeeds, answerPermission } = useStore();
+  const { needs, asks, writeTriggers, openNeeds } = useStore();
   const { t } = useTranslation();
+  const reduce = useReducedMotion();
   const total = needs.length + asks.length + writeTriggers.length;
   const top = topDockItem(writeTriggers, asks, needs);
 
-  // Nothing needs the human → no banner at all: "flowing automatically" is the
-  // default state, not an announcement worth a permanent strip on every screen.
-  if (total === 0) return null;
-
-  if (top?.kind === "permission") {
-    return (
-      <div className="flex min-h-10 shrink-0 items-center gap-2 border-b border-waiting/30 bg-waiting/10 px-5 py-1.5 text-left text-[12px]">
-        <button
-          type="button"
-          onClick={openNeeds}
-          className="grid h-5 min-w-5 place-items-center rounded-full bg-waiting text-[11px] font-semibold tabular-nums text-bg transition-opacity hover:opacity-90"
-          title={t("needs.openQueue")}
-        >
-          {total}
-        </button>
-        <button
-          type="button"
-          onClick={openNeeds}
-          className="shrink-0 font-semibold text-waiting transition-colors hover:text-ink"
-        >
-          {t("needs.title")}
-        </button>
-        <PermissionConfirmationCard
-          ask={top.item}
-          onAnswer={(askId, answer) => void answerPermission(askId, answer)}
-          context={<PermissionDockContext item={top.item} />}
-          className="min-w-0 flex-1 flex-row flex-wrap items-center gap-2 rounded-none border-0 bg-transparent p-0"
-          titleClassName="text-[12px]"
-          actionsClassName="ml-auto shrink-0 gap-1.5"
-        />
-        <button
-          type="button"
-          onClick={openNeeds}
-          className="text-[11.5px] text-ink-faint transition-colors hover:text-ink"
-        >
-          {t("needs.openQueue")}
-        </button>
-      </div>
-    );
-  }
-
   return (
-    <button
-      type="button"
-      onClick={openNeeds}
-      className="group flex h-10 shrink-0 items-center gap-2 border-b border-waiting/30 bg-waiting/10 px-5 text-left text-[12px] transition-colors hover:bg-waiting/15"
-    >
-      <span className="grid h-5 min-w-5 place-items-center rounded-full bg-waiting text-[11px] font-semibold tabular-nums text-bg">
-        {total}
-      </span>
-      <span className="font-semibold text-waiting">{t("needs.title")}</span>
-      {top && <DockSummary top={top} />}
-      <span className="ml-auto text-[11.5px] text-ink-faint">
-        {t("needs.openQueue")}
-      </span>
-    </button>
+    <AnimatePresence initial={false}>
+      {total > 0 && (
+        <motion.div
+          key="needs-dock"
+          {...needsBarMotion(!!reduce)}
+          className="shrink-0 overflow-hidden"
+        >
+          <button
+            type="button"
+            onClick={openNeeds}
+            className="group flex h-10 w-full items-center gap-2 border-b border-waiting/30 bg-waiting/10 px-5 text-left text-[12px] transition-colors hover:bg-waiting/15"
+          >
+            <span className="grid h-5 min-w-5 place-items-center rounded-full bg-waiting text-[11px] font-semibold tabular-nums text-bg">
+              {total}
+            </span>
+            <span className="font-semibold text-waiting">{t("needs.title")}</span>
+            {top && <DockSummary top={top} />}
+            <span className="ml-auto text-[11.5px] text-ink-faint transition-colors group-hover:text-ink">
+              {t("needs.openQueue")}
+            </span>
+          </button>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
@@ -118,16 +96,6 @@ function DockSummary({ top }: { top: DockItem }) {
       <HelpCircle size={13} className="shrink-0 text-waiting" />
       <span>{t("needs.question")}</span>
       <ContextText text={[item.thread_title, item.direction_name].filter(Boolean).join(" · ")} />
-    </span>
-  );
-}
-
-function PermissionDockContext({ item }: { item: PermissionAsk }) {
-  const text = [item.thread_title, item.dir_name].filter(Boolean).join(" · ");
-  if (!text) return null;
-  return (
-    <span className="flex min-w-0 items-center gap-1 text-ink-muted">
-      <ContextText text={text} />
     </span>
   );
 }

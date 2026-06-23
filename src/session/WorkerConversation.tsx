@@ -10,6 +10,7 @@ import { ChatComposer } from "./ChatComposer";
 import { DiffPanel } from "./DiffPanel";
 import { FileTreePanel } from "./FileTreePanel";
 import { SessionInfoPanel } from "./SessionInfoPanel";
+import { PermissionBar } from "./PermissionBar";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { appLink, resumeCommand } from "../lib/resume";
@@ -41,6 +42,8 @@ export function WorkerConversation() {
     activeWorkspaceId,
     skillsDirtyAt,
     markSkillsDirty,
+    asks,
+    directionsByThread,
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
@@ -64,6 +67,20 @@ export function WorkerConversation() {
   // The thread the worker's rows live under: the live session's own thread, else
   // the open thread (board path). Covers cross-thread entry from "Needs you".
   const threadId = live?.threadId ?? activeThreadId;
+
+  // This worker's pending permission asks: an ask's `dir` is the direction's
+  // slug, so resolve the viewed direction by id and match on its thread + slug.
+  // Answered in the same in-session bar the lead uses, so an ask is actionable
+  // in one place — the workspace dock only routes here.
+  const viewedDir =
+    directionId == null
+      ? undefined
+      : Object.values(directionsByThread)
+          .flat()
+          .find((d) => d.id === directionId);
+  const workerAsks = viewedDir
+    ? asks.filter((a) => a.thread === viewedDir.thread_id && a.dir === viewedDir.slug)
+    : [];
 
   // History lives in the thread timeline; hydrate it (worker rows ride along).
   useEffect(() => {
@@ -186,7 +203,7 @@ export function WorkerConversation() {
               {toolFullName(ref.tool)}
             </span>
           )}
-          <span className="hidden min-w-0 truncate font-mono text-[11.5px] text-ink-faint md:block">
+          <span className="block min-w-0 truncate font-mono text-[11.5px] text-ink-faint">
             {ref?.branch}
           </span>
           <button
@@ -228,6 +245,8 @@ export function WorkerConversation() {
             />
           )}
         </header>
+
+        <PermissionBar asks={workerAsks} />
 
         {openAsks.length > 0 && (
           <div className="border-b border-border bg-surface/60 px-3 py-2">

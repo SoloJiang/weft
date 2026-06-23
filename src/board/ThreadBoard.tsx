@@ -109,13 +109,13 @@ export function ThreadBoard() {
           <EmptyDiscuss onTalk={() => setThreadTab("lead")} />
         ) : (
           <div className="min-h-0 flex-1 overflow-auto">
-            <div className="flex h-full min-w-fit gap-3 px-5 py-4">
+            <div className="flex h-full min-w-0 gap-3 px-5 py-4">
               {COLUMNS.map((col) => {
                 const cards = dirs
                   .filter((d) => statusOf(d) === col.key)
                   .sort((a, b) => Number(urgent(b)) - Number(urgent(a)));
                 return (
-                  <div key={col.key} className="flex w-[300px] shrink-0 flex-col gap-2">
+                  <div key={col.key} className="flex min-w-[260px] max-w-[360px] flex-1 flex-col gap-2">
                     <div className="flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
                       <span className={cn("h-1.5 w-1.5 rounded-full", col.dot)} />
                       {t(col.label)}

@@ -2,11 +2,12 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
 import { DiffView } from "./DiffView";
+import { clampPanelWidth } from "./panelWidth";
 import { cn } from "../lib/cn";
 
 const MIN_W = 360;
 const MAX_W = 860;
-const clampW = (x: number) => Math.max(MIN_W, Math.min(MAX_W, x));
+const clampW = (x: number) => clampPanelWidth(x, MIN_W, MAX_W);
 
 /**
  * The worktree diff as a real third column (not a floating overlay): opening it
@@ -37,6 +38,14 @@ export function DiffPanel({
   useEffect(() => {
     localStorage.setItem("weft-diff-w", String(w));
   }, [w]);
+
+  // Re-clamp on window shrink (e.g. 2000 → 1500) so a wide panel set on a big
+  // screen can't crowd out the main column at the floor.
+  useEffect(() => {
+    const onResize = () => setW((cur) => clampW(cur));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
