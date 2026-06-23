@@ -9,7 +9,7 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
-import { currentLang } from "../i18n";
+import i18n, { currentLang } from "../i18n";
 import { mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -177,6 +177,9 @@ interface Store {
   refreshReposAndMap: (workspaceId?: number) => Promise<void>;
   reprofileRepo: (repoId: number) => Promise<void>;
   reanalyzeDeps: () => Promise<void>;
+  /** A workspace dependency-analysis run is in flight (shared by every Analyze
+   *  entry so spinners stay in sync and a second click can't double-run). */
+  analyzing: boolean;
   deleteRepo: (repoId: number) => Promise<void>;
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
@@ -356,6 +359,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
+  const [analyzing, setAnalyzing] = useState(false);
+  const analyzingRef = useRef(false);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
@@ -1653,17 +1658,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refreshRepoMap],
   );
 
-  // Manually re-run the agent dependency curator, then refresh the map so the
-  // newly inferred runtime/infra edges appear. Slow (spawns a read-only agent).
-  const reanalyzeDeps = useCallback(async () => {
-    const ws = activeWorkspaceId;
-    if (ws == null) return;
-    await api.analyzeWorkspaceDeps(ws);
-    // The analysis can run up to the curator timeout; if the user switched
-    // workspaces meanwhile, don't overwrite the now-current map with ws's graph.
-    if (activeWorkspaceIdRef.current === ws) await refreshRepoMap();
-  }, [activeWorkspaceId, refreshRepoMap]);
-
   const editRepoSummary = useCallback(
     async (repoId: number, summary: string) => {
       await api.updateRepoProfile(repoId, summary, null);
@@ -1725,6 +1719,50 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoDrawerTabState("curator");
     setRepoDrawerOpen(true);
   }, []);
+
+  // The single Analyze entry: open the curator, mirror a trigger message into
+  // its thread, run the real pipeline, then finalize the running line to a summary.
+  // `analyzingRef` dedups concurrent clicks; `analyzing` syncs every button's spinner.
+  const reanalyzeDeps = useCallback(async () => {
+    const ws = activeWorkspaceId;
+    if (ws == null || analyzingRef.current) return;
+    analyzingRef.current = true;
+    setAnalyzing(true);
+    openCurator();
+    let runningId: number | null = null;
+    let tid: number | null = null;
+    try {
+      try {
+        tid = await api.openCuratorChat(ws); // get-or-create; idempotent
+        setCuratorThreadId(tid);
+        await api.curatorAppendMessage(tid, "user", i18n.t("repomap.analysisTrigger"));
+        runningId = await api.curatorAppendMessage(
+          tid,
+          "assistant",
+          i18n.t("repomap.analysisRunning"),
+        );
+      } catch {
+        tid = null; // mirror is best-effort; the pipeline still runs
+      }
+      await api.analyzeWorkspaceDeps(ws);
+      // Switched workspaces mid-run → don't write ws's graph into another view.
+      if (activeWorkspaceIdRef.current !== ws) return;
+      const g = await api.repoGraph(ws);
+      setRepoProfiles(g.nodes);
+      setRepoEdges(g.edges);
+      if (tid != null && runningId != null) {
+        await api.curatorFinalizeMessage(
+          tid,
+          runningId,
+          i18n.t("repomap.analysisDone", { repos: g.nodes.length, edges: g.edges.length }),
+        );
+      }
+    } finally {
+      analyzingRef.current = false;
+      setAnalyzing(false);
+    }
+  }, [activeWorkspaceId, openCurator]);
+
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
 
@@ -2192,6 +2230,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshRepoMap,
     refreshReposAndMap,
     reprofileRepo,
+    analyzing,
     reanalyzeDeps,
     deleteRepo,
     curatorThreadId,
