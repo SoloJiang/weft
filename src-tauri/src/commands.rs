@@ -308,14 +308,16 @@ pub async fn curator_append_message(
     // A resident curator engine seeded its turn counter at spawn from the THEN-current
     // DB max; this synthetic row advances that max. Bump the live counter so the next
     // REAL curator message increments past this turn id instead of reusing it (which
-    // would corrupt per-turn grouping). No-op if no engine is resident (it seeds fresh
-    // from the DB on its next spawn).
+    // would corrupt per-turn grouping). Only an IDLE engine: bumping while a real turn
+    // is in flight would advance the counter the live turn is still writing under,
+    // mis-grouping its own assistant/tool rows. No-op if no engine is resident (it
+    // seeds fresh from the DB on its next spawn).
     {
         use tauri::Manager;
         let key = crate::lead_chat::commands::lead_key(thread_id);
         if let Some(eng) = app.state::<crate::lead_chat::engine::LeadChatState>().get(key) {
             let mut inner = eng.lock().await;
-            if inner.turn_id < turn {
+            if !inner.turn.busy && inner.turn_id < turn {
                 inner.turn_id = turn;
             }
         }
