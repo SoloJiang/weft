@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Reorder } from "motion/react";
 import { GripVertical, Image as ImageIcon, Pencil, X } from "lucide-react";
@@ -17,18 +17,34 @@ export function QueueStack({
   onReorder: (order: number[]) => void;
 }) {
   const { t } = useTranslation();
+  // Drag reorders the local copy for a smooth UI; the backend is told ONCE on drop
+  // (not on every intermediate permutation), so out-of-order async calls can't land
+  // the engine queue in the wrong order. Adopt the backend order when not dragging.
+  const [order, setOrder] = useState(items);
+  const draggingRef = useRef(false);
+  useEffect(() => {
+    if (!draggingRef.current) setOrder(items);
+  }, [items]);
+
   if (items.length === 0) return null;
   return (
     <Reorder.Group
       axis="y"
-      values={items}
-      onReorder={(next: QueuedItem[]) => onReorder(next.map((i) => i.id))}
+      values={order}
+      onReorder={setOrder}
       className="flex flex-col gap-1"
     >
-      {items.map((it) => (
+      {order.map((it) => (
         <Reorder.Item
           key={it.id}
           value={it}
+          onDragStart={() => {
+            draggingRef.current = true;
+          }}
+          onDragEnd={() => {
+            draggingRef.current = false;
+            onReorder(order.map((i) => i.id));
+          }}
           className="flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-bg px-2 py-1"
         >
           <GripVertical

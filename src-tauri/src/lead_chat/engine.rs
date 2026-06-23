@@ -409,7 +409,7 @@ async fn mark_queued_delivered(
         Ok(Some(m)) => {
             // Carry the (possibly edited) text so the transcript shows what was
             // delivered, not the stale original Push::Message body.
-            let content = finalize_text_if_plain(&m);
+            let content = finalize_text(&m, out);
             let _ = app.emit(
                 EVENT,
                 Push::Finalize {
@@ -428,20 +428,26 @@ async fn mark_queued_delivered(
 /// A delivered row's text, but only for a plain text row with no attachments. The
 /// finalize-content channel wraps content as `{text}`, which would mangle a command
 /// row or drop image/file chips — those keep their original cached body (None).
-fn finalize_text_if_plain(m: &crate::store::entities::lead_message::Model) -> Option<String> {
-    if m.kind != "text" {
+fn finalize_text(
+    m: &crate::store::entities::lead_message::Model,
+    out: &Outgoing,
+) -> Option<String> {
+    // Only plain text rows round-trip: command rows ({command,args}) and
+    // attachment-bearing rows keep their cached body (finalize wraps as {text}).
+    if m.kind != "text" || !out.images.is_empty() {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_str(&m.content).ok()?;
-    let non_empty = |key: &str| {
-        v.get(key)
-            .and_then(|x| x.as_array())
-            .is_some_and(|a| !a.is_empty())
-    };
-    if non_empty("images") || non_empty("files") {
+    // files are appended into the text; skip files-bearing rows.
+    let files_empty = serde_json::from_str::<serde_json::Value>(&m.content)
+        .ok()
+        .and_then(|v| v.get("files").and_then(|f| f.as_array()).map(|a| a.is_empty()))
+        .unwrap_or(true);
+    if !files_empty {
         return None;
     }
-    v.get("text").and_then(|t| t.as_str()).map(String::from)
+    // Source the text from the in-memory Outgoing (already reflects any edit) so a
+    // not-yet-persisted edit can't make the live finalize show stale text.
+    Some(out.text.clone())
 }
 
 async fn mark_queued_status(
