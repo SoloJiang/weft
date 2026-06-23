@@ -497,8 +497,9 @@ pub async fn lead_state(
     }
 }
 
-/// 会话信息面板:非-claude lead 的带外 meta(model / window / MCP server)。claude
-/// lead 走事件流(init/usage),返回 None —— 让前端别用空快照覆盖事件填的富 meta。
+/// 会话信息面板的带外 meta。codex/opencode 补 model / window / MCP server;claude 的
+/// model/window/MCP 走事件流(init/usage),这里只补它的 skill（`gather_claude` 现扫
+/// cwd 的 skill 目录,其余字段留 None,`mergeSnapshot` 的 `?? prev` 保住事件填的富 meta）。
 #[tauri::command]
 pub async fn lead_session_meta(
     db: State<'_, Db>,
@@ -510,9 +511,6 @@ pub async fn lead_session_meta(
     else {
         return Ok(None);
     };
-    if t.lead_tool == "claude" {
-        return Ok(None);
-    }
     let cwd = ensure_lead_cwd(thread_id).map_err(|e| e.to_string())?;
     let native = repo::lead_native_id(&db, thread_id).await.ok().flatten();
     let command = crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool);

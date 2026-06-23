@@ -357,19 +357,16 @@ fn push_unique(out: &mut Vec<SlashCmd>, commands: impl IntoIterator<Item = Slash
 }
 
 pub(crate) fn local_skill_commands_for_cwd(cwd: impl AsRef<Path>) -> Vec<SlashCmd> {
-    let cwd = cwd.as_ref();
-    let mut out = Vec::new();
-    for root in [cwd.join(".agents"), cwd.join(".claude")] {
-        let commands = crate::skills::parse::parse_source(&root)
-            .into_iter()
-            .map(|s| SlashCmd {
-                name: s.name,
-                description: (!s.description.is_empty()).then_some(s.description),
-                arg_hint: None,
-            });
-        push_unique(&mut out, commands);
-    }
-    out
+    // codex/opencode load `.agents/skills`; also scan `.claude` so weft-injected
+    // skills (materialized into both) and shared local skills still surface.
+    crate::skills::cwd_skills(cwd.as_ref(), &[".agents", ".claude"])
+        .into_iter()
+        .map(|s| SlashCmd {
+            name: s.name,
+            description: (!s.description.is_empty()).then_some(s.description),
+            arg_hint: None,
+        })
+        .collect()
 }
 
 async fn fetch_skills(cwd: Option<&Path>) -> anyhow::Result<Vec<SlashCmd>> {

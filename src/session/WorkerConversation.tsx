@@ -115,16 +115,16 @@ export function WorkerConversation() {
       .catch(() => {});
   }, [activeWorkspaceId, skillsDirtyAt]);
 
-  // codex/opencode 的带外 meta(model/window/MCP server,+ opencode 的 usage)。
-  // claude 走事件流不用拉。开页 + 每次 turn 状态变(running/idle)各拉一次。
-  // 该 effect 按 live.status 触发,turn 起/止都会跑;running 期的请求读的是上一条
-  // assistant 行(旧 usage),若它晚于 idle 期的请求返回,会用旧值盖掉新的 contextTokens。
-  // 用 alive 标志丢弃被取代的旧请求(也防 thread 切换后旧请求落到新会话)。
+  // 带外 meta:codex/opencode 补 model/window/MCP(+ opencode usage);claude 只补 cwd
+  // 的 skill(model/window/MCP 走事件流,session_meta 留空不覆盖)。开页 + 每次 turn 状态
+  // 变 + skills 变(刷新按钮)各拉一次。该 effect 按 live.status 触发,turn 起/止都会跑;
+  // running 期的请求读的是上一条 assistant 行(旧 usage),若它晚于 idle 期的请求返回,会用
+  // 旧值盖掉新的 contextTokens。用 alive 标志丢弃被取代的旧请求(也防 thread 切换串台)。
   useEffect(() => {
     const tool = ref?.tool;
     const metaSid = live?.info.session_id ?? ref?.session_id ?? null;
     if (directionId == null || repoId == null || metaSid == null) return;
-    if (tool == null || tool === "claude") return;
+    if (tool == null) return;
     let alive = true;
     void api
       .sessionMeta(directionId, repoId)
@@ -142,6 +142,7 @@ export function WorkerConversation() {
     ref?.tool,
     live?.info.session_id,
     live?.status,
+    skillsDirtyAt,
     mergeWorkerMeta,
   ]);
 
@@ -162,18 +163,15 @@ export function WorkerConversation() {
   // unlike the async `ref` — so relative file refs resolve against this worker.
   const cwd = live?.info.worktree ?? ref?.worktree;
 
-  // 重载会话:重拉 skills + 标记静默 re-spawn(下条消息拾取新 MCP/skill);
-  // codex/opencode 立即重拉 session_meta(server/window 即时刷新)。
+  // 重载会话:先让 flagSessionSkillRefresh 把新启用的 skill 注入 cwd(并标记静默 re-spawn),
+  // **注入完成后**再 bump skillsDirtyAt —— 上面的带外 meta effect 据此重扫 cwd。若先 bump,
+  // 重扫会抢在 inject_for 之前跑、把陈旧/空列表当权威合并,且之后没有触发再纠正。
   const onReload = () => {
-    markSkillsDirty();
-    if (sid == null) return;
-    void api.flagSessionSkillRefresh(sid);
-    if (ref?.tool && ref.tool !== "claude") {
-      void api
-        .sessionMeta(directionId, repoId)
-        .then((s) => mergeWorkerMeta(sid, s))
-        .catch(() => {});
+    if (sid == null) {
+      markSkillsDirty();
+      return;
     }
+    void api.flagSessionSkillRefresh(sid).finally(() => markSkillsDirty());
   };
 
   return (
