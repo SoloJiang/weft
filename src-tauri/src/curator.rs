@@ -1213,65 +1213,100 @@ pub fn clear_failure(repo_id: i32) {
     }
 }
 
-// ---- Curator analysis cancellation (cooperative) --------------------------
+// ---- Curator analysis cancellation (cooperative, per-call token) ----------
 // `reanalyze_tool` runs the workspace pass inline while the curator turn is busy.
 // Clicking 中止 interrupts the lead turn but does not, by itself, reach the pass
-// running in the bus backend. So the tool registers which WORKSPACE the curator
-// thread is analyzing; `lead_interrupt` calls `cancel_analysis`, which trips that
-// workspace's `PassGate.cancel`. The cancel flag lives in the gate (not on the
-// caller) so WHOEVER drains the gate — the curator's own call OR a background
-// backfill that drained the curator's queued forced request — observes it. The pass
-// checks it at SAFE points only (between repos, before the relation pass) and returns
-// cleanly. We deliberately do NOT drop the pass future: dropping mid-run would orphan
-// a codex app-server child (its read-loop owns the process until `shutdown_and_reap`),
-// strand a repo at `running`, or tear a non-atomic relation write in half.
-fn analysis_cancels() -> &'static std::sync::Mutex<std::collections::HashMap<i32, i32>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
-        std::sync::OnceLock::new();
+// running in the bus backend. So the tool registers a per-call cancel TOKEN keyed by
+// the curator thread; `lead_interrupt` calls `cancel_analysis`, which trips it. The
+// token belongs ONLY to the curator's forced pass (which runs directly under the gate
+// lock via `reanalyze_workspace`, NOT through the shared coalescing dirty/force flags),
+// so cancelling it can't drop unrelated requests or be lost to a background drainer.
+// The pass checks the token at SAFE points only (between repos, before the relation
+// pass) and returns cleanly — we never drop the future, which would orphan a codex
+// app-server child, strand a repo at `running`, or tear a non-atomic relation write.
+fn analysis_cancels(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>
+{
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    > = std::sync::OnceLock::new();
     S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Note that a curator thread is analyzing `workspace_id`, so `cancel_analysis(thread)`
-/// can find and trip the right workspace gate. Clears any stale cancel up front.
-pub fn register_analysis_cancel(thread_id: i32, workspace_id: i32) {
-    pass_gate(workspace_id)
-        .cancel
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+/// Threads whose cancel arrived BEFORE `reanalyze_tool` registered (the tiny race
+/// between the lead dispatching the tool call and the handler registering). The cancel
+/// is parked here and consumed by the next `register_analysis_cancel` for that thread.
+fn pending_cancels() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Register a fresh cancel token for a curator thread's forced pass. Consumes any
+/// cancel that arrived before registration (so it isn't lost).
+pub fn register_analysis_cancel(thread_id: i32) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if pending_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&thread_id)
+    {
+        token.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     analysis_cancels()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(thread_id, workspace_id);
+        .insert(thread_id, token.clone());
+    token
 }
 
-/// Forget a curator thread's analysis once it finished (or was cancelled). Also clears
-/// the workspace gate's cancel flag so a late `cancel_analysis` (racing the unregister)
-/// can't strand it set and make the next auto pass bail.
+/// Drop a curator thread's cancel token once its pass finished (or was cancelled).
 pub fn unregister_analysis_cancel(thread_id: i32) {
-    let ws = analysis_cancels()
+    analysis_cancels()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&thread_id);
-    if let Some(ws) = ws {
-        pass_gate(ws)
-            .cancel
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
+    pending_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&thread_id);
 }
 
-/// Request cancellation of a curator thread's in-flight analysis; no-op for a
-/// non-curator/idle thread. Trips the workspace gate's cancel flag, which any drainer
-/// (the curator's call or a background backfill) observes at its next safe checkpoint.
+/// Request cancellation of a curator thread's in-flight forced pass. Trips the
+/// registered token; if none is registered yet (cancel raced registration), park it
+/// as pending so the imminent `register_analysis_cancel` consumes it. No-op for a
+/// non-curator/idle thread that never re-analyzes.
 pub fn cancel_analysis(thread_id: i32) {
-    let ws = analysis_cancels()
+    let token = analysis_cancels()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&thread_id)
-        .copied();
-    if let Some(ws) = ws {
-        pass_gate(ws)
-            .cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        .cloned();
+    match token {
+        Some(token) => token.store(true, std::sync::atomic::Ordering::SeqCst),
+        None => {
+            pending_cancels()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(thread_id);
+        }
     }
+}
+
+/// The curator's user-initiated forced re-analysis: serialize against background passes
+/// via the gate LOCK, but run `analyze_workspace` directly with this call's own cancel
+/// token — deliberately NOT through the coalescing `dirty`/`force` flags, so cancelling
+/// it can't drop a concurrent request or be drained (and thus lost) by another holder.
+pub async fn reanalyze_workspace(db: &Db, workspace_id: i32, cancel: &std::sync::atomic::AtomicBool) {
+    let gate = pass_gate(workspace_id);
+    let _g = gate.lock.lock().await;
+    // Cancelled while queued behind another pass → don't start.
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = analyze_workspace(db, workspace_id, true, Some(cancel)).await;
 }
 
 /// Drop a repo's run-state entirely, whatever its phase — called when the repo is
@@ -1587,13 +1622,15 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 ///      emitting a graph refresh after each so nodes light up progressively;
 ///   2. a cross-repo pass (only with ≥2 repos) infers the relations between them.
 /// Any single failure leaves that repo's prior state intact.
-pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Result<()> {
-    // Cooperative cancel reads the workspace gate's flag (set by `cancel_analysis`).
-    let cancelled = || {
-        pass_gate(workspace_id)
-            .cancel
-            .load(std::sync::atomic::Ordering::SeqCst)
-    };
+pub async fn analyze_workspace(
+    db: &Db,
+    workspace_id: i32,
+    force: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    // Cooperative cancel: the curator's forced pass passes its own token; background
+    // passes pass None (not cancellable).
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
     let repos = repo::list_repos(db, workspace_id).await?;
     // Only analyze repos whose checkout still exists on disk.
     let existing: Vec<repo_ref::Model> = repos
@@ -1623,6 +1660,9 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
         if cancelled() {
             if did_classify {
                 let _ = repo::clear_repo_map_doc(db, workspace_id).await;
+                // Tell the map panel to refetch — it only reloads the doc on this event,
+                // so without it the Map tab would keep serving the now-cleared markdown.
+                emit_graph_updated(workspace_id);
             }
             return Ok(());
         }
@@ -1656,6 +1696,7 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
     if cancelled() {
         if did_classify {
             let _ = repo::clear_repo_map_doc(db, workspace_id).await;
+            emit_graph_updated(workspace_id);
         }
         return Ok(());
     }
@@ -2020,11 +2061,6 @@ struct PassGate {
     /// Sticky across the drain window: a forced (user-initiated) request anywhere
     /// while a pass is pending makes the next drained run force-retry failures.
     force: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Cooperative cancel for this workspace's analysis. Lives in the gate (not on the
-    /// caller) so WHOEVER drains — the curator's own call or a background backfill that
-    /// drained the curator's queued forced request — observes it and stops. Checked at
-    /// safe points (between repos, before the relation pass) and cleared by the drain.
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn pass_gate(workspace_id: i32) -> PassGate {
@@ -2037,7 +2073,6 @@ fn pass_gate(workspace_id: i32) -> PassGate {
             lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
         .clone()
 }
@@ -2051,10 +2086,10 @@ fn pass_gate(workspace_id: i32) -> PassGate {
 /// The lock holder drains — it reruns while `dirty` was set during its run — so a
 /// batch add (many requests) collapses into ~one pass, while a request that lands
 /// mid-pass is still covered before any waiter is released. Spawn it
-/// fire-and-forget when you don't want to block (e.g. after adding a repo).
-/// Returns whether the drain was cancelled (the workspace gate's cancel flag tripped
-/// mid-pass). Background callers ignore it; `reanalyze_tool` uses it to report Stop.
-pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool) -> bool {
+/// fire-and-forget when you don't want to block (e.g. after adding a repo). NOT
+/// cancellable: the curator's user-initiated Stop targets only its own forced pass
+/// (`reanalyze_workspace`), never these background/auto requests.
+pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool) {
     use std::sync::atomic::Ordering;
     let gate = pass_gate(workspace_id);
     gate.dirty.store(true, Ordering::SeqCst);
@@ -2068,26 +2103,10 @@ pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool
     // A forced request anywhere in the drain window forces that run (then resets),
     // so an explicit "Analyze deps" retries failures even if it coalesced with an
     // auto pass.
-    let mut cancelled = false;
     while gate.dirty.swap(false, Ordering::SeqCst) {
         let forced = gate.force.swap(false, Ordering::SeqCst);
-        let _ = analyze_workspace(db, workspace_id, forced).await;
-        // Cooperative cancel: the inner pass already stopped at its next safe point.
-        // READ (don't clear) the flag — `unregister_analysis_cancel` clears it once,
-        // so a curator request that a DIFFERENT holder (a background backfill) drained
-        // and cancelled still observes the cancel when it later acquires the lock and
-        // finds nothing dirty. Clear the pending dirty/force this cancelled request set
-        // so a waiter can't drain them and resurrect the forced run.
-        if gate.cancel.load(Ordering::SeqCst) {
-            gate.dirty.store(false, Ordering::SeqCst);
-            gate.force.store(false, Ordering::SeqCst);
-            cancelled = true;
-            break;
-        }
+        let _ = analyze_workspace(db, workspace_id, forced, None).await;
     }
-    // Also true for a queued caller whose forced work a prior drainer already ran and
-    // cancelled (it finds nothing dirty here, but the flag is still set until unregister).
-    cancelled || gate.cancel.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
