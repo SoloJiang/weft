@@ -1,5 +1,4 @@
 import { StickToBottom } from "use-stick-to-bottom";
-import { Sparkles } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/cn";
 
@@ -17,11 +16,6 @@ export function Message({
         role === "user" ? "flex-row-reverse" : "flex-row",
       )}
     >
-      {role === "assistant" && (
-        <span className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] bg-brand-ghost text-brand">
-          <Sparkles size={14} />
-        </span>
-      )}
       <div
         className={cn(
           // flex-1 on BOTH roles: the column needs a definite width, else its

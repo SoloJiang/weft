@@ -39,7 +39,7 @@ export function DiffPanel({
     localStorage.setItem("weft-diff-w", String(w));
   }, [w]);
 
-  // Re-clamp on window shrink (e.g. 2000 → 1500) so a wide panel set on a big
+  // Re-clamp on window shrink (e.g. 1000 → 600) so a wide panel set on a big
   // screen can't crowd out the main column at the floor.
   useEffect(() => {
     const onResize = () => setW((cur) => clampW(cur));

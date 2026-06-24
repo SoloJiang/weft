@@ -528,7 +528,7 @@ function ChatComposerBody({
             >
               <Paperclip size={13} />
             </PromptInputButton>
-            <span className="block truncate text-[11px] text-ink-faint">
+            <span className="hidden truncate text-[11px] text-ink-faint sm:block">
               {t("lead.slashHint")}
             </span>
           </PromptInputTools>

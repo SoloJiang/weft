@@ -118,7 +118,7 @@ export function FirstRunOnboarding() {
           Weft
           <span className="text-[12px] font-normal text-ink-faint">{t("onboarding.kicker")}</span>
         </button>
-        <div className="mx-auto flex min-w-0 items-center gap-2">
+        <div className="mx-auto hidden min-w-0 items-center gap-2 lg:flex">
           {steps.map((label, i) => (
             <button
               key={label}
@@ -146,7 +146,7 @@ export function FirstRunOnboarding() {
         </div>
         <button
           onClick={dismiss}
-          className="rounded-[var(--radius-md)] px-3 py-1.5 text-[12.5px] font-medium text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
+          className="ml-auto rounded-[var(--radius-md)] px-3 py-1.5 text-[12.5px] font-medium text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink lg:ml-0"
         >
           {t("onboarding.skip")}
         </button>
