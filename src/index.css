@@ -305,7 +305,11 @@
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   padding: 0.6em 0.8em;
-  overflow-x: auto;
+  /* Wrap long code lines (e.g. the curator's dependency-graph dump) to the
+     panel width rather than scrolling sideways — the chat panel is narrow, and
+     a clipped horizontal-scroll block reads as "message overflows the panel". */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   margin: 0.5em 0;
 }
 .weft-md pre code {
