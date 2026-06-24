@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { StoreProvider, useStore } from "./state/store";
 import { WorkspaceNav } from "./nav/WorkspaceNav";
 import { AppTopBar } from "./nav/AppTopBar";
@@ -16,6 +17,26 @@ import { SettingsScreen } from "./nav/SettingsDialog";
 import { useAppShortcuts } from "./state/shortcuts";
 import { useSystemNotifications } from "./lib/notifications";
 
+// Below this window width the nav rail can't coexist with an open worker side
+// panel: rail (288) + diff panel min (360) + main min (360). When a diff/files
+// panel is open under it, hide the rail to give the panel + main room — without
+// touching the user's manual collapse choice (navCollapsed governs the rest).
+const RAIL_PLUS_PANEL_MIN = 288 + 360 + 360;
+
+function NavRailGate() {
+  const { navCollapsed, activeSidePanel } = useStore();
+  // Boolean (not raw width) so a resize only re-renders on a threshold cross.
+  const [narrow, setNarrow] = useState(() => window.innerWidth < RAIL_PLUS_PANEL_MIN);
+  useEffect(() => {
+    const onResize = () => setNarrow(window.innerWidth < RAIL_PLUS_PANEL_MIN);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  if (navCollapsed) return null;
+  if (activeSidePanel != null && narrow) return null;
+  return <WorkspaceNav />;
+}
+
 function Main() {
   const { viewing, activeThreadId, showNeeds } = useStore();
   // Needs-you is the workspace-wide exception queue — it takes precedence over
@@ -28,7 +49,6 @@ function Main() {
 
 function Shell() {
   const {
-    navCollapsed,
     activeWorkspaceId,
     viewing,
     activeThreadId,
@@ -62,7 +82,7 @@ function Shell() {
   const routeKey = `${showNeeds ? "needs" : ""}|${viewing ?? ""}|${activeThreadId ?? ""}|${homeTab}`;
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-bg text-ink">
-      {!navCollapsed && <WorkspaceNav />}
+      <NavRailGate />
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <AppTopBar />
         {showDock && <NeedsDock />}

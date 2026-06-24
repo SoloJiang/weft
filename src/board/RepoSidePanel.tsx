@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { X, RefreshCw } from "lucide-react";
 import { useStore } from "../state/store";
 import { LeadTab } from "../session/LeadTab";
+import { clampPanelWidth } from "../session/panelWidth";
 import { RepoDetailContent } from "./RepoGraph";
 import { Markdown } from "../components/Markdown";
 import { api } from "../lib/api";
@@ -16,7 +17,10 @@ const WIDTH = {
   curator: { key: "weft-curator-w", def: 420, min: 320, max: 620 },
 } as const;
 type Surface = keyof typeof WIDTH;
-const clampW = (s: Surface, n: number) => Math.max(WIDTH[s].min, Math.min(WIDTH[s].max, n));
+// Window-aware clamp (like DiffPanel/FileTreePanel): caps the drawer to its
+// [min, max] AND to the current window, so an open drawer can't crowd out the
+// repo graph at the 600px floor.
+const clampW = (s: Surface, n: number) => clampPanelWidth(n, WIDTH[s].min, WIDTH[s].max);
 
 /**
  * The Repos view's right side panel — one mutually-exclusive slot, no tabs.
@@ -44,6 +48,18 @@ export function RepoSidePanel() {
     setWidths((prev) => ({ ...prev, [surface]: cw }));
     localStorage.setItem(WIDTH[surface].key, String(cw));
   };
+
+  // Re-clamp on window shrink (e.g. 1000 → 600) so a wide drawer set on a big
+  // screen can't crowd out the repo graph at the floor.
+  useEffect(() => {
+    const onResize = () =>
+      setWidths((prev) => ({
+        detail: clampW("detail", prev.detail),
+        curator: clampW("curator", prev.curator),
+      }));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   // Lazily create the curator thread on first open of the curator surface, and
   // keep LeadTab mounted thereafter (preserve chat scroll / draft across switches).

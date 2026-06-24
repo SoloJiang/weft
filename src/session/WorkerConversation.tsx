@@ -42,6 +42,7 @@ export function WorkerConversation() {
     skillsDirtyAt,
     markSkillsDirty,
     asks,
+    setActiveSidePanel,
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
@@ -51,6 +52,13 @@ export function WorkerConversation() {
 
   const directionId = viewing?.directionId ?? null;
   const repoId = viewing?.repoId ?? null;
+
+  // Mirror the live diff/files panel to the store so the nav rail can yield room
+  // to it on narrow windows; clear it when this session unmounts.
+  useEffect(() => {
+    setActiveSidePanel(rail === "diff" || rail === "files" ? rail : null);
+  }, [rail, setActiveSidePanel]);
+  useEffect(() => () => setActiveSidePanel(null), [setActiveSidePanel]);
 
   // Live engine for this slot (if any). Computed before hooks so threadId is
   // available to the hydrate effect (rules-of-hooks: no early return above).

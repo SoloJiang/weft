@@ -109,6 +109,9 @@ interface Store {
   /** Left sidebar collapse (manual + auto on narrow windows). */
   navCollapsed: boolean;
   setNavCollapsed: (v: boolean) => void;
+  /** Open worker side panel (diff/files), so the nav rail can yield room on narrow windows. */
+  activeSidePanel: "diff" | "files" | null;
+  setActiveSidePanel: (p: "diff" | "files" | null) => void;
   /** App settings (persisted to localStorage). */
   projectsDir: string;
   setProjectsDir: (p: string) => void;
@@ -400,6 +403,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [navCollapsed, setNavCollapsed] = useState(
     () => window.innerWidth < NAV_AUTOCOLLAPSE_BELOW,
   );
+  // Mirror of the open worker diff/files panel (set by WorkerConversation). When
+  // one is open and the window can't fit rail+panel+main, the rail hides to make
+  // room (see NavRailGate) — without mutating the user's manual collapse choice.
+  const [activeSidePanel, setActiveSidePanel] = useState<"diff" | "files" | null>(null);
 
   // App settings, persisted to localStorage.
   const [projectsDir, setProjectsDirState] = useState(
@@ -2246,6 +2253,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setShowBus,
     navCollapsed,
     setNavCollapsed,
+    activeSidePanel,
+    setActiveSidePanel,
     reviewingProposal,
     setReviewingProposal,
     threadTab,
