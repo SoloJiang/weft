@@ -45,7 +45,7 @@ export function ShellSnippet({
           <span>{buttonLabel}</span>
         </button>
       </figcaption>
-      <div className="overflow-x-auto whitespace-pre p-3 font-mono leading-relaxed text-ink">
+      <div className="whitespace-pre-wrap break-words p-3 font-mono leading-relaxed text-ink">
         <code>{code}</code>
       </div>
     </figure>

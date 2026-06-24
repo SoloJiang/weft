@@ -539,6 +539,7 @@ function ChatComposerBody({
               <PromptInputButton
                 onClick={onOpenApp}
                 tooltip={t("lead.openInApp")}
+                tooltipAlign="end"
               >
                 <ExternalLink size={13} />
               </PromptInputButton>
@@ -546,6 +547,7 @@ function ChatComposerBody({
             {onTakeOver && (
               <PromptInputButton
                 onClick={() => void takeOver()}
+                tooltipAlign="end"
                 tooltip={
                   copied ? t("lead.takeOverCopied") : t("lead.takeOverTip")
                 }

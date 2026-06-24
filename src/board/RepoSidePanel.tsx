@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { X, RefreshCw } from "lucide-react";
@@ -21,6 +21,10 @@ type Surface = keyof typeof WIDTH;
 // [min, max] AND to the current window, so an open drawer can't crowd out the
 // repo graph at the 600px floor.
 const clampW = (s: Surface, n: number) => clampPanelWidth(n, WIDTH[s].min, WIDTH[s].max);
+// Bound to the surface's [min, max] WITHOUT the window cap — this is the stored
+// "intended" width; clampW additionally applies the live window cap at render.
+const boundRange = (s: Surface, n: number) =>
+  Math.max(WIDTH[s].min, Math.min(WIDTH[s].max, n));
 
 /**
  * The Repos view's right side panel — one mutually-exclusive slot, no tabs.
@@ -36,29 +40,30 @@ export function RepoSidePanel() {
   const { t } = useTranslation();
   const surface = repoDrawerTab as Surface;
 
-  const [widths, setWidths] = useState(() => ({
-    detail: clampW("detail", Number(localStorage.getItem(WIDTH.detail.key)) || WIDTH.detail.def),
-    curator: clampW("curator", Number(localStorage.getItem(WIDTH.curator.key)) || WIDTH.curator.def),
+  // Persist the user's INTENDED width, bounded to the surface's [min, max] only
+  // (not the window). The window cap is applied at render below, so shrinking the
+  // window narrows the panel without forgetting the chosen width — it springs
+  // back when the window grows again.
+  const [intended, setIntended] = useState(() => ({
+    detail: boundRange("detail", Number(localStorage.getItem(WIDTH.detail.key)) || WIDTH.detail.def),
+    curator: boundRange("curator", Number(localStorage.getItem(WIDTH.curator.key)) || WIDTH.curator.def),
   }));
-  const w = widths[surface];
+  const w = clampW(surface, intended[surface]);
   const [dragging, setDragging] = useState(false);
   const drag = useRef<{ x: number; w: number } | null>(null);
   const setW = (n: number) => {
-    const cw = clampW(surface, n);
-    setWidths((prev) => ({ ...prev, [surface]: cw }));
-    localStorage.setItem(WIDTH[surface].key, String(cw));
+    const bounded = boundRange(surface, n);
+    setIntended((prev) => ({ ...prev, [surface]: bounded }));
+    localStorage.setItem(WIDTH[surface].key, String(bounded));
   };
 
-  // Re-clamp on window shrink (e.g. 1000 → 600) so a wide drawer set on a big
-  // screen can't crowd out the repo graph at the floor.
+  // A resize doesn't change the intended width, only the rendered window cap —
+  // re-render so `w` (derived above) recomputes: clamps down as the window
+  // shrinks to the 600px floor, springs back as it grows.
+  const [, forceResize] = useReducer((n) => n + 1, 0);
   useEffect(() => {
-    const onResize = () =>
-      setWidths((prev) => ({
-        detail: clampW("detail", prev.detail),
-        curator: clampW("curator", prev.curator),
-      }));
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    window.addEventListener("resize", forceResize);
+    return () => window.removeEventListener("resize", forceResize);
   }, []);
 
   // Lazily create the curator thread on first open of the curator surface, and
