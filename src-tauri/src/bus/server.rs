@@ -397,11 +397,9 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
 /// Run a full workspace analysis pass for the curator's workspace and return a
 /// summary. Awaited inline (NOT detached) so the agent's turn stays busy for the
 /// pass's whole duration — subsequent user messages queue, and the UI's `analyzing`
-/// flag (derived from the lead turn) accurately tracks it. A detached spawn would
-/// outlive an interrupted/timed-out turn while still holding the coalescing gate,
-/// re-enabling the Analyze buttons mid-pass and inviting a duplicate forced run;
-/// awaiting inline means an interrupted turn drops the pass with it (the gate's lock
-/// is an RAII guard, so it releases cleanly and the next trigger re-runs).
+/// flag (derived from the lead turn) accurately tracks it. Clicking 中止 flips a
+/// cancel flag the pass checks at safe points (between repos, before the relation
+/// pass) and returns cleanly — see the cooperative-cancellation note in curator.rs.
 async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
     let t = crate::store::repo::get_thread(db, thread)
         .await?
@@ -423,21 +421,17 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
                    (moved or deleted). Restore the repos and try again."
             .to_string());
     }
-    // Register a cancel handle so clicking 中止 — which interrupts the lead turn and
-    // calls `cancel_analysis(thread)` — drops the pass future here. The in-flight
-    // codex child then dies via its `kill_on_drop(true)`, and the coalescing gate's
-    // RAII lock releases cleanly. Matches worker-chat "stop = stop the work".
+    // Register a cancel flag and thread it INTO the pass. Clicking 中止 interrupts the
+    // lead turn and calls `cancel_analysis(thread)`, which flips the flag; the pass
+    // observes it at its next safe checkpoint and returns cleanly (no dropped future,
+    // so no orphaned app-server child, stranded `running` repo, or half-written
+    // relations). Matches worker-chat "stop = stop the work".
+    use std::sync::atomic::Ordering;
     let cancel = crate::curator::register_analysis_cancel(thread);
-    let cancelled = tokio::select! {
-        biased;
-        _ = cancel.notified() => true,
-        _ = crate::curator::analyze_workspace_coalesced(db, ws_id, true) => false,
-    };
+    crate::curator::analyze_workspace_coalesced(db, ws_id, true, Some(&cancel)).await;
+    let cancelled = cancel.load(Ordering::SeqCst);
     crate::curator::unregister_analysis_cancel(thread);
     if cancelled {
-        // The dropped pass can leave the gate's force/dirty flags set and a repo
-        // stuck `running`; reset them so Stop truly stops and the next Analyze re-runs.
-        crate::curator::cancel_workspace_analysis(db, ws_id).await;
         return Ok("Re-analysis cancelled.".to_string());
     }
     let g = crate::curator::graph(db, ws_id).await?;

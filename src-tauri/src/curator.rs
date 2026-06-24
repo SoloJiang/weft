@@ -304,8 +304,8 @@ fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
     if needs_backfill && try_claim_backfill(workspace_id) {
         let db = db.clone();
         tauri::async_runtime::spawn(async move {
-            // Auto pass (fires on graph reads) → not forced: leave failed repos be.
-            analyze_workspace_coalesced(&db, workspace_id, false).await;
+            // Auto pass (fires on graph reads) → not forced, not cancellable.
+            analyze_workspace_coalesced(&db, workspace_id, false, None).await;
         });
     }
 }
@@ -1213,34 +1213,41 @@ pub fn clear_failure(repo_id: i32) {
     }
 }
 
-// ---- Curator analysis cancellation ---------------------------------------
+// ---- Curator analysis cancellation (cooperative) --------------------------
 // `reanalyze_tool` runs the workspace pass inline while the curator turn is busy.
 // Clicking 中止 interrupts the lead turn but does not, by itself, reach the pass
-// running in the bus backend. So the tool registers a one-shot Notify keyed by the
-// curator thread id; `lead_interrupt` fires it via `cancel_analysis`, and the tool's
-// `select!` drops the pass future — the in-flight codex child dies via its
-// `kill_on_drop(true)`. Mirrors the run_states/pass_gate static-registry pattern.
+// running in the bus backend. So the tool registers an AtomicBool flag keyed by the
+// curator thread id, passes it into the pass, and `lead_interrupt` flips it via
+// `cancel_analysis`. The pass checks the flag at SAFE points only — between repos
+// and before the cross-repo relation pass — and returns cleanly. We deliberately do
+// NOT drop the pass future: dropping mid-run would orphan a codex app-server child
+// (its read-loop owns the process until `shutdown_and_reap`), strand a repo at
+// `running`, or tear a non-atomic relation write in half. Cooperative checks let the
+// in-flight repo finish (its own cleanup runs) and stop before the next unit of work.
 #[allow(clippy::type_complexity)]
-fn analysis_cancels(
-) -> &'static std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<tokio::sync::Notify>>> {
+fn analysis_cancels() -> &'static std::sync::Mutex<
+    std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+> {
     static S: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<tokio::sync::Notify>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
     > = std::sync::OnceLock::new();
     S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Register a cancel handle for a curator thread's in-flight analysis. The caller
-/// awaits the returned `Notify` alongside the pass and unregisters when done.
-pub fn register_analysis_cancel(thread_id: i32) -> std::sync::Arc<tokio::sync::Notify> {
-    let n = std::sync::Arc::new(tokio::sync::Notify::new());
+/// Register a cancel flag for a curator thread's in-flight analysis. The caller
+/// passes the returned flag into the pass and unregisters when done.
+pub fn register_analysis_cancel(thread_id: i32) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let f = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     analysis_cancels()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(thread_id, n.clone());
-    n
+        .insert(thread_id, f.clone());
+    f
 }
 
-/// Drop a curator thread's cancel handle once its analysis finished (or was cancelled).
+/// Drop a curator thread's cancel flag once its analysis finished (or was cancelled).
 pub fn unregister_analysis_cancel(thread_id: i32) {
     analysis_cancels()
         .lock()
@@ -1248,42 +1255,21 @@ pub fn unregister_analysis_cancel(thread_id: i32) {
         .remove(&thread_id);
 }
 
-/// Cancel a curator thread's in-flight analysis if one is registered; no-op for a
-/// non-curator/idle thread. `notify_one` stores a permit, so a cancel that races
-/// just before the tool starts awaiting still fires.
+/// Request cancellation of a curator thread's in-flight analysis; no-op for a
+/// non-curator/idle thread. The pass observes the flag at its next safe checkpoint.
 pub fn cancel_analysis(thread_id: i32) {
-    if let Some(n) = analysis_cancels()
+    if let Some(f) = analysis_cancels()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&thread_id)
     {
-        n.notify_one();
+        f.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Clean up the state a curator analysis leaves behind when it's cancelled mid-pass
-/// (the `select!` in `reanalyze_tool` drops the pass future before `profile_repo_agent`
-/// reaches its run-state cleanup). Two leaks to undo:
-///   1. The coalescing gate's `dirty`/`force` flags this forced request set — if a
-///      background pass holds the lock, draining them would resurrect the cancelled
-///      forced run. Clear them so Stop actually stops queued work.
-///   2. Any repo left `running` (the one being classified when dropped) — reset it
-///      in-memory AND persisted to `idle`, else `run_begin` returns false on the next
-///      Analyze and the repo stays stuck until restart.
-pub async fn cancel_workspace_analysis(db: &Db, workspace_id: i32) {
-    use std::sync::atomic::Ordering;
-    let gate = pass_gate(workspace_id);
-    gate.dirty.store(false, Ordering::SeqCst);
-    gate.force.store(false, Ordering::SeqCst);
-    for r in repo::list_repos(db, workspace_id).await.unwrap_or_default() {
-        if run_phase(r.id) == "running" {
-            run_forget(r.id);
-        }
-        if matches!(repo::get_repo_profile(db, r.id).await, Ok(Some(p)) if p.analysis_state == "running")
-        {
-            let _ = repo::set_analysis_state(db, r.id, "idle", None).await;
-        }
-    }
+/// Whether an optional cancel flag has been tripped.
+fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Drop a repo's run-state entirely, whatever its phase — called when the repo is
@@ -1599,7 +1585,12 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 ///      emitting a graph refresh after each so nodes light up progressively;
 ///   2. a cross-repo pass (only with ≥2 repos) infers the relations between them.
 /// Any single failure leaves that repo's prior state intact.
-pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Result<()> {
+pub async fn analyze_workspace(
+    db: &Db,
+    workspace_id: i32,
+    force: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     let repos = repo::list_repos(db, workspace_id).await?;
     // Only analyze repos whose checkout still exists on disk.
     let existing: Vec<repo_ref::Model> = repos
@@ -1615,6 +1606,12 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
     // HEAD) — re-running the minutes-long agent for every unchanged checkout when
     // a single repo is added would stall a large workspace for a long time.
     for r in &existing {
+        // Cooperative cancel: stop BEFORE starting the next repo (the previous one
+        // already finished, including its app-server shutdown/run-state cleanup), so
+        // Stop leaves no orphaned child or stranded `running` repo.
+        if is_cancelled(cancel) {
+            return Ok(());
+        }
         // Honor the persisted failed state: after a restart the in-memory run-state
         // map is empty, so run_phase() returns "idle" for a repo whose
         // analysis_state="failed" was persisted to the DB. Consulting both sources
@@ -1638,20 +1635,24 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
         emit_graph_updated(workspace_id);
     }
 
+    // Cooperative cancel: skip the cross-repo relation pass entirely if Stop arrived
+    // during stage 1. Checked BEFORE it starts (not during) so its non-atomic
+    // per-repo edge writes either all run or none — never a half-updated graph.
+    if is_cancelled(cancel) {
+        return Ok(());
+    }
     // Stage 2: cross-repo relations — needs at least two repos to relate.
     analyze_relations(db, workspace_id).await
 }
 
-/// Whether stage-1 should (re)classify a repo this pass. A FAILED repo is retried
-/// only on a `force`d (user-initiated) pass — never on an auto pass, which runs on
-/// every graph read (so a persistently-failing repo can't storm). A non-failed
-/// repo runs iff it `needs` (re)classification (unclassified, or HEAD moved).
+/// Whether stage-1 should (re)classify a repo this pass. A `force`d (user-initiated
+/// "Analyze deps") pass ALWAYS re-reads the repo — that's the only remaining
+/// force-refresh path now that per-repo reprofile is gone, so a user who sees a wrong
+/// summary/role can re-run even when HEAD hasn't moved. An AUTO pass (force=false,
+/// runs on every graph read) re-classifies only a repo that `needs` it (unclassified
+/// or HEAD moved) and never a FAILED one (so a persistently-failing repo can't storm).
 fn should_analyze(failed: bool, force: bool, needs: bool) -> bool {
-    if failed {
-        force
-    } else {
-        needs
-    }
+    force || (!failed && needs)
 }
 
 /// Whether a repo needs the deep classifier on an automatic pass: a repo with no
@@ -2027,7 +2028,12 @@ fn pass_gate(workspace_id: i32) -> PassGate {
 /// batch add (many requests) collapses into ~one pass, while a request that lands
 /// mid-pass is still covered before any waiter is released. Spawn it
 /// fire-and-forget when you don't want to block (e.g. after adding a repo).
-pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool) {
+pub async fn analyze_workspace_coalesced(
+    db: &Db,
+    workspace_id: i32,
+    force: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) {
     use std::sync::atomic::Ordering;
     let gate = pass_gate(workspace_id);
     gate.dirty.store(true, Ordering::SeqCst);
@@ -2043,7 +2049,15 @@ pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool
     // auto pass.
     while gate.dirty.swap(false, Ordering::SeqCst) {
         let forced = gate.force.swap(false, Ordering::SeqCst);
-        let _ = analyze_workspace(db, workspace_id, forced).await;
+        let _ = analyze_workspace(db, workspace_id, forced, cancel).await;
+        // Cooperative cancel: the inner pass already stopped at its next safe point.
+        // Clear the flags this (now-cancelled) request set so a waiter doesn't drain
+        // them and resurrect the forced run, then stop draining.
+        if is_cancelled(cancel) {
+            gate.dirty.store(false, Ordering::SeqCst);
+            gate.force.store(false, Ordering::SeqCst);
+            break;
+        }
     }
 }
 
@@ -2158,13 +2172,15 @@ mod tests {
     #[test]
     fn should_analyze_gates_failed_on_force() {
         // A failed repo is retried ONLY on a forced (user) pass — never on an auto
-        // pass — regardless of whether it "needs" reclassification. A non-failed repo
-        // runs iff it needs (re)classification; force is irrelevant to it.
+        // pass — regardless of whether it "needs" reclassification. A forced pass also
+        // re-reads an unchanged, already-classified repo (the only force-refresh path
+        // now that per-repo reprofile is gone); an auto pass runs only what `needs` it.
         assert!(!super::should_analyze(true, false, true), "failed + auto → skip even if needs");
         assert!(!super::should_analyze(true, false, false), "failed + auto → skip");
         assert!(super::should_analyze(true, true, false), "failed + forced → retry even if unchanged");
         assert!(super::should_analyze(false, false, true), "not failed + needs → run");
-        assert!(!super::should_analyze(false, true, false), "not failed + unchanged → skip even forced");
+        assert!(!super::should_analyze(false, false, false), "not failed + unchanged + auto → skip");
+        assert!(super::should_analyze(false, true, false), "not failed + unchanged + forced → re-read");
     }
 
     // ─── Finding 1: persisted failed state gates the auto-pass ─────────────
