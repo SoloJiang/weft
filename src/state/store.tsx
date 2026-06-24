@@ -326,6 +326,11 @@ export const useStore = () => {
   return s;
 };
 
+// Below this window width the nav rail (WorkspaceNav, w-72 = 288px) is auto-
+// collapsed so the main column keeps a readable width; default window is 1000
+// (≥ this), so it starts expanded. Manual RailToggle still wins (see effect).
+const NAV_AUTOCOLLAPSE_BELOW = 800;
+
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<number | null>(null);
@@ -390,9 +395,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
   const [threadTab, setThreadTab] = useState<ThreadTab>("lead");
-  // Min window width is 1500 (tauri.conf), so the sidebar always has room —
-  // nav starts expanded and only the manual RailToggle collapses it.
-  const [navCollapsed, setNavCollapsed] = useState(false);
+  // Start collapsed when the window opens below the floor (e.g. restored at a
+  // narrow size); the resize effect below keeps it in sync on threshold crosses.
+  const [navCollapsed, setNavCollapsed] = useState(
+    () => window.innerWidth < NAV_AUTOCOLLAPSE_BELOW,
+  );
 
   // App settings, persisted to localStorage.
   const [projectsDir, setProjectsDirState] = useState(
@@ -558,6 +565,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const i = localStorage.getItem("weft-idle-cap-mins");
     const w = localStorage.getItem("weft-wall-cap-mins");
     if (i != null && w != null) void api.setGuardrails(Number(i) * 60, Number(w) * 60);
+  }, []);
+
+  // Auto-collapse the sidebar when the window gets narrow; auto-restore when it
+  // widens again (only on threshold crossings, so manual toggles stick).
+  useEffect(() => {
+    let prevNarrow = window.innerWidth < NAV_AUTOCOLLAPSE_BELOW;
+    const onResize = () => {
+      const narrow = window.innerWidth < NAV_AUTOCOLLAPSE_BELOW;
+      if (narrow !== prevNarrow) {
+        prevNarrow = narrow;
+        setNavCollapsed(narrow);
+      }
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
   }, []);
 
   const refreshWorkspaces = useCallback(async () => {

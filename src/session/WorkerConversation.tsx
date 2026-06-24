@@ -196,7 +196,7 @@ export function WorkerConversation() {
               {toolFullName(ref.tool)}
             </span>
           )}
-          <span className="block min-w-0 truncate font-mono text-[11.5px] text-ink-faint">
+          <span className="hidden min-w-0 truncate font-mono text-[11.5px] text-ink-faint md:block">
             {ref?.branch}
           </span>
           <button
