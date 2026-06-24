@@ -365,6 +365,15 @@ fn curator_specs() -> Value {
             "name": "reanalyze",
             "description": "Run a fresh dependency-analysis pass over the WHOLE workspace: re-classify each repo (tier/stack/summary) and re-infer cross-repo runtime/infra edges, then regenerate the map. Call this when the human asks to re-analyze / regenerate the repo map (e.g. after repos changed). Takes no arguments; returns when the pass completes, with the resulting repo/edge counts. Human-pinned edges survive the pass.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "set_classification",
+            "description": "Fix ONE repo's architectural classification when get_repo_map shows it wrong (e.g. a frontend/local SDK mislabeled as a backend service). `repo` is the repo id from get_repo_map. `tier` ∈ frontend|backend. `category` is the role within that tier (free text, e.g. gateway|biz|core|common|idl|support for backend; app|sdk|web for frontend). Human/curator-set classification is PINNED and survives automatic re-analysis.",
+            "inputSchema": { "type": "object", "properties": {
+                "repo": { "type": "integer" },
+                "tier": { "type": "string", "enum": ["frontend", "backend"] },
+                "category": { "type": "string" }
+            }, "required": ["repo", "tier"] }
         }
     ])
 }
@@ -376,6 +385,7 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "calibrate_edges" => calibrate_edges_tool(db, thread, args).await,
+        "set_classification" => set_classification_tool(db, thread, args).await,
         "reanalyze" => match reanalyze_tool(db, thread).await {
             Ok(v) => text_result(v),
             Err(e) => text_result(format!("error: {e}")),
@@ -413,7 +423,20 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
                    (moved or deleted). Restore the repos and try again."
             .to_string());
     }
-    crate::curator::analyze_workspace_coalesced(db, ws_id, true).await;
+    // Register a cancel handle so clicking 中止 — which interrupts the lead turn and
+    // calls `cancel_analysis(thread)` — drops the pass future here. The in-flight
+    // codex child then dies via its `kill_on_drop(true)`, and the coalescing gate's
+    // RAII lock releases cleanly. Matches worker-chat "stop = stop the work".
+    let cancel = crate::curator::register_analysis_cancel(thread);
+    let cancelled = tokio::select! {
+        biased;
+        _ = cancel.notified() => true,
+        _ = crate::curator::analyze_workspace_coalesced(db, ws_id, true) => false,
+    };
+    crate::curator::unregister_analysis_cancel(thread);
+    if cancelled {
+        return Ok("Re-analysis cancelled.".to_string());
+    }
     let g = crate::curator::graph(db, ws_id).await?;
     Ok(format!(
         "Re-analysis complete: {} repos, {} dependency links. The repo map has been refreshed.",
@@ -511,6 +534,63 @@ async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
             }
             text_result(format!(
                 "{action} {kind} edge {from}->{to} (pinned to your calibration)"
+            ))
+        }
+        Err(e) => text_result(format!("error: {e}")),
+    }
+}
+
+/// Pin ONE repo's tier/role classification (e.g. mark a frontend/local SDK that was
+/// mislabeled as a backend service). Validates the repo belongs to THIS curator's
+/// workspace and the tier is canonical, then writes via `curator::edit_profile`
+/// (which pins ownership so the classification survives re-analysis) and emits
+/// `repo-graph-updated`.
+async fn set_classification_tool(db: &Db, thread: i32, args: &Value) -> Value {
+    // i32::try_from (not lossy `as i32`): a huge id must NOT wrap to a valid repo id
+    // and slip past the workspace membership check.
+    let repo = args.get("repo").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+    let Some(repo) = repo else {
+        return text_result("repo must be a valid repo id from get_repo_map".into());
+    };
+    // Tier is REQUIRED and must canonicalize to frontend|backend: a misspelling would
+    // otherwise clear the tier (or store a legacy value) and the node would read as
+    // unclassified.
+    let tier = args.get("tier").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(tier) = crate::profile::normalize_tier(tier) else {
+        return text_result("tier is required and must be \"frontend\" or \"backend\"".into());
+    };
+    // Category (role within the tier) is optional free text; blank → leave it to a
+    // later pass (don't pin an empty role).
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await else {
+        return text_result("curator thread not found".into());
+    };
+    // Only the hidden curator thread may classify — reject a direct call with a normal
+    // feature thread id (it would bypass the chat boundary).
+    if t.kind != "curator" {
+        return text_result("set_classification is only available in the curator chat".into());
+    }
+    let in_ws = crate::store::repo::list_repos(db, t.workspace_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .any(|r| r.id == repo);
+    if !in_ws {
+        return text_result("repo must be a repo id in this workspace (use get_repo_map)".into());
+    }
+    match crate::curator::edit_profile(db, repo, None, Some(tier.as_str()), category).await {
+        Ok(_) => {
+            if let Some(app) = crate::APP_HANDLE.get() {
+                use tauri::Emitter;
+                let _ = app.emit("repo-graph-updated", t.workspace_id);
+            }
+            let role = category.map(|c| format!("/{c}")).unwrap_or_default();
+            text_result(format!(
+                "repo {repo} classified as {tier}{role} (pinned — survives re-analysis)"
             ))
         }
         Err(e) => text_result(format!("error: {e}")),

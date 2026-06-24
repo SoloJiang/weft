@@ -67,8 +67,6 @@ export const api = {
   // Repo map (curator): profiles + cross-repo dependency graph.
   repoGraph: (workspaceId: number) =>
     invoke<RepoGraph>("repo_graph", { workspaceId }),
-  reprofileRepo: (repoId: number) =>
-    invoke<void>("reprofile_repo", { repoId }),
   // Remove a repo from its workspace (ref + profile + bound tasks + worktrees).
   // The user's actual repository on disk is left untouched.
   deleteRepo: (repoId: number) =>

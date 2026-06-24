@@ -432,20 +432,6 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
     crate::curator::graph(&db, workspace_id).await.map_err(e)
 }
 
-/// Re-run the deep, read-only agent classification for a single repo (tier +
-/// summary + components), then refresh the workspace's cross-repo relations so
-/// the stored edges reflect the repo's changed dependencies. Slow (spawns the
-/// agent); the caller refreshes the map after it resolves.
-#[tauri::command]
-pub async fn reprofile_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
-    let r = repo::get_repo(&db, repo_id)
-        .await
-        .map_err(e)?
-        .ok_or("repo not found")?;
-    crate::curator::reprofile_repo(&db, &r).await.map_err(e)?;
-    Ok(())
-}
-
 /// Get-or-create this workspace's hidden curator-chat thread and return its id,
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]
@@ -517,8 +503,10 @@ pub async fn update_repo_profile(
     tier: Option<String>,
 ) -> R<()> {
     // Only the field(s) the user actually changed are `Some`, so editing the
-    // summary doesn't pin the tier and vice versa.
-    crate::curator::edit_profile(&db, repo_id, summary.as_deref(), tier.as_deref())
+    // summary doesn't pin the tier and vice versa. The detail-pane editor doesn't
+    // change the role/category, so pass None for it (the curator's set_classification
+    // tool is the path that pins a role).
+    crate::curator::edit_profile(&db, repo_id, summary.as_deref(), tier.as_deref(), None)
         .await
         .map_err(e)?;
     Ok(())

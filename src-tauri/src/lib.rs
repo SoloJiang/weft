@@ -198,7 +198,6 @@ pub fn run() {
             commands::list_repos,
             commands::list_repo_profiles,
             commands::repo_graph,
-            commands::reprofile_repo,
             commands::open_curator_chat,
             commands::get_repo_map_doc,
             commands::delete_repo,

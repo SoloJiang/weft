@@ -128,6 +128,12 @@ for exactly that edge (from/to are repo ids that must differ). Explain the \
 evidence you found in plain language. Human-set edges are pinned and survive \
 automatic re-analysis; removals are remembered. Make one calibrate_edges call per \
 edge.\n\n\
+When a repo's TIER or ROLE is wrong in get_repo_map (e.g. a frontend/local SDK \
+classified as a backend service, or the wrong role within its tier), call \
+set_classification with the repo id, the correct tier (frontend|backend), and the \
+role/category (free text, e.g. gateway|biz|core|common|idl|support for backend; \
+app|sdk|web for frontend). Classification you set is pinned and survives \
+re-analysis — use it to fix what the automatic pass got wrong, not to guess.\n\n\
 When the human asks you to re-analyze, regenerate the map, or analyze dependencies \
 (including a one-off message sent by the Analyze / Regenerate buttons), call the \
 reanalyze tool — it runs a full pass over the workspace and returns the resulting \
@@ -289,6 +295,11 @@ pub async fn lead_send(
 
 #[tauri::command]
 pub async fn lead_interrupt(app: AppHandle, thread_id: i32) -> Result<(), String> {
+    // Interrupting a curator turn must also cancel an in-flight analysis pass it
+    // started (the `reanalyze` MCP tool runs in the bus backend, out of reach of the
+    // engine interrupt). No-op for non-curator/idle threads. Fire it first so the
+    // pass starts unwinding even if the engine interrupt blocks.
+    crate::curator::cancel_analysis(thread_id);
     if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
         engine::interrupt(&app, &eng)
             .await
