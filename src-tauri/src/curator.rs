@@ -1224,6 +1224,12 @@ pub fn clear_failure(repo_id: i32) {
 // The pass checks the token at SAFE points only (between repos, before the relation
 // pass) and returns cleanly — we never drop the future, which would orphan a codex
 // app-server child, strand a repo at `running`, or tear a non-atomic relation write.
+//
+// A single map (no separate "pending" set): `cancel_analysis` only trips a token that
+// is already registered. A Stop that lands in the sub-millisecond window before
+// `register_analysis_cancel` is a benign no-op — the lead turn is still interrupted,
+// and the just-started pass completes harmlessly. (Parking such cancels was worse: a
+// Stop on an unrelated chat/calibration turn would poison the NEXT Analyze.)
 fn analysis_cancels(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>
 {
@@ -1235,26 +1241,9 @@ fn analysis_cancels(
     S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Threads whose cancel arrived BEFORE `reanalyze_tool` registered (the tiny race
-/// between the lead dispatching the tool call and the handler registering). The cancel
-/// is parked here and consumed by the next `register_analysis_cancel` for that thread.
-fn pending_cancels() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
-/// Register a fresh cancel token for a curator thread's forced pass. Consumes any
-/// cancel that arrived before registration (so it isn't lost).
+/// Register a fresh cancel token for a curator thread's forced pass.
 pub fn register_analysis_cancel(thread_id: i32) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if pending_cancels()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&thread_id)
-    {
-        token.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
     analysis_cancels()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1262,36 +1251,26 @@ pub fn register_analysis_cancel(thread_id: i32) -> std::sync::Arc<std::sync::ato
     token
 }
 
-/// Drop a curator thread's cancel token once its pass finished (or was cancelled).
-pub fn unregister_analysis_cancel(thread_id: i32) {
-    analysis_cancels()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&thread_id);
-    pending_cancels()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&thread_id);
+/// Drop a curator thread's cancel token once its pass finished — but ONLY if it's still
+/// the token THIS call registered. A second Analyze on the same thread overwrites the
+/// map entry with its own token; the older call must not delete the newer one (else a
+/// Stop during the second pass wouldn't reach its token).
+pub fn unregister_analysis_cancel(thread_id: i32, token: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let mut g = analysis_cancels().lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(g.get(&thread_id), Some(t) if std::sync::Arc::ptr_eq(t, token)) {
+        g.remove(&thread_id);
+    }
 }
 
 /// Request cancellation of a curator thread's in-flight forced pass. Trips the
-/// registered token; if none is registered yet (cancel raced registration), park it
-/// as pending so the imminent `register_analysis_cancel` consumes it. No-op for a
-/// non-curator/idle thread that never re-analyzes.
+/// registered token; no-op if none is registered (the thread isn't re-analyzing).
 pub fn cancel_analysis(thread_id: i32) {
-    let token = analysis_cancels()
+    if let Some(token) = analysis_cancels()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&thread_id)
-        .cloned();
-    match token {
-        Some(token) => token.store(true, std::sync::atomic::Ordering::SeqCst),
-        None => {
-            pending_cancels()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(thread_id);
-        }
+    {
+        token.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

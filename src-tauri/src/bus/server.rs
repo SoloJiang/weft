@@ -431,7 +431,7 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
     let cancel = crate::curator::register_analysis_cancel(thread);
     crate::curator::reanalyze_workspace(db, ws_id, &cancel).await;
     let cancelled = cancel.load(std::sync::atomic::Ordering::SeqCst);
-    crate::curator::unregister_analysis_cancel(thread);
+    crate::curator::unregister_analysis_cancel(thread, &cancel);
     if cancelled {
         return Ok("Re-analysis cancelled.".to_string());
     }
