@@ -13,9 +13,9 @@
     "windows": [
       {
         "title": "",
-        "width": 1100,
+        "width": 2000,
         "height": 760,
-        "minWidth": 520
+        "minWidth": 1500
       }
     ],
     "security": {

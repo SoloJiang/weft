@@ -41,6 +41,7 @@ export function WorkerConversation() {
     activeWorkspaceId,
     skillsDirtyAt,
     markSkillsDirty,
+    asks,
   } = useStore();
   const { t } = useTranslation();
   const [ref, setRef] = useState<ObserveRef | null>(null);
@@ -64,6 +65,15 @@ export function WorkerConversation() {
   // The thread the worker's rows live under: the live session's own thread, else
   // the open thread (board path). Covers cross-thread entry from "Needs you".
   const threadId = live?.threadId ?? activeThreadId;
+
+  // This worker's pending permission asks. A worker ask's `dir` is the direction
+  // id as a string (backend uses direction_id.to_string(); board code matches
+  // String(direction.id) / Number(a.dir)). Answered in the same in-session card
+  // the lead uses, so an ask is actionable in one place — the dock only routes.
+  const workerAsks =
+    directionId == null
+      ? []
+      : asks.filter((a) => a.dir === String(directionId));
 
   // History lives in the thread timeline; hydrate it (worker rows ride along).
   useEffect(() => {
@@ -186,7 +196,7 @@ export function WorkerConversation() {
               {toolFullName(ref.tool)}
             </span>
           )}
-          <span className="hidden min-w-0 truncate font-mono text-[11.5px] text-ink-faint md:block">
+          <span className="block min-w-0 truncate font-mono text-[11.5px] text-ink-faint">
             {ref?.branch}
           </span>
           <button
@@ -240,6 +250,7 @@ export function WorkerConversation() {
         <div className="flex min-h-0 flex-1 flex-col">
           <ChatTimeline
             messages={msgs}
+            asks={workerAsks}
             busy={busy}
             activity={sid != null ? workerActivity[sid] : undefined}
             onReviewProposal={() => {}}

@@ -303,6 +303,7 @@ export const en = {
     wantsPermission: "wants permission",
     question: "needs an answer",
     openQueue: "Open queue",
+    more: "More",
     always: "Always allow",
     allowTitle: "Allow just this one request",
     alwaysTitle: "Always allow this exact command from now on",

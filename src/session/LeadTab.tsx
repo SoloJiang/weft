@@ -5,7 +5,6 @@ import { useStore } from "../state/store";
 import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
 import { ChatComposer } from "./ChatComposer";
-import { PermissionBar } from "./PermissionBar";
 import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
@@ -204,11 +203,9 @@ export function LeadTab({
             </button>
           </header>
         )}
-        <PermissionBar
-          asks={asks.filter((a) => a.thread === tid && (a.dir === "lead" || a.dir === ""))}
-        />
         <ChatTimeline
           messages={msgs}
+          asks={asks.filter((a) => a.thread === tid && (a.dir === "lead" || a.dir === ""))}
           busy={turn.state === "busy"}
           activity={leadActivity[tid]}
           onReviewProposal={() => {

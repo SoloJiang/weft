@@ -152,7 +152,7 @@ export function AppTopBar() {
             <span className="min-w-0 truncate text-[13px] font-semibold text-ink">
               {viewedDirection?.name ?? "task"}
             </span>
-            <span className="hidden shrink-0 text-[11.5px] text-ink-faint sm:inline">
+            <span className="inline shrink-0 text-[11.5px] text-ink-faint">
               {viewedRepo?.name ?? "working copy"}
             </span>
           </div>

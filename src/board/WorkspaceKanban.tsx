@@ -60,7 +60,7 @@ export function WorkspaceKanban() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 overflow-auto">
-        <div className="flex h-full min-w-fit gap-3 px-5 py-4">
+        <div className="flex h-full min-w-0 gap-3 px-5 py-4">
           {COLUMNS.map((col) => {
             const cards = overview
               .filter((o) => phaseOf(o) === col.key)
@@ -68,7 +68,7 @@ export function WorkspaceKanban() {
             return (
               <div
                 key={col.key}
-                className="flex w-[292px] shrink-0 flex-col rounded-[var(--radius-lg)] border border-border bg-surface/35"
+                className="flex min-w-[260px] max-w-[360px] flex-1 flex-col rounded-[var(--radius-lg)] border border-border bg-surface/35"
               >
                 <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
                   <span

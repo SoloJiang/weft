@@ -390,7 +390,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
   const [threadTab, setThreadTab] = useState<ThreadTab>("lead");
-  const [navCollapsed, setNavCollapsed] = useState(() => window.innerWidth < 820);
+  // Min window width is 1500 (tauri.conf), so the sidebar always has room —
+  // nav starts expanded and only the manual RailToggle collapses it.
+  const [navCollapsed, setNavCollapsed] = useState(false);
 
   // App settings, persisted to localStorage.
   const [projectsDir, setProjectsDirState] = useState(
@@ -556,22 +558,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const i = localStorage.getItem("weft-idle-cap-mins");
     const w = localStorage.getItem("weft-wall-cap-mins");
     if (i != null && w != null) void api.setGuardrails(Number(i) * 60, Number(w) * 60);
-  }, []);
-
-  // Auto-collapse the sidebar when the window gets narrow; auto-restore when it
-  // widens again (only on threshold crossings, so manual toggles stick).
-  useEffect(() => {
-    const TH = 820;
-    let prevNarrow = window.innerWidth < TH;
-    const onResize = () => {
-      const narrow = window.innerWidth < TH;
-      if (narrow !== prevNarrow) {
-        prevNarrow = narrow;
-        setNavCollapsed(narrow);
-      }
-    };
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
   }, []);
 
   const refreshWorkspaces = useCallback(async () => {

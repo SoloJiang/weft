@@ -293,6 +293,7 @@ export const zh = {
     wantsPermission: "请求权限",
     question: "需要回答",
     openQueue: "查看队列",
+    more: "更多",
     always: "始终允许",
     allowTitle: "仅允许这一次请求",
     alwaysTitle: "以后自动允许相同的命令",

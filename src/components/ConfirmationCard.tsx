@@ -1,11 +1,17 @@
 import type { ToolUIPart } from "ai";
 import type { ComponentProps, ReactNode } from "react";
-import { createContext, useContext, useMemo } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { ShieldQuestion } from "lucide-react";
+import { MoreHorizontal, ShieldQuestion } from "lucide-react";
 import type { PermissionAsk } from "../lib/types";
 import { cn } from "../lib/cn";
 import { Button } from "./ui/Button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/DropdownMenu";
 import { ToolIcon, toolFullName } from "./ToolIcon";
 
 type ToolUIPartApproval =
@@ -117,6 +123,8 @@ type PermissionConfirmationCardProps = {
   readonly timestamp?: ReactNode;
   readonly showToolIcon?: boolean;
   readonly summaryMode?: "inline" | "block";
+  /** Bind keyboard shortcuts (Enter/⌘↩/Esc). Only for a single active in-session ask. */
+  readonly enableShortcuts?: boolean;
 };
 
 export function PermissionConfirmationCard({
@@ -129,13 +137,48 @@ export function PermissionConfirmationCard({
   timestamp,
   showToolIcon = false,
   summaryMode = "inline",
+  enableShortcuts = false,
 }: PermissionConfirmationCardProps) {
   const { t } = useTranslation();
   const detailTitle = ask.detail || ask.summary;
   const isBlockSummary = summaryMode === "block";
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // On the in-session card (a single active ask) the keyboard answers it:
+  // Enter = allow, ⌘/Ctrl+Enter = always, Esc = deny. Runs in the capture phase
+  // and stops propagation so the card preempts other window keydown handlers
+  // (e.g. an open Diff/FileTree panel that also closes on Escape — otherwise Esc
+  // would deny AND close the panel). It fires ONLY when the card is visible and
+  // focus is neutral (the document body): if the user is interacting with ANY
+  // widget — composer, buttons, the ⋯ menu, the file tree, side panels, … — that
+  // widget keeps its own Enter/Escape. Allow-listing neutral focus (rather than
+  // blocklisting widget roles, which can never be exhaustive) is what makes this
+  // robust.
+  useEffect(() => {
+    if (!enableShortcuts) return;
+    const onKey = (e: KeyboardEvent) => {
+      // One physical press = one answer: ignore IME composition and key-repeat so
+      // a held key can't resolve this ask and then the next one it exposes.
+      if (e.isComposing || e.repeat) return;
+      if (rootRef.current?.offsetParent == null) return;
+      const ae = document.activeElement;
+      if (ae && ae !== document.body && ae !== document.documentElement) return;
+      const act = (answer: PermissionAnswer) => {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        onAnswer(ask.id, answer);
+      };
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) act("always");
+      else if (e.key === "Enter") act("allow");
+      else if (e.key === "Escape") act("deny");
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [enableShortcuts, ask.id, onAnswer]);
 
   return (
     <Confirmation
+      ref={rootRef}
       approval={{ id: String(ask.id) }}
       state="approval-requested"
       className={cn(
@@ -177,25 +220,36 @@ export function PermissionConfirmationCard({
         >
           {t("common.allow")}
         </ConfirmationAction>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              size="icon"
+              variant="default"
+              title={t("needs.more")}
+              aria-label={t("needs.more")}
+            >
+              <MoreHorizontal size={15} />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent>
+            <DropdownMenuItem
+              title={t("needs.alwaysTitle")}
+              onSelect={() => onAnswer(ask.id, "always")}
+            >
+              {t("needs.always")}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              title={t("needs.fullAccessTitle")}
+              onSelect={() => onAnswer(ask.id, "full")}
+            >
+              {t("needs.fullAccess")}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
         <ConfirmationAction
           size="sm"
-          variant="default"
-          title={t("needs.alwaysTitle")}
-          onClick={() => onAnswer(ask.id, "always")}
-        >
-          {t("needs.always")}
-        </ConfirmationAction>
-        <ConfirmationAction
-          size="sm"
-          variant="default"
-          title={t("needs.fullAccessTitle")}
-          onClick={() => onAnswer(ask.id, "full")}
-        >
-          {t("needs.fullAccess")}
-        </ConfirmationAction>
-        <ConfirmationAction
-          size="sm"
-          variant="danger"
+          variant="ghost"
           title={t("needs.denyTitle")}
           onClick={() => onAnswer(ask.id, "deny")}
         >

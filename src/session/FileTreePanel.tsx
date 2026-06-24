@@ -2,11 +2,12 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
 import { FileTreeView } from "./FileTreeView";
+import { clampPanelWidth } from "./panelWidth";
 import { cn } from "../lib/cn";
 
 const MIN_W = 280;
 const MAX_W = 520;
-const clampW = (x: number) => Math.max(MIN_W, Math.min(MAX_W, x));
+const clampW = (x: number) => clampPanelWidth(x, MIN_W, MAX_W);
 
 /**
  * The worktree file tree as a real third column (like DiffPanel): opening it
@@ -31,6 +32,14 @@ export function FileTreePanel({
   useEffect(() => {
     localStorage.setItem("weft-files-w", String(w));
   }, [w]);
+
+  // Re-clamp on window shrink (e.g. 2000 → 1500) so a wide panel set on a big
+  // screen can't crowd out the main column at the floor.
+  useEffect(() => {
+    const onResize = () => setW((cur) => clampW(cur));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
