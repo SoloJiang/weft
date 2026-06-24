@@ -226,6 +226,7 @@ export function PromptInputButton({
   title,
   onClick,
   tooltip,
+  tooltipAlign,
 }: {
   readonly children: ReactNode;
   readonly className?: string;
@@ -233,6 +234,8 @@ export function PromptInputButton({
   readonly title?: string;
   readonly onClick?: () => void;
   readonly tooltip?: string;
+  /** Anchor the tooltip to the button's right edge (for right-aligned buttons). */
+  readonly tooltipAlign?: "center" | "end";
 }) {
   const ctx = usePromptInput();
   const accessibleLabel = title ?? tooltip;
@@ -251,7 +254,11 @@ export function PromptInputButton({
     </Button>
   );
   if (tooltip) {
-    return <Tooltip label={tooltip}>{button}</Tooltip>;
+    return (
+      <Tooltip label={tooltip} align={tooltipAlign}>
+        {button}
+      </Tooltip>
+    );
   }
   return button;
 }
