@@ -434,27 +434,37 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
         return Ok("Re-analysis cancelled.".to_string());
     }
     let g = crate::curator::graph(db, ws_id).await?;
-    // The pass swallows per-repo failures (missing agent, timeout, unparsable reply) —
-    // surface them in the curator turn so the human sees them in the chat (the map node
-    // renders a failed repo as plain "未分析"). The agent narrates them.
-    let failed: Vec<String> = crate::store::repo::repos_with_analysis_state(db, "failed")
+    // Surface repos the pass left unclassified so the human sees them in the chat (the
+    // map node renders them as plain "未分析"). Two sources, both swallowed by the pass:
+    //   - analysis_state = "failed": a per-repo classifier error (missing agent,
+    //     timeout, unparsable reply);
+    //   - a MISSING checkout: `analyze_workspace` filters these out up front (so they
+    //     are never marked failed), and the all-missing guard above only fires when
+    //     EVERY checkout is gone — a partially-missing workspace would otherwise report
+    //     a clean "complete".
+    let mut unanalyzed: Vec<String> = crate::store::repo::repos_with_analysis_state(db, "failed")
         .await
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.workspace_id == ws_id)
         .map(|r| r.name)
         .collect();
+    for r in &repos {
+        if !std::path::Path::new(&r.local_git_path).exists() && !unanalyzed.contains(&r.name) {
+            unanalyzed.push(r.name.clone());
+        }
+    }
     let mut msg = format!(
         "Re-analysis complete: {} repos, {} dependency links. The repo map has been refreshed.",
         g.nodes.len(),
         g.edges.len()
     );
-    if !failed.is_empty() {
+    if !unanalyzed.is_empty() {
         msg.push_str(&format!(
-            " Note: {} repo(s) could not be analyzed and stayed unclassified: {}. \
-             Tell the human, who can re-run the analysis.",
-            failed.len(),
-            failed.join(", ")
+            " Note: {} repo(s) could not be analyzed and stayed unclassified (classifier \
+             error or missing checkout): {}. Tell the human, who can re-run the analysis.",
+            unanalyzed.len(),
+            unanalyzed.join(", ")
         ));
     }
     Ok(msg)

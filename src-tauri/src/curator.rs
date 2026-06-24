@@ -1604,6 +1604,14 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
         return Ok(());
     }
 
+    // On a cancellation that interrupted stage 1, the relation pass below (which
+    // normally clears + rewrites the synthesized map markdown) is skipped, so the
+    // Map tab would keep serving the pre-cancel narrative while the graph shows the
+    // freshly-classified nodes. `did_classify` tracks whether we actually re-classified
+    // anything this pass; on a cancel-bail we invalidate the doc so it regenerates on
+    // the next pass rather than reading stale.
+    let mut did_classify = false;
+
     // Stage 1: deep per-repo classification, progressive. Skip a repo that's
     // already classified (canonical tier) AND unchanged since (profiled_commit ==
     // HEAD) — re-running the minutes-long agent for every unchanged checkout when
@@ -1613,6 +1621,9 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
         // already finished, including its app-server shutdown/run-state cleanup), so
         // Stop leaves no orphaned child or stranded `running` repo.
         if cancelled() {
+            if did_classify {
+                let _ = repo::clear_repo_map_doc(db, workspace_id).await;
+            }
             return Ok(());
         }
         // Honor the persisted failed state: after a restart the in-memory run-state
@@ -1635,6 +1646,7 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
             continue;
         }
         let _ = profile_repo_agent(db, r).await;
+        did_classify = true;
         emit_graph_updated(workspace_id);
     }
 
@@ -1642,6 +1654,9 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
     // during stage 1. Checked BEFORE it starts (not during) so its non-atomic
     // per-repo edge writes either all run or none — never a half-updated graph.
     if cancelled() {
+        if did_classify {
+            let _ = repo::clear_repo_map_doc(db, workspace_id).await;
+        }
         return Ok(());
     }
     // Stage 2: cross-repo relations — needs at least two repos to relate.
@@ -2058,17 +2073,21 @@ pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool
         let forced = gate.force.swap(false, Ordering::SeqCst);
         let _ = analyze_workspace(db, workspace_id, forced).await;
         // Cooperative cancel: the inner pass already stopped at its next safe point.
-        // `swap(false)` observes AND clears the flag under the lock (so the next
-        // drainer doesn't see it stale); clear the pending dirty/force this cancelled
-        // request set so a waiter can't drain them and resurrect the forced run.
-        if gate.cancel.swap(false, Ordering::SeqCst) {
+        // READ (don't clear) the flag — `unregister_analysis_cancel` clears it once,
+        // so a curator request that a DIFFERENT holder (a background backfill) drained
+        // and cancelled still observes the cancel when it later acquires the lock and
+        // finds nothing dirty. Clear the pending dirty/force this cancelled request set
+        // so a waiter can't drain them and resurrect the forced run.
+        if gate.cancel.load(Ordering::SeqCst) {
             gate.dirty.store(false, Ordering::SeqCst);
             gate.force.store(false, Ordering::SeqCst);
             cancelled = true;
             break;
         }
     }
-    cancelled
+    // Also true for a queued caller whose forced work a prior drainer already ran and
+    // cancelled (it finds nothing dirty here, but the flag is still set until unregister).
+    cancelled || gate.cancel.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
