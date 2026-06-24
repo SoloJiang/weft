@@ -1278,14 +1278,23 @@ pub fn cancel_analysis(thread_id: i32) {
 /// via the gate LOCK, but run `analyze_workspace` directly with this call's own cancel
 /// token — deliberately NOT through the coalescing `dirty`/`force` flags, so cancelling
 /// it can't drop a concurrent request or be drained (and thus lost) by another holder.
-pub async fn reanalyze_workspace(db: &Db, workspace_id: i32, cancel: &std::sync::atomic::AtomicBool) {
+/// Returns whether the pass was actually cancelled (mid-run, or while queued) — NOT
+/// merely whether the token was tripped, so a Stop that arrives after the pass already
+/// finished its relation write isn't reported as a cancelled (it completed).
+pub async fn reanalyze_workspace(
+    db: &Db,
+    workspace_id: i32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
     let gate = pass_gate(workspace_id);
     let _g = gate.lock.lock().await;
-    // Cancelled while queued behind another pass → don't start.
+    // Cancelled while queued behind another pass → don't start; that's a real cancel.
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-        return;
+        return true;
     }
-    let _ = analyze_workspace(db, workspace_id, true, Some(cancel)).await;
+    analyze_workspace(db, workspace_id, true, Some(cancel))
+        .await
+        .unwrap_or(false)
 }
 
 /// Drop a repo's run-state entirely, whatever its phase — called when the repo is
@@ -1606,9 +1615,10 @@ pub async fn analyze_workspace(
     workspace_id: i32,
     force: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<()> {
-    // Cooperative cancel: the curator's forced pass passes its own token; background
-    // passes pass None (not cancellable).
+) -> Result<bool> {
+    // Returns whether the pass ACTUALLY bailed at a cancel checkpoint (so callers can
+    // tell a real mid-pass Stop from a Stop that landed after the pass had finished).
+    // The curator's forced pass passes its own token; background passes pass None.
     let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
     let repos = repo::list_repos(db, workspace_id).await?;
     // Only analyze repos whose checkout still exists on disk.
@@ -1617,7 +1627,7 @@ pub async fn analyze_workspace(
         .filter(|r| Path::new(&r.local_git_path).exists())
         .collect();
     if existing.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     // On a cancellation that interrupted stage 1, the relation pass below (which
@@ -1643,7 +1653,7 @@ pub async fn analyze_workspace(
                 // so without it the Map tab would keep serving the now-cleared markdown.
                 emit_graph_updated(workspace_id);
             }
-            return Ok(());
+            return Ok(true);
         }
         // Honor the persisted failed state: after a restart the in-memory run-state
         // map is empty, so run_phase() returns "idle" for a repo whose
@@ -1677,10 +1687,11 @@ pub async fn analyze_workspace(
             let _ = repo::clear_repo_map_doc(db, workspace_id).await;
             emit_graph_updated(workspace_id);
         }
-        return Ok(());
+        return Ok(true);
     }
     // Stage 2: cross-repo relations — needs at least two repos to relate.
-    analyze_relations(db, workspace_id).await
+    analyze_relations(db, workspace_id).await?;
+    Ok(false)
 }
 
 /// Whether stage-1 should (re)classify a repo this pass. A `force`d (user-initiated

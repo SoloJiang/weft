@@ -347,7 +347,7 @@ fn curator_specs() -> Value {
     json!([
         {
             "name": "get_repo_map",
-            "description": "Read the workspace repos and their current dependency edges (ids, roles, summaries, published interfaces). Use the ids when calling calibrate_edges.",
+            "description": "Read the workspace repos and their current dependency edges (ids, tier, category/role, summaries, components, path) plus each repo's analysis_state (\"failed\" repos carry an analysis_error — automatic passes couldn't classify them; tell the human if they ask why a repo is unclassified). Use the ids when calling calibrate_edges or set_classification.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -408,6 +408,23 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
         anyhow::bail!("reanalyze is only available in the curator chat");
     }
     let ws_id = t.workspace_id;
+    // Register the cancel token BEFORE the (multi-repo, disk-stat) checkout preflight,
+    // so a Stop during it trips THIS call's token instead of being dropped. Everything
+    // after registration runs through the helper so the token is always unregistered.
+    let cancel = crate::curator::register_analysis_cancel(thread);
+    let out = reanalyze_after_register(db, ws_id, &cancel).await;
+    crate::curator::unregister_analysis_cancel(thread, &cancel);
+    out
+}
+
+/// The post-registration body of `reanalyze_tool` (checkout preflight + the cancellable
+/// forced pass + the summary), split out so `reanalyze_tool` always unregisters the
+/// cancel token afterwards.
+async fn reanalyze_after_register(
+    db: &Db,
+    ws_id: i32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<String> {
     // Every tracked repo's checkout gone → the pass filters them all out and would
     // analyze nothing, leaving the stale graph to read as a clean "complete". Tell
     // the human instead (matches the behavior of the removed analyze command).
@@ -421,18 +438,13 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
                    (moved or deleted). Restore the repos and try again."
             .to_string());
     }
-    // Register a per-call cancel token for this curator thread. Clicking 中止 interrupts
-    // the lead turn and calls `cancel_analysis(thread)`, which trips the token; the
-    // forced pass (`reanalyze_workspace`) checks it at safe points (between repos,
-    // before the relation pass) and returns cleanly — never a dropped future, so no
-    // orphaned app-server child, stranded `running` repo, or half-written relations.
-    // The pass runs directly under the gate lock (not via the coalescing flags), so the
-    // cancel can't drop unrelated requests. Matches worker-chat "stop = stop the work".
-    let cancel = crate::curator::register_analysis_cancel(thread);
-    crate::curator::reanalyze_workspace(db, ws_id, &cancel).await;
-    let cancelled = cancel.load(std::sync::atomic::Ordering::SeqCst);
-    crate::curator::unregister_analysis_cancel(thread, &cancel);
-    if cancelled {
+    // Clicking 中止 interrupts the lead turn and calls `cancel_analysis(thread)`, which
+    // trips the token; `reanalyze_workspace` checks it at safe points (between repos,
+    // before the relation pass) and returns whether it ACTUALLY bailed — so a Stop that
+    // lands after the pass already finished its relation write reports "complete", not
+    // "cancelled". The pass runs directly under the gate lock (not via the coalescing
+    // flags), so the cancel can't drop unrelated requests. Worker-chat "stop = stop".
+    if crate::curator::reanalyze_workspace(db, ws_id, cancel).await {
         return Ok("Re-analysis cancelled.".to_string());
     }
     let g = crate::curator::graph(db, ws_id).await?;
@@ -499,6 +511,13 @@ async fn curator_map_json(db: &Db, thread: i32) -> anyhow::Result<String> {
                 "summary": n.summary,
                 "components": n.components,
                 "path": path_of.get(&n.repo_id).cloned().unwrap_or_default(),
+                // Per-repo analysis status, so the agent can tell the human which repos
+                // an automatic (add/backfill/resume) pass failed to analyze — those
+                // never flow through reanalyze's chat summary and the map node just
+                // shows them as unclassified. "failed" carries an error; "" / "idle"
+                // is normal.
+                "analysis_state": n.analysis_state,
+                "analysis_error": n.analysis_error,
             })
         })
         .collect();
