@@ -330,9 +330,11 @@ export const useStore = () => {
 };
 
 // Below this window width the nav rail (WorkspaceNav, w-72 = 288px) is auto-
-// collapsed so the main column keeps a readable width; default window is 1000
+// collapsed so the main column keeps a readable width; default window is 1200
 // (≥ this), so it starts expanded. Manual RailToggle still wins (see effect).
-const NAV_AUTOCOLLAPSE_BELOW = 800;
+// 900px floor is the app's natural multi-column minimum (nav + a side panel +
+// readable main); below it the surfaces can't coexist, hence the raised floor.
+const NAV_AUTOCOLLAPSE_BELOW = 1000;
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
