@@ -421,15 +421,14 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
                    (moved or deleted). Restore the repos and try again."
             .to_string());
     }
-    // Register a cancel flag and thread it INTO the pass. Clicking 中止 interrupts the
-    // lead turn and calls `cancel_analysis(thread)`, which flips the flag; the pass
-    // observes it at its next safe checkpoint and returns cleanly (no dropped future,
-    // so no orphaned app-server child, stranded `running` repo, or half-written
-    // relations). Matches worker-chat "stop = stop the work".
-    use std::sync::atomic::Ordering;
-    let cancel = crate::curator::register_analysis_cancel(thread);
-    crate::curator::analyze_workspace_coalesced(db, ws_id, true, Some(&cancel)).await;
-    let cancelled = cancel.load(Ordering::SeqCst);
+    // Note which workspace this curator thread is analyzing so 中止 can find it.
+    // Clicking 中止 interrupts the lead turn and calls `cancel_analysis(thread)`, which
+    // trips this workspace's gate cancel flag; whichever drain runs the pass observes
+    // it at its next safe checkpoint and returns cleanly (no dropped future, so no
+    // orphaned app-server child, stranded `running` repo, or half-written relations).
+    // Matches worker-chat "stop = stop the work".
+    crate::curator::register_analysis_cancel(thread, ws_id);
+    let cancelled = crate::curator::analyze_workspace_coalesced(db, ws_id, true).await;
     crate::curator::unregister_analysis_cancel(thread);
     if cancelled {
         return Ok("Re-analysis cancelled.".to_string());

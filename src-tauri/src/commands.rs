@@ -346,7 +346,7 @@ async fn register_repo(
     let db_bg = db.clone();
     let ws = r.workspace_id;
     tauri::async_runtime::spawn(async move {
-        crate::curator::analyze_workspace_coalesced(&db_bg, ws, false, None).await;
+        crate::curator::analyze_workspace_coalesced(&db_bg, ws, false).await;
     });
     Ok(r)
 }
