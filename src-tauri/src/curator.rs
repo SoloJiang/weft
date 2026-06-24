@@ -82,15 +82,18 @@ fn combine_source(summary_owned: bool, tier_owned: bool) -> &'static str {
     }
 }
 
-/// Apply a user calibration to the opinion fields. `summary`/`tier` are each
-/// `Some` only for the field the user actually changed, so editing one pins ONLY
-/// that field's ownership; the other keeps its prior value and ownership and can
-/// still be refreshed by the agent.
+/// Apply a user calibration to the opinion fields. `summary`/`tier`/`category` are
+/// each `Some` only for the field the caller actually changed, so editing one pins
+/// ONLY that field's ownership; the others keep their prior value and ownership and
+/// can still be refreshed by the agent. `category` (role within the tier) rides on
+/// tier ownership: setting it alongside a tier pins both, so a human/curator
+/// classification survives later re-analysis (see `persist_repo_class`).
 pub async fn edit_profile(
     db: &Db,
     repo_id: i32,
     summary: Option<&str>,
     tier: Option<&str>,
+    category: Option<&str>,
 ) -> Result<repo_profile::Model> {
     // Don't resurrect a deleted repo: a stale edit (e.g. an input blur racing
     // delete_repo) must not recreate an orphaned profile row, since repo_profile
@@ -150,6 +153,24 @@ pub async fn edit_profile(
     let saved =
         repo::upsert_repo_profile(db, repo_id, &new_tier, &stack, &new_summary, &components, source, &commit)
             .await?;
+    // Role/category (upsert above guarantees a profile row). Preserve domains — only
+    // the role changes.
+    let domains = existing.as_ref().map(|p| p.domains.clone()).unwrap_or_else(|| "[]".into());
+    match category {
+        // Curator/human set the role explicitly — persist it. While the tier stays
+        // user-owned it survives re-analysis (see persist_repo_class).
+        Some(cat) => {
+            let _ = repo::set_repo_category_domains(db, repo_id, cat, &domains).await;
+        }
+        // A tier-ONLY edit (the detail picker) doesn't touch the role. Clear the prior
+        // category rather than let persist_repo_class freeze a now-stale agent role
+        // under the new tier — the next analysis re-derives it (persist_repo_class
+        // falls through to the agent's category when the prior one is empty).
+        None if tier.is_some() => {
+            let _ = repo::set_repo_category_domains(db, repo_id, "", &domains).await;
+        }
+        None => {}
+    }
     // A manual edit where the user PROVIDES a canonical tier RECOVERS a repo whose
     // analysis failed: clear any lingering `failed` run-state so it stops reading as
     // a retryable failure (failed overrides analyzed in the UI). Gate on `tier`
@@ -283,7 +304,7 @@ fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
     if needs_backfill && try_claim_backfill(workspace_id) {
         let db = db.clone();
         tauri::async_runtime::spawn(async move {
-            // Auto pass (fires on graph reads) → not forced: leave failed repos be.
+            // Auto pass (fires on graph reads) → not forced, not cancellable.
             analyze_workspace_coalesced(&db, workspace_id, false).await;
         });
     }
@@ -1192,6 +1213,90 @@ pub fn clear_failure(repo_id: i32) {
     }
 }
 
+// ---- Curator analysis cancellation (cooperative, per-call token) ----------
+// `reanalyze_tool` runs the workspace pass inline while the curator turn is busy.
+// Clicking 中止 interrupts the lead turn but does not, by itself, reach the pass
+// running in the bus backend. So the tool registers a per-call cancel TOKEN keyed by
+// the curator thread; `lead_interrupt` calls `cancel_analysis`, which trips it. The
+// token belongs ONLY to the curator's forced pass (which runs directly under the gate
+// lock via `reanalyze_workspace`, NOT through the shared coalescing dirty/force flags),
+// so cancelling it can't drop unrelated requests or be lost to a background drainer.
+// The pass checks the token at SAFE points only (between repos, before the relation
+// pass) and returns cleanly — we never drop the future, which would orphan a codex
+// app-server child, strand a repo at `running`, or tear a non-atomic relation write.
+//
+// A single map (no separate "pending" set): `cancel_analysis` only trips a token that
+// is already registered. A Stop that lands in the sub-millisecond window before
+// `register_analysis_cancel` is a benign no-op — the lead turn is still interrupted,
+// and the just-started pass completes harmlessly. (Parking such cancels was worse: a
+// Stop on an unrelated chat/calibration turn would poison the NEXT Analyze.)
+fn analysis_cancels(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>
+{
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Register a fresh cancel token for a curator thread's forced pass.
+pub fn register_analysis_cancel(thread_id: i32) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    analysis_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(thread_id, token.clone());
+    token
+}
+
+/// Drop a curator thread's cancel token once its pass finished — but ONLY if it's still
+/// the token THIS call registered. A second Analyze on the same thread overwrites the
+/// map entry with its own token; the older call must not delete the newer one (else a
+/// Stop during the second pass wouldn't reach its token).
+pub fn unregister_analysis_cancel(thread_id: i32, token: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let mut g = analysis_cancels().lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(g.get(&thread_id), Some(t) if std::sync::Arc::ptr_eq(t, token)) {
+        g.remove(&thread_id);
+    }
+}
+
+/// Request cancellation of a curator thread's in-flight forced pass. Trips the
+/// registered token; no-op if none is registered (the thread isn't re-analyzing).
+pub fn cancel_analysis(thread_id: i32) {
+    if let Some(token) = analysis_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&thread_id)
+    {
+        token.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The curator's user-initiated forced re-analysis: serialize against background passes
+/// via the gate LOCK, but run `analyze_workspace` directly with this call's own cancel
+/// token — deliberately NOT through the coalescing `dirty`/`force` flags, so cancelling
+/// it can't drop a concurrent request or be drained (and thus lost) by another holder.
+/// Returns whether the pass was actually cancelled (mid-run, or while queued) — NOT
+/// merely whether the token was tripped, so a Stop that arrives after the pass already
+/// finished its relation write isn't reported as a cancelled (it completed).
+pub async fn reanalyze_workspace(
+    db: &Db,
+    workspace_id: i32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let gate = pass_gate(workspace_id);
+    let _g = gate.lock.lock().await;
+    // Cancelled while queued behind another pass → don't start; that's a real cancel.
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    analyze_workspace(db, workspace_id, true, Some(cancel))
+        .await
+        .unwrap_or(false)
+}
+
 /// Drop a repo's run-state entirely, whatever its phase — called when the repo is
 /// DELETED, so the process-global registry doesn't keep a stale `failed`/`running`
 /// entry for a repo that no longer exists. (Unlike `clear_failure`, this also drops
@@ -1374,9 +1479,15 @@ async fn persist_repo_class(
     if has_category || has_domains {
         let prior_category = prior.as_ref().map(|p| p.category.as_str()).unwrap_or("");
         let prior_domains_json = prior.as_ref().map(|p| p.domains.as_str()).unwrap_or("[]");
-        let final_category = match wire.category {
-            Some(ref c) => c.trim().to_string(),
-            None => prior_category.to_string(),
+        // Role/category rides on tier ownership: when the human/curator pinned the
+        // tier (source = user_tier/user), their role is theirs too — keep it instead
+        // of letting the agent overwrite. A blank prior falls through to the agent's.
+        let final_category = match prior.as_ref().filter(|_| tier_owned) {
+            Some(p) if !p.category.trim().is_empty() => p.category.clone(),
+            _ => match wire.category {
+                Some(ref c) => c.trim().to_string(),
+                None => prior_category.to_string(),
+            },
         };
         let final_domains_json = match wire.domains {
             Some(ref d) => json_strs(d),
@@ -1403,8 +1514,8 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
         // The checkout is gone (e.g. a retry after it was moved/deleted). Don't
         // silently return Ok — that would drop a previously-failed repo to idle and
         // lose its retryable error. Mark a visible, retryable failure instead.
-        // (Background passes pre-filter missing checkouts, so this only fires on an
-        // explicit reprofile_repo retry.) Store a stable CODE, not an English
+        // (Background passes pre-filter missing checkouts, so this only fires on a
+        // resumed "running" repo whose checkout vanished.) Store a stable CODE, not English
         // sentence: the agent/transport errors are inherently dynamic English
         // diagnostics, but THIS is our own known, user-facing case, so the UI
         // localizes it (see `analysisErrorCheckoutMissing` in the i18n files).
@@ -1499,7 +1610,16 @@ pub async fn profile_repo_agent(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 ///      emitting a graph refresh after each so nodes light up progressively;
 ///   2. a cross-repo pass (only with ≥2 repos) infers the relations between them.
 /// Any single failure leaves that repo's prior state intact.
-pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Result<()> {
+pub async fn analyze_workspace(
+    db: &Db,
+    workspace_id: i32,
+    force: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<bool> {
+    // Returns whether the pass ACTUALLY bailed at a cancel checkpoint (so callers can
+    // tell a real mid-pass Stop from a Stop that landed after the pass had finished).
+    // The curator's forced pass passes its own token; background passes pass None.
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
     let repos = repo::list_repos(db, workspace_id).await?;
     // Only analyze repos whose checkout still exists on disk.
     let existing: Vec<repo_ref::Model> = repos
@@ -1507,14 +1627,34 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
         .filter(|r| Path::new(&r.local_git_path).exists())
         .collect();
     if existing.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
+
+    // On a cancellation that interrupted stage 1, the relation pass below (which
+    // normally clears + rewrites the synthesized map markdown) is skipped, so the
+    // Map tab would keep serving the pre-cancel narrative while the graph shows the
+    // freshly-classified nodes. `did_classify` tracks whether we actually re-classified
+    // anything this pass; on a cancel-bail we invalidate the doc so it regenerates on
+    // the next pass rather than reading stale.
+    let mut did_classify = false;
 
     // Stage 1: deep per-repo classification, progressive. Skip a repo that's
     // already classified (canonical tier) AND unchanged since (profiled_commit ==
     // HEAD) — re-running the minutes-long agent for every unchanged checkout when
     // a single repo is added would stall a large workspace for a long time.
     for r in &existing {
+        // Cooperative cancel: stop BEFORE starting the next repo (the previous one
+        // already finished, including its app-server shutdown/run-state cleanup), so
+        // Stop leaves no orphaned child or stranded `running` repo.
+        if cancelled() {
+            if did_classify {
+                let _ = repo::clear_repo_map_doc(db, workspace_id).await;
+                // Tell the map panel to refetch — it only reloads the doc on this event,
+                // so without it the Map tab would keep serving the now-cleared markdown.
+                emit_graph_updated(workspace_id);
+            }
+            return Ok(true);
+        }
         // Honor the persisted failed state: after a restart the in-memory run-state
         // map is empty, so run_phase() returns "idle" for a repo whose
         // analysis_state="failed" was persisted to the DB. Consulting both sources
@@ -1535,23 +1675,33 @@ pub async fn analyze_workspace(db: &Db, workspace_id: i32, force: bool) -> Resul
             continue;
         }
         let _ = profile_repo_agent(db, r).await;
+        did_classify = true;
         emit_graph_updated(workspace_id);
     }
 
+    // Cooperative cancel: skip the cross-repo relation pass entirely if Stop arrived
+    // during stage 1. Checked BEFORE it starts (not during) so its non-atomic
+    // per-repo edge writes either all run or none — never a half-updated graph.
+    if cancelled() {
+        if did_classify {
+            let _ = repo::clear_repo_map_doc(db, workspace_id).await;
+            emit_graph_updated(workspace_id);
+        }
+        return Ok(true);
+    }
     // Stage 2: cross-repo relations — needs at least two repos to relate.
-    analyze_relations(db, workspace_id).await
+    analyze_relations(db, workspace_id).await?;
+    Ok(false)
 }
 
-/// Whether stage-1 should (re)classify a repo this pass. A FAILED repo is retried
-/// only on a `force`d (user-initiated) pass — never on an auto pass, which runs on
-/// every graph read (so a persistently-failing repo can't storm). A non-failed
-/// repo runs iff it `needs` (re)classification (unclassified, or HEAD moved).
+/// Whether stage-1 should (re)classify a repo this pass. A `force`d (user-initiated
+/// "Analyze deps") pass ALWAYS re-reads the repo — that's the only remaining
+/// force-refresh path now that per-repo reprofile is gone, so a user who sees a wrong
+/// summary/role can re-run even when HEAD hasn't moved. An AUTO pass (force=false,
+/// runs on every graph read) re-classifies only a repo that `needs` it (unclassified
+/// or HEAD moved) and never a FAILED one (so a persistently-failing repo can't storm).
 fn should_analyze(failed: bool, force: bool, needs: bool) -> bool {
-    if failed {
-        force
-    } else {
-        needs
-    }
+    force || (!failed && needs)
 }
 
 /// Whether a repo needs the deep classifier on an automatic pass: a repo with no
@@ -1842,28 +1992,6 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     Ok(())
 }
 
-/// Re-profile a single repo on an explicit user action: force the deep classifier
-/// for just this repo, then refresh the workspace's cross-repo relations. The
-/// WHOLE operation holds the per-workspace `pass_gate` lock, so it is serialized
-/// against any background workspace pass — a concurrent pass can't classify the
-/// same repo in parallel and have its older result overwrite this forced one, and
-/// the relation refresh can't run two agents at once. We classify directly (not
-/// via the full coalescer) so a failed/timed-out forced classify isn't immediately
-/// retried by the workspace pass's stage-1 (which would block for two timeouts).
-pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
-    let gate = pass_gate(repo.workspace_id);
-    let _g = gate.lock.lock().await;
-    // NB: do NOT clear the failed state up front. `profile_repo_agent` clears it via
-    // `run_begin` only once a run actually STARTS (after its checkout-exists guard),
-    // so a retry whose checkout is gone keeps a visible failed state instead of
-    // being silently dropped to idle. (run_begin overwrites a `failed` entry with
-    // `running`, and reprofile bypasses the auto-pass `failed`-skip by calling here.)
-    profile_repo_agent(db, repo).await?;
-    emit_graph_updated(repo.workspace_id);
-    let _ = analyze_relations(db, repo.workspace_id).await;
-    Ok(())
-}
-
 /// On startup, repos whose `analysis_state` was persisted as "running" at shutdown
 /// have no live process. Re-kick their per-repo classification so a repo
 /// interrupted mid-analysis resumes instead of spinning forever in a stale state.
@@ -1873,7 +2001,7 @@ pub async fn reprofile_repo(db: &Db, repo: &repo_ref::Model) -> Result<()> {
 async fn resume_workspace(db: Db, repos: Vec<repo_ref::Model>, workspace_id: i32) {
     use futures::future::join_all;
     // Serialize the WHOLE resume (classifiers + relation pass) under the workspace
-    // pass-gate, like reprofile_repo. Otherwise, if a backfill/manual pass already
+    // pass-gate. Otherwise, if a backfill/manual pass already
     // owns these repos' `run_begin`, the classifier futures return immediately
     // (deduped) and join_all reaches `analyze_relations` while that pass's own
     // relation agent is still running — two concurrent relation passes, and the
@@ -1948,7 +2076,9 @@ fn pass_gate(workspace_id: i32) -> PassGate {
 /// The lock holder drains — it reruns while `dirty` was set during its run — so a
 /// batch add (many requests) collapses into ~one pass, while a request that lands
 /// mid-pass is still covered before any waiter is released. Spawn it
-/// fire-and-forget when you don't want to block (e.g. after adding a repo).
+/// fire-and-forget when you don't want to block (e.g. after adding a repo). NOT
+/// cancellable: the curator's user-initiated Stop targets only its own forced pass
+/// (`reanalyze_workspace`), never these background/auto requests.
 pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool) {
     use std::sync::atomic::Ordering;
     let gate = pass_gate(workspace_id);
@@ -1965,7 +2095,7 @@ pub async fn analyze_workspace_coalesced(db: &Db, workspace_id: i32, force: bool
     // auto pass.
     while gate.dirty.swap(false, Ordering::SeqCst) {
         let forced = gate.force.swap(false, Ordering::SeqCst);
-        let _ = analyze_workspace(db, workspace_id, forced).await;
+        let _ = analyze_workspace(db, workspace_id, forced, None).await;
     }
 }
 
@@ -2080,13 +2210,15 @@ mod tests {
     #[test]
     fn should_analyze_gates_failed_on_force() {
         // A failed repo is retried ONLY on a forced (user) pass — never on an auto
-        // pass — regardless of whether it "needs" reclassification. A non-failed repo
-        // runs iff it needs (re)classification; force is irrelevant to it.
+        // pass — regardless of whether it "needs" reclassification. A forced pass also
+        // re-reads an unchanged, already-classified repo (the only force-refresh path
+        // now that per-repo reprofile is gone); an auto pass runs only what `needs` it.
         assert!(!super::should_analyze(true, false, true), "failed + auto → skip even if needs");
         assert!(!super::should_analyze(true, false, false), "failed + auto → skip");
         assert!(super::should_analyze(true, true, false), "failed + forced → retry even if unchanged");
         assert!(super::should_analyze(false, false, true), "not failed + needs → run");
-        assert!(!super::should_analyze(false, true, false), "not failed + unchanged → skip even forced");
+        assert!(!super::should_analyze(false, false, false), "not failed + unchanged + auto → skip");
+        assert!(super::should_analyze(false, true, false), "not failed + unchanged + forced → re-read");
     }
 
     // ─── Finding 1: persisted failed state gates the auto-pass ─────────────
@@ -2208,7 +2340,7 @@ mod tests {
         let r = repo::add_repo_ref(&db, ws.id, "r", "/tmp/r", "main", "", true).await.unwrap();
 
         super::run_finish_err(r.id, "analysis failed".into());
-        super::edit_profile(&db, r.id, Some("notes"), None).await.unwrap();
+        super::edit_profile(&db, r.id, Some("notes"), None, None).await.unwrap();
         assert_eq!(super::run_phase(r.id), "failed", "summary-only edit leaves it failed (no tier)");
 
         // A summary-only edit on a repo that ALREADY has a canonical tier but is
@@ -2218,14 +2350,14 @@ mod tests {
             .await
             .unwrap();
         super::run_finish_err(r.id, "stale refresh failed".into());
-        super::edit_profile(&db, r.id, Some("new notes"), None).await.unwrap();
+        super::edit_profile(&db, r.id, Some("new notes"), None, None).await.unwrap();
         assert_eq!(
             super::run_phase(r.id),
             "failed",
             "summary-only edit inheriting a canonical tier does NOT clear a real failure"
         );
 
-        super::edit_profile(&db, r.id, Some("a web app"), Some("frontend")).await.unwrap();
+        super::edit_profile(&db, r.id, Some("a web app"), Some("frontend"), None).await.unwrap();
         assert_eq!(super::run_phase(r.id), "idle", "a canonical tier clears the failure");
     }
 
@@ -2428,7 +2560,7 @@ mod tests {
             .await
             .unwrap();
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
-        super::edit_profile(&db, r.id, Some("a web client"), Some("frontend")).await.unwrap();
+        super::edit_profile(&db, r.id, Some("a web client"), Some("frontend"), None).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend");
         assert_eq!(p.summary, "a web client");
@@ -2447,7 +2579,7 @@ mod tests {
             .unwrap();
         repo::set_analysis_state(&db, r.id, "failed", Some("boom")).await.unwrap();
 
-        super::edit_profile(&db, r.id, None, Some("backend")).await.unwrap();
+        super::edit_profile(&db, r.id, None, Some("backend"), None).await.unwrap();
 
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "backend");
@@ -2469,7 +2601,7 @@ mod tests {
             .unwrap();
         repo::set_analysis_state(&db, r.id, "failed", Some("boom")).await.unwrap();
 
-        super::edit_profile(&db, r.id, Some("new summary"), None).await.unwrap();
+        super::edit_profile(&db, r.id, Some("new summary"), None, None).await.unwrap();
 
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.analysis_state, "failed", "summary-only edit must not clear failure");
@@ -2489,7 +2621,7 @@ mod tests {
             .unwrap();
         repo::set_repo_map_doc(&db, ws.id, "## old map").await.unwrap();
 
-        super::edit_profile(&db, r.id, None, Some("frontend")).await.unwrap();
+        super::edit_profile(&db, r.id, None, Some("frontend"), None).await.unwrap();
 
         assert!(
             repo::get_repo_map_doc(&db, ws.id).await.unwrap().is_none(),
@@ -2546,6 +2678,81 @@ mod tests {
         super::persist_repo_class(&db, &r, wire, "").await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "a valid user-pinned tier is not overwritten");
+    }
+
+    #[tokio::test]
+    async fn curator_set_classification_survives_reanalysis() {
+        // The curator's set_classification path (edit_profile with tier + category)
+        // pins BOTH the tier and the role/category; a later agent re-analysis must
+        // revert NEITHER. Mirrors the imsdk case: a frontend/local SDK the agent
+        // keeps mislabeling as a backend service.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "imsdk", "/tmp/imsdk", "main", "", true)
+            .await
+            .unwrap();
+        // Agent first classifies it (wrongly) as a backend / biz service.
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "an sdk", "[]", "agent", "")
+            .await
+            .unwrap();
+        let _ = repo::set_repo_category_domains(&db, r.id, "biz", "[]").await;
+
+        // Curator fixes it: frontend / sdk (exactly what set_classification_tool does).
+        super::edit_profile(&db, r.id, None, Some("frontend"), Some("sdk")).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend", "tier set by the curator");
+        assert_eq!(p.category, "sdk", "role/category set by the curator");
+        assert_eq!(p.source, "user_tier", "tier ownership pinned");
+
+        // A later agent re-analysis insists it's backend/biz — both must survive.
+        let wire = super::RepoClassWire {
+            name: None,
+            tier: "backend".into(),
+            summary: "agent re-summary".into(),
+            stack: None,
+            components: None,
+            category: Some("biz".into()),
+            ..Default::default()
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend", "pinned tier survives re-analysis");
+        assert_eq!(p.category, "sdk", "pinned role/category survives re-analysis");
+    }
+
+    #[tokio::test]
+    async fn tier_only_edit_does_not_freeze_a_stale_role() {
+        // A tier-only edit (the detail picker, category = None) must NOT pin the prior
+        // agent category — otherwise re-tiering to frontend would permanently freeze a
+        // stale backend role. It clears the role so a later analysis can re-derive it.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "a svc", "[]", "agent", "")
+            .await
+            .unwrap();
+        let _ = repo::set_repo_category_domains(&db, r.id, "biz", "[]").await;
+
+        super::edit_profile(&db, r.id, None, Some("frontend"), None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.category, "", "tier-only edit clears the stale role");
+
+        // A later analysis refreshes the role (it is not frozen).
+        let wire = super::RepoClassWire {
+            name: None,
+            tier: "frontend".into(),
+            summary: "x".into(),
+            stack: None,
+            components: None,
+            category: Some("app".into()),
+            ..Default::default()
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "app", "role refreshes from the agent, not frozen");
     }
 
     #[tokio::test]
@@ -2810,7 +3017,7 @@ mod tests {
         repo::upsert_repo_profile(&db, r.id, "service", "[]", "old", "[]", "agent", "")
             .await
             .unwrap();
-        super::edit_profile(&db, r.id, Some("new summary"), None).await.unwrap();
+        super::edit_profile(&db, r.id, Some("new summary"), None, None).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "service", "tier untouched by a summary-only edit");
         assert_eq!(p.summary, "new summary");
@@ -2829,7 +3036,7 @@ mod tests {
         repo::upsert_repo_profile(&db, r.id, "backend", "[]", "agent sum", "[]", "agent", "")
             .await
             .unwrap();
-        super::edit_profile(&db, r.id, None, Some("frontend")).await.unwrap();
+        super::edit_profile(&db, r.id, None, Some("frontend"), None).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "tier pinned");
         assert_eq!(p.summary, "agent sum", "summary unchanged by a tier-only edit");
@@ -2883,7 +3090,7 @@ mod tests {
             .await
             .unwrap();
         repo::delete_repo_cascade(&db, r.id).await.unwrap();
-        assert!(super::edit_profile(&db, r.id, Some("s"), Some("frontend")).await.is_err());
+        assert!(super::edit_profile(&db, r.id, Some("s"), Some("frontend"), None).await.is_err());
         assert!(repo::get_repo_profile(&db, r.id).await.unwrap().is_none());
     }
 
@@ -2925,7 +3132,7 @@ mod tests {
             &[("web", "frontend"), ("api", "frontend")],
         )
         .await;
-        super::edit_profile(&db, r.id, None, Some("backend")).await.unwrap();
+        super::edit_profile(&db, r.id, None, Some("backend"), None).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         let comps: Vec<crate::profile::Component> = serde_json::from_str(&p.components).unwrap();
         assert!(comps.iter().all(|c| c.tier == "backend"), "all component tiers cascaded to backend");
@@ -2938,7 +3145,7 @@ mod tests {
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws_summary_only").await.unwrap();
         let r = seed_repo_with_components(&db, ws.id, "frontend", &[("web", "frontend")]).await;
-        super::edit_profile(&db, r.id, Some("just a summary"), None).await.unwrap();
+        super::edit_profile(&db, r.id, Some("just a summary"), None, None).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         let comps: Vec<crate::profile::Component> = serde_json::from_str(&p.components).unwrap();
         assert_eq!(comps[0].tier, "frontend", "summary-only edit leaves component tier unchanged");

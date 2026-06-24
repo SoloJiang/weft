@@ -347,7 +347,7 @@ fn curator_specs() -> Value {
     json!([
         {
             "name": "get_repo_map",
-            "description": "Read the workspace repos and their current dependency edges (ids, roles, summaries, published interfaces). Use the ids when calling calibrate_edges.",
+            "description": "Read the workspace repos and their current dependency edges (ids, tier, category/role, summaries, components, path) plus each repo's analysis_state (\"failed\" repos carry an analysis_error — automatic passes couldn't classify them; tell the human if they ask why a repo is unclassified). Use the ids when calling calibrate_edges or set_classification.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -365,6 +365,15 @@ fn curator_specs() -> Value {
             "name": "reanalyze",
             "description": "Run a fresh dependency-analysis pass over the WHOLE workspace: re-classify each repo (tier/stack/summary) and re-infer cross-repo runtime/infra edges, then regenerate the map. Call this when the human asks to re-analyze / regenerate the repo map (e.g. after repos changed). Takes no arguments; returns when the pass completes, with the resulting repo/edge counts. Human-pinned edges survive the pass.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "set_classification",
+            "description": "Fix ONE repo's architectural classification when get_repo_map shows it wrong (e.g. a frontend/local SDK mislabeled as a backend service). `repo` is the repo id from get_repo_map. `tier` ∈ frontend|backend. `category` is the role within that tier (free text, e.g. gateway|biz|core|common|idl|support for backend; app|sdk|web for frontend). Human/curator-set classification is PINNED and survives automatic re-analysis.",
+            "inputSchema": { "type": "object", "properties": {
+                "repo": { "type": "integer" },
+                "tier": { "type": "string", "enum": ["frontend", "backend"] },
+                "category": { "type": "string" }
+            }, "required": ["repo", "tier"] }
         }
     ])
 }
@@ -376,6 +385,7 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Err(e) => text_result(format!("error: {e}")),
         },
         "calibrate_edges" => calibrate_edges_tool(db, thread, args).await,
+        "set_classification" => set_classification_tool(db, thread, args).await,
         "reanalyze" => match reanalyze_tool(db, thread).await {
             Ok(v) => text_result(v),
             Err(e) => text_result(format!("error: {e}")),
@@ -387,11 +397,9 @@ async fn call_curator(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
 /// Run a full workspace analysis pass for the curator's workspace and return a
 /// summary. Awaited inline (NOT detached) so the agent's turn stays busy for the
 /// pass's whole duration — subsequent user messages queue, and the UI's `analyzing`
-/// flag (derived from the lead turn) accurately tracks it. A detached spawn would
-/// outlive an interrupted/timed-out turn while still holding the coalescing gate,
-/// re-enabling the Analyze buttons mid-pass and inviting a duplicate forced run;
-/// awaiting inline means an interrupted turn drops the pass with it (the gate's lock
-/// is an RAII guard, so it releases cleanly and the next trigger re-runs).
+/// flag (derived from the lead turn) accurately tracks it. Clicking 中止 flips a
+/// cancel flag the pass checks at safe points (between repos, before the relation
+/// pass) and returns cleanly — see the cooperative-cancellation note in curator.rs.
 async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
     let t = crate::store::repo::get_thread(db, thread)
         .await?
@@ -400,6 +408,23 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
         anyhow::bail!("reanalyze is only available in the curator chat");
     }
     let ws_id = t.workspace_id;
+    // Register the cancel token BEFORE the (multi-repo, disk-stat) checkout preflight,
+    // so a Stop during it trips THIS call's token instead of being dropped. Everything
+    // after registration runs through the helper so the token is always unregistered.
+    let cancel = crate::curator::register_analysis_cancel(thread);
+    let out = reanalyze_after_register(db, ws_id, &cancel).await;
+    crate::curator::unregister_analysis_cancel(thread, &cancel);
+    out
+}
+
+/// The post-registration body of `reanalyze_tool` (checkout preflight + the cancellable
+/// forced pass + the summary), split out so `reanalyze_tool` always unregisters the
+/// cancel token afterwards.
+async fn reanalyze_after_register(
+    db: &Db,
+    ws_id: i32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<String> {
     // Every tracked repo's checkout gone → the pass filters them all out and would
     // analyze nothing, leaving the stale graph to read as a clean "complete". Tell
     // the human instead (matches the behavior of the removed analyze command).
@@ -413,13 +438,50 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
                    (moved or deleted). Restore the repos and try again."
             .to_string());
     }
-    crate::curator::analyze_workspace_coalesced(db, ws_id, true).await;
+    // Clicking 中止 interrupts the lead turn and calls `cancel_analysis(thread)`, which
+    // trips the token; `reanalyze_workspace` checks it at safe points (between repos,
+    // before the relation pass) and returns whether it ACTUALLY bailed — so a Stop that
+    // lands after the pass already finished its relation write reports "complete", not
+    // "cancelled". The pass runs directly under the gate lock (not via the coalescing
+    // flags), so the cancel can't drop unrelated requests. Worker-chat "stop = stop".
+    if crate::curator::reanalyze_workspace(db, ws_id, cancel).await {
+        return Ok("Re-analysis cancelled.".to_string());
+    }
     let g = crate::curator::graph(db, ws_id).await?;
-    Ok(format!(
+    // Surface repos the pass left unclassified so the human sees them in the chat (the
+    // map node renders them as plain "未分析"). Two sources, both swallowed by the pass:
+    //   - analysis_state = "failed": a per-repo classifier error (missing agent,
+    //     timeout, unparsable reply);
+    //   - a MISSING checkout: `analyze_workspace` filters these out up front (so they
+    //     are never marked failed), and the all-missing guard above only fires when
+    //     EVERY checkout is gone — a partially-missing workspace would otherwise report
+    //     a clean "complete".
+    let mut unanalyzed: Vec<String> = crate::store::repo::repos_with_analysis_state(db, "failed")
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.workspace_id == ws_id)
+        .map(|r| r.name)
+        .collect();
+    for r in &repos {
+        if !std::path::Path::new(&r.local_git_path).exists() && !unanalyzed.contains(&r.name) {
+            unanalyzed.push(r.name.clone());
+        }
+    }
+    let mut msg = format!(
         "Re-analysis complete: {} repos, {} dependency links. The repo map has been refreshed.",
         g.nodes.len(),
         g.edges.len()
-    ))
+    );
+    if !unanalyzed.is_empty() {
+        msg.push_str(&format!(
+            " Note: {} repo(s) could not be analyzed and stayed unclassified (classifier \
+             error or missing checkout): {}. Tell the human, who can re-run the analysis.",
+            unanalyzed.len(),
+            unanalyzed.join(", ")
+        ));
+    }
+    Ok(msg)
 }
 
 /// Like `repo_map_json`, but every node carries its full `local_git_path` — the
@@ -444,10 +506,18 @@ async fn curator_map_json(db: &Db, thread: i32) -> anyhow::Result<String> {
                 "repo_id": n.repo_id,
                 "repo_name": n.repo_name,
                 "tier": n.tier,
+                "category": n.category,
                 "stack": n.stack,
                 "summary": n.summary,
                 "components": n.components,
                 "path": path_of.get(&n.repo_id).cloned().unwrap_or_default(),
+                // Per-repo analysis status, so the agent can tell the human which repos
+                // an automatic (add/backfill/resume) pass failed to analyze — those
+                // never flow through reanalyze's chat summary and the map node just
+                // shows them as unclassified. "failed" carries an error; "" / "idle"
+                // is normal.
+                "analysis_state": n.analysis_state,
+                "analysis_error": n.analysis_error,
             })
         })
         .collect();
@@ -511,6 +581,63 @@ async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
             }
             text_result(format!(
                 "{action} {kind} edge {from}->{to} (pinned to your calibration)"
+            ))
+        }
+        Err(e) => text_result(format!("error: {e}")),
+    }
+}
+
+/// Pin ONE repo's tier/role classification (e.g. mark a frontend/local SDK that was
+/// mislabeled as a backend service). Validates the repo belongs to THIS curator's
+/// workspace and the tier is canonical, then writes via `curator::edit_profile`
+/// (which pins ownership so the classification survives re-analysis) and emits
+/// `repo-graph-updated`.
+async fn set_classification_tool(db: &Db, thread: i32, args: &Value) -> Value {
+    // i32::try_from (not lossy `as i32`): a huge id must NOT wrap to a valid repo id
+    // and slip past the workspace membership check.
+    let repo = args.get("repo").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+    let Some(repo) = repo else {
+        return text_result("repo must be a valid repo id from get_repo_map".into());
+    };
+    // Tier is REQUIRED and must canonicalize to frontend|backend: a misspelling would
+    // otherwise clear the tier (or store a legacy value) and the node would read as
+    // unclassified.
+    let tier = args.get("tier").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(tier) = crate::profile::normalize_tier(tier) else {
+        return text_result("tier is required and must be \"frontend\" or \"backend\"".into());
+    };
+    // Category (role within the tier) is optional free text; blank → leave it to a
+    // later pass (don't pin an empty role).
+    let category = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let Ok(Some(t)) = crate::store::repo::get_thread(db, thread).await else {
+        return text_result("curator thread not found".into());
+    };
+    // Only the hidden curator thread may classify — reject a direct call with a normal
+    // feature thread id (it would bypass the chat boundary).
+    if t.kind != "curator" {
+        return text_result("set_classification is only available in the curator chat".into());
+    }
+    let in_ws = crate::store::repo::list_repos(db, t.workspace_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .any(|r| r.id == repo);
+    if !in_ws {
+        return text_result("repo must be a repo id in this workspace (use get_repo_map)".into());
+    }
+    match crate::curator::edit_profile(db, repo, None, Some(tier.as_str()), category).await {
+        Ok(_) => {
+            if let Some(app) = crate::APP_HANDLE.get() {
+                use tauri::Emitter;
+                let _ = app.emit("repo-graph-updated", t.workspace_id);
+            }
+            let role = category.map(|c| format!("/{c}")).unwrap_or_default();
+            text_result(format!(
+                "repo {repo} classified as {tier}{role} (pinned — survives re-analysis)"
             ))
         }
         Err(e) => text_result(format!("error: {e}")),

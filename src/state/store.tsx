@@ -176,7 +176,6 @@ interface Store {
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
   refreshReposAndMap: (workspaceId?: number) => Promise<void>;
-  reprofileRepo: (repoId: number) => Promise<void>;
   /** Trigger a re-analysis: posts a message to the 仓库分析助手, which runs the one
    *  `reanalyze` tool. Used by the graph button and the map's regenerate. */
   reanalyzeDeps: () => Promise<void>;
@@ -1685,14 +1684,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void refreshRepoMap();
   }, [refreshRepoMap]);
 
-  const reprofileRepo = useCallback(
-    async (repoId: number) => {
-      await api.reprofileRepo(repoId);
-      await refreshRepoMap();
-    },
-    [refreshRepoMap],
-  );
-
   const editRepoSummary = useCallback(
     async (repoId: number, summary: string) => {
       await api.updateRepoProfile(repoId, summary, null);
@@ -2266,7 +2257,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     openRepoMap,
     refreshRepoMap,
     refreshReposAndMap,
-    reprofileRepo,
     reanalyzeDeps,
     analyzing,
     deleteRepo,

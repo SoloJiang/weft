@@ -6,7 +6,6 @@ import {
   CircleDashed,
   GitBranch,
   Layers,
-  Loader2,
   Maximize2,
   Minus,
   Pencil,
@@ -14,11 +13,9 @@ import {
   RefreshCw,
   Server,
   Trash2,
-  TriangleAlert,
   type LucideProps,
 } from "lucide-react";
 import type { ComponentType } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { useStore } from "../state/store";
 import type { RepoComponent, RepoEdge, RepoProfile } from "../lib/types";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
@@ -43,34 +40,21 @@ const bandOf = (tier: string): Band =>
   (TIER_ORDER as readonly string[]).includes(tier) ? (tier as Band) : "other";
 
 // ─────────────────── repo analysis display status ───────────────────
-// A repo's analysis lifecycle as ONE discriminant the canvas cards and the
-// detail pane both render from — a single source of truth instead of each spot
-// re-deriving the `analyzed` / `analysis_state` booleans. `phase` is the live
-// stream (detail pane only); cards omit it and never see "running". Distinct
-// from the raw `profile.analysis_state` ("idle"/"running"/"failed"): this folds
-// in `analyzed` to split a classified repo ("analyzed") from an unfinished
-// placeholder ("pending"). See CLAUDE.md "discriminated state, exhaustive map".
+// All analysis runs through the workspace curator (仓库分析助手) now — the map is a
+// PROFILE surface, not a per-repo analysis lifecycle. A node is either classified
+// ("analyzed") or not yet ("pending", a passive "未分析" hint). No per-node
+// running/failed status or retry: progress and failures live in the curator chat.
 
-type AnalysisView = "running" | "failed" | "analyzed" | "pending";
+type AnalysisView = "analyzed" | "pending";
 
-function analysisView(p: RepoProfile, phase?: string): AnalysisView {
-  // The detail pane's LIVE stream `phase` wins over the persisted `analysis_state`,
-  // which lags (a start refresh sets "running"; the "failed"/done refresh arrives
-  // later). Cards pass no `phase` and fall through to `analysis_state`.
-  if (phase === "running") return "running";
-  if (phase === "failed") return "failed";
-  if (p.analysis_state === "running") return "running";
-  if (p.analysis_state === "failed") return "failed";
-  if (p.analyzed) return "analyzed";
-  return "pending";
+function analysisView(p: RepoProfile): AnalysisView {
+  return p.analyzed ? "analyzed" : "pending";
 }
 
 /** Status-driven border accent for a card. Selection/importance are separate
  *  axes layered on top via `cn` (see `cardFrame`). Keyed by the discriminant, so
  *  a new view forces a new entry — exhaustive by construction. */
 const CARD_STATUS_FRAME: Record<AnalysisView, string> = {
-  failed: "border-danger/40",
-  running: "border-dashed opacity-80",
   pending: "border-dashed opacity-80",
   analyzed: "",
 };
@@ -82,10 +66,9 @@ function cardFrame(selected: boolean, core: boolean): string {
   return "border-border hover:border-border-strong";
 }
 
-/** Border for an expanded (monorepo) card: selection wins, then a failed run. */
-function expandedFrame(selected: boolean, view: AnalysisView): string {
+/** Border for an expanded (monorepo) card: selection wins. */
+function expandedFrame(selected: boolean): string {
   if (selected) return "border-brand/60 bg-brand-ghost/40";
-  if (view === "failed") return "border-danger/40";
   return "border-border hover:border-border-strong";
 }
 
@@ -137,7 +120,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * relations. Drag to pan, scroll/buttons to zoom.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reprofileRepo, reanalyzeDeps, analyzing, selectedRepoId, openRepoDetail } = useStore();
+  const { repoProfiles, repoEdges, reanalyzeDeps, analyzing, selectedRepoId, openRepoDetail } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<ViewMode>("overview");
 
@@ -338,7 +321,6 @@ export function RepoGraph() {
                 pt={pt}
                 selected={selected}
                 onSelect={onSelect}
-                onReprofile={() => void reprofileRepo(p.repo_id)}
               />
             ) : (
               <RepoNode
@@ -349,7 +331,6 @@ export function RepoGraph() {
                 dependents={dependents}
                 showPkgs={mode === "expanded"}
                 onSelect={onSelect}
-                onReprofile={() => void reprofileRepo(p.repo_id)}
               />
             );
           })}
@@ -412,24 +393,20 @@ export function RepoGraph() {
 }
 
 /** A standard repo node (overview, or expanded mode for a single-component repo). */
-/** The status glyph shared by both card variants (mirrors StatusChip's `Glyph`). */
+/** The leading glyph: the repo's tier icon (CircleDashed for an unclassified repo,
+ *  since its tier band is "other"). */
 function NodeStatusGlyph({
-  view,
   selected,
   Icon,
 }: {
-  view: AnalysisView;
   selected: boolean;
   Icon: ComponentType<LucideProps>;
 }) {
-  if (view === "failed") return <TriangleAlert size={12} className="text-danger" />;
-  if (view === "analyzed")
-    return <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />;
-  return <Loader2 size={12} className="animate-spin text-ink-faint" />; // running | pending
+  return <Icon size={12} className={selected ? "text-brand" : "text-ink-muted"} />;
 }
 
-/** A collapsed card's status-driven body: failure reason, classified badges, or
- *  the analyzing placeholder. */
+/** A collapsed card's body: classified badges + summary, or a passive "未分析" hint
+ *  for a not-yet-analyzed repo (analysis happens in the curator chat). */
 function NodeStatusBody({
   view,
   p,
@@ -442,8 +419,6 @@ function NodeStatusBody({
   dependents: number;
 }) {
   const { t } = useTranslation();
-  if (view === "failed")
-    return <span className="text-[11.5px] italic text-danger">{t("repomap.analysisFailed")}</span>;
   if (view === "analyzed")
     return (
       <>
@@ -451,7 +426,7 @@ function NodeStatusBody({
         <NodeSummary profile={p} />
       </>
     );
-  return <span className="text-[11.5px] italic text-ink-faint">{t("repomap.analyzing")}</span>; // running | pending
+  return <span className="text-[11.5px] italic text-ink-faint">{t("repomap.notAnalyzed")}</span>;
 }
 
 function RepoNode({
@@ -461,7 +436,6 @@ function RepoNode({
   dependents,
   showPkgs,
   onSelect,
-  onReprofile,
 }: {
   profile: RepoProfile;
   pt: { x: number; y: number; w: number; h: number };
@@ -469,14 +443,10 @@ function RepoNode({
   dependents: number;
   showPkgs: boolean;
   onSelect: () => void;
-  onReprofile: () => void;
 }) {
   const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
   const core = dependents >= 2;
-  // Cards pass no live `phase`, but a card CAN still be "running": the backend sets
-  // `analysis_state: "running"` (and pushes a graph refresh) on start, so a repo
-  // being (re)analyzed shows the spinner on its card too, not just in the open pane.
   const view = analysisView(p);
 
   return (
@@ -492,7 +462,7 @@ function RepoNode({
     >
       <div className="flex items-center gap-1.5">
         <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
-          <NodeStatusGlyph view={view} selected={selected} Icon={Icon} />
+          <NodeStatusGlyph selected={selected} Icon={Icon} />
         </span>
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
@@ -507,17 +477,6 @@ function RepoNode({
             {t("repomap.pkgCount", { count: p.components.length })}
           </span>
         )}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onReprofile();
-          }}
-          aria-label={t("repomap.reprofile")}
-          title={t("repomap.reprofile")}
-          className="grid h-5 w-5 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity hover:bg-brand-ghost hover:text-ink group-hover:opacity-100"
-        >
-          <RefreshCw size={11} />
-        </button>
       </div>
 
       <NodeStatusBody view={view} p={p} core={core} dependents={dependents} />
@@ -531,32 +490,27 @@ function ExpandedNode({
   pt,
   selected,
   onSelect,
-  onReprofile,
 }: {
   profile: RepoProfile;
   pt: { x: number; y: number; w: number; h: number };
   selected: boolean;
   onSelect: () => void;
-  onReprofile: () => void;
 }) {
   const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
-  // A failed reprofile keeps the prior monorepo components (still useful), but the
-  // header must flag the retryable failure — same discriminant as the collapsed card.
-  const view = analysisView(p);
   return (
     <div
       data-repo-node
       onClick={onSelect}
       className={cn(
         "group absolute flex flex-col overflow-hidden rounded-[var(--radius-md)] border bg-surface text-left",
-        expandedFrame(selected, view),
+        expandedFrame(selected),
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
     >
       <div className="flex items-center gap-1.5 border-b border-border px-3 py-2">
         <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-raised">
-          <NodeStatusGlyph view={view} selected={selected} Icon={Icon} />
+          <NodeStatusGlyph selected={selected} Icon={Icon} />
         </span>
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
@@ -569,17 +523,6 @@ function ExpandedNode({
         <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
           {t("repomap.pkgCount", { count: p.components.length })}
         </span>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onReprofile();
-          }}
-          aria-label={t("repomap.reprofile")}
-          title={t("repomap.reprofile")}
-          className="grid h-5 w-5 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity hover:bg-brand-ghost hover:text-ink group-hover:opacity-100"
-        >
-          <RefreshCw size={11} />
-        </button>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden px-2 py-1.5">
         {groupComponents(p.components).map(([band, comps]) => {
@@ -637,149 +580,13 @@ function ModeBtn({
   );
 }
 
-/** Subscribe to a repo's live analysis stream (started/delta/done/failed). The
- *  LISTENER — not the profile — is the live source of truth for `phase`/`transcript`
- *  here; `analysisView(profile, phase)` falls back to the profile's persisted
- *  `analysis_state` when there's no live phase yet, and the caller falls back to
- *  `analysis_error` for the failure detail. Subscribe ONCE per repo: the backend
- *  fires `repo-graph-updated` on `started` and after every repo in a workspace pass,
- *  so keying this effect on the profile's state would tear the listener down
- *  mid-run, wiping the transcript and dropping deltas in the async re-subscribe gap. */
-function useAnalysisStream(profile?: RepoProfile) {
-  const repoId = profile?.repo_id;
-  const [phase, setPhase] = useState<string>("idle");
-  const [transcript, setTranscript] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    // Reset the live state only when the SELECTED repo changes — NOT on a profile
-    // refresh. (The persisted `analysis_state`/`analysis_error` drive the fallback.)
-    setPhase("idle");
-    setTranscript("");
-    setError(null);
-    if (repoId == null) return;
-    const un = listen<{ repoId: number; phase: string; text?: string; error?: string }>(
-      "repo-analysis",
-      (e) => {
-        if (e.payload.repoId !== repoId) return;
-        const p = e.payload;
-        if (p.phase === "started") {
-          setPhase("running");
-          setTranscript("");
-          setError(null);
-        } else if (p.phase === "delta") {
-          setPhase("running");
-          if (p.text) setTranscript((prev) => prev + p.text);
-        } else if (p.phase === "done") {
-          setPhase("idle"); // the graph refresh brings the classified fields
-        } else if (p.phase === "failed") {
-          setPhase("failed");
-          setError(p.error ?? null);
-        }
-      },
-    );
-    return () => {
-      void un.then((f) => f());
-    };
-  }, [repoId]);
-
-  // A manual recovery (edit_profile lands a canonical tier → backend clears the
-  // failed run-state) fires NO analysis event, so the sticky live `phase` could
-  // keep showing the failure while the refreshed profile already reads recovered.
-  // Drop a stale live `failed` once the persisted state settles to "idle". Gated on
-  // exactly "idle" — never mid-run, where analysis_state is "running"/"failed" — so
-  // this can't race a genuine in-flight failure. Touches only `phase` (not the
-  // transcript or the listener), so it doesn't reintroduce the wipe.
-  useEffect(() => {
-    if (phase === "failed" && profile?.analysis_state === "idle") {
-      setPhase("idle");
-    }
-  }, [phase, profile?.analysis_state]);
-
-  return { phase, transcript, error };
-}
-
-/** Running state: the agent's process streamed live into the panel. */
-function AnalyzingTranscript({ text }: { text: string }) {
-  const { t } = useTranslation();
-  const scrollRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [text]);
-  return (
-    <div className="flex h-full flex-col gap-2 px-4 py-4">
-      <div className="flex items-center gap-2 text-[12px] font-medium text-brand">
-        <Loader2 size={13} className="animate-spin" />
-        {t("repomap.analyzing")}
-      </div>
-      <div
-        ref={scrollRef}
-        className="min-h-0 flex-1 overflow-auto rounded-[var(--radius-md)] border border-border bg-bg p-3"
-      >
-        {text ? (
-          <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink-muted">
-            {text}
-          </pre>
-        ) : (
-          <p className="text-[11.5px] text-ink-faint">{t("repomap.analyzingHint")}</p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** Failed state: the error + a manual retry (never a silent eternal spinner). */
-/** A compact failure banner above the (still-editable) fields, so a repo whose
- *  analysis fails can still be manually tiered/summarized — not a full takeover. */
-function FailedNotice({ error, onRetry }: { error: string | null; onRetry: () => void }) {
-  const { t } = useTranslation();
-  // Our own known failure cases are stored as stable CODES that the UI localizes;
-  // agent/transport errors are inherently dynamic English diagnostics, shown raw.
-  const errorCodes: Record<string, string> = {
-    "checkout-missing": t("repomap.analysisErrorCheckoutMissing"),
-  };
-  // Some codes carry a parameter (`agent-not-found:<tool>`); localize those by
-  // prefix, then fall back to the exact-match table, then to the raw diagnostic.
-  const localize = (code: string): string => {
-    const agent = code.match(/^agent-not-found:(.+)$/);
-    if (agent) return t("repomap.analysisErrorAgentNotFound", { tool: agent[1] });
-    return errorCodes[code] ?? code;
-  };
-  const message = error ? localize(error) : null;
-  return (
-    <div className="mb-4 rounded-[var(--radius-md)] border border-danger/30 bg-danger/5 px-3 py-2.5">
-      <div className="flex items-center gap-1.5 text-[12px] font-medium text-danger">
-        <TriangleAlert size={13} />
-        {t("repomap.analysisFailed")}
-      </div>
-      {message && (
-        <pre className="mt-1.5 max-h-24 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-ink-faint">
-          {message}
-        </pre>
-      )}
-      <button
-        onClick={onRetry}
-        className="mt-2 inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-2.5 py-1 text-[12px] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
-      >
-        <RefreshCw size={12} /> {t("repomap.retryAnalysis")}
-      </button>
-    </div>
-  );
-}
-
-/** A compact "not analyzed yet" banner above the fields (offers a manual run);
- *  the fields stay editable so a placeholder can be hand-classified. */
-function PendingNotice({ onAnalyze }: { onAnalyze: () => void }) {
+/** A passive "not analyzed yet" banner above the (still-editable) fields. Analysis
+ *  runs through the curator chat now, so there's no per-repo run button here. */
+function PendingNotice() {
   const { t } = useTranslation();
   return (
-    <div className="mb-4 flex items-center justify-between gap-2 rounded-[var(--radius-md)] border border-dashed border-border bg-bg px-3 py-2 text-[12px] text-ink-faint">
-      <span>{t("repomap.notAnalyzed")}</span>
-      <button
-        onClick={onAnalyze}
-        className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border px-2.5 py-1 text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
-      >
-        <RefreshCw size={12} /> {t("repomap.analyze")}
-      </button>
+    <div className="mb-4 rounded-[var(--radius-md)] border border-dashed border-border bg-bg px-3 py-2 text-[12px] text-ink-faint">
+      {t("repomap.notAnalyzed")}
     </div>
   );
 }
@@ -853,12 +660,10 @@ function AnalyzedProfileFields({
  *  button (the drawer owns close). */
 export function RepoDetailContent({ repoId }: { repoId: number | null }) {
   const { t } = useTranslation();
-  const { repoProfiles, repoEdges, reprofileRepo, deleteRepo, openRepoDetail } = useStore();
+  const { repoProfiles, repoEdges, deleteRepo, openRepoDetail } = useStore();
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const profile = repoId != null ? repoProfiles.find((p) => p.repo_id === repoId) : undefined;
-  // Always call the hook (rules of hooks) — it no-ops when there's no profile.
-  const stream = useAnalysisStream(profile);
   if (!profile) return <EmptyProfileBody />;
 
   const deps = repoEdges
@@ -870,25 +675,18 @@ export function RepoDetailContent({ repoId }: { repoId: number | null }) {
     .map((e) => ({ edge: e, repo: repoProfiles.find((p) => p.repo_id === e.from) }))
     .filter((x): x is { edge: RepoEdge; repo: RepoProfile } => !!x.repo);
   const Icon = TIER_ICON[bandOf(profile.tier)] ?? CircleDashed;
-  const retry = () => void reprofileRepo(profile.repo_id);
-  const view = analysisView(profile, stream.phase);
-
-  const notices: Partial<Record<AnalysisView, React.ReactNode>> = {
-    failed: <FailedNotice error={stream.error ?? profile.analysis_error ?? null} onRetry={retry} />,
-    pending: <PendingNotice onAnalyze={retry} />,
-  };
-  const paneBody =
-    view === "running" ? (
-      <AnalyzingTranscript text={stream.transcript} />
-    ) : (
-      <AnalyzedProfileFields
-        profile={profile}
-        deps={deps}
-        usedBy={usedBy}
-        onSelect={openRepoDetail}
-        notice={notices[view]}
-      />
-    );
+  // Profile-only surface: classified repo shows its fields; an unanalyzed one shows
+  // a passive "未分析" hint above the (still-editable) fields. Analysis itself runs
+  // through the curator chat — no per-repo run/retry here.
+  const paneBody = (
+    <AnalyzedProfileFields
+      profile={profile}
+      deps={deps}
+      usedBy={usedBy}
+      onSelect={openRepoDetail}
+      notice={profile.analyzed ? undefined : <PendingNotice />}
+    />
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -908,13 +706,6 @@ export function RepoDetailContent({ repoId }: { repoId: number | null }) {
               )}
             </div>
           </div>
-          <button
-            onClick={() => void reprofileRepo(profile.repo_id)}
-            title={t("repomap.reprofile")}
-            className="grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-brand-ghost hover:text-ink"
-          >
-            <RefreshCw size={14} />
-          </button>
           <button
             onClick={() => setConfirmDelete(true)}
             title={t("repomap.deleteRepo")}
