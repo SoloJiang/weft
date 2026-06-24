@@ -1714,15 +1714,18 @@ async fn codex_consumer(
                     },
                 );
             }
-            ThreadMsg::Event(ChatEvent::Assistant { texts: _, tools }) => {
+            ThreadMsg::Event(ChatEvent::Assistant { texts, tools }) => {
                 // Codex streams text via deltas; non-text items are tool calls →
                 // inline `kind:"tool"` rows, filled by their item.completed result.
                 let mut inner = eng.lock().await;
                 inner.clock.last_activity = std::time::Instant::now();
-                // Close any open text row BEFORE the tool row so later deltas open a
-                // fresh row BELOW it — keeps "I'll inspect…" → command → explanation
-                // flows in order instead of stacking post-tool prose above the tool.
-                if !tools.is_empty() {
+                // Finalize the open text row when the agent message *completes*
+                // (texts non-empty) so its streaming caret clears at text-end — and
+                // before any tool row, so later deltas open a fresh row BELOW it,
+                // keeping "I'll inspect…" → command → explanation flows in order
+                // instead of stacking post-tool prose above the tool. The accumulated
+                // deltas are the body; `texts` is only the finalize trigger.
+                if !texts.is_empty() || !tools.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
                 persist_tool_calls(&app, &db, &mut inner, tools).await;

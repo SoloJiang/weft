@@ -253,8 +253,8 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             }),
             _ => None,
         },
-        // agentMessage text already streamed via deltas → no-op; tool items deliver
-        // their result here, merged into the running row by item id.
+        // Tool items deliver their result here (merged into the running row by id);
+        // agentMessage's completion finalizes the streamed text row.
         "item/completed" => match item["type"].as_str() {
             Some(
                 "commandExecution" | "fileChange" | "mcpToolCall" | "collabAgentToolCall"
@@ -262,8 +262,20 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             ) => Some(ChatEvent::ToolResults {
                 items: vec![appserver_tool_result(item)],
             }),
-            // already streamed (agentMessage) or carries no display payload.
-            Some("agentMessage" | "userMessage" | "reasoning") | None => None,
+            // agentMessage already streamed via deltas; its *completion* is the
+            // finalize signal — surface it as an Assistant text event (no tools) so
+            // the engine closes the open row and its streaming caret clears at
+            // text-end, not at the next tool's item/started or turn/completed. The
+            // carried text is only the trigger; the body is the accumulated deltas.
+            Some("agentMessage") => Some(ChatEvent::Assistant {
+                texts: item["text"]
+                    .as_str()
+                    .map(|t| vec![t.to_string()])
+                    .unwrap_or_default(),
+                tools: vec![],
+            }),
+            // userMessage / reasoning carry no display payload of their own.
+            Some("userMessage" | "reasoning") | None => None,
             // Other content items (/plan, /review …) don't stream via agentMessage
             // deltas, so surface any text they carry instead of dropping it.
             Some(_) => crate::lead_chat::proto::codex_content_item_text(item)
@@ -1016,7 +1028,9 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
-        // error item → text; agentMessage/userMessage/reasoning + lifecycle ignored.
+        // error item → text; userMessage/reasoning + lifecycle ignored on completion
+        // (agentMessage completion finalizes — see
+        // agent_message_completion_finalizes_streamed_text).
         match notification_to_event(
             "item/started",
             &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
@@ -1026,7 +1040,7 @@ mod tests {
         }
         assert!(notification_to_event(
             "item/completed",
-            &json!({"item":{"id":"i","type":"agentMessage","text":"done"}}),
+            &json!({"item":{"id":"i","type":"userMessage","text":"hi"}}),
         )
         .is_none());
         assert!(
@@ -1048,6 +1062,31 @@ mod tests {
             notification_to_event("item/started", &json!({"item":{"type":"reasoning"}})).is_none()
         );
         assert!(notification_to_event("turn/started", &json!({"threadId":"t"})).is_none());
+    }
+
+    #[test]
+    fn agent_message_completion_finalizes_streamed_text() {
+        // Regression (lingering streaming caret): the app-server transport must
+        // surface agentMessage's *completion* as an Assistant event (texts
+        // non-empty, no tools) so the engine finalizes the open streaming row at
+        // text-end. Dropping it (→ None) left the caret lit until the next tool's
+        // item/started or turn/completed. The carried text is only the finalize
+        // trigger; the persisted body comes from the accumulated deltas.
+        match notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"i","type":"agentMessage","text":"done"}}),
+        ) {
+            Some(ChatEvent::Assistant { texts, tools }) => {
+                assert_eq!(texts, vec!["done".to_string()]);
+                assert!(tools.is_empty());
+            }
+            e => panic!("{e:?}"),
+        }
+        // item/started for agentMessage still opens no row — text arrives via deltas.
+        assert!(
+            notification_to_event("item/started", &json!({"item":{"type":"agentMessage"}}))
+                .is_none()
+        );
     }
 
     #[test]
