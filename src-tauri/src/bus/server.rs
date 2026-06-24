@@ -435,14 +435,36 @@ async fn reanalyze_tool(db: &Db, thread: i32) -> anyhow::Result<String> {
     };
     crate::curator::unregister_analysis_cancel(thread);
     if cancelled {
+        // The dropped pass can leave the gate's force/dirty flags set and a repo
+        // stuck `running`; reset them so Stop truly stops and the next Analyze re-runs.
+        crate::curator::cancel_workspace_analysis(db, ws_id).await;
         return Ok("Re-analysis cancelled.".to_string());
     }
     let g = crate::curator::graph(db, ws_id).await?;
-    Ok(format!(
+    // The pass swallows per-repo failures (missing agent, timeout, unparsable reply) —
+    // surface them in the curator turn so the human sees them in the chat (the map node
+    // renders a failed repo as plain "未分析"). The agent narrates them.
+    let failed: Vec<String> = crate::store::repo::repos_with_analysis_state(db, "failed")
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.workspace_id == ws_id)
+        .map(|r| r.name)
+        .collect();
+    let mut msg = format!(
         "Re-analysis complete: {} repos, {} dependency links. The repo map has been refreshed.",
         g.nodes.len(),
         g.edges.len()
-    ))
+    );
+    if !failed.is_empty() {
+        msg.push_str(&format!(
+            " Note: {} repo(s) could not be analyzed and stayed unclassified: {}. \
+             Tell the human, who can re-run the analysis.",
+            failed.len(),
+            failed.join(", ")
+        ));
+    }
+    Ok(msg)
 }
 
 /// Like `repo_map_json`, but every node carries its full `local_git_path` — the
@@ -467,6 +489,7 @@ async fn curator_map_json(db: &Db, thread: i32) -> anyhow::Result<String> {
                 "repo_id": n.repo_id,
                 "repo_name": n.repo_name,
                 "tier": n.tier,
+                "category": n.category,
                 "stack": n.stack,
                 "summary": n.summary,
                 "components": n.components,

@@ -153,12 +153,23 @@ pub async fn edit_profile(
     let saved =
         repo::upsert_repo_profile(db, repo_id, &new_tier, &stack, &new_summary, &components, source, &commit)
             .await?;
-    // A provided role/category is written here (upsert above guarantees a profile
-    // row exists). Preserve the existing domains — only the role changes. Because it
-    // rides on tier ownership, persist_repo_class keeps it across re-analysis.
-    if let Some(cat) = category {
-        let domains = existing.as_ref().map(|p| p.domains.clone()).unwrap_or_else(|| "[]".into());
-        let _ = repo::set_repo_category_domains(db, repo_id, cat, &domains).await;
+    // Role/category (upsert above guarantees a profile row). Preserve domains — only
+    // the role changes.
+    let domains = existing.as_ref().map(|p| p.domains.clone()).unwrap_or_else(|| "[]".into());
+    match category {
+        // Curator/human set the role explicitly — persist it. While the tier stays
+        // user-owned it survives re-analysis (see persist_repo_class).
+        Some(cat) => {
+            let _ = repo::set_repo_category_domains(db, repo_id, cat, &domains).await;
+        }
+        // A tier-ONLY edit (the detail picker) doesn't touch the role. Clear the prior
+        // category rather than let persist_repo_class freeze a now-stale agent role
+        // under the new tier — the next analysis re-derives it (persist_repo_class
+        // falls through to the agent's category when the prior one is empty).
+        None if tier.is_some() => {
+            let _ = repo::set_repo_category_domains(db, repo_id, "", &domains).await;
+        }
+        None => {}
     }
     // A manual edit where the user PROVIDES a canonical tier RECOVERS a repo whose
     // analysis failed: clear any lingering `failed` run-state so it stops reading as
@@ -1247,6 +1258,31 @@ pub fn cancel_analysis(thread_id: i32) {
         .get(&thread_id)
     {
         n.notify_one();
+    }
+}
+
+/// Clean up the state a curator analysis leaves behind when it's cancelled mid-pass
+/// (the `select!` in `reanalyze_tool` drops the pass future before `profile_repo_agent`
+/// reaches its run-state cleanup). Two leaks to undo:
+///   1. The coalescing gate's `dirty`/`force` flags this forced request set — if a
+///      background pass holds the lock, draining them would resurrect the cancelled
+///      forced run. Clear them so Stop actually stops queued work.
+///   2. Any repo left `running` (the one being classified when dropped) — reset it
+///      in-memory AND persisted to `idle`, else `run_begin` returns false on the next
+///      Analyze and the repo stays stuck until restart.
+pub async fn cancel_workspace_analysis(db: &Db, workspace_id: i32) {
+    use std::sync::atomic::Ordering;
+    let gate = pass_gate(workspace_id);
+    gate.dirty.store(false, Ordering::SeqCst);
+    gate.force.store(false, Ordering::SeqCst);
+    for r in repo::list_repos(db, workspace_id).await.unwrap_or_default() {
+        if run_phase(r.id) == "running" {
+            run_forget(r.id);
+        }
+        if matches!(repo::get_repo_profile(db, r.id).await, Ok(Some(p)) if p.analysis_state == "running")
+        {
+            let _ = repo::set_analysis_state(db, r.id, "idle", None).await;
+        }
     }
 }
 
@@ -2628,6 +2664,41 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "pinned tier survives re-analysis");
         assert_eq!(p.category, "sdk", "pinned role/category survives re-analysis");
+    }
+
+    #[tokio::test]
+    async fn tier_only_edit_does_not_freeze_a_stale_role() {
+        // A tier-only edit (the detail picker, category = None) must NOT pin the prior
+        // agent category — otherwise re-tiering to frontend would permanently freeze a
+        // stale backend role. It clears the role so a later analysis can re-derive it.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "a svc", "[]", "agent", "")
+            .await
+            .unwrap();
+        let _ = repo::set_repo_category_domains(&db, r.id, "biz", "[]").await;
+
+        super::edit_profile(&db, r.id, None, Some("frontend"), None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.category, "", "tier-only edit clears the stale role");
+
+        // A later analysis refreshes the role (it is not frozen).
+        let wire = super::RepoClassWire {
+            name: None,
+            tier: "frontend".into(),
+            summary: "x".into(),
+            stack: None,
+            components: None,
+            category: Some("app".into()),
+            ..Default::default()
+        };
+        super::persist_repo_class(&db, &r, wire, "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.category, "app", "role refreshes from the agent, not frozen");
     }
 
     #[tokio::test]
