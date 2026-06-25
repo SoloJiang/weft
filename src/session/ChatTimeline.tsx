@@ -102,6 +102,19 @@ export function ChatTimeline({
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
   }, [visible.length, growthLen, busy, activity]);
 
+  // Switching THREADS swaps this timeline's data without remounting it (e.g. the lead
+  // chat stays mounted as the active thread changes), so Virtuoso keeps the previous
+  // thread's scroll position. Reset the at-bottom intent and re-pin to the latest, so
+  // switching into a chat always lands at the bottom. (rAF lets the new data lay out;
+  // if it loads async the at-bottom reset makes the message-growth effect above scroll
+  // once it arrives.)
+  useEffect(() => {
+    atBottomRef.current = true;
+    requestAnimationFrame(() =>
+      virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" }),
+    );
+  }, [threadId]);
+
   const showList = visible.length > 0 || busy || asks.length > 0;
 
   // Re-pin to the latest message when this timeline is REVEALED (its height goes
