@@ -386,6 +386,13 @@ export interface RepoProfile {
   category: string;
   /** Feature domains owned by this repo (agent-assigned). */
   domains: string[];
+  /** Architectural layer label, assigned by the cross-repo curator pass (it sees the
+   *  whole workspace, so labels are consistent). The repo map's band header text.
+   *  "" until the cross-repo analysis has run. */
+  layer: string;
+  /** Vertical rank of `layer` (higher = closer to the user; 0 = foundation). The map
+   *  stacks bands by this; same-layer repos share a rank. 0 until classified. */
+  layer_rank: number;
 }
 
 /** A directed dependency edge: `from` consumes `to`, evidenced by `via`. */

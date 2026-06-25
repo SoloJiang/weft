@@ -807,6 +807,24 @@ pub async fn set_repo_category_domains(
     Ok(())
 }
 
+/// Persist the cross-repo curator pass's architectural `layer` label + `layer_rank`
+/// for a repo. Only these two columns are touched; all other profile fields are left
+/// unchanged. No-op if the repo has no profile row yet.
+pub async fn set_repo_layer_rank(
+    db: &Db,
+    repo_id: i32,
+    layer: &str,
+    layer_rank: i32,
+) -> Result<()> {
+    if let Some(m) = get_repo_profile(db, repo_id).await? {
+        let mut a: repo_profile::ActiveModel = m.into();
+        a.layer = Set(layer.to_string());
+        a.layer_rank = Set(layer_rank);
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// Persist a repo's analysis run-state (durable across restarts). Clears the
 /// error unless state == "failed".
 ///
@@ -4080,6 +4098,55 @@ mod tests {
         let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.category, "", "fresh row: category defaults to empty string");
         assert_eq!(p.domains, "[]", "fresh row: domains defaults to '[]'");
+    }
+
+    /// M0033: set_repo_layer_rank writes and reads back; upsert_repo_profile does NOT
+    /// touch layer/layer_rank (preservation invariant — agent re-classify keeps the
+    /// cross-repo pass's layering until that pass reruns).
+    #[tokio::test]
+    async fn layer_rank_roundtrip_and_upsert_preserves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+
+        // (1) Set and read back layer/layer_rank.
+        set_repo_layer_rank(&db, r.id, "Core 核心", 3).await.unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "Core 核心");
+        assert_eq!(p.layer_rank, 3);
+
+        // (2) A subsequent upsert_repo_profile (per-repo re-classify) must NOT clobber
+        //     layer/layer_rank — they are preserved (Unchanged in the ActiveModel).
+        upsert_repo_profile(&db, r.id, "frontend", "[]", "new summary", "[]", "agent", "sha2")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "Core 核心", "upsert must not reset layer");
+        assert_eq!(p.layer_rank, 3, "upsert must not reset layer_rank");
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.profiled_commit, "sha2");
+    }
+
+    /// M0033: a fresh profile row (first upsert, no prior set_repo_layer_rank) must
+    /// default layer="" and layer_rank=0.
+    #[tokio::test]
+    async fn layer_rank_default_on_fresh_profile() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "new-svc", "/tmp/new-svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "", "fresh row: layer defaults to empty string");
+        assert_eq!(p.layer_rank, 0, "fresh row: layer_rank defaults to 0");
     }
 
     /// set_repo_map_doc / get_repo_map_doc round-trip: store and retrieve a

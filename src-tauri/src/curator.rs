@@ -40,6 +40,11 @@ pub struct ProfileView {
     pub category: String,
     /// Feature domains owned by this repo (agent-assigned).
     pub domains: Vec<String>,
+    /// Architectural layer label from the cross-repo pass (the map band's header
+    /// text). "" until the cross-repo analysis has assigned it.
+    pub layer: String,
+    /// Vertical rank of `layer` (higher = closer to the user; 0 = foundation).
+    pub layer_rank: i32,
 }
 
 /// The workspace dependency graph: every repo (placeholders included) + the
@@ -219,6 +224,8 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
             analysis_error: None,
             category: String::new(),
             domains: Vec::new(),
+            layer: String::new(),
+            layer_rank: 0,
         };
     };
     ProfileView {
@@ -241,6 +248,8 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
         analysis_error: p.analysis_error.clone(),
         category: p.category.clone(),
         domains: arr(&p.domains),
+        layer: p.layer.clone(),
+        layer_rank: p.layer_rank,
     }
 }
 
@@ -366,6 +375,23 @@ struct CuratorWire {
     /// tolerate an agent that omits it — the doc update is skipped, not a failure.
     #[serde(default)]
     repo_map_markdown: Option<String>,
+    /// Per-repo architectural layer assignment (label + rank). Optional: an agent
+    /// that omits it just leaves the prior layering. The cross-repo pass owns this
+    /// because only it sees the whole workspace, so the labels stay consistent.
+    #[serde(default)]
+    layers: Vec<RepoLayerWire>,
+}
+
+/// One repo's architectural-layer assignment from the cross-repo pass. `rank`
+/// orders the bands vertically (higher = closer to the user, 0 = foundation); the
+/// agent reuses the same label+rank for every repo in a layer.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RepoLayerWire {
+    pub repo_id: i32,
+    #[serde(default)]
+    pub layer: String,
+    #[serde(default)]
+    pub rank: i32,
 }
 
 /// The parsed result of the curator agent's cross-repo pass. Relations are always
@@ -375,6 +401,9 @@ pub struct CuratorOutput {
     /// A RedIM-style workspace doc synthesized by the analyst. `None` when the
     /// agent did not emit one (degrade gracefully — skip the doc update).
     pub repo_map_markdown: Option<String>,
+    /// Per-repo architectural layer assignment. Empty when the agent omitted it
+    /// (the caller then leaves the prior layering untouched).
+    pub layers: Vec<RepoLayerWire>,
 }
 
 /// Every balanced top-level `{...}` substring, in order. Byte-scans for the ASCII
@@ -447,6 +476,7 @@ pub fn parse_curator_output(text: &str) -> Option<CuratorOutput> {
             relations: w.relations,
             // Treat an explicit null or omitted key as None (skip doc update).
             repo_map_markdown: w.repo_map_markdown.filter(|s| !s.trim().is_empty()),
+            layers: w.layers,
         })
 }
 
@@ -697,6 +727,13 @@ fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> Str
         } else {
             format!(" domains=[{}]", domains.join(", "))
         };
+        // Surface the repo's current layer so a re-run keeps stable labels/ranks
+        // instead of renaming bands every pass.
+        let layer_str = if p.layer.is_empty() {
+            String::new()
+        } else {
+            format!(" layer={:?} rank={}", p.layer, p.layer_rank)
+        };
         // Use the live on-disk manifest hint (always available, even on first
         // analysis). Fall back to the persisted hint as a secondary source only when
         // the live scan yielded nothing (e.g. checkout temporarily unreadable).
@@ -709,8 +746,8 @@ fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> Str
             }
         };
         lines.push_str(&format!(
-            "- id={} name={:?} tier={} category={:?}{} path={:?}\n  summary: {}\n{}",
-            r.id, r.name, tier, category, domains_str, r.local_git_path, p.summary, manifest_hint
+            "- id={} name={:?} tier={} category={:?}{}{} path={:?}\n  summary: {}\n{}",
+            r.id, r.name, tier, category, domains_str, layer_str, r.local_git_path, p.summary, manifest_hint
         ));
     }
     format!(
@@ -737,7 +774,18 @@ the LAST thing in your reply, output a single JSON object and nothing after it:\
 {{\"relations\":[{{\"from\":<id>,\"to\":<id>,\"kind\":\"http|grpc|queue|infra|lib\",\
 \"via\":\"<short evidence>\",\"confidence\":<0-100>,\
 \"rationale\":\"<one sentence: why this dependency exists>\"}}],\
+\"layers\":[{{\"repo_id\":<id>,\"layer\":\"<layer name>\",\"rank\":<int>}}],\
 \"repo_map_markdown\":\"<markdown string>\"}}\n\
+The `layers` array assigns EVERY repo above to exactly one architectural layer for a \
+top-to-bottom map. YOU name the layers — choose the small set that best describes \
+THIS workspace (e.g. Foundation / Core / Service / Gateway / Client, or whatever \
+fits a data-pipeline, a pure-frontend project, etc.). `rank` orders the layers \
+vertically: 0 = the most foundational layer (shared libraries / IDL / things \
+everything else depends on), and INCREASES as you move up toward user-facing \
+entrypoints (clients, gateways). Reuse the EXACT same `layer` string and `rank` for \
+every repo in the same layer, and give different layers different ranks, so the map \
+groups them into clean bands. Derive the layering from the dependency direction you \
+found: a repo sits ABOVE everything it depends on.\n\
 The `repo_map_markdown` value MUST be a RedIM-style workspace map with these four \
 sections:\n\
 1. **Inventory** — grouped by tier→category; one bullet per repo with its purpose \
@@ -752,9 +800,11 @@ Include a relation when you have concrete evidence — for a runtime edge that m
 matching endpoint / topic / host / contract across the two repos. `via` is a short \
 label (e.g. \"POST /orders\", \"orders-topic\", \"shared postgres\", \
 \"@acme/api-client\"). `rationale` is one sentence explaining why the dependency \
-exists. If you find no cross-repo dependencies, output `{{\"relations\":[], \
-\"repo_map_markdown\":\"<still include the inventory and domain index>\"}}`. \
-`repo_map_markdown` must be a JSON string (escape newlines as \\\\n, quotes as \\\\\")."
+exists. Every repo id in the list MUST appear exactly once in `layers`. If you find \
+no cross-repo dependencies, still assign layers and output `{{\"relations\":[], \
+\"layers\":[…], \"repo_map_markdown\":\"<still include the inventory and domain \
+index>\"}}`. `repo_map_markdown` must be a JSON string (escape newlines as \\\\n, \
+quotes as \\\\\")."
     )
 }
 
@@ -1946,6 +1996,17 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     if let Ok(text) = run_streaming_agent(&tool, &cwd, &prompt, &mut |_| {}).await {
         if let Some(output) = parse_curator_output(&text) {
             persist_relations(db, &profiled, &output.relations).await?;
+            // Persist agent-assigned layers for repos the agent actually saw (the
+            // profiled set). Best-effort per repo: a stray id outside the set, or a
+            // repo without a profile row, is simply skipped (set_repo_layer_rank
+            // no-ops). An omitted `layers` array leaves the prior layering intact.
+            let profiled_ids: std::collections::HashSet<i32> =
+                profiled.iter().map(|(r, _)| r.id).collect();
+            for l in &output.layers {
+                if profiled_ids.contains(&l.repo_id) {
+                    let _ = repo::set_repo_layer_rank(db, l.repo_id, l.layer.trim(), l.rank).await;
+                }
+            }
             fresh_markdown = output.repo_map_markdown;
         }
     }
@@ -2107,6 +2168,21 @@ mod tests {
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[test]
+    fn forced_pass_retries_failed_repo_auto_pass_skips_it() {
+        // The invariant the "Analyze deps" button relies on: a user-initiated FORCED
+        // pass re-classifies EVERY repo, including one stuck in `failed` (so a repo whose
+        // first analysis hit a transient error is retried), while an AUTO/background pass
+        // skips a failed repo (anti-storm). The button reaches this by triggering a forced
+        // pass directly — not by asking the (possibly-down) curator agent to do it.
+        assert!(super::should_analyze(true, true, false), "forced: retries a failed repo");
+        assert!(super::should_analyze(true, true, true), "forced: retries a failed repo that also needs it");
+        assert!(!super::should_analyze(true, false, true), "auto: skips a failed repo even when it needs classifying");
+        assert!(super::should_analyze(false, false, true), "auto: classifies a non-failed repo that needs it");
+        assert!(!super::should_analyze(false, false, false), "auto: skips an up-to-date repo");
+        assert!(super::should_analyze(false, true, false), "forced: re-reads even an up-to-date repo");
     }
 
     #[test]
@@ -3282,6 +3358,25 @@ mod tests {
             out.repo_map_markdown.as_deref(),
             Some("## Inventory\n- web (frontend)")
         );
+    }
+
+    #[test]
+    fn parse_curator_output_reads_layers() {
+        // The cross-repo pass assigns each repo a layer label + rank.
+        let reply = "{\"relations\":[],\
+            \"layers\":[{\"repo_id\":1,\"layer\":\"Client\",\"rank\":5},\
+            {\"repo_id\":2,\"layer\":\"Foundation\",\"rank\":0}]}";
+        let out = super::parse_curator_output(reply).expect("parsed layers");
+        assert_eq!(out.layers.len(), 2);
+        assert_eq!((out.layers[0].repo_id, out.layers[0].layer.as_str(), out.layers[0].rank), (1, "Client", 5));
+        assert_eq!((out.layers[1].repo_id, out.layers[1].layer.as_str(), out.layers[1].rank), (2, "Foundation", 0));
+    }
+
+    #[test]
+    fn parse_curator_output_layers_default_empty_when_omitted() {
+        // An older/omitting agent reply yields empty layers (caller preserves prior).
+        let out = super::parse_curator_output(r#"{"relations":[]}"#).expect("parsed");
+        assert!(out.layers.is_empty(), "omitted layers must default to empty");
     }
 
     #[test]

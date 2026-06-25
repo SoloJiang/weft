@@ -59,10 +59,12 @@ const CARD_STATUS_FRAME: Record<AnalysisView, string> = {
   analyzed: "",
 };
 
-/** Selection/importance axis for a card border — orthogonal to analysis status. */
-function cardFrame(selected: boolean, core: boolean): string {
+/** Selection axis for a card border — orthogonal to analysis status. Importance is
+ *  no longer accented: with dependency lines and the dependents badge gone, a lone
+ *  colored "core" border was an unexplained signal, so all unselected cards share
+ *  the neutral border. */
+function cardFrame(selected: boolean): string {
   if (selected) return "border-brand/60 bg-brand-ghost/60";
-  if (core) return "border-accent/50";
   return "border-border hover:border-border-strong";
 }
 
@@ -80,16 +82,45 @@ type ViewMode = "overview" | "expanded";
 
 const NODE_W = 248;
 const NODE_H = 108;
-const COL_GAP = 82;
 const ROW_GAP = 18;
 const PAD = 18;
 // Expanded-container metrics (a repo's monorepo components grouped by tier).
 const EXP_HEADER_H = 60;
 const EXP_TIER_SUB_H = 20;
 const EXP_COMP_H = 40;
+// Stacked-band layout metrics. Each architectural layer is a horizontal band;
+// cards flow left→right and wrap into rows after CARDS_PER_ROW so a fat layer
+// (e.g. all the IDL/common libs) becomes a couple of rows instead of overflowing.
+const CARDS_PER_ROW = 7;
+const CARD_GAP_X = 18; // horizontal gap between cards within a row
+const BAND_HEADER_H = 30; // the layer label strip above a band's cards
+const BAND_PAD = 14; // inner padding inside a band, around the cards
+const BAND_GAP_V = 22; // vertical gap between stacked bands
 const MIN_Z = 0.35;
 const MAX_Z = 2.5;
 const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));
+
+/** A repo's architectural layer for the map. The cross-repo curator pass assigns an
+ *  agent-named `layer` + `layer_rank` (higher rank = closer to the user); when that
+ *  hasn't run yet we fall back to a generic band derived from the agent's existing
+ *  category/tier signal (NOT repo names), so the map still stacks sensibly and the
+ *  moment the curator assigns real layers they take over. */
+function layerBandOf(p: RepoProfile, t: (k: string) => string): { label: string; rank: number } {
+  if (p.layer.trim()) return { label: p.layer.trim(), rank: p.layer_rank };
+  const c = (p.category ?? "").toLowerCase();
+  const has = (s: string) => c.includes(s);
+  if (has("task") || has("worker") || has("support")) return { label: t("repomap.layer_support"), rank: 2 };
+  if (has("gateway") || has("edge") || has("bff")) return { label: t("repomap.layer_gateway"), rank: 5 };
+  if (has("biz") || has("aggreg")) return { label: t("repomap.layer_biz"), rank: 4 };
+  if (has("core")) return { label: t("repomap.layer_core"), rank: 3 };
+  if (has("common") || has("idl") || has("cache") || has("proto") || has("lib") || has("shared"))
+    return { label: t("repomap.layer_foundation"), rank: 1 };
+  if (has("sdk") || has("app") || has("web") || has("client") || has("desktop"))
+    return { label: t("repomap.layer_client"), rank: 6 };
+  if (p.tier === "frontend") return { label: t("repomap.layer_client"), rank: 6 };
+  if (p.tier === "backend") return { label: t("repomap.layer_biz"), rank: 4 };
+  return { label: t("repomap.layer_other"), rank: 0 };
+}
 
 /** Group a repo's components into tier bands, in tier order then "other". */
 function groupComponents(components: RepoComponent[]): [Band, RepoComponent[]][] {
@@ -113,11 +144,12 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
 }
 
 /**
- * The repo map as a pan/zoom canvas — the whole Repos surface. Nodes are laid
- * out in bands by architectural TIER (frontend → backend → other),
- * agent-classified. Switch to the expanded view to break monorepos into their
- * internal components, grouped by tier. Edges are agent-inferred cross-repo
- * relations. Drag to pan, scroll/buttons to zoom.
+ * The repo map as a pan/zoom canvas — the whole Repos surface. Repos are stacked
+ * into architectural-layer bands (agent-assigned `layer`/`layer_rank` from the
+ * cross-repo curator pass; a generic category/tier fallback until it runs), top →
+ * bottom by rank, so the stacking itself states "上层依赖下层". No dependency lines
+ * are drawn at all — a repo's deps / dependents live in its detail panel. Switch to
+ * the expanded view to break monorepos into their components. Drag to pan, scroll to zoom.
  */
 export function RepoGraph() {
   const { repoProfiles, repoEdges, reanalyzeDeps, analyzing, selectedRepoId, openRepoDetail } = useStore();
@@ -125,42 +157,86 @@ export function RepoGraph() {
   const [mode, setMode] = useState<ViewMode>("overview");
 
   const layout = useMemo(() => {
-    const dependents = (id: number) => repoEdges.filter((e) => e.to === id).length;
-    // Bucket repos into tier bands; within a band, the most-depended-on first.
-    const bands = new Map<Band, RepoProfile[]>();
+    // Topological depth (memoised DFS, cycle-guarded) — the within-layer ordering
+    // hint so a layer's most-foundational repos sit leftmost in their band.
+    const depsOf = new Map<number, number[]>();
+    for (const p of repoProfiles) depsOf.set(p.repo_id, []);
+    for (const e of repoEdges) {
+      const d = depsOf.get(e.from);
+      if (d) d.push(e.to);
+    }
+    const depthMemo = new Map<number, number>();
+    const visiting = new Set<number>();
+    function computeDepth(id: number): number {
+      if (depthMemo.has(id)) return depthMemo.get(id)!;
+      if (visiting.has(id)) return 0;
+      visiting.add(id);
+      const myDeps = depsOf.get(id) ?? [];
+      const d = myDeps.length === 0 ? 0 : 1 + Math.max(0, ...myDeps.map(computeDepth));
+      visiting.delete(id);
+      depthMemo.set(id, d);
+      return d;
+    }
+    for (const p of repoProfiles) computeDepth(p.repo_id);
+    const inDegree = (id: number) => repoEdges.filter((e) => e.to === id).length;
+
+    // Bucket repos by their agent-assigned layer label. Each band's vertical rank is
+    // the max rank among its members — tolerant of a stray inconsistent rank from the
+    // agent without splitting a layer. Cards flow left→right and wrap into rows.
+    const byLabel = new Map<string, RepoProfile[]>();
+    const rankOf = new Map<number, number>();
     for (const p of repoProfiles) {
-      const band = bandOf(p.tier);
-      const arr = bands.get(band) ?? [];
+      const { label, rank } = layerBandOf(p, t);
+      rankOf.set(p.repo_id, rank);
+      const arr = byLabel.get(label) ?? [];
       arr.push(p);
-      bands.set(band, arr);
+      byLabel.set(label, arr);
     }
-    for (const arr of bands.values()) {
-      arr.sort((a, b) => dependents(b.repo_id) - dependents(a.repo_id) || a.repo_name.localeCompare(b.repo_name));
+    const bandRank = new Map<string, number>();
+    for (const [label, arr] of byLabel) {
+      bandRank.set(label, Math.max(...arr.map((p) => rankOf.get(p.repo_id) ?? 0)));
     }
-    const visibleBands = BANDS.filter((b) => (bands.get(b)?.length ?? 0) > 0);
+    for (const arr of byLabel.values()) {
+      arr.sort(
+        (a, b) =>
+          (depthMemo.get(a.repo_id) ?? 0) - (depthMemo.get(b.repo_id) ?? 0) ||
+          inDegree(b.repo_id) - inDegree(a.repo_id) ||
+          a.repo_name.localeCompare(b.repo_name),
+      );
+    }
+    // Stack bands top → bottom by rank DESC (highest rank = closest to the user).
+    const orderedLabels = Array.from(byLabel.keys()).sort(
+      (a, b) => (bandRank.get(b) ?? 0) - (bandRank.get(a) ?? 0) || a.localeCompare(b),
+    );
 
-    const bandHeight = (b: Band) => {
-      const arr = bands.get(b) ?? [];
-      return arr.reduce((sum, p) => sum + nodeHeight(p, mode) + ROW_GAP, 0) - ROW_GAP;
-    };
-    const maxH = Math.max(0, ...visibleBands.map(bandHeight));
-
+    const contentW = CARDS_PER_ROW * NODE_W + (CARDS_PER_ROW - 1) * CARD_GAP_X;
+    const width = PAD + BAND_PAD + contentW + BAND_PAD + PAD;
     const pos = new Map<number, { x: number; y: number; w: number; h: number }>();
-    visibleBands.forEach((b, col) => {
-      const arr = bands.get(b) ?? [];
-      const x = PAD + col * (NODE_W + COL_GAP);
-      let y = PAD + (maxH - bandHeight(b)) / 2;
-      for (const p of arr) {
-        const h = nodeHeight(p, mode);
-        pos.set(p.repo_id, { x, y, w: NODE_W, h });
-        y += h + ROW_GAP;
-      }
-    });
+    const bands: { label: string; count: number; top: number; height: number }[] = [];
+    let y = PAD;
 
-    const width = Math.max(NODE_W + PAD * 2, PAD * 2 + visibleBands.length * NODE_W + Math.max(0, visibleBands.length - 1) * COL_GAP);
-    const height = PAD * 2 + Math.max(NODE_H, maxH);
-    return { pos, width, height };
-  }, [repoProfiles, repoEdges, mode]);
+    for (const label of orderedLabels) {
+      const arr = byLabel.get(label);
+      if (!arr || arr.length === 0) continue;
+      const top = y;
+      let cardY = top + BAND_HEADER_H;
+      for (let i = 0; i < arr.length; i += CARDS_PER_ROW) {
+        const row = arr.slice(i, i + CARDS_PER_ROW);
+        const rowH = Math.max(...row.map((p) => nodeHeight(p, mode)));
+        for (let c = 0; c < row.length; c++) {
+          const x = PAD + BAND_PAD + c * (NODE_W + CARD_GAP_X);
+          pos.set(row[c].repo_id, { x, y: cardY, w: NODE_W, h: nodeHeight(row[c], mode) });
+        }
+        cardY += rowH + ROW_GAP;
+      }
+      const height = cardY - ROW_GAP + BAND_PAD - top;
+      bands.push({ label, count: arr.length, top, height });
+      y = top + height + BAND_GAP_V;
+    }
+
+    const height = Math.max(NODE_H + PAD * 2, y - BAND_GAP_V + PAD);
+    return { pos, bands, width, contentW, height };
+  }, [repoProfiles, repoEdges, mode, t]);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [zoom, setZoom] = useState(1);
@@ -272,45 +348,27 @@ export function RepoGraph() {
             transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
           }}
         >
-          <svg className="absolute inset-0" width={layout.width} height={layout.height} fill="none">
-            <defs>
-              <marker id="weft-arrow" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                <path d="M0 0 L8 4 L0 8 z" className="fill-border-strong" />
-              </marker>
-              <marker id="weft-arrow-active" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                <path d="M0 0 L8 4 L0 8 z" className="fill-brand" />
-              </marker>
-            </defs>
-            {repoEdges.map((e, i) => {
-              const a = layout.pos.get(e.from);
-              const b = layout.pos.get(e.to);
-              if (!a || !b) return null;
-              // Exit `from` on the side facing `to`, enter `to` on the side facing
-              // `from`; arrow points at the dependency (`to`).
-              const fromLeftOfTo = a.x + a.w / 2 < b.x + b.w / 2;
-              const x1 = fromLeftOfTo ? a.x + a.w : a.x;
-              const x2 = fromLeftOfTo ? b.x : b.x + b.w;
-              const y1 = a.y + a.h / 2;
-              const y2 = b.y + b.h / 2;
-              const mx = (x1 + x2) / 2;
-              const active = selectedRepoId === e.from || selectedRepoId === e.to;
-              return (
-                <path
-                  key={i}
-                  d={`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`}
-                  className={cn(active ? "stroke-brand" : "stroke-border-strong")}
-                  strokeWidth={active ? 1.8 : 1.25}
-                  opacity={active ? 0.72 : 0.34}
-                  markerEnd={active ? "url(#weft-arrow-active)" : "url(#weft-arrow)"}
-                />
-              );
-            })}
-          </svg>
+          {/* Architectural-layer bands (behind the cards): one labeled strip per
+              layer, stacked top → bottom by rank. The stacking IS the dependency
+              statement ("上层依赖下层"), so no resting edges are drawn. */}
+          {layout.bands.map((band) => (
+            <div
+              key={band.label}
+              className="absolute rounded-[var(--radius-lg)] border border-border/40 bg-surface/20"
+              style={{ left: PAD / 2, top: band.top, width: layout.width - PAD, height: band.height }}
+            >
+              <div className="flex items-center gap-2 px-3 pt-1.5">
+                <span className="truncate text-[12.5px] font-semibold text-ink-muted" title={band.label}>
+                  {band.label}
+                </span>
+                <span className="shrink-0 text-[11px] tabular-nums text-ink-faint">{band.count}</span>
+              </div>
+            </div>
+          ))}
 
           {repoProfiles.map((p) => {
             const pt = layout.pos.get(p.repo_id);
             if (!pt) return null;
-            const dependents = repoEdges.filter((e) => e.to === p.repo_id).length;
             const selected = selectedRepoId === p.repo_id;
             const onSelect = () => openRepoDetail(p.repo_id);
             const expanded = mode === "expanded" && p.components.length > 0;
@@ -328,46 +386,45 @@ export function RepoGraph() {
                 profile={p}
                 pt={pt}
                 selected={selected}
-                dependents={dependents}
-                showPkgs={mode === "expanded"}
                 onSelect={onSelect}
               />
             );
           })}
         </div>
 
-        {/* Bottom toolbar: analyze / calibrate / view mode + kind filter / zoom. */}
-        <div className="pointer-events-none absolute inset-x-4 bottom-4 flex items-end justify-between gap-3">
-          <div className="pointer-events-none flex flex-col items-start gap-2">
-            <div className="pointer-events-none flex items-center gap-2">
-              <button
+        {/* Bottom toolbar: analyze / calibrate / view mode + kind filter / zoom.
+            flex-wrap + shrink-0 keep each group at its content width and let them
+            stack on a narrow panel, instead of flexbox squeezing the buttons until
+            their CJK labels wrap one character per line. */}
+        <div className="pointer-events-none absolute inset-x-4 bottom-4 flex flex-wrap items-end justify-between gap-2">
+          <div className="pointer-events-none flex shrink-0 flex-wrap items-center gap-2">
+            <button
+              data-graph-controls
+              onClick={() => void reanalyzeDeps()}
+              disabled={analyzing}
+              title={t("repomap.reanalyzeHint")}
+              className="pointer-events-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
+            >
+              <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
+              {t("repomap.reanalyze")}
+            </button>
+            {anyComponents && (
+              <div
                 data-graph-controls
-                onClick={() => void reanalyzeDeps()}
-                disabled={analyzing}
-                title={t("repomap.reanalyzeHint")}
-                className="pointer-events-auto flex items-center gap-1.5 rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
+                className="pointer-events-auto flex shrink-0 items-center gap-0.5 rounded-[var(--radius-md)] border border-border bg-raised p-0.5 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
               >
-                <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
-                {t("repomap.reanalyze")}
-              </button>
-              {anyComponents && (
-                <div
-                  data-graph-controls
-                  className="pointer-events-auto flex items-center gap-0.5 rounded-[var(--radius-md)] border border-border bg-raised p-0.5 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
-                >
-                  <ModeBtn active={mode === "overview"} onClick={() => setMode("overview")} icon={Boxes}>
-                    {t("repomap.viewOverview")}
-                  </ModeBtn>
-                  <ModeBtn active={mode === "expanded"} onClick={() => setMode("expanded")} icon={Layers}>
-                    {t("repomap.viewExpanded")}
-                  </ModeBtn>
-                </div>
-              )}
-            </div>
+                <ModeBtn active={mode === "overview"} onClick={() => setMode("overview")} icon={Boxes}>
+                  {t("repomap.viewOverview")}
+                </ModeBtn>
+                <ModeBtn active={mode === "expanded"} onClick={() => setMode("expanded")} icon={Layers}>
+                  {t("repomap.viewExpanded")}
+                </ModeBtn>
+              </div>
+            )}
           </div>
           <div
             data-graph-controls
-            className="pointer-events-auto flex items-center gap-0.5 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
+            className="pointer-events-auto ml-auto flex shrink-0 items-center gap-0.5 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)]"
           >
             <ZoomBtn onClick={() => zoomButton(0.83)} label={t("repomap.zoomOut")}>
               <Minus size={14} />
@@ -407,25 +464,9 @@ function NodeStatusGlyph({
 
 /** A collapsed card's body: classified badges + summary, or a passive "未分析" hint
  *  for a not-yet-analyzed repo (analysis happens in the curator chat). */
-function NodeStatusBody({
-  view,
-  p,
-  core,
-  dependents,
-}: {
-  view: AnalysisView;
-  p: RepoProfile;
-  core: boolean;
-  dependents: number;
-}) {
+function NodeStatusBody({ view, p }: { view: AnalysisView; p: RepoProfile }) {
   const { t } = useTranslation();
-  if (view === "analyzed")
-    return (
-      <>
-        <NodeBadges tier={p.tier} stack={p.stack} core={core} dependents={dependents} />
-        <NodeSummary profile={p} />
-      </>
-    );
+  if (view === "analyzed") return <NodeSummary profile={p} />;
   return <span className="text-[11.5px] italic text-ink-faint">{t("repomap.notAnalyzed")}</span>;
 }
 
@@ -433,20 +474,14 @@ function RepoNode({
   profile: p,
   pt,
   selected,
-  dependents,
-  showPkgs,
   onSelect,
 }: {
   profile: RepoProfile;
   pt: { x: number; y: number; w: number; h: number };
   selected: boolean;
-  dependents: number;
-  showPkgs: boolean;
   onSelect: () => void;
 }) {
-  const { t } = useTranslation();
   const Icon = TIER_ICON[bandOf(p.tier)] ?? CircleDashed;
-  const core = dependents >= 2;
   const view = analysisView(p);
 
   return (
@@ -455,7 +490,7 @@ function RepoNode({
       onClick={onSelect}
       className={cn(
         "group absolute flex flex-col gap-2 overflow-hidden rounded-[var(--radius-md)] border bg-surface px-3 py-2.5 text-left transition-[transform,border-color,background-color] hover:-translate-y-px",
-        cardFrame(selected, core),
+        cardFrame(selected),
         CARD_STATUS_FRAME[view],
       )}
       style={{ left: pt.x, top: pt.y, width: pt.w, height: pt.h }}
@@ -467,19 +502,9 @@ function RepoNode({
         <span title={p.repo_name} className="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">
           {p.repo_name}
         </span>
-        {p.category && (
-          <span className="shrink-0 rounded bg-bg px-1.5 py-px text-[9.5px] uppercase text-ink-faint" title={p.category}>
-            {p.category}
-          </span>
-        )}
-        {showPkgs && p.components.length > 0 && (
-          <span className="shrink-0 rounded-full bg-accent-ghost px-1.5 text-[10px] text-accent">
-            {t("repomap.pkgCount", { count: p.components.length })}
-          </span>
-        )}
       </div>
 
-      <NodeStatusBody view={view} p={p} core={core} dependents={dependents} />
+      <NodeStatusBody view={view} p={p} />
     </div>
   );
 }
@@ -570,7 +595,7 @@ function ModeBtn({
     <button
       onClick={onClick}
       className={cn(
-        "flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors",
+        "flex shrink-0 items-center gap-1 whitespace-nowrap rounded px-2 py-1 text-[11px] transition-colors",
         active ? "bg-brand-ghost text-brand" : "text-ink-muted hover:text-ink",
       )}
     >
@@ -610,10 +635,10 @@ function AnalyzedProfileFields({
 }) {
   const { t } = useTranslation();
   return (
-    <div className="h-full overflow-auto px-4 py-4">
+    <div className="h-full overflow-x-hidden overflow-y-auto px-4 py-4">
       {notice}
       <ProfileSection title={t("repomap.oneLine")}>
-        <NodeSummary profile={profile} />
+        <EditableSummary profile={profile} />
       </ProfileSection>
 
       <ProfileSection title={t("repomap.tier")}>
@@ -815,73 +840,6 @@ function EmptyProfileBody() {
   );
 }
 
-function NodeBadges({
-  tier,
-  stack,
-  core,
-  dependents,
-}: {
-  tier: string;
-  stack: string[];
-  core: boolean;
-  dependents: number;
-}) {
-  const { t } = useTranslation();
-  const visibleStack = stack.slice(0, 2);
-  const hiddenStack = stack.slice(2);
-  const tierLabel = tier ? t(`repomap.tier_${tier}`, tier) : t("repomap.tier_other");
-
-  return (
-    <div className="flex min-h-[20px] min-w-0 items-center gap-1 overflow-hidden">
-      <MiniPill title={tierLabel} rounded>
-        {tierLabel}
-      </MiniPill>
-      {visibleStack.map((s) => (
-        <MiniPill key={s} title={s} mono>
-          {s}
-        </MiniPill>
-      ))}
-      {hiddenStack.length > 0 && (
-        <MiniPill title={hiddenStack.join(", ")} mono>
-          +{hiddenStack.length}
-        </MiniPill>
-      )}
-      {core && (
-        <span
-          title={t("repomap.rippleTitle", { count: dependents })}
-          className="ml-auto inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-accent-ghost px-1.5 text-[10px] font-medium tabular-nums text-accent"
-        >
-          {dependents}
-        </span>
-      )}
-    </div>
-  );
-}
-
-function MiniPill({
-  title,
-  mono,
-  rounded,
-  children,
-}: {
-  title: string;
-  mono?: boolean;
-  rounded?: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <span
-      title={title}
-      className={cn(
-        "min-w-0 max-w-[76px] shrink-0 truncate bg-bg px-1.5 py-px text-[10.5px] leading-5 text-ink-faint",
-        mono && "font-mono",
-        rounded ? "rounded-full" : "rounded-[var(--radius-sm)]",
-      )}
-    >
-      {children}
-    </span>
-  );
-}
 
 function ProfileSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -951,73 +909,118 @@ function RepoLinks({
   );
 }
 
-/** The node's one-line summary, click-to-edit (correcting it teaches the map). */
+/** The node's one-line summary as shown on a map CARD: read-only, clamped to 2 lines.
+ *  (Editing lives only in the detail panel now — a card shouldn't be a tiny editor.) */
 function NodeSummary({ profile }: { profile: RepoProfile }) {
+  const { t } = useTranslation();
+  return (
+    <span
+      className={cn(
+        "min-w-0 break-words text-[11.5px] leading-snug",
+        profile.summary ? "text-ink-muted" : "text-ink-faint italic",
+      )}
+      style={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}
+    >
+      {profile.summary || t("repomap.addSummary")}
+    </span>
+  );
+}
+
+/** The repo's one-line summary in the DETAIL panel: read in place, edited in a modal
+ *  via the pencil. A multi-line textarea + Save/Cancel — more deliberate than the old
+ *  inline single-line input. A user edit pins the summary (the wording teaches the map). */
+function EditableSummary({ profile }: { profile: RepoProfile }) {
   const { editRepoSummary } = useStore();
   const { t } = useTranslation();
-  const [editing, setEditing] = useState(false);
+  const [open, setOpen] = useState(false);
   const [text, setText] = useState(profile.summary);
+  const [saving, setSaving] = useState(false);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // Put the caret at the END when the modal opens. Deferred past Radix's
+  // open-autofocus (which otherwise lands the caret at position 0), so the user
+  // continues editing from the tail of the existing text.
+  useEffect(() => {
+    if (!open) return;
+    const id = requestAnimationFrame(() => {
+      const el = taRef.current;
+      if (!el) return;
+      el.focus();
+      const end = el.value.length;
+      el.setSelectionRange(end, end);
+    });
+    return () => cancelAnimationFrame(id);
+  }, [open]);
 
   async function save() {
-    setEditing(false);
     const next = text.trim();
-    if (next === profile.summary) return;
-    await editRepoSummary(profile.repo_id, next);
-  }
-
-  if (editing) {
-    return (
-      <input
-        autoFocus
-        value={text}
-        onChange={(e) => setText(e.currentTarget.value)}
-        onBlur={() => void save()}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") void save();
-          if (e.key === "Escape") {
-            setText(profile.summary);
-            setEditing(false);
-          }
-        }}
-        placeholder={t("repomap.summaryPlaceholder")}
-        className="w-full rounded border border-border bg-bg px-1.5 py-1 text-[11.5px] text-ink outline-none focus:border-brand/60"
-      />
-    );
+    if (next === profile.summary) {
+      setOpen(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await editRepoSummary(profile.repo_id, next);
+      setOpen(false);
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
-    <button
-      onClick={() => {
-        setText(profile.summary);
-        setEditing(true);
-      }}
-      title={t("repomap.editHint")}
-      className="group/sum flex min-w-0 items-start gap-1 text-left"
-    >
-      <span
-        className={cn(
-          "min-w-0 text-[11.5px] leading-snug",
-          profile.summary ? "text-ink-muted" : "text-ink-faint italic",
-        )}
-        style={{
-          display: "-webkit-box",
-          WebkitLineClamp: 2,
-          WebkitBoxOrient: "vertical",
-          overflow: "hidden",
-        }}
-      >
-        {profile.summary || t("repomap.addSummary")}
-      </span>
-      {ownsSummary(profile.source) && (
-        <span className="mt-px shrink-0 rounded bg-brand-ghost px-1 py-px text-[9px] font-medium text-brand">
-          {t("repomap.yours")}
+    <>
+      <div className="group/sum flex items-start gap-1.5">
+        <span
+          className={cn(
+            "min-w-0 flex-1 break-words text-[12.5px] leading-relaxed",
+            profile.summary ? "text-ink" : "text-ink-faint italic",
+          )}
+        >
+          {profile.summary || t("repomap.addSummary")}
         </span>
-      )}
-      <Pencil
-        size={10}
-        className="mt-0.5 shrink-0 text-ink-faint opacity-0 transition-opacity group-hover/sum:opacity-100"
-      />
-    </button>
+        {ownsSummary(profile.source) && (
+          <span className="mt-px shrink-0 rounded bg-brand-ghost px-1 py-px text-[9px] font-medium text-brand">
+            {t("repomap.yours")}
+          </span>
+        )}
+        <button
+          onClick={() => {
+            setText(profile.summary);
+            setOpen(true);
+          }}
+          title={t("repomap.editHint")}
+          aria-label={t("repomap.editHint")}
+          className="grid h-6 w-6 shrink-0 place-items-center rounded-[var(--radius-md)] text-ink-faint opacity-0 transition-[opacity,color,background-color] hover:bg-raised hover:text-ink group-hover/sum:opacity-100"
+        >
+          <Pencil size={12} />
+        </button>
+      </div>
+
+      <Dialog open={open} onOpenChange={(o) => !saving && setOpen(o)}>
+        <DialogContent title={t("repomap.editSummaryTitle")}>
+          <textarea
+            ref={taRef}
+            rows={2}
+            value={text}
+            onChange={(e) => setText(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              // ⌘/Ctrl+Enter saves; plain Enter inserts a newline (it's multi-line now).
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void save();
+            }}
+            placeholder={t("repomap.summaryPlaceholder")}
+            className="w-full resize-none rounded-[var(--radius-md)] border border-border bg-bg px-2.5 py-2.5 text-[13px] leading-tight text-ink outline-none focus:border-brand/60"
+          />
+          <div className="mt-4 flex justify-end gap-2">
+            <Button variant="ghost" disabled={saving} onClick={() => setOpen(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button variant="primary" disabled={saving} onClick={() => void save()}>
+              {t("common.save")}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 
