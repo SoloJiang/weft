@@ -970,11 +970,14 @@ pub async fn calibrate_repo_relation(
     });
     let json = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
     set_repo_relations(db, from_id, &json).await?;
-    // A pinned edge add/remove changes the dependency structure the agent derived the
-    // layer from, so the dependent's stored `layer`/`layer_rank` can be stale — and the
-    // map now reads layers (not edges) as the dependency statement. Clear it so the band
-    // falls back to the tier/category derivation until the next cross-repo pass re-derives.
-    set_repo_layer_rank(db, from_id, "", 0).await
+    // A pinned edge changes the relative ordering of BOTH endpoints — the consumer's
+    // depth AND where the target must sit relative to it (a target whose stored layer
+    // currently ranks it ABOVE its new consumer would contradict the edge). The map reads
+    // layers, not edges, so clear both stored `layer`/`layer_rank` → both fall back to the
+    // tier/category band until the next cross-repo pass re-derives. (No-op for an endpoint
+    // without a profile row.)
+    set_repo_layer_rank(db, from_id, "", 0).await?;
+    set_repo_layer_rank(db, to_id, "", 0).await
 }
 
 pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::Model>> {
@@ -2525,24 +2528,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn calibrate_repo_relation_clears_dependent_layer() {
-        // Pinning/removing an edge changes the structure the agent derived the layer
-        // from; the map now reads layers (not edges), so the dependent's stale layer
-        // must be cleared (→ tier/category fallback) until the next pass re-derives.
+    async fn calibrate_repo_relation_clears_both_endpoint_layers() {
+        // Pinning/removing an edge changes the relative ordering of BOTH endpoints; the
+        // map now reads layers (not edges), so both stale layers must be cleared
+        // (→ tier/category fallback) until the next pass re-derives.
         let db = mem().await;
         let ws = create_workspace(&db, "ws").await.unwrap();
         let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true).await.unwrap();
         let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true).await.unwrap();
         upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "").await.unwrap();
+        upsert_repo_profile(&db, api.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
         set_repo_layer_rank(&db, web.id, "Client", 5).await.unwrap();
+        set_repo_layer_rank(&db, api.id, "Service", 4).await.unwrap();
 
         calibrate_repo_relation(&db, web.id, api.id, "grpc", "Pricing.Quote", "add")
             .await
             .unwrap();
 
-        let p = get_repo_profile(&db, web.id).await.unwrap().unwrap();
-        assert_eq!(p.layer, "", "calibrating the dependent's edge clears its stale layer");
-        assert_eq!(p.layer_rank, 0);
+        let from = get_repo_profile(&db, web.id).await.unwrap().unwrap();
+        assert_eq!((from.layer.as_str(), from.layer_rank), ("", 0), "consumer layer cleared");
+        let to = get_repo_profile(&db, api.id).await.unwrap().unwrap();
+        assert_eq!((to.layer.as_str(), to.layer_rank), ("", 0), "target layer cleared too");
     }
 
     #[tokio::test]

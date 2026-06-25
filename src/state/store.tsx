@@ -1826,16 +1826,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (activeWorkspaceIdRef.current === ws) openCurator();
       const report = await api.reanalyzeWorkspaceDeps(ws);
       // Surface the feedback the curator chat tool gives (the button bypasses it):
-      // all checkouts missing (skipped), or repos left unanalyzed after the pass.
-      if (report.all_missing) {
-        toast(i18n.t("repomap.reanalyzeAllMissing"));
-      } else if (!report.cancelled && report.unanalyzed.length > 0) {
-        toast(
-          i18n.t("repomap.reanalyzeUnanalyzed", {
-            count: report.unanalyzed.length,
-            names: report.unanalyzed.join(", "),
-          }),
-        );
+      // all checkouts missing (skipped), or repos left unanalyzed after the pass. The
+      // pass can take minutes; if the user switched workspaces meanwhile, this report is
+      // about `ws`, not the now-active one — don't pop it as the active workspace's
+      // status (mirrors the openCurator guard above).
+      if (activeWorkspaceIdRef.current === ws) {
+        if (report.all_missing) {
+          toast(i18n.t("repomap.reanalyzeAllMissing"));
+        } else if (!report.cancelled && report.unanalyzed.length > 0) {
+          toast(
+            i18n.t("repomap.reanalyzeUnanalyzed", {
+              count: report.unanalyzed.length,
+              names: report.unanalyzed.join(", "),
+            }),
+          );
+        }
       }
     } finally {
       reanalyzeSendingRef.current.delete(ws);

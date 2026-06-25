@@ -2813,10 +2813,14 @@ mod tests {
         // missing checkout; a healthy repo is excluded.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let a = repo::add_repo_ref(&db, ws.id, "failed-one", "/tmp", "main", "", true).await.unwrap();
+        // A guaranteed-existing dir for the repos that should read as present (`/tmp`
+        // isn't guaranteed on Windows; `temp_dir()` is cross-platform).
+        let here = std::env::temp_dir();
+        let here = here.to_str().unwrap();
+        let a = repo::add_repo_ref(&db, ws.id, "failed-one", here, "main", "", true).await.unwrap();
         repo::set_analysis_state(&db, a.id, "failed", Some("boom")).await.unwrap();
         repo::add_repo_ref(&db, ws.id, "gone-one", "/no/such/path/here", "main", "", true).await.unwrap();
-        let c = repo::add_repo_ref(&db, ws.id, "healthy-one", "/tmp", "main", "", true).await.unwrap();
+        let c = repo::add_repo_ref(&db, ws.id, "healthy-one", here, "main", "", true).await.unwrap();
         repo::upsert_repo_profile(&db, c.id, "backend", "[]", "s", "[]", "agent", "").await.unwrap();
 
         let names = super::unanalyzed_repo_names(&db, ws.id).await;
