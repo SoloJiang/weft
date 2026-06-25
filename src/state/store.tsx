@@ -9,7 +9,7 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
-import i18n, { currentLang } from "../i18n";
+import { currentLang } from "../i18n";
 import { mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -1804,16 +1804,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (ws == null || reanalyzeSendingRef.current.has(ws)) return;
     reanalyzeSendingRef.current.add(ws);
     try {
-      const tid = await ensureCuratorThreadId(ws);
-      // `tid` is ws's curator thread — deliver the reanalysis turn even if the user
-      // navigated away while the thread was being ensured; only opening the drawer
-      // (which targets the *active* workspace's curator) is gated on still being on ws.
+      // Trigger the forced pass DIRECTLY (deterministic), rather than sending a chat
+      // message and depending on the curator agent to invoke its reanalyze tool — that
+      // path silently did nothing whenever the agent backend was down, so a repo whose
+      // first analysis hit a transient error stayed `failed` forever (auto passes skip
+      // failed repos). A forced pass retries them. Still open the curator so progress
+      // (running cards / map) and follow-up questions stay in one place.
       if (activeWorkspaceIdRef.current === ws) openCurator();
-      await sendLeadChat(tid, i18n.t("repomap.reanalyzeMessage"));
+      await api.reanalyzeWorkspaceDeps(ws);
     } finally {
       reanalyzeSendingRef.current.delete(ws);
     }
-  }, [activeWorkspaceId, ensureCuratorThreadId, openCurator, sendLeadChat]);
+  }, [activeWorkspaceId, openCurator]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);

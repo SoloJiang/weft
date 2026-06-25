@@ -432,6 +432,28 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
     crate::curator::graph(&db, workspace_id).await.map_err(e)
 }
 
+/// User-initiated "Analyze deps": run a FORCED analysis pass for the workspace.
+///
+/// A forced pass re-classifies EVERY repo, including ones stuck in `failed` —
+/// unlike the auto/background pass, which skips failed repos so a persistently
+/// broken one can't storm (`should_analyze`). That skip is correct for auto passes
+/// but used to leave a repo whose FIRST analysis hit a transient error (e.g. the
+/// agent CLI briefly off PATH) failed forever, because the button only sent a chat
+/// message and depended on the curator agent to invoke its reanalyze tool — a no-op
+/// whenever the agent backend was down. Triggering the forced pass directly makes
+/// the retry deterministic. Fire-and-forget + coalesced: rapid clicks and concurrent
+/// background passes collapse into one run; the UI follows `repo-graph-updated`.
+#[tauri::command]
+pub async fn reanalyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
+    // Clone the inner `Db` (Arc, 'static) — NOT the borrowed `State` — so it can move
+    // into the fire-and-forget task without the State's lifetime escaping.
+    let db_bg = db.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        crate::curator::analyze_workspace_coalesced(&db_bg, workspace_id, true).await;
+    });
+    Ok(())
+}
+
 /// Get-or-create this workspace's hidden curator-chat thread and return its id,
 /// so the frontend can open its lead-chat surface for dependency calibration.
 #[tauri::command]
