@@ -316,6 +316,36 @@ export function PromptInputSubmit({
   );
 }
 
+/** The stop/interrupt button shown while a turn is streaming. Mirrors the submit
+ *  button's footprint exactly (same `flex items-end p-2` wrapper + h-8 w-8 button)
+ *  so toggling send ↔ stop never shifts the edge, and shows a FILLED square (the
+ *  universal stop glyph) instead of a bare outline. Calm by default, danger on hover. */
+export function PromptInputStop({
+  onClick,
+  label,
+}: {
+  readonly onClick?: () => void;
+  readonly label: string;
+}) {
+  return (
+    <div className="flex items-end p-2">
+      <Tooltip label={label} align="end">
+        <Button
+          type="button"
+          size="icon"
+          variant="default"
+          onClick={onClick}
+          title={label}
+          aria-label={label}
+          className="h-8 w-8 text-ink-muted hover:border-danger/50 hover:text-danger"
+        >
+          <span className="h-2.5 w-2.5 rounded-[2px] bg-current" aria-hidden />
+        </Button>
+      </Tooltip>
+    </div>
+  );
+}
+
 export function PromptInputAttachment({
   attachment,
   onRemove,
