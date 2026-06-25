@@ -1640,6 +1640,11 @@ async fn persist_repo_class(
     )
     .await?;
 
+    // Track whether this pass actually CHANGED the classification — drives the
+    // stale-layer clear below.
+    let prior_tier = prior.as_ref().map(|p| p.role.as_str()).unwrap_or("");
+    let mut classification_changed = tier.as_str() != prior_tier;
+
     // Persist category + domains when the agent provided them (Some = present,
     // even empty — clears prior; None = absent — preserves prior). (Finding 4)
     let has_category = wire.category.is_some();
@@ -1661,7 +1666,22 @@ async fn persist_repo_class(
             Some(ref d) => json_strs(d),
             None => prior_domains_json.to_string(),
         };
+        if final_category != prior_category {
+            classification_changed = true;
+        }
         let _ = repo::set_repo_category_domains(db, repo.id, &final_category, &final_domains_json).await;
+    }
+
+    // A real reclassification (tier/category changed) can make the stored architectural
+    // `layer` stale. The stage-2 relation pass would normally re-derive/clear it, but it
+    // might not run or might omit layers (Stop before stage 2, agent timeout) — in which
+    // case nothing else clears it and the map keeps the old band (it prefers `layer` over
+    // the tier/category fallback). Clear it here so a reclassified repo falls back to its
+    // new classification; a stage-2 pass that DOES emit fresh layers overwrites this.
+    // (Mirrors the manual edit_profile path. No-op when classification is unchanged, so a
+    // stable repo's layer isn't churned.)
+    if classification_changed {
+        let _ = repo::set_repo_layer_rank(db, repo.id, "", 0).await;
     }
     Ok(())
 }
@@ -2117,26 +2137,29 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
             // Persist agent-assigned layers for repos the agent actually saw (the
             // profiled set). Best-effort per repo: a stray id outside the set, or a
             // repo without a profile row, is simply skipped (set_repo_layer_rank no-ops).
+            // Track exactly which ids got a fresh layer so the cleanup below clears
+            // everything else (NOT the parsed-but-unwritten ids — a skipped repo the
+            // agent named would otherwise be neither written nor cleared, staying stale).
             let profiled_ids: std::collections::HashSet<i32> =
                 profiled.iter().map(|(r, _)| r.id).collect();
+            let mut written: std::collections::HashSet<i32> = std::collections::HashSet::new();
             for l in &output.layers {
                 if profiled_ids.contains(&l.repo_id) {
                     let _ = repo::set_repo_layer_rank(db, l.repo_id, l.layer.trim(), l.rank).await;
+                    written.insert(l.repo_id);
                 }
             }
-            // A PRESENT layers payload re-derives the whole map, so any current repo the
-            // agent OMITTED would otherwise keep a now-stale layer (the map prefers the
-            // persisted layer over the tier/category fallback, and renders graph nodes for
-            // ALL repos — not just `profiled`). Clear every non-assigned repo, including
-            // ones SKIPPED from the prompt (missing checkout / blank-or-failed profile), so
-            // they fall back instead of lingering in an outdated band. (An absent/empty
-            // `layers` array isn't a re-derivation — leave the prior layering intact.)
+            // A PRESENT layers payload re-derives the whole map, so any current repo that
+            // did NOT get a fresh layer would otherwise keep a now-stale one (the map
+            // prefers the persisted layer over the tier/category fallback, and renders
+            // graph nodes for ALL repos — not just `profiled`). Clear every repo not
+            // freshly written — omitted profiled repos AND ones SKIPPED from the prompt
+            // (missing checkout / blank-or-failed profile) — so none lingers in an outdated
+            // band. (An absent/empty `layers` array isn't a re-derivation — leave it.)
             if !output.layers.is_empty() {
-                let assigned: std::collections::HashSet<i32> =
-                    output.layers.iter().map(|l| l.repo_id).collect();
                 let current = repo::list_repos(db, workspace_id).await.unwrap_or_default();
                 for r in &current {
-                    if !assigned.contains(&r.id) {
+                    if !written.contains(&r.id) {
                         let _ = repo::set_repo_layer_rank(db, r.id, "", 0).await;
                     }
                 }
@@ -3072,6 +3095,38 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "agent-filled tier is refreshable");
         assert_eq!(p.summary, "mine", "user summary still pinned");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_clears_layer_on_reclassification() {
+        // A reclassification (tier change) clears the stale layer — a stage-2 pass might
+        // not run / might omit layers, so nothing else would. Re-confirming the SAME
+        // classification keeps a freshly-set layer (no churn for stable repos).
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true).await.unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "s", "[]", "agent", "").await.unwrap();
+        repo::set_repo_layer_rank(&db, r.id, "Core", 3).await.unwrap();
+        let mk = |tier: &str| super::RepoClassWire {
+            name: None,
+            tier: tier.into(),
+            summary: "agent".into(),
+            stack: None,
+            components: None,
+            ..Default::default()
+        };
+
+        // (a) tier change backend → frontend clears the stale layer.
+        super::persist_repo_class(&db, &r, mk("frontend"), "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend");
+        assert_eq!((p.layer.as_str(), p.layer_rank), ("", 0), "reclassification clears the stale layer");
+
+        // (b) re-confirming the same tier keeps a freshly-set layer.
+        repo::set_repo_layer_rank(&db, r.id, "Client", 5).await.unwrap();
+        super::persist_repo_class(&db, &r, mk("frontend"), "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!((p.layer.as_str(), p.layer_rank), ("Client", 5), "unchanged classification keeps the layer");
     }
 
     #[tokio::test]
