@@ -1799,21 +1799,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Keyed by workspace so an in-flight send for one workspace never swallows a click
   // in another.
   const reanalyzeSendingRef = useRef<Set<number>>(new Set());
+  // Workspaces with a forced pass in flight. The `reanalyzeWorkspaceDeps` command now
+  // AWAITS the pass, so this stays set for the pass's full (minutes-long) duration and
+  // feeds `analyzing` below — keeping the Analyze control disabled/spinning the whole
+  // time, since the direct pass no longer starts a curator lead turn to derive busy from.
+  const [reanalyzingWs, setReanalyzingWs] = useState<Set<number>>(() => new Set());
   const reanalyzeDeps = useCallback(async () => {
     const ws = activeWorkspaceId;
     if (ws == null || reanalyzeSendingRef.current.has(ws)) return;
     reanalyzeSendingRef.current.add(ws);
+    setReanalyzingWs((s) => new Set(s).add(ws));
     try {
       // Trigger the forced pass DIRECTLY (deterministic), rather than sending a chat
       // message and depending on the curator agent to invoke its reanalyze tool — that
       // path silently did nothing whenever the agent backend was down, so a repo whose
       // first analysis hit a transient error stayed `failed` forever (auto passes skip
       // failed repos). A forced pass retries them. Still open the curator so progress
-      // (running cards / map) and follow-up questions stay in one place.
+      // (running cards / map) and follow-up questions stay in one place. The await spans
+      // the whole pass (the command awaits it), so the button stays disabled throughout.
       if (activeWorkspaceIdRef.current === ws) openCurator();
       await api.reanalyzeWorkspaceDeps(ws);
     } finally {
       reanalyzeSendingRef.current.delete(ws);
+      setReanalyzingWs((s) => {
+        const n = new Set(s);
+        n.delete(ws);
+        return n;
+      });
     }
   }, [activeWorkspaceId, openCurator]);
 
@@ -2214,7 +2226,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // selectWorkspace clears on switch — so the Analyze entries stay disabled while
   // its turn is busy even right after a switch.
   const curatorTid = threads.find((th) => th.kind === "curator")?.id;
-  const analyzing = curatorTid != null && leadTurn[curatorTid]?.state === "busy";
+  // Busy when EITHER the curator's chat-driven reanalyze turn is running, OR a direct
+  // forced pass (button) is in flight for the active workspace — the latter has no lead
+  // turn, so it'd otherwise leave the Analyze control enabled mid-pass.
+  const analyzing =
+    (curatorTid != null && leadTurn[curatorTid]?.state === "busy") ||
+    (activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId));
 
   const value: Store = {
     workspaces,

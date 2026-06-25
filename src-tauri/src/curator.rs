@@ -378,8 +378,30 @@ struct CuratorWire {
     /// Per-repo architectural layer assignment (label + rank). Optional: an agent
     /// that omits it just leaves the prior layering. The cross-repo pass owns this
     /// because only it sees the whole workspace, so the labels stay consistent.
-    #[serde(default)]
+    /// Parsed BEST-EFFORT (`lenient_layers`): a present-but-malformed value (null,
+    /// non-array, or an element missing `repo_id`) must not sink the whole wire —
+    /// the relations + markdown may still be valid.
+    #[serde(default, deserialize_with = "lenient_layers")]
     layers: Vec<RepoLayerWire>,
+}
+
+/// Tolerant deserialize for `layers`: an ABSENT key falls to `Default` (empty) and
+/// never reaches here; a PRESENT value is accepted only as a JSON array, keeping the
+/// elements that parse and dropping the rest (so one bad layer entry, or `null`,
+/// doesn't reject the entire dependency-analysis result).
+fn lenient_layers<'de, D>(d: D) -> Result<Vec<RepoLayerWire>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let arr = match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(a) => a,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(arr
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<RepoLayerWire>(item).ok())
+        .collect())
 }
 
 /// One repo's architectural-layer assignment from the cross-repo pass. `rank`
@@ -3377,6 +3399,24 @@ mod tests {
         // An older/omitting agent reply yields empty layers (caller preserves prior).
         let out = super::parse_curator_output(r#"{"relations":[]}"#).expect("parsed");
         assert!(out.layers.is_empty(), "omitted layers must default to empty");
+    }
+
+    #[test]
+    fn parse_curator_output_tolerates_malformed_layers() {
+        // A present-but-malformed `layers` must NOT sink the whole result: relations +
+        // markdown survive, and only well-formed layer entries are kept.
+        // (a) layers = null → empty, relations preserved.
+        let out = super::parse_curator_output(r#"{"relations":[],"layers":null}"#)
+            .expect("null layers tolerated, not a parse failure");
+        assert!(out.layers.is_empty());
+
+        // (b) one entry missing `repo_id` is dropped; the valid one survives; relations kept.
+        let reply = "{\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"x\",\"confidence\":50}],\
+            \"layers\":[{\"layer\":\"Core\",\"rank\":3},{\"repo_id\":2,\"layer\":\"Foundation\",\"rank\":0}]}";
+        let out = super::parse_curator_output(reply).expect("relations preserved despite a bad layer");
+        assert_eq!(out.relations.len(), 1, "relations survive a malformed layer entry");
+        assert_eq!(out.layers.len(), 1, "only the well-formed layer entry is kept");
+        assert_eq!((out.layers[0].repo_id, out.layers[0].rank), (2, 0));
     }
 
     #[test]

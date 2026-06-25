@@ -445,12 +445,12 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
 /// background passes collapse into one run; the UI follows `repo-graph-updated`.
 #[tauri::command]
 pub async fn reanalyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
-    // Clone the inner `Db` (Arc, 'static) — NOT the borrowed `State` — so it can move
-    // into the fire-and-forget task without the State's lifetime escaping.
-    let db_bg = db.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        crate::curator::analyze_workspace_coalesced(&db_bg, workspace_id, true).await;
-    });
+    // AWAIT the coalesced pass (don't fire-and-forget): `analyze_workspace_coalesced`
+    // resolves only once this request's work has completed, so the frontend can keep
+    // the Analyze control disabled for the ACTUAL pass — not just until the task spawns.
+    // It's serialized + coalesced, so a click landing mid-pass folds into one rerun
+    // rather than starting a parallel forced pass.
+    crate::curator::analyze_workspace_coalesced(&db, workspace_id, true).await;
     Ok(())
 }
 

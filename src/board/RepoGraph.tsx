@@ -209,7 +209,15 @@ export function RepoGraph() {
       (a, b) => (bandRank.get(b) ?? 0) - (bandRank.get(a) ?? 0) || a.localeCompare(b),
     );
 
-    const contentW = CARDS_PER_ROW * NODE_W + (CARDS_PER_ROW - 1) * CARD_GAP_X;
+    // Width the canvas to the WIDEST actual row — a band of N repos fills
+    // min(N, CARDS_PER_ROW) columns — not always CARDS_PER_ROW. Otherwise a 1–2 repo
+    // workspace got a ~7-column (~1.9k px) canvas that fit() couldn't shrink to (the
+    // MIN_Z clamp), leaving the map clipped/off-center.
+    const maxRowCards = Math.max(
+      1,
+      ...orderedLabels.map((label) => Math.min(CARDS_PER_ROW, byLabel.get(label)?.length ?? 0)),
+    );
+    const contentW = maxRowCards * NODE_W + (maxRowCards - 1) * CARD_GAP_X;
     const width = PAD + BAND_PAD + contentW + BAND_PAD + PAD;
     const pos = new Map<number, { x: number; y: number; w: number; h: number }>();
     const bands: { label: string; count: number; top: number; height: number }[] = [];
@@ -953,7 +961,11 @@ function EditableSummary({ profile }: { profile: RepoProfile }) {
   }, [open]);
 
   async function save() {
-    const next = text.trim();
+    // Collapse internal whitespace (incl. the newlines this multi-line textarea allows,
+    // and any pasted line breaks) to single spaces: the summary is a ONE-LINE field that
+    // build_curator_prompt interpolates per repo, so a stray newline would spill into
+    // extra prompt lines and confuse the relation/layer analysis.
+    const next = text.trim().replace(/\s+/g, " ");
     if (next === profile.summary) {
       setOpen(false);
       return;
