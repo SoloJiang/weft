@@ -40,6 +40,11 @@ pub struct ProfileView {
     pub category: String,
     /// Feature domains owned by this repo (agent-assigned).
     pub domains: Vec<String>,
+    /// Architectural layer label from the cross-repo pass (the map band's header
+    /// text). "" until the cross-repo analysis has assigned it.
+    pub layer: String,
+    /// Vertical rank of `layer` (higher = closer to the user; 0 = foundation).
+    pub layer_rank: i32,
 }
 
 /// The workspace dependency graph: every repo (placeholders included) + the
@@ -171,6 +176,15 @@ pub async fn edit_profile(
         }
         None => {}
     }
+    // A classification (tier/category) edit can make the stored architectural `layer`
+    // stale: the layered map PREFERS the agent's `layer` over the tier/category fallback,
+    // so without this the repo would stay in its old band (e.g. Business/Core) despite
+    // the new tier. Clear the layer so the map reflects the edit immediately via the
+    // fallback band; the next cross-repo pass re-derives a real layer. A summary-only
+    // edit leaves it (summary doesn't affect layering).
+    if tier.is_some() || category.is_some() {
+        let _ = repo::set_repo_layer_rank(db, repo_id, "", 0).await;
+    }
     // A manual edit where the user PROVIDES a canonical tier RECOVERS a repo whose
     // analysis failed: clear any lingering `failed` run-state so it stops reading as
     // a retryable failure (failed overrides analyzed in the UI). Gate on `tier`
@@ -219,6 +233,8 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
             analysis_error: None,
             category: String::new(),
             domains: Vec::new(),
+            layer: String::new(),
+            layer_rank: 0,
         };
     };
     ProfileView {
@@ -241,6 +257,8 @@ fn view_of(repo: &repo_ref::Model, profile: Option<&repo_profile::Model>) -> Pro
         analysis_error: p.analysis_error.clone(),
         category: p.category.clone(),
         domains: arr(&p.domains),
+        layer: p.layer.clone(),
+        layer_rank: p.layer_rank,
     }
 }
 
@@ -366,6 +384,45 @@ struct CuratorWire {
     /// tolerate an agent that omits it — the doc update is skipped, not a failure.
     #[serde(default)]
     repo_map_markdown: Option<String>,
+    /// Per-repo architectural layer assignment (label + rank). Optional: an agent
+    /// that omits it just leaves the prior layering. The cross-repo pass owns this
+    /// because only it sees the whole workspace, so the labels stay consistent.
+    /// Parsed BEST-EFFORT (`lenient_layers`): a present-but-malformed value (null,
+    /// non-array, or an element missing `repo_id`) must not sink the whole wire —
+    /// the relations + markdown may still be valid.
+    #[serde(default, deserialize_with = "lenient_layers")]
+    layers: Vec<RepoLayerWire>,
+}
+
+/// Tolerant deserialize for `layers`: an ABSENT key falls to `Default` (empty) and
+/// never reaches here; a PRESENT value is accepted only as a JSON array, keeping the
+/// elements that parse and dropping the rest (so one bad layer entry, or `null`,
+/// doesn't reject the entire dependency-analysis result).
+fn lenient_layers<'de, D>(d: D) -> Result<Vec<RepoLayerWire>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let arr = match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(a) => a,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(arr
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<RepoLayerWire>(item).ok())
+        .collect())
+}
+
+/// One repo's architectural-layer assignment from the cross-repo pass. `rank`
+/// orders the bands vertically (higher = closer to the user, 0 = foundation); the
+/// agent reuses the same label+rank for every repo in a layer.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RepoLayerWire {
+    pub repo_id: i32,
+    #[serde(default)]
+    pub layer: String,
+    #[serde(default)]
+    pub rank: i32,
 }
 
 /// The parsed result of the curator agent's cross-repo pass. Relations are always
@@ -375,6 +432,9 @@ pub struct CuratorOutput {
     /// A RedIM-style workspace doc synthesized by the analyst. `None` when the
     /// agent did not emit one (degrade gracefully — skip the doc update).
     pub repo_map_markdown: Option<String>,
+    /// Per-repo architectural layer assignment. Empty when the agent omitted it
+    /// (the caller then leaves the prior layering untouched).
+    pub layers: Vec<RepoLayerWire>,
 }
 
 /// Every balanced top-level `{...}` substring, in order. Byte-scans for the ASCII
@@ -447,6 +507,7 @@ pub fn parse_curator_output(text: &str) -> Option<CuratorOutput> {
             relations: w.relations,
             // Treat an explicit null or omitted key as None (skip doc update).
             repo_map_markdown: w.repo_map_markdown.filter(|s| !s.trim().is_empty()),
+            layers: w.layers,
         })
 }
 
@@ -697,6 +758,13 @@ fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> Str
         } else {
             format!(" domains=[{}]", domains.join(", "))
         };
+        // Surface the repo's current layer so a re-run keeps stable labels/ranks
+        // instead of renaming bands every pass.
+        let layer_str = if p.layer.is_empty() {
+            String::new()
+        } else {
+            format!(" layer={:?} rank={}", p.layer, p.layer_rank)
+        };
         // Use the live on-disk manifest hint (always available, even on first
         // analysis). Fall back to the persisted hint as a secondary source only when
         // the live scan yielded nothing (e.g. checkout temporarily unreadable).
@@ -709,8 +777,8 @@ fn build_curator_prompt(repos: &[(repo_ref::Model, repo_profile::Model)]) -> Str
             }
         };
         lines.push_str(&format!(
-            "- id={} name={:?} tier={} category={:?}{} path={:?}\n  summary: {}\n{}",
-            r.id, r.name, tier, category, domains_str, r.local_git_path, p.summary, manifest_hint
+            "- id={} name={:?} tier={} category={:?}{}{} path={:?}\n  summary: {}\n{}",
+            r.id, r.name, tier, category, domains_str, layer_str, r.local_git_path, p.summary, manifest_hint
         ));
     }
     format!(
@@ -737,7 +805,18 @@ the LAST thing in your reply, output a single JSON object and nothing after it:\
 {{\"relations\":[{{\"from\":<id>,\"to\":<id>,\"kind\":\"http|grpc|queue|infra|lib\",\
 \"via\":\"<short evidence>\",\"confidence\":<0-100>,\
 \"rationale\":\"<one sentence: why this dependency exists>\"}}],\
+\"layers\":[{{\"repo_id\":<id>,\"layer\":\"<layer name>\",\"rank\":<int>}}],\
 \"repo_map_markdown\":\"<markdown string>\"}}\n\
+The `layers` array assigns EVERY repo above to exactly one architectural layer for a \
+top-to-bottom map. YOU name the layers — choose the small set that best describes \
+THIS workspace (e.g. Foundation / Core / Service / Gateway / Client, or whatever \
+fits a data-pipeline, a pure-frontend project, etc.). `rank` orders the layers \
+vertically: 0 = the most foundational layer (shared libraries / IDL / things \
+everything else depends on), and INCREASES as you move up toward user-facing \
+entrypoints (clients, gateways). Reuse the EXACT same `layer` string and `rank` for \
+every repo in the same layer, and give different layers different ranks, so the map \
+groups them into clean bands. Derive the layering from the dependency direction you \
+found: a repo sits ABOVE everything it depends on.\n\
 The `repo_map_markdown` value MUST be a RedIM-style workspace map with these four \
 sections:\n\
 1. **Inventory** — grouped by tier→category; one bullet per repo with its purpose \
@@ -752,9 +831,11 @@ Include a relation when you have concrete evidence — for a runtime edge that m
 matching endpoint / topic / host / contract across the two repos. `via` is a short \
 label (e.g. \"POST /orders\", \"orders-topic\", \"shared postgres\", \
 \"@acme/api-client\"). `rationale` is one sentence explaining why the dependency \
-exists. If you find no cross-repo dependencies, output `{{\"relations\":[], \
-\"repo_map_markdown\":\"<still include the inventory and domain index>\"}}`. \
-`repo_map_markdown` must be a JSON string (escape newlines as \\\\n, quotes as \\\\\")."
+exists. Every repo id in the list MUST appear exactly once in `layers`. If you find \
+no cross-repo dependencies, still assign layers and output `{{\"relations\":[], \
+\"layers\":[…], \"repo_map_markdown\":\"<still include the inventory and domain \
+index>\"}}`. `repo_map_markdown` must be a JSON string (escape newlines as \\\\n, \
+quotes as \\\\\")."
     )
 }
 
@@ -1274,6 +1355,78 @@ pub fn cancel_analysis(thread_id: i32) {
     }
 }
 
+// ---- Direct (button) reanalysis cancellation -----------------------------------
+// The "Analyze deps" button runs a forced pass directly (no curator lead turn), so the
+// chat 中止 / `cancel_analysis(thread_id)` path can't reach it. Mirror the same
+// cooperative-token scheme keyed by WORKSPACE id instead (a separate registry so a
+// workspace id can't collide with a thread id), letting the toolbar's Stop trip it.
+fn ws_analysis_cancels(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>
+{
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Register a fresh cancel token for a workspace's direct (button) forced pass.
+pub fn register_ws_analysis_cancel(workspace_id: i32) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    ws_analysis_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(workspace_id, token.clone());
+    token
+}
+
+/// Drop a workspace's direct-pass cancel token once it finished — only if it's still
+/// the token THIS call registered (a newer click must not have its token removed).
+pub fn unregister_ws_analysis_cancel(
+    workspace_id: i32,
+    token: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut g = ws_analysis_cancels().lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(g.get(&workspace_id), Some(t) if std::sync::Arc::ptr_eq(t, token)) {
+        g.remove(&workspace_id);
+    }
+}
+
+/// Request cancellation of a workspace's in-flight direct (button) forced pass. No-op
+/// if none is registered.
+pub fn cancel_ws_analysis(workspace_id: i32) {
+    if let Some(token) = ws_analysis_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&workspace_id)
+    {
+        token.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Repo names a pass left UNANALYZED in this workspace, for surfacing after a forced
+/// pass (the curator chat's summary, the toolbar button's toast). Two sources the pass
+/// swallows: `analysis_state == "failed"` (classifier error/timeout/unparsable reply)
+/// and a MISSING checkout (`analyze_workspace` filters those out, so they're never
+/// marked failed). Shared by the bus reanalyze tool and the direct command.
+pub async fn unanalyzed_repo_names(db: &Db, workspace_id: i32) -> Vec<String> {
+    let repos = repo::list_repos(db, workspace_id).await.unwrap_or_default();
+    let mut names: Vec<String> = repo::repos_with_analysis_state(db, "failed")
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.workspace_id == workspace_id)
+        .map(|r| r.name)
+        .collect();
+    for r in &repos {
+        if !Path::new(&r.local_git_path).exists() && !names.contains(&r.name) {
+            names.push(r.name.clone());
+        }
+    }
+    names
+}
+
 /// The curator's user-initiated forced re-analysis: serialize against background passes
 /// via the gate LOCK, but run `analyze_workspace` directly with this call's own cancel
 /// token — deliberately NOT through the coalescing `dirty`/`force` flags, so cancelling
@@ -1287,7 +1440,22 @@ pub async fn reanalyze_workspace(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> bool {
     let gate = pass_gate(workspace_id);
-    let _g = gate.lock.lock().await;
+    // Acquire the gate, but OBSERVE cancellation while waiting: when a background/add
+    // pass already holds it, a Stop must return promptly instead of hanging until that
+    // unrelated pass finishes. The cancel token is cooperative (no async wake), so poll
+    // it while queued. `biased` prefers the lock, so an uncontended gate acquires with
+    // no delay.
+    let _g = loop {
+        tokio::select! {
+            biased;
+            g = gate.lock.lock() => break g,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return true;
+                }
+            }
+        }
+    };
     // Cancelled while queued behind another pass → don't start; that's a real cancel.
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return true;
@@ -1472,6 +1640,11 @@ async fn persist_repo_class(
     )
     .await?;
 
+    // Track whether this pass actually CHANGED the classification — drives the
+    // stale-layer clear below.
+    let prior_tier = prior.as_ref().map(|p| p.role.as_str()).unwrap_or("");
+    let mut classification_changed = tier.as_str() != prior_tier;
+
     // Persist category + domains when the agent provided them (Some = present,
     // even empty — clears prior; None = absent — preserves prior). (Finding 4)
     let has_category = wire.category.is_some();
@@ -1493,7 +1666,22 @@ async fn persist_repo_class(
             Some(ref d) => json_strs(d),
             None => prior_domains_json.to_string(),
         };
+        if final_category != prior_category {
+            classification_changed = true;
+        }
         let _ = repo::set_repo_category_domains(db, repo.id, &final_category, &final_domains_json).await;
+    }
+
+    // A real reclassification (tier/category changed) can make the stored architectural
+    // `layer` stale. The stage-2 relation pass would normally re-derive/clear it, but it
+    // might not run or might omit layers (Stop before stage 2, agent timeout) — in which
+    // case nothing else clears it and the map keeps the old band (it prefers `layer` over
+    // the tier/category fallback). Clear it here so a reclassified repo falls back to its
+    // new classification; a stage-2 pass that DOES emit fresh layers overwrites this.
+    // (Mirrors the manual edit_profile path. No-op when classification is unchanged, so a
+    // stable repo's layer isn't churned.)
+    if classification_changed {
+        let _ = repo::set_repo_layer_rank(db, repo.id, "", 0).await;
     }
     Ok(())
 }
@@ -1946,6 +2134,36 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
     if let Ok(text) = run_streaming_agent(&tool, &cwd, &prompt, &mut |_| {}).await {
         if let Some(output) = parse_curator_output(&text) {
             persist_relations(db, &profiled, &output.relations).await?;
+            // Persist agent-assigned layers for repos the agent actually saw (the
+            // profiled set). Best-effort per repo: a stray id outside the set, or a
+            // repo without a profile row, is simply skipped (set_repo_layer_rank no-ops).
+            // Track exactly which ids got a fresh layer so the cleanup below clears
+            // everything else (NOT the parsed-but-unwritten ids — a skipped repo the
+            // agent named would otherwise be neither written nor cleared, staying stale).
+            let profiled_ids: std::collections::HashSet<i32> =
+                profiled.iter().map(|(r, _)| r.id).collect();
+            let mut written: std::collections::HashSet<i32> = std::collections::HashSet::new();
+            for l in &output.layers {
+                if profiled_ids.contains(&l.repo_id) {
+                    let _ = repo::set_repo_layer_rank(db, l.repo_id, l.layer.trim(), l.rank).await;
+                    written.insert(l.repo_id);
+                }
+            }
+            // A PRESENT layers payload re-derives the whole map, so any current repo that
+            // did NOT get a fresh layer would otherwise keep a now-stale one (the map
+            // prefers the persisted layer over the tier/category fallback, and renders
+            // graph nodes for ALL repos — not just `profiled`). Clear every repo not
+            // freshly written — omitted profiled repos AND ones SKIPPED from the prompt
+            // (missing checkout / blank-or-failed profile) — so none lingers in an outdated
+            // band. (An absent/empty `layers` array isn't a re-derivation — leave it.)
+            if !output.layers.is_empty() {
+                let current = repo::list_repos(db, workspace_id).await.unwrap_or_default();
+                for r in &current {
+                    if !written.contains(&r.id) {
+                        let _ = repo::set_repo_layer_rank(db, r.id, "", 0).await;
+                    }
+                }
+            }
             fresh_markdown = output.repo_map_markdown;
         }
     }
@@ -2107,6 +2325,21 @@ mod tests {
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    #[test]
+    fn forced_pass_retries_failed_repo_auto_pass_skips_it() {
+        // The invariant the "Analyze deps" button relies on: a user-initiated FORCED
+        // pass re-classifies EVERY repo, including one stuck in `failed` (so a repo whose
+        // first analysis hit a transient error is retried), while an AUTO/background pass
+        // skips a failed repo (anti-storm). The button reaches this by triggering a forced
+        // pass directly — not by asking the (possibly-down) curator agent to do it.
+        assert!(super::should_analyze(true, true, false), "forced: retries a failed repo");
+        assert!(super::should_analyze(true, true, true), "forced: retries a failed repo that also needs it");
+        assert!(!super::should_analyze(true, false, true), "auto: skips a failed repo even when it needs classifying");
+        assert!(super::should_analyze(false, false, true), "auto: classifies a non-failed repo that needs it");
+        assert!(!super::should_analyze(false, false, false), "auto: skips an up-to-date repo");
+        assert!(super::should_analyze(false, true, false), "forced: re-reads even an up-to-date repo");
     }
 
     #[test]
@@ -2588,6 +2821,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_profile_classification_edit_clears_stale_layer() {
+        // The layered map PREFERS the agent's `layer` over the tier/category fallback,
+        // so a tier/category edit must clear the stored layer — otherwise the repo stays
+        // in its old band despite the new tier. A summary-only edit must NOT clear it.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "s", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_repo_layer_rank(&db, r.id, "Core", 3).await.unwrap();
+
+        // (a) tier edit clears the stale layer.
+        super::edit_profile(&db, r.id, None, Some("frontend"), None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "", "tier edit clears the stale layer");
+        assert_eq!(p.layer_rank, 0);
+
+        // (b) summary-only edit leaves the layer alone.
+        repo::set_repo_layer_rank(&db, r.id, "Client", 5).await.unwrap();
+        super::edit_profile(&db, r.id, Some("new summary"), None, None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!((p.layer.as_str(), p.layer_rank), ("Client", 5), "summary-only edit keeps the layer");
+    }
+
+    #[tokio::test]
+    async fn unanalyzed_repo_names_lists_failed_and_missing() {
+        // The post-pass report lists repos left unanalyzed: failed classification OR a
+        // missing checkout; a healthy repo is excluded.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        // A guaranteed-existing dir for the repos that should read as present (`/tmp`
+        // isn't guaranteed on Windows; `temp_dir()` is cross-platform).
+        let here = std::env::temp_dir();
+        let here = here.to_str().unwrap();
+        let a = repo::add_repo_ref(&db, ws.id, "failed-one", here, "main", "", true).await.unwrap();
+        repo::set_analysis_state(&db, a.id, "failed", Some("boom")).await.unwrap();
+        repo::add_repo_ref(&db, ws.id, "gone-one", "/no/such/path/here", "main", "", true).await.unwrap();
+        let c = repo::add_repo_ref(&db, ws.id, "healthy-one", here, "main", "", true).await.unwrap();
+        repo::upsert_repo_profile(&db, c.id, "backend", "[]", "s", "[]", "agent", "").await.unwrap();
+
+        let names = super::unanalyzed_repo_names(&db, ws.id).await;
+        assert!(names.contains(&"failed-one".to_string()), "failed repo listed");
+        assert!(names.contains(&"gone-one".to_string()), "missing-checkout repo listed");
+        assert!(!names.contains(&"healthy-one".to_string()), "healthy repo not listed");
+    }
+
+    #[tokio::test]
     async fn edit_profile_summary_only_keeps_persisted_failure() {
         // A summary-only edit INHERITS the prior tier without re-classifying, so it
         // must NOT silently clear a real failure (no re-run happened).
@@ -2812,6 +3095,38 @@ mod tests {
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.role, "frontend", "agent-filled tier is refreshable");
         assert_eq!(p.summary, "mine", "user summary still pinned");
+    }
+
+    #[tokio::test]
+    async fn persist_repo_class_clears_layer_on_reclassification() {
+        // A reclassification (tier change) clears the stale layer — a stage-2 pass might
+        // not run / might omit layers, so nothing else would. Re-confirming the SAME
+        // classification keeps a freshly-set layer (no churn for stable repos).
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "x", "/tmp/x", "main", "", true).await.unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "s", "[]", "agent", "").await.unwrap();
+        repo::set_repo_layer_rank(&db, r.id, "Core", 3).await.unwrap();
+        let mk = |tier: &str| super::RepoClassWire {
+            name: None,
+            tier: tier.into(),
+            summary: "agent".into(),
+            stack: None,
+            components: None,
+            ..Default::default()
+        };
+
+        // (a) tier change backend → frontend clears the stale layer.
+        super::persist_repo_class(&db, &r, mk("frontend"), "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.role, "frontend");
+        assert_eq!((p.layer.as_str(), p.layer_rank), ("", 0), "reclassification clears the stale layer");
+
+        // (b) re-confirming the same tier keeps a freshly-set layer.
+        repo::set_repo_layer_rank(&db, r.id, "Client", 5).await.unwrap();
+        super::persist_repo_class(&db, &r, mk("frontend"), "").await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!((p.layer.as_str(), p.layer_rank), ("Client", 5), "unchanged classification keeps the layer");
     }
 
     #[tokio::test]
@@ -3282,6 +3597,43 @@ mod tests {
             out.repo_map_markdown.as_deref(),
             Some("## Inventory\n- web (frontend)")
         );
+    }
+
+    #[test]
+    fn parse_curator_output_reads_layers() {
+        // The cross-repo pass assigns each repo a layer label + rank.
+        let reply = "{\"relations\":[],\
+            \"layers\":[{\"repo_id\":1,\"layer\":\"Client\",\"rank\":5},\
+            {\"repo_id\":2,\"layer\":\"Foundation\",\"rank\":0}]}";
+        let out = super::parse_curator_output(reply).expect("parsed layers");
+        assert_eq!(out.layers.len(), 2);
+        assert_eq!((out.layers[0].repo_id, out.layers[0].layer.as_str(), out.layers[0].rank), (1, "Client", 5));
+        assert_eq!((out.layers[1].repo_id, out.layers[1].layer.as_str(), out.layers[1].rank), (2, "Foundation", 0));
+    }
+
+    #[test]
+    fn parse_curator_output_layers_default_empty_when_omitted() {
+        // An older/omitting agent reply yields empty layers (caller preserves prior).
+        let out = super::parse_curator_output(r#"{"relations":[]}"#).expect("parsed");
+        assert!(out.layers.is_empty(), "omitted layers must default to empty");
+    }
+
+    #[test]
+    fn parse_curator_output_tolerates_malformed_layers() {
+        // A present-but-malformed `layers` must NOT sink the whole result: relations +
+        // markdown survive, and only well-formed layer entries are kept.
+        // (a) layers = null → empty, relations preserved.
+        let out = super::parse_curator_output(r#"{"relations":[],"layers":null}"#)
+            .expect("null layers tolerated, not a parse failure");
+        assert!(out.layers.is_empty());
+
+        // (b) one entry missing `repo_id` is dropped; the valid one survives; relations kept.
+        let reply = "{\"relations\":[{\"from\":1,\"to\":2,\"kind\":\"http\",\"via\":\"x\",\"confidence\":50}],\
+            \"layers\":[{\"layer\":\"Core\",\"rank\":3},{\"repo_id\":2,\"layer\":\"Foundation\",\"rank\":0}]}";
+        let out = super::parse_curator_output(reply).expect("relations preserved despite a bad layer");
+        assert_eq!(out.relations.len(), 1, "relations survive a malformed layer entry");
+        assert_eq!(out.layers.len(), 1, "only the well-formed layer entry is kept");
+        assert_eq!((out.layers[0].repo_id, out.layers[0].rank), (2, 0));
     }
 
     #[test]

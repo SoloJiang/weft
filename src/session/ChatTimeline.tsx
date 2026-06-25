@@ -87,6 +87,7 @@ export function ChatTimeline({
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const atBottomRef = useRef(true);
+  const rootRef = useRef<HTMLDivElement>(null);
 
   // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
   // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
@@ -101,12 +102,49 @@ export function ChatTimeline({
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
   }, [visible.length, growthLen, busy, activity]);
 
-  if (visible.length === 0 && !busy && asks.length === 0) {
+  // Switching THREADS swaps this timeline's data without remounting it (e.g. the lead
+  // chat stays mounted as the active thread changes), so Virtuoso keeps the previous
+  // thread's scroll position. Reset the at-bottom intent and re-pin to the latest, so
+  // switching into a chat always lands at the bottom. (rAF lets the new data lay out;
+  // if it loads async the at-bottom reset makes the message-growth effect above scroll
+  // once it arrives.)
+  useEffect(() => {
+    atBottomRef.current = true;
+    requestAnimationFrame(() =>
+      virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" }),
+    );
+  }, [threadId]);
+
+  const showList = visible.length > 0 || busy || asks.length > 0;
+
+  // Re-pin to the latest message when this timeline is REVEALED (its height goes
+  // 0 → >0). A chat kept mounted-but-hidden (the curator behind the detail surface,
+  // an inactive tab) can't position its virtualized list while `display:none`, so the
+  // initial bottom-scroll is lost and switching in would land mid-history. rAF lets
+  // Virtuoso lay out at the new size before we scroll.
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let prevH = el.offsetHeight;
+    const ro = new ResizeObserver(() => {
+      const h = el.offsetHeight;
+      if (prevH === 0 && h > 0) {
+        requestAnimationFrame(() =>
+          virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" }),
+        );
+      }
+      prevH = h;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [showList]);
+
+  if (!showList) {
     return <>{emptyState}</>;
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div ref={rootRef} className="flex min-h-0 flex-1 flex-col">
       <Virtuoso<LeadMessage>
         ref={virtuosoRef}
         className="min-h-0 flex-1"

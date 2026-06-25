@@ -67,6 +67,18 @@ export const api = {
   // Repo map (curator): profiles + cross-repo dependency graph.
   repoGraph: (workspaceId: number) =>
     invoke<RepoGraph>("repo_graph", { workspaceId }),
+  // "Analyze deps": run a deterministic FORCED analysis pass (cancellable). Unlike the
+  // auto pass, a forced pass retries repos stuck in `failed` (a first analysis that hit
+  // a transient error). The promise resolves when the pass completes (or is cancelled)
+  // with a report the caller surfaces (all-checkouts-missing, or repos left unanalyzed).
+  reanalyzeWorkspaceDeps: (workspaceId: number) =>
+    invoke<{ all_missing: boolean; cancelled: boolean; unanalyzed: string[] }>(
+      "reanalyze_workspace_deps",
+      { workspaceId },
+    ),
+  // Stop an in-flight "Analyze deps" forced pass (bails at the next safe point).
+  cancelReanalyzeWorkspaceDeps: (workspaceId: number) =>
+    invoke<void>("cancel_reanalyze_workspace_deps", { workspaceId }),
   // Remove a repo from its workspace (ref + profile + bound tasks + worktrees).
   // The user's actual repository on disk is left untouched.
   deleteRepo: (repoId: number) =>

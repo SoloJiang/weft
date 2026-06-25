@@ -43,6 +43,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0030AnalysisState),
             Box::new(M0031RepoCategoryDomains),
             Box::new(M0032LeadMessageSeq),
+            Box::new(M0033RepoLayerRank),
         ]
     }
 }
@@ -1434,6 +1435,78 @@ impl MigrationTrait for M0032LeadMessageSeq {
     }
 }
 
+/// Adds `layer` (TEXT NOT NULL DEFAULT '') and `layer_rank` (INTEGER NOT NULL
+/// DEFAULT 0) to `repo_profile`. The cross-repo curator pass assigns these so the
+/// repo map can stack repos into agent-named architectural bands. A fresh db
+/// already has them (M0002 reflects the entity); sqlite has no ADD COLUMN IF NOT
+/// EXISTS, so the duplicate is tolerated.
+pub struct M0033RepoLayerRank;
+impl MigrationName for M0033RepoLayerRank {
+    fn name(&self) -> &str {
+        "m0033_repo_layer_rank"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0033RepoLayerRank {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r1 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("layer"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r1 {
+            Ok(()) => {}
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+            Err(e) => return Err(e),
+        }
+        let r2 = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("layer_rank"))
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r2 {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("layer"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("repo_profile"))
+                    .drop_column(Alias::new("layer_rank"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1511,6 +1584,26 @@ mod tests {
         // Both columns must exist with their defaults.
         assert_eq!(p.category, "", "category column must exist and default to empty");
         assert_eq!(p.domains, "[]", "domains column must exist and default to '[]'");
+    }
+
+    /// M0033: layer and layer_rank columns are present after migration and default correctly.
+    #[tokio::test]
+    async fn m0033_layer_rank_columns_added() {
+        use crate::store::Db;
+        use crate::store::repo::{add_repo_ref, create_workspace, get_repo_profile, upsert_repo_profile};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        // Both columns must exist with their defaults.
+        assert_eq!(p.layer, "", "layer column must exist and default to empty");
+        assert_eq!(p.layer_rank, 0, "layer_rank column must exist and default to 0");
     }
 
     /// M0029: raw-query path rewrites gateway components without touching

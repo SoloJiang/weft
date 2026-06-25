@@ -9,6 +9,7 @@ export {
   PromptInputAttachment,
   PromptInputButton,
   PromptInputProvider,
+  PromptInputStop,
   PromptInputSubmit,
   PromptInputTextarea,
   PromptInputTools,

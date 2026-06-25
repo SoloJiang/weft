@@ -49,6 +49,17 @@ pub struct Model {
     /// JSON array of owned feature domains (agent-assigned). "[]" until classified.
     #[sea_orm(default_value = "[]")]
     pub domains: String,
+    /// Architectural layer label, assigned by the cross-repo curator pass (which sees
+    /// the whole workspace, so the labels are consistent across repos). Free text the
+    /// agent names itself, e.g. "Foundation"/"Core 核心"/"Client". "" until classified.
+    /// Drives the repo map's stacked-band layout; this is the band's header text.
+    #[sea_orm(default_value = "")]
+    pub layer: String,
+    /// Vertical rank of `layer`: higher = closer to the user (client/top), 0 = most
+    /// foundational (bottom). The agent reuses the same label+rank for every repo in a
+    /// layer so the map can aggregate them into one band. 0 until classified.
+    #[sea_orm(default_value = "0")]
+    pub layer_rank: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

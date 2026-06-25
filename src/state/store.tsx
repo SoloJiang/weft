@@ -10,6 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import i18n, { currentLang } from "../i18n";
+import { toast } from "../components/Toast";
 import { mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -182,9 +183,14 @@ interface Store {
   /** Trigger a re-analysis: posts a message to the 仓库分析助手, which runs the one
    *  `reanalyze` tool. Used by the graph button and the map's regenerate. */
   reanalyzeDeps: () => Promise<void>;
+  /** Stop the active workspace's in-flight direct (button) forced pass. */
+  cancelReanalyze: () => void;
   /** The active workspace's 仓库分析助手 is mid-turn (e.g. running `reanalyze`) — the
    *  Analyze entries disable while true so a click can't queue a redundant pass. */
   analyzing: boolean;
+  /** A DIRECT (button) forced pass is running for the active workspace — distinct from
+   *  `analyzing` (which also covers the chat-driven turn). The toolbar shows Stop. */
+  reanalyzing: boolean;
   deleteRepo: (repoId: number) => Promise<void>;
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
@@ -1799,21 +1805,56 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Keyed by workspace so an in-flight send for one workspace never swallows a click
   // in another.
   const reanalyzeSendingRef = useRef<Set<number>>(new Set());
+  // Workspaces with a forced pass in flight. The `reanalyzeWorkspaceDeps` command now
+  // AWAITS the pass, so this stays set for the pass's full (minutes-long) duration and
+  // feeds `analyzing` below — keeping the Analyze control disabled/spinning the whole
+  // time, since the direct pass no longer starts a curator lead turn to derive busy from.
+  const [reanalyzingWs, setReanalyzingWs] = useState<Set<number>>(() => new Set());
   const reanalyzeDeps = useCallback(async () => {
     const ws = activeWorkspaceId;
     if (ws == null || reanalyzeSendingRef.current.has(ws)) return;
     reanalyzeSendingRef.current.add(ws);
+    setReanalyzingWs((s) => new Set(s).add(ws));
     try {
-      const tid = await ensureCuratorThreadId(ws);
-      // `tid` is ws's curator thread — deliver the reanalysis turn even if the user
-      // navigated away while the thread was being ensured; only opening the drawer
-      // (which targets the *active* workspace's curator) is gated on still being on ws.
+      // Trigger the forced pass DIRECTLY (deterministic), rather than sending a chat
+      // message and depending on the curator agent to invoke its reanalyze tool — that
+      // path silently did nothing whenever the agent backend was down, so a repo whose
+      // first analysis hit a transient error stayed `failed` forever (auto passes skip
+      // failed repos). A forced pass retries them. Still open the curator so progress
+      // (running cards / map) and follow-up questions stay in one place. The await spans
+      // the whole pass (the command awaits it), so the button stays disabled throughout.
       if (activeWorkspaceIdRef.current === ws) openCurator();
-      await sendLeadChat(tid, i18n.t("repomap.reanalyzeMessage"));
+      const report = await api.reanalyzeWorkspaceDeps(ws);
+      // Surface the feedback the curator chat tool gives (the button bypasses it):
+      // all checkouts missing (skipped), or repos left unanalyzed after the pass. The
+      // pass can take minutes; if the user switched workspaces meanwhile, this report is
+      // about `ws`, not the now-active one — don't pop it as the active workspace's
+      // status (mirrors the openCurator guard above).
+      if (activeWorkspaceIdRef.current === ws) {
+        if (report.all_missing) {
+          toast(i18n.t("repomap.reanalyzeAllMissing"));
+        } else if (!report.cancelled && report.unanalyzed.length > 0) {
+          toast(
+            i18n.t("repomap.reanalyzeUnanalyzed", {
+              count: report.unanalyzed.length,
+              names: report.unanalyzed.join(", "),
+            }),
+          );
+        }
+      }
     } finally {
       reanalyzeSendingRef.current.delete(ws);
+      setReanalyzingWs((s) => {
+        const n = new Set(s);
+        n.delete(ws);
+        return n;
+      });
     }
-  }, [activeWorkspaceId, ensureCuratorThreadId, openCurator, sendLeadChat]);
+  }, [activeWorkspaceId, openCurator]);
+  const cancelReanalyze = useCallback(() => {
+    const ws = activeWorkspaceId;
+    if (ws != null) void api.cancelReanalyzeWorkspaceDeps(ws);
+  }, [activeWorkspaceId]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
@@ -2212,7 +2253,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // selectWorkspace clears on switch — so the Analyze entries stay disabled while
   // its turn is busy even right after a switch.
   const curatorTid = threads.find((th) => th.kind === "curator")?.id;
-  const analyzing = curatorTid != null && leadTurn[curatorTid]?.state === "busy";
+  // Busy when EITHER the curator's chat-driven reanalyze turn is running, OR a direct
+  // forced pass (button) is in flight for the active workspace — the latter has no lead
+  // turn, so it'd otherwise leave the Analyze control enabled mid-pass.
+  const reanalyzing = activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId);
+  const analyzing =
+    (curatorTid != null && leadTurn[curatorTid]?.state === "busy") || reanalyzing;
 
   const value: Store = {
     workspaces,
@@ -2291,7 +2337,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshRepoMap,
     refreshReposAndMap,
     reanalyzeDeps,
+    cancelReanalyze,
     analyzing,
+    reanalyzing,
     deleteRepo,
     curatorThreadId,
     ensureCuratorThread,

@@ -6,7 +6,6 @@ import {
   Paperclip,
   Send,
   SlashSquare,
-  Square,
   SquareTerminal,
 } from "lucide-react";
 import type { ImageAttachment, SlashCmd } from "../lib/types";
@@ -21,6 +20,7 @@ import {
   PromptInputAttachment,
   PromptInputButton,
   PromptInputProvider,
+  PromptInputStop,
   PromptInputSubmit,
   PromptInputTextarea,
   PromptInputTools,
@@ -407,15 +407,7 @@ function ChatComposerBody({
 
   function renderSubmitButton() {
     if (busy) {
-      return (
-        <PromptInputButton
-          onClick={guardedStop}
-          tooltip={t("lead.stop")}
-          className="text-danger hover:bg-danger/10 hover:text-danger"
-        >
-          <Square size={14} />
-        </PromptInputButton>
-      );
+      return <PromptInputStop onClick={guardedStop} label={t("lead.stop")} />;
     }
     return (
       <PromptInputSubmit

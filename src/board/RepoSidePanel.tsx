@@ -1,60 +1,56 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
-import { X, RefreshCw } from "lucide-react";
+import { X } from "lucide-react";
 import { useStore } from "../state/store";
 import { LeadTab } from "../session/LeadTab";
 import { clampPanelWidth } from "../session/panelWidth";
 import { RepoDetailContent } from "./RepoGraph";
-import { Markdown } from "../components/Markdown";
-import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 
-// Per-surface remembered width (localStorage, like DiffPanel/FileTreePanel — not
-// per-workspace store state). Detail is profile-narrow; the curator chat is wider.
-const WIDTH = {
-  detail: { key: "weft-repodetail-w", def: 360, min: 280, max: 520 },
-  curator: { key: "weft-curator-w", def: 420, min: 320, max: 620 },
-} as const;
-type Surface = keyof typeof WIDTH;
-// Window-aware clamp (like DiffPanel/FileTreePanel): caps the drawer to its
-// [min, max] AND to the current window, so an open drawer can't crowd out the
-// repo graph at the 600px floor.
-const clampW = (s: Surface, n: number) => clampPanelWidth(n, WIDTH[s].min, WIDTH[s].max);
-// Bound to the surface's [min, max] WITHOUT the window cap — this is the stored
-// "intended" width; clampW additionally applies the live window cap at render.
-const boundRange = (s: Surface, n: number) =>
-  Math.max(WIDTH[s].min, Math.min(WIDTH[s].max, n));
+// ONE remembered panel width (localStorage, like DiffPanel/FileTreePanel — not
+// per-workspace store state), SHARED by both surfaces. Detail and the curator chat
+// used to remember separate widths, but they render in the same animated-width
+// aside, so switching surfaces slid the panel between the two widths. A single width
+// keeps the edge fixed across switches; the range spans both surfaces' needs.
+const PANEL_W = { key: "weft-repopanel-w", def: 420, min: 320, max: 620 } as const;
+// Window-aware clamp (like DiffPanel/FileTreePanel): caps the drawer to [min, max]
+// AND to the current window, so an open drawer can't crowd out the repo graph at the
+// 600px floor.
+const clampW = (n: number) => clampPanelWidth(n, PANEL_W.min, PANEL_W.max);
+// Bound to [min, max] WITHOUT the window cap — this is the stored "intended" width;
+// clampW additionally applies the live window cap at render.
+const boundRange = (n: number) => Math.max(PANEL_W.min, Math.min(PANEL_W.max, n));
 
 /**
  * The Repos view's right side panel — one mutually-exclusive slot, no tabs.
  * Detail (RepoDetailContent) opens by clicking a repo card; the dependency
  * curator (LeadTab) opens from the top-bar button. Modeled on DiffPanel: an
  * animated-width flex column that pushes the graph narrower (not an overlay),
- * with a left-edge drag-resize and per-surface remembered width. The curator
- * chat is mounted lazily on first open and kept alive after that.
+ * with a left-edge drag-resize and one shared remembered width (so switching
+ * surfaces never slides the edge). The curator chat is mounted lazily on first
+ * open and kept alive after that.
  */
 export function RepoSidePanel() {
   const { repoDrawerOpen, repoDrawerTab, selectedRepoId, closeRepoDrawer, curatorThreadId, ensureCuratorThread } =
     useStore();
   const { t } = useTranslation();
-  const surface = repoDrawerTab as Surface;
+  const surface = repoDrawerTab;
 
-  // Persist the user's INTENDED width, bounded to the surface's [min, max] only
-  // (not the window). The window cap is applied at render below, so shrinking the
-  // window narrows the panel without forgetting the chosen width — it springs
-  // back when the window grows again.
-  const [intended, setIntended] = useState(() => ({
-    detail: boundRange("detail", Number(localStorage.getItem(WIDTH.detail.key)) || WIDTH.detail.def),
-    curator: boundRange("curator", Number(localStorage.getItem(WIDTH.curator.key)) || WIDTH.curator.def),
-  }));
-  const w = clampW(surface, intended[surface]);
+  // Persist the user's INTENDED width, bounded to [min, max] only (not the window).
+  // The window cap is applied at render below, so shrinking the window narrows the
+  // panel without forgetting the chosen width — it springs back when it grows again.
+  // One value, shared by both surfaces, so switching detail ↔ curator never animates
+  // a width change.
+  const [intended, setIntended] = useState(() =>
+    boundRange(Number(localStorage.getItem(PANEL_W.key)) || PANEL_W.def),
+  );
+  const w = clampW(intended);
   const [dragging, setDragging] = useState(false);
   const drag = useRef<{ x: number; w: number } | null>(null);
   const setW = (n: number) => {
-    const bounded = boundRange(surface, n);
-    setIntended((prev) => ({ ...prev, [surface]: bounded }));
-    localStorage.setItem(WIDTH[surface].key, String(bounded));
+    const bounded = boundRange(n);
+    setIntended(bounded);
+    localStorage.setItem(PANEL_W.key, String(bounded));
   };
 
   // A resize doesn't change the intended width, only the rendered window cap —
@@ -156,157 +152,34 @@ export function RepoSidePanel() {
   );
 }
 
-type CuratorView = "chat" | "map";
-
-/** The curator surface, kept mounted across switches; `hidden` when inactive. */
+/** The curator surface — just the chat. (The separate markdown "Map" tab was
+ *  removed: the main Repos view is the dependency map now.) Kept mounted across
+ *  surface switches; `hidden` when inactive so chat scroll/draft survive.
+ *
+ *  min-w-0: without it this flex child adopts its wide descendant's min-content
+ *  width (a long code/mermaid line in the chat) and grows past the fixed-width
+ *  aside. LeadTab's own root already has min-w-0; the leak was this wrapper. */
 function CuratorBody({ active, threadId }: { active: boolean; threadId: number | null }) {
   const { t } = useTranslation();
-  const { activeWorkspaceId, reanalyzeDeps, analyzing } = useStore();
-  const [view, setView] = useState<CuratorView>("chat");
-  const [mapDoc, setMapDoc] = useState<string | null | undefined>(undefined);
-
-  useEffect(() => {
-    // Gate on `active` too: this panel stays mounted while hidden behind the detail
-    // surface, and detail-side mutations (profile edit, delete) clear the persisted
-    // doc while we're hidden. Re-running when the panel becomes active again
-    // refetches, so we never render markdown the backend already invalidated.
-    if (!active || view !== "map" || activeWorkspaceId == null) return;
-    const ws = activeWorkspaceId;
-    let cancelled = false;
-    // Single guarded fetch used by the initial load, the graph-update re-fetch, and
-    // the re-show refetch. `mapDoc` is kept in the mounted curator panel, so without
-    // the `cancelled` + captured-`ws` guard a late response could repopulate the
-    // panel with another workspace's markdown after a switch. A failed fetch falls
-    // back to empty.
-    const load = () => {
-      api
-        .getRepoMapDoc(ws)
-        .then((doc) => {
-          if (!cancelled) setMapDoc(doc);
-        })
-        .catch(() => {
-          if (!cancelled) setMapDoc(null);
-        });
-    };
-    // Reset to the loading state immediately so a switch/re-show never shows a stale map.
-    setMapDoc(undefined);
-    load();
-    // Re-fetch when the backend signals a graph update while map is open.
-    const unlistenP = listen<number>("repo-graph-updated", (e) => {
-      if (e.payload === ws) load();
-    });
-    return () => {
-      cancelled = true;
-      void unlistenP.then((f) => f());
-    };
-  }, [active, view, activeWorkspaceId]);
-
-  function renderMapBody() {
-    if (mapDoc === undefined) {
-      return (
-        <div className="flex h-full items-center justify-center text-[12px] text-ink-faint">
-          {t("repomap.curatorLoading")}
-        </div>
-      );
-    }
-    if (mapDoc === null) {
-      return (
-        <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
-          <p className="text-[12px] text-ink-faint">{t("repomap.mapEmpty")}</p>
-          <button
-            onClick={() => {
-              setView("chat");
-              void reanalyzeDeps();
-            }}
-            disabled={analyzing}
-            className="flex items-center gap-1.5 rounded-[var(--radius-md)] bg-brand-ghost px-3 py-1.5 text-[11.5px] font-medium text-brand transition-colors hover:bg-brand/20 disabled:opacity-50"
-          >
-            <RefreshCw size={12} className={analyzing ? "animate-spin" : ""} />
-            {t("repomap.reanalyze")}
-          </button>
-        </div>
-      );
-    }
-    return (
-      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-3">
-        <div className="mb-3 flex justify-end">
-          <button
-            onClick={() => {
-              setView("chat");
-              void reanalyzeDeps();
-            }}
-            disabled={analyzing}
-            title={t("repomap.reanalyze")}
-            className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-faint transition-colors hover:bg-raised hover:text-ink disabled:opacity-50"
-          >
-            <RefreshCw size={11} className={analyzing ? "animate-spin" : ""} />
-            {t("repomap.reanalyze")}
-          </button>
-        </div>
-        <Markdown text={mapDoc} />
-      </div>
-    );
-  }
-
-  // min-w-0 on this column and the chat/map wrappers below: without it these flex
-  // children adopt their wide descendant's min-content width (a long code/mermaid
-  // line in the chat) and grow past the fixed-width aside, shifting and clipping the
-  // tab row. LeadTab's own root already has min-w-0; the leak was these wrappers.
   return (
     <div className={cn("min-h-0 min-w-0 flex-1 flex-col", active ? "flex" : "hidden")}>
-      {/* chat / map segmented toggle */}
-      <div className="flex shrink-0 gap-0.5 border-b border-border px-3 py-1.5">
-        <button
-          onClick={() => setView("chat")}
-          className={cn(
-            "rounded-[var(--radius-sm)] px-2.5 py-1 text-[11.5px] font-medium transition-colors",
-            view === "chat"
-              ? "bg-raised text-ink"
-              : "text-ink-faint hover:bg-raised/60 hover:text-ink",
-          )}
-        >
-          {t("repomap.chatTab")}
-        </button>
-        <button
-          onClick={() => setView("map")}
-          className={cn(
-            "rounded-[var(--radius-sm)] px-2.5 py-1 text-[11.5px] font-medium transition-colors",
-            view === "map"
-              ? "bg-raised text-ink"
-              : "text-ink-faint hover:bg-raised/60 hover:text-ink",
-          )}
-        >
-          {t("repomap.mapTab")}
-        </button>
-      </div>
-
-      {/* chat view: keep LeadTab mounted so scroll/draft survive toggling */}
-      <div className={cn("min-h-0 min-w-0 flex-1 flex-col", view === "chat" ? "flex" : "hidden")}>
-        {threadId != null ? (
-          <LeadTab
-            threadId={threadId}
-            compact
-            composePlaceholder={t("repomap.curatorCompose")}
-            emptyState={
-              <div className="flex flex-1 items-center justify-center px-6 text-center">
-                <p className="max-w-[420px] text-[12px] leading-relaxed text-ink-faint">
-                  {t("repomap.curatorEmpty")}
-                </p>
-              </div>
-            }
-            onReview={() => {}}
-          />
-        ) : (
-          <div className="flex h-full items-center justify-center text-[12px] text-ink-faint">
-            {t("repomap.curatorLoading")}
-          </div>
-        )}
-      </div>
-
-      {/* map view */}
-      {view === "map" && (
-        <div className="min-h-0 min-w-0 flex-1 flex flex-col">
-          {renderMapBody()}
+      {threadId != null ? (
+        <LeadTab
+          threadId={threadId}
+          compact
+          composePlaceholder={t("repomap.curatorCompose")}
+          emptyState={
+            <div className="flex flex-1 items-center justify-center px-6 text-center">
+              <p className="max-w-[420px] text-[12px] leading-relaxed text-ink-faint">
+                {t("repomap.curatorEmpty")}
+              </p>
+            </div>
+          }
+          onReview={() => {}}
+        />
+      ) : (
+        <div className="flex h-full items-center justify-center text-[12px] text-ink-faint">
+          {t("repomap.curatorLoading")}
         </div>
       )}
     </div>

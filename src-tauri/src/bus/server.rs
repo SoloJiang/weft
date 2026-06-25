@@ -449,25 +449,9 @@ async fn reanalyze_after_register(
     }
     let g = crate::curator::graph(db, ws_id).await?;
     // Surface repos the pass left unclassified so the human sees them in the chat (the
-    // map node renders them as plain "未分析"). Two sources, both swallowed by the pass:
-    //   - analysis_state = "failed": a per-repo classifier error (missing agent,
-    //     timeout, unparsable reply);
-    //   - a MISSING checkout: `analyze_workspace` filters these out up front (so they
-    //     are never marked failed), and the all-missing guard above only fires when
-    //     EVERY checkout is gone — a partially-missing workspace would otherwise report
-    //     a clean "complete".
-    let mut unanalyzed: Vec<String> = crate::store::repo::repos_with_analysis_state(db, "failed")
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.workspace_id == ws_id)
-        .map(|r| r.name)
-        .collect();
-    for r in &repos {
-        if !std::path::Path::new(&r.local_git_path).exists() && !unanalyzed.contains(&r.name) {
-            unanalyzed.push(r.name.clone());
-        }
-    }
+    // map node renders them as plain "未分析"). Shared with the direct button command via
+    // `unanalyzed_repo_names` (failed classification OR missing checkout).
+    let unanalyzed = crate::curator::unanalyzed_repo_names(db, ws_id).await;
     let mut msg = format!(
         "Re-analysis complete: {} repos, {} dependency links. The repo map has been refreshed.",
         g.nodes.len(),

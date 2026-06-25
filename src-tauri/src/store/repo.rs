@@ -807,6 +807,24 @@ pub async fn set_repo_category_domains(
     Ok(())
 }
 
+/// Persist the cross-repo curator pass's architectural `layer` label + `layer_rank`
+/// for a repo. Only these two columns are touched; all other profile fields are left
+/// unchanged. No-op if the repo has no profile row yet.
+pub async fn set_repo_layer_rank(
+    db: &Db,
+    repo_id: i32,
+    layer: &str,
+    layer_rank: i32,
+) -> Result<()> {
+    if let Some(m) = get_repo_profile(db, repo_id).await? {
+        let mut a: repo_profile::ActiveModel = m.into();
+        a.layer = Set(layer.to_string());
+        a.layer_rank = Set(layer_rank);
+        a.update(&db.0).await?;
+    }
+    Ok(())
+}
+
 /// Persist a repo's analysis run-state (durable across restarts). Clears the
 /// error unless state == "failed".
 ///
@@ -951,7 +969,15 @@ pub async fn calibrate_repo_relation(
         ..Default::default()
     });
     let json = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
-    set_repo_relations(db, from_id, &json).await
+    set_repo_relations(db, from_id, &json).await?;
+    // A pinned edge changes the relative ordering of BOTH endpoints — the consumer's
+    // depth AND where the target must sit relative to it (a target whose stored layer
+    // currently ranks it ABOVE its new consumer would contradict the edge). The map reads
+    // layers, not edges, so clear both stored `layer`/`layer_rank` → both fall back to the
+    // tier/category band until the next cross-repo pass re-derives. (No-op for an endpoint
+    // without a profile row.)
+    set_repo_layer_rank(db, from_id, "", 0).await?;
+    set_repo_layer_rank(db, to_id, "", 0).await
 }
 
 pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::Model>> {
@@ -2499,6 +2525,30 @@ mod tests {
         let created = removed.iter().find(|t| t.1 == "/tmp/r-wt2").unwrap();
         assert!(created.3, "weft-created branch must have created_branch=true");
         assert!(created.4, "created_checkout defaults to true");
+    }
+
+    #[tokio::test]
+    async fn calibrate_repo_relation_clears_both_endpoint_layers() {
+        // Pinning/removing an edge changes the relative ordering of BOTH endpoints; the
+        // map now reads layers (not edges), so both stale layers must be cleared
+        // (→ tier/category fallback) until the next pass re-derives.
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true).await.unwrap();
+        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "").await.unwrap();
+        upsert_repo_profile(&db, api.id, "backend", "[]", "", "[]", "agent", "").await.unwrap();
+        set_repo_layer_rank(&db, web.id, "Client", 5).await.unwrap();
+        set_repo_layer_rank(&db, api.id, "Service", 4).await.unwrap();
+
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "Pricing.Quote", "add")
+            .await
+            .unwrap();
+
+        let from = get_repo_profile(&db, web.id).await.unwrap().unwrap();
+        assert_eq!((from.layer.as_str(), from.layer_rank), ("", 0), "consumer layer cleared");
+        let to = get_repo_profile(&db, api.id).await.unwrap().unwrap();
+        assert_eq!((to.layer.as_str(), to.layer_rank), ("", 0), "target layer cleared too");
     }
 
     #[tokio::test]
@@ -4080,6 +4130,55 @@ mod tests {
         let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!(p.category, "", "fresh row: category defaults to empty string");
         assert_eq!(p.domains, "[]", "fresh row: domains defaults to '[]'");
+    }
+
+    /// M0033: set_repo_layer_rank writes and reads back; upsert_repo_profile does NOT
+    /// touch layer/layer_rank (preservation invariant — agent re-classify keeps the
+    /// cross-repo pass's layering until that pass reruns).
+    #[tokio::test]
+    async fn layer_rank_roundtrip_and_upsert_preserves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+
+        // (1) Set and read back layer/layer_rank.
+        set_repo_layer_rank(&db, r.id, "Core 核心", 3).await.unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "Core 核心");
+        assert_eq!(p.layer_rank, 3);
+
+        // (2) A subsequent upsert_repo_profile (per-repo re-classify) must NOT clobber
+        //     layer/layer_rank — they are preserved (Unchanged in the ActiveModel).
+        upsert_repo_profile(&db, r.id, "frontend", "[]", "new summary", "[]", "agent", "sha2")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "Core 核心", "upsert must not reset layer");
+        assert_eq!(p.layer_rank, 3, "upsert must not reset layer_rank");
+        assert_eq!(p.role, "frontend");
+        assert_eq!(p.profiled_commit, "sha2");
+    }
+
+    /// M0033: a fresh profile row (first upsert, no prior set_repo_layer_rank) must
+    /// default layer="" and layer_rank=0.
+    #[tokio::test]
+    async fn layer_rank_default_on_fresh_profile() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "new-svc", "/tmp/new-svc", "main", "", true)
+            .await
+            .unwrap();
+        upsert_repo_profile(&db, r.id, "backend", "[]", "", "[]", "agent", "")
+            .await
+            .unwrap();
+        let p = get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "", "fresh row: layer defaults to empty string");
+        assert_eq!(p.layer_rank, 0, "fresh row: layer_rank defaults to 0");
     }
 
     /// set_repo_map_doc / get_repo_map_doc round-trip: store and retrieve a
