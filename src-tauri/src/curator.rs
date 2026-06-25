@@ -1440,7 +1440,22 @@ pub async fn reanalyze_workspace(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> bool {
     let gate = pass_gate(workspace_id);
-    let _g = gate.lock.lock().await;
+    // Acquire the gate, but OBSERVE cancellation while waiting: when a background/add
+    // pass already holds it, a Stop must return promptly instead of hanging until that
+    // unrelated pass finishes. The cancel token is cooperative (no async wake), so poll
+    // it while queued. `biased` prefers the lock, so an uncontended gate acquires with
+    // no delay.
+    let _g = loop {
+        tokio::select! {
+            biased;
+            g = gate.lock.lock() => break g,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return true;
+                }
+            }
+        }
+    };
     // Cancelled while queued behind another pass → don't start; that's a real cancel.
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return true;
@@ -2109,15 +2124,18 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
                     let _ = repo::set_repo_layer_rank(db, l.repo_id, l.layer.trim(), l.rank).await;
                 }
             }
-            // A PRESENT layers payload re-derives the whole map, so any profiled repo the
+            // A PRESENT layers payload re-derives the whole map, so any current repo the
             // agent OMITTED would otherwise keep a now-stale layer (the map prefers the
-            // persisted layer over the tier/category fallback). Clear the omitted ones so
+            // persisted layer over the tier/category fallback, and renders graph nodes for
+            // ALL repos — not just `profiled`). Clear every non-assigned repo, including
+            // ones SKIPPED from the prompt (missing checkout / blank-or-failed profile), so
             // they fall back instead of lingering in an outdated band. (An absent/empty
             // `layers` array isn't a re-derivation — leave the prior layering intact.)
             if !output.layers.is_empty() {
                 let assigned: std::collections::HashSet<i32> =
                     output.layers.iter().map(|l| l.repo_id).collect();
-                for (r, _) in &profiled {
+                let current = repo::list_repos(db, workspace_id).await.unwrap_or_default();
+                for r in &current {
                     if !assigned.contains(&r.id) {
                         let _ = repo::set_repo_layer_rank(db, r.id, "", 0).await;
                     }
