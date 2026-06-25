@@ -443,17 +443,47 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
 /// whenever the agent backend was down. Triggering the forced pass directly makes
 /// the retry deterministic. Fire-and-forget + coalesced: rapid clicks and concurrent
 /// background passes collapse into one run; the UI follows `repo-graph-updated`.
+/// Outcome of a direct "Analyze deps" pass, so the frontend can surface the same
+/// feedback the curator chat tool gives (the button bypasses that chat round-trip).
+#[derive(serde::Serialize)]
+pub struct ReanalyzeReport {
+    /// Every tracked repo's checkout is missing on disk — the pass was skipped (it
+    /// would have filtered them all out and "succeeded" against a stale graph).
+    pub all_missing: bool,
+    /// The pass was cancelled (Stop) before completing.
+    pub cancelled: bool,
+    /// Repos the pass left unanalyzed (classifier error or missing checkout).
+    pub unanalyzed: Vec<String>,
+}
+
 #[tauri::command]
-pub async fn reanalyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
-    // Run the CANCELLABLE forced pass (`reanalyze_workspace`), registering a
-    // workspace-keyed cancel token so the toolbar's Stop (`cancel_reanalyze_workspace_deps`)
-    // can interrupt it — otherwise a big workspace would block on every per-repo timeout
-    // with no Stop path (the button has no curator lead turn to 中止). It AWAITs the pass
-    // (so the button stays busy for the real work) and is serialized via the gate lock.
+pub async fn reanalyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<ReanalyzeReport> {
+    // Same all-checkouts-missing preflight as the curator reanalyze tool: without it the
+    // pass filters every repo out and reports a clean "success" against a stale graph,
+    // with no feedback. Skip the pass and tell the frontend to surface it instead.
+    let repos = repo::list_repos(&db, workspace_id).await.map_err(e)?;
+    if !repos.is_empty()
+        && !repos
+            .iter()
+            .any(|r| std::path::Path::new(&r.local_git_path).exists())
+    {
+        return Ok(ReanalyzeReport { all_missing: true, cancelled: false, unanalyzed: Vec::new() });
+    }
+    // Run the CANCELLABLE forced pass (`reanalyze_workspace`) under a workspace-keyed
+    // cancel token so the toolbar's Stop (`cancel_reanalyze_workspace_deps`) can interrupt
+    // it — the button has no curator lead turn to 中止. It AWAITs the pass (so the button
+    // stays busy for the real work) and is serialized via the gate lock.
     let token = crate::curator::register_ws_analysis_cancel(workspace_id);
-    crate::curator::reanalyze_workspace(&db, workspace_id, &token).await;
+    let cancelled = crate::curator::reanalyze_workspace(&db, workspace_id, &token).await;
     crate::curator::unregister_ws_analysis_cancel(workspace_id, &token);
-    Ok(())
+    // Surface repos left unanalyzed so the user sees WHICH/why (the map renders them as a
+    // plain "未分析" card). Skip on cancel — a half-run's failed set isn't meaningful.
+    let unanalyzed = if cancelled {
+        Vec::new()
+    } else {
+        crate::curator::unanalyzed_repo_names(&db, workspace_id).await
+    };
+    Ok(ReanalyzeReport { all_missing: false, cancelled, unanalyzed })
 }
 
 /// Stop an in-flight "Analyze deps" forced pass for a workspace (trips its cancel

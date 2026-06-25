@@ -9,7 +9,8 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
-import { currentLang } from "../i18n";
+import i18n, { currentLang } from "../i18n";
+import { toast } from "../components/Toast";
 import { mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -1823,7 +1824,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // (running cards / map) and follow-up questions stay in one place. The await spans
       // the whole pass (the command awaits it), so the button stays disabled throughout.
       if (activeWorkspaceIdRef.current === ws) openCurator();
-      await api.reanalyzeWorkspaceDeps(ws);
+      const report = await api.reanalyzeWorkspaceDeps(ws);
+      // Surface the feedback the curator chat tool gives (the button bypasses it):
+      // all checkouts missing (skipped), or repos left unanalyzed after the pass.
+      if (report.all_missing) {
+        toast(i18n.t("repomap.reanalyzeAllMissing"));
+      } else if (!report.cancelled && report.unanalyzed.length > 0) {
+        toast(
+          i18n.t("repomap.reanalyzeUnanalyzed", {
+            count: report.unanalyzed.length,
+            names: report.unanalyzed.join(", "),
+          }),
+        );
+      }
     } finally {
       reanalyzeSendingRef.current.delete(ws);
       setReanalyzingWs((s) => {

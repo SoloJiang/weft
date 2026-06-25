@@ -1405,6 +1405,28 @@ pub fn cancel_ws_analysis(workspace_id: i32) {
     }
 }
 
+/// Repo names a pass left UNANALYZED in this workspace, for surfacing after a forced
+/// pass (the curator chat's summary, the toolbar button's toast). Two sources the pass
+/// swallows: `analysis_state == "failed"` (classifier error/timeout/unparsable reply)
+/// and a MISSING checkout (`analyze_workspace` filters those out, so they're never
+/// marked failed). Shared by the bus reanalyze tool and the direct command.
+pub async fn unanalyzed_repo_names(db: &Db, workspace_id: i32) -> Vec<String> {
+    let repos = repo::list_repos(db, workspace_id).await.unwrap_or_default();
+    let mut names: Vec<String> = repo::repos_with_analysis_state(db, "failed")
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.workspace_id == workspace_id)
+        .map(|r| r.name)
+        .collect();
+    for r in &repos {
+        if !Path::new(&r.local_git_path).exists() && !names.contains(&r.name) {
+            names.push(r.name.clone());
+        }
+    }
+    names
+}
+
 /// The curator's user-initiated forced re-analysis: serialize against background passes
 /// via the gate LOCK, but run `analyze_workspace` directly with this call's own cancel
 /// token — deliberately NOT through the coalescing `dirty`/`force` flags, so cancelling
@@ -2079,13 +2101,26 @@ async fn analyze_relations(db: &Db, workspace_id: i32) -> Result<()> {
             persist_relations(db, &profiled, &output.relations).await?;
             // Persist agent-assigned layers for repos the agent actually saw (the
             // profiled set). Best-effort per repo: a stray id outside the set, or a
-            // repo without a profile row, is simply skipped (set_repo_layer_rank
-            // no-ops). An omitted `layers` array leaves the prior layering intact.
+            // repo without a profile row, is simply skipped (set_repo_layer_rank no-ops).
             let profiled_ids: std::collections::HashSet<i32> =
                 profiled.iter().map(|(r, _)| r.id).collect();
             for l in &output.layers {
                 if profiled_ids.contains(&l.repo_id) {
                     let _ = repo::set_repo_layer_rank(db, l.repo_id, l.layer.trim(), l.rank).await;
+                }
+            }
+            // A PRESENT layers payload re-derives the whole map, so any profiled repo the
+            // agent OMITTED would otherwise keep a now-stale layer (the map prefers the
+            // persisted layer over the tier/category fallback). Clear the omitted ones so
+            // they fall back instead of lingering in an outdated band. (An absent/empty
+            // `layers` array isn't a re-derivation — leave the prior layering intact.)
+            if !output.layers.is_empty() {
+                let assigned: std::collections::HashSet<i32> =
+                    output.layers.iter().map(|l| l.repo_id).collect();
+                for (r, _) in &profiled {
+                    if !assigned.contains(&r.id) {
+                        let _ = repo::set_repo_layer_rank(db, r.id, "", 0).await;
+                    }
                 }
             }
             fresh_markdown = output.repo_map_markdown;
@@ -2770,6 +2805,24 @@ mod tests {
         super::edit_profile(&db, r.id, Some("new summary"), None, None).await.unwrap();
         let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
         assert_eq!((p.layer.as_str(), p.layer_rank), ("Client", 5), "summary-only edit keeps the layer");
+    }
+
+    #[tokio::test]
+    async fn unanalyzed_repo_names_lists_failed_and_missing() {
+        // The post-pass report lists repos left unanalyzed: failed classification OR a
+        // missing checkout; a healthy repo is excluded.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let a = repo::add_repo_ref(&db, ws.id, "failed-one", "/tmp", "main", "", true).await.unwrap();
+        repo::set_analysis_state(&db, a.id, "failed", Some("boom")).await.unwrap();
+        repo::add_repo_ref(&db, ws.id, "gone-one", "/no/such/path/here", "main", "", true).await.unwrap();
+        let c = repo::add_repo_ref(&db, ws.id, "healthy-one", "/tmp", "main", "", true).await.unwrap();
+        repo::upsert_repo_profile(&db, c.id, "backend", "[]", "s", "[]", "agent", "").await.unwrap();
+
+        let names = super::unanalyzed_repo_names(&db, ws.id).await;
+        assert!(names.contains(&"failed-one".to_string()), "failed repo listed");
+        assert!(names.contains(&"gone-one".to_string()), "missing-checkout repo listed");
+        assert!(!names.contains(&"healthy-one".to_string()), "healthy repo not listed");
     }
 
     #[tokio::test]
