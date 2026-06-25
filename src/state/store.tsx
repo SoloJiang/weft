@@ -182,9 +182,14 @@ interface Store {
   /** Trigger a re-analysis: posts a message to the 仓库分析助手, which runs the one
    *  `reanalyze` tool. Used by the graph button and the map's regenerate. */
   reanalyzeDeps: () => Promise<void>;
+  /** Stop the active workspace's in-flight direct (button) forced pass. */
+  cancelReanalyze: () => void;
   /** The active workspace's 仓库分析助手 is mid-turn (e.g. running `reanalyze`) — the
    *  Analyze entries disable while true so a click can't queue a redundant pass. */
   analyzing: boolean;
+  /** A DIRECT (button) forced pass is running for the active workspace — distinct from
+   *  `analyzing` (which also covers the chat-driven turn). The toolbar shows Stop. */
+  reanalyzing: boolean;
   deleteRepo: (repoId: number) => Promise<void>;
   /** The active workspace's hidden curator thread id (ensured lazily, no nav). */
   curatorThreadId: number | null;
@@ -1828,6 +1833,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       });
     }
   }, [activeWorkspaceId, openCurator]);
+  const cancelReanalyze = useCallback(() => {
+    const ws = activeWorkspaceId;
+    if (ws != null) void api.cancelReanalyzeWorkspaceDeps(ws);
+  }, [activeWorkspaceId]);
 
   const closeRepoDrawer = useCallback(() => setRepoDrawerOpen(false), []);
   const clearSelectedRepo = useCallback(() => setSelectedRepoId(null), []);
@@ -2229,9 +2238,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Busy when EITHER the curator's chat-driven reanalyze turn is running, OR a direct
   // forced pass (button) is in flight for the active workspace — the latter has no lead
   // turn, so it'd otherwise leave the Analyze control enabled mid-pass.
+  const reanalyzing = activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId);
   const analyzing =
-    (curatorTid != null && leadTurn[curatorTid]?.state === "busy") ||
-    (activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId));
+    (curatorTid != null && leadTurn[curatorTid]?.state === "busy") || reanalyzing;
 
   const value: Store = {
     workspaces,
@@ -2310,7 +2319,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshRepoMap,
     refreshReposAndMap,
     reanalyzeDeps,
+    cancelReanalyze,
     analyzing,
+    reanalyzing,
     deleteRepo,
     curatorThreadId,
     ensureCuratorThread,

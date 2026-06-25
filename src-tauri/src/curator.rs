@@ -176,6 +176,15 @@ pub async fn edit_profile(
         }
         None => {}
     }
+    // A classification (tier/category) edit can make the stored architectural `layer`
+    // stale: the layered map PREFERS the agent's `layer` over the tier/category fallback,
+    // so without this the repo would stay in its old band (e.g. Business/Core) despite
+    // the new tier. Clear the layer so the map reflects the edit immediately via the
+    // fallback band; the next cross-repo pass re-derives a real layer. A summary-only
+    // edit leaves it (summary doesn't affect layering).
+    if tier.is_some() || category.is_some() {
+        let _ = repo::set_repo_layer_rank(db, repo_id, "", 0).await;
+    }
     // A manual edit where the user PROVIDES a canonical tier RECOVERS a repo whose
     // analysis failed: clear any lingering `failed` run-state so it stops reading as
     // a retryable failure (failed overrides analyzed in the UI). Gate on `tier`
@@ -1341,6 +1350,56 @@ pub fn cancel_analysis(thread_id: i32) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&thread_id)
+    {
+        token.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// ---- Direct (button) reanalysis cancellation -----------------------------------
+// The "Analyze deps" button runs a forced pass directly (no curator lead turn), so the
+// chat 中止 / `cancel_analysis(thread_id)` path can't reach it. Mirror the same
+// cooperative-token scheme keyed by WORKSPACE id instead (a separate registry so a
+// workspace id can't collide with a thread id), letting the toolbar's Stop trip it.
+fn ws_analysis_cancels(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>
+{
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Register a fresh cancel token for a workspace's direct (button) forced pass.
+pub fn register_ws_analysis_cancel(workspace_id: i32) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    ws_analysis_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(workspace_id, token.clone());
+    token
+}
+
+/// Drop a workspace's direct-pass cancel token once it finished — only if it's still
+/// the token THIS call registered (a newer click must not have its token removed).
+pub fn unregister_ws_analysis_cancel(
+    workspace_id: i32,
+    token: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut g = ws_analysis_cancels().lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(g.get(&workspace_id), Some(t) if std::sync::Arc::ptr_eq(t, token)) {
+        g.remove(&workspace_id);
+    }
+}
+
+/// Request cancellation of a workspace's in-flight direct (button) forced pass. No-op
+/// if none is registered.
+pub fn cancel_ws_analysis(workspace_id: i32) {
+    if let Some(token) = ws_analysis_cancels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&workspace_id)
     {
         token.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -2683,6 +2742,34 @@ mod tests {
         assert_eq!(p.role, "backend");
         assert_eq!(p.analysis_state, "idle", "persisted failure must be cleared");
         assert_eq!(p.analysis_error, None, "persisted error must be cleared");
+    }
+
+    #[tokio::test]
+    async fn edit_profile_classification_edit_clears_stale_layer() {
+        // The layered map PREFERS the agent's `layer` over the tier/category fallback,
+        // so a tier/category edit must clear the stored layer — otherwise the repo stays
+        // in its old band despite the new tier. A summary-only edit must NOT clear it.
+        let db = mem().await;
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        repo::upsert_repo_profile(&db, r.id, "backend", "[]", "s", "[]", "agent", "")
+            .await
+            .unwrap();
+        repo::set_repo_layer_rank(&db, r.id, "Core", 3).await.unwrap();
+
+        // (a) tier edit clears the stale layer.
+        super::edit_profile(&db, r.id, None, Some("frontend"), None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "", "tier edit clears the stale layer");
+        assert_eq!(p.layer_rank, 0);
+
+        // (b) summary-only edit leaves the layer alone.
+        repo::set_repo_layer_rank(&db, r.id, "Client", 5).await.unwrap();
+        super::edit_profile(&db, r.id, Some("new summary"), None, None).await.unwrap();
+        let p = repo::get_repo_profile(&db, r.id).await.unwrap().unwrap();
+        assert_eq!((p.layer.as_str(), p.layer_rank), ("Client", 5), "summary-only edit keeps the layer");
     }
 
     #[tokio::test]

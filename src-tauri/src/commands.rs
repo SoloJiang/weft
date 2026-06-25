@@ -445,12 +445,23 @@ pub async fn repo_graph(db: State<'_, Db>, workspace_id: i32) -> R<crate::curato
 /// background passes collapse into one run; the UI follows `repo-graph-updated`.
 #[tauri::command]
 pub async fn reanalyze_workspace_deps(db: State<'_, Db>, workspace_id: i32) -> R<()> {
-    // AWAIT the coalesced pass (don't fire-and-forget): `analyze_workspace_coalesced`
-    // resolves only once this request's work has completed, so the frontend can keep
-    // the Analyze control disabled for the ACTUAL pass — not just until the task spawns.
-    // It's serialized + coalesced, so a click landing mid-pass folds into one rerun
-    // rather than starting a parallel forced pass.
-    crate::curator::analyze_workspace_coalesced(&db, workspace_id, true).await;
+    // Run the CANCELLABLE forced pass (`reanalyze_workspace`), registering a
+    // workspace-keyed cancel token so the toolbar's Stop (`cancel_reanalyze_workspace_deps`)
+    // can interrupt it — otherwise a big workspace would block on every per-repo timeout
+    // with no Stop path (the button has no curator lead turn to 中止). It AWAITs the pass
+    // (so the button stays busy for the real work) and is serialized via the gate lock.
+    let token = crate::curator::register_ws_analysis_cancel(workspace_id);
+    crate::curator::reanalyze_workspace(&db, workspace_id, &token).await;
+    crate::curator::unregister_ws_analysis_cancel(workspace_id, &token);
+    Ok(())
+}
+
+/// Stop an in-flight "Analyze deps" forced pass for a workspace (trips its cancel
+/// token; the pass bails at the next safe point — between repos / before the relation
+/// pass). No-op if none is running.
+#[tauri::command]
+pub async fn cancel_reanalyze_workspace_deps(workspace_id: i32) -> R<()> {
+    crate::curator::cancel_ws_analysis(workspace_id);
     Ok(())
 }
 

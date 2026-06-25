@@ -152,7 +152,7 @@ function nodeHeight(p: RepoProfile, mode: ViewMode): number {
  * the expanded view to break monorepos into their components. Drag to pan, scroll to zoom.
  */
 export function RepoGraph() {
-  const { repoProfiles, repoEdges, reanalyzeDeps, analyzing, selectedRepoId, openRepoDetail } = useStore();
+  const { repoProfiles, repoEdges, reanalyzeDeps, cancelReanalyze, analyzing, reanalyzing, selectedRepoId, openRepoDetail } = useStore();
   const { t } = useTranslation();
   const [mode, setMode] = useState<ViewMode>("overview");
 
@@ -406,16 +406,28 @@ export function RepoGraph() {
             their CJK labels wrap one character per line. */}
         <div className="pointer-events-none absolute inset-x-4 bottom-4 flex flex-wrap items-end justify-between gap-2">
           <div className="pointer-events-none flex shrink-0 flex-wrap items-center gap-2">
-            <button
-              data-graph-controls
-              onClick={() => void reanalyzeDeps()}
-              disabled={analyzing}
-              title={t("repomap.reanalyzeHint")}
-              className="pointer-events-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
-            >
-              <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
-              {t("repomap.reanalyze")}
-            </button>
+            {reanalyzing ? (
+              <button
+                data-graph-controls
+                onClick={cancelReanalyze}
+                title={t("lead.stop")}
+                className="pointer-events-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:border-danger/50 hover:text-danger"
+              >
+                <span className="h-2.5 w-2.5 rounded-[2px] bg-current" aria-hidden />
+                {t("lead.stop")}
+              </button>
+            ) : (
+              <button
+                data-graph-controls
+                onClick={() => void reanalyzeDeps()}
+                disabled={analyzing}
+                title={t("repomap.reanalyzeHint")}
+                className="pointer-events-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-md)] border border-border bg-raised px-2.5 py-1.5 text-[11.5px] text-ink-muted shadow-[0_4px_16px_-6px_rgba(0,0,0,0.4)] transition-colors hover:text-ink disabled:opacity-60"
+              >
+                <RefreshCw size={12} className={analyzing ? "animate-spin" : undefined} />
+                {t("repomap.reanalyze")}
+              </button>
+            )}
             {anyComponents && (
               <div
                 data-graph-controls

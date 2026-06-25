@@ -969,7 +969,12 @@ pub async fn calibrate_repo_relation(
         ..Default::default()
     });
     let json = serde_json::to_string(&rels).unwrap_or_else(|_| "[]".into());
-    set_repo_relations(db, from_id, &json).await
+    set_repo_relations(db, from_id, &json).await?;
+    // A pinned edge add/remove changes the dependency structure the agent derived the
+    // layer from, so the dependent's stored `layer`/`layer_rank` can be stale — and the
+    // map now reads layers (not edges) as the dependency statement. Clear it so the band
+    // falls back to the tier/category derivation until the next cross-repo pass re-derives.
+    set_repo_layer_rank(db, from_id, "", 0).await
 }
 
 pub async fn list_directions(db: &Db, thread_id: i32) -> Result<Vec<direction::Model>> {
@@ -2517,6 +2522,27 @@ mod tests {
         let created = removed.iter().find(|t| t.1 == "/tmp/r-wt2").unwrap();
         assert!(created.3, "weft-created branch must have created_branch=true");
         assert!(created.4, "created_checkout defaults to true");
+    }
+
+    #[tokio::test]
+    async fn calibrate_repo_relation_clears_dependent_layer() {
+        // Pinning/removing an edge changes the structure the agent derived the layer
+        // from; the map now reads layers (not edges), so the dependent's stale layer
+        // must be cleared (→ tier/category fallback) until the next pass re-derives.
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let web = add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true).await.unwrap();
+        let api = add_repo_ref(&db, ws.id, "api", "/tmp/api", "main", "", true).await.unwrap();
+        upsert_repo_profile(&db, web.id, "frontend", "[]", "", "[]", "agent", "").await.unwrap();
+        set_repo_layer_rank(&db, web.id, "Client", 5).await.unwrap();
+
+        calibrate_repo_relation(&db, web.id, api.id, "grpc", "Pricing.Quote", "add")
+            .await
+            .unwrap();
+
+        let p = get_repo_profile(&db, web.id).await.unwrap().unwrap();
+        assert_eq!(p.layer, "", "calibrating the dependent's edge clears its stale layer");
+        assert_eq!(p.layer_rank, 0);
     }
 
     #[tokio::test]
