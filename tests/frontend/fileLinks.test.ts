@@ -150,6 +150,21 @@ test("does not suffix-match spaced paths in tool summaries", () => {
   });
 });
 
+test("peels balanced parentheses around tool paths", () => {
+  assert.deepEqual(compactToolTarget("read", "Reading (src/App.tsx)"), {
+    target: "src/App.tsx",
+    targetToken: "src/App.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("file_change", "(src/app/(auth)/page.tsx)"), {
+    target: "(auth)/page.tsx",
+    targetToken: "src/app/(auth)/page.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
 test("wraps assistant prose file references for markdown rendering", () => {
   const tree = {
     type: "root",

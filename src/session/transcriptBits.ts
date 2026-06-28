@@ -96,12 +96,15 @@ function extractToolFileTarget(name: string, raw: string): string | undefined {
 function matchToolPath(raw: string, pattern: RegExp): string | undefined {
   pattern.lastIndex = 0;
   const match = pattern.exec(raw);
-  const file = match?.[1];
-  if (!file || match.index === undefined) return undefined;
+  if (!match) return undefined;
+  let file = match[1];
+  if (!file) return undefined;
   const captureStart = match.index + match[0].indexOf(file);
   const captureEnd = captureStart + file.length;
   if (isSpacedPathSuffix(raw, captureStart)) return undefined;
-  return isSpacedPathPrefix(raw, captureEnd) ? undefined : file;
+  if (isSpacedPathPrefix(raw, captureEnd)) return undefined;
+  file = unwrapParenthesizedToolPath(raw, file, captureEnd);
+  return file || undefined;
 }
 
 function isSpacedPathSuffix(raw: string, captureStart: number): boolean {
@@ -116,6 +119,11 @@ function isSpacedPathPrefix(raw: string, captureEnd: number): boolean {
   if (!/\s/.test(raw[captureEnd] ?? "")) return false;
   const nextToken = raw.slice(captureEnd).trimStart().match(/^[^\s"'`]+/)?.[0] ?? "";
   return /[/\\]/.test(nextToken) || /\.[A-Za-z0-9]+(?::\d+(?::\d+)?)?$/.test(nextToken);
+}
+
+function unwrapParenthesizedToolPath(raw: string, file: string, captureEnd: number): string {
+  if (!file.startsWith("(")) return file;
+  return raw[captureEnd] === ")" ? file.slice(1) : file;
 }
 
 function allowsSlashOnlyToolTarget(name: string): boolean {
