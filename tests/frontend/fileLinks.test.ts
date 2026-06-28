@@ -72,8 +72,7 @@ test("requires a boundary before line-label paths", () => {
     { type: "path", value: "jobs/[id]/route.ts:122", label: "jobs/[id]/route.ts:122" },
   ]);
   assert.deepEqual(splitTextForPaths("insrc/App.tsx (line 3)"), [
-    { type: "text", value: "in" },
-    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "path", value: "insrc/App.tsx:3", label: "insrc/App.tsx:3" },
   ]);
 });
 
@@ -105,6 +104,20 @@ test("preserves valid parent directories before line-label paths", () => {
       type: "path",
       value: "frontend/src/App.tsx:3",
       label: "frontend/src/App.tsx:3",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("my-app/src/App.tsx (line 1)"), [
+    {
+      type: "path",
+      value: "my-app/src/App.tsx:1",
+      label: "my-app/src/App.tsx:1",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("foo-components/Button.tsx (line 4)"), [
+    {
+      type: "path",
+      value: "foo-components/Button.tsx:4",
+      label: "foo-components/Button.tsx:4",
     },
   ]);
 });
@@ -197,6 +210,12 @@ test("recognizes Windows and route-group paths in tool summaries", () => {
   assert.deepEqual(compactToolTarget("file_change", "src/app/(auth)/page.tsx"), {
     target: "(auth)/page.tsx",
     targetToken: "src/app/(auth)/page.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("read", "~/repo/src/App.tsx"), {
+    target: "src/App.tsx",
+    targetToken: "~/repo/src/App.tsx",
     added: undefined,
     removed: undefined,
   });

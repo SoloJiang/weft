@@ -177,6 +177,7 @@ function trimLeadingProsePath(rawPath: string): string {
   const rooted = rawPath.match(/(?:src|app|components|pages|jobs|cmd|lib|tests|test|packages|src-tauri)[/\\].*$/);
   if (!rooted || rooted.index === undefined) return "";
   const prefix = rawPath.slice(0, rooted.index);
+  if (/[A-Za-z0-9_-]$/.test(prefix)) return "";
   return /[/\\]/.test(prefix) ? "" : rooted[0];
 }
 

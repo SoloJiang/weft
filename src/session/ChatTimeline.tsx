@@ -391,7 +391,7 @@ function TimelineRow({
         summary={summary}
         status={status}
         target={target}
-        targetToken={targetToken}
+        targetToken={generic ? undefined : targetToken}
         cwd={cwd}
         added={added}
         removed={removed}
