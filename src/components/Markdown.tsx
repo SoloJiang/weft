@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import { codeToHtml } from "shiki";
 import { api } from "../lib/api";
 import { classifyHref, filePathsRehype, isPathLike } from "../lib/fileLinks";
-import { splitTextForPaths } from "../lib/filePathParsing";
+import { hasLineLabelSyntax, splitTextForPaths } from "../lib/filePathParsing";
 import { cn } from "../lib/cn";
 import { FilePathRef, InsideRefContext } from "./FilePathRef";
 import { ShellSnippet } from "./ai-elements";
@@ -217,7 +217,7 @@ export const Markdown = memo(function Markdown({
                 </FilePathRef>
               );
             }
-            if (isPathLike(content, true)) {
+            if (!hasLineLabelSyntax(content) && isPathLike(content, true)) {
               return (
                 <FilePathRef token={content} cwd={cwd} code isUrl={/^file:/i.test(content)}>
                   {children}

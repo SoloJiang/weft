@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { classifyHref, filePathsRehype } from "../../src/lib/fileLinkMarkdown.ts";
-import { splitTextForPaths } from "../../src/lib/filePathParsing.ts";
+import { hasLineLabelSyntax, isPathLike, splitTextForPaths } from "../../src/lib/filePathParsing.ts";
 import { compactToolTarget } from "../../src/session/transcriptBits.ts";
 
 test("recognizes agent path labels with parenthesized line numbers", () => {
@@ -29,6 +29,16 @@ test("keeps wrappers outside path labels with line numbers", () => {
     { type: "text", value: "【" },
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "】" },
+  ]);
+  assert.deepEqual(splitTextForPaths("[[src/App.tsx (line 3)]]"), [
+    { type: "text", value: "[[" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: "]]" },
+  ]);
+  assert.deepEqual(splitTextForPaths("((src/App.tsx (line 3)))"), [
+    { type: "text", value: "((" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: "))" },
   ]);
 });
 
@@ -89,6 +99,11 @@ test("preserves text trimmed from embedded line-label paths", () => {
     { type: "text", value: "," },
     { type: "path", value: "src/B.ts:2", label: "src/B.ts:2" },
   ]);
+  assert.deepEqual(splitTextForPaths("src/A.ts (line 1),foo/bar.ts (line 2)"), [
+    { type: "path", value: "src/A.ts:1", label: "src/A.ts:1" },
+    { type: "text", value: "," },
+    { type: "path", value: "foo/bar.ts:2", label: "foo/bar.ts:2" },
+  ]);
 });
 
 test("rejects unrescued prose prefixes before anchored line-label paths", () => {
@@ -128,6 +143,48 @@ test("preserves valid parent directories before line-label paths", () => {
       value: "foo-components/Button.tsx:4",
       label: "foo-components/Button.tsx:4",
     },
+  ]);
+  assert.deepEqual(splitTextForPaths("my.app/src/App.tsx (line 1)"), [
+    {
+      type: "path",
+      value: "my.app/src/App.tsx:1",
+      label: "my.app/src/App.tsx:1",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("foo.src/App.tsx (line 3)"), [
+    {
+      type: "path",
+      value: "foo.src/App.tsx:3",
+      label: "foo.src/App.tsx:3",
+    },
+  ]);
+});
+
+test("separates prose before colon-prefixed line labels", () => {
+  assert.deepEqual(splitTextForPaths("见：crates/foo/src/lib.rs (line 3)"), [
+    { type: "text", value: "见：" },
+    {
+      type: "path",
+      value: "crates/foo/src/lib.rs:3",
+      label: "crates/foo/src/lib.rs:3",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("see:crates/foo/src/lib.rs (line 3)"), [
+    { type: "text", value: "see:" },
+    {
+      type: "path",
+      value: "crates/foo/src/lib.rs:3",
+      label: "crates/foo/src/lib.rs:3",
+    },
+  ]);
+});
+
+test("detects rejected inline-code line labels before path fallback", () => {
+  const spacedLineLabel = "/Users/me/My Repo/src/App.tsx (line 1)";
+  assert.equal(hasLineLabelSyntax(spacedLineLabel), true);
+  assert.equal(isPathLike(spacedLineLabel, true), true);
+  assert.deepEqual(splitTextForPaths(spacedLineLabel), [
+    { type: "text", value: spacedLineLabel },
   ]);
 });
 

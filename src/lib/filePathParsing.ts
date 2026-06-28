@@ -74,6 +74,8 @@ const PATH_WITH_LINE_RE = new RegExp(
   `([^\\s"']+?)\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
   "gi",
 );
+const LINE_LABEL_SYNTAX_RE =
+  /\s+\(line\s+\d+(?:\s*,\s*(?:col|column)\s+\d+)?\)$/i;
 
 function couldBePath(core: string): boolean {
   if (/[/\\.]/.test(core)) return true;
@@ -93,6 +95,10 @@ export function splitTextForPaths(text: string): Seg[] {
   return splitPlainTextForPaths(text);
 }
 
+export function hasLineLabelSyntax(text: string): boolean {
+  return LINE_LABEL_SYNTAX_RE.test(text);
+}
+
 function splitLineLabels(text: string): Seg[] | null {
   PATH_WITH_LINE_RE.lastIndex = 0;
   const out: Seg[] = [];
@@ -107,10 +113,20 @@ function splitLineLabels(text: string): Seg[] | null {
     const originalSpacedPath =
       isSpacedPathSuffix(text, originalCaptureStart) ||
       isSpacedPathPrefix(text, originalCaptureEnd);
-    const embeddedPath = trimLeadingProsePath(rawPath);
     let captureStart = originalCaptureStart;
+    const separatedPath = trimLeadingSeparatorPath(rawPath);
+    if (!originalSpacedPath && separatedPath && separatedPath.length < rawPath.length) {
+      captureStart = originalCaptureStart + rawPath.indexOf(separatedPath);
+      rawPath = separatedPath;
+    }
+    const delimitedPath = trimLeadingDelimitedPath(rawPath);
+    if (!originalSpacedPath && delimitedPath && delimitedPath.length < rawPath.length) {
+      captureStart = originalCaptureStart + rawPath.indexOf(delimitedPath);
+      rawPath = delimitedPath;
+    }
+    const embeddedPath = trimLeadingProsePath(rawPath);
     if (!originalSpacedPath && embeddedPath && embeddedPath.length < rawPath.length) {
-      captureStart = originalCaptureStart + rawPath.indexOf(embeddedPath);
+      captureStart += rawPath.indexOf(embeddedPath);
       rawPath = embeddedPath;
     }
     const boundary = hasLinePathBoundary(text, captureStart);
@@ -164,16 +180,40 @@ function splitLineLabels(text: string): Seg[] | null {
 }
 
 function lineLabelLeadWrapper(text: string, start: number, matchText: string, rawPath: string): string {
-  const lead = rawPath[0] ?? "";
-  const closing = LINE_LABEL_WRAPPERS[lead];
-  if (!closing) return "";
-  const next = text[start + matchText.length] ?? "";
-  return next === closing ? lead : "";
+  let lead = "";
+  let rest = rawPath;
+  while (rest) {
+    const nextLead = rest[0] ?? "";
+    const closing = LINE_LABEL_WRAPPERS[nextLead];
+    if (!closing) break;
+    const nextTail = text[start + matchText.length + lead.length] ?? "";
+    if (nextTail !== closing) break;
+    lead += nextLead;
+    rest = rest.slice(nextLead.length);
+  }
+  return lead;
 }
 
 function hasLinePathBoundary(text: string, captureStart: number): boolean {
   if (captureStart <= 0) return true;
-  return /[\s"'`([{<【「『〔〈《〖“‘]/.test(text[captureStart - 1] ?? "");
+  return /[\s"'`,;:：([{<【「『〔〈《〖“‘]/.test(text[captureStart - 1] ?? "");
+}
+
+function trimLeadingSeparatorPath(rawPath: string): string {
+  const candidate = rawPath.replace(/^[,;]+/, "");
+  return candidate !== rawPath && isPathLike(candidate) ? candidate : "";
+}
+
+function trimLeadingDelimitedPath(rawPath: string): string {
+  let best = "";
+  const matches = rawPath.matchAll(/[：:]/g);
+  for (const match of matches) {
+    const index = match.index ?? -1;
+    if (index < 0) continue;
+    const candidate = rawPath.slice(index + match[0].length);
+    if (candidate && isPathLike(candidate)) best = candidate;
+  }
+  return best;
 }
 
 function trimLeadingProsePath(rawPath: string): string {
@@ -181,7 +221,7 @@ function trimLeadingProsePath(rawPath: string): string {
   const rooted = rawPath.match(/(?:src|app|components|pages|jobs|cmd|lib|tests|test|packages|src-tauri)[/\\].*$/);
   if (!rooted || rooted.index === undefined) return "";
   const prefix = rawPath.slice(0, rooted.index);
-  if (/[A-Za-z0-9_-]$/.test(prefix)) return "";
+  if (/[A-Za-z0-9_.-]$/.test(prefix)) return "";
   return /[/\\]/.test(prefix) ? "" : rooted[0];
 }
 
