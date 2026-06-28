@@ -31,10 +31,35 @@ test("keeps wrappers outside path labels with line numbers", () => {
   ]);
 });
 
+test("preserves leading dynamic route segments in line labels", () => {
+  assert.deepEqual(splitTextForPaths("[id]/route.ts (line 122)"), [
+    { type: "path", value: "[id]/route.ts:122", label: "[id]/route.ts (line 122)" },
+  ]);
+});
+
+test("recognizes route-group paths with line numbers", () => {
+  assert.deepEqual(splitTextForPaths("src/app/(auth)/page.tsx (line 1)"), [
+    {
+      type: "path",
+      value: "src/app/(auth)/page.tsx:1",
+      label: "src/app/(auth)/page.tsx (line 1)",
+    },
+  ]);
+});
+
 test("keeps full path token for tool summaries while showing a compact label", () => {
   assert.deepEqual(compactToolTarget("read", "Reading files src/app/layout.tsx"), {
     target: "app/layout.tsx",
     targetToken: "src/app/layout.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("does not turn search patterns into file targets", () => {
+  assert.deepEqual(compactToolTarget("grep", "api/v1"), {
+    target: "api/v1",
+    targetToken: undefined,
     added: undefined,
     removed: undefined,
   });

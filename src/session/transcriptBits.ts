@@ -87,5 +87,5 @@ function extractToolFileTarget(name: string, raw: string): string | undefined {
 }
 
 function allowsSlashOnlyToolTarget(name: string): boolean {
-  return /(read|view|cat|grep|glob|rg|ripgrep|ls|find|list|search)/.test(name.toLowerCase());
+  return /(read|view|cat|ls|list)/.test(name.toLowerCase());
 }
