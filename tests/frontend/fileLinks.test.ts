@@ -195,11 +195,17 @@ test("preserves Windows drive prefixes in line labels", () => {
 
 test("detects rejected inline-code line labels before path fallback", () => {
   const spacedLineLabel = "/Users/me/My Repo/src/App.tsx (line 1)";
+  const punctuatedSpacedLineLabel = "/Users/me/My Repo/src/App.tsx (line 1).";
   assert.equal(hasLineLabelSyntax(spacedLineLabel), true);
+  assert.equal(hasLineLabelSyntax(punctuatedSpacedLineLabel), true);
   assert.equal(isPathLike(spacedLineLabel, true), true);
+  assert.equal(isPathLike(punctuatedSpacedLineLabel, true), true);
   assert.deepEqual(splitTextForPaths(spacedLineLabel), [
     { type: "text", value: spacedLineLabel },
   ]);
+  const punctuatedSegments = splitTextForPaths(punctuatedSpacedLineLabel);
+  assert.equal(punctuatedSegments.every((seg) => seg.type === "text"), true);
+  assert.equal(punctuatedSegments.map((seg) => seg.value).join(""), punctuatedSpacedLineLabel);
 });
 
 test("keeps full path token for tool summaries while showing a compact label", () => {

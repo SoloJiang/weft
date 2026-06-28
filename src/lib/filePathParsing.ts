@@ -75,7 +75,7 @@ const PATH_WITH_LINE_RE = new RegExp(
   "gi",
 );
 const LINE_LABEL_SYNTAX_RE =
-  /\s+\(line\s+\d+(?:\s*,\s*(?:col|column)\s+\d+)?\)$/i;
+  /\s+\(line\s+\d+(?:\s*,\s*(?:col|column)\s+\d+)?\)/i;
 
 function couldBePath(core: string): boolean {
   if (/[/\\.]/.test(core)) return true;
