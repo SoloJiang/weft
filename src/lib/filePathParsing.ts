@@ -54,6 +54,7 @@ const LEAD_PUNCT = /^[([{<'"`]+/;
 const TAIL_PUNCT = /[)\]}>'"`.,;:!?]+$/;
 const LINE_LABEL_WRAPPERS: Record<string, string> = {
   "(": ")",
+  "（": "）",
   "[": "]",
   "{": "}",
   "<": ">",
@@ -211,6 +212,9 @@ function trimLeadingDelimitedPath(rawPath: string): string {
     const index = match.index ?? -1;
     if (index < 0) continue;
     if (/^[A-Za-z]$/.test(rawPath[index - 1] ?? "") && /[\\/]/.test(rawPath[index + 1] ?? "")) {
+      continue;
+    }
+    if (match[0] === ":" && /[/\\.]/.test(rawPath.slice(0, index))) {
       continue;
     }
     const candidate = rawPath.slice(index + match[0].length);

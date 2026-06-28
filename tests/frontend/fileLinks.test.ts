@@ -44,6 +44,11 @@ test("keeps wrappers outside path labels with line numbers", () => {
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "))" },
   ]);
+  assert.deepEqual(splitTextForPaths("（crates/foo/src/lib.rs (line 3)）"), [
+    { type: "text", value: "（" },
+    { type: "path", value: "crates/foo/src/lib.rs:3", label: "crates/foo/src/lib.rs:3" },
+    { type: "text", value: "）" },
+  ]);
 });
 
 test("preserves leading dynamic route segments in line labels", () => {
@@ -179,6 +184,20 @@ test("separates prose before colon-prefixed line labels", () => {
       type: "path",
       value: "crates/foo/src/lib.rs:3",
       label: "crates/foo/src/lib.rs:3",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("routes/users/:id.tsx (line 5)"), [
+    {
+      type: "path",
+      value: "routes/users/:id.tsx:5",
+      label: "routes/users/:id.tsx:5",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("src/foo:bar.ts (line 1)"), [
+    {
+      type: "path",
+      value: "src/foo:bar.ts:1",
+      label: "src/foo:bar.ts:1",
     },
   ]);
 });
