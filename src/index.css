@@ -399,6 +399,12 @@
 .weft-file-ref {
   cursor: pointer;
 }
+.weft-md .weft-file-ref {
+  padding-top: 1px;
+  padding-bottom: 1px;
+  line-height: 1.2;
+  vertical-align: -0.08em;
+}
 
 /* shadcn/ui radius scale. */
 :root {
