@@ -233,8 +233,15 @@ test("does not turn search patterns into file targets", () => {
 });
 
 test("does not turn command slash arguments into file targets", () => {
+  assert.equal(toolDoneLabelKey("commandExecution"), "session.toolRan");
   assert.deepEqual(compactToolTarget("command_execution", "pnpm add @radix-ui/react-dialog"), {
     target: "pnpm add @radix-ui/react-dialog",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("commandExecution", "node scripts/foo.js"), {
+    target: "node scripts/foo.js",
     targetToken: undefined,
     added: undefined,
     removed: undefined,
@@ -268,6 +275,15 @@ test("keeps slash-only targets for file listing tools", () => {
   });
   assert.deepEqual(compactToolTarget("mcp__weft_curator__set_classification", "services/api"), {
     target: "services/api",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("does not turn URL summaries into local file targets", () => {
+  assert.deepEqual(compactToolTarget("read_url", "https://example.com/api.json"), {
+    target: "https://example.com/api.json",
     targetToken: undefined,
     added: undefined,
     removed: undefined,

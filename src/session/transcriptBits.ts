@@ -90,12 +90,13 @@ function extractToolFileTarget(name: string, raw: string): string | undefined {
   if (isCommandTool(name)) return undefined;
   if (!toolAllowsFileTarget(name)) return undefined;
   const file = matchToolPath(raw, EXTENDED_FILE_TARGET_RE);
-  if (file && isPathLike(file)) return file;
+  if (file && !isWebUrl(file) && isPathLike(file)) return file;
   const manifest = matchToolPath(raw, MANIFEST_FILE_TARGET_RE);
-  if (manifest && isPathLike(manifest)) return manifest;
+  if (manifest && !isWebUrl(manifest) && isPathLike(manifest)) return manifest;
   if (!allowsSlashOnlyToolTarget(name)) return undefined;
   const sepTarget = matchToolPath(raw, PATH_SEP_TARGET_RE);
   if (!sepTarget) return undefined;
+  if (isWebUrl(sepTarget)) return undefined;
   if (isPathLike(sepTarget)) return sepTarget;
   return /^(?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+$/.test(sepTarget)
     ? sepTarget
@@ -140,6 +141,10 @@ function unwrapParenthesizedToolPath(raw: string, file: string, captureEnd: numb
   return raw[captureEnd] === ")" ? file.slice(1) : file;
 }
 
+function isWebUrl(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
+}
+
 function allowsSlashOnlyToolTarget(name: string): boolean {
   const kind = toolKind(name);
   return kind === "read" || kind === "edit" || kind === "search";
@@ -157,7 +162,11 @@ function isCommandTool(name: string): boolean {
 }
 
 function toolNameTokens(name: string): string[] {
-  return name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
 }
 
 function toolKind(name: string): ToolKind {
