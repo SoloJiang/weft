@@ -1,6 +1,7 @@
 import { useState, type ComponentType } from "react";
 import { ChevronRight, type LucideProps } from "lucide-react";
 import { cn } from "../../lib/cn";
+import { FilePathRef } from "../FilePathRef";
 
 export type AiToolStatus = "streaming" | "complete" | "error";
 
@@ -11,6 +12,8 @@ export function Tool({
   label,
   status,
   target,
+  targetToken,
+  cwd,
   summary,
   added,
   removed,
@@ -25,6 +28,8 @@ export function Tool({
   readonly label: string;
   readonly status: AiToolStatus;
   readonly target?: string;
+  readonly targetToken?: string;
+  readonly cwd?: string;
   readonly summary?: string;
   readonly added?: string;
   readonly removed?: string;
@@ -60,9 +65,7 @@ export function Tool({
         />
         <span className="shrink-0 text-ink-muted">{label}</span>
         {(target || summary) && (
-          <span className="min-w-0 truncate font-mono text-ink-faint">
-            {target || summary}
-          </span>
+          <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} />
         )}
         {added != null && <span className="shrink-0 font-mono text-running">+{added}</span>}
         {removed != null && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
@@ -105,6 +108,8 @@ export function ToolActivity({
   icon: Icon,
   label,
   target,
+  targetToken,
+  cwd,
   summary,
   added,
   removed,
@@ -112,6 +117,8 @@ export function ToolActivity({
   readonly icon: ToolIcon;
   readonly label: string;
   readonly target?: string;
+  readonly targetToken?: string;
+  readonly cwd?: string;
   readonly summary?: string;
   readonly added?: string;
   readonly removed?: string;
@@ -121,11 +128,42 @@ export function ToolActivity({
       <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-running" />
       <Icon size={15} className="shrink-0 text-ink-faint" />
       <span className="shrink-0 font-medium text-ink-muted">{label}</span>
-      {target && <span className="min-w-0 truncate font-mono text-brand">{target}</span>}
+      {target && (
+        <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} active />
+      )}
       {!target && summary && <span className="min-w-0 truncate font-mono text-brand">{summary}</span>}
       {added != null && <span className="shrink-0 font-mono text-running">+{added}</span>}
       {removed != null && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
     </div>
+  );
+}
+
+function ToolTarget({
+  target,
+  targetToken,
+  summary,
+  cwd,
+  active = false,
+}: {
+  readonly target?: string;
+  readonly targetToken?: string;
+  readonly summary?: string;
+  readonly cwd?: string;
+  readonly active?: boolean;
+}) {
+  const label = target || summary || "";
+  if (!label) return null;
+  if (targetToken) {
+    return (
+      <FilePathRef token={targetToken} cwd={cwd} compact>
+        {label}
+      </FilePathRef>
+    );
+  }
+  return (
+    <span className={cn("min-w-0 truncate font-mono", active ? "text-brand" : "text-ink-faint")}>
+      {label}
+    </span>
   );
 }
 

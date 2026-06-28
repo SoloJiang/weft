@@ -184,7 +184,7 @@ export function ChatTimeline({
         <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
           <div className="flex flex-col gap-1.5">
             <PermissionBar asks={asks} />
-            {busy && <BusyIndicator activity={activity} />}
+            {busy && <BusyIndicator activity={activity} cwd={cwd} />}
             <QueueStack
               items={queue}
               onRemove={onRemove}
@@ -200,11 +200,13 @@ export function ChatTimeline({
 
 function BusyIndicator({
   activity,
+  cwd,
 }: {
   activity?: { name: string; summary: string } | null;
+  cwd?: string;
 }) {
   const { t } = useTranslation();
-  if (activity) return <ToolStatus name={activity.name} summary={activity.summary} />;
+  if (activity) return <ToolStatus name={activity.name} summary={activity.summary} cwd={cwd} />;
   return (
     <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
       <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
@@ -228,11 +230,11 @@ function deriveToolStatus(m: LeadMessage, c: Record<string, unknown>): AiToolSta
 }
 
 /** The tool call in flight — pulsing, transient, precise about WHAT it calls. */
-function ToolStatus({ name, summary }: { name: string; summary: string }) {
+function ToolStatus({ name, summary, cwd }: { name: string; summary: string; cwd?: string }) {
   const { t } = useTranslation();
   const Icon = toolIcon(name);
   const labelKey = toolLabelKey(name);
-  const { target, added, removed } = compactToolTarget(name, summary);
+  const { target, targetToken, added, removed } = compactToolTarget(name, summary);
   // For unrecognized tools (MCP etc.) the generic "Calling" says nothing —
   // show the cleaned tool identity instead.
   const generic = labelKey === "session.toolCalling";
@@ -241,6 +243,8 @@ function ToolStatus({ name, summary }: { name: string; summary: string }) {
       icon={Icon}
       label={generic ? cleanToolName(name) : t(labelKey)}
       target={generic ? undefined : target}
+      targetToken={generic ? undefined : targetToken}
+      cwd={cwd}
       summary={generic ? summary : undefined}
       added={added}
       removed={removed}
@@ -379,7 +383,7 @@ function TimelineRow({
     const Icon = toolIcon(name);
     const labelKey = status === "streaming" ? toolLabelKey(name) : toolDoneLabelKey(name);
     const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
-    const { target, added, removed } = compactToolTarget(name, summary);
+    const { target, targetToken, added, removed } = compactToolTarget(name, summary);
     return (
       <Tool
         icon={Icon}
@@ -387,6 +391,8 @@ function TimelineRow({
         summary={summary}
         status={status}
         target={target}
+        targetToken={targetToken}
+        cwd={cwd}
         added={added}
         removed={removed}
         input={inputText}

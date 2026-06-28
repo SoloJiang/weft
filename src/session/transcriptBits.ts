@@ -64,10 +64,13 @@ export function toolDoneLabelKey(name: string) {
 export function compactToolTarget(name: string, summary: string) {
   const raw = summary || name;
   const file =
-    raw.match(/(?:^|[\\s"'`])([\\w./-]+\\.(?:tsx|ts|jsx|js|rs|css|md|json|toml|yaml|yml|html))/)?.[1] ??
-    raw.match(/(?:^|[\\s"'`])([\\w./-]+\/[\\w./-]+)/)?.[1];
+    raw.match(
+      /(?:^|[\s"'`])([\w./\-@[\]]+\.(?:tsx|ts|jsx|js|rs|css|md|json|toml|yaml|yml|html))(?:$|[\s"'`),.;:!?])/,
+    )?.[1] ??
+    raw.match(/(?:^|[\s"'`])([\w./\-@[\]]+\/[\w./\-@[\]]+)(?:$|[\s"'`),.;:!?])/)?.[1];
   const target = file ? file.split("/").slice(-2).join("/") : raw.replace(/\s+/g, " ").slice(0, 90);
+  const targetToken = file;
   const added = raw.match(/(?:\+|added[:= ]+)(\d+)/i)?.[1];
   const removed = raw.match(/(?:-|removed[:= ]+)(\d+)/i)?.[1];
-  return { target, added, removed };
+  return { target, targetToken, added, removed };
 }
