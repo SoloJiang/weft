@@ -16,6 +16,8 @@ import { isPathLike } from "../lib/filePathParsing.ts";
 
 const EXTENDED_FILE_TARGET_RE =
   /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]+\.[A-Za-z0-9][\w-]*(?::\d+(?::\d+)?)?)(?:$|[\s"'`),.;:!?])/;
+const MANIFEST_FILE_TARGET_RE =
+  /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]*(?:Dockerfile|Makefile|\.gitignore|\.env(?:\.[\w.-]+)?))(?:$|[\s"'`),.;:!?])/;
 const PATH_SEP_TARGET_RE =
   /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]+[\\/][\w./\\\-@()[\]]+)(?:$|[\s"'`),.;:!?])/;
 
@@ -84,6 +86,8 @@ function extractToolFileTarget(name: string, raw: string): string | undefined {
   if (isCommandTool(name)) return undefined;
   const file = matchToolPath(raw, EXTENDED_FILE_TARGET_RE);
   if (file && isPathLike(file)) return file;
+  const manifest = matchToolPath(raw, MANIFEST_FILE_TARGET_RE);
+  if (manifest && isPathLike(manifest)) return manifest;
   if (!allowsSlashOnlyToolTarget(name)) return undefined;
   const sepTarget = matchToolPath(raw, PATH_SEP_TARGET_RE);
   if (!sepTarget) return undefined;

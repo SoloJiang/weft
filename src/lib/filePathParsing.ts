@@ -100,10 +100,27 @@ function splitLineLabels(text: string): Seg[] | null {
   let matched = false;
   for (const match of text.matchAll(PATH_WITH_LINE_RE)) {
     const start = match.index ?? 0;
-    const rawPath = match[1];
+    let rawPath = match[1];
+    const originalCaptureStart = start + match[0].indexOf(rawPath);
+    const originalCaptureEnd = originalCaptureStart + rawPath.length;
+    const originalSpacedPath =
+      isSpacedPathSuffix(text, originalCaptureStart) ||
+      isSpacedPathPrefix(text, originalCaptureEnd);
+    const canTrimEmbeddedPath = !LINE_LABEL_WRAPPERS[rawPath[0] ?? ""];
+    const embeddedPath = canTrimEmbeddedPath ? trimLeadingProsePath(rawPath) : "";
+    if (!originalSpacedPath && embeddedPath && embeddedPath.length < rawPath.length) {
+      rawPath = embeddedPath;
+    }
+    const boundary = hasLinePathBoundary(text, start + match[0].indexOf(rawPath));
+    if (!boundary) rawPath = trimLeadingProsePath(rawPath);
     const captureStart = start + match[0].indexOf(rawPath);
     const captureEnd = captureStart + rawPath.length;
-    if (isSpacedPathSuffix(text, captureStart) || isSpacedPathPrefix(text, captureEnd)) {
+    if (
+      !rawPath ||
+      originalSpacedPath ||
+      isSpacedPathSuffix(text, captureStart) ||
+      isSpacedPathPrefix(text, captureEnd)
+    ) {
       matched = true;
       const end = start + match[0].length;
       pushText(out, text.slice(last, end));
@@ -137,6 +154,16 @@ function lineLabelLeadWrapper(text: string, start: number, matchText: string, ra
   if (!closing) return "";
   const next = text[start + matchText.length] ?? "";
   return next === closing ? lead : "";
+}
+
+function hasLinePathBoundary(text: string, captureStart: number): boolean {
+  if (captureStart <= 0) return true;
+  return /[\s"'`([{<【「『〔〈《〖“‘]/.test(text[captureStart - 1] ?? "");
+}
+
+function trimLeadingProsePath(rawPath: string): string {
+  const rooted = rawPath.match(/(?:src|app|components|pages|jobs|cmd|lib|tests|test|packages|src-tauri)[/\\].*$/);
+  return rooted?.[0] ?? "";
 }
 
 function isSpacedPathSuffix(text: string, captureStart: number): boolean {

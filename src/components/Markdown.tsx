@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import { codeToHtml } from "shiki";
 import { api } from "../lib/api";
 import { classifyHref, filePathsRehype, isPathLike } from "../lib/fileLinks";
+import { splitTextForPaths } from "../lib/filePathParsing";
 import { cn } from "../lib/cn";
 import { FilePathRef, InsideRefContext } from "./FilePathRef";
 import { ShellSnippet } from "./ai-elements";
@@ -204,6 +205,17 @@ export const Markdown = memo(function Markdown({
                 );
               }
               return <CodeBlock code={content} language={language} className="my-2" />;
+            }
+            const pathSegs = splitTextForPaths(content);
+            const singlePath = pathSegs.length === 1 && pathSegs[0].type === "path"
+              ? pathSegs[0]
+              : undefined;
+            if (singlePath) {
+              return (
+                <FilePathRef token={singlePath.value} cwd={cwd} code isUrl={/^file:/i.test(singlePath.value)}>
+                  {singlePath.label ?? children}
+                </FilePathRef>
+              );
             }
             if (isPathLike(content, true)) {
               return (

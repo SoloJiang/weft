@@ -66,6 +66,15 @@ test("does not suffix-match spaced line-label paths", () => {
   ]);
 });
 
+test("requires a boundary before line-label paths", () => {
+  assert.deepEqual(splitTextForPaths("见jobs/[id]/route.ts (line 122)"), [
+    { type: "path", value: "jobs/[id]/route.ts:122", label: "jobs/[id]/route.ts:122" },
+  ]);
+  assert.deepEqual(splitTextForPaths("insrc/App.tsx (line 3)"), [
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+  ]);
+});
+
 test("keeps full path token for tool summaries while showing a compact label", () => {
   assert.deepEqual(compactToolTarget("read", "Reading files src/app/layout.tsx"), {
     target: "app/layout.tsx",
@@ -163,6 +172,21 @@ test("recognizes shared path extensions in edit tool summaries", () => {
   assert.deepEqual(compactToolTarget("edit", "cmd/server.go"), {
     target: "cmd/server.go",
     targetToken: "cmd/server.go",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("recognizes manifest paths in edit tool summaries", () => {
+  assert.deepEqual(compactToolTarget("file_change", "src/Dockerfile"), {
+    target: "src/Dockerfile",
+    targetToken: "src/Dockerfile",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("edit", "src/.gitignore"), {
+    target: "src/.gitignore",
+    targetToken: "src/.gitignore",
     added: undefined,
     removed: undefined,
   });
