@@ -15,8 +15,9 @@ import {
 import { isPathLike } from "../lib/filePathParsing.ts";
 
 const EXTENDED_FILE_TARGET_RE =
-  /(?:^|[\s"'`])([\w./\-@[\]]+\.(?:tsx|ts|jsx|js|rs|css|md|json|toml|yaml|yml|html))(?:$|[\s"'`),.;:!?])/;
-const SLASH_TARGET_RE = /(?:^|[\s"'`])([\w./\-@[\]]+\/[\w./\-@[\]]+)(?:$|[\s"'`),.;:!?])/;
+  /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]+\.(?:tsx|ts|jsx|js|rs|css|md|json|toml|yaml|yml|html)(?::\d+(?::\d+)?)?)(?:$|[\s"'`),.;:!?])/;
+const PATH_SEP_TARGET_RE =
+  /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]+[\\/][\w./\\\-@()[\]]+)(?:$|[\s"'`),.;:!?])/;
 
 /** Map a (cleaned) tool name to a glyph so the pills are scannable. */
 export function toolIcon(name: string): ComponentType<LucideProps> {
@@ -69,7 +70,9 @@ export function toolDoneLabelKey(name: string) {
 export function compactToolTarget(name: string, summary: string) {
   const raw = summary || name;
   const file = extractToolFileTarget(name, raw);
-  const target = file ? file.split("/").slice(-2).join("/") : raw.replace(/\s+/g, " ").slice(0, 90);
+  const target = file
+    ? file.split(/[\\/]/).slice(-2).join("/")
+    : raw.replace(/\s+/g, " ").slice(0, 90);
   const targetToken = file;
   const added = raw.match(/(?:\+|added[:= ]+)(\d+)/i)?.[1];
   const removed = raw.match(/(?:-|removed[:= ]+)(\d+)/i)?.[1];
@@ -77,15 +80,22 @@ export function compactToolTarget(name: string, summary: string) {
 }
 
 function extractToolFileTarget(name: string, raw: string): string | undefined {
+  if (isSearchTool(name)) return undefined;
   const file = raw.match(EXTENDED_FILE_TARGET_RE)?.[1];
   if (file) return file;
   if (!allowsSlashOnlyToolTarget(name)) return undefined;
-  const slashTarget = raw.match(SLASH_TARGET_RE)?.[1];
-  if (!slashTarget) return undefined;
-  if (isPathLike(slashTarget)) return slashTarget;
-  return /^[\w.-]+\/[\w./\-@[\]]+$/.test(slashTarget) ? slashTarget : undefined;
+  const sepTarget = raw.match(PATH_SEP_TARGET_RE)?.[1];
+  if (!sepTarget) return undefined;
+  if (isPathLike(sepTarget)) return sepTarget;
+  return /^(?:[A-Za-z]:[\\/])?[\w.-]+[\\/][\w./\\\-@()[\]]+$/.test(sepTarget)
+    ? sepTarget
+    : undefined;
 }
 
 function allowsSlashOnlyToolTarget(name: string): boolean {
   return /(read|view|cat|ls|list)/.test(name.toLowerCase());
+}
+
+function isSearchTool(name: string): boolean {
+  return /(grep|glob|rg|ripgrep|find|search)/.test(name.toLowerCase());
 }

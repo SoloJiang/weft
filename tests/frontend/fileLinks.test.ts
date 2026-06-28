@@ -64,6 +64,18 @@ test("does not turn search patterns into file targets", () => {
     added: undefined,
     removed: undefined,
   });
+  assert.deepEqual(compactToolTarget("grep", "package.json"), {
+    target: "package.json",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("ripgrep", "index.ts"), {
+    target: "index.ts",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
 });
 
 test("does not turn command slash arguments into file targets", () => {
@@ -85,6 +97,27 @@ test("keeps slash-only targets for file listing tools", () => {
   assert.deepEqual(compactToolTarget("list", "src/components"), {
     target: "src/components",
     targetToken: "src/components",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("recognizes Windows and route-group paths in tool summaries", () => {
+  assert.deepEqual(compactToolTarget("read", String.raw`Reading files src\App.tsx`), {
+    target: "src/App.tsx",
+    targetToken: String.raw`src\App.tsx`,
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("read", String.raw`Reading files C:\repo\src\App.tsx`), {
+    target: "src/App.tsx",
+    targetToken: String.raw`C:\repo\src\App.tsx`,
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("file_change", "src/app/(auth)/page.tsx"), {
+    target: "(auth)/page.tsx",
+    targetToken: "src/app/(auth)/page.tsx",
     added: undefined,
     removed: undefined,
   });
