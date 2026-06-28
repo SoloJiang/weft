@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { classifyHref, filePathsRehype } from "../../src/lib/fileLinkMarkdown.ts";
 import { splitTextForPaths } from "../../src/lib/filePathParsing.ts";
 import { compactToolTarget } from "../../src/session/transcriptBits.ts";
 
 test("recognizes agent path labels with parenthesized line numbers", () => {
   assert.deepEqual(splitTextForPaths("cancel/route.ts (line 43)。"), [
-    { type: "path", value: "cancel/route.ts:43", label: "cancel/route.ts (line 43)" },
+    { type: "path", value: "cancel/route.ts:43", label: "cancel/route.ts:43" },
     { type: "text", value: "。" },
   ]);
 });
@@ -13,7 +14,7 @@ test("recognizes agent path labels with parenthesized line numbers", () => {
 test("recognizes bracketed dynamic route paths with line numbers", () => {
   assert.deepEqual(splitTextForPaths("见 jobs/[id]/route.ts (line 122)。"), [
     { type: "text", value: "见 " },
-    { type: "path", value: "jobs/[id]/route.ts:122", label: "jobs/[id]/route.ts (line 122)" },
+    { type: "path", value: "jobs/[id]/route.ts:122", label: "jobs/[id]/route.ts:122" },
     { type: "text", value: "。" },
   ]);
 });
@@ -21,19 +22,19 @@ test("recognizes bracketed dynamic route paths with line numbers", () => {
 test("keeps wrappers outside path labels with line numbers", () => {
   assert.deepEqual(splitTextForPaths("[src/App.tsx (line 3)]"), [
     { type: "text", value: "[" },
-    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx (line 3)" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "]" },
   ]);
   assert.deepEqual(splitTextForPaths("【src/App.tsx (line 3)】"), [
     { type: "text", value: "【" },
-    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx (line 3)" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "】" },
   ]);
 });
 
 test("preserves leading dynamic route segments in line labels", () => {
   assert.deepEqual(splitTextForPaths("[id]/route.ts (line 122)"), [
-    { type: "path", value: "[id]/route.ts:122", label: "[id]/route.ts (line 122)" },
+    { type: "path", value: "[id]/route.ts:122", label: "[id]/route.ts:122" },
   ]);
 });
 
@@ -42,7 +43,7 @@ test("recognizes route-group paths with line numbers", () => {
     {
       type: "path",
       value: "src/app/(auth)/page.tsx:1",
-      label: "src/app/(auth)/page.tsx (line 1)",
+      label: "src/app/(auth)/page.tsx:1",
     },
   ]);
 });
@@ -86,5 +87,84 @@ test("keeps slash-only targets for file listing tools", () => {
     targetToken: "src/components",
     added: undefined,
     removed: undefined,
+  });
+});
+
+test("wraps assistant prose file references for markdown rendering", () => {
+  const tree = {
+    type: "root",
+    children: [
+      {
+        type: "element",
+        tagName: "p",
+        children: [
+          {
+            type: "text",
+            value:
+              "取消接口在 cancel/route.ts (line 43)，删除接口见 jobs/[id]/route.ts (line 122)。",
+          },
+        ],
+      },
+    ],
+  };
+  filePathsRehype()(tree);
+  assert.deepEqual(tree.children[0].children, [
+    { type: "text", value: "取消接口在 " },
+    {
+      type: "element",
+      tagName: "span",
+      properties: { dataFilepath: "cancel/route.ts:43" },
+      children: [{ type: "text", value: "cancel/route.ts:43" }],
+    },
+    { type: "text", value: "，删除接口见 " },
+    {
+      type: "element",
+      tagName: "span",
+      properties: { dataFilepath: "jobs/[id]/route.ts:122" },
+      children: [{ type: "text", value: "jobs/[id]/route.ts:122" }],
+    },
+    { type: "text", value: "。" },
+  ]);
+});
+
+test("does not wrap paths inside markdown links or inline code in rehype prose pass", () => {
+  const tree = {
+    type: "root",
+    children: [
+      {
+        type: "element",
+        tagName: "p",
+        children: [
+          {
+            type: "element",
+            tagName: "a",
+            properties: { href: "src/App.tsx" },
+            children: [{ type: "text", value: "src/App.tsx" }],
+          },
+          { type: "text", value: " " },
+          {
+            type: "element",
+            tagName: "code",
+            children: [{ type: "text", value: "src/app/layout.tsx" }],
+          },
+        ],
+      },
+    ],
+  };
+  filePathsRehype()(tree);
+  assert.equal(tree.children[0].children[0].tagName, "a");
+  assert.equal(tree.children[0].children[2].tagName, "code");
+});
+
+test("classifies markdown hrefs that point at local files", () => {
+  assert.deepEqual(classifyHref("src/App.tsx"), { kind: "file", token: "src/App.tsx" });
+  assert.deepEqual(classifyHref("src/App.tsx:12"), { kind: "file", token: "src/App.tsx:12" });
+  assert.deepEqual(classifyHref("file:///Users/me/project/src/App.tsx#L12"), {
+    kind: "file",
+    token: "file:///Users/me/project/src/App.tsx#L12",
+  });
+  assert.deepEqual(classifyHref("https://example.com/src/App.tsx"), {
+    kind: "web",
+    url: "https://example.com/src/App.tsx",
   });
 });

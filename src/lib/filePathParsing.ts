@@ -112,7 +112,7 @@ function splitLineLabels(text: string): Seg[] | null {
     const line = match[2];
     const col = match[3];
     const value = col ? `${path}:${line}:${col}` : `${path}:${line}`;
-    out.push({ type: "path", value, label: match[0].slice(lead.length) });
+    out.push({ type: "path", value, label: value });
     last = start + match[0].length;
   }
   if (!matched) return null;
