@@ -138,6 +138,7 @@ function isSpacedPathPrefix(raw: string, captureEnd: number): boolean {
 
 function unwrapParenthesizedToolPath(raw: string, file: string, captureEnd: number): string {
   if (!file.startsWith("(")) return file;
+  if (file.endsWith(")")) return file.slice(1, -1);
   return raw[captureEnd] === ")" ? file.slice(1) : file;
 }
 

@@ -29,7 +29,17 @@ test("keeps wrappers outside path labels with line numbers", () => {
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "]" },
   ]);
+  assert.deepEqual(splitTextForPaths("[src/App.tsx] (line 3)"), [
+    { type: "text", value: "[" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: "]" },
+  ]);
   assert.deepEqual(splitTextForPaths("【src/App.tsx (line 3)】"), [
+    { type: "text", value: "【" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: "】" },
+  ]);
+  assert.deepEqual(splitTextForPaths("【src/App.tsx】 (line 3)"), [
     { type: "text", value: "【" },
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "】" },
@@ -95,6 +105,11 @@ test("recognizes extensionless relative paths with line numbers", () => {
   ]);
   assert.deepEqual(splitTextForPaths("src/bin/tool (line 2)"), [
     { type: "path", value: "src/bin/tool:2", label: "src/bin/tool:2" },
+  ]);
+  assert.deepEqual(splitTextForPaths("src/A.ts (line 1),scripts/pre-commit (line 2)"), [
+    { type: "path", value: "src/A.ts:1", label: "src/A.ts:1" },
+    { type: "text", value: "," },
+    { type: "path", value: "scripts/pre-commit:2", label: "scripts/pre-commit:2" },
   ]);
 });
 
@@ -203,6 +218,30 @@ test("separates prose before colon-prefixed line labels", () => {
       type: "path",
       value: "crates/foo/src/lib.rs:3",
       label: "crates/foo/src/lib.rs:3",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("see:scripts/pre-commit (line 1)"), [
+    { type: "text", value: "see:" },
+    {
+      type: "path",
+      value: "scripts/pre-commit:1",
+      label: "scripts/pre-commit:1",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("见：foo/bar (line 1)"), [
+    { type: "text", value: "见：" },
+    {
+      type: "path",
+      value: "foo/bar:1",
+      label: "foo/bar:1",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("see:/tmp/foo.ts (line 1)"), [
+    { type: "text", value: "see:" },
+    {
+      type: "path",
+      value: "/tmp/foo.ts:1",
+      label: "/tmp/foo.ts:1",
     },
   ]);
   assert.deepEqual(splitTextForPaths("routes/users/:id.tsx (line 5)"), [
@@ -475,6 +514,18 @@ test("peels balanced parentheses around tool paths", () => {
   assert.deepEqual(compactToolTarget("file_change", "(src/app/(auth)/page.tsx)"), {
     target: "(auth)/page.tsx",
     targetToken: "src/app/(auth)/page.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("edit", "(scripts/pre-commit)"), {
+    target: "scripts/pre-commit",
+    targetToken: "scripts/pre-commit",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("read", "(src/bin/tool)"), {
+    target: "bin/tool",
+    targetToken: "src/bin/tool",
     added: undefined,
     removed: undefined,
   });

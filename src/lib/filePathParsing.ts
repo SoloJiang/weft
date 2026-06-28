@@ -160,7 +160,7 @@ function splitLineLabels(text: string): Seg[] | null {
       last = end;
       continue;
     }
-    const lead = lineLabelLeadWrapper(text, start, match[0], rawPath);
+    const lead = lineLabelLeadWrapper(text, start, match[0], rawPath, trail);
     const path = rawPath.slice(lead.length);
     if (!path || !isLineLabelPathLike(path)) continue;
     matched = true;
@@ -182,14 +182,14 @@ function splitLineLabels(text: string): Seg[] | null {
   return out;
 }
 
-function lineLabelLeadWrapper(text: string, start: number, matchText: string, rawPath: string): string {
+function lineLabelLeadWrapper(text: string, start: number, matchText: string, rawPath: string, trail = ""): string {
   let lead = "";
   let rest = rawPath;
   while (rest) {
     const nextLead = rest[0] ?? "";
     const closing = LINE_LABEL_WRAPPERS[nextLead];
     if (!closing) break;
-    const nextTail = text[start + matchText.length + lead.length] ?? "";
+    const nextTail = trail && lead.length === 0 ? trail : text[start + matchText.length + lead.length] ?? "";
     if (nextTail !== closing) break;
     lead += nextLead;
     rest = rest.slice(nextLead.length);
@@ -210,7 +210,7 @@ function hasLinePathBoundary(text: string, captureStart: number): boolean {
 
 function trimLeadingSeparatorPath(rawPath: string): string {
   const candidate = rawPath.replace(/^[,;]+/, "");
-  return candidate !== rawPath && isPathLike(candidate) ? candidate : "";
+  return candidate !== rawPath && isLineLabelPathLike(candidate) ? candidate : "";
 }
 
 function trimLeadingDelimitedPath(rawPath: string): string {
@@ -219,14 +219,14 @@ function trimLeadingDelimitedPath(rawPath: string): string {
   for (const match of matches) {
     const index = match.index ?? -1;
     if (index < 0) continue;
-    if (/^[A-Za-z]$/.test(rawPath[index - 1] ?? "") && /[\\/]/.test(rawPath[index + 1] ?? "")) {
+    if (index === 1 && /^[A-Za-z]$/.test(rawPath[index - 1] ?? "") && /[\\/]/.test(rawPath[index + 1] ?? "")) {
       continue;
     }
     if (match[0] === ":" && /[/\\.]/.test(rawPath.slice(0, index))) {
       continue;
     }
     const candidate = rawPath.slice(index + match[0].length);
-    if (candidate && isPathLike(candidate)) best = candidate;
+    if (candidate && isLineLabelPathLike(candidate)) best = candidate;
   }
   return best;
 }
