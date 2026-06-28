@@ -34,6 +34,16 @@ test("keeps wrappers outside path labels with line numbers", () => {
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "]" },
   ]);
+  assert.deepEqual(splitTextForPaths("[[src/App.tsx]] (line 3)"), [
+    { type: "text", value: "[[" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: "]]" },
+  ]);
+  assert.deepEqual(splitTextForPaths("((src/App.tsx)) (line 3)"), [
+    { type: "text", value: "((" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: "))" },
+  ]);
   assert.deepEqual(splitTextForPaths("【src/App.tsx (line 3)】"), [
     { type: "text", value: "【" },
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
@@ -146,6 +156,16 @@ test("preserves text trimmed from embedded line-label paths", () => {
     { type: "path", value: "src/A.ts:1", label: "src/A.ts:1" },
     { type: "text", value: "," },
     { type: "path", value: "foo/bar.ts:2", label: "foo/bar.ts:2" },
+  ]);
+  assert.deepEqual(splitTextForPaths("src/A.ts,src/B.ts (line 2)"), [
+    { type: "path", value: "src/A.ts" },
+    { type: "text", value: "," },
+    { type: "path", value: "src/B.ts:2", label: "src/B.ts:2" },
+  ]);
+  assert.deepEqual(splitTextForPaths("src/A.ts、src/B.ts (line 2)"), [
+    { type: "path", value: "src/A.ts" },
+    { type: "text", value: "、" },
+    { type: "path", value: "src/B.ts:2", label: "src/B.ts:2" },
   ]);
 });
 
@@ -283,6 +303,9 @@ test("detects rejected inline-code line labels before path fallback", () => {
   const punctuatedSegments = splitTextForPaths(punctuatedSpacedLineLabel);
   assert.equal(punctuatedSegments.every((seg) => seg.type === "text"), true);
   assert.equal(punctuatedSegments.map((seg) => seg.value).join(""), punctuatedSpacedLineLabel);
+  assert.deepEqual(splitTextForPaths("https://example.com/src/App.tsx (line 3)"), [
+    { type: "text", value: "https://example.com/src/App.tsx (line 3)" },
+  ]);
 });
 
 test("keeps full path token for tool summaries while showing a compact label", () => {

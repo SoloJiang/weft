@@ -72,7 +72,7 @@ const LINE_LABEL_WRAPPERS: Record<string, string> = {
   "‘": "’",
 };
 const PATH_WITH_LINE_RE = new RegExp(
-  `([^\\s"'\`]+?)(["'\`\\])}>）】」』〕〉》〖”’])?\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
+  `([^\\s"'\`,;，；、]+?)(["'\`\\])}>）】」』〕〉》〖”’])?\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
   "gi",
 );
 const LINE_LABEL_SYNTAX_RE =
@@ -160,8 +160,8 @@ function splitLineLabels(text: string): Seg[] | null {
       last = end;
       continue;
     }
-    const lead = lineLabelLeadWrapper(text, start, match[0], rawPath, trail);
-    const path = rawPath.slice(lead.length);
+    const wrapped = peelLineLabelWrappers(text, start, match[0], rawPath, trail);
+    const { lead, path, capturedTail } = wrapped;
     if (!path || !isLineLabelPathLike(path)) continue;
     matched = true;
     if (captureStart > last) {
@@ -172,7 +172,7 @@ function splitLineLabels(text: string): Seg[] | null {
     const col = match[4];
     const value = col ? `${path}:${line}:${col}` : `${path}:${line}`;
     out.push({ type: "path", value, label: value });
-    if (trail) pushText(out, trail);
+    if (capturedTail) pushText(out, capturedTail);
     last = start + match[0].length;
   }
   if (!matched) return null;
@@ -182,19 +182,40 @@ function splitLineLabels(text: string): Seg[] | null {
   return out;
 }
 
-function lineLabelLeadWrapper(text: string, start: number, matchText: string, rawPath: string, trail = ""): string {
+function peelLineLabelWrappers(
+  text: string,
+  start: number,
+  matchText: string,
+  rawPath: string,
+  trail = "",
+): { lead: string; path: string; capturedTail: string } {
   let lead = "";
   let rest = rawPath;
+  let capturedTail = "";
+  let consumedTrail = false;
   while (rest) {
     const nextLead = rest[0] ?? "";
     const closing = LINE_LABEL_WRAPPERS[nextLead];
     if (!closing) break;
-    const nextTail = trail && lead.length === 0 ? trail : text[start + matchText.length + lead.length] ?? "";
+    if (!consumedTrail && trail === closing) {
+      lead += nextLead;
+      capturedTail = closing + capturedTail;
+      rest = rest.slice(nextLead.length);
+      consumedTrail = true;
+      continue;
+    }
+    if (rest.endsWith(closing)) {
+      lead += nextLead;
+      capturedTail = closing + capturedTail;
+      rest = rest.slice(nextLead.length, -closing.length);
+      continue;
+    }
+    const nextTail = text[start + matchText.length + lead.length] ?? "";
     if (nextTail !== closing) break;
     lead += nextLead;
     rest = rest.slice(nextLead.length);
   }
-  return lead;
+  return { lead, path: rest, capturedTail: capturedTail || trail };
 }
 
 function isLineLabelPathLike(path: string): boolean {
@@ -220,6 +241,9 @@ function trimLeadingDelimitedPath(rawPath: string): string {
     const index = match.index ?? -1;
     if (index < 0) continue;
     if (index === 1 && /^[A-Za-z]$/.test(rawPath[index - 1] ?? "") && /[\\/]/.test(rawPath[index + 1] ?? "")) {
+      continue;
+    }
+    if (match[0] === ":" && rawPath.slice(index, index + 3) === "://") {
       continue;
     }
     if (match[0] === ":" && /[/\\.]/.test(rawPath.slice(0, index))) {
