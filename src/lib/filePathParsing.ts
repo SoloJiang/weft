@@ -71,7 +71,7 @@ const LINE_LABEL_WRAPPERS: Record<string, string> = {
   "‘": "’",
 };
 const PATH_WITH_LINE_RE = new RegExp(
-  `([^\\s"'（）]+?\\.(?:${CODE_EXT}))\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
+  `([^\\s"']+?)\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
   "gi",
 );
 
@@ -101,6 +101,15 @@ function splitLineLabels(text: string): Seg[] | null {
   for (const match of text.matchAll(PATH_WITH_LINE_RE)) {
     const start = match.index ?? 0;
     const rawPath = match[1];
+    const captureStart = start + match[0].indexOf(rawPath);
+    const captureEnd = captureStart + rawPath.length;
+    if (isSpacedPathSuffix(text, captureStart) || isSpacedPathPrefix(text, captureEnd)) {
+      matched = true;
+      const end = start + match[0].length;
+      pushText(out, text.slice(last, end));
+      last = end;
+      continue;
+    }
     const lead = lineLabelLeadWrapper(text, start, match[0], rawPath);
     const path = rawPath.slice(lead.length);
     if (!path || !isPathLike(path)) continue;
@@ -128,6 +137,20 @@ function lineLabelLeadWrapper(text: string, start: number, matchText: string, ra
   if (!closing) return "";
   const next = text[start + matchText.length] ?? "";
   return next === closing ? lead : "";
+}
+
+function isSpacedPathSuffix(text: string, captureStart: number): boolean {
+  const space = captureStart - 1;
+  if (space < 0 || !/\s/.test(text[space] ?? "")) return false;
+  const before = text.slice(0, space);
+  const previousToken = before.match(/[^\s"'`]+$/)?.[0] ?? "";
+  return /[/\\]/.test(previousToken);
+}
+
+function isSpacedPathPrefix(text: string, captureEnd: number): boolean {
+  if (!/\s/.test(text[captureEnd] ?? "")) return false;
+  const nextToken = text.slice(captureEnd).trimStart().match(/^[^\s"'`]+/)?.[0] ?? "";
+  return /[/\\]/.test(nextToken) || /\.[A-Za-z0-9]+(?::\d+(?::\d+)?)?$/.test(nextToken);
 }
 
 function splitPlainTextForPaths(text: string): Seg[] {

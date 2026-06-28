@@ -43,47 +43,54 @@ export function Tool({
   const [open, setOpen] = useState(false);
   const hasDetail = (input && input.length > 0) || (output && output.length > 0);
   const hasInteractiveTarget = Boolean(targetToken);
-  const disabled = !hasDetail && !hasInteractiveTarget;
+  const disabled = !hasDetail;
 
   return (
     <div>
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => {
-          if (!hasDetail) return;
-          setOpen((value) => !value);
-        }}
+      <div
         className={cn(
           "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
           hasDetail && "hover:bg-surface/60",
         )}
       >
-        <Icon
-          size={13}
-          className={cn(
-            "shrink-0",
-            status === "streaming" && "animate-pulse text-running",
-            status === "error" && "text-danger",
-            status === "complete" && "text-ink-faint",
-          )}
-        />
-        <span className="shrink-0 text-ink-muted">{label}</span>
-        {(target || summary) && (
-          <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} />
-        )}
-        {added != null && <span className="shrink-0 font-mono text-running">+{added}</span>}
-        {removed != null && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
-        {hasDetail && (
-          <ChevronRight
-            size={12}
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            if (!hasDetail) return;
+            setOpen((value) => !value);
+          }}
+          className="flex min-w-0 flex-1 items-center gap-1.5 text-left outline-none disabled:cursor-default focus-visible:ring-2 focus-visible:ring-brand/25"
+        >
+          <Icon
+            size={13}
             className={cn(
-              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
-              open && "rotate-90",
+              "shrink-0",
+              status === "streaming" && "animate-pulse text-running",
+              status === "error" && "text-danger",
+              status === "complete" && "text-ink-faint",
             )}
           />
+          <span className="shrink-0 text-ink-muted">{label}</span>
+          {!hasInteractiveTarget && (target || summary) && (
+            <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} />
+          )}
+          {added != null && <span className="shrink-0 font-mono text-running">+{added}</span>}
+          {removed != null && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
+          {hasDetail && (
+            <ChevronRight
+              size={12}
+              className={cn(
+                "ml-auto shrink-0 text-ink-faint/60 transition-transform",
+                open && "rotate-90",
+              )}
+            />
+          )}
+        </button>
+        {hasInteractiveTarget && (target || summary) && (
+          <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} />
         )}
-      </button>
+      </div>
       {open && hasDetail && (
         <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
           {input && (

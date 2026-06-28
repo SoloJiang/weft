@@ -48,6 +48,24 @@ test("recognizes route-group paths with line numbers", () => {
   ]);
 });
 
+test("recognizes dotless manifest paths with line numbers", () => {
+  assert.deepEqual(splitTextForPaths("Dockerfile (line 12)"), [
+    { type: "path", value: "Dockerfile:12", label: "Dockerfile:12" },
+  ]);
+  assert.deepEqual(splitTextForPaths("Makefile (line 4)"), [
+    { type: "path", value: "Makefile:4", label: "Makefile:4" },
+  ]);
+  assert.deepEqual(splitTextForPaths(".gitignore (line 2)"), [
+    { type: "path", value: ".gitignore:2", label: ".gitignore:2" },
+  ]);
+});
+
+test("does not suffix-match spaced line-label paths", () => {
+  assert.deepEqual(splitTextForPaths("/Users/me/My Repo/src/App.tsx (line 1)"), [
+    { type: "text", value: "/Users/me/My Repo/src/App.tsx (line 1)" },
+  ]);
+});
+
 test("keeps full path token for tool summaries while showing a compact label", () => {
   assert.deepEqual(compactToolTarget("read", "Reading files src/app/layout.tsx"), {
     target: "app/layout.tsx",
@@ -130,6 +148,21 @@ test("recognizes Windows and route-group paths in tool summaries", () => {
   assert.deepEqual(compactToolTarget("file_change", "src/app/(auth)/page.tsx"), {
     target: "(auth)/page.tsx",
     targetToken: "src/app/(auth)/page.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("recognizes shared path extensions in edit tool summaries", () => {
+  assert.deepEqual(compactToolTarget("file_change", "src/main.py"), {
+    target: "src/main.py",
+    targetToken: "src/main.py",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("edit", "cmd/server.go"), {
+    target: "cmd/server.go",
+    targetToken: "cmd/server.go",
     added: undefined,
     removed: undefined,
   });

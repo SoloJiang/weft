@@ -15,7 +15,7 @@ import {
 import { isPathLike } from "../lib/filePathParsing.ts";
 
 const EXTENDED_FILE_TARGET_RE =
-  /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]+\.(?:tsx|ts|jsx|js|rs|css|md|json|toml|yaml|yml|html)(?::\d+(?::\d+)?)?)(?:$|[\s"'`),.;:!?])/;
+  /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]+\.[A-Za-z0-9][\w-]*(?::\d+(?::\d+)?)?)(?:$|[\s"'`),.;:!?])/;
 const PATH_SEP_TARGET_RE =
   /(?:^|[\s"'`])((?:[A-Za-z]:[\\/])?[\w./\\\-@()[\]]+[\\/][\w./\\\-@()[\]]+)(?:$|[\s"'`),.;:!?])/;
 
@@ -83,7 +83,7 @@ function extractToolFileTarget(name: string, raw: string): string | undefined {
   if (isSearchTool(name)) return undefined;
   if (isCommandTool(name)) return undefined;
   const file = matchToolPath(raw, EXTENDED_FILE_TARGET_RE);
-  if (file) return file;
+  if (file && isPathLike(file)) return file;
   if (!allowsSlashOnlyToolTarget(name)) return undefined;
   const sepTarget = matchToolPath(raw, PATH_SEP_TARGET_RE);
   if (!sepTarget) return undefined;
