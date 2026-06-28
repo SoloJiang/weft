@@ -131,7 +131,9 @@ function unwrapParenthesizedToolPath(raw: string, file: string, captureEnd: numb
 }
 
 function allowsSlashOnlyToolTarget(name: string): boolean {
-  return /(read|view|cat|ls|list)/.test(name.toLowerCase());
+  return toolNameTokens(name).some((token) =>
+    token === "read" || token === "view" || token === "cat" || token === "ls" || token === "list"
+  );
 }
 
 function isSearchTool(name: string): boolean {
@@ -140,4 +142,8 @@ function isSearchTool(name: string): boolean {
 
 function isCommandTool(name: string): boolean {
   return /(bash|command|exec_command|shell|run)/.test(name.toLowerCase());
+}
+
+function toolNameTokens(name: string): string[] {
+  return name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 }

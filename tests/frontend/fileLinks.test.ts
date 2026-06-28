@@ -68,10 +68,27 @@ test("does not suffix-match spaced line-label paths", () => {
 
 test("requires a boundary before line-label paths", () => {
   assert.deepEqual(splitTextForPaths("见jobs/[id]/route.ts (line 122)"), [
+    { type: "text", value: "见" },
     { type: "path", value: "jobs/[id]/route.ts:122", label: "jobs/[id]/route.ts:122" },
   ]);
   assert.deepEqual(splitTextForPaths("insrc/App.tsx (line 3)"), [
+    { type: "text", value: "in" },
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+  ]);
+});
+
+test("keeps earlier file chips before rejected line-label paths", () => {
+  assert.deepEqual(splitTextForPaths("src/A.ts and /Users/me/My Repo/src/App.tsx (line 1)"), [
+    { type: "path", value: "src/A.ts" },
+    { type: "text", value: " and /Users/me/My Repo/src/App.tsx (line 1)" },
+  ]);
+});
+
+test("preserves text trimmed from embedded line-label paths", () => {
+  assert.deepEqual(splitTextForPaths("src/A.ts (line 1),src/B.ts (line 2)"), [
+    { type: "path", value: "src/A.ts:1", label: "src/A.ts:1" },
+    { type: "text", value: "," },
+    { type: "path", value: "src/B.ts:2", label: "src/B.ts:2" },
   ]);
 });
 
@@ -153,6 +170,12 @@ test("keeps slash-only targets for file listing tools", () => {
   assert.deepEqual(compactToolTarget("list", "src/components"), {
     target: "src/components",
     targetToken: "src/components",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("mcp__weft_curator__set_classification", "services/api"), {
+    target: "services/api",
+    targetToken: undefined,
     added: undefined,
     removed: undefined,
   });

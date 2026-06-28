@@ -101,18 +101,26 @@ function splitLineLabels(text: string): Seg[] | null {
   for (const match of text.matchAll(PATH_WITH_LINE_RE)) {
     const start = match.index ?? 0;
     let rawPath = match[1];
-    const originalCaptureStart = start + match[0].indexOf(rawPath);
+    const rawPathOffset = match[0].indexOf(rawPath);
+    const originalCaptureStart = start + rawPathOffset;
     const originalCaptureEnd = originalCaptureStart + rawPath.length;
     const originalSpacedPath =
       isSpacedPathSuffix(text, originalCaptureStart) ||
       isSpacedPathPrefix(text, originalCaptureEnd);
     const embeddedPath = trimLeadingProsePath(rawPath);
+    let captureStart = originalCaptureStart;
     if (!originalSpacedPath && embeddedPath && embeddedPath.length < rawPath.length) {
+      captureStart = originalCaptureStart + rawPath.indexOf(embeddedPath);
       rawPath = embeddedPath;
     }
-    const boundary = hasLinePathBoundary(text, start + match[0].indexOf(rawPath));
-    if (!boundary) rawPath = trimLeadingProsePath(rawPath);
-    const captureStart = start + match[0].indexOf(rawPath);
+    const boundary = hasLinePathBoundary(text, captureStart);
+    if (!boundary) {
+      const trimmedPath = trimLeadingProsePath(rawPath);
+      if (trimmedPath) {
+        captureStart += rawPath.indexOf(trimmedPath);
+        rawPath = trimmedPath;
+      }
+    }
     const captureEnd = captureStart + rawPath.length;
     if (
       !rawPath ||
@@ -122,7 +130,11 @@ function splitLineLabels(text: string): Seg[] | null {
     ) {
       matched = true;
       const end = start + match[0].length;
-      pushText(out, text.slice(last, end));
+      const rejectedStart = originalSpacedPath ? spacedPathStart(text, originalCaptureStart) : start;
+      if (rejectedStart > last) {
+        for (const seg of splitPlainTextForPaths(text.slice(last, rejectedStart))) out.push(seg);
+      }
+      pushText(out, text.slice(rejectedStart, end));
       last = end;
       continue;
     }
@@ -130,8 +142,8 @@ function splitLineLabels(text: string): Seg[] | null {
     const path = rawPath.slice(lead.length);
     if (!path || !isPathLike(path)) continue;
     matched = true;
-    if (start > last) {
-      for (const seg of splitPlainTextForPaths(text.slice(last, start))) out.push(seg);
+    if (captureStart > last) {
+      for (const seg of splitPlainTextForPaths(text.slice(last, captureStart))) out.push(seg);
     }
     if (lead) pushText(out, lead);
     const line = match[2];
@@ -180,6 +192,14 @@ function isSpacedPathPrefix(text: string, captureEnd: number): boolean {
   if (!/\s/.test(text[captureEnd] ?? "")) return false;
   const nextToken = text.slice(captureEnd).trimStart().match(/^[^\s"'`]+/)?.[0] ?? "";
   return /[/\\]/.test(nextToken) || /\.[A-Za-z0-9]+(?::\d+(?::\d+)?)?$/.test(nextToken);
+}
+
+function spacedPathStart(text: string, captureStart: number): number {
+  const space = captureStart - 1;
+  if (space < 0 || !/\s/.test(text[space] ?? "")) return captureStart;
+  const before = text.slice(0, space);
+  const previousToken = before.match(/[^\s"'`]+$/)?.[0] ?? "";
+  return /[/\\]/.test(previousToken) ? space - previousToken.length : captureStart;
 }
 
 function splitPlainTextForPaths(text: string): Seg[] {
