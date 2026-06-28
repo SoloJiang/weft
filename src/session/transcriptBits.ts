@@ -81,15 +81,41 @@ export function compactToolTarget(name: string, summary: string) {
 
 function extractToolFileTarget(name: string, raw: string): string | undefined {
   if (isSearchTool(name)) return undefined;
-  const file = raw.match(EXTENDED_FILE_TARGET_RE)?.[1];
+  if (isCommandTool(name)) return undefined;
+  const file = matchToolPath(raw, EXTENDED_FILE_TARGET_RE);
   if (file) return file;
   if (!allowsSlashOnlyToolTarget(name)) return undefined;
-  const sepTarget = raw.match(PATH_SEP_TARGET_RE)?.[1];
+  const sepTarget = matchToolPath(raw, PATH_SEP_TARGET_RE);
   if (!sepTarget) return undefined;
   if (isPathLike(sepTarget)) return sepTarget;
   return /^(?:[A-Za-z]:[\\/])?[\w.-]+[\\/][\w./\\\-@()[\]]+$/.test(sepTarget)
     ? sepTarget
     : undefined;
+}
+
+function matchToolPath(raw: string, pattern: RegExp): string | undefined {
+  pattern.lastIndex = 0;
+  const match = pattern.exec(raw);
+  const file = match?.[1];
+  if (!file || match.index === undefined) return undefined;
+  const captureStart = match.index + match[0].indexOf(file);
+  const captureEnd = captureStart + file.length;
+  if (isSpacedPathSuffix(raw, captureStart)) return undefined;
+  return isSpacedPathPrefix(raw, captureEnd) ? undefined : file;
+}
+
+function isSpacedPathSuffix(raw: string, captureStart: number): boolean {
+  const space = captureStart - 1;
+  if (space < 0 || !/\s/.test(raw[space] ?? "")) return false;
+  const before = raw.slice(0, space);
+  const previousToken = before.match(/[^\s"'`]+$/)?.[0] ?? "";
+  return /[/\\]/.test(previousToken);
+}
+
+function isSpacedPathPrefix(raw: string, captureEnd: number): boolean {
+  if (!/\s/.test(raw[captureEnd] ?? "")) return false;
+  const nextToken = raw.slice(captureEnd).trimStart().match(/^[^\s"'`]+/)?.[0] ?? "";
+  return /[/\\]/.test(nextToken) || /\.[A-Za-z0-9]+(?::\d+(?::\d+)?)?$/.test(nextToken);
 }
 
 function allowsSlashOnlyToolTarget(name: string): boolean {
@@ -98,4 +124,8 @@ function allowsSlashOnlyToolTarget(name: string): boolean {
 
 function isSearchTool(name: string): boolean {
   return /(grep|glob|rg|ripgrep|find|search)/.test(name.toLowerCase());
+}
+
+function isCommandTool(name: string): boolean {
+  return /(bash|command|exec_command|shell|run)/.test(name.toLowerCase());
 }

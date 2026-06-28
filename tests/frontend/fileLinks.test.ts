@@ -91,6 +91,18 @@ test("does not turn command slash arguments into file targets", () => {
     added: undefined,
     removed: undefined,
   });
+  assert.deepEqual(compactToolTarget("command_execution", "git checkout package.json"), {
+    target: "git checkout package.json",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("exec_command", "node scripts/foo.js"), {
+    target: "node scripts/foo.js",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
 });
 
 test("keeps slash-only targets for file listing tools", () => {
@@ -118,6 +130,21 @@ test("recognizes Windows and route-group paths in tool summaries", () => {
   assert.deepEqual(compactToolTarget("file_change", "src/app/(auth)/page.tsx"), {
     target: "(auth)/page.tsx",
     targetToken: "src/app/(auth)/page.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("does not suffix-match spaced paths in tool summaries", () => {
+  assert.deepEqual(compactToolTarget("file_change", "src/My File.tsx"), {
+    target: "src/My File.tsx",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("read", "/Users/me/My Repo/src/App.tsx"), {
+    target: "/Users/me/My Repo/src/App.tsx",
+    targetToken: undefined,
     added: undefined,
     removed: undefined,
   });
