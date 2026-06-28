@@ -42,13 +42,18 @@ export function Tool({
 }) {
   const [open, setOpen] = useState(false);
   const hasDetail = (input && input.length > 0) || (output && output.length > 0);
+  const hasInteractiveTarget = Boolean(targetToken);
+  const disabled = !hasDetail && !hasInteractiveTarget;
 
   return (
     <div>
       <button
         type="button"
-        disabled={!hasDetail}
-        onClick={() => setOpen((value) => !value)}
+        disabled={disabled}
+        onClick={() => {
+          if (!hasDetail) return;
+          setOpen((value) => !value);
+        }}
         className={cn(
           "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
           hasDetail && "hover:bg-surface/60",

@@ -52,6 +52,7 @@ const DELIM = new RegExp(`(\\s+|[${LIST_SEP}${CJK_PUNCT}]+)`);
 const IS_DELIM = new RegExp(`^(?:\\s|[${LIST_SEP}${CJK_PUNCT}])`);
 const LEAD_PUNCT = /^[([{<'"`]+/;
 const TAIL_PUNCT = /[)\]}>'"`.,;:!?]+$/;
+const LINE_LABEL_LEAD_PUNCT = /^[([{<'"`【「『〔〈《〖“‘]+/;
 const PATH_WITH_LINE_RE = new RegExp(
   `([^\\s"'()（）]+\\.(?:${CODE_EXT}))\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
   "gi",
@@ -82,16 +83,19 @@ function splitLineLabels(text: string): Seg[] | null {
   let matched = false;
   for (const match of text.matchAll(PATH_WITH_LINE_RE)) {
     const start = match.index ?? 0;
-    const path = match[1];
+    const rawPath = match[1];
+    const lead = rawPath.match(LINE_LABEL_LEAD_PUNCT)?.[0] ?? "";
+    const path = rawPath.slice(lead.length);
     if (!path || !isPathLike(path)) continue;
     matched = true;
     if (start > last) {
       for (const seg of splitPlainTextForPaths(text.slice(last, start))) out.push(seg);
     }
+    if (lead) pushText(out, lead);
     const line = match[2];
     const col = match[3];
     const value = col ? `${path}:${line}:${col}` : `${path}:${line}`;
-    out.push({ type: "path", value, label: match[0] });
+    out.push({ type: "path", value, label: match[0].slice(lead.length) });
     last = start + match[0].length;
   }
   if (!matched) return null;

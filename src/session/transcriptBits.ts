@@ -12,6 +12,11 @@ import {
   SquareTerminal,
   Wrench,
 } from "lucide-react";
+import { isPathLike } from "../lib/filePathParsing.ts";
+
+const EXTENDED_FILE_TARGET_RE =
+  /(?:^|[\s"'`])([\w./\-@[\]]+\.(?:tsx|ts|jsx|js|rs|css|md|json|toml|yaml|yml|html))(?:$|[\s"'`),.;:!?])/;
+const SLASH_TARGET_RE = /(?:^|[\s"'`])([\w./\-@[\]]+\/[\w./\-@[\]]+)(?:$|[\s"'`),.;:!?])/;
 
 /** Map a (cleaned) tool name to a glyph so the pills are scannable. */
 export function toolIcon(name: string): ComponentType<LucideProps> {
@@ -63,14 +68,24 @@ export function toolDoneLabelKey(name: string) {
 /** Squeeze a tool call's target into a compact, scannable fragment. */
 export function compactToolTarget(name: string, summary: string) {
   const raw = summary || name;
-  const file =
-    raw.match(
-      /(?:^|[\s"'`])([\w./\-@[\]]+\.(?:tsx|ts|jsx|js|rs|css|md|json|toml|yaml|yml|html))(?:$|[\s"'`),.;:!?])/,
-    )?.[1] ??
-    raw.match(/(?:^|[\s"'`])([\w./\-@[\]]+\/[\w./\-@[\]]+)(?:$|[\s"'`),.;:!?])/)?.[1];
+  const file = extractToolFileTarget(name, raw);
   const target = file ? file.split("/").slice(-2).join("/") : raw.replace(/\s+/g, " ").slice(0, 90);
   const targetToken = file;
   const added = raw.match(/(?:\+|added[:= ]+)(\d+)/i)?.[1];
   const removed = raw.match(/(?:-|removed[:= ]+)(\d+)/i)?.[1];
   return { target, targetToken, added, removed };
+}
+
+function extractToolFileTarget(name: string, raw: string): string | undefined {
+  const file = raw.match(EXTENDED_FILE_TARGET_RE)?.[1];
+  if (file) return file;
+  if (!allowsSlashOnlyToolTarget(name)) return undefined;
+  const slashTarget = raw.match(SLASH_TARGET_RE)?.[1];
+  if (!slashTarget) return undefined;
+  if (isPathLike(slashTarget)) return slashTarget;
+  return /^[\w.-]+\/[\w./\-@[\]]+$/.test(slashTarget) ? slashTarget : undefined;
+}
+
+function allowsSlashOnlyToolTarget(name: string): boolean {
+  return /(read|view|cat|grep|glob|rg|ripgrep|ls|find|list|search)/.test(name.toLowerCase());
 }

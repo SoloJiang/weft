@@ -18,10 +18,47 @@ test("recognizes bracketed dynamic route paths with line numbers", () => {
   ]);
 });
 
+test("keeps wrappers outside path labels with line numbers", () => {
+  assert.deepEqual(splitTextForPaths("[src/App.tsx (line 3)]"), [
+    { type: "text", value: "[" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx (line 3)" },
+    { type: "text", value: "]" },
+  ]);
+  assert.deepEqual(splitTextForPaths("【src/App.tsx (line 3)】"), [
+    { type: "text", value: "【" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx (line 3)" },
+    { type: "text", value: "】" },
+  ]);
+});
+
 test("keeps full path token for tool summaries while showing a compact label", () => {
   assert.deepEqual(compactToolTarget("read", "Reading files src/app/layout.tsx"), {
     target: "app/layout.tsx",
     targetToken: "src/app/layout.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("does not turn command slash arguments into file targets", () => {
+  assert.deepEqual(compactToolTarget("command_execution", "pnpm add @radix-ui/react-dialog"), {
+    target: "pnpm add @radix-ui/react-dialog",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("command_execution", "git merge origin/main"), {
+    target: "git merge origin/main",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("keeps slash-only targets for file listing tools", () => {
+  assert.deepEqual(compactToolTarget("list", "src/components"), {
+    target: "src/components",
+    targetToken: "src/components",
     added: undefined,
     removed: undefined,
   });
