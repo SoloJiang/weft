@@ -114,16 +114,20 @@ function splitLineLabels(text: string): Seg[] | null {
       rawPath = embeddedPath;
     }
     const boundary = hasLinePathBoundary(text, captureStart);
+    let rejectedForBoundary = hasLeadingProseBeforeAnchor(rawPath);
     if (!boundary) {
       const trimmedPath = trimLeadingProsePath(rawPath);
       if (trimmedPath) {
         captureStart += rawPath.indexOf(trimmedPath);
         rawPath = trimmedPath;
+      } else {
+        rejectedForBoundary = true;
       }
     }
     const captureEnd = captureStart + rawPath.length;
     if (
       !rawPath ||
+      rejectedForBoundary ||
       originalSpacedPath ||
       isSpacedPathSuffix(text, captureStart) ||
       isSpacedPathPrefix(text, captureEnd)
@@ -179,6 +183,12 @@ function trimLeadingProsePath(rawPath: string): string {
   const prefix = rawPath.slice(0, rooted.index);
   if (/[A-Za-z0-9_-]$/.test(prefix)) return "";
   return /[/\\]/.test(prefix) ? "" : rooted[0];
+}
+
+function hasLeadingProseBeforeAnchor(rawPath: string): boolean {
+  const match = rawPath.match(/^(.*?)(?:\.{1,2}[\\/]|~[\\/]|[A-Za-z]:[\\/])/);
+  const prefix = match?.[1] ?? "";
+  return prefix.length > 0;
 }
 
 function isSpacedPathSuffix(text: string, captureStart: number): boolean {

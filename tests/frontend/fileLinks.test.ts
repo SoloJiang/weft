@@ -91,6 +91,15 @@ test("preserves text trimmed from embedded line-label paths", () => {
   ]);
 });
 
+test("rejects unrescued prose prefixes before anchored line-label paths", () => {
+  assert.deepEqual(splitTextForPaths("见./src/App.tsx (line 3)"), [
+    { type: "text", value: "见./src/App.tsx (line 3)" },
+  ]);
+  assert.deepEqual(splitTextForPaths("见~/repo/src/App.tsx (line 3)"), [
+    { type: "text", value: "见~/repo/src/App.tsx (line 3)" },
+  ]);
+});
+
 test("preserves valid parent directories before line-label paths", () => {
   assert.deepEqual(splitTextForPaths("crates/foo/src/lib.rs (line 3)"), [
     {
@@ -216,6 +225,18 @@ test("recognizes Windows and route-group paths in tool summaries", () => {
   assert.deepEqual(compactToolTarget("read", "~/repo/src/App.tsx"), {
     target: "src/App.tsx",
     targetToken: "~/repo/src/App.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("read", "src/组件/Button.tsx"), {
+    target: "组件/Button.tsx",
+    targetToken: "src/组件/Button.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("read", "src/中文.ts"), {
+    target: "src/中文.ts",
+    targetToken: "src/中文.ts",
     added: undefined,
     removed: undefined,
   });

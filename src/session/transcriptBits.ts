@@ -15,11 +15,11 @@ import {
 import { isPathLike } from "../lib/filePathParsing.ts";
 
 const EXTENDED_FILE_TARGET_RE =
-  /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[\w./\\\-@()[\]]+\.[A-Za-z0-9][\w-]*(?::\d+(?::\d+)?)?)(?:$|[\s"'`),.;:!?])/;
+  /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+?\.[A-Za-z0-9][\w-]*(?::\d+(?::\d+)?)?)(?:$|[\s"'`),.;:!?，。；！？、])/;
 const MANIFEST_FILE_TARGET_RE =
-  /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[\w./\\\-@()[\]]*(?:Dockerfile|Makefile|\.gitignore|\.env(?:\.[\w.-]+)?))(?:$|[\s"'`),.;:!?])/;
+  /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]*(?:Dockerfile|Makefile|\.gitignore|\.env(?:\.[\w.-]+)?))(?:$|[\s"'`),.;:!?，。；！？、])/;
 const PATH_SEP_TARGET_RE =
-  /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[\w./\\\-@()[\]]+[\\/][\w./\\\-@()[\]]+)(?:$|[\s"'`),.;:!?])/;
+  /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+)(?:$|[\s"'`),.;:!?，。；！？、])/;
 
 /** Map a (cleaned) tool name to a glyph so the pills are scannable. */
 export function toolIcon(name: string): ComponentType<LucideProps> {
@@ -92,7 +92,7 @@ function extractToolFileTarget(name: string, raw: string): string | undefined {
   const sepTarget = matchToolPath(raw, PATH_SEP_TARGET_RE);
   if (!sepTarget) return undefined;
   if (isPathLike(sepTarget)) return sepTarget;
-  return /^(?:~[\\/]|(?:[A-Za-z]:[\\/])?)[\w.-]+[\\/][\w./\\\-@()[\]]+$/.test(sepTarget)
+  return /^(?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+$/.test(sepTarget)
     ? sepTarget
     : undefined;
 }
