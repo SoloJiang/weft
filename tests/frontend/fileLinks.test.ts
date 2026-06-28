@@ -44,6 +44,16 @@ test("keeps wrappers outside path labels with line numbers", () => {
     { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
     { type: "text", value: "))" },
   ]);
+  assert.deepEqual(splitTextForPaths('"src/App.tsx" (line 3)'), [
+    { type: "text", value: '"' },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: '"' },
+  ]);
+  assert.deepEqual(splitTextForPaths("`src/App.tsx` (line 3)"), [
+    { type: "text", value: "`" },
+    { type: "path", value: "src/App.tsx:3", label: "src/App.tsx:3" },
+    { type: "text", value: "`" },
+  ]);
   assert.deepEqual(splitTextForPaths("（crates/foo/src/lib.rs (line 3)）"), [
     { type: "text", value: "（" },
     { type: "path", value: "crates/foo/src/lib.rs:3", label: "crates/foo/src/lib.rs:3" },
@@ -76,6 +86,15 @@ test("recognizes dotless manifest paths with line numbers", () => {
   ]);
   assert.deepEqual(splitTextForPaths(".gitignore (line 2)"), [
     { type: "path", value: ".gitignore:2", label: ".gitignore:2" },
+  ]);
+});
+
+test("recognizes extensionless relative paths with line numbers", () => {
+  assert.deepEqual(splitTextForPaths("scripts/pre-commit (line 1)"), [
+    { type: "path", value: "scripts/pre-commit:1", label: "scripts/pre-commit:1" },
+  ]);
+  assert.deepEqual(splitTextForPaths("src/bin/tool (line 2)"), [
+    { type: "path", value: "src/bin/tool:2", label: "src/bin/tool:2" },
   ]);
 });
 
@@ -231,6 +250,27 @@ test("keeps full path token for tool summaries while showing a compact label", (
   assert.deepEqual(compactToolTarget("read", "Reading files src/app/layout.tsx"), {
     target: "app/layout.tsx",
     targetToken: "src/app/layout.tsx",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("keeps multi-dot root tool file targets", () => {
+  assert.deepEqual(compactToolTarget("read", "vite.config.ts"), {
+    target: "vite.config.ts",
+    targetToken: "vite.config.ts",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("file_change", ".eslintrc.js"), {
+    target: ".eslintrc.js",
+    targetToken: ".eslintrc.js",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("edit", "foo.test.ts"), {
+    target: "foo.test.ts",
+    targetToken: "foo.test.ts",
     added: undefined,
     removed: undefined,
   });

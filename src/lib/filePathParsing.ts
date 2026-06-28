@@ -72,7 +72,7 @@ const LINE_LABEL_WRAPPERS: Record<string, string> = {
   "‘": "’",
 };
 const PATH_WITH_LINE_RE = new RegExp(
-  `([^\\s"']+?)\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
+  `([^\\s"'\`]+?)(["'\`\\])}>）】」』〕〉》〖”’])?\\s+\\(line\\s+(\\d+)(?:\\s*,\\s*(?:col|column)\\s+(\\d+))?\\)`,
   "gi",
 );
 const LINE_LABEL_SYNTAX_RE =
@@ -108,6 +108,7 @@ function splitLineLabels(text: string): Seg[] | null {
   for (const match of text.matchAll(PATH_WITH_LINE_RE)) {
     const start = match.index ?? 0;
     let rawPath = match[1];
+    const trail = match[2] ?? "";
     const rawPathOffset = match[0].indexOf(rawPath);
     const originalCaptureStart = start + rawPathOffset;
     const originalCaptureEnd = originalCaptureStart + rawPath.length;
@@ -161,16 +162,17 @@ function splitLineLabels(text: string): Seg[] | null {
     }
     const lead = lineLabelLeadWrapper(text, start, match[0], rawPath);
     const path = rawPath.slice(lead.length);
-    if (!path || !isPathLike(path)) continue;
+    if (!path || !isLineLabelPathLike(path)) continue;
     matched = true;
     if (captureStart > last) {
       for (const seg of splitPlainTextForPaths(text.slice(last, captureStart))) out.push(seg);
     }
     if (lead) pushText(out, lead);
-    const line = match[2];
-    const col = match[3];
+    const line = match[3];
+    const col = match[4];
     const value = col ? `${path}:${line}:${col}` : `${path}:${line}`;
     out.push({ type: "path", value, label: value });
+    if (trail) pushText(out, trail);
     last = start + match[0].length;
   }
   if (!matched) return null;
@@ -193,6 +195,12 @@ function lineLabelLeadWrapper(text: string, start: number, matchText: string, ra
     rest = rest.slice(nextLead.length);
   }
   return lead;
+}
+
+function isLineLabelPathLike(path: string): boolean {
+  if (isPathLike(path)) return true;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return false;
+  return /^[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+$/.test(path);
 }
 
 function hasLinePathBoundary(text: string, captureStart: number): boolean {
