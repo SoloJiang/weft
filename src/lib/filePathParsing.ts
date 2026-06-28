@@ -106,8 +106,7 @@ function splitLineLabels(text: string): Seg[] | null {
     const originalSpacedPath =
       isSpacedPathSuffix(text, originalCaptureStart) ||
       isSpacedPathPrefix(text, originalCaptureEnd);
-    const canTrimEmbeddedPath = !LINE_LABEL_WRAPPERS[rawPath[0] ?? ""];
-    const embeddedPath = canTrimEmbeddedPath ? trimLeadingProsePath(rawPath) : "";
+    const embeddedPath = trimLeadingProsePath(rawPath);
     if (!originalSpacedPath && embeddedPath && embeddedPath.length < rawPath.length) {
       rawPath = embeddedPath;
     }
@@ -162,8 +161,11 @@ function hasLinePathBoundary(text: string, captureStart: number): boolean {
 }
 
 function trimLeadingProsePath(rawPath: string): string {
+  if (LINE_LABEL_WRAPPERS[rawPath[0] ?? ""]) return "";
   const rooted = rawPath.match(/(?:src|app|components|pages|jobs|cmd|lib|tests|test|packages|src-tauri)[/\\].*$/);
-  return rooted?.[0] ?? "";
+  if (!rooted || rooted.index === undefined) return "";
+  const prefix = rawPath.slice(0, rooted.index);
+  return /[/\\]/.test(prefix) ? "" : rooted[0];
 }
 
 function isSpacedPathSuffix(text: string, captureStart: number): boolean {

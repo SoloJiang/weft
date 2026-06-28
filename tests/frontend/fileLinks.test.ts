@@ -75,6 +75,23 @@ test("requires a boundary before line-label paths", () => {
   ]);
 });
 
+test("preserves valid parent directories before line-label paths", () => {
+  assert.deepEqual(splitTextForPaths("crates/foo/src/lib.rs (line 3)"), [
+    {
+      type: "path",
+      value: "crates/foo/src/lib.rs:3",
+      label: "crates/foo/src/lib.rs:3",
+    },
+  ]);
+  assert.deepEqual(splitTextForPaths("frontend/src/App.tsx (line 3)"), [
+    {
+      type: "path",
+      value: "frontend/src/App.tsx:3",
+      label: "frontend/src/App.tsx:3",
+    },
+  ]);
+});
+
 test("keeps full path token for tool summaries while showing a compact label", () => {
   assert.deepEqual(compactToolTarget("read", "Reading files src/app/layout.tsx"), {
     target: "app/layout.tsx",
