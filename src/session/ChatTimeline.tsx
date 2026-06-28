@@ -19,6 +19,7 @@ import {
   toolDoneLabelKey,
   toolIcon,
   toolLabelKey,
+  toolAllowsFileTarget,
 } from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
 import { PermissionBar } from "./PermissionBar";
@@ -384,6 +385,7 @@ function TimelineRow({
     const labelKey = status === "streaming" ? toolLabelKey(name) : toolDoneLabelKey(name);
     const generic = labelKey === "session.toolCalling" || labelKey === "session.toolCalled";
     const { target, targetToken, added, removed } = compactToolTarget(name, summary);
+    const showFileTarget = toolAllowsFileTarget(name);
     return (
       <Tool
         icon={Icon}
@@ -391,7 +393,7 @@ function TimelineRow({
         summary={summary}
         status={status}
         target={target}
-        targetToken={generic ? undefined : targetToken}
+        targetToken={showFileTarget ? targetToken : undefined}
         cwd={cwd}
         added={added}
         removed={removed}

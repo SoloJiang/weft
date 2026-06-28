@@ -20,20 +20,20 @@ const MANIFEST_FILE_TARGET_RE =
   /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]*(?:Dockerfile|Makefile|\.gitignore|\.env(?:\.[\w.-]+)?))(?:$|[\s"'`),.;:!?，。；！？、])/;
 const PATH_SEP_TARGET_RE =
   /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+)(?:$|[\s"'`),.;:!?，。；！？、])/;
+type ToolKind = "command" | "edit" | "search" | "read" | "sync" | "todo" | "generic";
 
 /** Map a (cleaned) tool name to a glyph so the pills are scannable. */
 export function toolIcon(name: string): ComponentType<LucideProps> {
-  const n = name.toLowerCase();
-  // `command`/`file_change` cover codex's item types in both dialects: exec's
-  // snake_case (command_execution/file_change) and app-server's camelCase
-  // (commandExecution/fileChange, lowercased here).
-  if (/(bash|command|exec_command|shell|run)/.test(n)) return SquareTerminal;
-  if (/(write|edit|apply_patch|patch|file_change|filechange)/.test(n)) return FilePen;
-  if (/(grep|glob|rg|ripgrep|ls|find|list)/.test(n)) return Search;
-  if (/read|view|cat/.test(n)) return FileText;
-  if (/(bus_|broadcast|ask_human|announce|interface|inbox|status)/.test(n)) return Radio;
-  if (/todo/.test(n)) return ListTodo;
-  return Wrench;
+  const icons: Record<ToolKind, ComponentType<LucideProps>> = {
+    command: SquareTerminal,
+    edit: FilePen,
+    search: Search,
+    read: FileText,
+    sync: Radio,
+    todo: ListTodo,
+    generic: Wrench,
+  };
+  return icons[toolKind(name)];
 }
 
 /** Human-scannable tool identity: `mcp__weft_planner__get_task` → "weft_planner · get_task". */
@@ -45,27 +45,31 @@ export function cleanToolName(name: string) {
 
 /** i18n key for the tool's activity label — call t() on the result. */
 export function toolLabelKey(name: string) {
-  const n = name.toLowerCase();
-  if (/(write|edit|apply_patch|patch|file_change|filechange)/.test(n)) return "session.toolEditing";
-  if (/(read|view|cat)/.test(n)) return "session.toolReading";
-  if (/(grep|glob|rg|ripgrep|ls|find|list|search)/.test(n)) return "session.toolSearching";
-  if (/(bash|command|exec_command|shell|run)/.test(n)) return "session.toolRunning";
-  if (/(bus_|broadcast|ask_human|announce|interface|inbox|status)/.test(n)) return "session.toolSyncing";
-  if (/todo/.test(n)) return "session.toolOrganizing";
-  return "session.toolCalling";
+  const labels: Record<ToolKind, string> = {
+    command: "session.toolRunning",
+    edit: "session.toolEditing",
+    search: "session.toolSearching",
+    read: "session.toolReading",
+    sync: "session.toolSyncing",
+    todo: "session.toolOrganizing",
+    generic: "session.toolCalling",
+  };
+  return labels[toolKind(name)];
 }
 
 /** Past-tense label for a FINISHED tool row (codex-style "Ran"/"已运行"), vs the
  *  present-continuous `toolLabelKey` the in-flight activity line uses. */
 export function toolDoneLabelKey(name: string) {
-  const n = name.toLowerCase();
-  if (/(write|edit|apply_patch|patch|file_change|filechange)/.test(n)) return "session.toolEdited";
-  if (/(read|view|cat)/.test(n)) return "session.toolRead";
-  if (/(grep|glob|rg|ripgrep|ls|find|list|search)/.test(n)) return "session.toolSearched";
-  if (/(bash|command|exec_command|shell|run)/.test(n)) return "session.toolRan";
-  if (/(bus_|broadcast|ask_human|announce|interface|inbox|status)/.test(n)) return "session.toolSynced";
-  if (/todo/.test(n)) return "session.toolOrganized";
-  return "session.toolCalled";
+  const labels: Record<ToolKind, string> = {
+    command: "session.toolRan",
+    edit: "session.toolEdited",
+    search: "session.toolSearched",
+    read: "session.toolRead",
+    sync: "session.toolSynced",
+    todo: "session.toolOrganized",
+    generic: "session.toolCalled",
+  };
+  return labels[toolKind(name)];
 }
 
 /** Squeeze a tool call's target into a compact, scannable fragment. */
@@ -84,6 +88,7 @@ export function compactToolTarget(name: string, summary: string) {
 function extractToolFileTarget(name: string, raw: string): string | undefined {
   if (isSearchTool(name)) return undefined;
   if (isCommandTool(name)) return undefined;
+  if (!toolAllowsFileTarget(name)) return undefined;
   const file = matchToolPath(raw, EXTENDED_FILE_TARGET_RE);
   if (file && isPathLike(file)) return file;
   const manifest = matchToolPath(raw, MANIFEST_FILE_TARGET_RE);
@@ -95,6 +100,11 @@ function extractToolFileTarget(name: string, raw: string): string | undefined {
   return /^(?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+$/.test(sepTarget)
     ? sepTarget
     : undefined;
+}
+
+export function toolAllowsFileTarget(name: string): boolean {
+  const kind = toolKind(name);
+  return kind === "read" || kind === "edit" || kind === "search";
 }
 
 function matchToolPath(raw: string, pattern: RegExp): string | undefined {
@@ -131,19 +141,48 @@ function unwrapParenthesizedToolPath(raw: string, file: string, captureEnd: numb
 }
 
 function allowsSlashOnlyToolTarget(name: string): boolean {
-  return toolNameTokens(name).some((token) =>
-    token === "read" || token === "view" || token === "cat" || token === "ls" || token === "list"
-  );
+  const kind = toolKind(name);
+  return kind === "read" || kind === "edit" || kind === "search";
 }
 
 function isSearchTool(name: string): boolean {
-  return /(grep|glob|rg|ripgrep|find|search)/.test(name.toLowerCase());
+  const tokens = toolNameTokens(name);
+  return tokens.some((token) =>
+    token === "grep" || token === "glob" || token === "rg" || token === "ripgrep" || token === "find" || token === "search"
+  );
 }
 
 function isCommandTool(name: string): boolean {
-  return /(bash|command|exec_command|shell|run)/.test(name.toLowerCase());
+  return toolKind(name) === "command";
 }
 
 function toolNameTokens(name: string): string[] {
   return name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function toolKind(name: string): ToolKind {
+  const tokens = toolNameTokens(name);
+  const has = (token: string) => tokens.includes(token);
+  if (has("write") || has("edit") || has("patch")) return "edit";
+  if (has("filechange") || (has("file") && has("change"))) return "edit";
+  if (has("apply") && has("patch")) return "edit";
+  if (has("grep") || has("glob") || has("rg") || has("ripgrep") || has("find") || has("search")) {
+    return "search";
+  }
+  if (has("ls") || has("list")) return "search";
+  if (has("read") || has("view") || has("cat")) return "read";
+  if (has("bash") || has("command") || has("exec") || has("shell") || has("run")) return "command";
+  if (
+    has("bus") ||
+    has("broadcast") ||
+    (has("ask") && has("human")) ||
+    has("announce") ||
+    has("interface") ||
+    has("inbox") ||
+    has("status")
+  ) {
+    return "sync";
+  }
+  if (has("todo")) return "todo";
+  return "generic";
 }

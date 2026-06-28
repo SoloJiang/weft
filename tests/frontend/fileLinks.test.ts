@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { classifyHref, filePathsRehype } from "../../src/lib/fileLinkMarkdown.ts";
 import { hasLineLabelSyntax, isPathLike, splitTextForPaths } from "../../src/lib/filePathParsing.ts";
-import { compactToolTarget } from "../../src/session/transcriptBits.ts";
+import {
+  compactToolTarget,
+  toolAllowsFileTarget,
+  toolDoneLabelKey,
+} from "../../src/session/transcriptBits.ts";
 
 test("recognizes agent path labels with parenthesized line numbers", () => {
   assert.deepEqual(splitTextForPaths("cancel/route.ts (line 43)。"), [
@@ -179,6 +183,16 @@ test("separates prose before colon-prefixed line labels", () => {
   ]);
 });
 
+test("preserves Windows drive prefixes in line labels", () => {
+  assert.deepEqual(splitTextForPaths(String.raw`C:\repo\src\App.tsx (line 3)`), [
+    {
+      type: "path",
+      value: String.raw`C:\repo\src\App.tsx:3`,
+      label: String.raw`C:\repo\src\App.tsx:3`,
+    },
+  ]);
+});
+
 test("detects rejected inline-code line labels before path fallback", () => {
   const spacedLineLabel = "/Users/me/My Repo/src/App.tsx (line 1)";
   assert.equal(hasLineLabelSyntax(spacedLineLabel), true);
@@ -254,6 +268,32 @@ test("keeps slash-only targets for file listing tools", () => {
   });
   assert.deepEqual(compactToolTarget("mcp__weft_curator__set_classification", "services/api"), {
     target: "services/api",
+    targetToken: undefined,
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("keeps extensionless targets for known file-change tools", () => {
+  assert.deepEqual(compactToolTarget("file_change", "src/bin/tool"), {
+    target: "bin/tool",
+    targetToken: "src/bin/tool",
+    added: undefined,
+    removed: undefined,
+  });
+  assert.deepEqual(compactToolTarget("edit", "scripts/pre-commit"), {
+    target: "scripts/pre-commit",
+    targetToken: "scripts/pre-commit",
+    added: undefined,
+    removed: undefined,
+  });
+});
+
+test("does not classify arbitrary mcp tools by substring-only path verbs", () => {
+  assert.equal(toolDoneLabelKey("mcp__weft_curator__set_classification"), "session.toolCalled");
+  assert.equal(toolAllowsFileTarget("mcp__weft_curator__set_classification"), false);
+  assert.deepEqual(compactToolTarget("mcp__weft_curator__set_classification", "package.json"), {
+    target: "package.json",
     targetToken: undefined,
     added: undefined,
     removed: undefined,

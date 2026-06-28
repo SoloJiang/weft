@@ -210,6 +210,9 @@ function trimLeadingDelimitedPath(rawPath: string): string {
   for (const match of matches) {
     const index = match.index ?? -1;
     if (index < 0) continue;
+    if (/^[A-Za-z]$/.test(rawPath[index - 1] ?? "") && /[\\/]/.test(rawPath[index + 1] ?? "")) {
+      continue;
+    }
     const candidate = rawPath.slice(index + match[0].length);
     if (candidate && isPathLike(candidate)) best = candidate;
   }
