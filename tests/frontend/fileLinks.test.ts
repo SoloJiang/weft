@@ -636,12 +636,12 @@ test("classifies markdown hrefs that point at local files", () => {
 test("decodes percent-encoded url tokens for tooltip display", () => {
   // codex emits markdown hrefs as percent-encoded URIs; the tooltip must read back as the real path.
   assert.equal(
-    displayPath("/Users/me/Desktop/%E5%AF%86%E8%81%8A.md", true),
-    "/Users/me/Desktop/密聊.md",
+    displayPath("/Users/me/Desktop/%E6%96%87%E6%A1%A3.md", true),
+    "/Users/me/Desktop/文档.md",
   );
   assert.equal(
-    displayPath("file:///Users/me/%E5%AF%86%E8%81%8A.md:42", true),
-    "/Users/me/密聊.md:42",
+    displayPath("file:///Users/me/%E6%96%87%E6%A1%A3.md:42", true),
+    "/Users/me/文档.md:42",
   );
 });
 
