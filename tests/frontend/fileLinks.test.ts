@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { classifyHref, filePathsRehype } from "../../src/lib/fileLinkMarkdown.ts";
-import { hasLineLabelSyntax, isPathLike, splitTextForPaths } from "../../src/lib/filePathParsing.ts";
+import { displayPath, hasLineLabelSyntax, isPathLike, splitTextForPaths } from "../../src/lib/filePathParsing.ts";
 import {
   compactToolTarget,
   toolAllowsFileTarget,
@@ -631,4 +631,22 @@ test("classifies markdown hrefs that point at local files", () => {
     kind: "web",
     url: "https://example.com/src/App.tsx",
   });
+});
+
+test("decodes percent-encoded url tokens for tooltip display", () => {
+  // codex emits markdown hrefs as percent-encoded URIs; the tooltip must read back as the real path.
+  assert.equal(
+    displayPath("/Users/me/Desktop/%E6%96%87%E6%A1%A3.md", true),
+    "/Users/me/Desktop/文档.md",
+  );
+  assert.equal(
+    displayPath("file:///Users/me/%E6%96%87%E6%A1%A3.md:42", true),
+    "/Users/me/文档.md:42",
+  );
+});
+
+test("leaves literal path tokens verbatim for tooltip display", () => {
+  // Inline-code / prose paths are literal: '%' is a real character, never decoded.
+  assert.equal(displayPath("src/100%done/app.tsx", false), "src/100%done/app.tsx");
+  assert.equal(displayPath("src/App.tsx:12:5", false), "src/App.tsx:12:5");
 });
