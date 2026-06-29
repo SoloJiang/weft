@@ -1,6 +1,7 @@
 import { useState, type ComponentType } from "react";
 import { ChevronRight, type LucideProps } from "lucide-react";
 import { cn } from "../../lib/cn";
+import { FilePathRef } from "../FilePathRef";
 
 export type AiToolStatus = "streaming" | "complete" | "error";
 
@@ -11,6 +12,8 @@ export function Tool({
   label,
   status,
   target,
+  targetToken,
+  cwd,
   summary,
   added,
   removed,
@@ -25,6 +28,8 @@ export function Tool({
   readonly label: string;
   readonly status: AiToolStatus;
   readonly target?: string;
+  readonly targetToken?: string;
+  readonly cwd?: string;
   readonly summary?: string;
   readonly added?: string;
   readonly removed?: string;
@@ -37,45 +42,55 @@ export function Tool({
 }) {
   const [open, setOpen] = useState(false);
   const hasDetail = (input && input.length > 0) || (output && output.length > 0);
+  const hasInteractiveTarget = Boolean(targetToken);
+  const disabled = !hasDetail;
 
   return (
     <div>
-      <button
-        type="button"
-        disabled={!hasDetail}
-        onClick={() => setOpen((value) => !value)}
+      <div
         className={cn(
           "group flex w-full items-center gap-1.5 rounded-[var(--radius-sm)] px-1.5 py-1 text-left text-[12.5px]",
           hasDetail && "hover:bg-surface/60",
         )}
       >
-        <Icon
-          size={13}
-          className={cn(
-            "shrink-0",
-            status === "streaming" && "animate-pulse text-running",
-            status === "error" && "text-danger",
-            status === "complete" && "text-ink-faint",
-          )}
-        />
-        <span className="shrink-0 text-ink-muted">{label}</span>
-        {(target || summary) && (
-          <span className="min-w-0 truncate font-mono text-ink-faint">
-            {target || summary}
-          </span>
-        )}
-        {added != null && <span className="shrink-0 font-mono text-running">+{added}</span>}
-        {removed != null && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
-        {hasDetail && (
-          <ChevronRight
-            size={12}
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            if (!hasDetail) return;
+            setOpen((value) => !value);
+          }}
+          className="flex min-w-0 flex-1 items-center gap-1.5 text-left outline-none disabled:cursor-default focus-visible:ring-2 focus-visible:ring-brand/25"
+        >
+          <Icon
+            size={13}
             className={cn(
-              "ml-auto shrink-0 text-ink-faint/60 transition-transform",
-              open && "rotate-90",
+              "shrink-0",
+              status === "streaming" && "animate-pulse text-running",
+              status === "error" && "text-danger",
+              status === "complete" && "text-ink-faint",
             )}
           />
+          <span className="shrink-0 text-ink-muted">{label}</span>
+          {!hasInteractiveTarget && (target || summary) && (
+            <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} />
+          )}
+          {added != null && <span className="shrink-0 font-mono text-running">+{added}</span>}
+          {removed != null && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
+          {hasDetail && (
+            <ChevronRight
+              size={12}
+              className={cn(
+                "ml-auto shrink-0 text-ink-faint/60 transition-transform",
+                open && "rotate-90",
+              )}
+            />
+          )}
+        </button>
+        {hasInteractiveTarget && (target || summary) && (
+          <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} />
         )}
-      </button>
+      </div>
       {open && hasDetail && (
         <div className="space-y-2 py-1.5 pl-[26px] pr-1.5">
           {input && (
@@ -105,6 +120,8 @@ export function ToolActivity({
   icon: Icon,
   label,
   target,
+  targetToken,
+  cwd,
   summary,
   added,
   removed,
@@ -112,6 +129,8 @@ export function ToolActivity({
   readonly icon: ToolIcon;
   readonly label: string;
   readonly target?: string;
+  readonly targetToken?: string;
+  readonly cwd?: string;
   readonly summary?: string;
   readonly added?: string;
   readonly removed?: string;
@@ -121,11 +140,42 @@ export function ToolActivity({
       <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-running" />
       <Icon size={15} className="shrink-0 text-ink-faint" />
       <span className="shrink-0 font-medium text-ink-muted">{label}</span>
-      {target && <span className="min-w-0 truncate font-mono text-brand">{target}</span>}
+      {target && (
+        <ToolTarget target={target} targetToken={targetToken} summary={summary} cwd={cwd} active />
+      )}
       {!target && summary && <span className="min-w-0 truncate font-mono text-brand">{summary}</span>}
       {added != null && <span className="shrink-0 font-mono text-running">+{added}</span>}
       {removed != null && <span className="shrink-0 font-mono text-danger">-{removed}</span>}
     </div>
+  );
+}
+
+function ToolTarget({
+  target,
+  targetToken,
+  summary,
+  cwd,
+  active = false,
+}: {
+  readonly target?: string;
+  readonly targetToken?: string;
+  readonly summary?: string;
+  readonly cwd?: string;
+  readonly active?: boolean;
+}) {
+  const label = target || summary || "";
+  if (!label) return null;
+  if (targetToken) {
+    return (
+      <FilePathRef token={targetToken} cwd={cwd} compact>
+        {label}
+      </FilePathRef>
+    );
+  }
+  return (
+    <span className={cn("min-w-0 truncate font-mono", active ? "text-brand" : "text-ink-faint")}>
+      {label}
+    </span>
   );
 }
 
