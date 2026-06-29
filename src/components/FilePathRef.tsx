@@ -2,6 +2,7 @@ import { createContext, useContext, type ReactNode } from "react";
 import { FileCode2, FileText } from "lucide-react";
 import { cn } from "../lib/cn";
 import { openFileMenu, openFileRef } from "../lib/fileLinks";
+import { displayPath } from "../lib/filePathParsing";
 
 /**
  * True when already inside an interactive link / file-ref. Descendant file refs
@@ -57,7 +58,7 @@ export function FilePathRef({
         compact && "max-w-[24ch]",
         code && CODE_CHIP,
       )}
-      title={token}
+      title={displayPath(token, isUrl)}
       onClick={(e) => {
         e.preventDefault();
         e.stopPropagation();

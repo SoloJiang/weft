@@ -3,7 +3,7 @@ import { parsePathToken } from "./filePathParsing";
 import { toast } from "../components/Toast";
 import i18n from "../i18n";
 
-export { isPathLike, parsePathToken, splitTextForPaths } from "./filePathParsing";
+export { isPathLike, parsePathToken, displayPath, splitTextForPaths } from "./filePathParsing";
 export { classifyHref, filePathsRehype, type HrefKind } from "./fileLinkMarkdown";
 
 /**

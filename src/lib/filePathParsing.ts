@@ -1,3 +1,15 @@
+/**
+ * Human-readable form of a file token for tooltips: URL tokens (markdown hrefs,
+ * which codex emits percent-encoded) get their `%`-escapes decoded and `file:`
+ * scheme stripped while keeping the `:line[:col]` suffix; literal paths pass
+ * through verbatim (their `%` is a real character).
+ */
+export function displayPath(token: string, isUrl = false): string {
+  const { path, line, col } = parsePathToken(token, isUrl);
+  if (line == null) return path;
+  return col == null ? `${path}:${line}` : `${path}:${line}:${col}`;
+}
+
 export function parsePathToken(
   token: string,
   isUrl = false,
