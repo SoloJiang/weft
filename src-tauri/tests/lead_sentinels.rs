@@ -1,6 +1,7 @@
-//! lead_chat::sentinels::extract_sentinels — pulls `<weft:action_card>{...}`
-//! and `<weft:list_repos/>` markers out of assistant text so the engine can
-//! persist action_card rows and answer list_repos via stdin separately.
+//! lead_chat::sentinels::extract_sentinels — pulls `<weft:action_card>{...}`,
+//! `<weft:plan_card>{...}` and `<weft:list_repos/>` markers out of assistant
+//! text so the engine can persist card rows and answer list_repos via stdin
+//! separately.
 use weft::lead_chat::sentinels::{extract_sentinels, Sentinel};
 
 #[test]
@@ -13,6 +14,37 @@ fn extracts_action_card() {
         Sentinel::ActionCard(json) => assert!(json.contains("\"title\":\"T\"")),
         _ => panic!("wrong variant"),
     }
+}
+
+#[test]
+fn extracts_plan_card() {
+    let t = "讨论后 <weft:plan_card>{\"title\":\"P\",\"requirements\":[]}</weft:plan_card> 等确认";
+    let (clean, found) = extract_sentinels(t);
+    assert_eq!(clean.trim(), "讨论后  等确认");
+    assert_eq!(found.len(), 1);
+    match &found[0] {
+        Sentinel::PlanCard(json) => assert!(json.contains("\"title\":\"P\"")),
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn skips_malformed_plan_card_unclosed() {
+    // 没有 closing tag，整段保持原样、不当作 sentinel
+    let t = "before <weft:plan_card>{\"a\":1} no close";
+    let (clean, found) = extract_sentinels(t);
+    assert_eq!(clean, t);
+    assert!(found.is_empty());
+}
+
+#[test]
+fn plan_card_mixes_with_action_card_in_order() {
+    let t = "<weft:plan_card>{\"p\":1}</weft:plan_card>x<weft:action_card>{\"a\":1}</weft:action_card>";
+    let (clean, found) = extract_sentinels(t);
+    assert_eq!(clean, "x");
+    assert_eq!(found.len(), 2);
+    assert!(matches!(found[0], Sentinel::PlanCard(_)));
+    assert!(matches!(found[1], Sentinel::ActionCard(_)));
 }
 
 #[test]

@@ -22,6 +22,10 @@ import {
   toolAllowsFileTarget,
 } from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
+import { PlanCardBlock, type PlanCardSplitItem } from "./blocks/PlanCardBlock";
+import { api } from "../lib/api";
+import { currentLang } from "../i18n";
+import { toast } from "../components/Toast";
 import { PermissionBar } from "./PermissionBar";
 import type { useRepoActions } from "./useRepoActions";
 
@@ -148,7 +152,11 @@ export function ChatTimeline({
     <div ref={rootRef} className="flex min-h-0 flex-1 flex-col">
       <Virtuoso<LeadMessage>
         ref={virtuosoRef}
-        className="min-h-0 flex-1"
+        // overflow-x-hidden: the scroller's inline overflow-y:auto computes
+        // overflow-x to auto, so any over-wide row scrolls the WHOLE timeline
+        // sideways. The timeline never pans — wide content (code, tables)
+        // scrolls inside its own block (see .weft-md pre/table).
+        className="min-h-0 flex-1 overflow-x-hidden"
         data={visible}
         computeItemKey={(_index, m) => m.id}
         initialTopMostItemIndex={
@@ -456,6 +464,57 @@ function TimelineRow({
     );
   }
 
+  if (m.kind === "plan_card") {
+    const parsed = safeParseObj(m.content);
+    // Approved (persisted into the row): collapse to a settled one-line summary
+    // so the gate reads as closed and can't re-fire after a reload.
+    if (typeof parsed.resolved === "string" && parsed.resolved) {
+      return <SettledLine label={t("planCard.approved", { name: parsed.resolved })} />;
+    }
+    const title = typeof parsed.title === "string" ? parsed.title : "";
+    // runtime-checked sentinel payload from the lead — engine only guarantees an
+    // object root (src-tauri lead_chat::engine::persist_card_row).
+    const split = Array.isArray(parsed.split) ? parsed.split.filter(isPlanSplitItem) : [];
+    // `runAction` is only wired on the lead host, so its presence doubles as
+    // "this timeline may approve"; worker hosts and older turns are read-only.
+    // A newer USER turn also stales the card: the reply is a revision request,
+    // and a late approval could be read against the revised plan.
+    const readOnly =
+      !runAction ||
+      threadId == null ||
+      !isLastAssistant(m, all) ||
+      hasNewerUserTurn(m, all);
+    const tid = threadId;
+    const onApprove = async () => {
+      if (tid == null) return;
+      // Feedback first, and only collapse the card once the lead actually
+      // accepted the delivery — a stopped lead silently drops hidden input, and
+      // a card stamped "approved" with no split coming would mislead.
+      const delivered = await api.postLeadToolResult(
+        tid,
+        { tool: "plan_decision", status: "approved", title },
+        currentLang(),
+      );
+      if (!delivered) {
+        toast(t("planCard.deliverFailed"));
+        return;
+      }
+      await api.resolveActionCard(m.id, title || t("planCard.label"));
+    };
+    return (
+      <PlanCardBlock
+        title={title}
+        requirements={stringArray(parsed.requirements)}
+        approach={typeof parsed.approach === "string" ? parsed.approach : ""}
+        split={split}
+        risks={stringArray(parsed.risks)}
+        readOnly={readOnly}
+        cwd={cwd}
+        onApprove={onApprove}
+      />
+    );
+  }
+
   if (m.kind === "settled") {
     // Durable trail left when a permission/question card was answered — the
     // interactive card itself vanished from its dock; this is its closed record.
@@ -519,7 +578,10 @@ function TimelineRow({
     return (
       <button
         onClick={onReviewProposal}
-        className="group flex items-center gap-2.5 rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5 text-left transition-colors hover:border-accent/70"
+        // w-full: a button's auto width is fit-content, so without it the
+        // nowrap truncate rationale below sets the button's max-content width
+        // and drags the whole timeline into horizontal scroll.
+        className="group flex w-full items-center gap-2.5 rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5 text-left transition-colors hover:border-accent/70"
       >
         <Sparkles size={15} className="shrink-0 text-accent" />
         <div className="min-w-0 flex-1">
@@ -624,6 +686,28 @@ function isActionCardAction(value: unknown): value is ActionCardAction {
     typeof action.id === "string" &&
     typeof action.label === "string" &&
     (action.kind === "add" || action.kind === "new" || action.kind === "clone")
+  );
+}
+
+// True when any user message landed after `m` — for a plan card that means the
+// human replied (a revision request), so approving the old card must be blocked:
+// the queued plan_decision could otherwise be read against the revised plan.
+function hasNewerUserTurn(m: LeadMessage, all: LeadMessage[]): boolean {
+  for (let i = all.length - 1; i >= 0; i--) {
+    const row = all[i];
+    if (row.id === m.id) return false;
+    if (row.role === "user") return true;
+  }
+  return false;
+}
+
+function isPlanSplitItem(value: unknown): value is PlanCardSplitItem {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.name === "string" &&
+    typeof item.repo === "string" &&
+    (item.reason === undefined || typeof item.reason === "string")
   );
 }
 

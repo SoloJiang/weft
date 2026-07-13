@@ -215,6 +215,7 @@ export interface LeadMessage {
     | "worker_event"
     | "meta"
     | "action_card"
+    | "plan_card"
     | "settled";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;

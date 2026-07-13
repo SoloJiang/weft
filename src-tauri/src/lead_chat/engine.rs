@@ -693,10 +693,10 @@ async fn merge_tool_results(
 }
 
 /// Persist / answer the `<weft:*>` sentinels forked out of a finalized assistant
-/// message — action_card becomes its own row, list_repos triggers a hidden
-/// stdin-style reply. Errors are logged but never abort the stream. Shared by the
-/// exec/claude reader and the codex app-server consumer so both transports render
-/// action cards and answer list_repos.
+/// message — action_card / plan_card become their own rows, list_repos triggers
+/// a hidden stdin-style reply. Errors are logged but never abort the stream.
+/// Shared by the exec/claude reader and the codex app-server consumer so both
+/// transports render the cards and answer list_repos.
 async fn apply_lead_sentinels(
     app: &AppHandle,
     db: &Db,
@@ -707,42 +707,10 @@ async fn apply_lead_sentinels(
     for s in sentinels {
         match s {
             super::sentinels::Sentinel::ActionCard(json) => {
-                // Reject anything that isn't a JSON object so the UI can rely on
-                // `card.title / actions / …`.
-                match serde_json::from_str::<serde_json::Value>(&json) {
-                    Ok(v) if v.is_object() => {
-                        let (sid, turn) = (inner.session_id, inner.turn_id);
-                        match repo::insert_lead_message(
-                            db,
-                            thread_id,
-                            sid,
-                            turn,
-                            "assistant",
-                            "action_card",
-                            &json,
-                            "complete",
-                        )
-                        .await
-                        {
-                            Ok(m) => {
-                                let _ = app.emit(
-                                    EVENT,
-                                    Push::Message {
-                                        thread_id,
-                                        message: m,
-                                    },
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("[weft] lead sentinel: insert action_card failed: {e}")
-                            }
-                        }
-                    }
-                    Ok(_) => eprintln!(
-                        "[weft] lead sentinel: action_card payload is not an object — dropped"
-                    ),
-                    Err(e) => eprintln!("[weft] lead sentinel: action_card JSON parse failed: {e}"),
-                }
+                persist_card_row(app, db, inner, thread_id, "action_card", &json).await;
+            }
+            super::sentinels::Sentinel::PlanCard(json) => {
+                persist_card_row(app, db, inner, thread_id, "plan_card", &json).await;
             }
             super::sentinels::Sentinel::ListRepos => {
                 // Look up workspace via the thread row (engine doesn't cache it; one
@@ -801,6 +769,42 @@ async fn apply_lead_sentinels(
                 }
             }
         }
+    }
+}
+
+/// Persist one card sentinel (`action_card` / `plan_card`) as its own timeline
+/// row and push it to the UI. Rejects anything that isn't a JSON object so the
+/// UI can rely on the card's fields; errors are logged, never fatal.
+async fn persist_card_row(
+    app: &AppHandle,
+    db: &Db,
+    inner: &EngineInner,
+    thread_id: i32,
+    kind: &str,
+    json: &str,
+) {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(v) if v.is_object() => {
+            let (sid, turn) = (inner.session_id, inner.turn_id);
+            match repo::insert_lead_message(
+                db, thread_id, sid, turn, "assistant", kind, json, "complete",
+            )
+            .await
+            {
+                Ok(m) => {
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Message {
+                            thread_id,
+                            message: m,
+                        },
+                    );
+                }
+                Err(e) => eprintln!("[weft] lead sentinel: insert {kind} failed: {e}"),
+            }
+        }
+        Ok(_) => eprintln!("[weft] lead sentinel: {kind} payload is not an object — dropped"),
+        Err(e) => eprintln!("[weft] lead sentinel: {kind} JSON parse failed: {e}"),
     }
 }
 
