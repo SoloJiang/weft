@@ -1066,18 +1066,32 @@ pub struct PersistedMeta {
     pub tools: Vec<String>,
 }
 
+/// Whether a transport's live event stream reports context usage itself.
+/// claude (`result.usage`) and codex (TokenCount / turn-end usage) do — for
+/// them a probe's tokens only fill a hole, since a probe started mid-turn can
+/// carry the PREVIOUS turn's usage and land after the turn-end checkpoint.
+/// opencode has no usage-bearing event (turns end on EOF); its sidecar probe
+/// is the ONLY usage source, so probe tokens must stay updatable or the count
+/// freezes at the first probed value forever.
+fn usage_events_authoritative(tool: &str) -> bool {
+    tool != "opencode"
+}
+
 impl PersistedMeta {
     /// Merge an out-of-band probe snapshot (`session_meta::gather`). `None`
     /// fields keep existing values — a transient probe failure must never
     /// blank anything. Returns whether anything changed.
     ///
-    /// `context_tokens` only fills a hole, never overwrites: a probe started
-    /// mid-turn reads the PREVIOUS turn's usage and can land seconds later,
-    /// after the turn-end checkpoint wrote the fresh count — the live event
-    /// stream is authoritative for usage whenever it has spoken. Model/window/
-    /// MCP are configuration-shaped and stay updatable (probes are their only
-    /// source on codex/opencode).
-    fn merge_probe(&mut self, snap: &crate::session_meta::SessionMetaSnapshot) -> bool {
+    /// `usage_from_events` gates `context_tokens` (see
+    /// [`usage_events_authoritative`]): true → fill-a-hole only; false → the
+    /// probe is the transport's only usage source and may update it. Model/
+    /// window/MCP are configuration-shaped and stay updatable everywhere
+    /// (probes are their only source on codex/opencode).
+    fn merge_probe(
+        &mut self,
+        snap: &crate::session_meta::SessionMetaSnapshot,
+        usage_from_events: bool,
+    ) -> bool {
         let mut changed = false;
         if let Some(v) = &snap.model {
             if self.model.as_deref() != Some(v) {
@@ -1092,7 +1106,12 @@ impl PersistedMeta {
             }
         }
         if let Some(v) = snap.context_tokens {
-            if self.context_tokens.is_none() {
+            let accept = if usage_from_events {
+                self.context_tokens.is_none()
+            } else {
+                self.context_tokens != Some(v)
+            };
+            if accept {
                 self.context_tokens = Some(v);
                 changed = true;
             }
@@ -1164,7 +1183,7 @@ pub async fn absorb_probe_meta(
             mcp_servers: inner.last_mcp_servers.clone(),
             tools: inner.last_tools.clone(),
         };
-        if m.merge_probe(snap) {
+        if m.merge_probe(snap, usage_events_authoritative(&inner.tool)) {
             inner.last_context_tokens = m.context_tokens;
             inner.last_window = m.window;
             inner.last_model = m.model.clone();
@@ -1174,20 +1193,22 @@ pub async fn absorb_probe_meta(
         return;
     }
     // No live engine (e.g. right after a relaunch): merge into the stored JSON.
-    let existing = match session_id {
-        Some(sid) => repo::get_session(db, sid).await.ok().flatten().map(|s| s.meta),
-        None => repo::get_thread(db, thread_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|t| t.lead_meta),
+    let (existing, tool) = match session_id {
+        Some(sid) => match repo::get_session(db, sid).await.ok().flatten() {
+            Some(s) => (Some(s.meta), s.tool),
+            None => (None, String::new()),
+        },
+        None => match repo::get_thread(db, thread_id).await.ok().flatten() {
+            Some(t) => (Some(t.lead_meta), t.lead_tool),
+            None => (None, String::new()),
+        },
     };
     let mut m: PersistedMeta = existing
         .as_deref()
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
-    if !m.merge_probe(snap) {
+    if !m.merge_probe(snap, usage_events_authoritative(&tool)) {
         return;
     }
     let Ok(json) = serde_json::to_string(&m) else {
