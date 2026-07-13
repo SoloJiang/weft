@@ -789,6 +789,7 @@ export const zh = {
     reviseHint: "要调整？直接在下方回复。",
     readOnlyHint: "这份方案属于较早的轮次。",
     approved: "方案已确认 · {{name}}",
+    deliverFailed: "lead 没有收到确认——它可能已停止。重启 lead 后再次确认。",
   },
   settled: {
     permissionAllow: "已批准 · {{summary}}",

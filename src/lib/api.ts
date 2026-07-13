@@ -59,8 +59,10 @@ export const api = {
     invoke<RepoRef>("clone_repo", { workspaceId, url, dest, name }),
   createRepo: (workspaceId: number, name: string, dest: string) =>
     invoke<RepoRef>("create_repo", { workspaceId, name, dest }),
+  /** Best-effort hidden delivery to the lead; resolves false when the lead
+   *  ignored it (stopped/dead engine) so callers can keep follow-up UI honest. */
   postLeadToolResult: (threadId: number, payload: unknown, lang: string) =>
-    invoke<void>("post_lead_tool_result", { threadId, payload, lang }),
+    invoke<boolean>("post_lead_tool_result", { threadId, payload, lang }),
   resolveActionCard: (messageId: number, name: string) =>
     invoke<void>("resolve_action_card", { messageId, name }),
 

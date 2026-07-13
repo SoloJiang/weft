@@ -1327,7 +1327,7 @@ pub async fn post_lead_tool_result(
     thread_id: i32,
     payload: serde_json::Value,
     lang: Option<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     post_lead_tool_result_inner(&app, &db, thread_id, payload, lang.as_deref().unwrap_or("en"))
         .await
 }
@@ -1345,18 +1345,23 @@ fn hidden_feedback_text(payload: &serde_json::Value) -> Result<String, serde_jso
     Ok(format!("<weft:{tag}>{json}</weft:{tag}>"))
 }
 
+/// Best-effort hidden delivery to the lead. Returns Ok(true) when the feedback
+/// was handed to a live engine, Ok(false) when it was ignored (stopped lead,
+/// dead engine, serialization failure) — callers that persist follow-up state
+/// (e.g. collapsing an approved plan card) must check the flag so a dropped
+/// delivery never masquerades as a received one.
 async fn post_lead_tool_result_inner(
     app: &AppHandle,
     db: &Db,
     thread_id: i32,
     payload: serde_json::Value,
     lang: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let text = match hidden_feedback_text(&payload) {
         Ok(text) => text,
         Err(e) => {
             log_hidden_feedback_ignored(thread_id, &e.to_string());
-            return Ok(());
+            return Ok(false);
         }
     };
     let key = lead_key(thread_id);
@@ -1373,25 +1378,26 @@ async fn post_lead_tool_result_inner(
             );
             if stopped {
                 log_hidden_feedback_ignored(thread_id, "lead is stopped");
-                return Ok(());
+                return Ok(false);
             }
             match lead_engine(app, db, thread_id, lang).await {
                 Ok(eng) => eng,
                 Err(e) => {
                     log_hidden_feedback_ignored(thread_id, &e.to_string());
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
     };
     if let Err(e) = engine::ensure_running(app, db, &eng).await {
         log_hidden_feedback_ignored(thread_id, &e.to_string());
-        return Ok(());
+        return Ok(false);
     }
     if let Err(e) = engine::send_hidden_existing(app, db, &eng, text).await {
         log_hidden_feedback_ignored(thread_id, &e.to_string());
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

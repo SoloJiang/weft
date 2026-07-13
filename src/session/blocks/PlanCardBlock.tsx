@@ -23,6 +23,9 @@ export interface PlanCardBlockProps {
   risks: string[];
   /** When true, the approve button is disabled and a hint explains why. */
   readOnly: boolean;
+  /** Timeline cwd so file refs in the approach markdown resolve/open, matching
+   *  regular assistant messages. */
+  cwd?: string;
   /** Approve → post plan_decision to the lead + persist the settled state.
    *  The row collapses via the resolve push, so no local settled state here. */
   onApprove: () => Promise<void>;
@@ -35,6 +38,7 @@ export function PlanCardBlock({
   split,
   risks,
   readOnly,
+  cwd,
   onApprove,
 }: PlanCardBlockProps) {
   const { t } = useTranslation();
@@ -76,7 +80,7 @@ export function PlanCardBlock({
             {t("planCard.approach")}
           </div>
           <div className="mt-1.5 max-w-[62ch] text-xs leading-relaxed text-ink-muted">
-            <Markdown text={approach} />
+            <Markdown text={approach} cwd={cwd} />
           </div>
         </section>
       ) : null}

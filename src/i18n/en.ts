@@ -813,6 +813,7 @@ export const en = {
     reviseHint: "Want changes? Just reply below.",
     readOnlyHint: "This plan belongs to an older turn.",
     approved: "Plan approved · {{name}}",
+    deliverFailed: "The lead didn't receive the approval — it may be stopped. Restart it and approve again.",
   },
   settled: {
     permissionAllow: "Approved · {{summary}}",

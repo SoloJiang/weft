@@ -25,6 +25,7 @@ import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock
 import { PlanCardBlock, type PlanCardSplitItem } from "./blocks/PlanCardBlock";
 import { api } from "../lib/api";
 import { currentLang } from "../i18n";
+import { toast } from "../components/Toast";
 import { PermissionBar } from "./PermissionBar";
 import type { useRepoActions } from "./useRepoActions";
 
@@ -472,17 +473,28 @@ function TimelineRow({
     const split = Array.isArray(parsed.split) ? parsed.split.filter(isPlanSplitItem) : [];
     // `runAction` is only wired on the lead host, so its presence doubles as
     // "this timeline may approve"; worker hosts and older turns are read-only.
-    const readOnly = !runAction || threadId == null || !isLastAssistant(m, all);
+    // A newer USER turn also stales the card: the reply is a revision request,
+    // and a late approval could be read against the revised plan.
+    const readOnly =
+      !runAction ||
+      threadId == null ||
+      !isLastAssistant(m, all) ||
+      hasNewerUserTurn(m, all);
     const tid = threadId;
     const onApprove = async () => {
       if (tid == null) return;
-      // Feedback first (the lead must see the decision even if the collapse
-      // persist fails), then persist the settled state into the row.
-      await api.postLeadToolResult(
+      // Feedback first, and only collapse the card once the lead actually
+      // accepted the delivery — a stopped lead silently drops hidden input, and
+      // a card stamped "approved" with no split coming would mislead.
+      const delivered = await api.postLeadToolResult(
         tid,
         { tool: "plan_decision", status: "approved", title },
         currentLang(),
       );
+      if (!delivered) {
+        toast(t("planCard.deliverFailed"));
+        return;
+      }
       await api.resolveActionCard(m.id, title || t("planCard.label"));
     };
     return (
@@ -493,6 +505,7 @@ function TimelineRow({
         split={split}
         risks={stringArray(parsed.risks)}
         readOnly={readOnly}
+        cwd={cwd}
         onApprove={onApprove}
       />
     );
@@ -667,6 +680,18 @@ function isActionCardAction(value: unknown): value is ActionCardAction {
     typeof action.label === "string" &&
     (action.kind === "add" || action.kind === "new" || action.kind === "clone")
   );
+}
+
+// True when any user message landed after `m` — for a plan card that means the
+// human replied (a revision request), so approving the old card must be blocked:
+// the queued plan_decision could otherwise be read against the revised plan.
+function hasNewerUserTurn(m: LeadMessage, all: LeadMessage[]): boolean {
+  for (let i = all.length - 1; i >= 0; i--) {
+    const row = all[i];
+    if (row.id === m.id) return false;
+    if (row.role === "user") return true;
+  }
+  return false;
 }
 
 function isPlanSplitItem(value: unknown): value is PlanCardSplitItem {
