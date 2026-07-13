@@ -577,32 +577,54 @@ function ChatComposerBody({
   );
 }
 
-/** Inline context gauge for the composer toolbar: a tiny usage bar + percent,
- *  with tokens/window/model in the tooltip. Falls back to the bare model name
- *  before the first usage event; renders nothing when neither is known. */
+/** Inline context readout for the composer toolbar — the Session panel's old
+ *  Context section lives here now, condensed to one row: usage bar, percent,
+ *  token count vs window, then model (+ reasoning effort). Shows whatever
+ *  subset is known (model alone before the first usage event); renders nothing
+ *  when nothing is. */
 function ContextGauge({ meta }: { meta?: SessionMeta }) {
   const { t } = useTranslation();
   const ct = meta?.contextTokens;
   const win = meta?.window;
   const model = meta?.model;
   const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
-  if (pct == null && !model) return null;
+  if (ct == null && !model) return null;
   const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
-  const detail =
-    pct != null && ct != null && win
-      ? `${t("sessionInfo.context")} · ${fmtK(ct)} / ${fmtK(win)} ${t("sessionInfo.tokens")}${model ? ` · ${model}` : ""}`
-      : model;
+  // Usage reads "57,000 tokens / 200k" and only exists once real usage is
+  // known; before that the window joins the model line (model · 272k), where
+  // a bare "272k" can't be misread as consumption.
+  const usage =
+    ct != null
+      ? [`${ct.toLocaleString()} ${t("sessionInfo.tokens")}`, win != null ? fmtK(win) : null]
+          .filter(Boolean)
+          .join(" / ")
+      : "";
+  const modelLabel = [
+    model,
+    ct == null && win != null ? fmtK(win) : null,
+    meta?.reasoningEffort,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <span
-      title={detail}
+      title={[usage || null, modelLabel || null].filter(Boolean).join(" · ")}
       className="flex min-w-0 shrink items-center gap-1.5 text-[11px] tabular-nums text-ink-faint"
     >
       {pct != null && (
-        <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
-          <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
+        <>
+          <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
+            <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
+          </span>
+          <span className="shrink-0">{pct}%</span>
+        </>
+      )}
+      {usage && <span className="hidden shrink-0 sm:inline">{usage}</span>}
+      {modelLabel && (
+        <span className="hidden min-w-0 truncate font-mono text-[10.5px] md:inline">
+          {modelLabel}
         </span>
       )}
-      {pct != null ? <span className="shrink-0">{pct}%</span> : <span className="truncate">{model}</span>}
     </span>
   );
 }

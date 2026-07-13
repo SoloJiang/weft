@@ -5,7 +5,8 @@ import type { SessionMeta, EnabledSkill, Direction } from "../lib/types";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 
 /**
- * 常驻右栏「会话信息」:Context(token + %,不含花费)、Sub-tasks、Skills、MCP。
+ * 常驻右栏「会话信息」:Sub-tasks、Skills、MCP。Context(token/%/model)不在这里——
+ * 它常驻 composer 工具条的 ContextGauge(ChatComposer),面板只管列表型信息。
  * Sub-tasks/Skills/MCP 共享 <Section> 静态头 + <OverflowList>(head+show-more):
  * 头常驻只读,长列表用同一个 head + "Show N more" 控件折叠尾部。纯展示——数据由
  * store 的 leadMeta/workerMeta + workspaceSkills + directionsByThread 喂。
@@ -29,9 +30,6 @@ export function SessionInfoPanel({
   busy?: boolean;
 }) {
   const { t } = useTranslation();
-  const ct = meta?.contextTokens;
-  const win = meta?.window;
-  const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
 
   // Workspace skills (`skills`) ∪ engine skills (`meta.engineSkills`), deduped by
   // name (workspace wins).
@@ -90,43 +88,6 @@ export function SessionInfoPanel({
           permanently reserved, so expanding a list never changes the content
           width — scrollbar-gutter alone wasn't reliably honored here. */}
       <div className="min-h-0 flex-1 overflow-y-scroll">
-        {/* Context — stats, not a list; keeps its own bespoke layout. */}
-        <section className="border-b border-border px-4 py-3">
-          <div className="flex items-center">
-            <span className="text-[11px] text-ink-faint">{t("sessionInfo.context")}</span>
-            {pct != null && (
-              <span className="ml-auto text-[11px] text-ink-muted">
-                {t("sessionInfo.used", { pct })}
-              </span>
-            )}
-          </div>
-          {ct != null && (
-            <>
-              <div className="mt-1.5 flex items-baseline gap-1.5">
-                <span className="text-[18px] font-medium text-ink">{ct.toLocaleString()}</span>
-                <span className="text-[11px] text-ink-faint">{t("sessionInfo.tokens")}</span>
-              </div>
-              {pct != null && (
-                <div className="mt-2 h-1 overflow-hidden rounded-full bg-surface">
-                  <div className="h-full bg-brand" style={{ width: `${pct}%` }} />
-                </div>
-              )}
-            </>
-          )}
-          {/* model·window 独立于 token usage 渲染:codex 的 token 走首条消息后的 usage
-              事件,但 model/window 由 session_meta 立即提供。 */}
-          {meta?.model && (
-            <div className="mt-1.5 truncate font-mono text-[10.5px] text-ink-faint">
-              {meta.model}
-              {win ? ` · ${Math.round(win / 1000)}k` : ""}
-              {meta.reasoningEffort ? ` · ${meta.reasoningEffort}` : ""}
-            </div>
-          )}
-          {ct == null && !meta?.model && (
-            <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
-          )}
-        </section>
-
         {/* Sub-tasks — created directions, newest first. Lead-only. The header
             stays put (most task-relevant → not hideable); the list caps at 3. */}
         {sortedSubtasks.length > 0 && (
