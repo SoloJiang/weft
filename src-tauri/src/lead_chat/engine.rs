@@ -1051,6 +1051,68 @@ pub struct EngineInner {
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
 
+/// Engine meta snapshot persisted across app restarts (thread.lead_meta /
+/// session.meta). Written at init/turn-end, read back on engine (re)creation,
+/// so the Session panel shows the last-known context/model/MCP state instead of
+/// blanking until the next turn's events.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct PersistedMeta {
+    pub context_tokens: Option<u64>,
+    pub window: Option<u64>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<super::proto::McpServer>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+/// Snapshot the engine's last-known meta and persist it fire-and-forget (spawned
+/// so the event loop never blocks on the DB write; failures only log).
+fn persist_engine_meta(db: &Db, inner: &EngineInner) {
+    let snap = PersistedMeta {
+        context_tokens: inner.last_context_tokens,
+        window: inner.last_window,
+        model: inner.last_model.clone(),
+        mcp_servers: inner.last_mcp_servers.clone(),
+        tools: inner.last_tools.clone(),
+    };
+    let json = match serde_json::to_string(&snap) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("[weft] engine meta serialize failed: {e}");
+            return;
+        }
+    };
+    let db = db.clone();
+    let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+    tokio::spawn(async move {
+        let r = match session_id {
+            Some(sid) => repo::save_session_meta(&db, sid, &json).await,
+            None => repo::save_lead_meta(&db, thread_id, &json).await,
+        };
+        if let Err(e) = r {
+            eprintln!("[weft] engine meta persist failed: {e}");
+        }
+    });
+}
+
+/// Restore a persisted meta snapshot into a freshly built engine (the inverse of
+/// [`persist_engine_meta`]). Empty/corrupt JSON is a silent no-op — the panel
+/// just waits for the next turn like before.
+pub fn apply_persisted_meta(inner: &mut EngineInner, json: &str) {
+    if json.is_empty() {
+        return;
+    }
+    let Ok(m) = serde_json::from_str::<PersistedMeta>(json) else {
+        return;
+    };
+    inner.last_context_tokens = m.context_tokens;
+    inner.last_window = m.window;
+    inner.last_model = m.model;
+    inner.last_mcp_servers = m.mcp_servers;
+    inner.last_tools = m.tools;
+}
+
 /// All live chat engines, keyed by `-thread_id` (lead) or `session_id` (worker).
 ///
 /// A [`DashMap`] (sharded, lock-free at the map level) rather than a
@@ -1781,6 +1843,9 @@ async fn codex_consumer(
                         },
                     );
                 }
+                // Turn end is the natural checkpoint: last_* is at its freshest,
+                // and one write per turn keeps the persistence cost trivial.
+                persist_engine_meta(&db, &inner);
                 let status = if inner.interrupting {
                     "interrupted"
                 } else if is_error {
@@ -2610,6 +2675,9 @@ fn spawn_reader(
                     inner.last_tools = tools.clone();
                     inner.last_model = model.clone();
                     inner.last_window = window;
+                    // Persist at init too: if the app dies mid-turn, the
+                    // MCP/model snapshot still survives the relaunch.
+                    persist_engine_meta(&db, &inner);
                     if let Some(sid) = inner.session_id {
                         let _ = repo::set_session_native_id(&db, sid, &session_id).await;
                     } else {
@@ -3126,6 +3194,44 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
+    /// while empty/corrupt JSON leaves the fresh engine untouched.
+    #[test]
+    fn persisted_meta_roundtrip_and_tolerance() {
+        let snap = PersistedMeta {
+            context_tokens: Some(57_000),
+            window: Some(200_000),
+            model: Some("claude-sonnet-4-5".into()),
+            mcp_servers: vec![super::super::proto::McpServer {
+                name: "context7".into(),
+                status: "connected".into(),
+            }],
+            tools: vec!["mcp__context7__query-docs".into()],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+
+        let mut inner = test_inner("claude");
+        apply_persisted_meta(&mut inner, &json);
+        assert_eq!(inner.last_context_tokens, Some(57_000));
+        assert_eq!(inner.last_window, Some(200_000));
+        assert_eq!(inner.last_model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(inner.last_mcp_servers.len(), 1);
+        assert_eq!(inner.last_tools.len(), 1);
+
+        // Empty and corrupt snapshots are silent no-ops.
+        let mut fresh = test_inner("claude");
+        apply_persisted_meta(&mut fresh, "");
+        apply_persisted_meta(&mut fresh, "{not json");
+        assert_eq!(fresh.last_context_tokens, None);
+        assert!(fresh.last_mcp_servers.is_empty());
+
+        // Old snapshots missing optional arrays still deserialize (serde defaults).
+        let mut sparse = test_inner("claude");
+        apply_persisted_meta(&mut sparse, r#"{"context_tokens":1,"window":2,"model":null}"#);
+        assert_eq!(sparse.last_context_tokens, Some(1));
+        assert!(sparse.last_tools.is_empty());
+    }
 
     #[test]
     fn queue_machine() {

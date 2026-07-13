@@ -1690,6 +1690,30 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
     Ok(())
 }
 
+/// Persist the lead engine's last-known meta snapshot (JSON `PersistedMeta`)
+/// so the Session panel survives an app relaunch. A missing thread (deleted
+/// mid-turn) is a no-op — callers are fire-and-forget.
+pub async fn save_lead_meta(db: &Db, thread_id: i32, json: &str) -> Result<()> {
+    let Some(m) = thread::Entity::find_by_id(thread_id).one(&db.0).await? else {
+        return Ok(());
+    };
+    let mut a: thread::ActiveModel = m.into();
+    a.lead_meta = Set(json.to_string());
+    a.update(&db.0).await?;
+    Ok(())
+}
+
+/// Mirror of [`save_lead_meta`] for a chat-mode worker session row.
+pub async fn save_session_meta(db: &Db, session_id: i32, json: &str) -> Result<()> {
+    let Some(m) = session::Entity::find_by_id(session_id).one(&db.0).await? else {
+        return Ok(());
+    };
+    let mut a: session::ActiveModel = m.into();
+    a.meta = Set(json.to_string());
+    a.update(&db.0).await?;
+    Ok(())
+}
+
 /// Stamp an action_card row as resolved (its repo flow succeeded) and return the
 /// updated row, so the settled state survives reload. Merges `{"resolved":
 /// <name>}` into the card's JSON. None if the row is gone.
@@ -2690,6 +2714,38 @@ mod tests {
         assert_eq!(all[0].content, updated.content);
         // a missing row is a no-op
         assert!(resolve_action_card(&db, 9999, "x").await.unwrap().is_none());
+    }
+
+    /// Engine meta snapshots roundtrip through thread.lead_meta / session.meta,
+    /// and a missing row is a fire-and-forget no-op.
+    #[tokio::test]
+    async fn engine_meta_snapshot_roundtrips() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        assert_eq!(t.lead_meta, "");
+        save_lead_meta(&db, t.id, r#"{"context_tokens":42}"#)
+            .await
+            .unwrap();
+        let t2 = get_thread(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(t2.lead_meta, r#"{"context_tokens":42}"#);
+        // Missing rows are tolerated (engine may outlive a deleted thread).
+        save_lead_meta(&db, 9999, "{}").await.unwrap();
+
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-meta", "main", "", true)
+            .await
+            .unwrap();
+        let d = create_direction(&db, t.id, "dir", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+        let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd").await.unwrap();
+        assert_eq!(s.meta, "");
+        save_session_meta(&db, s.id, r#"{"model":"gpt-5"}"#).await.unwrap();
+        let s2 = get_session(&db, s.id).await.unwrap().unwrap();
+        assert_eq!(s2.meta, r#"{"model":"gpt-5"}"#);
+        save_session_meta(&db, 9999, "{}").await.unwrap();
     }
 
     #[tokio::test]

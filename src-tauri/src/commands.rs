@@ -1561,7 +1561,24 @@ pub async fn session_for(
                 g.last_tools.clone(),
             )
         }
-        None => (None, None, None, vec![], vec![]),
+        None => {
+            // No live engine (e.g. after an app relaunch): serve the persisted
+            // snapshot (session.meta) so the panel isn't blank until the next turn.
+            let snap = latest
+                .as_ref()
+                .filter(|s| !s.meta.is_empty())
+                .and_then(|s| {
+                    serde_json::from_str::<crate::lead_chat::engine::PersistedMeta>(&s.meta).ok()
+                })
+                .unwrap_or_default();
+            (
+                snap.context_tokens,
+                snap.window,
+                snap.model,
+                snap.mcp_servers,
+                snap.tools,
+            )
+        }
     };
     let command = crate::tool_command::effective(
         latest.as_ref().and_then(|s| s.command.as_deref()),

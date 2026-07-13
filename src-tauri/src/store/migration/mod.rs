@@ -44,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0031RepoCategoryDomains),
             Box::new(M0032LeadMessageSeq),
             Box::new(M0033RepoLayerRank),
+            Box::new(M0034SessionMetaSnapshot),
         ]
     }
 }
@@ -1507,6 +1508,59 @@ impl MigrationTrait for M0033RepoLayerRank {
     }
 }
 
+/// Adds thread.lead_meta and session.meta: the engine's last-known meta snapshot
+/// (JSON — context tokens, window, model, MCP servers, tools), written at
+/// init/turn-end and read back on engine (re)creation so the Session panel
+/// survives an app relaunch instead of blanking until the next turn. A fresh db
+/// already has both (M0001 reflects the entities); sqlite has no ADD COLUMN IF
+/// NOT EXISTS, so the duplicate is tolerated.
+pub struct M0034SessionMetaSnapshot;
+impl MigrationName for M0034SessionMetaSnapshot {
+    fn name(&self) -> &str {
+        "m0034_session_meta_snapshot"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0034SessionMetaSnapshot {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [("thread", "lead_meta"), ("session", "meta")] {
+            let r = manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .add_column(
+                            ColumnDef::new(Alias::new(column))
+                                .string()
+                                .not_null()
+                                .default(""),
+                        )
+                        .to_owned(),
+                )
+                .await;
+            match r {
+                Ok(()) => {}
+                Err(e) if e.to_string().to_lowercase().contains("duplicate column") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, column) in [("thread", "lead_meta"), ("session", "meta")] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Alias::new(table))
+                        .drop_column(Alias::new(column))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1604,6 +1658,31 @@ mod tests {
         // Both columns must exist with their defaults.
         assert_eq!(p.layer, "", "layer column must exist and default to empty");
         assert_eq!(p.layer_rank, 0, "layer_rank column must exist and default to 0");
+    }
+
+    /// M0034: thread.lead_meta and session.meta are present after migration and
+    /// default to empty (never captured).
+    #[tokio::test]
+    async fn m0034_session_meta_snapshot_columns_added() {
+        use crate::store::Db;
+        use crate::store::repo::{
+            add_repo_ref, create_direction, create_session, create_thread, create_workspace,
+        };
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        assert_eq!(t.lead_meta, "", "thread.lead_meta must exist and default to empty");
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        let d = create_direction(&db, t.id, "dir", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+        let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd").await.unwrap();
+        assert_eq!(s.meta, "", "session.meta must exist and default to empty");
     }
 
     /// M0029: raw-query path rewrites gateway components without touching

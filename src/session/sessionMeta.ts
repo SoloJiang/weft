@@ -121,3 +121,19 @@ export function metaFromSnapshot(snap: {
     mcpServers: groupMcpTools(snap.mcp_servers, snap.tools),
   };
 }
+
+/** 引擎/DB 快照回填到已有 meta 的**补洞**合并:带外 session_meta / live push 可能已
+ *  先写入(更新的)值,快照只填 undefined 的洞、mcpServers 只在旧值为空时使用 —— 解决
+ *  "带外 meta 先落地导致 first-paint-only 回填被跳过、持久化快照丢失"的竞态,同时保持
+ *  原不变量:快照绝不覆盖更富的 live meta。 */
+export function fillMetaHoles(prev: SessionMeta | undefined, snap: SessionMeta): SessionMeta {
+  if (!prev) return snap;
+  return {
+    contextTokens: prev.contextTokens ?? snap.contextTokens,
+    window: prev.window ?? snap.window,
+    model: prev.model ?? snap.model,
+    mcpServers: prev.mcpServers.length > 0 ? prev.mcpServers : snap.mcpServers,
+    engineSkills: prev.engineSkills ?? snap.engineSkills,
+    reasoningEffort: prev.reasoningEffort ?? snap.reasoningEffort,
+  };
+}

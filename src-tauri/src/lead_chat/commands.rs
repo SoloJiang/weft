@@ -228,7 +228,7 @@ pub async fn lead_engine(
             .as_deref(),
         Some("stopped")
     );
-    let inner = engine::EngineInner {
+    let mut inner = engine::EngineInner {
         thread_id,
         tool: t.lead_tool.clone(),
         command: t.lead_command.clone(),
@@ -259,6 +259,9 @@ pub async fn lead_engine(
         stopped,
         codex_client: None,
     };
+    // Restore the last persisted meta snapshot so the Session panel is populated
+    // right away after an app relaunch (not "after first message").
+    engine::apply_persisted_meta(&mut inner, &t.lead_meta);
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     Ok(state.get_or_insert(lead_key(thread_id), eng))
 }
@@ -537,31 +540,44 @@ pub async fn lead_state(
 ) -> Result<LeadStateInfo, String> {
     let eng = app.state::<LeadChatState>().get(lead_key(thread_id));
     match eng {
-        None => Ok(LeadStateInfo {
-            state: "stopped".into(),
-            queue: vec![],
-            native_id: repo::lead_native_id(&db, thread_id).await.ok().flatten(),
-            command: repo::get_thread(&db, thread_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|t| crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool))
-                .unwrap_or_default(),
-            slash_commands: vec![],
-            cwd: crate::paths::weft_home()
-                .map(|h| {
-                    h.join("leads")
-                        .join(thread_id.to_string())
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .unwrap_or_default(),
-            context_tokens: None,
-            window: None,
-            model: None,
-            mcp_servers: vec![],
-            tools: vec![],
-        }),
+        None => {
+            let t = repo::get_thread(&db, thread_id).await.ok().flatten();
+            // No live engine yet (e.g. right after an app relaunch): serve the
+            // persisted meta snapshot so the Session panel isn't blank until the
+            // first message spins the engine up.
+            let mut snap = engine::PersistedMeta::default();
+            if let Some(t) = &t {
+                if !t.lead_meta.is_empty() {
+                    if let Ok(m) = serde_json::from_str::<engine::PersistedMeta>(&t.lead_meta) {
+                        snap = m;
+                    }
+                }
+            }
+            Ok(LeadStateInfo {
+                state: "stopped".into(),
+                queue: vec![],
+                native_id: repo::lead_native_id(&db, thread_id).await.ok().flatten(),
+                command: t
+                    .map(|t| {
+                        crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool)
+                    })
+                    .unwrap_or_default(),
+                slash_commands: vec![],
+                cwd: crate::paths::weft_home()
+                    .map(|h| {
+                        h.join("leads")
+                            .join(thread_id.to_string())
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_default(),
+                context_tokens: snap.context_tokens,
+                window: snap.window,
+                model: snap.model,
+                mcp_servers: snap.mcp_servers,
+                tools: snap.tools,
+            })
+        }
         Some(e) => {
             let mut i = e.lock().await;
             let child_alive = i
@@ -1039,7 +1055,7 @@ pub(crate) async fn chat_open_worker_impl(
     let eng = match state.get(key) {
         Some(e) => e,
         None => {
-            let inner = engine::EngineInner {
+            let mut inner = engine::EngineInner {
                 thread_id: dir.thread_id,
                 tool: dir.tool.clone(),
                 command: sess.command.clone(),
@@ -1070,6 +1086,9 @@ pub(crate) async fn chat_open_worker_impl(
                 stopped: sess.status == "stopped",
                 codex_client: None,
             };
+            // Restore the last persisted meta snapshot so the Session panel is
+            // populated right away after an app relaunch (not "after first message").
+            engine::apply_persisted_meta(&mut inner, &sess.meta);
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
             state.get_or_insert(key, e)
         }

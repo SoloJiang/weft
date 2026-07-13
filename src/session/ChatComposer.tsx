@@ -8,11 +8,12 @@ import {
   SlashSquare,
   SquareTerminal,
 } from "lucide-react";
-import type { ImageAttachment, SlashCmd } from "../lib/types";
+import type { ImageAttachment, SessionMeta, SlashCmd } from "../lib/types";
 import { api } from "../lib/api";
 import { toast } from "../components/Toast";
 import { cn } from "../lib/cn";
 import { useClickOutside } from "../lib/useClickOutside";
+import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import {
   InputGroup,
   PromptInput,
@@ -59,6 +60,8 @@ export function ChatComposer({
   extraActions,
   placeholder,
   onNeedSlashCommands,
+  tool,
+  contextMeta,
 }: {
   slashCommands: SlashCmd[];
   /** Extra "local" slash items, prepended to the palette under a divider.
@@ -84,6 +87,11 @@ export function ChatComposer({
   placeholder?: string;
   /** Called when "/" is typed but the command list is empty — refresh it. */
   onNeedSlashCommands?: () => void;
+  /** Coding agent driving this session — rendered as a badge in the toolbar
+   *  row (this surface has no header of its own). */
+  tool?: string;
+  /** Session meta for the inline context gauge (tokens/window/model). */
+  contextMeta?: SessionMeta;
 }) {
   return (
     <PromptInputProvider>
@@ -100,6 +108,8 @@ export function ChatComposer({
         extraActions={extraActions}
         placeholder={placeholder}
         onNeedSlashCommands={onNeedSlashCommands}
+        tool={tool}
+        contextMeta={contextMeta}
       />
     </PromptInputProvider>
   );
@@ -122,6 +132,8 @@ interface ChatComposerBodyProps {
   extraActions?: React.ReactNode;
   placeholder?: string;
   onNeedSlashCommands?: () => void;
+  tool?: string;
+  contextMeta?: SessionMeta;
 }
 
 function ChatComposerBody({
@@ -137,6 +149,8 @@ function ChatComposerBody({
   extraActions,
   placeholder,
   onNeedSlashCommands,
+  tool,
+  contextMeta,
 }: ChatComposerBodyProps) {
   const { t } = useTranslation();
   const { value: text, setValue: setText } = usePromptInput();
@@ -514,19 +528,24 @@ function ChatComposerBody({
 
         <PromptInputActions className="flex items-center gap-2 border-t border-border/70 px-1.5 pt-2">
           <PromptInputTools>
-            <PromptInputButton
-              onClick={() => void attachFiles()}
-              tooltip={t("lead.attachFiles")}
-            >
-              <Paperclip size={13} />
-            </PromptInputButton>
-            <span className="hidden truncate text-[11px] text-ink-faint sm:block">
-              {t("lead.slashHint")}
-            </span>
+            {tool && (
+              <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] bg-bg px-1.5 py-0.5 text-[11px] font-medium text-ink-muted">
+                <ToolIcon tool={tool} size={11} />
+                {toolFullName(tool)}
+              </span>
+            )}
+            <ContextGauge meta={contextMeta} />
           </PromptInputTools>
 
           <div className="ml-auto flex items-center gap-2">
             {extraActions}
+            <PromptInputButton
+              onClick={() => void attachFiles()}
+              tooltip={t("lead.attachFiles")}
+              tooltipAlign="end"
+            >
+              <Paperclip size={13} />
+            </PromptInputButton>
             {onOpenApp && (
               <PromptInputButton
                 onClick={onOpenApp}
@@ -555,5 +574,35 @@ function ChatComposerBody({
         </PromptInputActions>
       </PromptInput>
     </div>
+  );
+}
+
+/** Inline context gauge for the composer toolbar: a tiny usage bar + percent,
+ *  with tokens/window/model in the tooltip. Falls back to the bare model name
+ *  before the first usage event; renders nothing when neither is known. */
+function ContextGauge({ meta }: { meta?: SessionMeta }) {
+  const { t } = useTranslation();
+  const ct = meta?.contextTokens;
+  const win = meta?.window;
+  const model = meta?.model;
+  const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
+  if (pct == null && !model) return null;
+  const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+  const detail =
+    pct != null && ct != null && win
+      ? `${t("sessionInfo.context")} · ${fmtK(ct)} / ${fmtK(win)} ${t("sessionInfo.tokens")}${model ? ` · ${model}` : ""}`
+      : model;
+  return (
+    <span
+      title={detail}
+      className="flex min-w-0 shrink items-center gap-1.5 text-[11px] tabular-nums text-ink-faint"
+    >
+      {pct != null && (
+        <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
+          <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
+        </span>
+      )}
+      {pct != null ? <span className="shrink-0">{pct}%</span> : <span className="truncate">{model}</span>}
+    </span>
   );
 }

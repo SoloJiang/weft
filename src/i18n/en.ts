@@ -243,7 +243,6 @@ export const en = {
     terminalErrorBeforeOutput: "The agent turn ended with an error before producing output.",
     terminalAgentNotFound: "Agent \"{{tool}}\" not found on PATH. Install it, or set its command path in Settings.",
     terminalInterruptedBeforeOutput: "The agent turn was interrupted before producing output.",
-    slashHint: "Type / for commands & skills · paste images directly",
     busyHint: "Replying — messages sent now queue and go out when the turn ends",
     attachFiles: "Attach files",
     removeAttachment: "Remove {{name}}",
