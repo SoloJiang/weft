@@ -1604,6 +1604,7 @@ pub async fn session_for(
 /// server,**不含 tool**)。claude 不走这里——其 meta 全在事件流 + 引擎缓存。
 #[tauri::command]
 pub async fn session_meta(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     direction_id: i32,
     repo_id: i32,
@@ -1624,7 +1625,15 @@ pub async fn session_meta(
         latest.as_ref().and_then(|s| s.command.as_deref()),
         &dir.tool,
     );
-    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await)
+    let snap =
+        crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await;
+    // Probe results feed the engine cache + persisted snapshot: codex/opencode
+    // model/window/MCP only exist here, never in engine events.
+    if let Some(sid) = latest.as_ref().map(|s| s.id) {
+        crate::lead_chat::engine::absorb_probe_meta(&app, &db, dir.thread_id, Some(sid), &snap)
+            .await;
+    }
+    Ok(snap)
 }
 
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,

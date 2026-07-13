@@ -610,6 +610,7 @@ pub async fn lead_state(
 /// cwd 的 skill 目录,其余字段留 None,`mergeSnapshot` 的 `?? prev` 保住事件填的富 meta）。
 #[tauri::command]
 pub async fn lead_session_meta(
+    app: AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
 ) -> Result<Option<crate::session_meta::SessionMetaSnapshot>, String> {
@@ -622,15 +623,17 @@ pub async fn lead_session_meta(
     let cwd = ensure_lead_cwd(thread_id).map_err(|e| e.to_string())?;
     let native = repo::lead_native_id(&db, thread_id).await.ok().flatten();
     let command = crate::tool_command::effective(t.lead_command.as_deref(), &t.lead_tool);
-    Ok(Some(
-        crate::session_meta::gather(
-            &t.lead_tool,
-            &cwd.to_string_lossy(),
-            native.as_deref(),
-            &command,
-        )
-        .await,
-    ))
+    let snap = crate::session_meta::gather(
+        &t.lead_tool,
+        &cwd.to_string_lossy(),
+        native.as_deref(),
+        &command,
+    )
+    .await;
+    // Probe results feed the engine cache + persisted snapshot: codex/opencode
+    // model/window/MCP only exist here, never in engine events.
+    engine::absorb_probe_meta(&app, &db, thread_id, None, &snap).await;
+    Ok(Some(snap))
 }
 
 /// Discover the slash commands a session's CLI actually supports — never

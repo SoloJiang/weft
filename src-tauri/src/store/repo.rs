@@ -1691,26 +1691,29 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
 }
 
 /// Persist the lead engine's last-known meta snapshot (JSON `PersistedMeta`)
-/// so the Session panel survives an app relaunch. A missing thread (deleted
+/// so the Session panel survives an app relaunch. Single-column UPDATE — never
+/// a whole-row read-modify-write, which could clobber a concurrent write to a
+/// sibling column (e.g. the turn-end status flip). A missing thread (deleted
 /// mid-turn) is a no-op — callers are fire-and-forget.
 pub async fn save_lead_meta(db: &Db, thread_id: i32, json: &str) -> Result<()> {
-    let Some(m) = thread::Entity::find_by_id(thread_id).one(&db.0).await? else {
-        return Ok(());
-    };
-    let mut a: thread::ActiveModel = m.into();
-    a.lead_meta = Set(json.to_string());
-    a.update(&db.0).await?;
+    thread::Entity::update_many()
+        .col_expr(thread::Column::LeadMeta, Expr::value(json))
+        .filter(thread::Column::Id.eq(thread_id))
+        .exec(&db.0)
+        .await?;
     Ok(())
 }
 
-/// Mirror of [`save_lead_meta`] for a chat-mode worker session row.
+/// Mirror of [`save_lead_meta`] for a chat-mode worker session row. The
+/// single-column UPDATE matters even more here: `session.status` is the honest
+/// activity flag, and a whole-row write racing the turn-end `idle` flip could
+/// resurrect `running` on a cleanly finished worker.
 pub async fn save_session_meta(db: &Db, session_id: i32, json: &str) -> Result<()> {
-    let Some(m) = session::Entity::find_by_id(session_id).one(&db.0).await? else {
-        return Ok(());
-    };
-    let mut a: session::ActiveModel = m.into();
-    a.meta = Set(json.to_string());
-    a.update(&db.0).await?;
+    session::Entity::update_many()
+        .col_expr(session::Column::Meta, Expr::value(json))
+        .filter(session::Column::Id.eq(session_id))
+        .exec(&db.0)
+        .await?;
     Ok(())
 }
 

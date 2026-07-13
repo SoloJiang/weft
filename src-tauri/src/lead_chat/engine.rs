@@ -1066,9 +1066,46 @@ pub struct PersistedMeta {
     pub tools: Vec<String>,
 }
 
-/// Snapshot the engine's last-known meta and persist it fire-and-forget (spawned
-/// so the event loop never blocks on the DB write; failures only log).
-fn persist_engine_meta(db: &Db, inner: &EngineInner) {
+impl PersistedMeta {
+    /// Merge an out-of-band probe snapshot (`session_meta::gather`). `None`
+    /// fields keep existing values — a transient probe failure must never
+    /// blank anything. Returns whether anything changed.
+    fn merge_probe(&mut self, snap: &crate::session_meta::SessionMetaSnapshot) -> bool {
+        let mut changed = false;
+        if let Some(v) = &snap.model {
+            if self.model.as_deref() != Some(v) {
+                self.model = Some(v.clone());
+                changed = true;
+            }
+        }
+        if let Some(v) = snap.window {
+            if self.window != Some(v) {
+                self.window = Some(v);
+                changed = true;
+            }
+        }
+        if let Some(v) = snap.context_tokens {
+            if self.context_tokens != Some(v) {
+                self.context_tokens = Some(v);
+                changed = true;
+            }
+        }
+        if let Some(v) = &snap.mcp_servers {
+            if self.mcp_servers != *v {
+                self.mcp_servers = v.clone();
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// Snapshot the engine's last-known meta and persist it. Awaited inline (like
+/// every other DB write on the event loop) rather than spawned: an Init write
+/// racing a TurnEnd write from independent tasks could land last and revert the
+/// snapshot to pre-turn values. A single-column UPDATE of a few hundred bytes —
+/// the await is negligible. Failures only log; the snapshot is best-effort.
+async fn persist_engine_meta(db: &Db, inner: &EngineInner) {
     let snap = PersistedMeta {
         context_tokens: inner.last_context_tokens,
         window: inner.last_window,
@@ -1083,17 +1120,79 @@ fn persist_engine_meta(db: &Db, inner: &EngineInner) {
             return;
         }
     };
-    let db = db.clone();
-    let (thread_id, session_id) = (inner.thread_id, inner.session_id);
-    tokio::spawn(async move {
-        let r = match session_id {
-            Some(sid) => repo::save_session_meta(&db, sid, &json).await,
-            None => repo::save_lead_meta(&db, thread_id, &json).await,
+    let r = match inner.session_id {
+        Some(sid) => repo::save_session_meta(db, sid, &json).await,
+        None => repo::save_lead_meta(db, inner.thread_id, &json).await,
+    };
+    if let Err(e) = r {
+        eprintln!("[weft] engine meta persist failed: {e}");
+    }
+}
+
+/// Fold an out-of-band probe snapshot (`session_meta` / `lead_session_meta`)
+/// into the engine's cached meta — and into the persisted snapshot, so it
+/// survives a relaunch. codex/opencode model/window/MCP only exist via these
+/// probes, never via engine events; without this the turn-end snapshot writes
+/// `model: null` + empty MCP for those transports and a relaunch shows a blank
+/// panel until the next probe (or forever if it keeps failing). Works with or
+/// without a live engine: on a fresh relaunch the panel probes before any
+/// engine is spawned, so the no-engine path merges straight into the stored JSON.
+pub async fn absorb_probe_meta(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    snap: &crate::session_meta::SessionMetaSnapshot,
+) {
+    let key = match session_id {
+        Some(sid) => sid as i64,
+        None => -(thread_id as i64),
+    };
+    if let Some(eng) = app.state::<LeadChatState>().get(key) {
+        let mut inner = eng.lock().await;
+        let mut m = PersistedMeta {
+            context_tokens: inner.last_context_tokens,
+            window: inner.last_window,
+            model: inner.last_model.clone(),
+            mcp_servers: inner.last_mcp_servers.clone(),
+            tools: inner.last_tools.clone(),
         };
-        if let Err(e) = r {
-            eprintln!("[weft] engine meta persist failed: {e}");
+        if m.merge_probe(snap) {
+            inner.last_context_tokens = m.context_tokens;
+            inner.last_window = m.window;
+            inner.last_model = m.model.clone();
+            inner.last_mcp_servers = m.mcp_servers.clone();
+            persist_engine_meta(db, &inner).await;
         }
-    });
+        return;
+    }
+    // No live engine (e.g. right after a relaunch): merge into the stored JSON.
+    let existing = match session_id {
+        Some(sid) => repo::get_session(db, sid).await.ok().flatten().map(|s| s.meta),
+        None => repo::get_thread(db, thread_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.lead_meta),
+    };
+    let mut m: PersistedMeta = existing
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if !m.merge_probe(snap) {
+        return;
+    }
+    let Ok(json) = serde_json::to_string(&m) else {
+        return;
+    };
+    let r = match session_id {
+        Some(sid) => repo::save_session_meta(db, sid, &json).await,
+        None => repo::save_lead_meta(db, thread_id, &json).await,
+    };
+    if let Err(e) = r {
+        eprintln!("[weft] probe meta persist failed: {e}");
+    }
 }
 
 /// Restore a persisted meta snapshot into a freshly built engine (the inverse of
@@ -1845,7 +1944,7 @@ async fn codex_consumer(
                 }
                 // Turn end is the natural checkpoint: last_* is at its freshest,
                 // and one write per turn keeps the persistence cost trivial.
-                persist_engine_meta(&db, &inner);
+                persist_engine_meta(&db, &inner).await;
                 let status = if inner.interrupting {
                     "interrupted"
                 } else if is_error {
@@ -2677,7 +2776,7 @@ fn spawn_reader(
                     inner.last_window = window;
                     // Persist at init too: if the app dies mid-turn, the
                     // MCP/model snapshot still survives the relaunch.
-                    persist_engine_meta(&db, &inner);
+                    persist_engine_meta(&db, &inner).await;
                     if let Some(sid) = inner.session_id {
                         let _ = repo::set_session_native_id(&db, sid, &session_id).await;
                     } else {
@@ -2870,7 +2969,7 @@ fn spawn_reader(
                     // Same turn-end checkpoint as the app-server consumer: the
                     // reader transports (claude / codex exec / opencode) must
                     // persist too, or their sessions relaunch with stale meta.
-                    persist_engine_meta(&db, &inner);
+                    persist_engine_meta(&db, &inner).await;
                     let status = if inner.interrupting {
                         "interrupted"
                     } else if is_error {
