@@ -164,6 +164,9 @@ export interface SessionMeta {
   window?: number;
   model?: string;
   mcpServers: McpServerInfo[];
+  /** true 当 mcpServers 来自权威来源(claude init / 带外探测的非 null 结果)——
+   *  权威的空列表是"确实没有 MCP",引擎/持久化快照的补洞不得复活旧行。 */
+  mcpAuthoritative?: boolean;
   /** 引擎自有的 skill,带外 `session_meta` 填:codex 走 `skills/list`,claude 扫会话 cwd
    *  的 skill 目录(`.claude`/`.agents`);opencode 无对等,留空。 */
   engineSkills?: EngineSkill[];

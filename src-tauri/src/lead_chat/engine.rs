@@ -2867,6 +2867,10 @@ fn spawn_reader(
                             },
                         );
                     }
+                    // Same turn-end checkpoint as the app-server consumer: the
+                    // reader transports (claude / codex exec / opencode) must
+                    // persist too, or their sessions relaunch with stale meta.
+                    persist_engine_meta(&db, &inner);
                     let status = if inner.interrupting {
                         "interrupted"
                     } else if is_error {

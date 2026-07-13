@@ -590,20 +590,17 @@ function ContextGauge({ meta }: { meta?: SessionMeta }) {
   const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
   if (ct == null && !model) return null;
   const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+  const winLabel = win != null ? fmtK(win) : null;
   // Usage reads "57,000 tokens / 200k" and only exists once real usage is
   // known; before that the window joins the model line (model · 272k), where
   // a bare "272k" can't be misread as consumption.
   const usage =
     ct != null
-      ? [`${ct.toLocaleString()} ${t("sessionInfo.tokens")}`, win != null ? fmtK(win) : null]
+      ? [`${ct.toLocaleString()} ${t("sessionInfo.tokens")}`, winLabel]
           .filter(Boolean)
           .join(" / ")
       : "";
-  const modelLabel = [
-    model,
-    ct == null && win != null ? fmtK(win) : null,
-    meta?.reasoningEffort,
-  ]
+  const modelLabel = [model, ct == null ? winLabel : null, meta?.reasoningEffort]
     .filter(Boolean)
     .join(" · ");
   return (
