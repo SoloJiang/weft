@@ -152,7 +152,11 @@ export function ChatTimeline({
     <div ref={rootRef} className="flex min-h-0 flex-1 flex-col">
       <Virtuoso<LeadMessage>
         ref={virtuosoRef}
-        className="min-h-0 flex-1"
+        // overflow-x-hidden: the scroller's inline overflow-y:auto computes
+        // overflow-x to auto, so any over-wide row scrolls the WHOLE timeline
+        // sideways. The timeline never pans — wide content (code, tables)
+        // scrolls inside its own block (see .weft-md pre/table).
+        className="min-h-0 flex-1 overflow-x-hidden"
         data={visible}
         computeItemKey={(_index, m) => m.id}
         initialTopMostItemIndex={
@@ -574,7 +578,10 @@ function TimelineRow({
     return (
       <button
         onClick={onReviewProposal}
-        className="group flex items-center gap-2.5 rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5 text-left transition-colors hover:border-accent/70"
+        // w-full: a button's auto width is fit-content, so without it the
+        // nowrap truncate rationale below sets the button's max-content width
+        // and drags the whole timeline into horizontal scroll.
+        className="group flex w-full items-center gap-2.5 rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5 text-left transition-colors hover:border-accent/70"
       >
         <Sparkles size={15} className="shrink-0 text-accent" />
         <div className="min-w-0 flex-1">
