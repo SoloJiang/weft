@@ -14,6 +14,7 @@ import { toast } from "../components/Toast";
 import { cn } from "../lib/cn";
 import { useClickOutside } from "../lib/useClickOutside";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
+import { Tooltip } from "../components/ui/Tooltip";
 import {
   InputGroup,
   PromptInput,
@@ -577,51 +578,32 @@ function ChatComposerBody({
   );
 }
 
-/** Inline context readout for the composer toolbar — the Session panel's old
- *  Context section lives here now, condensed to one row: usage bar, percent,
- *  token count vs window, then model (+ reasoning effort). Shows whatever
- *  subset is known (model alone before the first usage event); renders nothing
- *  when nothing is. */
+/** Context readout for the composer toolbar: only the usage (bar + percent)
+ *  shows inline; the full detail — "57,000 tokens / 200k · model · effort" —
+ *  lives in the hover tooltip. Hidden entirely until the first usage event
+ *  makes the percentage real. */
 function ContextGauge({ meta }: { meta?: SessionMeta }) {
   const { t } = useTranslation();
   const ct = meta?.contextTokens;
   const win = meta?.window;
-  const model = meta?.model;
-  const pct = ct != null && win ? Math.min(100, Math.round((ct / win) * 100)) : null;
-  if (ct == null && !model) return null;
+  if (ct == null || win == null || win === 0) return null;
+  const pct = Math.min(100, Math.round((ct / win) * 100));
   const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
-  const winLabel = win != null ? fmtK(win) : null;
-  // Usage reads "57,000 tokens / 200k" and only exists once real usage is
-  // known; before that the window joins the model line (model · 272k), where
-  // a bare "272k" can't be misread as consumption.
-  const usage =
-    ct != null
-      ? [`${ct.toLocaleString()} ${t("sessionInfo.tokens")}`, winLabel]
-          .filter(Boolean)
-          .join(" / ")
-      : "";
-  const modelLabel = [model, ct == null ? winLabel : null, meta?.reasoningEffort]
+  const detail = [
+    `${ct.toLocaleString()} ${t("sessionInfo.tokens")} / ${fmtK(win)}`,
+    meta?.model,
+    meta?.reasoningEffort,
+  ]
     .filter(Boolean)
     .join(" · ");
   return (
-    <span
-      title={[usage || null, modelLabel || null].filter(Boolean).join(" · ")}
-      className="flex min-w-0 shrink items-center gap-1.5 text-[11px] tabular-nums text-ink-faint"
-    >
-      {pct != null && (
-        <>
-          <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
-            <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
-          </span>
-          <span className="shrink-0">{pct}%</span>
-        </>
-      )}
-      {usage && <span className="hidden shrink-0 sm:inline">{usage}</span>}
-      {modelLabel && (
-        <span className="hidden min-w-0 truncate font-mono text-[10.5px] md:inline">
-          {modelLabel}
+    <Tooltip label={detail}>
+      <span className="flex shrink-0 items-center gap-1.5 text-[11px] tabular-nums text-ink-faint">
+        <span className="h-1 w-9 overflow-hidden rounded-full bg-border">
+          <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
         </span>
-      )}
-    </span>
+        <span>{pct}%</span>
+      </span>
+    </Tooltip>
   );
 }

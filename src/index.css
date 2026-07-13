@@ -337,10 +337,17 @@
   border: 1px solid var(--color-border);
   padding: 0.25em 0.6em;
   text-align: left;
+  /* Cells break at word boundaries only — the inherited overflow-wrap:anywhere
+     let columns squeeze to one letter wide ("Mandate" stacked vertically) and
+     the table never reached its own overflow-x scroll. A genuinely wide table
+     now scrolls inside its block instead of crushing its columns. */
+  overflow-wrap: normal;
+  word-break: normal;
 }
 .weft-md th {
   background: var(--color-surface);
   font-weight: 600;
+  white-space: nowrap;
 }
 .weft-md hr {
   border: 0;
