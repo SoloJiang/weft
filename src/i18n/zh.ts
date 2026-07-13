@@ -779,6 +779,17 @@ export const zh = {
     readOnlyHint: "这张卡片属于较早的轮次。",
     resolved: "已添加 {{name}}",
   },
+  planCard: {
+    label: "方案",
+    requirements: "需求与验收",
+    approach: "技术方案",
+    split: "拆分预览",
+    risks: "未解决风险",
+    approve: "同意，开拆",
+    reviseHint: "要调整？直接在下方回复。",
+    readOnlyHint: "这份方案属于较早的轮次。",
+    approved: "方案已确认 · {{name}}",
+  },
   settled: {
     permissionAllow: "已批准 · {{summary}}",
     permissionDeny: "已拒绝 · {{summary}}",

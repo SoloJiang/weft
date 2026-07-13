@@ -1,69 +1,109 @@
 //! Scan assistant text for weft control sentinels so the engine can fork them
 //! out of the timeline body. Pure string scanning — no regex dep, no allocs
-//! beyond the cleaned output. Two markers today, matching the directives
-//! injected via `commands::SENTINEL_DIRECTIVES`:
-//!   `<weft:action_card>{json}</weft:action_card>` — assistant proposes a card.
+//! beyond the cleaned output. Three markers today, matching the directives
+//! injected via `commands` (`SENTINEL_DIRECTIVES` / `PLAN_CARD_DIRECTIVES`):
+//!   `<weft:action_card>{json}</weft:action_card>` — assistant proposes a repo-onboarding card.
+//!   `<weft:plan_card>{json}</weft:plan_card>` — assistant proposes the issue plan for confirmation.
 //!   `<weft:list_repos/>` — assistant requests the current workspace's repos.
-//! Malformed (unclosed) action_card stays inline as plain text so a half-typed
+//! Malformed (unclosed) cards stay inline as plain text so a half-typed
 //! sentinel never silently swallows assistant output.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sentinel {
     /// Raw JSON payload (the text between the open and close tags).
     ActionCard(String),
+    /// Raw JSON payload of the lead's plan card (the discuss-first gate).
+    PlanCard(String),
     ListRepos,
 }
 
 const OPEN_AC: &str = "<weft:action_card>";
 const CLOSE_AC: &str = "</weft:action_card>";
+const OPEN_PC: &str = "<weft:plan_card>";
+const CLOSE_PC: &str = "</weft:plan_card>";
 const LIST_REPOS: &str = "<weft:list_repos/>";
 
-enum Next {
-    ActionCard(usize),
-    ListRepos(usize),
+#[derive(Clone, Copy)]
+enum Kind {
+    ActionCard,
+    PlanCard,
+    ListRepos,
 }
 
 /// Scan `text` left-to-right; returns the cleaned body (sentinels stripped) and
-/// the sentinels in encounter order. Unknown `<…/>` tags and unclosed
-/// action_cards are left in the body verbatim.
+/// the sentinels in encounter order. Unknown `<…/>` tags and unclosed cards are
+/// left in the body verbatim.
 pub fn extract_sentinels(text: &str) -> (String, Vec<Sentinel>) {
     let mut out = String::with_capacity(text.len());
     let mut found = Vec::new();
     let mut rest = text;
     loop {
-        let ac = rest.find(OPEN_AC);
-        let lr = rest.find(LIST_REPOS);
-        let next = match (ac, lr) {
-            (None, None) => {
-                out.push_str(rest);
-                break;
-            }
-            (Some(a), None) => Next::ActionCard(a),
-            (None, Some(l)) => Next::ListRepos(l),
-            (Some(a), Some(l)) if a < l => Next::ActionCard(a),
-            (Some(_), Some(l)) => Next::ListRepos(l),
+        // Earliest marker wins; the open tags are mutually non-prefixing so
+        // positions never tie.
+        let next = [
+            (rest.find(OPEN_AC), Kind::ActionCard),
+            (rest.find(OPEN_PC), Kind::PlanCard),
+            (rest.find(LIST_REPOS), Kind::ListRepos),
+        ]
+        .into_iter()
+        .filter_map(|(pos, kind)| pos.map(|p| (p, kind)))
+        .min_by_key(|(pos, _)| *pos);
+        let Some((pos, kind)) = next else {
+            out.push_str(rest);
+            break;
         };
-        match next {
-            Next::ActionCard(pos) => {
-                let after_open = pos + OPEN_AC.len();
-                if let Some(close_rel) = rest[after_open..].find(CLOSE_AC) {
-                    out.push_str(&rest[..pos]);
-                    let json = &rest[after_open..after_open + close_rel];
-                    found.push(Sentinel::ActionCard(json.to_string()));
-                    rest = &rest[after_open + close_rel + CLOSE_AC.len()..];
-                } else {
-                    // Unclosed — keep the rest as plain text so a half-typed
-                    // sentinel never eats the tail of the assistant message.
-                    out.push_str(rest);
-                    break;
-                }
-            }
-            Next::ListRepos(pos) => {
+        let more = match kind {
+            Kind::ListRepos => {
                 out.push_str(&rest[..pos]);
                 found.push(Sentinel::ListRepos);
                 rest = &rest[pos + LIST_REPOS.len()..];
+                true
             }
+            Kind::ActionCard => consume_card(
+                &mut out,
+                &mut rest,
+                pos,
+                (OPEN_AC, CLOSE_AC),
+                &mut found,
+                Sentinel::ActionCard,
+            ),
+            Kind::PlanCard => consume_card(
+                &mut out,
+                &mut rest,
+                pos,
+                (OPEN_PC, CLOSE_PC),
+                &mut found,
+                Sentinel::PlanCard,
+            ),
+        };
+        if !more {
+            break;
         }
     }
     (out, found)
+}
+
+/// Consume one `open…close` card starting at `pos`, pushing the extracted
+/// payload via `make`. Returns false when the card is unclosed — the caller
+/// keeps the remainder verbatim and stops scanning.
+fn consume_card<'a>(
+    out: &mut String,
+    rest: &mut &'a str,
+    pos: usize,
+    (open, close): (&str, &str),
+    found: &mut Vec<Sentinel>,
+    make: fn(String) -> Sentinel,
+) -> bool {
+    let after_open = pos + open.len();
+    if let Some(close_rel) = rest[after_open..].find(close) {
+        out.push_str(&rest[..pos]);
+        found.push(make(rest[after_open..after_open + close_rel].to_string()));
+        *rest = &rest[after_open + close_rel + close.len()..];
+        true
+    } else {
+        // Unclosed — keep the rest as plain text so a half-typed sentinel
+        // never eats the tail of the assistant message.
+        out.push_str(rest);
+        false
+    }
 }

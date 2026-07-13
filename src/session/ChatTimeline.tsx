@@ -22,6 +22,9 @@ import {
   toolAllowsFileTarget,
 } from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
+import { PlanCardBlock, type PlanCardSplitItem } from "./blocks/PlanCardBlock";
+import { api } from "../lib/api";
+import { currentLang } from "../i18n";
 import { PermissionBar } from "./PermissionBar";
 import type { useRepoActions } from "./useRepoActions";
 
@@ -456,6 +459,45 @@ function TimelineRow({
     );
   }
 
+  if (m.kind === "plan_card") {
+    const parsed = safeParseObj(m.content);
+    // Approved (persisted into the row): collapse to a settled one-line summary
+    // so the gate reads as closed and can't re-fire after a reload.
+    if (typeof parsed.resolved === "string" && parsed.resolved) {
+      return <SettledLine label={t("planCard.approved", { name: parsed.resolved })} />;
+    }
+    const title = typeof parsed.title === "string" ? parsed.title : "";
+    // runtime-checked sentinel payload from the lead — engine only guarantees an
+    // object root (src-tauri lead_chat::engine::persist_card_row).
+    const split = Array.isArray(parsed.split) ? parsed.split.filter(isPlanSplitItem) : [];
+    // `runAction` is only wired on the lead host, so its presence doubles as
+    // "this timeline may approve"; worker hosts and older turns are read-only.
+    const readOnly = !runAction || threadId == null || !isLastAssistant(m, all);
+    const tid = threadId;
+    const onApprove = async () => {
+      if (tid == null) return;
+      // Feedback first (the lead must see the decision even if the collapse
+      // persist fails), then persist the settled state into the row.
+      await api.postLeadToolResult(
+        tid,
+        { tool: "plan_decision", status: "approved", title },
+        currentLang(),
+      );
+      await api.resolveActionCard(m.id, title || t("planCard.label"));
+    };
+    return (
+      <PlanCardBlock
+        title={title}
+        requirements={stringArray(parsed.requirements)}
+        approach={typeof parsed.approach === "string" ? parsed.approach : ""}
+        split={split}
+        risks={stringArray(parsed.risks)}
+        readOnly={readOnly}
+        onApprove={onApprove}
+      />
+    );
+  }
+
   if (m.kind === "settled") {
     // Durable trail left when a permission/question card was answered — the
     // interactive card itself vanished from its dock; this is its closed record.
@@ -624,6 +666,16 @@ function isActionCardAction(value: unknown): value is ActionCardAction {
     typeof action.id === "string" &&
     typeof action.label === "string" &&
     (action.kind === "add" || action.kind === "new" || action.kind === "clone")
+  );
+}
+
+function isPlanSplitItem(value: unknown): value is PlanCardSplitItem {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.name === "string" &&
+    typeof item.repo === "string" &&
+    (item.reason === undefined || typeof item.reason === "string")
   );
 }
 

@@ -803,6 +803,17 @@ export const en = {
     readOnlyHint: "This card belongs to an older turn.",
     resolved: "Added {{name}}",
   },
+  planCard: {
+    label: "Plan",
+    requirements: "Requirements & acceptance",
+    approach: "Approach",
+    split: "Proposed split",
+    risks: "Open risks",
+    approve: "Approve — start splitting",
+    reviseHint: "Want changes? Just reply below.",
+    readOnlyHint: "This plan belongs to an older turn.",
+    approved: "Plan approved · {{name}}",
+  },
   settled: {
     permissionAllow: "Approved · {{summary}}",
     permissionDeny: "Denied · {{summary}}",

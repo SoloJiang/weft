@@ -45,19 +45,30 @@ pub struct SessionInfo {
     pub native_id: Option<String>,
 }
 
-const BASE_PROMPT: &str = "You are the lead for this thread in weft — the human's main collaborator for converging write scope. \
-Your mission is to converge the issue's write scope with the human, then propose worker directions. \
-Use the weft_planner MCP capabilities when they materially affect scope: read the task when the request is unclear, and read the repo map when repo ownership or cross-repo dependencies matter. \
-Do not write code, and do not plan the directions' implementations — each worker decides how to deliver its own direction. \
-Ask clarifying questions only when ambiguity changes write scope, acceptance, or sequencing. \
-When the write boundary is clear enough for workers to start, call propose_directions with a short rationale and directions \
+const BASE_PROMPT: &str = "You are the lead for this thread in weft — the human's main collaborator for this issue. \
+Your mission: first converge WITH the human on what to build and how, then split the work into worker directions. \
+Work in three phases — a policy, not a rigid script: \
+(1) UNDERSTAND the need. Clarify the goal, boundaries, and acceptance criteria conversationally; calibrate questioning depth to the issue's complexity — a few sharp questions for a vague feature, none for a trivial fix. \
+(2) SHAPE the technical approach at the ISSUE level: architecture direction, cross-repo interfaces/contracts, data flow, and the split rationale with sequencing. Do not design each direction's internal implementation — that stays the worker's job. Before presenting, red-team your own plan for blind spots: hidden assumptions, missed requirements, a simpler alternative, cross-repo contract risks, acceptance gaps. Fold what you find back into the plan; carry what you cannot resolve as open risks. \
+(3) GATE the split on the plan card. Present the converged plan as ONE plan_card (schema below) and wait. Call propose_directions only after the human approves it — via the card's approve action (you receive a plan_decision with status \"approved\") or by clearly agreeing in chat. If they ask for changes, revise and emit a new plan_card. If the human explicitly says to skip discussion and split right away, you may propose directly. For trivial issues do not interrogate — emit a compact plan_card (one or two requirement bullets, a one-line approach) for one-click confirmation. \
+Use the weft_planner MCP capabilities when they materially affect the plan: read the task when the request is unclear, and read the repo map when repo ownership or cross-repo dependencies matter. \
+Do not write code. \
+When you call propose_directions, give a rationale that reflects the approved plan, and directions \
 (name, the ONE repo each writes, reason, mandate). Only list repos each direction must WRITE; reads are free. \
 Each direction branches off its repo's default branch by default — leave base_branch empty for that. If the user names a specific integration or release branch to build on (e.g. develop, staging, release/*), set base_branch to it; when it is genuinely ambiguous which base to use, ask the human before proposing. \
 Pick mandate per direction as a planning-depth hint: plan+impl for directions that need worker planning, impl-only for small or fully specified directions. \
 Prefer independent directions that can proceed in parallel; put shared contract owners first only when they block others. \
 The human reviews and confirms in weft; you can re-propose after more discussion. \
-To withdraw or pause pending directions — when the human says to hold off / cancel, or the write boundary is no longer settled — call cancel_directions with a short rationale; never call propose_directions with an empty directions list to express a cancel. \
+To withdraw or pause pending directions — when the human says to hold off / cancel, or the plan is no longer settled — call cancel_directions with a short rationale; never call propose_directions with an empty directions list to express a cancel. \
 After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), and reply with bus_post to a worker's direction id — a direct bus_post reliably reaches that worker even if it is currently idle. bus_broadcast only reaches participants already active on the bus, so to be sure a specific worker sees something, bus_post it directly rather than relying on a broadcast. Reading the bus is your job; do not assume silence means nothing happened.";
+
+/// The plan-card gate protocol (phase 3 of the lead policy): schema of the
+/// `<weft:plan_card>` sentinel and the `<weft:plan_decision>` feedback the UI
+/// posts back. Its own const (raw string keeps the JSON readable) because it is
+/// core flow, unlike the situational `SENTINEL_DIRECTIVES` below.
+const PLAN_CARD_DIRECTIVES: &str = r#"To present the plan for confirmation, render a plan card by outputting exactly:
+<weft:plan_card>{"title":"...","requirements":["..."],"approach":"...","split":[{"name":"...","repo":"...","reason":"..."}],"risks":["..."]}</weft:plan_card>
+`requirements` lists the agreed needs / acceptance criteria. `approach` is the issue-level technical plan (markdown: architecture, cross-repo contracts, data flow, sequencing). `split` is an optional coarse preview of the intended directions. `risks` lists open risks that survived your blind-spot pass (omit when none). Use language matching the user's locale for all values. After the human acts on the card you will receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision> as a hidden message; a clear textual agreement in chat counts the same. Never call propose_directions while your latest plan_card is unanswered, unless the human explicitly told you to skip the plan discussion."#;
 
 /// Sentinel usage directives appended to the lead prompt. Each subsequent task
 /// (Task 3-5) keeps growing this block, so it lives as its own const for easy
@@ -69,9 +80,10 @@ const SENTINEL_DIRECTIVES: &str = r#"When the user has no suitable repo for the 
 /// The conversational lead prompt. The lead is the human's main collaborator for
 /// the thread: it discusses the work, and the plan EMERGES from that conversation
 /// rather than from a one-shot propose-and-exit. It proposes when (and only when)
-/// the human has converged with it, and may re-propose after more discussion.
+/// the human has approved the plan card (or explicitly skipped the discussion),
+/// and may re-propose after more discussion.
 pub fn lead_prompt() -> String {
-    format!("{BASE_PROMPT}\n\n{SENTINEL_DIRECTIVES}")
+    format!("{BASE_PROMPT}\n\n{PLAN_CARD_DIRECTIVES}\n\n{SENTINEL_DIRECTIVES}")
 }
 
 /// Agent-output language directive (ARCHITECTURE §4.8, layer 2). Appended to the
@@ -406,11 +418,52 @@ mod tests {
     #[test]
     fn lead_prompt_is_policy_not_fixed_sequence() {
         let prompt = lead_prompt();
-        assert!(prompt.contains("converge the issue's write scope"));
+        assert!(prompt.contains("converge WITH the human"));
+        assert!(prompt.contains("a policy, not a rigid script"));
         assert!(prompt
-            .contains("Use the weft_planner MCP capabilities when they materially affect scope"));
+            .contains("Use the weft_planner MCP capabilities when they materially affect the plan"));
         assert!(!prompt.contains("Start by greeting"));
         assert!(!prompt.contains("call get_task"));
+    }
+
+    /// The discuss-first gate: the split happens only after the human approves
+    /// the plan card (or explicitly skips), the plan is red-teamed for blind
+    /// spots first, and the old "split as soon as scope is clear" bar is gone.
+    #[test]
+    fn lead_prompt_gates_split_on_plan_approval() {
+        let prompt = lead_prompt();
+        assert!(prompt.contains("<weft:plan_card>"));
+        assert!(prompt.contains("<weft:plan_decision>"));
+        assert!(prompt.contains("red-team your own plan for blind spots"));
+        assert!(prompt.contains("Call propose_directions only after the human approves"));
+        assert!(prompt.contains("skip"));
+        // Adaptive floor: trivial issues get a compact card, not an interrogation.
+        assert!(prompt.contains("For trivial issues do not interrogate"));
+        // The eager-split bar and the question-rationing rule must be gone.
+        assert!(!prompt.contains("clear enough for workers to start"));
+        assert!(!prompt.contains("Ask clarifying questions only when"));
+        // Workers still own their direction's implementation.
+        assert!(prompt.contains("that stays the worker's job"));
+    }
+
+    /// plan_decision feedback gets its own sentinel tag; everything else keeps
+    /// the historical repo_action tag (repo-onboarding flows depend on it).
+    #[test]
+    fn hidden_feedback_text_routes_tag_by_tool() {
+        let plan = serde_json::json!({"tool": "plan_decision", "status": "approved"});
+        let text = super::hidden_feedback_text(&plan).unwrap();
+        assert!(text.starts_with("<weft:plan_decision>"));
+        assert!(text.ends_with("</weft:plan_decision>"));
+        assert!(text.contains("\"approved\""));
+
+        let repo = serde_json::json!({"tool": "repo_action", "status": "ok"});
+        let text = super::hidden_feedback_text(&repo).unwrap();
+        assert!(text.starts_with("<weft:repo_action>"));
+
+        // No tool field → historical default.
+        let bare = serde_json::json!({"status": "ok"});
+        let text = super::hidden_feedback_text(&bare).unwrap();
+        assert!(text.starts_with("<weft:repo_action>"));
     }
 
     #[test]
@@ -1279,6 +1332,19 @@ pub async fn post_lead_tool_result(
         .await
 }
 
+/// Wrap a UI feedback payload in its sentinel tag for hidden delivery to the
+/// lead. The tag follows `payload.tool`: `plan_decision` (plan-card approval)
+/// gets its own tag; everything else stays `repo_action` (the historical
+/// default the repo-onboarding flows rely on).
+fn hidden_feedback_text(payload: &serde_json::Value) -> Result<String, serde_json::Error> {
+    let json = serde_json::to_string(payload)?;
+    let tag = match payload.get("tool").and_then(|v| v.as_str()) {
+        Some("plan_decision") => "plan_decision",
+        _ => "repo_action",
+    };
+    Ok(format!("<weft:{tag}>{json}</weft:{tag}>"))
+}
+
 async fn post_lead_tool_result_inner(
     app: &AppHandle,
     db: &Db,
@@ -1286,14 +1352,13 @@ async fn post_lead_tool_result_inner(
     payload: serde_json::Value,
     lang: &str,
 ) -> Result<(), String> {
-    let json = match serde_json::to_string(&payload) {
-        Ok(json) => json,
+    let text = match hidden_feedback_text(&payload) {
+        Ok(text) => text,
         Err(e) => {
             log_hidden_feedback_ignored(thread_id, &e.to_string());
             return Ok(());
         }
     };
-    let text = format!("<weft:repo_action>{json}</weft:repo_action>");
     let key = lead_key(thread_id);
     let eng = match app.state::<LeadChatState>().get(key) {
         Some(eng) => eng,
