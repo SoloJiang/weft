@@ -1070,6 +1070,13 @@ impl PersistedMeta {
     /// Merge an out-of-band probe snapshot (`session_meta::gather`). `None`
     /// fields keep existing values — a transient probe failure must never
     /// blank anything. Returns whether anything changed.
+    ///
+    /// `context_tokens` only fills a hole, never overwrites: a probe started
+    /// mid-turn reads the PREVIOUS turn's usage and can land seconds later,
+    /// after the turn-end checkpoint wrote the fresh count — the live event
+    /// stream is authoritative for usage whenever it has spoken. Model/window/
+    /// MCP are configuration-shaped and stay updatable (probes are their only
+    /// source on codex/opencode).
     fn merge_probe(&mut self, snap: &crate::session_meta::SessionMetaSnapshot) -> bool {
         let mut changed = false;
         if let Some(v) = &snap.model {
@@ -1085,7 +1092,7 @@ impl PersistedMeta {
             }
         }
         if let Some(v) = snap.context_tokens {
-            if self.context_tokens != Some(v) {
+            if self.context_tokens.is_none() {
                 self.context_tokens = Some(v);
                 changed = true;
             }

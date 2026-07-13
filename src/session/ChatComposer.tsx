@@ -578,10 +578,11 @@ function ChatComposerBody({
   );
 }
 
-/** Context readout for the composer toolbar: usage (bar + percent) plus the
- *  model inline; the tooltip carries the numbers — "57k / 200k · model ·
- *  effort", k-scaled, no unit word. Before the first usage event only the
- *  model shows (window/effort stay in the tooltip); nothing known → hidden. */
+/** Context readout for the composer toolbar: usage plus the model inline; the
+ *  tooltip carries the numbers — "57k / 200k · model · effort", k-scaled, no
+ *  unit word. With tokens but no window (window probe failed / unknown model)
+ *  the bare token count still shows — it's the only usage signal. Before the
+ *  first usage event only the model shows; nothing known → hidden. */
 function ContextGauge({ meta }: { meta?: SessionMeta }) {
   const ct = meta?.contextTokens;
   const win = meta?.window;
@@ -590,20 +591,22 @@ function ContextGauge({ meta }: { meta?: SessionMeta }) {
   const pct =
     ct != null && win != null && win > 0 ? Math.min(100, Math.round((ct / win) * 100)) : null;
   const fmtK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
-  const usage = ct != null && win != null ? `${fmtK(ct)} / ${fmtK(win)}` : null;
+  let usage: string | null = null;
+  if (ct != null) {
+    usage = win != null ? `${fmtK(ct)} / ${fmtK(win)}` : fmtK(ct);
+  }
   const windowOnly = ct == null && win != null ? fmtK(win) : null;
   const detail = [usage ?? windowOnly, model, meta?.reasoningEffort].filter(Boolean).join(" · ");
   return (
     <Tooltip label={detail} className="min-w-0">
       <span className="flex min-w-0 items-center gap-1.5 text-[11px] tabular-nums text-ink-faint">
         {pct != null && (
-          <>
-            <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
-              <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
-            </span>
-            <span className="shrink-0">{pct}%</span>
-          </>
+          <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
+            <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
+          </span>
         )}
+        {pct != null && <span className="shrink-0">{pct}%</span>}
+        {pct == null && ct != null && <span className="shrink-0">{fmtK(ct)}</span>}
         {model && <span className="min-w-0 truncate font-mono text-[10.5px]">{model}</span>}
       </span>
     </Tooltip>
