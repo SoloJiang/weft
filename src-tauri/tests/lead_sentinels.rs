@@ -2,7 +2,7 @@
 //! `<weft:plan_card>{...}` and `<weft:list_repos/>` markers out of assistant
 //! text so the engine can persist card rows and answer list_repos via stdin
 //! separately.
-use weft::lead_chat::sentinels::{extract_sentinels, Sentinel};
+use weft::lead_chat::sentinels::{extract_sentinels, extract_sentinels_with, Sentinel};
 
 #[test]
 fn extracts_action_card() {
@@ -62,6 +62,23 @@ fn extracts_test_cases_raw_markdown() {
         }
         _ => panic!("wrong variant"),
     }
+}
+
+/// Worker semantics: test_cases is lead-only — a worker quoting the protocol
+/// keeps the block verbatim in its text (nothing extracted, nothing lost),
+/// while the other sentinels still extract as usual.
+#[test]
+fn worker_keeps_test_cases_verbatim_but_extracts_other_sentinels() {
+    let t = "引用协议：<weft:test_cases>\n- a\n</weft:test_cases> 以及 <weft:list_repos/>";
+    let (clean, found) = extract_sentinels_with(t, false);
+    assert!(clean.contains("<weft:test_cases>"), "block must stay in the body");
+    assert!(clean.contains("- a"));
+    assert_eq!(found.len(), 1);
+    assert!(matches!(found[0], Sentinel::ListRepos));
+    // Lead semantics on the same text: the block extracts.
+    let (lead_clean, lead_found) = extract_sentinels_with(t, true);
+    assert!(!lead_clean.contains("<weft:test_cases>"));
+    assert_eq!(lead_found.len(), 2);
 }
 
 #[test]

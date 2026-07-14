@@ -41,18 +41,27 @@ enum Kind {
 
 /// Scan `text` left-to-right; returns the cleaned body (sentinels stripped) and
 /// the sentinels in encounter order. Unknown `<…/>` tags and unclosed cards are
-/// left in the body verbatim.
+/// left in the body verbatim. Lead semantics (all markers active).
 pub fn extract_sentinels(text: &str) -> (String, Vec<Sentinel>) {
+    extract_sentinels_with(text, true)
+}
+
+/// `lead` gates the test_cases marker: it is an issue-level, lead-only
+/// protocol, so on WORKER timelines the block stays in the body verbatim — a
+/// worker quoting protocol text (or prompt-injected repo content) must neither
+/// write the issue document nor have its quoted text silently vanish.
+pub fn extract_sentinels_with(text: &str, lead: bool) -> (String, Vec<Sentinel>) {
     let mut out = String::with_capacity(text.len());
     let mut found = Vec::new();
     let mut rest = text;
     loop {
         // Earliest marker wins; the open tags are mutually non-prefixing so
         // positions never tie.
+        let tc = if lead { rest.find(OPEN_TC) } else { None };
         let next = [
             (rest.find(OPEN_AC), Kind::ActionCard),
             (rest.find(OPEN_PC), Kind::PlanCard),
-            (rest.find(OPEN_TC), Kind::TestCases),
+            (tc, Kind::TestCases),
             (rest.find(LIST_REPOS), Kind::ListRepos),
         ]
         .into_iter()

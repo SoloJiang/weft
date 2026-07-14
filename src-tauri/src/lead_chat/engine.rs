@@ -852,7 +852,8 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     // `stripped` = the cleaned body differs from what streamed (sentinels removed),
     // so the live row still shows the raw tags and must be replaced, not just status.
     let (clean, stripped) = if status == "complete" {
-        let (clean, sentinels) = super::sentinels::extract_sentinels(&text);
+        let (clean, sentinels) =
+            super::sentinels::extract_sentinels_with(&text, inner.session_id.is_none());
         let stripped = clean != text;
         apply_lead_sentinels(app, db, inner, thread_id, sentinels).await;
         (clean, stripped)
@@ -3010,19 +3011,27 @@ fn spawn_reader(
                         // action_card lives as its own row so the UI can render the
                         // card without parsing prose; list_repos triggers a stdin
                         // reply (handled below) and produces no row of its own.
-                        let (clean, sentinels) = super::sentinels::extract_sentinels(&full);
+                        let (clean, sentinels) = super::sentinels::extract_sentinels_with(
+                            &full,
+                            inner.session_id.is_none(),
+                        );
                         let content = serde_json::json!({ "text": clean }).to_string();
                         match inner.current.take() {
                             Some((id, _, _)) => {
                                 let _ =
                                     repo::update_lead_message(&db, id, &content, "complete").await;
+                                // When sentinels were stripped, the live row still
+                                // shows the raw streamed tags — send the cleaned
+                                // body so the UI replaces it without a reload
+                                // (test_cases bodies are entire documents).
+                                let stripped = clean != full;
                                 let _ = app.emit(
                                     EVENT,
                                     Push::Finalize {
                                         thread_id,
                                         message_id: id,
                                         status: "complete".into(),
-                                        content: None,
+                                        content: if stripped { Some(clean.clone()) } else { None },
                                     },
                                 );
                                 emit_lead_out(
