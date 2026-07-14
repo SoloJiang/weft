@@ -66,7 +66,7 @@ After workers start, you share a thread bus with them via the weft_bus MCP: call
 /// `<weft:test_cases>` sentinel (RAW markdown body — multi-line markdown inside
 /// a JSON string invites escaping mistakes) and the `<weft:test_cases_updated>`
 /// feedback posted when the human edits the document in weft.
-const TEST_CASES_DIRECTIVES: &str = r#"Between understanding the need and shaping the approach, derive the issue's TEST CASES as a markdown tree when the issue is substantial enough to benefit — skip silently for trivial fixes, and always follow an explicit human ask to create or skip them. Deriving cases is a discovery tool: enumerate normal paths, boundaries, error paths, and acceptance checks, and when a case exposes an open question, resolve it in conversation BEFORE shaping the approach. Later, check the technical approach against these cases — a case the approach cannot satisfy is a gap in the approach.
+const TEST_CASES_DIRECTIVES: &str = r#"Between understanding the need and shaping the approach, derive the issue's TEST CASES as a markdown tree when the issue is substantial enough to benefit — skip silently for trivial fixes, and always follow an explicit human ask to create or skip them. Deriving cases is a discovery tool: enumerate normal paths, boundaries, error paths, and acceptance checks, and when a case exposes an open question, resolve it in conversation BEFORE shaping the approach. Later, check the technical approach against these cases — a case the approach cannot satisfy is a gap in the approach. For any non-trivial derivation, follow the weft-derive-test-cases skill available in your workspace (draft outline → enrich from code → adversarial review → clarify → finalize); its quality bars always apply: every leaf decidable (concrete action + observable result, never 「正常展示」/「符合预期」), the tree in user language only (no APIs, fields, SDKs, DB, logs, or analytics).
 To emit or update the document, output exactly:
 <weft:test_cases>
 # <title>
@@ -479,6 +479,11 @@ mod tests {
         // and the approach is later checked against the cases.
         assert!(prompt.contains("resolve it in conversation BEFORE shaping the approach"));
         assert!(prompt.contains("a case the approach cannot satisfy is a gap in the approach"));
+        // The built-in methodology skill is referenced, with its two hard
+        // quality bars inlined as the always-on floor.
+        assert!(prompt.contains("weft-derive-test-cases"));
+        assert!(prompt.contains("every leaf decidable"));
+        assert!(prompt.contains("user language only"));
     }
 
     /// plan_decision feedback gets its own sentinel tag; everything else keeps
