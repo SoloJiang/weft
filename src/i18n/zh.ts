@@ -238,7 +238,6 @@ export const zh = {
     terminalErrorBeforeOutput: "Agent 在产出内容前出错，本回合已结束。",
     terminalAgentNotFound: "未找到 Agent「{{tool}}」:请确认已安装并在 PATH 中,或在设置中为它配置命令路径。",
     terminalInterruptedBeforeOutput: "Agent 在产出内容前被中断，本回合已结束。",
-    slashHint: "输入 / 调用命令或 skill · 可直接粘贴图片",
     busyHint: "正在回复 · 此时发送会排队，回合结束自动送出",
     attachFiles: "添加文件",
     removeAttachment: "移除 {{name}}",

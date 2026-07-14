@@ -78,7 +78,7 @@ export function WorkspaceNav() {
   const onHome = activeThreadId == null && !showNeeds;
 
   return (
-    <nav className="flex h-full w-72 shrink-0 flex-col border-r border-border bg-surface">
+    <nav className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-surface">
       <div className="flex flex-col gap-2 px-3 pb-2.5 pt-3">
         <div className="flex items-center justify-between gap-2">
           <button

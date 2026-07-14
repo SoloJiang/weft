@@ -181,6 +181,7 @@ export function ChatTimeline({
               workspaceId={workspaceId ?? null}
               promptText={promptText}
               cwd={cwd}
+              queuedCount={queue.length}
             />
           </div>
         )}
@@ -367,6 +368,7 @@ function TimelineRow({
   workspaceId,
   promptText,
   cwd,
+  queuedCount = 0,
 }: {
   m: LeadMessage;
   all: LeadMessage[];
@@ -378,6 +380,8 @@ function TimelineRow({
   workspaceId: number | null;
   promptText?: (title: string, placeholder?: string) => Promise<string | null>;
   cwd?: string;
+  /** Messages waiting in the engine queue — a pending revision blocks plan approval. */
+  queuedCount?: number;
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
@@ -477,13 +481,15 @@ function TimelineRow({
     const split = Array.isArray(parsed.split) ? parsed.split.filter(isPlanSplitItem) : [];
     // `runAction` is only wired on the lead host, so its presence doubles as
     // "this timeline may approve"; worker hosts and older turns are read-only.
-    // A newer USER turn also stales the card: the reply is a revision request,
+    // A pending USER reply also stales the card — a newer user row, a queued
+    // user row, or anything waiting in the engine queue is a revision request,
     // and a late approval could be read against the revised plan.
     const readOnly =
       !runAction ||
       threadId == null ||
       !isLastAssistant(m, all) ||
-      hasNewerUserTurn(m, all);
+      hasPendingUserReply(m, all) ||
+      queuedCount > 0;
     const tid = threadId;
     const onApprove = async () => {
       if (tid == null) return;
@@ -689,10 +695,13 @@ function isActionCardAction(value: unknown): value is ActionCardAction {
   );
 }
 
-// True when any user message landed after `m` — for a plan card that means the
-// human replied (a revision request), so approving the old card must be blocked:
-// the queued plan_decision could otherwise be read against the revised plan.
-function hasNewerUserTurn(m: LeadMessage, all: LeadMessage[]): boolean {
+// True when a human reply is pending against `m` (a plan card): either a user
+// row AFTER the card, or a queued user row ANYWHERE — a message sent mid-turn
+// is inserted before the card row but delivered after the turn, so approving
+// would queue a plan_decision behind that revision and the lead could read the
+// stale approval against the revised plan.
+function hasPendingUserReply(m: LeadMessage, all: LeadMessage[]): boolean {
+  if (all.some((row) => row.role === "user" && row.status === "queued")) return true;
   for (let i = all.length - 1; i >= 0; i--) {
     const row = all[i];
     if (row.id === m.id) return false;

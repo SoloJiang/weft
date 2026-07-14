@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { Info } from "lucide-react";
 import { useStore } from "../state/store";
 import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
@@ -9,7 +8,6 @@ import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
-import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { useRepoActions } from "./useRepoActions";
 import { api } from "../lib/api";
 import type { EnabledSkill } from "../lib/types";
@@ -75,11 +73,15 @@ export function LeadTab({
     skillsDirtyAt,
     markSkillsDirty,
     mergeLeadMeta,
+    leadRailOpen,
+    setLeadRailOpen,
   } = useStore();
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
   const [promptState, setPromptState] = useState<PromptState | null>(null);
-  const [rail, setRail] = useState<"info" | "none">(compact ? "none" : "info");
+  // The Session rail is a store toggle (flipped from the top bar — this surface
+  // is header-less); the embedded curator panel (compact) never shows it.
+  const railOpen = !compact && leadRailOpen;
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
   // The lead's working dir — resolves relative file paths it mentions in chat.
   const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
@@ -183,26 +185,6 @@ export function LeadTab({
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
-        {!compact && (
-          <header className="flex items-center gap-2 border-b border-border bg-surface px-3 py-2">
-            <span className="mr-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] bg-bg px-2 py-0.5 text-[11px] font-medium text-ink-muted">
-              <ToolIcon tool={leadTool} size={12} />
-              {toolFullName(leadTool)}
-            </span>
-            <button
-              onClick={() => setRail((r) => (r === "info" ? "none" : "info"))}
-              title={t("sessionInfo.title")}
-              aria-label={t("sessionInfo.title")}
-              className={`grid h-7 w-7 shrink-0 place-items-center rounded-[var(--radius-md)] border transition-colors ${
-                rail === "info"
-                  ? "border-brand bg-brand-ghost text-brand"
-                  : "border-border text-ink-muted hover:bg-surface hover:text-ink"
-              }`}
-            >
-              <Info size={13} />
-            </button>
-          </header>
-        )}
         <ChatTimeline
           messages={msgs}
           asks={asks.filter((a) => a.thread === tid && (a.dir === "lead" || a.dir === ""))}
@@ -241,6 +223,8 @@ export function LeadTab({
           localSlash={localSlash}
           onLocalSlash={onLocalSlash}
           placeholder={composePlaceholder}
+          tool={leadTool}
+          contextMeta={leadMeta[tid]}
           busy={turn.state === "busy"}
           queued={turn.queue.length}
           onSend={(text, images, files) =>
@@ -307,12 +291,12 @@ export function LeadTab({
         </Dialog>
       </section>
 
-      {rail === "info" && (
+      {railOpen && (
         <SessionInfoPanel
           meta={leadMeta[tid]}
           skills={skills}
           subtasks={directionsByThread[tid]}
-          onClose={() => setRail("none")}
+          onClose={() => setLeadRailOpen(false)}
           onReload={onReload}
           busy={turn.state === "busy"}
         />

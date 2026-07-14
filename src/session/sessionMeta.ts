@@ -53,11 +53,13 @@ export function metaFromInit(
 ): SessionMeta {
   const grouped = groupMcpTools(p.mcp_servers, p.tools);
   const authoritative = p.model != null;
+  const keepPrevServers = !authoritative && grouped.length === 0;
   return {
     contextTokens: prev?.contextTokens,
     window: p.window ?? prev?.window ?? undefined,
     model: p.model ?? prev?.model ?? undefined,
-    mcpServers: authoritative ? grouped : grouped.length > 0 ? grouped : (prev?.mcpServers ?? []),
+    mcpServers: keepPrevServers ? (prev?.mcpServers ?? []) : grouped,
+    mcpAuthoritative: authoritative ? true : prev?.mcpAuthoritative,
     engineSkills: prev?.engineSkills, // 走带外 session_meta,保留已并入的
     reasoningEffort: prev?.reasoningEffort,
   };
@@ -70,6 +72,7 @@ export function metaFromUsage(
 ): SessionMeta {
   return {
     mcpServers: prev?.mcpServers ?? [],
+    mcpAuthoritative: prev?.mcpAuthoritative,
     model: p.model ?? prev?.model ?? undefined,
     window: p.window ?? prev?.window ?? undefined,
     contextTokens: p.context_tokens,
@@ -98,7 +101,8 @@ export function mergeSnapshot(
     window: s.window ?? prev?.window ?? undefined,
     model: s.model ?? prev?.model ?? undefined,
     mcpServers: s.mcp_servers == null ? (prev?.mcpServers ?? []) : groupMcpTools(s.mcp_servers, []),
-    // null = 没探到(保留旧),非 null = 权威列表
+    // null = 没探到(保留旧),非 null = 权威列表(空也算——此刻确实没有 MCP)
+    mcpAuthoritative: s.mcp_servers == null ? prev?.mcpAuthoritative : true,
     engineSkills: s.skills == null ? prev?.engineSkills : s.skills,
     reasoningEffort: s.reasoning_effort ?? prev?.reasoningEffort,
   };
@@ -119,5 +123,24 @@ export function metaFromSnapshot(snap: {
     window: snap.window ?? undefined,
     model: snap.model ?? undefined,
     mcpServers: groupMcpTools(snap.mcp_servers, snap.tools),
+  };
+}
+
+/** 引擎/DB 快照回填到已有 meta 的**补洞**合并:带外 session_meta / live push 可能已
+ *  先写入(更新的)值,快照只填 undefined 的洞、mcpServers 只在旧值为空**且不权威**时
+ *  使用 —— 权威的空列表(探测明确说"没有 MCP")绝不被陈旧的持久化快照复活。解决
+ *  "带外 meta 先落地导致 first-paint-only 回填被跳过、持久化快照丢失"的竞态,同时保持
+ *  原不变量:快照绝不覆盖更富/更权威的 live meta。 */
+export function fillMetaHoles(prev: SessionMeta | undefined, snap: SessionMeta): SessionMeta {
+  if (!prev) return snap;
+  const fillServers = prev.mcpServers.length === 0 && !prev.mcpAuthoritative;
+  return {
+    contextTokens: prev.contextTokens ?? snap.contextTokens,
+    window: prev.window ?? snap.window,
+    model: prev.model ?? snap.model,
+    mcpServers: fillServers ? snap.mcpServers : prev.mcpServers,
+    mcpAuthoritative: prev.mcpAuthoritative,
+    engineSkills: prev.engineSkills ?? snap.engineSkills,
+    reasoningEffort: prev.reasoningEffort ?? snap.reasoningEffort,
   };
 }

@@ -2,6 +2,7 @@ import {
   ArrowLeft,
   Download,
   FolderPlus,
+  Info,
   Languages,
   LayoutGrid,
   MessagesSquare,
@@ -49,6 +50,8 @@ export function AppTopBar() {
     updateAvailable,
     installUpdate,
     dismissUpdate,
+    leadRailOpen,
+    setLeadRailOpen,
   } = useStore();
   const { t } = useTranslation();
   const { pref, cycle } = useTheme();
@@ -231,6 +234,23 @@ export function AppTopBar() {
           <FolderPlus size={14} />
           {t("dialog.addRepo")}
         </Button>
+      )}
+
+      {inIssue && threadTab === "lead" && (
+        <button
+          type="button"
+          onClick={() => setLeadRailOpen(!leadRailOpen)}
+          title={t("sessionInfo.title")}
+          aria-label={t("sessionInfo.title")}
+          className={cn(
+            "grid h-8 w-8 place-items-center rounded-[var(--radius-md)] transition-colors",
+            leadRailOpen
+              ? "bg-brand-ghost text-brand"
+              : "text-ink-muted hover:bg-brand-ghost hover:text-ink",
+          )}
+        >
+          <Info size={15} />
+        </button>
       )}
 
       <button

@@ -11,7 +11,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import i18n, { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
-import { mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
+import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
   Direction,
@@ -110,6 +110,10 @@ interface Store {
   /** Left sidebar collapse (manual + auto on narrow windows). */
   navCollapsed: boolean;
   setNavCollapsed: (v: boolean) => void;
+  /** The issue chat's Session info rail; toggled from the top bar (the chat
+   *  surface itself is header-less). */
+  leadRailOpen: boolean;
+  setLeadRailOpen: (v: boolean) => void;
   /** Open worker side panel (diff/files), so the nav rail can yield room on narrow windows. */
   activeSidePanel: "diff" | "files" | null;
   setActiveSidePanel: (p: "diff" | "files" | null) => void;
@@ -334,7 +338,7 @@ export const useStore = () => {
   return s;
 };
 
-// Below this window width the nav rail (WorkspaceNav, w-72 = 288px) is auto-
+// Below this window width the nav rail (WorkspaceNav, w-60 = 240px) is auto-
 // collapsed so the main column keeps a readable width; default window is 1200
 // (≥ this), so it starts expanded. Manual RailToggle still wins (see effect).
 // 900px floor is the app's natural multi-column minimum (nav + a side panel +
@@ -414,6 +418,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // one is open and the window can't fit rail+panel+main, the rail hides to make
   // room (see NavRailGate) — without mutating the user's manual collapse choice.
   const [activeSidePanel, setActiveSidePanel] = useState<"diff" | "files" | null>(null);
+  const [leadRailOpen, setLeadRailOpen] = useState(true);
 
   // App settings, persisted to localStorage.
   const [projectsDir, setProjectsDirState] = useState(
@@ -1281,10 +1286,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [leadMeta, setLeadMeta] = useState<Record<number, SessionMeta>>({});
   const [workerMeta, setWorkerMeta] = useState<Record<number, SessionMeta>>({});
   const hydrateWorkerMeta = useCallback((sessionId: number, snap: ObserveRef) => {
-    // First-paint only: the snapshot carries no per-server tools (claude's tool
+    // Hole-filling only: the snapshot carries no per-server tools (claude's tool
     // catalog arrives via the `init` event), so never overwrite richer live meta
-    // — the 2s session_for poll would otherwise wipe the MCP tool lists.
-    setWorkerMeta((m) => (m[sessionId] ? m : { ...m, [sessionId]: metaFromSnapshot(snap) }));
+    // — the 2s session_for poll would otherwise wipe the MCP tool lists. But DO
+    // fill fields live meta doesn't have yet (out-of-band session_meta can land
+    // first, and the persisted snapshot is then the only source after a relaunch).
+    setWorkerMeta((m) => ({
+      ...m,
+      [sessionId]: fillMetaHoles(m[sessionId], metaFromSnapshot(snap)),
+    }));
   }, []);
   const mergeWorkerMeta = useCallback((sessionId: number, snap: SessionMetaSnapshot) => {
     setWorkerMeta((m) => ({ ...m, [sessionId]: mergeSnapshot(m[sessionId], snap) }));
@@ -1506,9 +1516,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (st.slash_commands.length > 0) {
         setLeadSlash((s) => ({ ...s, [threadId]: st.slash_commands }));
       }
-      // First-paint only (same reason as hydrateWorkerMeta): don't let a
-      // tool-less snapshot clobber the init event's MCP tool catalog on remount.
-      setLeadMeta((m) => (m[threadId] ? m : { ...m, [threadId]: metaFromSnapshot(st) }));
+      // Hole-filling only (same reason as hydrateWorkerMeta): a tool-less
+      // snapshot must not clobber the init event's MCP tool catalog, but it
+      // must fill what live meta lacks — the out-of-band session_meta effect
+      // can land BEFORE this, and after a relaunch the persisted snapshot is
+      // the only source of context/model/MCP until the next turn.
+      setLeadMeta((m) => ({
+        ...m,
+        [threadId]: fillMetaHoles(m[threadId], metaFromSnapshot(st)),
+      }));
     } catch {
       /* engine state is cosmetic at load time */
     }
@@ -2292,6 +2308,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setShowBus,
     navCollapsed,
     setNavCollapsed,
+    leadRailOpen,
+    setLeadRailOpen,
     activeSidePanel,
     setActiveSidePanel,
     reviewingProposal,

@@ -272,6 +272,8 @@ export function WorkerConversation() {
           <ChatComposer
             slashCommands={(sid != null ? workerSlash[sid] : undefined) ?? []}
             onNeedSlashCommands={() => sid != null && discoverWorkerSlash(sid)}
+            tool={ref?.tool}
+            contextMeta={sid != null ? workerMeta[sid] : undefined}
             busy={busy}
             queued={turn?.queue?.length ?? 0}
             placeholder={loadError ?? t("session.message")}

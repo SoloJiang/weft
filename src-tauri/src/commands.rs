@@ -1561,7 +1561,24 @@ pub async fn session_for(
                 g.last_tools.clone(),
             )
         }
-        None => (None, None, None, vec![], vec![]),
+        None => {
+            // No live engine (e.g. after an app relaunch): serve the persisted
+            // snapshot (session.meta) so the panel isn't blank until the next turn.
+            let snap = latest
+                .as_ref()
+                .filter(|s| !s.meta.is_empty())
+                .and_then(|s| {
+                    serde_json::from_str::<crate::lead_chat::engine::PersistedMeta>(&s.meta).ok()
+                })
+                .unwrap_or_default();
+            (
+                snap.context_tokens,
+                snap.window,
+                snap.model,
+                snap.mcp_servers,
+                snap.tools,
+            )
+        }
     };
     let command = crate::tool_command::effective(
         latest.as_ref().and_then(|s| s.command.as_deref()),
@@ -1587,6 +1604,7 @@ pub async fn session_for(
 /// server,**不含 tool**)。claude 不走这里——其 meta 全在事件流 + 引擎缓存。
 #[tauri::command]
 pub async fn session_meta(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     direction_id: i32,
     repo_id: i32,
@@ -1607,7 +1625,31 @@ pub async fn session_meta(
         latest.as_ref().and_then(|s| s.command.as_deref()),
         &dir.tool,
     );
-    Ok(crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await)
+    // Ticket BEFORE gathering: a slow probe overlapping a fresher one must not
+    // roll usage back when it finally lands (see absorb_probe_meta).
+    let sid = latest.as_ref().map(|s| s.id);
+    let ticket = match sid {
+        Some(sid) => {
+            crate::lead_chat::engine::take_probe_ticket(&app, dir.thread_id, Some(sid)).await
+        }
+        None => None,
+    };
+    let snap =
+        crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await;
+    // Probe results feed the engine cache + persisted snapshot: codex/opencode
+    // model/window/MCP only exist here, never in engine events.
+    if let Some(sid) = sid {
+        crate::lead_chat::engine::absorb_probe_meta(
+            &app,
+            &db,
+            dir.thread_id,
+            Some(sid),
+            ticket,
+            &snap,
+        )
+        .await;
+    }
+    Ok(snap)
 }
 
 /// Effective config for a repo (M6 有效配置预览): the skills + rules that apply,

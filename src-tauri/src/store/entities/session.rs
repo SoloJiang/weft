@@ -15,6 +15,10 @@ pub struct Model {
     pub cwd: String,
     pub native_session_id: Option<String>,
     pub status: String,
+    /// Last-known engine meta snapshot (JSON `PersistedMeta`), mirror of
+    /// thread.lead_meta for chat-mode workers. Empty = never captured.
+    #[sea_orm(default_value = "")]
+    pub meta: String,
     pub created_at: String,
 }
 

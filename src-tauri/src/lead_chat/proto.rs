@@ -31,7 +31,8 @@ impl SlashCmd {
 }
 
 /// 一个 MCP server 的连接态,来自 claude `system/init.mcp_servers`。
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+/// Deserialize:引擎 meta 快照(`PersistedMeta`)落库后要在重启时读回。
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct McpServer {
     pub name: String,
     pub status: String, // connected | pending | failed | …(原样透传)

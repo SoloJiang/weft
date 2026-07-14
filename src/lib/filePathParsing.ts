@@ -47,7 +47,14 @@ export function isPathLike(token: string, allowSpaces = false): boolean {
   if (/\s/.test(path)) {
     if (!allowSpaces || !/^(\/|~[\\/]?|\.\.?[\\/]|[a-zA-Z]:[\\/])/.test(path)) return false;
   }
-  if (/^(\/|\\|~[\\/]?|\.\.?[\\/])/.test(path)) return true;
+  if (/^(\/|\\)/.test(path)) {
+    // A bare one-segment absolute token (/health, /mcp, /api) is far more
+    // likely an HTTP route or slash command than a file. Require a second
+    // segment or a known file extension before calling it a path.
+    const segments = path.split(/[\\/]+/).filter(Boolean);
+    return segments.length >= 2 || EXT_RE.test(path) || MANIFEST_RE.test(path);
+  }
+  if (/^(~[\\/]?|\.\.?[\\/])/.test(path)) return true;
   if (/^[a-zA-Z]:[\\/]/.test(path)) return true;
   if (EXT_RE.test(path)) return true;
   if (MANIFEST_RE.test(path)) return true;

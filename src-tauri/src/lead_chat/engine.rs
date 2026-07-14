@@ -1033,6 +1033,13 @@ pub struct EngineInner {
     pub last_window: Option<u64>,
     pub last_mcp_servers: Vec<super::proto::McpServer>,
     pub last_tools: Vec<String>,
+    /// Out-of-band probe ordering: `probe_seq` hands a ticket to each probe as
+    /// it STARTS (`lead_session_meta` / `session_meta` take one before
+    /// gathering); `probe_committed` records the newest absorbed ticket. A
+    /// result bearing an older ticket lost the race — its usage was read
+    /// before a newer probe's and may only fill holes, never overwrite.
+    pub probe_seq: u64,
+    pub probe_committed: u64,
     /// Opaque tag of the turn whose output is currently being emitted. Set at
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
@@ -1050,6 +1057,242 @@ pub struct EngineInner {
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
+
+/// Engine meta snapshot persisted across app restarts (thread.lead_meta /
+/// session.meta). Written at init/turn-end, read back on engine (re)creation,
+/// so the Session panel shows the last-known context/model/MCP state instead of
+/// blanking until the next turn's events.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct PersistedMeta {
+    pub context_tokens: Option<u64>,
+    pub window: Option<u64>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<super::proto::McpServer>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+/// Whether a transport's live event stream reports context usage itself.
+/// claude (`result.usage`) and codex (TokenCount / turn-end usage) do — for
+/// them a probe's tokens only fill a hole, since a probe started mid-turn can
+/// carry the PREVIOUS turn's usage and land after the turn-end checkpoint.
+/// opencode has no usage-bearing event (turns end on EOF); its sidecar probe
+/// is the ONLY usage source, so probe tokens must stay updatable or the count
+/// freezes at the first probed value forever.
+fn usage_events_authoritative(tool: &str) -> bool {
+    tool != "opencode"
+}
+
+impl PersistedMeta {
+    /// Merge an out-of-band probe snapshot (`session_meta::gather`). `None`
+    /// fields keep existing values — a transient probe failure must never
+    /// blank anything. Returns whether anything changed.
+    ///
+    /// `freshest` — this result carries the newest probe ticket (or ran with
+    /// no engine, hence no race): only then may it OVERWRITE. A stale result
+    /// (older ticket, or ticketless while an engine is now live) read state
+    /// before a newer probe did, so every field degrades to fill-a-hole.
+    /// `usage_from_events` further gates `context_tokens` (see
+    /// [`usage_events_authoritative`]): claude/codex usage is owned by the
+    /// event stream, so probes only ever fill its holes.
+    fn merge_probe(
+        &mut self,
+        snap: &crate::session_meta::SessionMetaSnapshot,
+        freshest: bool,
+        usage_from_events: bool,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(v) = &snap.model {
+            let accept = if freshest {
+                self.model.as_deref() != Some(v)
+            } else {
+                self.model.is_none()
+            };
+            if accept {
+                self.model = Some(v.clone());
+                changed = true;
+            }
+        }
+        if let Some(v) = snap.window {
+            let accept = if freshest {
+                self.window != Some(v)
+            } else {
+                self.window.is_none()
+            };
+            if accept {
+                self.window = Some(v);
+                changed = true;
+            }
+        }
+        if let Some(v) = snap.context_tokens {
+            let updatable = freshest && !usage_from_events;
+            let accept = if updatable {
+                self.context_tokens != Some(v)
+            } else {
+                self.context_tokens.is_none()
+            };
+            if accept {
+                self.context_tokens = Some(v);
+                changed = true;
+            }
+        }
+        if let Some(v) = &snap.mcp_servers {
+            // Only the freshest result may touch MCP at all. An empty list is
+            // indistinguishable from "user just removed every server" (an
+            // authoritative empty result from a newer probe), so a stale
+            // result must not even fill it — resurrection is worse than one
+            // probe-cycle of latency on a cold start (whose first probe is
+            // freshest anyway).
+            if freshest && self.mcp_servers != *v {
+                self.mcp_servers = v.clone();
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// Snapshot the engine's last-known meta and persist it. Awaited inline (like
+/// every other DB write on the event loop) rather than spawned: an Init write
+/// racing a TurnEnd write from independent tasks could land last and revert the
+/// snapshot to pre-turn values. A single-column UPDATE of a few hundred bytes —
+/// the await is negligible. Failures only log; the snapshot is best-effort.
+async fn persist_engine_meta(db: &Db, inner: &EngineInner) {
+    let snap = PersistedMeta {
+        context_tokens: inner.last_context_tokens,
+        window: inner.last_window,
+        model: inner.last_model.clone(),
+        mcp_servers: inner.last_mcp_servers.clone(),
+        tools: inner.last_tools.clone(),
+    };
+    let json = match serde_json::to_string(&snap) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("[weft] engine meta serialize failed: {e}");
+            return;
+        }
+    };
+    let r = match inner.session_id {
+        Some(sid) => repo::save_session_meta(db, sid, &json).await,
+        None => repo::save_lead_meta(db, inner.thread_id, &json).await,
+    };
+    if let Err(e) = r {
+        eprintln!("[weft] engine meta persist failed: {e}");
+    }
+}
+
+/// Fold an out-of-band probe snapshot (`session_meta` / `lead_session_meta`)
+/// into the engine's cached meta — and into the persisted snapshot, so it
+/// survives a relaunch. codex/opencode model/window/MCP only exist via these
+/// probes, never via engine events; without this the turn-end snapshot writes
+/// `model: null` + empty MCP for those transports and a relaunch shows a blank
+/// panel until the next probe (or forever if it keeps failing). Works with or
+/// without a live engine: on a fresh relaunch the panel probes before any
+/// engine is spawned, so the no-engine path merges straight into the stored JSON.
+/// Hand out a probe ticket for the live engine (if any) at probe START.
+/// `absorb_probe_meta` later compares the ticket against the newest committed
+/// one, so a slow probe that returns after a fresher one can't roll usage back.
+/// No engine → None: nothing is running, so there is no race to order.
+pub async fn take_probe_ticket(app: &AppHandle, thread_id: i32, session_id: Option<i32>) -> Option<u64> {
+    let key = match session_id {
+        Some(sid) => sid as i64,
+        None => -(thread_id as i64),
+    };
+    let eng = app.state::<LeadChatState>().get(key)?;
+    let mut inner = eng.lock().await;
+    inner.probe_seq += 1;
+    Some(inner.probe_seq)
+}
+
+pub async fn absorb_probe_meta(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    ticket: Option<u64>,
+    snap: &crate::session_meta::SessionMetaSnapshot,
+) {
+    let key = match session_id {
+        Some(sid) => sid as i64,
+        None => -(thread_id as i64),
+    };
+    if let Some(eng) = app.state::<LeadChatState>().get(key) {
+        let mut inner = eng.lock().await;
+        // Freshest = carries the newest ticket. A ticketless result on a LIVE
+        // engine started before the engine existed — it has no ordering claim
+        // against probes ticketed since, so it degrades to fill-only too.
+        let freshest = ticket.is_some_and(|t| t > inner.probe_committed);
+        if let Some(t) = ticket {
+            inner.probe_committed = inner.probe_committed.max(t);
+        }
+        let mut m = PersistedMeta {
+            context_tokens: inner.last_context_tokens,
+            window: inner.last_window,
+            model: inner.last_model.clone(),
+            mcp_servers: inner.last_mcp_servers.clone(),
+            tools: inner.last_tools.clone(),
+        };
+        if m.merge_probe(snap, freshest, usage_events_authoritative(&inner.tool)) {
+            inner.last_context_tokens = m.context_tokens;
+            inner.last_window = m.window;
+            inner.last_model = m.model.clone();
+            inner.last_mcp_servers = m.mcp_servers.clone();
+            persist_engine_meta(db, &inner).await;
+        }
+        return;
+    }
+    // No live engine (e.g. right after a relaunch): merge into the stored JSON.
+    // No ticket ordering needed — with no engine there is no turn running and
+    // the probes were issued against the same resting state.
+    let (existing, tool) = match session_id {
+        Some(sid) => match repo::get_session(db, sid).await.ok().flatten() {
+            Some(s) => (Some(s.meta), s.tool),
+            None => (None, String::new()),
+        },
+        None => match repo::get_thread(db, thread_id).await.ok().flatten() {
+            Some(t) => (Some(t.lead_meta), t.lead_tool),
+            None => (None, String::new()),
+        },
+    };
+    let mut m: PersistedMeta = existing
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    // Engine-less all the way through: nothing ran concurrently, so this
+    // result IS the freshest view of the resting session.
+    if !m.merge_probe(snap, true, usage_events_authoritative(&tool)) {
+        return;
+    }
+    let Ok(json) = serde_json::to_string(&m) else {
+        return;
+    };
+    let r = match session_id {
+        Some(sid) => repo::save_session_meta(db, sid, &json).await,
+        None => repo::save_lead_meta(db, thread_id, &json).await,
+    };
+    if let Err(e) = r {
+        eprintln!("[weft] probe meta persist failed: {e}");
+    }
+}
+
+/// Restore a persisted meta snapshot into a freshly built engine (the inverse of
+/// [`persist_engine_meta`]). Empty/corrupt JSON is a silent no-op — the panel
+/// just waits for the next turn like before.
+pub fn apply_persisted_meta(inner: &mut EngineInner, json: &str) {
+    if json.is_empty() {
+        return;
+    }
+    let Ok(m) = serde_json::from_str::<PersistedMeta>(json) else {
+        return;
+    };
+    inner.last_context_tokens = m.context_tokens;
+    inner.last_window = m.window;
+    inner.last_model = m.model;
+    inner.last_mcp_servers = m.mcp_servers;
+    inner.last_tools = m.tools;
+}
 
 /// All live chat engines, keyed by `-thread_id` (lead) or `session_id` (worker).
 ///
@@ -1781,6 +2024,9 @@ async fn codex_consumer(
                         },
                     );
                 }
+                // Turn end is the natural checkpoint: last_* is at its freshest,
+                // and one write per turn keeps the persistence cost trivial.
+                persist_engine_meta(&db, &inner).await;
                 let status = if inner.interrupting {
                     "interrupted"
                 } else if is_error {
@@ -2606,10 +2852,28 @@ fn spawn_reader(
                         merge_init_slash_commands(&inner.slash_commands, slash_commands);
                     inner.slash_commands = slash_commands.clone();
                     let window = model.as_deref().and_then(super::window::context_window);
-                    inner.last_mcp_servers = mcp_servers.clone();
-                    inner.last_tools = tools.clone();
-                    inner.last_model = model.clone();
-                    inner.last_window = window;
+                    // Mirror the frontend's metaFromInit invariant: only an init
+                    // that carries a model is authoritative (may replace, even
+                    // with empty lists — the session truly has no MCP). A
+                    // model-less/partial init is fill-only, or the checkpoint
+                    // below would persist a blank snapshot over restored meta
+                    // merely because the chat was reopened after a relaunch.
+                    if model.is_some() {
+                        inner.last_mcp_servers = mcp_servers.clone();
+                        inner.last_tools = tools.clone();
+                        inner.last_model = model.clone();
+                        inner.last_window = window;
+                    } else {
+                        if inner.last_mcp_servers.is_empty() {
+                            inner.last_mcp_servers = mcp_servers.clone();
+                        }
+                        if inner.last_tools.is_empty() {
+                            inner.last_tools = tools.clone();
+                        }
+                    }
+                    // Persist at init too: if the app dies mid-turn, the
+                    // MCP/model snapshot still survives the relaunch.
+                    persist_engine_meta(&db, &inner).await;
                     if let Some(sid) = inner.session_id {
                         let _ = repo::set_session_native_id(&db, sid, &session_id).await;
                     } else {
@@ -2799,6 +3063,10 @@ fn spawn_reader(
                             },
                         );
                     }
+                    // Same turn-end checkpoint as the app-server consumer: the
+                    // reader transports (claude / codex exec / opencode) must
+                    // persist too, or their sessions relaunch with stale meta.
+                    persist_engine_meta(&db, &inner).await;
                     let status = if inner.interrupting {
                         "interrupted"
                     } else if is_error {
@@ -3127,6 +3395,114 @@ fn emit_lead_delta(
 mod tests {
     use super::*;
 
+    /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
+    /// while empty/corrupt JSON leaves the fresh engine untouched.
+    #[test]
+    fn persisted_meta_roundtrip_and_tolerance() {
+        let snap = PersistedMeta {
+            context_tokens: Some(57_000),
+            window: Some(200_000),
+            model: Some("claude-sonnet-4-5".into()),
+            mcp_servers: vec![super::super::proto::McpServer {
+                name: "context7".into(),
+                status: "connected".into(),
+            }],
+            tools: vec!["mcp__context7__query-docs".into()],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+
+        let mut inner = test_inner("claude");
+        apply_persisted_meta(&mut inner, &json);
+        assert_eq!(inner.last_context_tokens, Some(57_000));
+        assert_eq!(inner.last_window, Some(200_000));
+        assert_eq!(inner.last_model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(inner.last_mcp_servers.len(), 1);
+        assert_eq!(inner.last_tools.len(), 1);
+
+        // Empty and corrupt snapshots are silent no-ops.
+        let mut fresh = test_inner("claude");
+        apply_persisted_meta(&mut fresh, "");
+        apply_persisted_meta(&mut fresh, "{not json");
+        assert_eq!(fresh.last_context_tokens, None);
+        assert!(fresh.last_mcp_servers.is_empty());
+
+        // Old snapshots missing optional arrays still deserialize (serde defaults).
+        let mut sparse = test_inner("claude");
+        apply_persisted_meta(&mut sparse, r#"{"context_tokens":1,"window":2,"model":null}"#);
+        assert_eq!(sparse.last_context_tokens, Some(1));
+        assert!(sparse.last_tools.is_empty());
+    }
+
+    /// merge_probe semantics: the freshest result may overwrite (usage only on
+    /// probe-sourced transports); a stale result degrades to fill-a-hole for
+    /// EVERY field — including MCP, so a late non-empty list can't resurrect
+    /// servers a newer authoritative empty probe just cleared.
+    #[test]
+    fn merge_probe_usage_gate() {
+        let mcp = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| super::super::proto::McpServer {
+                    name: (*n).into(),
+                    status: "connected".into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let snap = crate::session_meta::SessionMetaSnapshot {
+            context_tokens: Some(999),
+            window: Some(200_000),
+            model: Some("gpt-5.6-sol".into()),
+            mcp_servers: Some(mcp(&["old-server"])),
+            skills: None,
+            reasoning_effort: None,
+        };
+        // Freshest + usage-from-events (claude/codex): usage fills a hole only.
+        let mut hole = PersistedMeta::default();
+        assert!(hole.merge_probe(&snap, true, true));
+        assert_eq!(hole.context_tokens, Some(999));
+        let mut known = PersistedMeta {
+            context_tokens: Some(57_000),
+            ..Default::default()
+        };
+        known.merge_probe(&snap, true, true);
+        assert_eq!(known.context_tokens, Some(57_000), "eventful usage must not be overwritten");
+        assert_eq!(known.model.as_deref(), Some("gpt-5.6-sol"), "config updates when freshest");
+        // Freshest + probe-sourced usage (opencode): overwrites.
+        let mut live = PersistedMeta {
+            context_tokens: Some(57_000),
+            ..Default::default()
+        };
+        assert!(live.merge_probe(&snap, true, false));
+        assert_eq!(live.context_tokens, Some(999));
+        // Stale: every field is fill-only — an authoritative empty MCP list
+        // (user removed servers) survives a late non-empty result.
+        let mut cleared = PersistedMeta {
+            context_tokens: Some(57_000),
+            window: Some(100_000),
+            model: Some("kept".into()),
+            mcp_servers: vec![],
+            tools: vec![],
+        };
+        cleared.merge_probe(&snap, false, false);
+        assert_eq!(cleared.context_tokens, Some(57_000));
+        assert_eq!(cleared.model.as_deref(), Some("kept"));
+        assert_eq!(cleared.window, Some(100_000));
+        // MCP never moves on a stale result — an empty list may be a newer
+        // probe's authoritative "user removed every server", so even a fill
+        // would resurrect them.
+        assert!(cleared.mcp_servers.is_empty(), "stale must not touch MCP");
+        let mut populated = PersistedMeta {
+            mcp_servers: mcp(&["new-server"]),
+            ..Default::default()
+        };
+        populated.merge_probe(&snap, false, false);
+        assert_eq!(populated.mcp_servers[0].name, "new-server");
+        // Transport mapping.
+        assert!(usage_events_authoritative("claude"));
+        assert!(usage_events_authoritative("codex"));
+        assert!(!usage_events_authoritative("opencode"));
+    }
+
     #[test]
     fn queue_machine() {
         let mut t = TurnState::default();
@@ -3454,6 +3830,8 @@ mod tests {
             last_window: None,
             last_mcp_servers: vec![],
             last_tools: vec![],
+            probe_seq: 0,
+            probe_committed: 0,
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
@@ -3602,6 +3980,8 @@ mod tests {
             last_window: None,
             last_mcp_servers: vec![],
             last_tools: vec![],
+            probe_seq: 0,
+            probe_committed: 0,
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
