@@ -23,6 +23,7 @@ import {
 } from "./transcriptBits";
 import { ActionCardBlock, type ActionCardAction } from "./blocks/ActionCardBlock";
 import { PlanCardBlock, type PlanCardSplitItem } from "./blocks/PlanCardBlock";
+import { TestCasesCard } from "./blocks/TestCasesCard";
 import { api } from "../lib/api";
 import { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
@@ -60,6 +61,7 @@ export function ChatTimeline({
   onRemove = () => {},
   onEdit = () => {},
   onReorder = () => {},
+  onOpenTestPlan,
 }: {
   messages: LeadMessage[];
   busy: boolean;
@@ -68,6 +70,8 @@ export function ChatTimeline({
   onRemove?: (id: number) => void;
   onEdit?: (id: number, text: string) => void;
   onReorder?: (order: number[]) => void;
+  /** Open the test-plan panel from a test_cases card (lead host only). */
+  onOpenTestPlan?: () => void;
   /** The tool call executing right now (transient), if any. */
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
@@ -182,6 +186,7 @@ export function ChatTimeline({
               promptText={promptText}
               cwd={cwd}
               queuedCount={queue.length}
+              onOpenTestPlan={onOpenTestPlan}
             />
           </div>
         )}
@@ -369,6 +374,7 @@ function TimelineRow({
   promptText,
   cwd,
   queuedCount = 0,
+  onOpenTestPlan,
 }: {
   m: LeadMessage;
   all: LeadMessage[];
@@ -382,6 +388,8 @@ function TimelineRow({
   cwd?: string;
   /** Messages waiting in the engine queue — a pending revision blocks plan approval. */
   queuedCount?: number;
+  /** Open the test-plan panel (lead host only; worker timelines render read-only). */
+  onOpenTestPlan?: () => void;
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
@@ -464,6 +472,20 @@ function TimelineRow({
         readOnly={readOnly}
         busy={actionsBusy ?? {}}
         onAction={onAction ?? (() => {})}
+      />
+    );
+  }
+
+  if (m.kind === "test_cases") {
+    // Summary payload persisted by the engine (lead_chat::test_plan::summarize);
+    // the document itself lives in the test_plan table and the panel reads it.
+    const parsed = safeParseObj(m.content);
+    return (
+      <TestCasesCard
+        title={typeof parsed.title === "string" ? parsed.title : ""}
+        branches={stringArray(parsed.branches)}
+        caseCount={typeof parsed.caseCount === "number" ? parsed.caseCount : 0}
+        onOpen={onOpenTestPlan}
       />
     );
   }

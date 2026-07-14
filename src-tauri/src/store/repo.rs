@@ -2,7 +2,7 @@
 
 use super::entities::{
     app_setting, direction, im_route, lead_message, plan, repo_profile, repo_ref, session,
-    skill_enable, skill_source, thread, workspace, worktree,
+    skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use super::Db;
 use crate::slug::unique_slug;
@@ -1690,6 +1690,43 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
     Ok(())
 }
 
+/// Upsert the issue's test-case document (0..1 per thread — UNIQUE thread_id).
+/// `source` records the last writer: "lead" (sentinel) or "user" (panel edit).
+pub async fn upsert_test_plan(
+    db: &Db,
+    thread_id: i32,
+    content: &str,
+    source: &str,
+) -> Result<test_plan::Model> {
+    if let Some(existing) = test_plan::Entity::find()
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .one(&db.0)
+        .await?
+    {
+        let mut a: test_plan::ActiveModel = existing.into();
+        a.content = Set(content.to_string());
+        a.source = Set(source.to_string());
+        a.updated_at = Set(now());
+        return Ok(a.update(&db.0).await?);
+    }
+    let a = test_plan::ActiveModel {
+        thread_id: Set(thread_id),
+        content: Set(content.to_string()),
+        source: Set(source.to_string()),
+        updated_at: Set(now()),
+        ..Default::default()
+    };
+    Ok(a.insert(&db.0).await?)
+}
+
+/// The issue's test-case document, if one has been derived.
+pub async fn get_test_plan(db: &Db, thread_id: i32) -> Result<Option<test_plan::Model>> {
+    Ok(test_plan::Entity::find()
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .one(&db.0)
+        .await?)
+}
+
 /// Persist the lead engine's last-known meta snapshot (JSON `PersistedMeta`)
 /// so the Session panel survives an app relaunch. Single-column UPDATE — never
 /// a whole-row read-modify-write, which could clobber a concurrent write to a
@@ -2717,6 +2754,27 @@ mod tests {
         assert_eq!(all[0].content, updated.content);
         // a missing row is a no-op
         assert!(resolve_action_card(&db, 9999, "x").await.unwrap().is_none());
+    }
+
+    /// test_plan upsert enforces 0..1 per thread (M0035 UNIQUE thread_id):
+    /// the second write updates in place and flips the source.
+    #[tokio::test]
+    async fn test_plan_upserts_one_doc_per_thread() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
+        let first = upsert_test_plan(&db, t.id, "# v1\n- a\n", "lead").await.unwrap();
+        assert_eq!(first.source, "lead");
+        let second = upsert_test_plan(&db, t.id, "# v2\n- a\n- b\n", "user")
+            .await
+            .unwrap();
+        assert_eq!(second.id, first.id, "same row updated, not a new one");
+        let read = get_test_plan(&db, t.id).await.unwrap().expect("doc exists");
+        assert_eq!(read.content, "# v2\n- a\n- b\n");
+        assert_eq!(read.source, "user");
     }
 
     /// Engine meta snapshots roundtrip through thread.lead_meta / session.meta,

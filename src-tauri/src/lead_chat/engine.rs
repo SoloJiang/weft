@@ -712,6 +712,26 @@ async fn apply_lead_sentinels(
             super::sentinels::Sentinel::PlanCard(json) => {
                 persist_card_row(app, db, inner, thread_id, "plan_card", &json).await;
             }
+            super::sentinels::Sentinel::TestCases(md) => {
+                // Raw markdown body: upsert the document (single source of
+                // truth), then drop a summary card into the timeline — the
+                // panel always reads the table, never the card.
+                let md = md.trim();
+                if md.is_empty() {
+                    eprintln!("[weft] lead sentinel: test_cases body is empty — dropped");
+                } else {
+                    match repo::upsert_test_plan(db, thread_id, md, "lead").await {
+                        Ok(_) => {
+                            let summary = super::test_plan::summarize(md).to_string();
+                            persist_card_row(app, db, inner, thread_id, "test_cases", &summary)
+                                .await;
+                        }
+                        Err(e) => {
+                            eprintln!("[weft] lead sentinel: upsert test_plan failed: {e}")
+                        }
+                    }
+                }
+            }
             super::sentinels::Sentinel::ListRepos => {
                 // Look up workspace via the thread row (engine doesn't cache it; one
                 // extra query per call is cheap and avoids a wider refactor).

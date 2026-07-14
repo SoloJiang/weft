@@ -50,8 +50,8 @@ export function AppTopBar() {
     updateAvailable,
     installUpdate,
     dismissUpdate,
-    leadRailOpen,
-    setLeadRailOpen,
+    leadRail,
+    setLeadRail,
   } = useStore();
   const { t } = useTranslation();
   const { pref, cycle } = useTheme();
@@ -239,12 +239,12 @@ export function AppTopBar() {
       {inIssue && threadTab === "lead" && (
         <button
           type="button"
-          onClick={() => setLeadRailOpen(!leadRailOpen)}
+          onClick={() => setLeadRail(leadRail === "info" ? "none" : "info")}
           title={t("sessionInfo.title")}
           aria-label={t("sessionInfo.title")}
           className={cn(
             "grid h-8 w-8 place-items-center rounded-[var(--radius-md)] transition-colors",
-            leadRailOpen
+            leadRail === "info"
               ? "bg-brand-ghost text-brand"
               : "text-ink-muted hover:bg-brand-ghost hover:text-ink",
           )}

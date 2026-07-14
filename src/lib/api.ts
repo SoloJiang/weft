@@ -26,6 +26,7 @@ import type {
   SessionMetaSnapshot,
   SkillSource,
   SlashCmd,
+  TestPlan,
   Thread,
   ThreadOverview,
   ToolStatus,
@@ -63,6 +64,13 @@ export const api = {
    *  ignored it (stopped/dead engine) so callers can keep follow-up UI honest. */
   postLeadToolResult: (threadId: number, payload: unknown, lang: string) =>
     invoke<boolean>("post_lead_tool_result", { threadId, payload, lang }),
+  /** The issue's test-case document (null = never derived). */
+  getTestPlan: (threadId: number) =>
+    invoke<TestPlan | null>("get_test_plan", { threadId }),
+  /** Save a panel edit (source="user"); the caller separately posts
+   *  `test_cases_updated` feedback so the lead learns the new content. */
+  saveTestPlan: (threadId: number, content: string) =>
+    invoke<void>("save_test_plan", { threadId, content }),
   resolveActionCard: (messageId: number, name: string) =>
     invoke<void>("resolve_action_card", { messageId, name }),
 

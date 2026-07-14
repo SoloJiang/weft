@@ -241,6 +241,13 @@
   animation: weft-screen-in 0.24s var(--ease-out-expo) both;
 }
 
+/* markmap (TestPlanPanel): node text follows the app theme — the library's
+   built-in #333 is unreadable on the dark background. Branch strokes keep
+   markmap's own categorical palette (readable on both themes). */
+svg.markmap {
+  color: var(--color-ink);
+}
+
 /* motion only when something changed; honor reduced-motion everywhere */
 @media (prefers-reduced-motion: reduce) {
   .weft-pulse,

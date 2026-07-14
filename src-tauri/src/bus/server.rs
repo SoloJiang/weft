@@ -639,6 +639,11 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             Ok(None) => text_result("error: thread not found".into()),
             Err(e) => text_result(format!("error: {e}")),
         },
+        "get_test_cases" => match crate::store::repo::get_test_plan(db, thread).await {
+            Ok(Some(p)) => text_result(p.content),
+            Ok(None) => text_result("no test cases derived for this issue yet".into()),
+            Err(e) => text_result(format!("error: {e}")),
+        },
         "propose_directions" => {
             // `directions` must be a PRESENT, non-empty array. A missing / empty / malformed
             // payload is NOT a cancel: return an error so the lead retries (cancellation goes
@@ -756,6 +761,11 @@ fn planner_specs() -> Value {
         {
             "name": "get_repo_map",
             "description": "Read the workspace repo map: each repo's role/stack/summary/published+declared packages, plus the cross-repo dependency edges. Use it to decide which repos a task must touch and in what order.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "get_test_cases",
+            "description": "Read the issue's current test-case document (markdown tree), if one exists. The human can edit it in weft, so read it back before shaping or revising the technical approach when you have not seen an update recently.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {

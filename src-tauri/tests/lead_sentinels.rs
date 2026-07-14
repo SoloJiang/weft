@@ -48,6 +48,31 @@ fn plan_card_mixes_with_action_card_in_order() {
 }
 
 #[test]
+fn extracts_test_cases_raw_markdown() {
+    let t = "推导如下：<weft:test_cases>\n# 登录\n## 异常\n- 密码错误\n  - 三次锁定\n</weft:test_cases>之后讨论方案。";
+    let (clean, found) = extract_sentinels(t);
+    assert_eq!(clean, "推导如下：之后讨论方案。");
+    assert_eq!(found.len(), 1);
+    match &found[0] {
+        Sentinel::TestCases(md) => {
+            // Raw markdown body, verbatim — including newlines, no JSON.
+            assert!(md.contains("# 登录"));
+            assert!(md.contains("- 密码错误"));
+            assert!(md.starts_with('\n'));
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn skips_malformed_test_cases_unclosed() {
+    let t = "before <weft:test_cases>\n- a\n no close";
+    let (clean, found) = extract_sentinels(t);
+    assert_eq!(clean, t);
+    assert!(found.is_empty());
+}
+
+#[test]
 fn extracts_list_repos() {
     let t = "before <weft:list_repos/> after";
     let (clean, found) = extract_sentinels(t);

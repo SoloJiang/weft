@@ -110,10 +110,11 @@ interface Store {
   /** Left sidebar collapse (manual + auto on narrow windows). */
   navCollapsed: boolean;
   setNavCollapsed: (v: boolean) => void;
-  /** The issue chat's Session info rail; toggled from the top bar (the chat
-   *  surface itself is header-less). */
-  leadRailOpen: boolean;
-  setLeadRailOpen: (v: boolean) => void;
+  /** The issue chat's right rail: Session info, the test-case panel, or
+   *  closed. Info is toggled from the top bar (the chat surface itself is
+   *  header-less); tests opens from a test-cases card or the panel itself. */
+  leadRail: "info" | "tests" | "none";
+  setLeadRail: (v: "info" | "tests" | "none") => void;
   /** Open worker side panel (diff/files), so the nav rail can yield room on narrow windows. */
   activeSidePanel: "diff" | "files" | null;
   setActiveSidePanel: (p: "diff" | "files" | null) => void;
@@ -418,7 +419,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // one is open and the window can't fit rail+panel+main, the rail hides to make
   // room (see NavRailGate) — without mutating the user's manual collapse choice.
   const [activeSidePanel, setActiveSidePanel] = useState<"diff" | "files" | null>(null);
-  const [leadRailOpen, setLeadRailOpen] = useState(true);
+  const [leadRail, setLeadRail] = useState<"info" | "tests" | "none">("info");
 
   // App settings, persisted to localStorage.
   const [projectsDir, setProjectsDirState] = useState(
@@ -2308,8 +2309,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setShowBus,
     navCollapsed,
     setNavCollapsed,
-    leadRailOpen,
-    setLeadRailOpen,
+    leadRail,
+    setLeadRail,
     activeSidePanel,
     setActiveSidePanel,
     reviewingProposal,

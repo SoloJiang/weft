@@ -1,9 +1,11 @@
 //! Scan assistant text for weft control sentinels so the engine can fork them
 //! out of the timeline body. Pure string scanning — no regex dep, no allocs
-//! beyond the cleaned output. Three markers today, matching the directives
-//! injected via `commands` (`SENTINEL_DIRECTIVES` / `PLAN_CARD_DIRECTIVES`):
+//! beyond the cleaned output. Four markers today, matching the directives
+//! injected via `commands` (`SENTINEL_DIRECTIVES` / `PLAN_CARD_DIRECTIVES` /
+//! `TEST_CASES_DIRECTIVES`):
 //!   `<weft:action_card>{json}</weft:action_card>` — assistant proposes a repo-onboarding card.
 //!   `<weft:plan_card>{json}</weft:plan_card>` — assistant proposes the issue plan for confirmation.
+//!   `<weft:test_cases>markdown</weft:test_cases>` — the issue's test-case tree (RAW markdown, not JSON).
 //!   `<weft:list_repos/>` — assistant requests the current workspace's repos.
 //! Malformed (unclosed) cards stay inline as plain text so a half-typed
 //! sentinel never silently swallows assistant output.
@@ -14,6 +16,10 @@ pub enum Sentinel {
     ActionCard(String),
     /// Raw JSON payload of the lead's plan card (the discuss-first gate).
     PlanCard(String),
+    /// Raw MARKDOWN body (not JSON): the issue's test-case tree. Multi-line
+    /// markdown inside a JSON string invites escaping mistakes from the model,
+    /// so this sentinel carries the document verbatim.
+    TestCases(String),
     ListRepos,
 }
 
@@ -21,12 +27,15 @@ const OPEN_AC: &str = "<weft:action_card>";
 const CLOSE_AC: &str = "</weft:action_card>";
 const OPEN_PC: &str = "<weft:plan_card>";
 const CLOSE_PC: &str = "</weft:plan_card>";
+const OPEN_TC: &str = "<weft:test_cases>";
+const CLOSE_TC: &str = "</weft:test_cases>";
 const LIST_REPOS: &str = "<weft:list_repos/>";
 
 #[derive(Clone, Copy)]
 enum Kind {
     ActionCard,
     PlanCard,
+    TestCases,
     ListRepos,
 }
 
@@ -43,6 +52,7 @@ pub fn extract_sentinels(text: &str) -> (String, Vec<Sentinel>) {
         let next = [
             (rest.find(OPEN_AC), Kind::ActionCard),
             (rest.find(OPEN_PC), Kind::PlanCard),
+            (rest.find(OPEN_TC), Kind::TestCases),
             (rest.find(LIST_REPOS), Kind::ListRepos),
         ]
         .into_iter()
@@ -74,6 +84,14 @@ pub fn extract_sentinels(text: &str) -> (String, Vec<Sentinel>) {
                 (OPEN_PC, CLOSE_PC),
                 &mut found,
                 Sentinel::PlanCard,
+            ),
+            Kind::TestCases => consume_card(
+                &mut out,
+                &mut rest,
+                pos,
+                (OPEN_TC, CLOSE_TC),
+                &mut found,
+                Sentinel::TestCases,
             ),
         };
         if !more {

@@ -1,6 +1,6 @@
 use crate::store::entities::{
     app_setting, backup_config, direction, im_route, lead_message, plan, repo_profile, repo_ref,
-    session, skill_enable, skill_source, thread, workspace, worktree,
+    session, skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -45,6 +45,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0032LeadMessageSeq),
             Box::new(M0033RepoLayerRank),
             Box::new(M0034SessionMetaSnapshot),
+            Box::new(M0035TestPlan),
         ]
     }
 }
@@ -1557,6 +1558,32 @@ impl MigrationTrait for M0034SessionMetaSnapshot {
                 )
                 .await?;
         }
+        Ok(())
+    }
+}
+
+/// Creates the test_plan table: an issue's 0..1 test-case document (markdown
+/// tree), derived by the lead in phase 1.5 and editable by the user. The
+/// UNIQUE thread_id enforces the 0..1 binding at the schema level.
+pub struct M0035TestPlan;
+impl MigrationName for M0035TestPlan {
+    fn name(&self) -> &str {
+        "m0035_test_plan"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0035TestPlan {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(test_plan::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("test_plan")).to_owned())
+            .await?;
         Ok(())
     }
 }
