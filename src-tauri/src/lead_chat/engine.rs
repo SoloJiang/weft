@@ -1089,33 +1089,45 @@ impl PersistedMeta {
     /// fields keep existing values — a transient probe failure must never
     /// blank anything. Returns whether anything changed.
     ///
-    /// `usage_updatable` gates `context_tokens`: false → fill-a-hole only
-    /// (claude/codex, whose event stream speaks for usage — see
-    /// [`usage_events_authoritative`] — or a probe holding a stale ticket);
-    /// true → the probe is the freshest usage source and may update it
-    /// (opencode with the newest ticket). Model/window/MCP are configuration-
-    /// shaped and stay updatable everywhere (probes are their only source on
-    /// codex/opencode).
+    /// `freshest` — this result carries the newest probe ticket (or ran with
+    /// no engine, hence no race): only then may it OVERWRITE. A stale result
+    /// (older ticket, or ticketless while an engine is now live) read state
+    /// before a newer probe did, so every field degrades to fill-a-hole.
+    /// `usage_from_events` further gates `context_tokens` (see
+    /// [`usage_events_authoritative`]): claude/codex usage is owned by the
+    /// event stream, so probes only ever fill its holes.
     fn merge_probe(
         &mut self,
         snap: &crate::session_meta::SessionMetaSnapshot,
-        usage_updatable: bool,
+        freshest: bool,
+        usage_from_events: bool,
     ) -> bool {
         let mut changed = false;
         if let Some(v) = &snap.model {
-            if self.model.as_deref() != Some(v) {
+            let accept = if freshest {
+                self.model.as_deref() != Some(v)
+            } else {
+                self.model.is_none()
+            };
+            if accept {
                 self.model = Some(v.clone());
                 changed = true;
             }
         }
         if let Some(v) = snap.window {
-            if self.window != Some(v) {
+            let accept = if freshest {
+                self.window != Some(v)
+            } else {
+                self.window.is_none()
+            };
+            if accept {
                 self.window = Some(v);
                 changed = true;
             }
         }
         if let Some(v) = snap.context_tokens {
-            let accept = if usage_updatable {
+            let updatable = freshest && !usage_from_events;
+            let accept = if updatable {
                 self.context_tokens != Some(v)
             } else {
                 self.context_tokens.is_none()
@@ -1126,7 +1138,13 @@ impl PersistedMeta {
             }
         }
         if let Some(v) = &snap.mcp_servers {
-            if self.mcp_servers != *v {
+            // Only the freshest result may touch MCP at all. An empty list is
+            // indistinguishable from "user just removed every server" (an
+            // authoritative empty result from a newer probe), so a stale
+            // result must not even fill it — resurrection is worse than one
+            // probe-cycle of latency on a cold start (whose first probe is
+            // freshest anyway).
+            if freshest && self.mcp_servers != *v {
                 self.mcp_servers = v.clone();
                 changed = true;
             }
@@ -1201,15 +1219,13 @@ pub async fn absorb_probe_meta(
     };
     if let Some(eng) = app.state::<LeadChatState>().get(key) {
         let mut inner = eng.lock().await;
-        // Usage may update only for probe-sourced transports (opencode) AND
-        // only when this result carries the newest ticket — an older ticket
-        // read the sidecar before a fresher probe did, so its count is stale
-        // even though it arrives later. Stale/eventful probes still fill holes.
-        let freshest = ticket.is_none_or(|t| t > inner.probe_committed);
+        // Freshest = carries the newest ticket. A ticketless result on a LIVE
+        // engine started before the engine existed — it has no ordering claim
+        // against probes ticketed since, so it degrades to fill-only too.
+        let freshest = ticket.is_some_and(|t| t > inner.probe_committed);
         if let Some(t) = ticket {
             inner.probe_committed = inner.probe_committed.max(t);
         }
-        let usage_updatable = !usage_events_authoritative(&inner.tool) && freshest;
         let mut m = PersistedMeta {
             context_tokens: inner.last_context_tokens,
             window: inner.last_window,
@@ -1217,7 +1233,7 @@ pub async fn absorb_probe_meta(
             mcp_servers: inner.last_mcp_servers.clone(),
             tools: inner.last_tools.clone(),
         };
-        if m.merge_probe(snap, usage_updatable) {
+        if m.merge_probe(snap, freshest, usage_events_authoritative(&inner.tool)) {
             inner.last_context_tokens = m.context_tokens;
             inner.last_window = m.window;
             inner.last_model = m.model.clone();
@@ -1244,7 +1260,9 @@ pub async fn absorb_probe_meta(
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
-    if !m.merge_probe(snap, !usage_events_authoritative(&tool)) {
+    // Engine-less all the way through: nothing ran concurrently, so this
+    // result IS the freshest view of the resting session.
+    if !m.merge_probe(snap, true, usage_events_authoritative(&tool)) {
         return;
     }
     let Ok(json) = serde_json::to_string(&m) else {
@@ -3400,37 +3418,70 @@ mod tests {
         assert!(sparse.last_tools.is_empty());
     }
 
-    /// merge_probe usage semantics: fill-only mode (claude/codex, or a stale
-    /// opencode ticket) never overwrites a known count; updatable mode (the
-    /// freshest opencode probe) does. Config fields update in both modes.
+    /// merge_probe semantics: the freshest result may overwrite (usage only on
+    /// probe-sourced transports); a stale result degrades to fill-a-hole for
+    /// EVERY field — including MCP, so a late non-empty list can't resurrect
+    /// servers a newer authoritative empty probe just cleared.
     #[test]
     fn merge_probe_usage_gate() {
+        let mcp = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| super::super::proto::McpServer {
+                    name: (*n).into(),
+                    status: "connected".into(),
+                })
+                .collect::<Vec<_>>()
+        };
         let snap = crate::session_meta::SessionMetaSnapshot {
             context_tokens: Some(999),
             window: Some(200_000),
             model: Some("gpt-5.6-sol".into()),
-            mcp_servers: None,
+            mcp_servers: Some(mcp(&["old-server"])),
             skills: None,
             reasoning_effort: None,
         };
-        // Fill-only: a hole fills, an existing value survives.
+        // Freshest + usage-from-events (claude/codex): usage fills a hole only.
         let mut hole = PersistedMeta::default();
-        assert!(hole.merge_probe(&snap, false));
+        assert!(hole.merge_probe(&snap, true, true));
         assert_eq!(hole.context_tokens, Some(999));
         let mut known = PersistedMeta {
             context_tokens: Some(57_000),
             ..Default::default()
         };
-        known.merge_probe(&snap, false);
-        assert_eq!(known.context_tokens, Some(57_000), "fill-only must not overwrite");
-        assert_eq!(known.model.as_deref(), Some("gpt-5.6-sol"), "config fields still update");
-        // Updatable (freshest opencode probe): overwrites.
+        known.merge_probe(&snap, true, true);
+        assert_eq!(known.context_tokens, Some(57_000), "eventful usage must not be overwritten");
+        assert_eq!(known.model.as_deref(), Some("gpt-5.6-sol"), "config updates when freshest");
+        // Freshest + probe-sourced usage (opencode): overwrites.
         let mut live = PersistedMeta {
             context_tokens: Some(57_000),
             ..Default::default()
         };
-        assert!(live.merge_probe(&snap, true));
+        assert!(live.merge_probe(&snap, true, false));
         assert_eq!(live.context_tokens, Some(999));
+        // Stale: every field is fill-only — an authoritative empty MCP list
+        // (user removed servers) survives a late non-empty result.
+        let mut cleared = PersistedMeta {
+            context_tokens: Some(57_000),
+            window: Some(100_000),
+            model: Some("kept".into()),
+            mcp_servers: vec![],
+            tools: vec![],
+        };
+        cleared.merge_probe(&snap, false, false);
+        assert_eq!(cleared.context_tokens, Some(57_000));
+        assert_eq!(cleared.model.as_deref(), Some("kept"));
+        assert_eq!(cleared.window, Some(100_000));
+        // MCP never moves on a stale result — an empty list may be a newer
+        // probe's authoritative "user removed every server", so even a fill
+        // would resurrect them.
+        assert!(cleared.mcp_servers.is_empty(), "stale must not touch MCP");
+        let mut populated = PersistedMeta {
+            mcp_servers: mcp(&["new-server"]),
+            ..Default::default()
+        };
+        populated.merge_probe(&snap, false, false);
+        assert_eq!(populated.mcp_servers[0].name, "new-server");
         // Transport mapping.
         assert!(usage_events_authoritative("claude"));
         assert!(usage_events_authoritative("codex"));
