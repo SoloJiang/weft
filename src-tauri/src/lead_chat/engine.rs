@@ -724,17 +724,33 @@ async fn apply_lead_sentinels(
                     );
                     continue;
                 }
-                // A user edit saved MID-TURN sits in the queue as an
-                // undelivered <weft:test_cases_updated> — this turn's emit was
-                // authored without seeing it, so writing would clobber the
-                // user's version. Skip; the lead re-emits (if still needed)
-                // after it reads the queued update.
+                // A user edit saved MID-TURN supersedes whatever this turn
+                // emits — the emit was authored without seeing it. Two
+                // complementary checks close the whole window:
+                // 1) the queued (undelivered) test_cases_updated feedback;
+                // 2) a DB-level CAS — the panel saves the row BEFORE it posts
+                //    the feedback, so a finalize landing in that gap sees no
+                //    queue entry, but the user-sourced row's updated_at is
+                //    already >= this turn's start.
                 if has_pending_user_test_update(&inner.turn) {
                     eprintln!(
                         "[weft] lead sentinel: test_cases skipped — a queued user edit \
                          supersedes this turn's emit"
                     );
                     continue;
+                }
+                if let Ok(Some(existing)) = repo::get_test_plan(db, thread_id).await {
+                    if user_save_supersedes(
+                        &existing.source,
+                        &existing.updated_at,
+                        inner.clock.started_unix,
+                    ) {
+                        eprintln!(
+                            "[weft] lead sentinel: test_cases skipped — a user edit saved \
+                             mid-turn supersedes this emit"
+                        );
+                        continue;
+                    }
                 }
                 // Raw markdown body: upsert the document (single source of
                 // truth), then drop a summary card into the timeline — the
@@ -823,6 +839,14 @@ fn has_pending_user_test_update(turn: &TurnState) -> bool {
     turn.queue
         .iter()
         .any(|o| o.text.contains("<weft:test_cases_updated>"))
+}
+
+/// DB-level CAS for lead test-case emits: a USER-sourced row saved at or after
+/// this turn began (same unix-seconds clock) was written mid-turn — the emit
+/// predates it and must not overwrite. Earlier user saves were delivered as
+/// turn input (or queued, caught separately), so the lead has seen them.
+fn user_save_supersedes(source: &str, updated_at: &str, turn_started_unix: u64) -> bool {
+    source == "user" && updated_at.parse::<u64>().unwrap_or(0) >= turn_started_unix.max(1)
 }
 
 /// Persist one card sentinel (`action_card` / `plan_card`) as its own timeline
@@ -1013,6 +1037,10 @@ pub struct TurnClock {
     pub started: Option<std::time::Instant>,
     /// Last stdout line seen from the child (any event counts as activity).
     pub last_activity: std::time::Instant,
+    /// Unix-seconds stamp of the in-flight turn's start (0 = never begun).
+    /// Same clock as the store's `updated_at` strings, so "did the user save
+    /// mid-turn?" is a plain comparison against `test_plan.updated_at`.
+    pub started_unix: u64,
 }
 
 impl Default for TurnClock {
@@ -1020,6 +1048,7 @@ impl Default for TurnClock {
         Self {
             started: None,
             last_activity: std::time::Instant::now(),
+            started_unix: 0,
         }
     }
 }
@@ -1028,6 +1057,10 @@ impl TurnClock {
     pub(crate) fn begin_turn(&mut self) {
         self.started = Some(std::time::Instant::now());
         self.last_activity = std::time::Instant::now();
+        self.started_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
     }
     /// Re-sync with the queue state after a turn ends (queued pop = new turn).
     fn on_turn_end(&mut self, still_busy: bool) {
@@ -3563,6 +3596,24 @@ mod tests {
         assert!(usage_events_authoritative("claude"));
         assert!(usage_events_authoritative("codex"));
         assert!(!usage_events_authoritative("opencode"));
+    }
+
+    /// DB-level CAS: a user-sourced row saved at/after the turn began beats the
+    /// turn's emit; earlier user saves (already seen as turn input) and
+    /// lead-sourced rows do not. Unknown turn start (0) fails safe.
+    #[test]
+    fn user_save_supersedes_semantics() {
+        // Saved mid-turn (same or later second) → supersedes.
+        assert!(user_save_supersedes("user", "1000", 1000));
+        assert!(user_save_supersedes("user", "1001", 1000));
+        // Saved before the turn began → the lead saw it as input.
+        assert!(!user_save_supersedes("user", "999", 1000));
+        // Lead-sourced rows never block a lead emit.
+        assert!(!user_save_supersedes("lead", "1001", 1000));
+        // Unparseable timestamps fail safe (don't block).
+        assert!(!user_save_supersedes("user", "not-a-number", 1000));
+        // Unknown turn start (never begun): any user row supersedes.
+        assert!(user_save_supersedes("user", "1", 0));
     }
 
     /// A queued (undelivered) user edit of the test cases marks any in-flight

@@ -1514,6 +1514,12 @@ pub async fn delete_thread_cascade(
             .await?;
         direction::Entity::delete_by_id(d.id).exec(&db.0).await?;
     }
+    // Delete the THREAD ROW FIRST: it is the anchor of the thread write fence
+    // (ensure_thread_workspace_accepts_writes errs once it is gone), so any
+    // concurrent save/sentinel racing this cascade is rejected before the
+    // owned-row sweep below — writes can no longer land between a table's
+    // delete pass and the end of the cascade and become unreachable orphans.
+    thread::Entity::delete_by_id(thread_id).exec(&db.0).await?;
     // Thread-owned rows (no FK cascades in sqlite here): chat history, the
     // pending plan, IM bindings, and the test-case document all die with the
     // issue — otherwise deleted-issue content lingers in weft.db and backups.
@@ -1533,7 +1539,6 @@ pub async fn delete_thread_cascade(
         .filter(test_plan::Column::ThreadId.eq(thread_id))
         .exec(&db.0)
         .await?;
-    thread::Entity::delete_by_id(thread_id).exec(&db.0).await?;
     Ok(removed)
 }
 
