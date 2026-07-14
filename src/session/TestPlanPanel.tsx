@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Maximize2, Pencil, X } from "lucide-react";
 
@@ -83,6 +83,10 @@ export function TestPlanPanel({
   // A re-emit while EDITING would make Save overwrite the freshly derived
   // document with a draft based on the old one — drop the stale draft back to
   // preview and say so. (Thread switches remount via key, so mode is fresh.)
+  // The toast's `t` lives in a ref: locale toggles swap the `t` identity, and
+  // a translation change must never re-run this effect and discard a draft.
+  const tRef = useRef(t);
+  tRef.current = t;
   useEffect(() => {
     let alive = true;
     setLoaded(false);
@@ -94,7 +98,7 @@ export function TestPlanPanel({
         setLoaded(true);
         setSelectedPath(null);
         setMode((m) => {
-          if (m === "edit") toast(t("testPlan.refreshedWhileEditing"));
+          if (m === "edit") toast(tRef.current("testPlan.refreshedWhileEditing"));
           return "preview";
         });
         setDraft("");
@@ -105,7 +109,7 @@ export function TestPlanPanel({
     return () => {
       alive = false;
     };
-  }, [threadId, refreshKey, t]);
+  }, [threadId, refreshKey]);
 
   const startEdit = () => {
     setDraft(plan?.content ?? "");
