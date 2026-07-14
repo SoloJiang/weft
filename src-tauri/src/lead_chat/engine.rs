@@ -716,10 +716,23 @@ async fn apply_lead_sentinels(
                 // Issue-level document — only the LEAD may write it. Chat-mode
                 // workers share this engine (session_id set); a worker echoing
                 // protocol text (or prompt-injected repo content) must not
-                // replace the issue's cases from its own timeline.
+                // replace the issue's cases from its own timeline. (Extraction
+                // is already lead-gated; this is defense in depth.)
                 if inner.session_id.is_some() {
                     eprintln!(
                         "[weft] worker sentinel: test_cases ignored (lead-only, issue-level doc)"
+                    );
+                    continue;
+                }
+                // A user edit saved MID-TURN sits in the queue as an
+                // undelivered <weft:test_cases_updated> — this turn's emit was
+                // authored without seeing it, so writing would clobber the
+                // user's version. Skip; the lead re-emits (if still needed)
+                // after it reads the queued update.
+                if has_pending_user_test_update(&inner.turn) {
+                    eprintln!(
+                        "[weft] lead sentinel: test_cases skipped — a queued user edit \
+                         supersedes this turn's emit"
                     );
                     continue;
                 }
@@ -800,6 +813,16 @@ async fn apply_lead_sentinels(
             }
         }
     }
+}
+
+/// True when an undelivered user edit of the test-case document is still
+/// queued for this engine: the in-flight turn was authored WITHOUT seeing it,
+/// so any `<weft:test_cases>` it emits is stale relative to the user's save
+/// and must not overwrite the user-sourced row.
+fn has_pending_user_test_update(turn: &TurnState) -> bool {
+    turn.queue
+        .iter()
+        .any(|o| o.text.contains("<weft:test_cases_updated>"))
 }
 
 /// Persist one card sentinel (`action_card` / `plan_card`) as its own timeline
@@ -3540,6 +3563,27 @@ mod tests {
         assert!(usage_events_authoritative("claude"));
         assert!(usage_events_authoritative("codex"));
         assert!(!usage_events_authoritative("opencode"));
+    }
+
+    /// A queued (undelivered) user edit of the test cases marks any in-flight
+    /// lead emit as stale; ordinary queued messages do not.
+    #[test]
+    fn pending_user_test_update_detection() {
+        let mk = |text: &str| Outgoing {
+            text: text.into(),
+            images: vec![],
+            tracked: false,
+            origin_tag: None,
+            queue_id: None,
+            has_attachments: false,
+        };
+        let mut turn = TurnState::default();
+        assert!(!has_pending_user_test_update(&turn));
+        turn.queue.push_back(mk("hello lead"));
+        assert!(!has_pending_user_test_update(&turn));
+        turn.queue
+            .push_back(mk("<weft:test_cases_updated>{\"source\":\"user\",\"content\":\"# v\"}</weft:test_cases_updated>"));
+        assert!(has_pending_user_test_update(&turn));
     }
 
     #[test]

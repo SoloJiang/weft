@@ -1725,7 +1725,7 @@ pub async fn upsert_test_plan(
     source: &str,
 ) -> Result<test_plan::Model> {
     ensure_thread_workspace_accepts_writes(db, thread_id).await?;
-    if let Some(existing) = test_plan::Entity::find()
+    let written = if let Some(existing) = test_plan::Entity::find()
         .filter(test_plan::Column::ThreadId.eq(thread_id))
         .one(&db.0)
         .await?
@@ -1734,16 +1734,25 @@ pub async fn upsert_test_plan(
         a.content = Set(content.to_string());
         a.source = Set(source.to_string());
         a.updated_at = Set(now());
-        return Ok(a.update(&db.0).await?);
-    }
-    let a = test_plan::ActiveModel {
-        thread_id: Set(thread_id),
-        content: Set(content.to_string()),
-        source: Set(source.to_string()),
-        updated_at: Set(now()),
-        ..Default::default()
+        a.update(&db.0).await?
+    } else {
+        let a = test_plan::ActiveModel {
+            thread_id: Set(thread_id),
+            content: Set(content.to_string()),
+            source: Set(source.to_string()),
+            updated_at: Set(now()),
+            ..Default::default()
+        };
+        a.insert(&db.0).await?
     };
-    Ok(a.insert(&db.0).await?)
+    // Post-write fence (same shape as create_thread/add_repo_ref): a cascade
+    // that passed its test_plan delete pass between our pre-check and this
+    // write would leave this row an unreachable orphan — re-check and undo.
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = test_plan::Entity::delete_by_id(written.id).exec(&db.0).await;
+        return Err(err);
+    }
+    Ok(written)
 }
 
 /// The issue's test-case document, if one has been derived.
