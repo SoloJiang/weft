@@ -804,6 +804,7 @@ export const zh = {
     empty: "还没有测试用例——可以让 lead 先推导，比如说「先出测试用例」。",
     emptyError: "测试用例不能保存为空。",
     savedLeadOffline: "已保存。lead 已停止，下次对话时会读到最新内容。",
+    refreshedWhileEditing: "lead 更新了测试用例——为避免覆盖新版本，未保存的草稿已丢弃。",
     editedBadge: "已编辑",
     notePlaceholder: "针对这个节点提问或提修改建议…",
     ask: "提问",

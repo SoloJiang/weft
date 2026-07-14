@@ -713,6 +713,16 @@ async fn apply_lead_sentinels(
                 persist_card_row(app, db, inner, thread_id, "plan_card", &json).await;
             }
             super::sentinels::Sentinel::TestCases(md) => {
+                // Issue-level document — only the LEAD may write it. Chat-mode
+                // workers share this engine (session_id set); a worker echoing
+                // protocol text (or prompt-injected repo content) must not
+                // replace the issue's cases from its own timeline.
+                if inner.session_id.is_some() {
+                    eprintln!(
+                        "[weft] worker sentinel: test_cases ignored (lead-only, issue-level doc)"
+                    );
+                    continue;
+                }
                 // Raw markdown body: upsert the document (single source of
                 // truth), then drop a summary card into the timeline — the
                 // panel always reads the table, never the card.

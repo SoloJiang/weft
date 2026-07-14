@@ -1715,12 +1715,16 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
 
 /// Upsert the issue's test-case document (0..1 per thread — UNIQUE thread_id).
 /// `source` records the last writer: "lead" (sentinel) or "user" (panel edit).
+/// Fenced like every other thread-owned write: the thread must still exist and
+/// its workspace must accept writes — a late panel save or lead sentinel after
+/// `delete_thread_cascade` must not recreate an orphan row (no FK cascades).
 pub async fn upsert_test_plan(
     db: &Db,
     thread_id: i32,
     content: &str,
     source: &str,
 ) -> Result<test_plan::Model> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     if let Some(existing) = test_plan::Entity::find()
         .filter(test_plan::Column::ThreadId.eq(thread_id))
         .one(&db.0)
@@ -2796,6 +2800,12 @@ mod tests {
         assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
         assert!(list_lead_messages(&db, t.id).await.unwrap().is_empty());
         assert!(get_thread(&db, t.id).await.unwrap().is_none());
+        // The write fence: a late save/sentinel can't recreate an orphan row.
+        assert!(
+            upsert_test_plan(&db, t.id, "# late\n- x\n", "user").await.is_err(),
+            "upsert after deletion must be rejected"
+        );
+        assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
     }
 
     /// test_plan upsert enforces 0..1 per thread (M0035 UNIQUE thread_id):

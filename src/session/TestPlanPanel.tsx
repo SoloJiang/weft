@@ -80,6 +80,9 @@ export function TestPlanPanel({
   }, [dragging]);
 
   // Refetch on open, thread switch, and lead re-emit. Drop stale responses.
+  // A re-emit while EDITING would make Save overwrite the freshly derived
+  // document with a draft based on the old one — drop the stale draft back to
+  // preview and say so. (Thread switches remount via key, so mode is fresh.)
   useEffect(() => {
     let alive = true;
     setLoaded(false);
@@ -90,6 +93,11 @@ export function TestPlanPanel({
         setPlan(p);
         setLoaded(true);
         setSelectedPath(null);
+        setMode((m) => {
+          if (m === "edit") toast(t("testPlan.refreshedWhileEditing"));
+          return "preview";
+        });
+        setDraft("");
       })
       .catch(() => {
         if (alive) setLoaded(true);
@@ -97,7 +105,7 @@ export function TestPlanPanel({
     return () => {
       alive = false;
     };
-  }, [threadId, refreshKey]);
+  }, [threadId, refreshKey, t]);
 
   const startEdit = () => {
     setDraft(plan?.content ?? "");

@@ -828,6 +828,7 @@ export const en = {
     empty: "No test cases yet — ask the lead to derive them, e.g. \"derive test cases first\".",
     emptyError: "Test cases can't be saved empty.",
     savedLeadOffline: "Saved. The lead is stopped and will pick the changes up on its next turn.",
+    refreshedWhileEditing: "The lead updated the test cases — your unsaved draft was discarded to avoid overwriting the new version.",
     editedBadge: "edited",
     notePlaceholder: "Ask or suggest about this node…",
     ask: "Ask",
