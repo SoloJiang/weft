@@ -15,6 +15,11 @@ interface MarkmapDatum {
 }
 
 const transformer = new Transformer();
+// markmap ships markdown-it with `html: true` and the view inserts node
+// content via `.html(...)` — raw HTML in a lead/user-authored document (e.g.
+// `<img onerror=…>`) would execute inside the Tauri webview. Disable raw HTML;
+// it renders as escaped text instead.
+transformer.md.set({ html: false });
 
 function textOf(content: string): string {
   // Node content may carry inline HTML (markmap renders via foreignObject);

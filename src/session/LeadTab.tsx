@@ -313,6 +313,9 @@ export function LeadTab({
       )}
       {rail === "tests" && (
         <TestPlanPanel
+          // Key by thread: switching issues remounts the panel, so issue A's
+          // edit mode/draft can never be saved into issue B.
+          key={tid}
           threadId={tid}
           refreshKey={testPlanRefreshKey}
           onClose={() => setLeadRail("none")}

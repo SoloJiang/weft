@@ -1424,6 +1424,10 @@ pub async fn delete_workspace_cascade(
             .filter(plan::Column::ThreadId.eq(*thread_id))
             .exec(&db.0)
             .await?;
+        test_plan::Entity::delete_many()
+            .filter(test_plan::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
     }
     if !repo_session_ids.is_empty() {
         lead_message::Entity::delete_many()
@@ -1510,6 +1514,25 @@ pub async fn delete_thread_cascade(
             .await?;
         direction::Entity::delete_by_id(d.id).exec(&db.0).await?;
     }
+    // Thread-owned rows (no FK cascades in sqlite here): chat history, the
+    // pending plan, IM bindings, and the test-case document all die with the
+    // issue — otherwise deleted-issue content lingers in weft.db and backups.
+    im_route::Entity::delete_many()
+        .filter(im_route::Column::ThreadId.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    lead_message::Entity::delete_many()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    plan::Entity::delete_many()
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .exec(&db.0)
+        .await?;
+    test_plan::Entity::delete_many()
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .exec(&db.0)
+        .await?;
     thread::Entity::delete_by_id(thread_id).exec(&db.0).await?;
     Ok(removed)
 }
@@ -2754,6 +2777,25 @@ mod tests {
         assert_eq!(all[0].content, updated.content);
         // a missing row is a no-op
         assert!(resolve_action_card(&db, 9999, "x").await.unwrap().is_none());
+    }
+
+    /// Deleting an issue removes every thread-owned row — chat history, plan,
+    /// IM routes, and the test-case document — not just directions/sessions.
+    #[tokio::test]
+    async fn thread_cascade_deletes_thread_owned_rows() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        upsert_test_plan(&db, t.id, "# doc\n- case\n", "lead").await.unwrap();
+        insert_lead_message(&db, t.id, None, 1, "assistant", "text", "{\"text\":\"hi\"}", "complete")
+            .await
+            .unwrap();
+        delete_thread_cascade(&db, t.id).await.unwrap();
+        assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
+        assert!(list_lead_messages(&db, t.id).await.unwrap().is_empty());
+        assert!(get_thread(&db, t.id).await.unwrap().is_none());
     }
 
     /// test_plan upsert enforces 0..1 per thread (M0035 UNIQUE thread_id):
