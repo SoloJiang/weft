@@ -832,7 +832,6 @@ export const en = {
     zoomIn: "Zoom in",
     zoomOut: "Zoom out",
     fitView: "Fit to view",
-    editedBadge: "edited",
     notePlaceholder: "Ask or suggest about this node…",
     ask: "Ask",
     suggest: "Suggest",

@@ -245,11 +245,6 @@ export function TestPlanPanel({
           <span className="min-w-0 truncate text-[12px] font-semibold text-ink">
             {t("testPlan.title")}
           </span>
-          {plan?.source === "user" && (
-            <span className="shrink-0 rounded-[var(--radius-sm)] bg-bg px-1.5 py-0.5 text-[10px] text-ink-faint">
-              {t("testPlan.editedBadge")}
-            </span>
-          )}
           <span className="ml-auto" />
           {plan && mode === "preview" && (
             <>

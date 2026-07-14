@@ -808,7 +808,6 @@ export const zh = {
     zoomIn: "放大",
     zoomOut: "缩小",
     fitView: "适配视图",
-    editedBadge: "已编辑",
     notePlaceholder: "针对这个节点提问或提修改建议…",
     ask: "提问",
     suggest: "建议修改",
