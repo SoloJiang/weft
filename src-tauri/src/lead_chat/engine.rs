@@ -1033,6 +1033,13 @@ pub struct EngineInner {
     pub last_window: Option<u64>,
     pub last_mcp_servers: Vec<super::proto::McpServer>,
     pub last_tools: Vec<String>,
+    /// Out-of-band probe ordering: `probe_seq` hands a ticket to each probe as
+    /// it STARTS (`lead_session_meta` / `session_meta` take one before
+    /// gathering); `probe_committed` records the newest absorbed ticket. A
+    /// result bearing an older ticket lost the race — its usage was read
+    /// before a newer probe's and may only fill holes, never overwrite.
+    pub probe_seq: u64,
+    pub probe_committed: u64,
     /// Opaque tag of the turn whose output is currently being emitted. Set at
     /// every turn-start (including None turns) so a prior concierge reply target
     /// never leaks into a later non-IM turn. Stamped onto each emitted frame.
@@ -1082,15 +1089,17 @@ impl PersistedMeta {
     /// fields keep existing values — a transient probe failure must never
     /// blank anything. Returns whether anything changed.
     ///
-    /// `usage_from_events` gates `context_tokens` (see
-    /// [`usage_events_authoritative`]): true → fill-a-hole only; false → the
-    /// probe is the transport's only usage source and may update it. Model/
-    /// window/MCP are configuration-shaped and stay updatable everywhere
-    /// (probes are their only source on codex/opencode).
+    /// `usage_updatable` gates `context_tokens`: false → fill-a-hole only
+    /// (claude/codex, whose event stream speaks for usage — see
+    /// [`usage_events_authoritative`] — or a probe holding a stale ticket);
+    /// true → the probe is the freshest usage source and may update it
+    /// (opencode with the newest ticket). Model/window/MCP are configuration-
+    /// shaped and stay updatable everywhere (probes are their only source on
+    /// codex/opencode).
     fn merge_probe(
         &mut self,
         snap: &crate::session_meta::SessionMetaSnapshot,
-        usage_from_events: bool,
+        usage_updatable: bool,
     ) -> bool {
         let mut changed = false;
         if let Some(v) = &snap.model {
@@ -1106,10 +1115,10 @@ impl PersistedMeta {
             }
         }
         if let Some(v) = snap.context_tokens {
-            let accept = if usage_from_events {
-                self.context_tokens.is_none()
-            } else {
+            let accept = if usage_updatable {
                 self.context_tokens != Some(v)
+            } else {
+                self.context_tokens.is_none()
             };
             if accept {
                 self.context_tokens = Some(v);
@@ -1163,11 +1172,27 @@ async fn persist_engine_meta(db: &Db, inner: &EngineInner) {
 /// panel until the next probe (or forever if it keeps failing). Works with or
 /// without a live engine: on a fresh relaunch the panel probes before any
 /// engine is spawned, so the no-engine path merges straight into the stored JSON.
+/// Hand out a probe ticket for the live engine (if any) at probe START.
+/// `absorb_probe_meta` later compares the ticket against the newest committed
+/// one, so a slow probe that returns after a fresher one can't roll usage back.
+/// No engine → None: nothing is running, so there is no race to order.
+pub async fn take_probe_ticket(app: &AppHandle, thread_id: i32, session_id: Option<i32>) -> Option<u64> {
+    let key = match session_id {
+        Some(sid) => sid as i64,
+        None => -(thread_id as i64),
+    };
+    let eng = app.state::<LeadChatState>().get(key)?;
+    let mut inner = eng.lock().await;
+    inner.probe_seq += 1;
+    Some(inner.probe_seq)
+}
+
 pub async fn absorb_probe_meta(
     app: &AppHandle,
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
+    ticket: Option<u64>,
     snap: &crate::session_meta::SessionMetaSnapshot,
 ) {
     let key = match session_id {
@@ -1176,6 +1201,15 @@ pub async fn absorb_probe_meta(
     };
     if let Some(eng) = app.state::<LeadChatState>().get(key) {
         let mut inner = eng.lock().await;
+        // Usage may update only for probe-sourced transports (opencode) AND
+        // only when this result carries the newest ticket — an older ticket
+        // read the sidecar before a fresher probe did, so its count is stale
+        // even though it arrives later. Stale/eventful probes still fill holes.
+        let freshest = ticket.is_none_or(|t| t > inner.probe_committed);
+        if let Some(t) = ticket {
+            inner.probe_committed = inner.probe_committed.max(t);
+        }
+        let usage_updatable = !usage_events_authoritative(&inner.tool) && freshest;
         let mut m = PersistedMeta {
             context_tokens: inner.last_context_tokens,
             window: inner.last_window,
@@ -1183,7 +1217,7 @@ pub async fn absorb_probe_meta(
             mcp_servers: inner.last_mcp_servers.clone(),
             tools: inner.last_tools.clone(),
         };
-        if m.merge_probe(snap, usage_events_authoritative(&inner.tool)) {
+        if m.merge_probe(snap, usage_updatable) {
             inner.last_context_tokens = m.context_tokens;
             inner.last_window = m.window;
             inner.last_model = m.model.clone();
@@ -1193,6 +1227,8 @@ pub async fn absorb_probe_meta(
         return;
     }
     // No live engine (e.g. right after a relaunch): merge into the stored JSON.
+    // No ticket ordering needed — with no engine there is no turn running and
+    // the probes were issued against the same resting state.
     let (existing, tool) = match session_id {
         Some(sid) => match repo::get_session(db, sid).await.ok().flatten() {
             Some(s) => (Some(s.meta), s.tool),
@@ -1208,7 +1244,7 @@ pub async fn absorb_probe_meta(
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
-    if !m.merge_probe(snap, usage_events_authoritative(&tool)) {
+    if !m.merge_probe(snap, !usage_events_authoritative(&tool)) {
         return;
     }
     let Ok(json) = serde_json::to_string(&m) else {
@@ -3364,6 +3400,43 @@ mod tests {
         assert!(sparse.last_tools.is_empty());
     }
 
+    /// merge_probe usage semantics: fill-only mode (claude/codex, or a stale
+    /// opencode ticket) never overwrites a known count; updatable mode (the
+    /// freshest opencode probe) does. Config fields update in both modes.
+    #[test]
+    fn merge_probe_usage_gate() {
+        let snap = crate::session_meta::SessionMetaSnapshot {
+            context_tokens: Some(999),
+            window: Some(200_000),
+            model: Some("gpt-5.6-sol".into()),
+            mcp_servers: None,
+            skills: None,
+            reasoning_effort: None,
+        };
+        // Fill-only: a hole fills, an existing value survives.
+        let mut hole = PersistedMeta::default();
+        assert!(hole.merge_probe(&snap, false));
+        assert_eq!(hole.context_tokens, Some(999));
+        let mut known = PersistedMeta {
+            context_tokens: Some(57_000),
+            ..Default::default()
+        };
+        known.merge_probe(&snap, false);
+        assert_eq!(known.context_tokens, Some(57_000), "fill-only must not overwrite");
+        assert_eq!(known.model.as_deref(), Some("gpt-5.6-sol"), "config fields still update");
+        // Updatable (freshest opencode probe): overwrites.
+        let mut live = PersistedMeta {
+            context_tokens: Some(57_000),
+            ..Default::default()
+        };
+        assert!(live.merge_probe(&snap, true));
+        assert_eq!(live.context_tokens, Some(999));
+        // Transport mapping.
+        assert!(usage_events_authoritative("claude"));
+        assert!(usage_events_authoritative("codex"));
+        assert!(!usage_events_authoritative("opencode"));
+    }
+
     #[test]
     fn queue_machine() {
         let mut t = TurnState::default();
@@ -3691,6 +3764,8 @@ mod tests {
             last_window: None,
             last_mcp_servers: vec![],
             last_tools: vec![],
+            probe_seq: 0,
+            probe_committed: 0,
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
@@ -3839,6 +3914,8 @@ mod tests {
             last_window: None,
             last_mcp_servers: vec![],
             last_tools: vec![],
+            probe_seq: 0,
+            probe_committed: 0,
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
             stopped: false,

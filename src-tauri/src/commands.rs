@@ -1625,13 +1625,29 @@ pub async fn session_meta(
         latest.as_ref().and_then(|s| s.command.as_deref()),
         &dir.tool,
     );
+    // Ticket BEFORE gathering: a slow probe overlapping a fresher one must not
+    // roll usage back when it finally lands (see absorb_probe_meta).
+    let sid = latest.as_ref().map(|s| s.id);
+    let ticket = match sid {
+        Some(sid) => {
+            crate::lead_chat::engine::take_probe_ticket(&app, dir.thread_id, Some(sid)).await
+        }
+        None => None,
+    };
     let snap =
         crate::session_meta::gather(&dir.tool, &wt.path, native.as_deref(), &command).await;
     // Probe results feed the engine cache + persisted snapshot: codex/opencode
     // model/window/MCP only exist here, never in engine events.
-    if let Some(sid) = latest.as_ref().map(|s| s.id) {
-        crate::lead_chat::engine::absorb_probe_meta(&app, &db, dir.thread_id, Some(sid), &snap)
-            .await;
+    if let Some(sid) = sid {
+        crate::lead_chat::engine::absorb_probe_meta(
+            &app,
+            &db,
+            dir.thread_id,
+            Some(sid),
+            ticket,
+            &snap,
+        )
+        .await;
     }
     Ok(snap)
 }
