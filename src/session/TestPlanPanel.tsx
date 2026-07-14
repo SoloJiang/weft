@@ -42,7 +42,7 @@ export function TestPlanPanel({
   onSendToLead?: (text: string) => void;
 }) {
   const { t } = useTranslation();
-  const [w, setW] = useState(() => clampW(Number(localStorage.getItem("weft-testplan-w")) || 480));
+  const [w, setW] = useState(() => clampW(Number(localStorage.getItem("weft-testplan-w")) || 560));
   const [dragging, setDragging] = useState(false);
   const [plan, setPlan] = useState<TestPlan | null>(null);
   const [loaded, setLoaded] = useState(false);

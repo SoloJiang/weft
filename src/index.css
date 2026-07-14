@@ -242,10 +242,15 @@
 }
 
 /* markmap (TestPlanPanel): node text follows the app theme — the library's
-   built-in #333 is unreadable on the dark background. Branch strokes keep
-   markmap's own categorical palette (readable on both themes). */
+   built-in #333 is unreadable on the dark background — and swaps markmap's
+   airy default type (300 16px) for the app's denser, steadier scale so a big
+   tree reads as UI, not a poster. Branch colors come from the component. */
 svg.markmap {
   color: var(--color-ink);
+  font: 450 12.5px/1.55 ui-sans-serif, system-ui, sans-serif;
+}
+svg.markmap .markmap-foreign {
+  letter-spacing: 0.01em;
 }
 
 /* motion only when something changed; honor reduced-motion everywhere */
