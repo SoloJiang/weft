@@ -2852,10 +2852,25 @@ fn spawn_reader(
                         merge_init_slash_commands(&inner.slash_commands, slash_commands);
                     inner.slash_commands = slash_commands.clone();
                     let window = model.as_deref().and_then(super::window::context_window);
-                    inner.last_mcp_servers = mcp_servers.clone();
-                    inner.last_tools = tools.clone();
-                    inner.last_model = model.clone();
-                    inner.last_window = window;
+                    // Mirror the frontend's metaFromInit invariant: only an init
+                    // that carries a model is authoritative (may replace, even
+                    // with empty lists — the session truly has no MCP). A
+                    // model-less/partial init is fill-only, or the checkpoint
+                    // below would persist a blank snapshot over restored meta
+                    // merely because the chat was reopened after a relaunch.
+                    if model.is_some() {
+                        inner.last_mcp_servers = mcp_servers.clone();
+                        inner.last_tools = tools.clone();
+                        inner.last_model = model.clone();
+                        inner.last_window = window;
+                    } else {
+                        if inner.last_mcp_servers.is_empty() {
+                            inner.last_mcp_servers = mcp_servers.clone();
+                        }
+                        if inner.last_tools.is_empty() {
+                            inner.last_tools = tools.clone();
+                        }
+                    }
                     // Persist at init too: if the app dies mid-turn, the
                     // MCP/model snapshot still survives the relaunch.
                     persist_engine_meta(&db, &inner).await;
