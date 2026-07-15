@@ -78,7 +78,8 @@ const MindMapEditor = forwardRef<
   const mindRef = useRef<MindElixirInstance | null>(null);
   // Set on the first real operation (after the ready guard). Save reads it to
   // treat an untouched open-and-Save as a no-op — no rewrite, no lead notify.
-  const dirtyRef = useRef(false);
+  // The tree serialized at init; dirty = the live tree serializes differently.
+  const initialMarkdownRef = useRef<string>("");
   // Keep the latest callbacks/labels in refs so the init effect runs exactly
   // once per mount — re-initializing would discard the user's in-progress edits.
   const onChangeRef = useRef(onChange);
@@ -88,14 +89,24 @@ const MindMapEditor = forwardRef<
 
   useImperativeHandle(
     ref,
-    () => ({
-      flush: () => {
+    () => {
+      const serialize = () => {
         const mind = mindRef.current;
-        if (!mind) return null;
-        return mindTreeToMarkdown(fromNodeObj(mind.getData().nodeData), rootLabelRef.current);
-      },
-      isDirty: () => dirtyRef.current,
-    }),
+        return mind
+          ? mindTreeToMarkdown(fromNodeObj(mind.getData().nodeData), rootLabelRef.current)
+          : null;
+      };
+      return {
+        flush: serialize,
+        // Compare the live serialization to the init snapshot rather than trusting
+        // the operation stream: a finishEdit after an inspect-only double-click
+        // fires an `operation` but leaves the tree unchanged, which must not count.
+        isDirty: () => {
+          const cur = serialize();
+          return cur != null && cur !== initialMarkdownRef.current;
+        },
+      };
+    },
     [],
   );
 
@@ -119,11 +130,35 @@ const MindMapEditor = forwardRef<
         link: false,
         extend: [],
       },
+      // Veto removing the root: Delete/Backspace on the title routes through
+      // removeNodes, and the rootless node leaves the map in a broken half-state.
+      before: {
+        removeNodes: (tpcs) =>
+          !tpcs.some(
+            (t) => (t as HTMLElement).parentElement?.tagName.toLowerCase() === "me-root",
+          ),
+      },
       theme: { name: "weft", palette: PALETTE, cssVar: CSS_VAR },
     };
     const mind: MindElixirInstance = new MindElixir(options);
     mind.init({ nodeData: toNodeObj(tree) });
     mindRef.current = mind;
+    // Snapshot the initial serialization for the no-op (isDirty) check.
+    initialMarkdownRef.current = mindTreeToMarkdown(
+      fromNodeObj(mind.getData().nodeData),
+      rootLabelRef.current,
+    );
+    // mind-elixir's built-in paste renders a copied NodeObj straight from the
+    // clipboard (its MIND-ELIXIR-WAIT-COPY payload) before our serializer runs —
+    // arbitrary node HTML in the webview. Block that paste in the capture phase
+    // (before mind-elixir's handler); ordinary text paste is unaffected.
+    const onPaste = (e: ClipboardEvent) => {
+      if ((e.clipboardData?.getData("text/plain") ?? "").includes("MIND-ELIXIR-WAIT-COPY")) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    };
+    el.addEventListener("paste", onPaste, true);
     // Fit the whole tree into the panel on open — mind-elixir's default view
     // centers the root at native scale, which pushes a right-growing tree off
     // the edge in a narrow column. A rAF lets the initial layout settle first.
@@ -140,7 +175,6 @@ const MindMapEditor = forwardRef<
     let emitTimer: ReturnType<typeof setTimeout> | null = null;
     const emit = () => {
       if (!ready) return;
-      dirtyRef.current = true;
       if (emitTimer) clearTimeout(emitTimer);
       emitTimer = setTimeout(() => {
         const data = mind.getData();
@@ -155,6 +189,7 @@ const MindMapEditor = forwardRef<
       cancelAnimationFrame(fitFrame);
       clearTimeout(readyTimer);
       if (emitTimer) clearTimeout(emitTimer);
+      el.removeEventListener("paste", onPaste, true);
       mind.bus.removeListener("operation", emit);
       mind.destroy();
       mindRef.current = null;

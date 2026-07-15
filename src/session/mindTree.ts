@@ -38,6 +38,10 @@ export function parseTestPlanMarkdown(md: string): MindTree {
   // whose sole top node is a deeper heading (`## Group`) keeps the synthetic root,
   // so that node stays a branch instead of being promoted to the title.
   const h1Roots = new WeakSet<MindTree>();
+  // Nodes that came from a bullet (list item). Only these accept a continuation
+  // line — prose under a heading is NOT a list-item wrap, so it isn't folded into
+  // the heading's title.
+  const bulletNodes = new WeakSet<MindTree>();
 
   for (const raw of md.split("\n")) {
     const line = raw.replace(/\s+$/, "");
@@ -55,10 +59,11 @@ export function parseTestPlanMarkdown(md: string): MindTree {
       const b = BULLET.exec(line);
       if (!b) {
         // A continuation line — a wrapped list item's tail (indented prose, not a
-        // new heading or bullet). Append it to the current node so the wrapped
-        // text is kept as one topic instead of dropped.
+        // new heading or bullet). Fold it into the current node ONLY if that node
+        // is a bullet, so a wrapped list item keeps its text; prose under a heading
+        // is not a list-item wrap and is left out of the heading title.
         const top = stack[stack.length - 1].node;
-        if (top !== root) top.topic = `${top.topic} ${line.trim()}`.trim();
+        if (bulletNodes.has(top)) top.topic = `${top.topic} ${line.trim()}`.trim();
         continue;
       }
       const indent = b[1].replace(/\t/g, "  ").length;
@@ -70,6 +75,7 @@ export function parseTestPlanMarkdown(md: string): MindTree {
     while (stack.length > 1 && stack[stack.length - 1].depth >= depth) stack.pop();
     const node: MindTree = { topic, children: [] };
     if (isHeading && depth === 1) h1Roots.add(node);
+    if (!isHeading) bulletNodes.add(node);
     stack[stack.length - 1].node.children.push(node);
     stack.push({ depth, node });
   }
