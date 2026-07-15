@@ -12,6 +12,7 @@ import { clampPanelWidth } from "./panelWidth";
 import { cn } from "../lib/cn";
 import type { NodePath } from "./MindMapView";
 import type { MindMapEditorHandle } from "./MindMapEditor";
+import { parseTestPlanMarkdown } from "./mindTree";
 
 // markmap + d3 (preview) and mind-elixir (editor) stay out of the main bundle;
 // the panel is rarely open, and the editor loads only when editing begins.
@@ -126,7 +127,20 @@ export function TestPlanPanel({
     // Flush the editor's live tree — a rename/add/drag right before Save schedules
     // its onChange on a debounce that may not have fired, so `draft` can lag. Fall
     // back to `draft` if the editor is gone (unmounted between click and read).
-    const content = (editorRef.current?.flush() ?? draft).trim();
+    const flushed = editorRef.current?.flush() ?? draft;
+    const original = plan?.content ?? "";
+    // No-op guard: open-and-Save (or edits that net to the same tree) must NOT
+    // rewrite the stored doc — flush() serializes to canonical markdown (headings
+    // → bullets), so persisting it on a no-op would needlessly reshape the source
+    // and notify the lead. Compare trees; if unchanged, just leave edit mode.
+    const changed =
+      JSON.stringify(parseTestPlanMarkdown(flushed)) !==
+      JSON.stringify(parseTestPlanMarkdown(original));
+    if (!changed) {
+      setMode("preview");
+      return;
+    }
+    const content = flushed.trim();
     if (!content) {
       toast(t("testPlan.emptyError"));
       return;

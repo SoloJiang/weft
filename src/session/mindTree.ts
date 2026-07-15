@@ -33,10 +33,11 @@ const BULLET_BASE = 7;
 export function parseTestPlanMarkdown(md: string): MindTree {
   const root: MindTree = { topic: "", children: [] };
   const stack: { depth: number; node: MindTree }[] = [{ depth: 0, node: root }];
-  // Which nodes came from a heading (vs a bullet). Only a genuine single-heading
-  // root is unwrapped below; a heading-less outline whose sole top-level node is
-  // a bullet keeps the synthetic root so its one branch isn't promoted to title.
-  const fromHeading = new WeakSet<MindTree>();
+  // Nodes that came from a LEVEL-ONE (`#`) heading. Only such a node is unwrapped
+  // to the document root below: a heading-less outline (sole node a bullet) or one
+  // whose sole top node is a deeper heading (`## Group`) keeps the synthetic root,
+  // so that node stays a branch instead of being promoted to the title.
+  const h1Roots = new WeakSet<MindTree>();
 
   for (const raw of md.split("\n")) {
     const line = raw.replace(/\s+$/, "");
@@ -61,16 +62,17 @@ export function parseTestPlanMarkdown(md: string): MindTree {
 
     while (stack.length > 1 && stack[stack.length - 1].depth >= depth) stack.pop();
     const node: MindTree = { topic, children: [] };
-    if (isHeading) fromHeading.add(node);
+    if (isHeading && depth === 1) h1Roots.add(node);
     stack[stack.length - 1].node.children.push(node);
     stack.push({ depth, node });
   }
 
-  // A single `#` heading root is the norm — unwrap the synthetic holder only then.
-  // A heading-less document with one top-level bullet keeps the holder so the
-  // bullet stays a branch (fallbackTitle names the root) instead of becoming it.
+  // A single `#` (level-one) heading root is the norm — unwrap the holder only
+  // then. A heading-less document, or one whose sole top node is a deeper heading
+  // (`## Group`), keeps the holder so that node stays a branch (fallbackTitle
+  // names the root) instead of being promoted to the title.
   const sole = root.children[0];
-  if (root.topic === "" && root.children.length === 1 && fromHeading.has(sole)) {
+  if (root.topic === "" && root.children.length === 1 && h1Roots.has(sole)) {
     return sole;
   }
   return root;
