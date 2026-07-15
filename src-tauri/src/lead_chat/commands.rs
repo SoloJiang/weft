@@ -1453,6 +1453,12 @@ fn hidden_feedback_text(payload: &serde_json::Value) -> Result<String, serde_jso
 /// dead engine, serialization failure) — callers that persist follow-up state
 /// (e.g. collapsing an approved plan card) must check the flag so a dropped
 /// delivery never masquerades as a received one.
+///
+/// A `plan_decision` (the user clicking Approve) REVIVES a stopped lead — the
+/// click is an explicit "continue" intent, the same as sending a message — so
+/// the approval isn't a dead-end that makes the user restart and re-approve.
+/// Other feedback (test_cases_updated / repo_action) stays droppable when
+/// stopped: its DB write is authoritative and the lead reads it back later.
 async fn post_lead_tool_result_inner(
     app: &AppHandle,
     db: &Db,
@@ -1460,6 +1466,7 @@ async fn post_lead_tool_result_inner(
     payload: serde_json::Value,
     lang: &str,
 ) -> Result<bool, String> {
+    let revives = payload.get("tool").and_then(|v| v.as_str()) == Some("plan_decision");
     let text = match hidden_feedback_text(&payload) {
         Ok(text) => text,
         Err(e) => {
@@ -1479,7 +1486,7 @@ async fn post_lead_tool_result_inner(
                     .as_deref(),
                 Some("stopped")
             );
-            if stopped {
+            if stopped && !revives {
                 log_hidden_feedback_ignored(thread_id, "lead is stopped");
                 return Ok(false);
             }
@@ -1492,7 +1499,14 @@ async fn post_lead_tool_result_inner(
             }
         }
     };
-    if let Err(e) = engine::ensure_running(app, db, &eng).await {
+    // A revive clears the stopped flag (like `send`) so the engine accepts the
+    // hidden input; a non-revive only ensures an already-live engine is running.
+    let ensured = if revives {
+        engine::ensure_running_for_send(app, db, &eng).await
+    } else {
+        engine::ensure_running(app, db, &eng).await
+    };
+    if let Err(e) = ensured {
         log_hidden_feedback_ignored(thread_id, &e.to_string());
         return Ok(false);
     }
