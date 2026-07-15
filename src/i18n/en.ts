@@ -861,6 +861,8 @@ export const en = {
     noWorkspaceToast: "Could not prepare workspace",
   },
   slashLocal: {
+    testCases: "Derive test cases",
+    testCasesPrompt: "Please derive the test cases for this issue first (as a mindmap), before we discuss the technical approach.",
     addRepo: "Import existing folder",
     newRepo: "Create new repo",
     cloneRepo: "Clone from URL",

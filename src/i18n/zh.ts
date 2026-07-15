@@ -836,6 +836,8 @@ export const zh = {
     noWorkspaceToast: "无法准备工作区",
   },
   slashLocal: {
+    testCases: "推导测试用例",
+    testCasesPrompt: "请先为这个 issue 推导测试用例（思维导图形式），再讨论技术方案。",
     addRepo: "导入已有目录",
     newRepo: "新建仓库",
     cloneRepo: "克隆仓库",

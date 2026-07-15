@@ -43,6 +43,16 @@ type SlashItem = {
   argHint?: string;
 };
 
+/** A host-provided local slash item. Two shapes drive what picking it does:
+ *  - `act: "action"` — the host owns the side effect; the composer fires
+ *    `onLocalSlash` and just clears its draft (nothing is sent).
+ *  - `act: "prompt"` — a canned message; the composer sends `prompt` through its
+ *    OWN send path, so pending attachments and the queue-full guard are handled
+ *    exactly like a typed message (never a bare, attachment-dropping send). */
+export type LocalSlashSpec =
+  | { name: string; label: string; act: "action" }
+  | { name: string; label: string; act: "prompt"; prompt: string };
+
 const IME_ENTER_GRACE_MS = 100;
 
 /** Max messages that can wait in the queue while a turn runs. */
@@ -66,9 +76,10 @@ export function ChatComposer({
 }: {
   slashCommands: SlashCmd[];
   /** Extra "local" slash items, prepended to the palette under a divider.
-   *  The host handles the action: when the user picks one, onLocalSlash is
-   *  called and the composer text is cleared (it is NOT sent). */
-  localSlash?: { name: string; label: string }[];
+   *  An `act:"action"` item defers to the host via onLocalSlash (draft cleared,
+   *  nothing sent); an `act:"prompt"` item is sent by the composer itself so its
+   *  canned text rides the normal send path (attachments + queue-full guard). */
+  localSlash?: LocalSlashSpec[];
   onLocalSlash?: (name: string) => void;
   busy: boolean;
   queued: number;
@@ -118,7 +129,7 @@ export function ChatComposer({
 
 interface ChatComposerBodyProps {
   slashCommands: SlashCmd[];
-  localSlash?: { name: string; label: string }[];
+  localSlash?: LocalSlashSpec[];
   onLocalSlash?: (name: string) => void;
   busy: boolean;
   queued: number;
@@ -191,7 +202,8 @@ function ChatComposerBody({
       return { exact, prefix, within };
     };
     const locals: SlashItem[] = (localSlash ?? []).map((x) => ({
-      ...x,
+      name: x.name,
+      label: x.label,
       source: "local",
     }));
     const clis: SlashItem[] = slashCommands.map((c) => ({
@@ -249,8 +261,11 @@ function ChatComposerBody({
     el.style.height = `${Math.min(el.scrollHeight, 150)}px`;
   }, [text]);
 
-  const send = () => {
-    const v = text.trim();
+  // overrideText sends a canned message (a local prompt-slash) instead of the
+  // draft — but still through this one path, so attachments, the queue-full
+  // guard, and failure-restore behave identically to a typed send.
+  const send = (overrideText?: string) => {
+    const v = (overrideText ?? text).trim();
     if (!v && images.length === 0 && files.length === 0) return;
     // Queue is capped while a turn runs: intercept, keep the draft, tell the user.
     if (busy && queued >= MAX_QUEUED) {
@@ -279,6 +294,18 @@ function ChatComposerBody({
 
   const complete = (item: SlashItem) => {
     if (item.source === "local") {
+      const spec = localSlash?.find((s) => s.name === item.name);
+      // A "prompt" item sends its canned text through the real send path so
+      // queue-full is surfaced and the composer's own attachments ride along
+      // (not dropped, not left to leak into the next message). "action" items
+      // defer to the host.
+      if (spec?.act === "prompt") {
+        // send() clears its own draft on success and KEEPS it when the queue is
+        // full (it toasts and returns before clearing), so don't clear here —
+        // otherwise a full queue would silently drop the `/…` command.
+        send(spec.prompt);
+        return;
+      }
       onLocalSlash?.(item.name);
       setText("");
       return;
