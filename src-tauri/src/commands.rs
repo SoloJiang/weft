@@ -751,8 +751,14 @@ pub async fn set_proposal_direction_base(
 
 /// Confirm the stored proposal: create its directions + materialize worktrees.
 #[tauri::command]
-pub async fn confirm_proposal(db: State<'_, Db>, thread_id: i32) -> R<Vec<i32>> {
-    crate::planner::confirm(&db, thread_id).await.map_err(e)
+pub async fn confirm_proposal(
+    db: State<'_, Db>,
+    thread_id: i32,
+    expected_version: Option<String>,
+) -> R<Vec<i32>> {
+    crate::planner::confirm(&db, thread_id, expected_version)
+        .await
+        .map_err(e)
 }
 
 /// The brief a worker for this direction would be dispatched with (§4.10).

@@ -1953,29 +1953,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return "review";
         }
         // One-click fast path: the card renders from the loaded `proposal`, which
-        // can lag a re-propose (the row lands before getProposal resolves). When a
-        // version is passed, re-fetch and route to Review if the backend has moved
-        // on — so a blind one-click never confirms a scope different from the card.
+        // can lag a re-propose. The version guard is ATOMIC in the backend — confirm
+        // runs the version check against the plan snapshot under its per-thread gate,
+        // so a re-propose can't slip between check and materialize. On a version
+        // mismatch it returns no ids; refresh + route to Review with the fresh scope.
         // The full ScopeReview path passes no version (the user reviewed live state).
-        if (expectedVersion != null) {
-          const current = await api.getProposal(tid);
-          // If the user switched threads during the fetch, abandon quietly — writing
-          // this thread's proposal into the shared state (or opening its review)
-          // would show/act on the wrong thread's scope.
-          if (activeThreadIdRef.current !== tid) return "abandoned";
-          setProposal(current);
-          const only = current?.directions[0];
-          const stillMatches =
-            current != null &&
-            current.status === "proposed" &&
-            current.created_at === expectedVersion &&
-            current.directions.length === 1 &&
-            only?.repo?.known === true &&
-            // Not already decided via a Needs-you write card (pending only).
-            only?.decision === "";
-          if (!stillMatches) return "review";
+        const ids = await api.confirmProposal(tid, expectedVersion);
+        if (expectedVersion != null && ids.length === 0) {
+          if (activeThreadIdRef.current === tid) await refreshProposal(tid);
+          return "review";
         }
-        const ids = await api.confirmProposal(tid);
         setProposal(null);
         setReviewingProposal(false);
         await loadThreadChildren(tid);

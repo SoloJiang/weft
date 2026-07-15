@@ -733,6 +733,10 @@ function TimelineRow({
     //  • not already decided — a direction the human already approved/denied via a
     //    Needs-you write card (decision != "") must go through Review, not a blind
     //    one-click that ignores that decision.
+    //  • no queued revision — a follow-up the user already sent (e.g. changing the
+    //    repo/base while the lead is busy) is about to re-shape this proposal, so
+    //    route to Review rather than one-click a scope that's about to change (same
+    //    guard the plan-card approval uses).
     //  • onConfirmProposal wired — lead host only (worker hosts render settled).
     const dirs = proposal.directions;
     const only = dirs.length === 1 ? dirs[0] : null;
@@ -741,6 +745,7 @@ function TimelineRow({
       count === 1 &&
       only.repo?.known === true &&
       only.decision === "" &&
+      queuedCount === 0 &&
       onConfirmProposal
     ) {
       return (
