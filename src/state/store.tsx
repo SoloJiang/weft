@@ -56,11 +56,6 @@ export interface OpenSession {
   nativeId: string | null;
 }
 
-/** Result of confirmProposal: dispatched the plan, fell back to Review (the
- *  caller should open + navigate there), or abandoned (thread switched — do
- *  nothing). */
-export type ConfirmOutcome = "dispatched" | "review" | "abandoned";
-
 interface Store {
   workspaces: Workspace[];
   activeWorkspaceId: number | null;
@@ -227,7 +222,7 @@ interface Store {
   proposal: ResolvedProposal | null;
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
-  confirmProposal: (expectedVersion?: string) => Promise<ConfirmOutcome>;
+  confirmProposal: () => Promise<void>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
@@ -1918,11 +1913,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // failure, so a different lane's success can't mask an earlier lane's stale base;
   // confirm/approve abort while the thread still has ANY unrecovered lane failure.
   const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
+  // Synchronous complement to the async `confirmingProposal` state: a rapid
+  // double-click can fire a second confirm before React re-renders the button
+  // disabled (a state update lands next tick). This ref is checked+set
+  // SYNCHRONOUSLY at the top of confirmProposal, so the second call bails at once.
+  const confirmingSyncRef = useRef<Set<number>>(new Set());
 
   const confirmProposal = useCallback(
-    async (expectedVersion?: string): Promise<ConfirmOutcome> => {
-      if (activeThreadId == null) return "abandoned";
+    async (): Promise<void> => {
+      if (activeThreadId == null) return;
       const tid = activeThreadId;
+      // Synchronous double-entry guard: a rapid double-click can fire a second
+      // call before React re-renders the button disabled off `confirmingProposal`
+      // (a state update lands next tick). Set the ref SYNCHRONOUSLY so the second
+      // call bails at once; the finally clears it.
+      if (confirmingSyncRef.current.has(tid)) return;
+      confirmingSyncRef.current.add(tid);
       // In-flight flag lives in the store, NOT the fast card's local state: the
       // card sits in a virtualized row that can unmount mid-dispatch (scrolled
       // away), which would drop a local guard and let a second click re-dispatch.
@@ -1930,9 +1936,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         // Flush any in-flight base-branch save before materializing. If it REJECTED
         // (a re-propose moved the lane, or a DB error), the backend still holds the
-        // old base — refresh to the real state and route to Review rather than
-        // materializing from a stale base. Consume the promise so a retry isn't
-        // blocked by the settled rejection.
+        // old base — refresh to the real state rather than materializing from a
+        // stale base. Consume the promise so a retry isn't blocked by the settled
+        // rejection.
         const pending = pendingBaseSave.current.get(tid) ?? Promise.resolve();
         pendingBaseSave.current.delete(tid);
         try {
@@ -1941,35 +1947,29 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // handled by the latch below
         }
         // The base-save flush is async — if the user switched threads during it,
-        // abandon without touching this thread's proposal or opening its review
-        // (the same active-thread guard the version re-check below applies).
-        if (activeThreadIdRef.current !== tid) return "abandoned";
+        // abandon without touching this thread's proposal.
+        if (activeThreadIdRef.current !== tid) return;
         // Also abort if any EARLIER link in the chain failed — the chain's
         // `.catch(() => {})` swallows predecessors for serialization, so the final
-        // promise may resolve even when a prior save rejected.
+        // promise may resolve even when a prior save rejected. Refresh so the card
+        // reflects the real base; the user re-confirms (or opens Review) from there.
         if ((baseSaveFailed.current.get(tid)?.size ?? 0) > 0) {
           baseSaveFailed.current.delete(tid);
           await refreshProposal(tid);
-          return "review";
+          return;
         }
-        // One-click fast path: the card renders from the loaded `proposal`, which
-        // can lag a re-propose. The version guard is ATOMIC in the backend — confirm
-        // runs the version check against the plan snapshot under its per-thread gate,
-        // so a re-propose can't slip between check and materialize. On a version
-        // mismatch it returns no ids; refresh + route to Review with the fresh scope.
-        // The full ScopeReview path passes no version (the user reviewed live state).
-        const ids = await api.confirmProposal(tid, expectedVersion);
-        if (expectedVersion != null && ids.length === 0) {
-          if (activeThreadIdRef.current === tid) await refreshProposal(tid);
-          return "review";
-        }
+        // Confirm LIVE state, exactly like the full ScopeReview path (which also
+        // calls confirmProposal with no version): the backend materializes the
+        // proposal as it currently stands. No version snapshot means there is no
+        // stale-snapshot / navigate-on-mismatch machinery left to get wrong.
+        const ids = await api.confirmProposal(tid);
         setProposal(null);
         setReviewingProposal(false);
         await loadThreadChildren(tid);
         // Automation-first: dispatch every new task's worker immediately.
         for (const id of ids) void dispatchDirection(id);
-        return "dispatched";
       } finally {
+        confirmingSyncRef.current.delete(tid);
         setConfirmingProposal((s) => {
           if (!s.has(tid)) return s;
           const next = new Set(s);

@@ -9,7 +9,6 @@ import type {
   ResolvedDirection,
   ResolvedProposal,
 } from "../lib/types";
-import type { ConfirmOutcome } from "../state/store";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { Button } from "../components/ui/Button";
 import { QueueStack } from "./QueueStack";
@@ -86,7 +85,7 @@ export function ChatTimeline({
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
   /** Confirm-and-dispatch a single-direction proposal in one click (lead host). */
-  onConfirmProposal?: (version: string) => Promise<ConfirmOutcome>;
+  onConfirmProposal?: () => Promise<void>;
   /** Thread id whose proposal is confirming/dispatching (store-owned in-flight). */
   confirmingProposal?: ReadonlySet<number>;
   /** The active thread's live plan, binding the LATEST proposal card to its
@@ -191,6 +190,7 @@ export function ChatTimeline({
             <TimelineRow
               m={m}
               all={visible}
+              busy={busy}
               onReviewProposal={onReviewProposal}
               onConfirmProposal={onConfirmProposal}
               confirmingProposal={confirmingProposal}
@@ -402,7 +402,7 @@ function ProposalFastCard({
   /** In-flight from the STORE (not local state): survives this virtualized row
    *  unmounting mid-dispatch, so a scroll-away can't drop the double-click guard. */
   confirming: boolean;
-  onConfirm: () => Promise<ConfirmOutcome>;
+  onConfirm: () => Promise<void>;
   onReview: () => void;
 }) {
   const { t } = useTranslation();
@@ -415,11 +415,10 @@ function ProposalFastCard({
   // shows this badge). The default "plan+impl" is the expected flow, left implicit.
   const buildsDirectly = direction.mandate === "impl-only";
   async function confirm() {
-    // confirmProposal owns the in-flight flag; if it routed to Review (a stale /
-    // re-proposed / base-aborted plan) navigate there so the user sees the fresh
-    // scope instead of silently staying on the timeline.
-    const outcome = await onConfirm();
-    if (outcome === "review") onReview();
+    // confirmProposal owns the in-flight flag and confirms LIVE state (no version
+    // snapshot, exactly like ScopeReview), so it never navigates — there is no
+    // outcome to route here. "Review" stays as the secondary button below.
+    await onConfirm();
   }
   // Vertical, left-aligned structure: header, then the direction details, then
   // actions — every row shares the card's left edge (no icon-indented column).
@@ -471,6 +470,7 @@ function ProposalFastCard({
 function TimelineRow({
   m,
   all,
+  busy,
   onReviewProposal,
   onConfirmProposal,
   confirmingProposal,
@@ -486,8 +486,12 @@ function TimelineRow({
 }: {
   m: LeadMessage;
   all: LeadMessage[];
+  /** The lead is mid-turn (processing). A follow-up it is actively reshaping
+   *  into isn't queued, so the fast card must also gate on this — not just on
+   *  queuedCount — before offering one-click confirm. */
+  busy?: boolean;
   onReviewProposal: () => void;
-  onConfirmProposal?: (version: string) => Promise<ConfirmOutcome>;
+  onConfirmProposal?: () => Promise<void>;
   /** Thread id whose proposal is confirming/dispatching (store-owned in-flight). */
   confirmingProposal?: ReadonlySet<number>;
   proposal: ResolvedProposal | null;
@@ -733,10 +737,14 @@ function TimelineRow({
     //  • not already decided — a direction the human already approved/denied via a
     //    Needs-you write card (decision != "") must go through Review, not a blind
     //    one-click that ignores that decision.
-    //  • no queued revision — a follow-up the user already sent (e.g. changing the
-    //    repo/base while the lead is busy) is about to re-shape this proposal, so
-    //    route to Review rather than one-click a scope that's about to change (same
-    //    guard the plan-card approval uses).
+    //  • no queued revision — a follow-up the user already sent is waiting in the
+    //    engine queue to re-shape this proposal, so route to Review rather than
+    //    one-click a scope that's about to change (same guard the plan-card
+    //    approval uses).
+    //  • lead idle — the CURRENT turn a user follow-up is being processed into
+    //    isn't queued (queuedCount is 0 for the in-flight message), so also gate
+    //    on `busy`: while the lead is mid-turn it may be re-shaping this proposal,
+    //    so route to Review instead of one-clicking a scope about to change.
     //  • onConfirmProposal wired — lead host only (worker hosts render settled).
     const dirs = proposal.directions;
     const only = dirs.length === 1 ? dirs[0] : null;
@@ -746,6 +754,7 @@ function TimelineRow({
       only.repo?.known === true &&
       only.decision === "" &&
       queuedCount === 0 &&
+      !busy &&
       onConfirmProposal
     ) {
       return (
@@ -753,10 +762,11 @@ function TimelineRow({
           count={count}
           direction={only}
           confirming={threadId != null && (confirmingProposal?.has(threadId) ?? false)}
-          // Pass the SHOWN proposal's version; confirmProposal re-checks it at
-          // click time and routes to Review if the backend re-proposed since,
-          // so one-click never dispatches a scope different from the card.
-          onConfirm={() => onConfirmProposal(proposal.created_at)}
+          // Plain confirm of LIVE state (like ScopeReview) — no version arg. The
+          // render guards above (single dir, count===1, repo known, not decided,
+          // no queued revision, lead idle) keep the shown card and the live scope
+          // in sync, so one-click can't dispatch something different.
+          onConfirm={() => onConfirmProposal()}
           onReview={onReviewProposal}
         />
       );
