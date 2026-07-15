@@ -11,6 +11,44 @@ fn e<E: ToString>(x: E) -> String {
     x.to_string()
 }
 
+/// Ensure `path` resolves to a location inside `dest`. Prevents symlink or
+/// non-canonical `dest` from causing the actual repo to land elsewhere.
+fn ensure_path_under_dest(path: &std::path::Path, dest: &std::path::Path) -> R<()> {
+    let dest_canon = std::fs::canonicalize(dest)
+        .map_err(|_| "destination directory does not exist or is not accessible")?;
+    let path_canon = std::fs::canonicalize(path)
+        .map_err(|_| "created repo path could not be resolved")?;
+    if !path_canon.starts_with(&dest_canon) {
+        return Err("repo path resolved outside the destination directory".into());
+    }
+    Ok(())
+}
+
+/// Validate a repo name before it is used as a directory segment under `dest`.
+/// Rejects empty names, path separators, `..`, and any character that would be
+/// unsafe or surprising on a filesystem.
+fn validate_repo_name(name: &str) -> R<()> {
+    if name.is_empty() {
+        return Err("repo name cannot be empty".into());
+    }
+    if name == "." || name == ".." {
+        return Err("repo name cannot be '.' or '..'".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("repo name cannot contain path separators or '..'".into());
+    }
+    // Conservative allow-list: alphanumeric, dot, dash, underscore, space.
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ' ')
+    {
+        return Err(
+            "repo name may only contain letters, digits, spaces, '.', '-', '_'".into(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn create_workspace(db: State<'_, Db>, name: String) -> R<entities::workspace::Model> {
     repo::create_workspace(&db, &name).await.map_err(e)
@@ -378,12 +416,14 @@ pub async fn clone_repo(
     dest: String,
     name: String,
 ) -> R<entities::repo_ref::Model> {
+    validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::clone_repo(&url, &p))
         .await
         .map_err(|err| err.to_string())?
         .map_err(e)?;
+    ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
     let r = register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await?;
     // If the row points somewhere other than the dir we just cloned, dedup
     // resolved to a DIFFERENT live repo (a dead-checkout match was already
@@ -407,12 +447,14 @@ pub async fn create_repo(
     name: String,
     dest: String,
 ) -> R<entities::repo_ref::Model> {
+    validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::init_repo(&p))
         .await
         .map_err(|err| err.to_string())?
         .map_err(e)?;
+    ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
     register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await
 }
 
