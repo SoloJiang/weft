@@ -1,0 +1,140 @@
+import { useEffect, useRef } from "react";
+import MindElixir, {
+  type MindElixirInstance,
+  type NodeObj,
+  type Options,
+} from "mind-elixir";
+import { en, zh_CN } from "mind-elixir/i18n";
+import "mind-elixir/style.css";
+
+import { parseTestPlanMarkdown, mindTreeToMarkdown, type MindTree } from "./mindTree";
+
+// mind-elixir needs a unique id per node; a module counter is enough (ids are
+// never persisted — we serialize topics/structure back to markdown, not ids).
+let uid = 0;
+const toNodeObj = (t: MindTree): NodeObj => ({
+  id: `weft-me-${uid++}`,
+  topic: t.topic,
+  children: t.children.map(toNodeObj),
+});
+const fromNodeObj = (n: NodeObj): MindTree => ({
+  topic: n.topic ?? "",
+  children: (n.children ?? []).map(fromNodeObj),
+});
+
+// mind-elixir reads these off the container; pointing them at our `--c-*` tokens
+// (which flip on `data-theme`) makes the editor follow the app's light/dark
+// theme with no JS theme-switching. Matches the markmap preview's brand palette.
+const CSS_VAR = {
+  "--main-color": "var(--c-ink)",
+  "--main-bgcolor": "var(--c-bg)",
+  "--color": "var(--c-ink)",
+  "--bgcolor": "var(--c-surface)",
+  "--selected": "var(--c-brand)",
+  "--root-color": "var(--c-brand-ink)",
+  "--root-bgcolor": "var(--c-brand)",
+  "--root-border-color": "var(--c-brand)",
+  "--topic-padding": "8px",
+  "--panel-color": "var(--c-ink)",
+  "--panel-bgcolor": "var(--c-surface)",
+  "--panel-border-color": "var(--c-border)",
+} as const;
+
+const PALETTE = ["#26a6ba", "#f27d53", "#8aa9c9", "#7c9885", "#b087c9", "#c9a15f"];
+
+/**
+ * Editable mindmap for the test-case document (mind-elixir). Where the markmap
+ * preview is a read-only SVG, this surface supports real structural editing:
+ * double-click a node to rename, Enter / Tab (or the context menu) to add a
+ * sibling / child, drag a node onto another to reparent, and undo/redo. Edits
+ * mutate mind-elixir's own tree; on each operation we serialize that tree back to
+ * canonical markdown and hand it up via `onChange`, so the panel's Save persists
+ * exactly what is on screen. Lazy-loaded so mind-elixir stays out of the main
+ * bundle (the panel is rarely open, and never in edit mode until asked).
+ */
+export default function MindMapEditor({
+  markdown,
+  rootLabel,
+  locale,
+  onChange,
+}: {
+  markdown: string;
+  /** Names the root when the document has no single heading of its own. */
+  rootLabel: string;
+  locale: "en" | "zh";
+  onChange: (markdown: string) => void;
+}) {
+  const elRef = useRef<HTMLDivElement>(null);
+  // Keep the latest callbacks/labels in refs so the init effect runs exactly
+  // once per mount — re-initializing would discard the user's in-progress edits.
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const rootLabelRef = useRef(rootLabel);
+  rootLabelRef.current = rootLabel;
+
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+
+    const tree = parseTestPlanMarkdown(markdown);
+    if (!tree.topic.trim()) tree.topic = rootLabelRef.current;
+
+    const options: Options = {
+      el,
+      direction: MindElixir.RIGHT,
+      editable: true,
+      toolBar: false,
+      keypress: true,
+      allowUndo: true,
+      contextMenu: {
+        locale: locale === "zh" ? zh_CN : en,
+        focus: false,
+        link: false,
+        extend: [],
+      },
+      theme: { name: "weft", palette: PALETTE, cssVar: CSS_VAR },
+    };
+    const mind: MindElixirInstance = new MindElixir(options);
+    mind.init({ nodeData: toNodeObj(tree) });
+    // Fit the whole tree into the panel on open — mind-elixir's default view
+    // centers the root at native scale, which pushes a right-growing tree off
+    // the edge in a narrow column. A rAF lets the initial layout settle first.
+    const fitFrame = requestAnimationFrame(() => mind.scaleFit());
+
+    // Ignore the operations mind-elixir may fire while wiring up — only a real
+    // user edit should mark the draft dirty (so an open-then-Save with no change
+    // writes the document back untouched, not a re-canonicalized diff).
+    let ready = false;
+    const readyTimer = setTimeout(() => {
+      ready = true;
+    }, 0);
+
+    let emitTimer: ReturnType<typeof setTimeout> | null = null;
+    const emit = () => {
+      if (!ready) return;
+      if (emitTimer) clearTimeout(emitTimer);
+      emitTimer = setTimeout(() => {
+        const data = mind.getData();
+        onChangeRef.current(
+          mindTreeToMarkdown(fromNodeObj(data.nodeData), rootLabelRef.current),
+        );
+      }, 300);
+    };
+    mind.bus.addListener("operation", emit);
+
+    return () => {
+      cancelAnimationFrame(fitFrame);
+      clearTimeout(readyTimer);
+      if (emitTimer) clearTimeout(emitTimer);
+      mind.bus.removeListener("operation", emit);
+      mind.destroy();
+    };
+    // Init once per mount. `markdown` is the seed only; after mount THIS editor
+    // is the source of truth (it pushes changes out, never takes them back in),
+    // and the panel remounts it on thread switch / re-emit via React key + the
+    // conditional edit-mode render, so a fresh document always re-seeds cleanly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return <div ref={elRef} className="mind-elixir h-full w-full" />;
+}

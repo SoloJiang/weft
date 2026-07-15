@@ -12,8 +12,10 @@ import { clampPanelWidth } from "./panelWidth";
 import { cn } from "../lib/cn";
 import type { NodePath } from "./MindMapView";
 
-// markmap + d3 stay out of the main bundle; the panel is rarely open.
+// markmap + d3 (preview) and mind-elixir (editor) stay out of the main bundle;
+// the panel is rarely open, and the editor loads only when editing begins.
 const MindMapView = lazy(() => import("./MindMapView"));
+const MindMapEditor = lazy(() => import("./MindMapEditor"));
 
 const MIN_W = 360;
 const MAX_W = 860;
@@ -177,13 +179,20 @@ export function TestPlanPanel({
     if (mode === "edit") {
       return (
         <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.currentTarget.value)}
-            spellCheck={false}
-            className="min-h-0 flex-1 resize-none rounded-[var(--radius-md)] border border-border bg-bg p-3 font-mono text-[12px] leading-relaxed text-ink outline-none focus:border-brand/60"
-          />
-          <div className="flex justify-end gap-2">
+          <div className="min-h-0 flex-1 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface">
+            <Suspense fallback={<div className="p-4 text-xs text-ink-faint">{t("testPlan.loading")}</div>}>
+              <MindMapEditor
+                markdown={plan.content}
+                rootLabel={t("testPlan.defaultTitle")}
+                locale={currentLang()}
+                onChange={setDraft}
+              />
+            </Suspense>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="mr-auto min-w-0 truncate text-[11px] text-ink-faint">
+              {t("testPlan.editHint")}
+            </span>
             <Button variant="ghost" size="sm" onClick={() => setMode("preview")} disabled={saving}>
               {t("testPlan.cancel")}
             </Button>
