@@ -1557,6 +1557,21 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
     }
 }
 
+/// Undo the turn reservation made by `send` Phase 1 when later persistence
+/// fails. Leaves the engine idle and forgets the incremented turn id so the
+/// next send can start a fresh turn.
+async fn rollback_send_reservation(eng: &EngineRef, direct: bool) {
+    let mut inner = eng.lock().await;
+    if direct {
+        inner.turn.busy = false;
+        if inner.turn_id > 0 {
+            inner.turn_id -= 1;
+        }
+        inner.current_origin_tag = None;
+        inner.clock.started = None;
+    }
+}
+
 pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
     let mut content = vec![serde_json::json!({ "type": "text", "text": out.text })];
     for (media_type, data) in &out.images {
@@ -1699,32 +1714,57 @@ pub async fn send(
         }
     }
     ensure_running_for_send(app, db, eng).await?;
-    let mut inner = eng.lock().await;
-    let thread_id = inner.thread_id;
-    let sid = inner.session_id;
-    let is_command = text.trim_start().starts_with('/');
-    let kind = if is_command { "command" } else { "text" };
-    let direct = inner.turn.try_begin_send();
-    // Count only tracked (user-visible) items: hidden plumbing deliveries
-    // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
-    if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
-        return Err(anyhow::anyhow!("queue_full"));
+
+    // Phase 1: acquire the lock only long enough to reserve turn state and
+    // snapshot the fields needed for persistence. All slow IO (DB writes,
+    // image spills, stdin writes) happens after the lock drops so
+    // stop/interrupt/status stay responsive for the session.
+    struct SendContext {
+        thread_id: i32,
+        session_id: Option<i32>,
+        turn: i32,
+        direct: bool,
+        is_command: bool,
+        tool: String,
+        origin_tag: Option<String>,
     }
-    if direct {
-        inner.turn_id += 1;
-        inner.clock.begin_turn();
-        // This send starts a turn now → its tag IS the in-flight turn's tag.
-        inner.current_origin_tag = origin_tag.clone();
-        crate::power::on_turn_began(app);
-        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+    let ctx = {
+        let mut inner = eng.lock().await;
+        let direct = inner.turn.try_begin_send();
+        // Count only tracked (user-visible) items: hidden plumbing deliveries
+        // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
+        if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
+            return Err(anyhow::anyhow!("queue_full"));
+        }
+        if direct {
+            inner.turn_id += 1;
+            inner.clock.begin_turn();
+            // This send starts a turn now → its tag IS the in-flight turn's tag.
+            inner.current_origin_tag = origin_tag.clone();
+            crate::power::on_turn_began(app);
+        }
+        SendContext {
+            thread_id: inner.thread_id,
+            session_id: inner.session_id,
+            turn: inner.turn_id,
+            direct,
+            is_command: text.trim_start().starts_with('/'),
+            tool: inner.tool.clone(),
+            origin_tag: origin_tag.clone(),
+        }
+    };
+
+    if ctx.direct {
+        persist_activity(db, ctx.session_id, ctx.thread_id, "running").await;
     }
-    let turn = inner.turn_id;
-    let status = if direct { "complete" } else { "queued" };
+
+    let kind = if ctx.is_command { "command" } else { "text" };
+    let status = if ctx.direct { "complete" } else { "queued" };
     let image_uris: Vec<String> = images
         .iter()
         .map(|(mt, data)| format!("data:{mt};base64,{data}"))
         .collect();
-    let content = if is_command {
+    let content = if ctx.is_command {
         let trimmed = text.trim_start();
         let mut it = trimmed.splitn(2, ' ');
         serde_json::json!({
@@ -1735,16 +1775,38 @@ pub async fn send(
     } else {
         serde_json::json!({ "text": text, "images": image_uris, "files": files }).to_string()
     };
-    let m =
-        repo::insert_lead_message(db, thread_id, sid, turn, "user", kind, &content, status).await?;
+
+    // Phase 2: persist the user row and spill per-turn image attachments without
+    // holding the engine lock.
+    let m = match repo::insert_lead_message(
+        db,
+        ctx.thread_id,
+        ctx.session_id,
+        ctx.turn,
+        "user",
+        kind,
+        &content,
+        status,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            // Phase 1 already reserved turn state; undo it so the session isn't
+            // left with a stuck busy flag or an orphaned turn id.
+            rollback_send_reservation(eng, ctx.direct).await;
+            return Err(e.into());
+        }
+    };
     let row_id = m.id;
     let _ = app.emit(
         EVENT,
         Push::Message {
-            thread_id,
+            thread_id: ctx.thread_id,
             message: m,
         },
     );
+
     let mut outbound = text.to_string();
     // Capture BEFORE images may be spilled to temp files below (per-turn dialects
     // clear out.images after spill; has_attachments must reflect the original inputs).
@@ -1757,7 +1819,7 @@ pub async fn send(
     }
     // Per-turn dialects take no inline image blocks: spill pasted images to
     // temp files and hand over paths — every agent can read those itself.
-    let images = if per_turn(&inner.tool) && !images.is_empty() {
+    let images = if per_turn(&ctx.tool) && !images.is_empty() {
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
         let _ = std::fs::create_dir_all(&dir);
@@ -1780,44 +1842,46 @@ pub async fn send(
         images,
         tracked: true,
         // Rides the turn (and the queue, if queued) so output frames recover it.
-        origin_tag: origin_tag.clone(),
-        queue_id: if direct { None } else { Some(row_id) },
+        origin_tag: ctx.origin_tag.clone(),
+        queue_id: if ctx.direct { None } else { Some(row_id) },
         has_attachments,
     };
-    // codex (app-server): a per-session connection drives the turn after the lock
-    // drops (streaming via item/agentMessage/delta). system_prompt is prepended to
-    // a new thread's first turn; per-thread bus MCP rides the connection's own
-    // `-c mcp_servers` spawn args. Falls back to exec if the app-server is
-    // unreachable.
-    let is_codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
-    let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
-    if direct && !spawn_now && !is_codex_appserver {
-        if let Err(e) = write_user(&mut inner, &out).await {
-            drop(inner);
-            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
-            return Err(e);
+
+    // Phase 3: re-acquire the lock to commit the outbound message to the agent
+    // or queue, then drop it before any turn-spawning awaits.
+    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
+    let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_codex_appserver;
+    {
+        let mut inner = eng.lock().await;
+        if ctx.direct && !spawn_now && !is_codex_appserver {
+            if let Err(e) = write_user(&mut inner, &out).await {
+                drop(inner);
+                rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
+                return Err(e);
+            }
+        } else if !ctx.direct {
+            inner.turn.queue.push_back(out.clone());
         }
-    } else if !direct {
-        inner.turn.queue.push_back(out.clone());
+        let _ = app.emit(
+            EVENT,
+            Push::Turn {
+                thread_id: ctx.thread_id,
+                session_id: ctx.session_id,
+                state: if inner.turn.busy { "busy" } else { "idle" }.into(),
+                queue: queue_items(&inner.turn),
+            },
+        );
     }
-    let _ = app.emit(
-        EVENT,
-        Push::Turn {
-            thread_id,
-            session_id: sid,
-            state: if inner.turn.busy { "busy" } else { "idle" }.into(),
-            queue: queue_items(&inner.turn),
-        },
-    );
-    drop(inner);
+
+    // Phase 4: turn spawning runs without the engine lock.
     if spawn_now {
         if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
-            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
             return Err(e);
         }
-    } else if direct && is_codex_appserver {
+    } else if ctx.direct && is_codex_appserver {
         if let Err(e) = spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await {
-            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
             return Err(e);
         }
     }
