@@ -69,6 +69,7 @@ export function LeadTab({
     sendLeadChat,
     interruptLead,
     setReviewingProposal,
+    confirmProposal,
     proposal,
     asks,
     skillsDirtyAt,
@@ -203,6 +204,7 @@ export function LeadTab({
             setReviewingProposal(true);
             onReview();
           }}
+          onConfirmProposal={() => void confirmProposal()}
           proposal={proposal}
           runAction={run}
           actionsBusy={actionsBusy}

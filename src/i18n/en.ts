@@ -205,6 +205,7 @@ export const en = {
     proposalResolved_other: "Reviewed {{count}} sub-tasks",
     proposalWithdrawn: "Withdrew directions: {{rationale}}",
     reviewCreate: "Review & create",
+    confirmDispatch: "Confirm & dispatch",
     starting: "Starting the lead…",
     stopped: "The lead stopped.",
     restart: "Restart lead",

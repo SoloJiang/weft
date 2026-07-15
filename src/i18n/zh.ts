@@ -200,6 +200,7 @@ export const zh = {
     proposalResolved_other: "已处理 {{count}} 个子任务",
     proposalWithdrawn: "已撤回方向：{{rationale}}",
     reviewCreate: "查看并创建",
+    confirmDispatch: "确认并派发",
     starting: "正在启动 lead…",
     stopped: "lead 已停止。",
     restart: "重启 lead",

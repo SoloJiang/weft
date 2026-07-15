@@ -48,6 +48,7 @@ export function ChatTimeline({
   busy,
   activity,
   onReviewProposal,
+  onConfirmProposal,
   proposal,
   runAction,
   actionsBusy,
@@ -75,6 +76,8 @@ export function ChatTimeline({
   /** The tool call executing right now (transient), if any. */
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
+  /** Confirm-and-dispatch a single-direction proposal in one click (lead host). */
+  onConfirmProposal?: () => void;
   /** The active thread's live plan, binding the LATEST proposal card to its
    *  open/confirmed state. Omit (worker hosts) → proposal cards render settled. */
   proposal?: ResolvedProposal | null;
@@ -178,6 +181,7 @@ export function ChatTimeline({
               m={m}
               all={visible}
               onReviewProposal={onReviewProposal}
+              onConfirmProposal={onConfirmProposal}
               proposal={proposal ?? null}
               runAction={runAction}
               actionsBusy={actionsBusy}
@@ -372,6 +376,7 @@ function TimelineRow({
   m,
   all,
   onReviewProposal,
+  onConfirmProposal,
   proposal,
   runAction,
   actionsBusy,
@@ -385,6 +390,7 @@ function TimelineRow({
   m: LeadMessage;
   all: LeadMessage[];
   onReviewProposal: () => void;
+  onConfirmProposal?: () => void;
   proposal: ResolvedProposal | null;
   runAction?: RunAction;
   actionsBusy?: Record<string, boolean>;
@@ -608,6 +614,47 @@ function TimelineRow({
       proposal.status === "proposed";
     if (!open) {
       return <SettledLine label={t("lead.proposalResolved", { count })} />;
+    }
+    // Single-direction fast path: with exactly one direction the write scope
+    // is unambiguous (the one repo shown), so the review→confirm round-trip
+    // collapses to a one-click "Confirm & dispatch" — the human still confirms
+    // the write (safety gate preserved), just without opening ScopeReview.
+    // "Review" stays as the secondary path for tuning base branch etc.
+    const dirs = proposal.directions;
+    if (dirs.length === 1 && onConfirmProposal) {
+      const d = dirs[0];
+      return (
+        <div className="rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5">
+          <div className="flex items-center gap-2.5">
+            <Sparkles size={15} className="shrink-0 text-accent" />
+            <div className="min-w-0 flex-1">
+              <p className="text-[12.5px] font-medium text-ink">{t("lead.proposalReady", { count })}</p>
+              <p className="truncate text-[11px] text-ink-muted">
+                <span className="font-medium text-ink">{d.name}</span>
+                <span className="mx-1 rounded-[var(--radius-sm)] bg-bg px-1 py-px font-mono text-[10px] text-ink-faint">
+                  {d.repo?.repo_name ?? ""}
+                </span>
+                {d.reason}
+              </p>
+            </div>
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              onClick={onConfirmProposal}
+              className="flex items-center gap-1 rounded-[var(--radius-md)] bg-accent px-2.5 py-1 text-[11px] font-medium text-accent-ink transition-colors hover:brightness-110"
+            >
+              {t("lead.confirmDispatch")}
+              <ArrowRight size={12} />
+            </button>
+            <button
+              onClick={onReviewProposal}
+              className="rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-muted transition-colors hover:text-ink"
+            >
+              {t("lead.reviewCreate")}
+            </button>
+          </div>
+        </div>
+      );
     }
     return (
       <button
