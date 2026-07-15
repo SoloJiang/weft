@@ -1891,9 +1891,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const refreshProposal = useCallback(async (threadId: number) => {
     try {
-      setProposal(await api.getProposal(threadId));
+      const p = await api.getProposal(threadId);
+      // Guard against a thread switch during the await: only write the fetched
+      // proposal into the shared state if THIS thread is still active. Otherwise a
+      // slow fetch for a thread the user just left would clobber the now-active
+      // thread's proposal with stale data.
+      if (activeThreadIdRef.current === threadId) setProposal(p);
     } catch {
-      setProposal(null);
+      if (activeThreadIdRef.current === threadId) setProposal(null);
     }
   }, []);
 
@@ -1927,6 +1932,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (): Promise<void> => {
       if (activeThreadId == null) return;
       const tid = activeThreadId;
+      // Capture the SHOWN proposal version NOW, before any await. proposalRef advances
+      // when a re-propose refresh resolves; if we read it later (after the base-save
+      // flush await) a mid-confirm refresh could swap in a NEW proposal and the backend
+      // would version-check the wrong scope. Reading it synchronously here pins the
+      // version the user actually saw.
+      const expectedVersion = proposalRef.current?.created_at;
       // Synchronous double-entry guard: a rapid double-click can fire a second
       // call before React re-renders the button disabled off `confirmingProposal`
       // (a state update lands next tick). Set the ref SYNCHRONOUSLY so the second
@@ -1969,12 +1980,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // after the card rendered, WITHOUT any frontend snapshot/navigate machinery:
         // on a mismatch we just refresh so the card re-renders the fresh scope (the
         // user re-confirms from there). The full ScopeReview path benefits equally.
-        const expectedVersion = proposalRef.current?.created_at;
-        const ids = await api.confirmProposal(tid, expectedVersion);
-        if (expectedVersion != null && ids.length === 0) {
+        const result = await api.confirmProposal(tid, expectedVersion);
+        // NULL means the backend refused a version MISMATCH (the shown scope was
+        // superseded) → refresh so the card re-renders the fresh scope. An
+        // empty-but-non-null result is a LEGITIMATE confirm that happened to dispatch
+        // zero lanes (all unknown/already-approved/denied); the plan IS confirmed, so
+        // fall through and clear the proposal as normal.
+        if (expectedVersion != null && result === null) {
           if (activeThreadIdRef.current === tid) await refreshProposal(tid);
           return;
         }
+        const ids = result ?? [];
         setProposal(null);
         setReviewingProposal(false);
         await loadThreadChildren(tid);

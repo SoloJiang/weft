@@ -413,7 +413,7 @@ pub async fn confirm(
     db: &Db,
     thread_id: i32,
     expected_version: Option<String>,
-) -> Result<Vec<i32>> {
+) -> Result<Option<Vec<i32>>> {
     // Serialize all plan mutations for this thread: held across the whole confirm (read → reuse/
     // create → materialize → CAS commit) so no concurrent confirm/approve/deny/save_proposal can
     // interleave. This is what makes the read→commit dance atomic and the TOCTOU races impossible.
@@ -436,7 +436,10 @@ pub async fn confirm(
     // user reviewed live state) confirms unconditionally as before.
     if let Some(want) = &expected_version {
         if &start_plan.created_at != want {
-            return Ok(Vec::new());
+            // Version mismatch: the shown proposal was superseded. Return None (NOT an empty
+            // Vec) so the frontend can distinguish this from a legitimate confirm that
+            // dispatched zero lanes — only None routes to Review/refresh.
+            return Ok(None);
         }
     }
     let resolved = resolved_from_plan(db, thread_id, &start_plan).await?;
@@ -661,7 +664,7 @@ pub async fn confirm(
                 recreated_fastpath.push(id);
             }
         }
-        return Ok(matching);
+        return Ok(Some(matching));
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;
     let tool = crate::tools::default_tool(db).await;
@@ -894,7 +897,7 @@ pub async fn confirm(
         rollback_attempt(db, &created_now, &recreated_reused).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
     }
-    Ok(dispatch_ids)
+    Ok(Some(dispatch_ids))
 }
 
 /// Tear down lanes created in the current confirm attempt (used on any failure to keep
@@ -1774,13 +1777,13 @@ mod tests {
         // A stale/mismatched expected version (a re-propose since the card was shown)
         // confirms NOTHING and leaves the plan "proposed" — the frontend routes to Review.
         let refused = confirm(&db, t.id, Some("not-the-version".into())).await.unwrap();
-        assert!(refused.is_empty(), "a version mismatch confirms nothing");
+        assert!(refused.is_none(), "a version mismatch returns None (distinct from a zero-lane confirm)");
         assert!(repo::list_directions(&db, t.id).await.unwrap().is_empty(), "nothing materialized on a refused confirm");
         assert_eq!(repo::get_plan(&db, t.id).await.unwrap().unwrap().status, "proposed", "plan stays proposed after a refused confirm");
 
         // The matching version confirms and dispatches the single lane.
         let ids = confirm(&db, t.id, Some(version)).await.unwrap();
-        assert_eq!(ids.len(), 1, "the matching version dispatches the one direction");
+        assert_eq!(ids.expect("confirmed (not a version mismatch)").len(), 1, "the matching version dispatches the one direction");
 
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
@@ -1807,7 +1810,7 @@ mod tests {
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"impl-only".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
-        let confirmed_ids = confirm(&db, t.id, None).await.unwrap();
+        let confirmed_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(confirmed_ids.len(), 1, "confirm dispatches the lane");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1);
 
@@ -2025,12 +2028,12 @@ mod tests {
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
-        let first = confirm(&db, t.id, None).await.unwrap();
+        let first = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(first.len(), 1);
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1);
         // A second confirm (e.g. after a partial-failure retry) must NOT duplicate the
         // already-created lane.
-        let _second = confirm(&db, t.id, None).await.unwrap();
+        let _second = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "no duplicate direction on re-confirm");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;
@@ -2057,12 +2060,12 @@ mod tests {
             ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &proposal).await.unwrap();
-        let first = confirm(&db, t.id, None).await.unwrap();
+        let first = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(first.len(), 1);
         let id = first[0];
         // A retry must STILL return that id (so the frontend dispatches a worker for it),
         // without creating a duplicate.
-        let second = confirm(&db, t.id, None).await.unwrap();
+        let second = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(second, vec![id], "retry returns the existing id for dispatch");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "no duplicate");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
@@ -2108,7 +2111,7 @@ mod tests {
         // Fix B's base and retry → both lanes created cleanly, no duplicates.
         // Editing FROM the bad "no-such-xyz" base the proposal still holds.
         set_direction_base(&db, t.id, 1, "B", "api", "no-such-xyz", "", "").await.unwrap();
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(ids.len(), 2, "retry creates both lanes");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 2, "exactly two, no duplicates");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
@@ -2342,7 +2345,7 @@ mod tests {
         let approved_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         // Lead re-proposes the SAME lane (decision resets to ""), then user clicks Create.
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(repo::list_directions(&db, t.id).await.unwrap().len(), 1, "confirm must NOT duplicate the approved lane");
         assert!(ids.contains(&approved_id), "confirm returns the existing lane id for dispatch");
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
@@ -2379,7 +2382,7 @@ mod tests {
         // Approve the FIRST lane (index 0): creates + materializes direction #1, sets its decision.
         let approved_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         // The stored proposal now has directions[0].decision="approved", directions[1] pending.
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         // The pending sibling must get its OWN direction, not reuse the approved one.
         let dirs = repo::list_directions(&db, t.id).await.unwrap();
         let same: Vec<_> = dirs.iter().filter(|d| d.name == "A" && d.repo_id == ra.id).collect();
@@ -2471,7 +2474,7 @@ mod tests {
         repo::set_direction_status(&db, done_id, "done").await.unwrap();
         // Lead re-proposes the SAME name+repo lane (pending), then the user clicks Create.
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         // confirm must create a NEW, distinct direction and dispatch it — not reuse the done one.
         assert_eq!(ids.len(), 1, "confirm dispatches exactly the fresh lane");
         assert_ne!(ids[0], done_id, "confirm must NOT reuse the completed (done) direction; it creates fresh");
@@ -2526,7 +2529,7 @@ mod tests {
         let lane = ProposedDirection { name:"A".into(), repo:"api".into(), reason:"r".into(), mandate:"".into(), base_branch:"release".into(), decision:"".into(), direction_id: 0 };
         let prop = Proposal { rationale:"r".into(), directions: vec![lane] };
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(ids, vec![dir_rel.id], "confirm reuses the base-COMPATIBLE (release) direction, not the develop one, and not a new lane");
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
@@ -2756,7 +2759,7 @@ mod tests {
 
         // Contrast — a no-failure run: re-propose A alone, confirm cleanly → A is recreated and STAYS.
         save_proposal(&db, t.id, &prop_a).await.unwrap();
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(ids, vec![a_id], "no-failure: confirm reuses A and dispatches its id");
         assert!(wt_path.exists(), "no-failure: a committed confirm recreates the reused dir and keeps it");
 
@@ -2796,7 +2799,7 @@ mod tests {
             ProposedDirection { name: "B".into(), repo: "api".into(), reason: "rb".into(), mandate: "".into(), base_branch: "".into(), decision: "".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let first = confirm(&db, t.id, None).await.unwrap();
+        let first = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(first.len(), 2, "first confirm creates both lanes");
         let after_first = get_resolved(&db, t.id).await.unwrap().unwrap();
         assert_eq!(after_first.status, "confirmed", "plan is confirmed after the first confirm");
@@ -2912,7 +2915,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wt_path);
         assert!(!wt_path.exists(), "precondition: reclaimed worktree dir is gone before the clean confirm");
         save_proposal(&db, t.id, &prop_a).await.unwrap();
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(ids, vec![a_id], "no-race: confirm reuses A and dispatches its id");
         assert!(wt_path.exists(), "no-race: a committed confirm recreates the reused dir (materialize-before-commit)");
 
@@ -3029,8 +3032,8 @@ mod tests {
         let r2 = h2.await.unwrap();
 
         // Both succeed (the gate serializes them; the loser hits the idempotent confirmed fast-path).
-        let ids1 = r1.expect("first confirm ok");
-        let ids2 = r2.expect("second confirm ok");
+        let ids1 = r1.expect("first confirm ok").expect("confirmed (not a version mismatch)");
+        let ids2 = r2.expect("second confirm ok").expect("confirmed (not a version mismatch)");
         assert_eq!(ids1.len(), 1, "first confirm dispatches the single lane");
         assert_eq!(ids2.len(), 1, "second confirm returns the same single lane (idempotent)");
         assert_eq!(ids1, ids2, "both confirms return the SAME direction id (no duplicate)");
@@ -3069,7 +3072,7 @@ mod tests {
 
         // First confirm: creates and materializes the direction.
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let first_ids = confirm(&db, t.id, None).await.unwrap();
+        let first_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(first_ids.len(), 1);
         let dir_id = first_ids[0];
 
@@ -3085,7 +3088,7 @@ mod tests {
 
         // Re-propose (resets status to "proposed") and confirm again → reuse path.
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let second_ids = confirm(&db, t.id, None).await.unwrap();
+        let second_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(second_ids, vec![dir_id], "re-confirm returns the existing id");
         assert!(wt_path.exists(), "R17-1: worktree dir must be recreated after confirm reuse");
 
@@ -3375,14 +3378,14 @@ mod tests {
         // Lane A is approved via approve_direction (the legitimate decision path) → decision="approved".
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         // confirm → creates B only (A is "approved" → skipped by main path).
-        let confirm_ids = confirm(&db, t.id, None).await.unwrap();
+        let confirm_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         // confirm should dispatch only B (A is "approved" → skipped by main path).
         assert_eq!(confirm_ids.len(), 1, "confirm creates only lane B (A is already approved)");
         let b_id = confirm_ids[0];
         assert_ne!(b_id, a_id, "B must be a different direction from A");
 
         // Now the plan is "confirmed". A retry must return ONLY B's id.
-        let retry_ids = confirm(&db, t.id, None).await.unwrap();
+        let retry_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(retry_ids, vec![b_id],
             "R17-3: confirmed fast-path must return only confirm-created lane B, NOT approved lane A");
         assert!(!retry_ids.contains(&a_id),
@@ -3426,14 +3429,14 @@ mod tests {
         // stays pending. confirm pre-claims the approved lane's a_id (R41-3), so the
         // pending lane creates its OWN distinct direction (b_id).
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
-        let confirm_ids = confirm(&db, t.id, None).await.unwrap();
+        let confirm_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(confirm_ids.len(), 1, "confirm creates only the pending duplicate lane");
         let b_id = confirm_ids[0];
         assert_ne!(b_id, a_id, "the pending lane owns a direction distinct from the approved one");
 
         // Plan is now "confirmed". The fast-path retry must return ONLY the pending lane's
         // b_id — NOT the approved a_id (which must not be re-dispatched here).
-        let retry_ids = confirm(&db, t.id, None).await.unwrap();
+        let retry_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(retry_ids.len(), 1, "R42-2: fast-path returns exactly one id (count == 1)");
         assert_eq!(retry_ids, vec![b_id], "R42-2: fast-path returns only the pending duplicate lane");
         assert!(!retry_ids.contains(&a_id), "R42-2: the approved duplicate sibling must NOT be re-dispatched");
@@ -3469,13 +3472,13 @@ mod tests {
         ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
         // First confirm: creates the lane and marks the plan "confirmed".
-        let first_ids = confirm(&db, t.id, None).await.unwrap();
+        let first_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(first_ids.len(), 1, "first confirm creates the single lane");
         let done_id = first_ids[0];
         // The lane completes (terminal). The plan stays "confirmed" (no re-propose).
         repo::set_direction_status(&db, done_id, "done").await.unwrap();
         // Retry hits the idempotent fast-path (plan == "confirmed"). It must NOT return the done id.
-        let retry_ids = confirm(&db, t.id, None).await.unwrap();
+        let retry_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert!(!retry_ids.contains(&done_id), "fast-path must NOT re-dispatch the completed (done) lane");
         assert!(retry_ids.is_empty(), "no reusable (non-done) lane remains, so the fast-path returns nothing");
         // The done direction is untouched.
@@ -3512,7 +3515,7 @@ mod tests {
 
         // First confirm: creates and materializes lane A.
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let first_ids = confirm(&db, t.id, None).await.unwrap();
+        let first_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(first_ids.len(), 1);
         let dir_id = first_ids[0];
 
@@ -3526,7 +3529,7 @@ mod tests {
         assert!(!wt_path.exists(), "precondition: dir must be gone before retry");
 
         // The plan is now "confirmed". A retry (fast-path) must recreate the dir.
-        let second_ids = confirm(&db, t.id, None).await.unwrap();
+        let second_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(second_ids, vec![dir_id], "fast-path retry returns the existing id");
         assert!(wt_path.exists(), "R18-3: fast-path retry must re-materialize the reclaimed dir");
 
@@ -3850,7 +3853,7 @@ mod tests {
             ProposedDirection { name:"Ghost".into(), repo:"nope".into(), reason:"r".into(), mandate:"".into(), base_branch:"".into(), decision:"".into(), direction_id: 0 },
         ]};
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(ids.len(), 2, "two known pending lanes are dispatched");
 
         // Re-read the STORED proposal: each known lane records its dispatched direction id; the
@@ -3923,7 +3926,7 @@ mod tests {
         // Approve the BLANK lane individually (legitimate decision path) -> records a_id, decision=approved.
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
         // Confirm -> creates the pending explicit lane (b_id) + records both lanes' ids + marks confirmed.
-        let confirm_ids = confirm(&db, t.id, None).await.unwrap();
+        let confirm_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(confirm_ids.len(), 1,
             "confirm dispatches only the pending explicit lane (the blank lane is already approved)");
         let b_id = confirm_ids[0];
@@ -3942,7 +3945,7 @@ mod tests {
         // Fast-path retry: dispatch ONLY the pending explicit lane's OWN recorded b_id. The approved
         // lane's a_id stays reserved (approved lanes are not dispatched here) - no swap, no drop, no
         // stale pick, even though the default moved and both directions share the same base.
-        let retry = confirm(&db, t.id, None).await.unwrap();
+        let retry = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(retry, vec![b_id],
             "round-6: the pending lane dispatches its OWN recorded id (b_id), unaffected by the moved default / duplicate");
         assert!(!retry.contains(&a_id),
@@ -3982,7 +3985,7 @@ mod tests {
 
         // First confirm: creates+materializes lane A and marks the plan "confirmed" (recording A's id).
         save_proposal(&db, t.id, &prop).await.unwrap();
-        let first_ids = confirm(&db, t.id, None).await.unwrap();
+        let first_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(first_ids.len(), 1, "first confirm creates the single lane");
         let dir_id = first_ids[0];
 
@@ -4005,7 +4008,7 @@ mod tests {
 
         // Fast-path retry on the LEGACY (id==0) plan: the name+repo fallback must claim the single
         // matching direction, re-materialize the reclaimed dir, and dispatch it (not stranded).
-        let retry = confirm(&db, t.id, None).await.unwrap();
+        let retry = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(retry, vec![dir_id],
             "#42r7-1: legacy id==0 lane falls back to its single name+repo match and dispatches it");
         assert!(wt_path.exists(),
@@ -4055,7 +4058,7 @@ mod tests {
 
         // Approve lane[0] (records a_id, decision=approved). Confirm creates the pending lane (b_id).
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
-        let confirm_ids = confirm(&db, t.id, None).await.unwrap();
+        let confirm_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(confirm_ids.len(), 1, "confirm dispatches only the pending explicit lane");
         let b_id = confirm_ids[0];
         assert_ne!(a_id, b_id, "the two lanes own DISTINCT directions on the same base");
@@ -4073,7 +4076,7 @@ mod tests {
 
         // Fast-path retry on the LEGACY plan: the approved legacy lane's a_id is pre-claimed, so the
         // pending sibling has exactly ONE unconsumed candidate (b_id) and dispatches its OWN direction.
-        let retry = confirm(&db, t.id, None).await.unwrap();
+        let retry = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(retry, vec![b_id],
             "#42r8-1: the pending legacy sibling dispatches its OWN direction (approved lane's dir pre-claimed)");
         assert!(!retry.contains(&a_id),
@@ -4137,7 +4140,7 @@ mod tests {
 
         // Approve lane[0] (records a_id on `main`, decision=approved). Confirm creates the pending lane (b_id).
         let a_id = approve_direction(&db, t.id, 0, "codex").await.unwrap();
-        let confirm_ids = confirm(&db, t.id, None).await.unwrap();
+        let confirm_ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(confirm_ids.len(), 1, "confirm dispatches only the pending explicit lane");
         let b_id = confirm_ids[0];
         assert_ne!(a_id, b_id, "the two lanes own DISTINCT directions on the same base");
@@ -4162,7 +4165,7 @@ mod tests {
         // Fast-path retry on the LEGACY plan: the blank approved terminal's `main` direction is reserved
         // by name+repo (NOT re-resolved through the moved default), so the pending explicit-`main`
         // sibling has exactly ONE remaining candidate (b_id) and dispatches its OWN direction.
-        let retry = confirm(&db, t.id, None).await.unwrap();
+        let retry = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(retry, vec![b_id],
             "#42r9-1: the pending legacy sibling dispatches its OWN `main` direction (blank terminal reserved by name+repo)");
         assert!(!retry.contains(&a_id),
@@ -4218,7 +4221,7 @@ mod tests {
 
         // Fast-path retry: the lone `release` candidate is base-incompatible with the `main` lane, so
         // the legacy fallback SKIPS it (does not dispatch the stale release worker).
-        let retry = confirm(&db, t.id, None).await.unwrap();
+        let retry = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert!(!retry.contains(&stale.id),
             "#42r8-2: a base-INCOMPATIBLE lone legacy candidate (release) is NOT dispatched for a main lane");
         assert!(retry.is_empty(),
@@ -4227,7 +4230,7 @@ mod tests {
         // CONTRAST: a base-COMPATIBLE lone candidate (`main`) DOES dispatch. Replace the stale row's
         // base with the default and retry — now the single candidate matches the `main` lane's base.
         repo::set_direction_base_branch(&db, stale.id, &main).await.unwrap();
-        let retry2 = confirm(&db, t.id, None).await.unwrap();
+        let retry2 = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(retry2, vec![stale.id],
             "#42r8-2 contrast: a base-COMPATIBLE lone legacy candidate IS dispatched");
 
@@ -4299,7 +4302,7 @@ mod tests {
 
         // Confirm: the approved lane's id is RESERVED first, so the pending explicit-`main` sibling
         // can't consume a_id. It must get/create its OWN distinct direction.
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(ids.len(), 1, "confirm dispatches only the pending sibling (the other lane is approved)");
         let b_id = ids[0];
         assert_ne!(b_id, a_id,
@@ -4460,7 +4463,7 @@ mod tests {
         repo::upsert_plan(&db, t.id, &json, "proposed", &now()).await.unwrap();
 
         // Confirm: the pending `main` lane must REUSE dir_main (the denied sibling must not claim it).
-        let ids = confirm(&db, t.id, None).await.unwrap();
+        let ids = confirm(&db, t.id, None).await.unwrap().expect("confirmed (not a version mismatch)");
         assert_eq!(ids, vec![dir_main.id],
             "R52-2: confirm must reuse the pending lane's OWN base-matching direction");
         let dirs = repo::list_directions(&db, t.id).await.unwrap();

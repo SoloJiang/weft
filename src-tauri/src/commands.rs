@@ -755,7 +755,7 @@ pub async fn confirm_proposal(
     db: State<'_, Db>,
     thread_id: i32,
     expected_version: Option<String>,
-) -> R<Vec<i32>> {
+) -> R<Option<Vec<i32>>> {
     crate::planner::confirm(&db, thread_id, expected_version)
         .await
         .map_err(e)
