@@ -436,8 +436,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshInstalledTools = useCallback(async () => {
     try {
       setInstalledTools(await api.detectTools());
-    } catch {
+    } catch (e) {
       // Pure-vite dev without the Tauri backend.
+      console.error(e);
     }
   }, []);
   // Re-resolve the effective default tool — saving an alias can change it (a
@@ -448,8 +449,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const info = await api.getDefaultTool();
       setDefaultToolState(info.tool);
       setConfiguredTool(info.configured);
-    } catch {
+    } catch (e) {
       // Pure-vite dev without the Tauri backend.
+      console.error(e);
     }
   }, []);
   useEffect(() => {
@@ -459,9 +461,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setDefaultToolState(info.tool);
         setConfiguredTool(info.configured);
         setInstalledTools(tools);
-      } catch {
+      } catch (e) {
         // Pure-vite dev without the Tauri backend: keep the static defaults.
-      }
+      console.error(e);
+    }
     })();
   }, []);
   const setDefaultTool = useCallback((tl: string) => {
@@ -522,9 +525,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (cancelled || !info) return;
         if (info.version === dismissedUpdateRef.current) return; // already dismissed this one
         setUpdateAvailable((prev) => (prev?.version === info.version ? prev : info));
-      } catch {
+      } catch (e) {
         /* updater unavailable in dev or offline */
-      }
+      console.error(e);
+    }
     };
     void run();
     const UPDATE_POLL_MS = 60 * 60 * 1000; // re-check hourly for long-running sessions
@@ -671,7 +675,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setReviewingProposal(false);
       try {
         setProposal(await api.getProposal(threadId));
-      } catch {
+      } catch (e) {
         setProposal(null);
       }
       await loadThreadChildren(threadId);
@@ -686,8 +690,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     try {
       setOverview(await api.workspaceOverview(activeWorkspaceId));
-    } catch {
+    } catch (e) {
       /* ignore */
+      console.error(e);
     }
   }, [activeWorkspaceId]);
 
@@ -840,8 +845,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (ws !== activeWorkspaceIdRef.current) return; // user switched during the fetch
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
-    } catch {
+    } catch (e) {
       /* ignore */
+      console.error(e);
     }
   }, []);
 
@@ -1144,16 +1150,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             try {
               const dirs = await api.listDirections(tid);
               setDirections((m) => ({ ...m, [tid]: dirs }));
-            } catch {
+            } catch (e) {
               /* best-effort: a thread whose directions fail to load just won't
                  show its running count until opened */
-            }
+      console.error(e);
+    }
           }),
         );
         for (const slot of slots) adoptWorker(slot);
       } while (hydratePendingRef.current);
-    } catch {
+    } catch (e) {
       /* best-effort hydration */
+      console.error(e);
     } finally {
       hydratingRef.current = false;
     }
@@ -1219,7 +1227,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       let wts;
       try {
         wts = await api.listWorktrees(directionId);
-      } catch {
+      } catch (e) {
         return;
       }
       // Skip reclaimed worktrees (exists=false): the directory is gone, so
@@ -1239,7 +1247,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       let wts;
       try {
         wts = await api.listWorktrees(directionId);
-      } catch {
+      } catch (e) {
         return;
       }
       // Skip reclaimed worktrees (exists=false): a resume would drive a worker
@@ -1350,9 +1358,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             let text = "";
             try {
               text = (JSON.parse(x.content).text as string) ?? "";
-            } catch {
+            } catch (e) {
               /* fresh row */
-            }
+      console.error(e);
+    }
             return { ...x, content: JSON.stringify({ text: text + p.text }) };
           }),
         }));
@@ -1424,9 +1433,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               try {
                 const dirId = await api.autoVerifyCheck(sid);
                 if (dirId != null) verifyDirectionRef.current(dirId);
-              } catch {
+              } catch (e) {
                 /* best-effort auto-verify */
-              }
+      console.error(e);
+    }
             })();
           }
 
@@ -1486,17 +1496,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void (async () => {
       try {
         await api.leadEnsure(threadId, currentLang());
-      } catch {
+      } catch (e) {
         /* discovery can still try the non-resident fallback below */
-      }
+      console.error(e);
+    }
       try {
         const cmds = await api.discoverSlash(threadId, null);
         if (cmds.length > 0) {
           setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
         }
-      } catch {
+      } catch (e) {
         /* slash discovery is best-effort */
-      }
+      console.error(e);
+    }
     })();
   }, []);
 
@@ -1526,8 +1538,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         ...m,
         [threadId]: fillMetaHoles(m[threadId], metaFromSnapshot(st)),
       }));
-    } catch {
+    } catch (e) {
       /* engine state is cosmetic at load time */
+      console.error(e);
     }
   }, [discoverLeadSlash]);
 
@@ -1567,8 +1580,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
     try {
       await api.setTaskStatus(directionId, status);
-    } catch {
+    } catch (e) {
       /* reverts on next poll */
+      console.error(e);
     }
   }, []);
 
@@ -1590,8 +1604,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const res = await api.verifyDirection(directionId);
         setChecksByDirection((m) => ({ ...m, [directionId]: res }));
       } while (verifyAgainRef.current.has(directionId));
-    } catch {
+    } catch (e) {
       /* leave prior results */
+      console.error(e);
     } finally {
       verifyAgainRef.current.delete(directionId);
       verifyingRef.current.delete(directionId);
@@ -1682,8 +1697,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Permission Asks are global (not workspace-scoped); always refresh them.
     try {
       setAsks(await api.pendingAsks());
-    } catch {
+    } catch (e) {
       /* server may not be ready */
+      console.error(e);
     }
     if (activeWorkspaceId == null) {
       setNeeds([]);
@@ -1693,14 +1709,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     try {
       setNeeds(await api.needsYou(activeWorkspaceId));
       setWriteTriggers(await api.writeTriggers(activeWorkspaceId));
-    } catch {
+    } catch (e) {
       /* bus may not be ready */
+      console.error(e);
     }
     // per-workspace counts so the switcher can flag OTHER workspaces.
     try {
       setNeedsByWorkspace(Object.fromEntries(await api.workspaceNeedsCounts()));
-    } catch {
+    } catch (e) {
       /* ignore */
+      console.error(e);
     }
   }, [activeWorkspaceId]);
 
@@ -1725,8 +1743,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (activeWorkspaceIdRef.current !== ws) return;
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
-    } catch {
+    } catch (e) {
       /* workspace may be empty */
+      console.error(e);
     }
   }, [activeWorkspaceId]);
 
@@ -1879,7 +1898,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshProposal = useCallback(async (threadId: number) => {
     try {
       setProposal(await api.getProposal(threadId));
-    } catch {
+    } catch (e) {
       setProposal(null);
     }
   }, []);
@@ -1916,8 +1935,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     pendingBaseSave.current.delete(activeThreadId);
     try {
       await pending;
-    } catch {
+    } catch (e) {
       // handled by the latch below
+      console.error(e);
     }
     // Also abort if any EARLIER link in the chain failed — the chain's
     // `.catch(() => {})` swallows predecessors for serialization, so the final
@@ -2004,9 +2024,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       pendingBaseSave.current.delete(item.thread_id);
       try {
         await pending;
-      } catch {
+      } catch (e) {
         // handled by the latch below
-      }
+      console.error(e);
+    }
       // Also abort if any EARLIER link in the chain failed — the chain's
       // `.catch(() => {})` swallows predecessors for serialization, so the final
       // promise may resolve even when a prior save rejected.
@@ -2043,9 +2064,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       pendingBaseSave.current.delete(item.thread_id);
       try {
         await pending;
-      } catch {
+      } catch (e) {
         // handled by the latch check below
-      }
+      console.error(e);
+    }
       // If that save REJECTED, a re-proposal may have moved/replaced the lanes (the
       // server-side base setter rejects when item.index's lane was replaced), so
       // item.index is no longer trustworthy — denying by it could deny the WRONG lane.
@@ -2082,9 +2104,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       try {
         await api.answerPermission(askId, answer);
-      } catch {
+      } catch (e) {
         /* already resolved/expired */
-      }
+      console.error(e);
+    }
     },
     [dangerousMode],
   );
@@ -2173,9 +2196,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         const p = await api.getProposal(thread);
         if (alive && p) setProposal(p);
-      } catch {
+      } catch (e) {
         /* planner not ready */
-      }
+      console.error(e);
+    }
     };
     void tick();
     const h = setInterval(tick, 2500);
@@ -2228,16 +2252,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         const m = await api.threadMessages(activeThreadId);
         if (alive) setMessages(m);
-      } catch {
+      } catch (e) {
         /* bus may not be ready */
-      }
+      console.error(e);
+    }
       // reflect agent-driven status changes (set via the bus MCP tool)
       try {
         const dirs = await api.listDirections(activeThreadId);
         if (alive) setDirections((m) => ({ ...m, [activeThreadId]: dirs }));
-      } catch {
+      } catch (e) {
         /* ignore */
-      }
+      console.error(e);
+    }
     };
     void tick();
     const h = setInterval(tick, 1500);
