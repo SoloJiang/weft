@@ -122,24 +122,86 @@ async fn handle_ask(
     }
 }
 
-/// A tool weft itself injected (`weft_planner` / `weft_bus` / `weft_curator` /
-/// `weft_global`). The Ask Bridge auto-approves these — the human already
-/// governs them through weft's own review surfaces, not per-call prompts.
+/// weft's own injected MCP servers. Used only to anchor tool-name parsing across
+/// the two agent naming schemes — the auto-approve decision is the CLOSED
+/// allowlist below, not membership here.
+const WEFT_SERVERS: [&str; 4] = ["weft_planner", "weft_bus", "weft_curator", "weft_global"];
+
+/// The EXACT `(server, tool)` pairs the Ask Bridge auto-approves. This is a
+/// closed allowlist, deliberately not a `weft_*` server-name match:
 ///
-/// Matched by the EXACT server segment of the `mcp__<server>__<tool>` name, NOT
-/// a `weft_` prefix: a user's own MCP server named e.g. `weft_analytics` yields
-/// `mcp__weft_analytics__…` and must still surface normally (mirrors the
-/// frontend's precise `WEFT_INTERNAL_MCP` set, not an open regex).
-fn is_weft_internal_tool(tool_name: &str) -> bool {
-    tool_name
+/// - Provenance: a user/repo MCP server that happens to share a weft server name
+///   only bypasses the card for these exact known calls; any OTHER tool it
+///   exposes (e.g. `mcp__weft_planner__deploy`) still surfaces the Needs-you card.
+/// - `weft_global`'s `answer_permission` is EXCLUDED on purpose: auto-approving
+///   it would let an agent answer an existing Bash/file permission ask as
+///   allow/always/full and erase the very boundary this bridge guards, so it
+///   stays gated even though weft injected the server.
+///
+/// The included writes (bus posts, task status, proposals, edge calibration) are
+/// governed by weft's own surfaces (Needs-you, the board, the direction-confirm
+/// flow), so a per-call prompt for them is pure interruption.
+const AUTO_APPROVED_INTERNAL_TOOLS: &[(&str, &str)] = &[
+    // weft_bus — thread bus: reads, weft-governed posts, and ask_human (which
+    // itself surfaces to the human).
+    ("weft_bus", "bus_post"),
+    ("weft_bus", "bus_broadcast"),
+    ("weft_bus", "bus_inbox"),
+    ("weft_bus", "ask_human"),
+    ("weft_bus", "thread_state_get"),
+    ("weft_bus", "thread_state_set"),
+    ("weft_bus", "announce_interface_change"),
+    ("weft_bus", "set_task_status"),
+    // weft_planner — lead read-only planning; proposals are confirmed by the
+    // human downstream in the direction-confirm flow.
+    ("weft_planner", "get_task"),
+    ("weft_planner", "get_repo_map"),
+    ("weft_planner", "get_test_cases"),
+    ("weft_planner", "propose_directions"),
+    ("weft_planner", "cancel_directions"),
+    // weft_curator — repo-map calibration in the curator chat.
+    ("weft_curator", "get_repo_map"),
+    ("weft_curator", "calibrate_edges"),
+    ("weft_curator", "reanalyze"),
+    ("weft_curator", "set_classification"),
+    // weft_global — concierge/IM helper. answer_permission is intentionally absent.
+    ("weft_global", "answer_question"),
+    ("weft_global", "create_issue"),
+    ("weft_global", "create_issue_from_im"),
+    ("weft_global", "ensure_issue_topic"),
+    ("weft_global", "ensure_issue_im_topic"),
+    ("weft_global", "issue_status"),
+    ("weft_global", "list_issues"),
+    ("weft_global", "list_workspaces"),
+    ("weft_global", "message_lead"),
+    ("weft_global", "pending_needs_you"),
+];
+
+/// Extract `(server, tool)` from an agent-reported MCP tool name, spanning both
+/// claude (`mcp__<server>__<tool>`) and opencode (`<server>_<tool>`, a single
+/// underscore) schemes. weft server names contain `_` too, so the opencode form
+/// is split by anchoring on the known server names rather than on the first `_`.
+fn split_internal_tool(tool_name: &str) -> Option<(&str, &str)> {
+    if let Some(pair) = tool_name
         .strip_prefix("mcp__")
         .and_then(|rest| rest.split_once("__"))
-        .is_some_and(|(server, _)| {
-            matches!(
-                server,
-                "weft_planner" | "weft_bus" | "weft_curator" | "weft_global"
-            )
-        })
+    {
+        return Some(pair);
+    }
+    WEFT_SERVERS.iter().find_map(|&server| {
+        tool_name
+            .strip_prefix(server)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .map(|tool| (server, tool))
+    })
+}
+
+/// A tool weft itself injected AND that is safe to auto-approve. The Ask Bridge
+/// skips the permission card for these; everything else (including a weft server
+/// name paired with an unknown tool, and `answer_permission`) surfaces normally.
+fn is_weft_internal_tool(tool_name: &str) -> bool {
+    split_internal_tool(tool_name)
+        .is_some_and(|pair| AUTO_APPROVED_INTERNAL_TOOLS.contains(&pair))
 }
 
 /// The PreToolUse hook response carrying a permission decision.
@@ -897,18 +959,44 @@ mod tests {
     use super::is_weft_internal_tool;
 
     #[test]
-    fn weft_internal_tools_auto_allow_exact_servers_only() {
-        // weft's own injected servers → auto-allow.
+    fn weft_internal_known_tools_auto_allow() {
+        // weft's own injected tools (claude naming) → auto-allow.
         assert!(is_weft_internal_tool("mcp__weft_planner__get_test_cases"));
         assert!(is_weft_internal_tool("mcp__weft_planner__get_task"));
+        assert!(is_weft_internal_tool("mcp__weft_planner__propose_directions"));
         assert!(is_weft_internal_tool("mcp__weft_bus__bus_inbox"));
         assert!(is_weft_internal_tool("mcp__weft_bus__set_task_status"));
         assert!(is_weft_internal_tool("mcp__weft_curator__get_repo_map"));
         assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
-        // A user's own `weft_*`-named server must still surface (no prefix match).
+        // opencode names the same MCP tools `<server>_<tool>` (single underscore).
+        assert!(is_weft_internal_tool("weft_bus_bus_post"));
+        assert!(is_weft_internal_tool("weft_planner_get_task"));
+        assert!(is_weft_internal_tool("weft_global_list_workspaces"));
+    }
+
+    #[test]
+    fn permission_answering_tool_still_surfaces() {
+        // answer_permission would let an agent erase a pending permission ask —
+        // it must NOT be auto-approved even though weft injects weft_global.
+        assert!(!is_weft_internal_tool("mcp__weft_global__answer_permission"));
+        assert!(!is_weft_internal_tool("weft_global_answer_permission"));
+    }
+
+    #[test]
+    fn unknown_tool_on_weft_server_surfaces() {
+        // Provenance: sharing a weft server name is not enough — an unknown tool
+        // (e.g. from a user/repo MCP server that reused the name) still surfaces.
+        assert!(!is_weft_internal_tool("mcp__weft_planner__deploy"));
+        assert!(!is_weft_internal_tool("mcp__weft_bus__rm_rf"));
+        assert!(!is_weft_internal_tool("weft_planner_deploy"));
+    }
+
+    #[test]
+    fn foreign_and_malformed_names_surface() {
+        // A user's own `weft_*`-named server (different server name) must surface.
         assert!(!is_weft_internal_tool("mcp__weft_analytics__query"));
         assert!(!is_weft_internal_tool("mcp__weftly__do"));
-        // Non-MCP tools (Bash, file ops) surface as before.
+        // Non-MCP tools (Bash, file ops) and third-party MCP surface as before.
         assert!(!is_weft_internal_tool("Bash"));
         assert!(!is_weft_internal_tool("mcp__github__create_pr"));
         // Malformed names never match.
