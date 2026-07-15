@@ -300,10 +300,13 @@ function ChatComposerBody({
       // (not dropped, not left to leak into the next message). "action" items
       // defer to the host.
       if (spec?.act === "prompt") {
+        // send() clears its own draft on success and KEEPS it when the queue is
+        // full (it toasts and returns before clearing), so don't clear here —
+        // otherwise a full queue would silently drop the `/…` command.
         send(spec.prompt);
-      } else {
-        onLocalSlash?.(item.name);
+        return;
       }
+      onLocalSlash?.(item.name);
       setText("");
       return;
     }
