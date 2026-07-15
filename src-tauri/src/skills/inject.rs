@@ -47,9 +47,10 @@ pub fn materialize(skills: &[ParsedSkill], cwd: &Path) {
 }
 
 /// weft's built-in skills, compiled into the binary. The `<!-- weft-builtin -->`
-/// marker distinguishes our copy from a user-owned same-name skill: a marked
-/// (or absent) target is (re)written so upgrades ship silently with the app; an
-/// unmarked existing skill is the user's and wins.
+/// marker (placed AFTER the frontmatter — skill loaders require `---` on the
+/// first line) distinguishes our copy from a user-owned same-name skill: a
+/// marked (or absent) target is (re)written so upgrades ship silently with the
+/// app; an unmarked existing skill is the user's and wins.
 const BUILTIN_TEST_CASES: &str = include_str!("builtin_test_cases.md");
 const BUILTIN_MARKER: &str = "<!-- weft-builtin -->";
 
@@ -62,7 +63,7 @@ fn write_builtin(cwd: &Path, name: &str, content: &str) {
         let dir = cwd.join(d).join(name);
         let file = dir.join("SKILL.md");
         if let Ok(existing) = std::fs::read_to_string(&file) {
-            if !existing.starts_with(BUILTIN_MARKER) {
+            if !existing.contains(BUILTIN_MARKER) {
                 continue; // user-owned same-name skill wins
             }
             if existing == content {
@@ -86,12 +87,18 @@ mod tests {
     fn builtin_writes_upgrades_and_yields_to_user() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
-        // Fresh: written to both targets with the marker.
+        // Fresh: written to both targets, frontmatter FIRST (skill loaders
+        // require `---` on line one), marker after it.
         materialize_builtins(cwd);
         let p = cwd.join(".claude/skills/weft-derive-test-cases/SKILL.md");
         let body = std::fs::read_to_string(&p).unwrap();
-        assert!(body.starts_with(BUILTIN_MARKER));
+        assert!(body.starts_with("---\n"), "frontmatter must be the first block");
+        assert!(body.contains(BUILTIN_MARKER));
         assert!(body.contains("weft-derive-test-cases"));
+        // weft's own parser surfaces the metadata (description non-empty).
+        let parsed = crate::skills::cwd_skills(cwd, &[".claude/skills"]);
+        let sk = parsed.iter().find(|s| s.name == "weft-derive-test-cases").expect("parsed");
+        assert!(!sk.description.is_empty(), "frontmatter description must parse");
         assert!(cwd.join(".agents/skills/weft-derive-test-cases/SKILL.md").exists());
         // Stale weft copy: upgraded to the current binary's content.
         std::fs::write(&p, format!("{BUILTIN_MARKER}\nold version")).unwrap();

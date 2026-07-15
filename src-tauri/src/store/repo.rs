@@ -1493,52 +1493,61 @@ pub async fn delete_thread_cascade(
     db: &Db,
     thread_id: i32,
 ) -> Result<Vec<(i32, String, String, bool, bool)>> {
+    use sea_orm::TransactionTrait;
+    // One TRANSACTION for the whole cascade. Atomicity gives both halves of
+    // the safety story at once: concurrent writers can't observe (and race)
+    // the intermediate state between the thread row's delete and the
+    // owned-row sweep, and a crash/error mid-cascade rolls back to a fully
+    // retryable issue instead of stranding orphaned owned rows whose anchor
+    // is already gone.
+    let txn = db.0.begin().await?;
     let dirs = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
-        .all(&db.0)
+        .all(&txn)
         .await?;
     // (repo_id, worktree path, branch, created_branch, created_checkout)
     let mut removed: Vec<(i32, String, String, bool, bool)> = Vec::new();
     for d in &dirs {
         let wts = worktree::Entity::find()
             .filter(worktree::Column::DirectionId.eq(d.id))
-            .all(&db.0)
+            .all(&txn)
             .await?;
         for w in wts {
             removed.push((w.repo_id, w.path.clone(), w.branch.clone(), w.created_branch, w.created_checkout));
-            worktree::Entity::delete_by_id(w.id).exec(&db.0).await?;
+            worktree::Entity::delete_by_id(w.id).exec(&txn).await?;
         }
         session::Entity::delete_many()
             .filter(session::Column::DirectionId.eq(d.id))
-            .exec(&db.0)
+            .exec(&txn)
             .await?;
-        direction::Entity::delete_by_id(d.id).exec(&db.0).await?;
+        direction::Entity::delete_by_id(d.id).exec(&txn).await?;
     }
-    // Delete the THREAD ROW FIRST: it is the anchor of the thread write fence
-    // (ensure_thread_workspace_accepts_writes errs once it is gone), so any
-    // concurrent save/sentinel racing this cascade is rejected before the
-    // owned-row sweep below — writes can no longer land between a table's
-    // delete pass and the end of the cascade and become unreachable orphans.
-    thread::Entity::delete_by_id(thread_id).exec(&db.0).await?;
+    // The thread row anchors the thread write fence
+    // (ensure_thread_workspace_accepts_writes errs once it is gone); inside
+    // the transaction its delete becomes visible together with the owned-row
+    // sweep, so a racing save/sentinel either lands entirely before the
+    // cascade (then dies with it) or is rejected by the fence after commit.
+    thread::Entity::delete_by_id(thread_id).exec(&txn).await?;
     // Thread-owned rows (no FK cascades in sqlite here): chat history, the
     // pending plan, IM bindings, and the test-case document all die with the
     // issue — otherwise deleted-issue content lingers in weft.db and backups.
     im_route::Entity::delete_many()
         .filter(im_route::Column::ThreadId.eq(thread_id))
-        .exec(&db.0)
+        .exec(&txn)
         .await?;
     lead_message::Entity::delete_many()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .exec(&db.0)
+        .exec(&txn)
         .await?;
     plan::Entity::delete_many()
         .filter(plan::Column::ThreadId.eq(thread_id))
-        .exec(&db.0)
+        .exec(&txn)
         .await?;
     test_plan::Entity::delete_many()
         .filter(test_plan::Column::ThreadId.eq(thread_id))
-        .exec(&db.0)
+        .exec(&txn)
         .await?;
+    txn.commit().await?;
     Ok(removed)
 }
 
@@ -1806,7 +1815,9 @@ pub async fn lead_upsert_test_plan(
             return Ok(false); // superseded by a newer user save
         }
         // First document for this thread. A user save racing this insert hits
-        // the UNIQUE(thread_id) and errs here — treat as superseded, not fatal.
+        // the UNIQUE(thread_id) — that specific conflict means "superseded".
+        // Anything else (locked db, I/O, schema) is a real failure and must
+        // propagate, not masquerade as a user edit winning.
         let a = test_plan::ActiveModel {
             thread_id: Set(thread_id),
             content: Set(content.to_string()),
@@ -1814,8 +1825,11 @@ pub async fn lead_upsert_test_plan(
             updated_at: Set(now_millis()),
             ..Default::default()
         };
-        if a.insert(&db.0).await.is_err() {
-            return Ok(false);
+        if let Err(e) = a.insert(&db.0).await {
+            if e.to_string().contains("UNIQUE constraint failed") {
+                return Ok(false);
+            }
+            return Err(e.into());
         }
     }
     // Post-write fence, mirroring upsert_test_plan.

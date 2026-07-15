@@ -1,8 +1,9 @@
-<!-- weft-builtin -->
 ---
 name: weft-derive-test-cases
 description: Use when deriving or revising an issue's test cases (the <weft:test_cases> document) — a draft → enrich → adversarial review → clarify → finalize workflow with hard quality gates for decidable, user-observable cases.
 ---
+
+<!-- weft-builtin -->
 
 # Deriving an issue's test cases
 
