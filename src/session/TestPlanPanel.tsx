@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Maximize2, Pencil, X } from "lucide-react";
 
 import { api } from "../lib/api";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import type { TestPlan } from "../lib/types";
 import { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
@@ -75,7 +76,7 @@ export function TestPlanPanel({
 }) {
   const { t } = useTranslation();
   const { width: w, dragging, startDrag } = useResizablePanel({
-    storageKey: "weft-testplan-w",
+    storageKey: STORAGE_KEYS.testPlanPanelWidth,
     min: 360,
     max: 860,
     default: 560,

@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { DiffView } from "./DiffView";
 import { useResizablePanel } from "./useResizablePanel";
 import { cn } from "../lib/cn";
@@ -27,7 +28,7 @@ export function DiffPanel({
 }) {
   const { t } = useTranslation();
   const { width: w, dragging, startDrag } = useResizablePanel({
-    storageKey: "weft-diff-w",
+    storageKey: STORAGE_KEYS.diffPanelWidth,
     min: 360,
     max: 860,
     default: 520,

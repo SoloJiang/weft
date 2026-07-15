@@ -1,6 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { useStore } from "../state/store";
 import { LeadTab } from "../session/LeadTab";
 import { clampPanelWidth } from "../session/panelWidth";
@@ -12,7 +13,7 @@ import { cn } from "../lib/cn";
 // used to remember separate widths, but they render in the same animated-width
 // aside, so switching surfaces slid the panel between the two widths. A single width
 // keeps the edge fixed across switches; the range spans both surfaces' needs.
-const PANEL_W = { key: "weft-repopanel-w", def: 420, min: 320, max: 620 } as const;
+const PANEL_W = { key: STORAGE_KEYS.repoSidePanelWidth, def: 420, min: 320, max: 620 } as const;
 // Window-aware clamp (like DiffPanel/FileTreePanel): caps the drawer to [min, max]
 // AND to the current window, so an open drawer can't crowd out the repo graph at the
 // 600px floor.

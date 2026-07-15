@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { FileTreeView } from "./FileTreeView";
 import { useResizablePanel } from "./useResizablePanel";
 import { cn } from "../lib/cn";
@@ -21,7 +22,7 @@ export function FileTreePanel({
 }) {
   const { t } = useTranslation();
   const { width: w, dragging, startDrag } = useResizablePanel({
-    storageKey: "weft-files-w",
+    storageKey: STORAGE_KEYS.filesPanelWidth,
     min: 280,
     max: 520,
     default: 320,

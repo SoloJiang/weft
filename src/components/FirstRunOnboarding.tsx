@@ -19,9 +19,10 @@ import {
   renamePendingRepo,
   type PendingRepo,
 } from "./firstRunOnboardingRepos";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { submitOnboarding, InvalidReposError } from "./firstRunOnboardingSubmit";
 
-const STORAGE_KEY = "weft-first-run-onboarding-v2-dismissed";
+const STORAGE_KEY = STORAGE_KEYS.onboardingDismissed;
 
 function stepBadgeClasses(i: number, current: number): string {
   if (i === current) return "border-brand bg-brand text-brand-ink";

@@ -11,6 +11,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import i18n, { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -430,10 +431,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // App settings, persisted to localStorage.
   const [projectsDir, setProjectsDirState] = useState(
-    () => localStorage.getItem("weft-projects-dir") ?? "",
+    () => localStorage.getItem(STORAGE_KEYS.projectsDir) ?? "",
   );
   const setProjectsDir = useCallback((p: string) => {
-    localStorage.setItem("weft-projects-dir", p);
+    localStorage.setItem(STORAGE_KEYS.projectsDir, p);
     setProjectsDirState(p);
   }, []);
   const [defaultTool, setDefaultToolState] = useState("codex");
@@ -482,43 +483,43 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
   // The global review skill: "" = auto-detect from the agent's own slash list.
   const [reviewSkill, setReviewSkillState] = useState(
-    () => localStorage.getItem("weft-review-skill") ?? "",
+    () => localStorage.getItem(STORAGE_KEYS.reviewSkill) ?? "",
   );
   const setReviewSkill = useCallback((s: string) => {
-    localStorage.setItem("weft-review-skill", s);
+    localStorage.setItem(STORAGE_KEYS.reviewSkill, s);
     setReviewSkillState(s);
   }, []);
   // Auto-review: entering the review column runs the review skill (with a
   // self-repair directive) in the sub-task's own session. Default ON.
   const [autoReview, setAutoReviewState] = useState(
-    () => localStorage.getItem("weft-auto-review") !== "0",
+    () => localStorage.getItem(STORAGE_KEYS.autoReview) !== "0",
   );
   const setAutoReview = useCallback((on: boolean) => {
-    localStorage.setItem("weft-auto-review", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.autoReview, on ? "1" : "0");
     setAutoReviewState(on);
   }, []);
   // System notifications: new Needs-you items / review-ready sub-tasks raise an
   // OS notification while the window is unfocused. Default ON.
   const [notifyEnabled, setNotifyEnabledState] = useState(
-    () => localStorage.getItem("weft-notify") !== "0",
+    () => localStorage.getItem(STORAGE_KEYS.notify) !== "0",
   );
   const setNotifyEnabled = useCallback((on: boolean) => {
-    localStorage.setItem("weft-notify", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.notify, on ? "1" : "0");
     setNotifyEnabledState(on);
   }, []);
   // Keep-awake: hold a "prevent idle sleep" OS assertion while any session is
   // busy (the display may still turn off). Default ON; synced to the backend
   // on launch — its state is in-memory (same pattern as dangerous mode).
   const [keepAwake, setKeepAwakeState] = useState(
-    () => localStorage.getItem("weft-keep-awake") !== "0",
+    () => localStorage.getItem(STORAGE_KEYS.keepAwake) !== "0",
   );
   const setKeepAwake = useCallback((on: boolean) => {
-    localStorage.setItem("weft-keep-awake", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.keepAwake, on ? "1" : "0");
     setKeepAwakeState(on);
     void api.setKeepAwake(on);
   }, []);
   useEffect(() => {
-    void api.setKeepAwake(localStorage.getItem("weft-keep-awake") !== "0");
+    void api.setKeepAwake(localStorage.getItem(STORAGE_KEYS.keepAwake) !== "0");
   }, []);
   // Auto-check for app updates on launch and hourly thereafter (silent; only
   // surface when found, and don't re-nag a version the user already dismissed).
@@ -557,10 +558,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
   }, []);
   const [dangerousMode, setDangerousModeState] = useState(
-    () => localStorage.getItem("weft-dangerous") === "1",
+    () => localStorage.getItem(STORAGE_KEYS.dangerousMode) === "1",
   );
   const setDangerousMode = useCallback((on: boolean) => {
-    localStorage.setItem("weft-dangerous", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.dangerousMode, on ? "1" : "0");
     setDangerousModeState(on);
     void api.setDangerousMode(on);
     // Turning it on retro-approves the existing permission backlog (the backend
@@ -572,30 +573,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Sync the persisted Dangerous-mode flag to the backend on launch (the bus
   // registry starts fresh each run).
   useEffect(() => {
-    void api.setDangerousMode(localStorage.getItem("weft-dangerous") === "1");
+    void api.setDangerousMode(localStorage.getItem(STORAGE_KEYS.dangerousMode) === "1");
   }, []);
 
   // Runaway guardrails (§7): idle + wall-clock caps in MINUTES, persisted. The
   // backend seeds its defaults from the WEFT_* env, so we only push when the user
   // has an explicit saved value — an env override survives an untouched install.
   const [idleCapMins, setIdleCapMins] = useState(
-    () => Number(localStorage.getItem("weft-idle-cap-mins") ?? "30"),
+    () => Number(localStorage.getItem(STORAGE_KEYS.idleCapMins) ?? "30"),
   );
   const [wallCapMins, setWallCapMins] = useState(
-    () => Number(localStorage.getItem("weft-wall-cap-mins") ?? "120"),
+    () => Number(localStorage.getItem(STORAGE_KEYS.wallCapMins) ?? "120"),
   );
   const setGuardrails = useCallback((idleMins: number, wallMins: number) => {
     const idle = Math.max(0, Math.round(idleMins));
     const wall = Math.max(0, Math.round(wallMins));
-    localStorage.setItem("weft-idle-cap-mins", String(idle));
-    localStorage.setItem("weft-wall-cap-mins", String(wall));
+    localStorage.setItem(STORAGE_KEYS.idleCapMins, String(idle));
+    localStorage.setItem(STORAGE_KEYS.wallCapMins, String(wall));
     setIdleCapMins(idle);
     setWallCapMins(wall);
     void api.setGuardrails(idle * 60, wall * 60);
   }, []);
   useEffect(() => {
-    const i = localStorage.getItem("weft-idle-cap-mins");
-    const w = localStorage.getItem("weft-wall-cap-mins");
+    const i = localStorage.getItem(STORAGE_KEYS.idleCapMins);
+    const w = localStorage.getItem(STORAGE_KEYS.wallCapMins);
     if (i != null && w != null) void api.setGuardrails(Number(i) * 60, Number(w) * 60);
   }, []);
 
@@ -624,7 +625,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // restore the last-used workspace instead of snapping to the first one.
       // Only fall back to the first when the saved id is gone (deleted) or there
       // is none yet.
-      const saved = Number(localStorage.getItem("weft-active-workspace"));
+      const saved = Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace));
       if (saved && ws.some((w) => w.id === saved)) return saved;
       return ws[0]?.id ?? null;
     });
@@ -638,7 +639,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoProfiles([]);
     setRepoEdges([]);
     // Remember the choice so a relaunch/reload lands here, not on the first one.
-    localStorage.setItem("weft-active-workspace", String(id));
+    localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
     // Drop the previous workspace's curator thread id so it is re-ensured lazily.
     setCuratorThreadId(null);
     // Repos side panel: open state resets each visit (canvas starts full-width);
@@ -765,8 +766,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         delete next[workspaceId];
         return next;
       });
-      if (Number(localStorage.getItem("weft-active-workspace")) === workspaceId) {
-        localStorage.removeItem("weft-active-workspace");
+      if (Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace)) === workspaceId) {
+        localStorage.removeItem(STORAGE_KEYS.activeWorkspace);
       }
       if (activeWorkspaceIdRef.current !== workspaceId) return;
 
@@ -2109,8 +2110,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // mode → once a day, suggest turning it on.
       if ((answer === "always" || answer === "full") && !dangerousMode) {
         const today = new Date().toISOString().slice(0, 10);
-        if (localStorage.getItem("weft-danger-nudge") !== today) {
-          localStorage.setItem("weft-danger-nudge", today);
+        if (localStorage.getItem(STORAGE_KEYS.dangerNudge) !== today) {
+          localStorage.setItem(STORAGE_KEYS.dangerNudge, today);
           setDangerNudge("ask");
         }
       }
