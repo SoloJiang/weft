@@ -310,14 +310,16 @@ function stringArray(value: unknown): string[] {
 // Tool rows are role:"assistant" too: skip only those from m's OWN turn (a card
 // and the tools it kicked off share a turn) so they don't read-only the card —
 // but a LATER turn's tool rows are genuine newer activity and must disqualify it.
-// test_cases summary rows are companion artifacts, not conversation progress:
-// a plan card emitted alongside (or before) a test-case doc must stay
-// approvable, so they never count as "the latest assistant activity".
+// test_cases summary rows from m's OWN turn are companion artifacts (a plan
+// card emitted alongside its test-case doc must stay approvable) — but a LATER
+// turn's summary is real progress (e.g. the lead re-derived after an edit) and
+// must retire the card like any other newer assistant activity.
 function isLastAssistant(m: LeadMessage, all: LeadMessage[]): boolean {
   for (let i = all.length - 1; i >= 0; i--) {
     const row = all[i];
-    if (row.kind === "tool" && row.turn_id === m.turn_id) continue;
-    if (row.kind === "test_cases") continue;
+    if ((row.kind === "tool" || row.kind === "test_cases") && row.turn_id === m.turn_id) {
+      continue;
+    }
     if (row.role === "assistant") return row.id === m.id;
   }
   return false;

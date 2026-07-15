@@ -138,6 +138,11 @@ export function TestPlanPanel({
         currentLang(),
       );
       if (!delivered) toast(t("testPlan.savedLeadOffline"));
+      // Also drop a SHORT visible message: hidden feedback creates no user row,
+      // so without this a pending plan card would stay approvable even though
+      // the plan was shaped against the pre-edit cases. The visible row engages
+      // the existing pending-reply guards (and gives the edit a chat anchor).
+      onSendToLead?.(t("testPlan.editedNotice"));
     } catch (e) {
       toast(String(e));
     } finally {

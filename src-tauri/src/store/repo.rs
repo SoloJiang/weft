@@ -1718,6 +1718,17 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
     Ok(())
 }
 
+/// Unix milliseconds as a string — `test_plan.updated_at`'s clock. Millisecond
+/// resolution (vs the store's usual seconds) lets the lead-emit CAS separate
+/// "saved just before this turn started" from "saved mid-turn".
+fn now_millis() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Upsert the issue's test-case document (0..1 per thread — UNIQUE thread_id).
 /// `source` records the last writer: "lead" (sentinel) or "user" (panel edit).
 /// Fenced like every other thread-owned write: the thread must still exist and
@@ -1738,14 +1749,14 @@ pub async fn upsert_test_plan(
         let mut a: test_plan::ActiveModel = existing.into();
         a.content = Set(content.to_string());
         a.source = Set(source.to_string());
-        a.updated_at = Set(now());
+        a.updated_at = Set(now_millis());
         a.update(&db.0).await?
     } else {
         let a = test_plan::ActiveModel {
             thread_id: Set(thread_id),
             content: Set(content.to_string()),
             source: Set(source.to_string()),
-            updated_at: Set(now()),
+            updated_at: Set(now_millis()),
             ..Default::default()
         };
         a.insert(&db.0).await?
@@ -1758,6 +1769,64 @@ pub async fn upsert_test_plan(
         return Err(err);
     }
     Ok(written)
+}
+
+/// Lead-emit upsert with an ATOMIC supersede check: the condition rides the SQL
+/// UPDATE itself (not a separate read), so a user save landing between any
+/// pre-read and this write still wins. A USER-sourced row stamped at/after the
+/// emitting turn began (`turn_started_millis`, same clock as `updated_at`) was
+/// saved mid-turn — the emit predates it. Returns false when superseded.
+pub async fn lead_upsert_test_plan(
+    db: &Db,
+    thread_id: i32,
+    content: &str,
+    turn_started_millis: u64,
+) -> Result<bool> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let updated = test_plan::Entity::update_many()
+        .col_expr(test_plan::Column::Content, Expr::value(content))
+        .col_expr(test_plan::Column::Source, Expr::value("lead"))
+        .col_expr(test_plan::Column::UpdatedAt, Expr::value(now_millis()))
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .filter(Expr::cust_with_values(
+            // updated_at holds decimal digits only; CAST keeps legacy
+            // second-resolution rows (shorter strings) comparing numerically.
+            "NOT (source = 'user' AND CAST(updated_at AS INTEGER) >= ?)",
+            [turn_started_millis as i64],
+        ))
+        .exec(&db.0)
+        .await?;
+    if updated.rows_affected == 0 {
+        let exists = test_plan::Entity::find()
+            .filter(test_plan::Column::ThreadId.eq(thread_id))
+            .one(&db.0)
+            .await?
+            .is_some();
+        if exists {
+            return Ok(false); // superseded by a newer user save
+        }
+        // First document for this thread. A user save racing this insert hits
+        // the UNIQUE(thread_id) and errs here — treat as superseded, not fatal.
+        let a = test_plan::ActiveModel {
+            thread_id: Set(thread_id),
+            content: Set(content.to_string()),
+            source: Set("lead".to_string()),
+            updated_at: Set(now_millis()),
+            ..Default::default()
+        };
+        if a.insert(&db.0).await.is_err() {
+            return Ok(false);
+        }
+    }
+    // Post-write fence, mirroring upsert_test_plan.
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = test_plan::Entity::delete_many()
+            .filter(test_plan::Column::ThreadId.eq(thread_id))
+            .exec(&db.0)
+            .await;
+        return Err(err);
+    }
+    Ok(true)
 }
 
 /// The issue's test-case document, if one has been derived.
@@ -2841,6 +2910,40 @@ mod tests {
         let read = get_test_plan(&db, t.id).await.unwrap().expect("doc exists");
         assert_eq!(read.content, "# v2\n- a\n- b\n");
         assert_eq!(read.source, "user");
+    }
+
+    /// The lead-emit CAS lives in the SQL predicate itself: a user row saved at
+    /// or after the turn began wins; older user rows and lead rows are
+    /// replaced; a missing row inserts.
+    #[tokio::test]
+    async fn lead_upsert_cas_respects_newer_user_saves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        // No row yet → insert.
+        assert!(lead_upsert_test_plan(&db, t.id, "# v1\n- a\n", 5_000).await.unwrap());
+        // Simulate a USER save stamped at t=10_000ms.
+        upsert_test_plan(&db, t.id, "# user\n- edited\n", "user").await.unwrap();
+        test_plan::Entity::update_many()
+            .col_expr(test_plan::Column::UpdatedAt, Expr::value("10000"))
+            .filter(test_plan::Column::ThreadId.eq(t.id))
+            .exec(&db.0)
+            .await
+            .unwrap();
+        // A turn that started BEFORE the save (t=9_000) is stale → rejected.
+        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 9_000).await.unwrap());
+        let row = get_test_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(row.content, "# user\n- edited\n");
+        assert_eq!(row.source, "user");
+        // Same-millisecond boundary: still the user's (>= is conservative).
+        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 10_000).await.unwrap());
+        // A turn that started AFTER the save (t=11_000) saw it as input → wins.
+        assert!(lead_upsert_test_plan(&db, t.id, "# revised\n- y\n", 11_000).await.unwrap());
+        let row = get_test_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(row.source, "lead");
+        assert_eq!(row.content, "# revised\n- y\n");
     }
 
     /// Engine meta snapshots roundtrip through thread.lead_meta / session.meta,

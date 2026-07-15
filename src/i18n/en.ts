@@ -832,6 +832,7 @@ export const en = {
     zoomIn: "Zoom in",
     zoomOut: "Zoom out",
     fitView: "Fit to view",
+    editedNotice: "I updated the test cases in the panel — please read the new version before we continue.",
     notePlaceholder: "Ask or suggest about this node…",
     ask: "Ask",
     suggest: "Suggest",
