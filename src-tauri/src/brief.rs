@@ -61,7 +61,7 @@ pub fn format_brief(d: &BriefData) -> String {
 
     s.push_str(
         "\n## Coordinate\n\
-         Other directions in this thread may run in parallel. Use the weft_bus \
+         Other tasks in this thread may run in parallel. Use the weft_bus \
          tools to post updates (bus_post / bus_broadcast), read your inbox \
          (bus_inbox), announce contract changes (announce_interface_change), and \
          ask_human when a decision is only the operator's to make. Stay within \
@@ -69,7 +69,7 @@ pub fn format_brief(d: &BriefData) -> String {
     );
 
     s.push_str("\n## Delivery contract\n");
-    s.push_str("You own delivery for this direction in your write repo. You may decide how much planning is needed before editing. Use existing repository conventions and configured checks; do not invent toolchains. Coordinate when your changes affect other directions, and announce interface/contract changes before relying on them. Ask the human only for missing requirements, product judgment, or permission decisions. Move your task status when material progress changes. When ready for review, report what changed, what was verified, and remaining risks.\n");
+    s.push_str("You own delivery for this task in your write repo. You may decide how much planning is needed before editing. Use existing repository conventions and configured checks; do not invent toolchains. Coordinate when your changes affect other tasks, and announce interface/contract changes before relying on them. Ask the human only for missing requirements, product judgment, or permission decisions. Move your task status when material progress changes. When ready for review, report what changed, what was verified, and remaining risks.\n");
 
     let mandate = d.mandate.as_str();
     if mandate == "impl-only" {
@@ -115,7 +115,7 @@ pub async fn assemble(db: &Db, direction_id: i32) -> Result<String> {
     let dir = crate::store::entities::direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("direction not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("task not found"))?;
     let thread = repo::get_thread(db, dir.thread_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
