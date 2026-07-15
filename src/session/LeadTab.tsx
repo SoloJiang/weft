@@ -21,12 +21,20 @@ type PromptState = {
   resolve: (v: string | null) => void;
 };
 
-// Host-owned local slash items. ChatComposer keeps the "what" generic
-// (a name + label); the kind is mapped to a useRepoActions invocation here.
-const LOCAL_SLASH = [
-  { name: "add-repo", kind: "add" as const, labelKey: "slashLocal.addRepo" },
-  { name: "new-repo", kind: "new" as const, labelKey: "slashLocal.newRepo" },
-  { name: "clone-repo", kind: "clone" as const, labelKey: "slashLocal.cloneRepo" },
+// Host-owned local slash items. ChatComposer keeps the "what" generic (a name +
+// label); the host maps each to an action here. Two shapes: repo-onboarding
+// items run a useRepoActions flow; a "prompt" item just sends a canned message
+// to the lead — used to make an otherwise-invisible soft policy (deriving test
+// cases) discoverable and explicitly triggerable from the slash palette.
+type LocalSlashItem =
+  | { name: string; act: "repo"; kind: "add" | "new" | "clone"; labelKey: string }
+  | { name: string; act: "prompt"; labelKey: string; promptKey: string };
+
+const LOCAL_SLASH: LocalSlashItem[] = [
+  { name: "test-cases", act: "prompt", labelKey: "slashLocal.testCases", promptKey: "slashLocal.testCasesPrompt" },
+  { name: "add-repo", act: "repo", kind: "add", labelKey: "slashLocal.addRepo" },
+  { name: "new-repo", act: "repo", kind: "new", labelKey: "slashLocal.newRepo" },
+  { name: "clone-repo", act: "repo", kind: "clone", labelKey: "slashLocal.cloneRepo" },
 ];
 
 /**
@@ -173,6 +181,10 @@ export function LeadTab({
   const onLocalSlash = (name: string) => {
     const item = LOCAL_SLASH.find((x) => x.name === name);
     if (!item) return;
+    if (item.act === "prompt") {
+      void sendLeadChat(tid, t(item.promptKey), [], []);
+      return;
+    }
     void run({
       actionId: `local-${item.kind}-${Date.now()}`,
       kind: item.kind,
