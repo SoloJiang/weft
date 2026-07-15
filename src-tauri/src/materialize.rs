@@ -83,7 +83,7 @@ pub async fn materialize_direction(
     let dir = entities::direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?
-        .context("direction not found")?;
+        .context("task not found")?;
     let _thread = entities::thread::Entity::find_by_id(dir.thread_id)
         .one(&db.0)
         .await?
@@ -528,7 +528,7 @@ pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> 
     let dir = entities::direction::Entity::find_by_id(wt.direction_id)
         .one(&db.0)
         .await?
-        .context("direction not found")?;
+        .context("task not found")?;
     if dir.status != "done" {
         anyhow::bail!("worktree can only be deleted for a done task");
     }

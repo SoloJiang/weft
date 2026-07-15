@@ -151,7 +151,7 @@ export function ThreadBoard() {
         }}
       >
         <DialogPanel title={t("scope.title")}>
-          <ScopeReview onBack={() => setReviewingProposal(false)} />
+          <ScopeReview onClose={() => setReviewingProposal(false)} />
         </DialogPanel>
       </Dialog>
 

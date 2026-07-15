@@ -563,7 +563,7 @@ pub fn global_specs() -> Value {
         },
         {
             "name": "answer_question",
-            "description": "Reply to an agent's open question (ask_human). The text is delivered into that direction's bus inbox.",
+            "description": "Reply to an agent's open question (ask_human). The text is delivered into that task's bus inbox.",
             "inputSchema": { "type": "object",
                 "properties": { "issue_id": i(), "ask_id": u(), "text": s() },
                 "required": ["issue_id", "ask_id", "text"] }

@@ -183,7 +183,7 @@ fn reconcile_reuse(
     if existing.base_branch.trim().is_empty() {
         if !proposed_base.trim().is_empty() {
             anyhow::bail!(
-                "direction {:?} predates base tracking (unknown branch-off base); delete the sub-task to recreate it from {:?}",
+                "task {:?} predates base tracking (unknown branch-off base); delete the task to recreate it from {:?}",
                 existing.name, proposed_base
             );
         }
@@ -193,8 +193,8 @@ fn reconcile_reuse(
         let is_detached_head = crate::git::is_full_commit_oid(repo_path, target);
         if is_detached_head && crate::git::head_commit_full(repo_path).as_deref() != Some(target) {
             anyhow::bail!(
-                "direction {:?} is based on a detached HEAD that has since moved; \
-                 delete the sub-task to recreate it from the new HEAD",
+                "task {:?} is based on a detached HEAD that has since moved; \
+                 delete the task to recreate it from the new HEAD",
                 existing.name
             );
         }
@@ -211,7 +211,7 @@ fn reconcile_reuse(
         base_ref_is_default,
     ) {
         anyhow::bail!(
-            "direction {:?} already exists with base {:?}; delete the sub-task to recreate it from {:?}",
+            "task {:?} already exists with base {:?}; delete the task to recreate it from {:?}",
             existing.name, existing.base_branch, proposed_base
         );
     }
@@ -1214,7 +1214,7 @@ pub async fn set_direction_base(
     let pd = proposal
         .directions
         .get_mut(index)
-        .ok_or_else(|| anyhow::anyhow!("direction index {index} out of range"))?;
+        .ok_or_else(|| anyhow::anyhow!("task index {index} out of range"))?;
     // Verify the lane still has the identity the client edited — a re-propose may
     // have replaced the proposal and shifted what sits at this index.
     if pd.name != expected_name || pd.repo != expected_repo {
