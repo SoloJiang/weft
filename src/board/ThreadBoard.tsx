@@ -22,6 +22,7 @@ import {
 import { useStore } from "../state/store";
 import type { Direction, RepoChecks, SessionStatus, Worktree } from "../lib/types";
 import { Button } from "../components/ui/Button";
+import { Dialog, DialogPanel } from "../components/ui/Dialog";
 import { StatusDot } from "../components/ui/StatusChip";
 import { Tooltip } from "../components/ui/Tooltip";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
@@ -93,55 +94,66 @@ export function ThreadBoard() {
     asks.some((a) => a.dir === String(d.id)) ||
     (checksByDirection[d.id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail"));
 
+  // One tab body, one obvious branch each (no nested ternary): the lead chat,
+  // the empty-discuss prompt, or the task board columns. Scope review is no
+  // longer a fourth branch here — it opens as an in-place dialog over whichever
+  // of these is showing, so confirming a split never yanks you off the chat.
+  const renderTabBody = () => {
+    if (threadTab === "lead") return <LeadTab />;
+    if (dirs.length === 0) return <EmptyDiscuss onTalk={() => setThreadTab("lead")} />;
+    return (
+      <div className="min-h-0 flex-1 overflow-auto">
+        <div className="flex h-full min-w-0 gap-3 px-5 py-4">
+          {COLUMNS.map((col) => {
+            const cards = dirs
+              .filter((d) => statusOf(d) === col.key)
+              .sort((a, b) => Number(urgent(b)) - Number(urgent(a)));
+            return (
+              <div key={col.key} className="flex min-w-[260px] max-w-[360px] flex-1 flex-col gap-2">
+                <div className="flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
+                  <span className={cn("h-1.5 w-1.5 rounded-full", col.dot)} />
+                  {t(col.label)}
+                  <span className="tabular-nums text-ink-faint/70">{cards.length}</span>
+                </div>
+                <div className="flex min-h-0 flex-1 flex-col gap-2 rounded-[var(--radius-lg)] bg-surface/40 p-2">
+                  {cards.map((d) => (
+                    <div key={d.id}>
+                      <DirectionCard direction={d} onRename={setRenamingDirectionId} />
+                    </div>
+                  ))}
+                  {cards.length === 0 && (
+                    <div className="flex flex-1 items-center justify-center py-6 text-[11px] text-ink-faint/60">
+                      {t("thread.colEmpty")}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
-      <div className="flex min-h-0 flex-1 flex-col">
-        {threadTab === "lead" ? (
-          <LeadTab onReview={() => setThreadTab("board")} />
-        ) : reviewingProposal && proposal && proposal.status === "proposed" ? (
-          <ScopeReview
-            onBack={() => {
-              setReviewingProposal(false);
-              setThreadTab("lead");
-            }}
-          />
-        ) : dirs.length === 0 ? (
-          <EmptyDiscuss onTalk={() => setThreadTab("lead")} />
-        ) : (
-          <div className="min-h-0 flex-1 overflow-auto">
-            <div className="flex h-full min-w-0 gap-3 px-5 py-4">
-              {COLUMNS.map((col) => {
-                const cards = dirs
-                  .filter((d) => statusOf(d) === col.key)
-                  .sort((a, b) => Number(urgent(b)) - Number(urgent(a)));
-                return (
-                  <div key={col.key} className="flex min-w-[260px] max-w-[360px] flex-1 flex-col gap-2">
-                    <div className="flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
-                      <span className={cn("h-1.5 w-1.5 rounded-full", col.dot)} />
-                      {t(col.label)}
-                      <span className="tabular-nums text-ink-faint/70">{cards.length}</span>
-                    </div>
-                    <div
-                      className="flex min-h-0 flex-1 flex-col gap-2 rounded-[var(--radius-lg)] bg-surface/40 p-2"
-                    >
-                      {cards.map((d) => (
-                        <div key={d.id}>
-                          <DirectionCard direction={d} onRename={setRenamingDirectionId} />
-                        </div>
-                      ))}
-                      {cards.length === 0 && (
-                        <div className="flex flex-1 items-center justify-center py-6 text-[11px] text-ink-faint/60">
-                          {t("thread.colEmpty")}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-      </div>
+      <div className="flex min-h-0 flex-1 flex-col">{renderTabBody()}</div>
+
+      {/* Scope review, in place: a dialog over the chat rather than a tab swap.
+          It reuses ScopeReview verbatim (live store state, its own confirm), so
+          there is no bespoke confirm surface to race. confirmProposal clears
+          reviewingProposal on success, which closes this; Esc/overlay dismiss
+          does the same. */}
+      <Dialog
+        open={reviewingProposal && !!proposal && proposal.status === "proposed"}
+        onOpenChange={(o) => {
+          if (!o) setReviewingProposal(false);
+        }}
+      >
+        <DialogPanel title={t("scope.title")}>
+          <ScopeReview onBack={() => setReviewingProposal(false)} />
+        </DialogPanel>
+      </Dialog>
 
       {renamingDirection && (
         <RenameDialog

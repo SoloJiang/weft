@@ -175,7 +175,6 @@ function CuratorBody({ active, threadId }: { active: boolean; threadId: number |
               </p>
             </div>
           }
-          onReview={() => {}}
         />
       ) : (
         <div className="flex h-full items-center justify-center text-[12px] text-ink-faint">

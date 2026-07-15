@@ -82,9 +82,14 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
     }
   }
 
+  // Hug-content column: this is shown only inside the review dialog now, so it
+  // sizes to its content (grow:0) and lets the dialog cap the height. When the
+  // lanes overflow that cap, the body (min-h-0 + shrink) scrolls and the footer
+  // (shrink-0) stays pinned — no reliance on a definite-height ancestor, which a
+  // max-h dialog panel does not provide.
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-bg">
-      <div className="min-h-0 flex-1 overflow-auto px-5 py-5">
+    <div className="flex min-h-0 flex-col overflow-hidden bg-bg">
+      <div className="min-h-0 overflow-y-auto px-5 py-5">
         <div className="mx-auto flex w-full max-w-[920px] flex-col gap-4">
           <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-4 py-3">
             <div className="flex items-center gap-3">
@@ -134,7 +139,7 @@ export function ScopeReview({ onBack }: { onBack: () => void }) {
         </div>
       </div>
 
-      <div className="border-t border-border bg-bg/95 px-5 py-3 backdrop-blur">
+      <div className="shrink-0 border-t border-border bg-bg/95 px-5 py-3 backdrop-blur">
         <div className="mx-auto flex w-full max-w-[920px] flex-wrap items-center gap-3">
           <SummaryPill tone="write" label={t("scope.writeSummary", { count: writeCount })} />
           <SummaryPill tone="none" label={t("scope.noneSummary", { count: noneCount })} />

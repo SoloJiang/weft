@@ -45,13 +45,11 @@ const LOCAL_SLASH: LocalSlashItem[] = [
  * restarts (resume) so history is always here and the composer always works.
  */
 export function LeadTab({
-  onReview,
   threadId,
   compact = false,
   composePlaceholder,
   emptyState,
 }: {
-  onReview: () => void;
   threadId?: number;
   compact?: boolean;
   /** Composer placeholder override — the curator panel passes its own so the
@@ -249,10 +247,7 @@ export function LeadTab({
           asks={asks.filter((a) => a.thread === tid && (a.dir === "lead" || a.dir === ""))}
           busy={turn.state === "busy"}
           activity={leadActivity[tid]}
-          onReviewProposal={() => {
-            setReviewingProposal(true);
-            onReview();
-          }}
+          onReviewProposal={() => setReviewingProposal(true)}
           proposal={proposal}
           runAction={run}
           actionsBusy={actionsBusy}
