@@ -70,6 +70,7 @@ export function LeadTab({
     interruptLead,
     setReviewingProposal,
     confirmProposal,
+    confirmingProposal,
     proposal,
     asks,
     skillsDirtyAt,
@@ -205,6 +206,7 @@ export function LeadTab({
             onReview();
           }}
           onConfirmProposal={(version) => confirmProposal(version)}
+          confirmingProposal={confirmingProposal}
           proposal={proposal}
           runAction={run}
           actionsBusy={actionsBusy}

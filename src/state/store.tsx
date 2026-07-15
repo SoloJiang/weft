@@ -56,6 +56,11 @@ export interface OpenSession {
   nativeId: string | null;
 }
 
+/** Result of confirmProposal: dispatched the plan, fell back to Review (the
+ *  caller should open + navigate there), or abandoned (thread switched — do
+ *  nothing). */
+export type ConfirmOutcome = "dispatched" | "review" | "abandoned";
+
 interface Store {
   workspaces: Workspace[];
   activeWorkspaceId: number | null;
@@ -142,6 +147,8 @@ interface Store {
   /** Whether the board canvas is showing the proposal's scope-confirm. */
   reviewingProposal: boolean;
   setReviewingProposal: (v: boolean) => void;
+  /** Thread id whose proposal is currently confirming/dispatching, else null. */
+  confirmingProposal: number | null;
   /** Active issue-level tab: console first, board second. */
   threadTab: ThreadTab;
   setThreadTab: (tab: ThreadTab) => void;
@@ -220,7 +227,7 @@ interface Store {
   proposal: ResolvedProposal | null;
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
-  confirmProposal: (expectedVersion?: string) => Promise<void>;
+  confirmProposal: (expectedVersion?: string) => Promise<ConfirmOutcome>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
@@ -409,6 +416,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
+  // Thread whose proposal is being confirmed/dispatched right now (or null). The
+  // fast-dispatch card reads this instead of local state so a virtualized-row
+  // unmount can't drop the in-flight guard mid-dispatch.
+  const [confirmingProposal, setConfirmingProposal] = useState<number | null>(null);
   const [threadTab, setThreadTab] = useState<ThreadTab>("lead");
   // Start collapsed when the window opens below the floor (e.g. restored at a
   // narrow size); the resize effect below keeps it in sync on threshold crosses.
@@ -1905,59 +1916,71 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // confirm/approve abort while the thread still has ANY unrecovered lane failure.
   const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
 
-  const confirmProposal = useCallback(async (expectedVersion?: string) => {
-    if (activeThreadId == null) return;
-    // Flush any in-flight base-branch save before materializing. If it REJECTED
-    // (e.g. a re-propose moved the lane, or a DB error), the backend still holds the
-    // old base — refresh the proposal to the real state and abort rather than
-    // materializing from a stale base. Consume the promise so a retry isn't blocked
-    // by the settled rejection.
-    const pending = pendingBaseSave.current.get(activeThreadId) ?? Promise.resolve();
-    pendingBaseSave.current.delete(activeThreadId);
-    try {
-      await pending;
-    } catch {
-      // handled by the latch below
-    }
-    // Also abort if any EARLIER link in the chain failed — the chain's
-    // `.catch(() => {})` swallows predecessors for serialization, so the final
-    // promise may resolve even when a prior save rejected.
-    if ((baseSaveFailed.current.get(activeThreadId)?.size ?? 0) > 0) {
-      baseSaveFailed.current.delete(activeThreadId);
-      await refreshProposal(activeThreadId);
-      return;
-    }
-    // One-click fast path: the card renders from the loaded `proposal`, which can
-    // lag a re-propose (the row lands before getProposal resolves). When a version
-    // is passed, re-fetch and bail to Review if the backend has moved on — so a
-    // blind one-click never confirms a scope different from what the card showed.
-    // The full ScopeReview path passes no version (the user reviewed live state).
-    if (expectedVersion != null) {
-      const current = await api.getProposal(activeThreadId);
-      // If the user switched threads during the fetch, abandon quietly — writing
-      // this thread's proposal into the shared state (or opening its review) would
-      // show/act on the wrong thread's scope (mirrors the ref guard other async
-      // proposal refreshes use here).
-      if (activeThreadIdRef.current !== activeThreadId) return;
-      setProposal(current);
-      const stillMatches =
-        current != null &&
-        current.status === "proposed" &&
-        current.created_at === expectedVersion &&
-        current.directions.length === 1 &&
-        current.directions[0]?.repo?.known === true;
-      if (!stillMatches) {
-        setReviewingProposal(true);
-        return;
+  const confirmProposal = useCallback(
+    async (expectedVersion?: string): Promise<ConfirmOutcome> => {
+      if (activeThreadId == null) return "abandoned";
+      const tid = activeThreadId;
+      // In-flight flag lives in the store, NOT the fast card's local state: the
+      // card sits in a virtualized row that can unmount mid-dispatch (scrolled
+      // away), which would drop a local guard and let a second click re-dispatch.
+      setConfirmingProposal(tid);
+      try {
+        // Flush any in-flight base-branch save before materializing. If it REJECTED
+        // (a re-propose moved the lane, or a DB error), the backend still holds the
+        // old base — refresh to the real state and route to Review rather than
+        // materializing from a stale base. Consume the promise so a retry isn't
+        // blocked by the settled rejection.
+        const pending = pendingBaseSave.current.get(tid) ?? Promise.resolve();
+        pendingBaseSave.current.delete(tid);
+        try {
+          await pending;
+        } catch {
+          // handled by the latch below
+        }
+        // Also abort if any EARLIER link in the chain failed — the chain's
+        // `.catch(() => {})` swallows predecessors for serialization, so the final
+        // promise may resolve even when a prior save rejected.
+        if ((baseSaveFailed.current.get(tid)?.size ?? 0) > 0) {
+          baseSaveFailed.current.delete(tid);
+          await refreshProposal(tid);
+          return "review";
+        }
+        // One-click fast path: the card renders from the loaded `proposal`, which
+        // can lag a re-propose (the row lands before getProposal resolves). When a
+        // version is passed, re-fetch and route to Review if the backend has moved
+        // on — so a blind one-click never confirms a scope different from the card.
+        // The full ScopeReview path passes no version (the user reviewed live state).
+        if (expectedVersion != null) {
+          const current = await api.getProposal(tid);
+          // If the user switched threads during the fetch, abandon quietly — writing
+          // this thread's proposal into the shared state (or opening its review)
+          // would show/act on the wrong thread's scope.
+          if (activeThreadIdRef.current !== tid) return "abandoned";
+          setProposal(current);
+          const only = current?.directions[0];
+          const stillMatches =
+            current != null &&
+            current.status === "proposed" &&
+            current.created_at === expectedVersion &&
+            current.directions.length === 1 &&
+            only?.repo?.known === true &&
+            // Not already decided via a Needs-you write card (pending only).
+            only?.decision === "";
+          if (!stillMatches) return "review";
+        }
+        const ids = await api.confirmProposal(tid);
+        setProposal(null);
+        setReviewingProposal(false);
+        await loadThreadChildren(tid);
+        // Automation-first: dispatch every new task's worker immediately.
+        for (const id of ids) void dispatchDirection(id);
+        return "dispatched";
+      } finally {
+        setConfirmingProposal((cur) => (cur === tid ? null : cur));
       }
-    }
-    const ids = await api.confirmProposal(activeThreadId);
-    setProposal(null);
-    setReviewingProposal(false);
-    await loadThreadChildren(activeThreadId);
-    // Automation-first: dispatch every new task's worker immediately.
-    for (const id of ids) void dispatchDirection(id);
-  }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
+    },
+    [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal],
+  );
 
   const setProposalDirectionBase = useCallback(
     (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string): Promise<void> => {
@@ -2339,6 +2362,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setActiveSidePanel,
     reviewingProposal,
     setReviewingProposal,
+    confirmingProposal,
     threadTab,
     setThreadTab,
     skillsDirtyAt,

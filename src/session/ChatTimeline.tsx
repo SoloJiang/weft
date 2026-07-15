@@ -9,6 +9,7 @@ import type {
   ResolvedDirection,
   ResolvedProposal,
 } from "../lib/types";
+import type { ConfirmOutcome } from "../state/store";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { Button } from "../components/ui/Button";
 import { QueueStack } from "./QueueStack";
@@ -56,6 +57,7 @@ export function ChatTimeline({
   activity,
   onReviewProposal,
   onConfirmProposal,
+  confirmingProposal,
   proposal,
   runAction,
   actionsBusy,
@@ -84,7 +86,9 @@ export function ChatTimeline({
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
   /** Confirm-and-dispatch a single-direction proposal in one click (lead host). */
-  onConfirmProposal?: (version: string) => Promise<void>;
+  onConfirmProposal?: (version: string) => Promise<ConfirmOutcome>;
+  /** Thread id whose proposal is confirming/dispatching (store-owned in-flight). */
+  confirmingProposal?: number | null;
   /** The active thread's live plan, binding the LATEST proposal card to its
    *  open/confirmed state. Omit (worker hosts) → proposal cards render settled. */
   proposal?: ResolvedProposal | null;
@@ -189,6 +193,7 @@ export function ChatTimeline({
               all={visible}
               onReviewProposal={onReviewProposal}
               onConfirmProposal={onConfirmProposal}
+              confirmingProposal={confirmingProposal}
               proposal={proposal ?? null}
               runAction={runAction}
               actionsBusy={actionsBusy}
@@ -388,16 +393,19 @@ function isLatestProposal(m: LeadMessage, all: LeadMessage[]): boolean {
 function ProposalFastCard({
   count,
   direction,
+  confirming,
   onConfirm,
   onReview,
 }: {
   count: number;
   direction: ResolvedDirection;
-  onConfirm: () => Promise<void>;
+  /** In-flight from the STORE (not local state): survives this virtualized row
+   *  unmounting mid-dispatch, so a scroll-away can't drop the double-click guard. */
+  confirming: boolean;
+  onConfirm: () => Promise<ConfirmOutcome>;
   onReview: () => void;
 }) {
   const { t } = useTranslation();
-  const [confirming, setConfirming] = useState(false);
   // "" = the repo's default branch; surface only an EXPLICIT non-default base so
   // the user sees they're dispatching off a non-default branch before one click
   // (the Review path shows this via BaseBranchField).
@@ -407,15 +415,11 @@ function ProposalFastCard({
   // shows this badge). The default "plan+impl" is the expected flow, left implicit.
   const buildsDirectly = direction.mandate === "impl-only";
   async function confirm() {
-    setConfirming(true);
-    try {
-      await onConfirm();
-    } finally {
-      // On success confirmProposal clears the proposal and this card unmounts;
-      // on failure (e.g. a base-save abort refreshes but keeps it) the card
-      // stays — re-enable so the user can retry.
-      setConfirming(false);
-    }
+    // confirmProposal owns the in-flight flag; if it routed to Review (a stale /
+    // re-proposed / base-aborted plan) navigate there so the user sees the fresh
+    // scope instead of silently staying on the timeline.
+    const outcome = await onConfirm();
+    if (outcome === "review") onReview();
   }
   // Vertical, left-aligned structure: header, then the direction details, then
   // actions — every row shares the card's left edge (no icon-indented column).
@@ -469,6 +473,7 @@ function TimelineRow({
   all,
   onReviewProposal,
   onConfirmProposal,
+  confirmingProposal,
   proposal,
   runAction,
   actionsBusy,
@@ -482,7 +487,9 @@ function TimelineRow({
   m: LeadMessage;
   all: LeadMessage[];
   onReviewProposal: () => void;
-  onConfirmProposal?: (version: string) => Promise<void>;
+  onConfirmProposal?: (version: string) => Promise<ConfirmOutcome>;
+  /** Thread id whose proposal is confirming/dispatching (store-owned in-flight). */
+  confirmingProposal?: number | null;
   proposal: ResolvedProposal | null;
   runAction?: RunAction;
   actionsBusy?: Record<string, boolean>;
@@ -723,14 +730,24 @@ function TimelineRow({
     //  • repo known — an unknown repo makes confirmProposal skip the lane and
     //    dispatch ZERO ids (a silent no-op). Review surfaces the unknown-repo
     //    warning, so route unknown repos there.
+    //  • not already decided — a direction the human already approved/denied via a
+    //    Needs-you write card (decision != "") must go through Review, not a blind
+    //    one-click that ignores that decision.
     //  • onConfirmProposal wired — lead host only (worker hosts render settled).
     const dirs = proposal.directions;
     const only = dirs.length === 1 ? dirs[0] : null;
-    if (only && count === 1 && only.repo?.known === true && onConfirmProposal) {
+    if (
+      only &&
+      count === 1 &&
+      only.repo?.known === true &&
+      only.decision === "" &&
+      onConfirmProposal
+    ) {
       return (
         <ProposalFastCard
           count={count}
           direction={only}
+          confirming={confirmingProposal === threadId}
           // Pass the SHOWN proposal's version; confirmProposal re-checks it at
           // click time and routes to Review if the backend re-proposed since,
           // so one-click never dispatches a scope different from the card.
