@@ -253,6 +253,32 @@ svg.markmap .markmap-foreign {
   letter-spacing: 0.01em;
 }
 
+/* mind-elixir editor (the test-case edit surface). Its own theme cssVar points
+   at our --c-* tokens (see MindMapEditor) so colors follow light/dark; here we
+   only tame the type scale — mind-elixir's default 25px root / 16px nodes reads
+   as a poster in a narrow side panel, so drop it to the app's denser UI scale.
+   The `.map-container` step out-specifies mind-elixir's own `.map-container …`
+   rules (equal-specificity otherwise loses on cascade order). */
+.mind-elixir .map-container me-tpc {
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.mind-elixir .map-container me-root me-tpc {
+  font-size: 15px;
+  font-weight: 600;
+  padding: 6px 16px;
+}
+.mind-elixir .map-container me-parent > me-tpc {
+  font-weight: 550;
+}
+/* mind-elixir's context menu has no option to drop its Summary action, and a
+   summary isn't part of our markdown tree (it's discarded on serialize), so hide
+   the item — the menu item is created with id="cm-summary" (globally unique; the
+   test-plan editor is the app's only mind-elixir instance). */
+#cm-summary {
+  display: none;
+}
+
 /* motion only when something changed; honor reduced-motion everywhere */
 @media (prefers-reduced-motion: reduce) {
   .weft-pulse,

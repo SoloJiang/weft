@@ -33,6 +33,7 @@
     "lucide-react": "^1.17.0",
     "markmap-lib": "^0.18.12",
     "markmap-view": "^0.18.12",
+    "mind-elixir": "^5.14.0",
     "motion": "^12.40.0",
     "radix-ui": "^1.6.0",
     "react": "^19.1.0",

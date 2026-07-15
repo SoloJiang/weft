@@ -11,9 +11,12 @@ import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { clampPanelWidth } from "./panelWidth";
 import { cn } from "../lib/cn";
 import type { NodePath } from "./MindMapView";
+import type { MindMapEditorHandle } from "./MindMapEditor";
 
-// markmap + d3 stay out of the main bundle; the panel is rarely open.
+// markmap + d3 (preview) and mind-elixir (editor) stay out of the main bundle;
+// the panel is rarely open, and the editor loads only when editing begins.
 const MindMapView = lazy(() => import("./MindMapView"));
+const MindMapEditor = lazy(() => import("./MindMapEditor"));
 
 const MIN_W = 360;
 const MAX_W = 860;
@@ -118,6 +121,9 @@ export function TestPlanPanel({
   // preview and say so. (Thread switches remount via key, so mode is fresh.)
   // The toast's `t` lives in a ref: locale toggles swap the `t` identity, and
   // a translation change must never re-run this effect and discard a draft.
+  // The live mindmap editor (edit mode only) — Save flushes its current tree
+  // through this rather than trusting the debounced draft.
+  const editorRef = useRef<MindMapEditorHandle>(null);
   const tRef = useRef(t);
   tRef.current = t;
   useEffect(() => {
@@ -150,7 +156,20 @@ export function TestPlanPanel({
   };
 
   const saveEdit = async () => {
-    const content = draft.trim();
+    // No-op guard: if the editor isn't mounted yet (lazy Suspense still loading —
+    // ref is null, so nothing could have been edited) OR the user made no
+    // structural edit (open-and-Save), leave edit mode WITHOUT persisting. flush()
+    // serializes to canonical markdown (headings → bullets, heading-less root gets
+    // a fallback title), so persisting a no-op would needlessly reshape the source
+    // and announce a phantom edit to the lead.
+    if (!editorRef.current || !editorRef.current.isDirty()) {
+      setMode("preview");
+      return;
+    }
+    // Flush the editor's live tree — a rename/add/drag right before Save schedules
+    // its onChange on a debounce that may not have fired, so `draft` can lag. Fall
+    // back to `draft` if the editor is gone (unmounted between click and read).
+    const content = (editorRef.current?.flush() ?? draft).trim();
     if (!content) {
       toast(t("testPlan.emptyError"));
       return;
@@ -213,13 +232,21 @@ export function TestPlanPanel({
     if (mode === "edit") {
       return (
         <div className="flex min-h-0 flex-1 flex-col gap-2 p-3">
-          <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.currentTarget.value)}
-            spellCheck={false}
-            className="min-h-0 flex-1 resize-none rounded-[var(--radius-md)] border border-border bg-bg p-3 font-mono text-[12px] leading-relaxed text-ink outline-none focus:border-brand/60"
-          />
-          <div className="flex justify-end gap-2">
+          <div className="min-h-0 flex-1 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface">
+            <Suspense fallback={<div className="p-4 text-xs text-ink-faint">{t("testPlan.loading")}</div>}>
+              <MindMapEditor
+                ref={editorRef}
+                markdown={plan.content}
+                rootLabel={t("testPlan.defaultTitle")}
+                locale={currentLang()}
+                onChange={setDraft}
+              />
+            </Suspense>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="mr-auto min-w-0 truncate text-[11px] text-ink-faint">
+              {t("testPlan.editHint")}
+            </span>
             <Button variant="ghost" size="sm" onClick={() => setMode("preview")} disabled={saving}>
               {t("testPlan.cancel")}
             </Button>
