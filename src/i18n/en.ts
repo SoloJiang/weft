@@ -813,6 +813,9 @@ export const en = {
     readOnlyHint: "This plan belongs to an older turn.",
     approved: "Plan approved · {{name}}",
     deliverFailed: "The lead didn't receive the approval — it may be stopped. Restart it and approve again.",
+    basedOnCases_one: "Shaped against {{count}} test case",
+    basedOnCases_other: "Shaped against {{count}} test cases",
+    viewCases: "View",
   },
   testPlan: {
     title: "Test cases",

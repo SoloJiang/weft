@@ -535,6 +535,11 @@ function TimelineRow({
       }
       await api.resolveActionCard(m.id, title || t("planCard.label"));
     };
+    // The product thesis (cases inform the plan) is otherwise invisible: link
+    // the plan card to the issue's test cases when the timeline has derived any.
+    // The count rides the latest test_cases summary already in the timeline —
+    // no fetch — and the link only shows when the panel is openable (lead host).
+    const testCaseCount = latestTestCaseCount(all);
     return (
       <PlanCardBlock
         title={title}
@@ -545,6 +550,8 @@ function TimelineRow({
         readOnly={readOnly}
         cwd={cwd}
         onApprove={onApprove}
+        testCaseCount={onOpenTestPlan ? testCaseCount : 0}
+        onOpenTestCases={onOpenTestPlan}
       />
     );
   }
@@ -736,6 +743,18 @@ function hasPendingUserReply(m: LeadMessage, all: LeadMessage[]): boolean {
     if (row.role === "user") return true;
   }
   return false;
+}
+
+// Case count from the most recent test_cases summary in the timeline (0 when
+// none derived). The summary payload already carries caseCount, so the plan
+// card can show "based on N cases" without hitting the store.
+function latestTestCaseCount(all: LeadMessage[]): number {
+  for (let i = all.length - 1; i >= 0; i--) {
+    if (all[i].kind !== "test_cases") continue;
+    const parsed = safeParseObj(all[i].content);
+    return typeof parsed.caseCount === "number" ? parsed.caseCount : 0;
+  }
+  return 0;
 }
 
 function isPlanSplitItem(value: unknown): value is PlanCardSplitItem {

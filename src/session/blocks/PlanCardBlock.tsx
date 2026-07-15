@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, Check, GitBranch } from "lucide-react";
+import { AlertTriangle, Check, GitBranch, ListTree } from "lucide-react";
 
 import { Button } from "../../components/ui/Button";
 import { Markdown } from "../../components/Markdown";
@@ -29,6 +29,10 @@ export interface PlanCardBlockProps {
   /** Approve → post plan_decision to the lead + persist the settled state.
    *  The row collapses via the resolve push, so no local settled state here. */
   onApprove: () => Promise<void>;
+  /** Test cases this plan is built against (0 = none / not shown). Makes the
+   *  "cases inform the plan" thesis visible and jumps to the panel. */
+  testCaseCount?: number;
+  onOpenTestCases?: () => void;
 }
 
 export function PlanCardBlock({
@@ -40,6 +44,8 @@ export function PlanCardBlock({
   readOnly,
   cwd,
   onApprove,
+  testCaseCount = 0,
+  onOpenTestCases,
 }: PlanCardBlockProps) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
@@ -119,6 +125,17 @@ export function PlanCardBlock({
             ))}
           </ul>
         </section>
+      ) : null}
+      {testCaseCount > 0 && onOpenTestCases ? (
+        <button
+          type="button"
+          onClick={onOpenTestCases}
+          className="mt-3 flex w-full items-center gap-2 rounded-[var(--radius-md)] border border-border bg-bg px-2.5 py-1.5 text-left text-xs text-ink-muted transition-colors hover:border-brand/40 hover:text-ink"
+        >
+          <ListTree size={13} className="shrink-0 text-brand" />
+          <span className="min-w-0 flex-1">{t("planCard.basedOnCases", { count: testCaseCount })}</span>
+          <span className="shrink-0 text-ink-faint">{t("planCard.viewCases")}</span>
+        </button>
       ) : null}
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <Button variant="default" size="sm" disabled={readOnly || busy} onClick={() => void approve()}>
