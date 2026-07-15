@@ -32,7 +32,12 @@ const BULLET_BASE = 7;
  */
 export function parseTestPlanMarkdown(md: string): MindTree {
   const root: MindTree = { topic: "", children: [] };
-  const stack: { depth: number; node: MindTree }[] = [{ depth: 0, node: root }];
+  // `indent` = the line's raw leading-space width, kept so a continuation line can
+  // attach to the bullet it's actually nested under (the deepest one indented LESS
+  // than the continuation), not merely the current stack top.
+  const stack: { depth: number; node: MindTree; indent: number }[] = [
+    { depth: 0, node: root, indent: -1 },
+  ];
   // Nodes that came from a LEVEL-ONE (`#`) heading. Only such a node is unwrapped
   // to the document root below: a heading-less outline (sole node a bullet) or one
   // whose sole top node is a deeper heading (`## Group`) keeps the synthetic root,
@@ -49,28 +54,33 @@ export function parseTestPlanMarkdown(md: string): MindTree {
 
     let depth: number;
     let topic: string;
+    let rawIndent: number;
     let isHeading = false;
     const h = HEADING.exec(line);
     if (h) {
       depth = h[1].length;
       topic = h[2].trim();
+      rawIndent = 0;
       isHeading = true;
     } else {
       const b = BULLET.exec(line);
       if (!b) {
-        // A continuation line — a wrapped list item's tail. Fold it into the
-        // current node ONLY if (a) that node is a bullet AND (b) the line is
-        // INDENTED: a wrap sits under its bullet. An UNINDENTED line is separate
-        // prose (or heading prose), not a wrap, so it's skipped, not folded.
+        // A continuation line — a wrapped list item's tail. Attach it to the
+        // bullet it's actually nested under: the DEEPEST bullet on the stack whose
+        // marker is indented LESS than this line. An unindented line (or prose
+        // under a heading) matches no bullet and is skipped, not folded.
         const indent = line.length - line.trimStart().length;
-        const top = stack[stack.length - 1].node;
-        if (indent > 0 && bulletNodes.has(top)) {
-          top.topic = `${top.topic} ${line.trim()}`.trim();
+        for (let i = stack.length - 1; i >= 0; i--) {
+          const entry = stack[i];
+          if (bulletNodes.has(entry.node) && entry.indent < indent) {
+            entry.node.topic = `${entry.node.topic} ${line.trim()}`.trim();
+            break;
+          }
         }
         continue;
       }
-      const indent = b[1].replace(/\t/g, "  ").length;
-      depth = BULLET_BASE + Math.floor(indent / 2);
+      rawIndent = b[1].replace(/\t/g, "  ").length;
+      depth = BULLET_BASE + Math.floor(rawIndent / 2);
       topic = b[2].trim();
     }
     if (!topic) continue;
@@ -80,7 +90,7 @@ export function parseTestPlanMarkdown(md: string): MindTree {
     if (isHeading && depth === 1) h1Roots.add(node);
     if (!isHeading) bulletNodes.add(node);
     stack[stack.length - 1].node.children.push(node);
-    stack.push({ depth, node });
+    stack.push({ depth, node, indent: rawIndent });
   }
 
   // A single `#` (level-one) heading root is the norm — unwrap the holder only
