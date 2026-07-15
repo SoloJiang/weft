@@ -419,7 +419,34 @@ pub(crate) fn error_text_from_item(item: &Value) -> String {
         .or_else(|| item["error"]["message"].as_str())
         .or_else(|| item["error"].as_str())
         .unwrap_or("Codex reported an error.");
-    text.trim().to_string()
+    humanize_error_text(text)
+}
+
+/// Dig the human message out of an error payload that may itself BE raw JSON:
+/// codex passes the provider's API error response straight through as the item
+/// message (`{"type":"error","status":400,"error":{"message":…}}`) — sometimes
+/// several objects CONCATENATED after stream retries — which used to render
+/// verbatim in chat. Plain text passes through unchanged; so does JSON we
+/// can't find a message in (better raw than blank).
+pub(crate) fn humanize_error_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') {
+        return trimmed.to_string();
+    }
+    // First object of a possibly-concatenated stream ("{…}{…}").
+    let mut objects = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+    if let Some(Ok(v)) = objects.next() {
+        let msg = v["error"]["message"]
+            .as_str()
+            .or_else(|| v["message"].as_str())
+            .or_else(|| v["error"].as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty());
+        if let Some(m) = msg {
+            return m.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 pub fn parse_line(line: &str) -> ChatEvent {
@@ -607,6 +634,33 @@ fn tool_result_text(content: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// codex passes the provider's raw API error JSON through as the item
+    /// message — sometimes several objects concatenated after retries. The
+    /// human message is dug out; plain text and unrecognizable JSON pass
+    /// through unchanged.
+    #[test]
+    fn humanize_error_digs_message_out_of_raw_provider_json() {
+        // The real payload observed in the smoke session (doubled by a retry).
+        let raw = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}"#;
+        assert_eq!(
+            humanize_error_text(raw),
+            "The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."
+        );
+        // Flat {"message": …} shape.
+        assert_eq!(humanize_error_text(r#"{"message":"rate limited"}"#), "rate limited");
+        // String-typed error field.
+        assert_eq!(humanize_error_text(r#"{"error":"boom"}"#), "boom");
+        // Plain text passes through.
+        assert_eq!(humanize_error_text("  context window exceeded  "), "context window exceeded");
+        // JSON without a recognizable message stays raw (better raw than blank).
+        assert_eq!(humanize_error_text(r#"{"code":500}"#), r#"{"code":500}"#);
+        // Malformed JSON stays raw.
+        assert_eq!(humanize_error_text("{oops"), "{oops");
+        // error_text_from_item routes through the same digger.
+        let item = serde_json::json!({"type":"error","message":"{\"error\":{\"message\":\"nested\"}}"});
+        assert_eq!(error_text_from_item(&item), "nested");
+    }
 
     #[test]
     fn parses_init() {

@@ -284,15 +284,14 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
         // Top-level failure (auth / usage-limit / context-window …): surface the
         // message so the turn doesn't end blank, then turn/completed marks it error.
         "error" => {
-            let text = params["message"]
-                .as_str()
-                .or_else(|| params["error"]["message"].as_str())
-                .or_else(|| params["error"].as_str())
-                .unwrap_or("Codex reported an error.")
-                .trim();
-            (!text.is_empty()).then(|| ChatEvent::TextDelta {
-                text: text.to_string(),
-            })
+            let text = crate::lead_chat::proto::humanize_error_text(
+                params["message"]
+                    .as_str()
+                    .or_else(|| params["error"]["message"].as_str())
+                    .or_else(|| params["error"].as_str())
+                    .unwrap_or("Codex reported an error."),
+            );
+            (!text.is_empty()).then(|| ChatEvent::TextDelta { text })
         }
         "thread/tokenUsage/updated" => {
             let tu = &params["tokenUsage"];
