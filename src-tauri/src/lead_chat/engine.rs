@@ -1390,6 +1390,10 @@ impl LeadChatState {
         self.0.get(&key).map(|r| r.value().clone())
     }
 
+    pub fn remove(&self, key: i64) -> Option<EngineRef> {
+        self.0.remove(&key).map(|r| r.1)
+    }
+
     /// Atomic get-or-insert: concurrent constructors (e.g. React StrictMode's
     /// double-mount firing two ensures) must converge on ONE engine — a lost
     /// race would orphan a duplicate headless process writing the same session.

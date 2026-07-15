@@ -210,7 +210,7 @@ async fn stop_workspace_engines(app: &tauri::AppHandle, db: &Db, workspace_id: i
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     let keys = workspace_engine_keys(db, workspace_id).await?;
     for key in keys {
-        if let Some(eng) = state.get(key) {
+        if let Some(eng) = state.remove(key) {
             crate::lead_chat::engine::stop(app, &eng).await;
         }
     }
@@ -1156,10 +1156,18 @@ pub fn list_worktree_files(cwd: String) -> R<FileTree> {
 
 
 #[tauri::command]
-pub async fn delete_thread(db: State<'_, Db>, thread_id: i32) -> R<()> {
+pub async fn delete_thread(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+) -> R<()> {
     let removed = repo::delete_thread_cascade(&db, thread_id)
         .await
         .map_err(e)?;
+    // Drop any resident engine for this thread so the deletion doesn't leak
+    // memory, child processes, or background tasks.
+    let state = app.state::<crate::lead_chat::engine::LeadChatState>();
+    state.remove(-(thread_id as i64));
     materialize::cleanup_worktrees(&db, &removed)
         .await
         .map_err(e)
