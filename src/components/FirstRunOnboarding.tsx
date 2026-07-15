@@ -431,15 +431,24 @@ function ScopeLane({
   tone: "write" | "read" | "none";
   muted?: boolean;
 }) {
-  const rowBorder = tone === "write" ? "border-accent/45" : "border-border";
-  const dotColor =
-    tone === "write" ? "bg-accent" : tone === "read" ? "bg-brand" : "bg-border-strong";
-  const pillClasses =
-    tone === "write"
-      ? "border-accent/35 bg-accent-ghost text-accent"
-      : tone === "read"
-        ? "border-brand/35 bg-brand-ghost text-brand"
-        : "border-border text-ink-faint";
+  const toneStyles: Record<typeof tone, { border: string; dot: string; pill: string }> = {
+    write: {
+      border: "border-accent/45",
+      dot: "bg-accent",
+      pill: "border-accent/35 bg-accent-ghost text-accent",
+    },
+    read: {
+      border: "border-brand/35",
+      dot: "bg-brand",
+      pill: "border-brand/35 bg-brand-ghost text-brand",
+    },
+    none: {
+      border: "border-border",
+      dot: "bg-border-strong",
+      pill: "border-border text-ink-faint",
+    },
+  };
+  const { border: rowBorder, dot: dotColor, pill: pillClasses } = toneStyles[tone];
   return (
     <div
       className={cn(

@@ -1164,10 +1164,12 @@ pub async fn delete_thread(
     let removed = repo::delete_thread_cascade(&db, thread_id)
         .await
         .map_err(e)?;
-    // Drop any resident engine for this thread so the deletion doesn't leak
-    // memory, child processes, or background tasks.
+    // Stop and drop any resident engine for this thread so the deletion doesn't
+    // leak child processes or background tasks.
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
-    state.remove(-(thread_id as i64));
+    if let Some(eng) = state.remove(-(thread_id as i64)) {
+        crate::lead_chat::engine::stop(&app, &eng).await;
+    }
     materialize::cleanup_worktrees(&db, &removed)
         .await
         .map_err(e)

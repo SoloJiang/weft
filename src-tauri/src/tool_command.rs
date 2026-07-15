@@ -94,11 +94,11 @@ pub fn command_for(tool: &str) -> String {
 pub fn effective(pin: Option<&str>, tool: &str) -> String {
     let cmd = match pin {
         Some(p) if !p.trim().is_empty() => p.trim().to_string(),
-        _ => command_for(tool),
+        _ => return command_for(tool),
     };
     if let Err(err) = validate_command(&cmd) {
-        eprintln!("[weft][tool_command] invalid pin for {tool}: {err}; falling back to {tool}");
-        return tool.to_string();
+        eprintln!("[weft][tool_command] invalid pin for {tool}: {err}; falling back to configured command");
+        return command_for(tool);
     }
     cmd
 }
@@ -164,6 +164,9 @@ mod tests {
         // Blank/whitespace pin is ignored → falls through to the global override.
         assert_eq!(effective(Some("  "), "claude"), "cc-claude");
         assert_eq!(effective(None, "claude"), "cc-claude");
+        // Invalid/legacy pins also fall back to the configured command, not the bare identity.
+        assert_eq!(effective(Some("/opt/claude"), "claude"), "cc-claude");
+        assert_eq!(effective(Some("claude --evil"), "claude"), "cc-claude");
 
         set_overrides(HashMap::new()); // leave the global map clean
     }
@@ -231,8 +234,11 @@ mod tests {
     #[test]
     fn effective_falls_back_on_invalid_pin() {
         set_overrides(HashMap::new());
+        // With no global override, invalid pins fall back to the bare identity.
         assert_eq!(effective(Some("/opt/claude"), "claude"), "claude");
         assert_eq!(effective(Some("claude --evil"), "claude"), "claude");
+        // Valid bare pins are honored.
         assert_eq!(effective(Some("cc-claude"), "claude"), "cc-claude");
+        set_overrides(HashMap::new()); // leave the global map clean
     }
 }
