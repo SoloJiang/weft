@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { useStore } from "../state/store";
 import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
-import { ChatComposer } from "./ChatComposer";
+import { ChatComposer, type LocalSlashSpec } from "./ChatComposer";
 import { SessionInfoPanel } from "./SessionInfoPanel";
 import { TestPlanPanel } from "./TestPlanPanel";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
@@ -21,11 +21,12 @@ type PromptState = {
   resolve: (v: string | null) => void;
 };
 
-// Host-owned local slash items. ChatComposer keeps the "what" generic (a name +
-// label); the host maps each to an action here. Two shapes: repo-onboarding
-// items run a useRepoActions flow; a "prompt" item just sends a canned message
-// to the lead — used to make an otherwise-invisible soft policy (deriving test
-// cases) discoverable and explicitly triggerable from the slash palette.
+// Host-owned local slash items, mapped to the composer's LocalSlashSpec below.
+// Two shapes: repo-onboarding items run a useRepoActions flow (act "action" in
+// the composer); a "prompt" item carries a canned message the composer sends
+// through its own send path — used to make an otherwise-invisible soft policy
+// (deriving test cases) discoverable and explicitly triggerable from the slash
+// palette. Prompt items are issue-lead only (filtered out of the curator panel).
 type LocalSlashItem =
   | { name: string; act: "repo"; kind: "add" | "new" | "clone"; labelKey: string }
   | { name: string; act: "prompt"; labelKey: string; promptKey: string };
@@ -108,11 +109,18 @@ export function LeadTab({
     );
 
   // Stable identity per language so ChatComposer's slashMatches useMemo
-  // doesn't recompute on every parent render.
-  const localSlash = useMemo(
-    () => LOCAL_SLASH.map((c) => ({ name: c.name, label: t(c.labelKey) })),
-    [t],
-  );
+  // doesn't recompute on every parent render. Prompt items are issue-lead only:
+  // hide them from the compact curator panel (a hidden curator thread) where an
+  // issue-specific ask would go to the wrong agent. Repo items stay in both.
+  const localSlash = useMemo<LocalSlashSpec[]>(() => {
+    const toSpec = (c: LocalSlashItem): LocalSlashSpec => {
+      if (c.act === "prompt") {
+        return { name: c.name, label: t(c.labelKey), act: "prompt", prompt: t(c.promptKey) };
+      }
+      return { name: c.name, label: t(c.labelKey), act: "action" };
+    };
+    return LOCAL_SLASH.filter((c) => c.act !== "prompt" || !compact).map(toSpec);
+  }, [t, compact]);
 
   useEffect(() => {
     if (tid != null) void loadLeadChat(tid);
@@ -180,11 +188,9 @@ export function LeadTab({
 
   const onLocalSlash = (name: string) => {
     const item = LOCAL_SLASH.find((x) => x.name === name);
-    if (!item) return;
-    if (item.act === "prompt") {
-      void sendLeadChat(tid, t(item.promptKey), [], []);
-      return;
-    }
+    // Only "action" (repo) items reach the host — the composer sends "prompt"
+    // items itself (through its own send path: attachments + queue-full guard).
+    if (!item || item.act !== "repo") return;
     void run({
       actionId: `local-${item.kind}-${Date.now()}`,
       kind: item.kind,
