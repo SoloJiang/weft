@@ -58,12 +58,15 @@ export function parseTestPlanMarkdown(md: string): MindTree {
     } else {
       const b = BULLET.exec(line);
       if (!b) {
-        // A continuation line — a wrapped list item's tail (indented prose, not a
-        // new heading or bullet). Fold it into the current node ONLY if that node
-        // is a bullet, so a wrapped list item keeps its text; prose under a heading
-        // is not a list-item wrap and is left out of the heading title.
+        // A continuation line — a wrapped list item's tail. Fold it into the
+        // current node ONLY if (a) that node is a bullet AND (b) the line is
+        // INDENTED: a wrap sits under its bullet. An UNINDENTED line is separate
+        // prose (or heading prose), not a wrap, so it's skipped, not folded.
+        const indent = line.length - line.trimStart().length;
         const top = stack[stack.length - 1].node;
-        if (bulletNodes.has(top)) top.topic = `${top.topic} ${line.trim()}`.trim();
+        if (indent > 0 && bulletNodes.has(top)) {
+          top.topic = `${top.topic} ${line.trim()}`.trim();
+        }
         continue;
       }
       const indent = b[1].replace(/\t/g, "  ").length;

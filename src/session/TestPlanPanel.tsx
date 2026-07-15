@@ -123,12 +123,13 @@ export function TestPlanPanel({
   };
 
   const saveEdit = async () => {
-    // No-op guard: if the user made no structural edit (open-and-Save), don't
-    // rewrite the stored doc — flush() serializes to canonical markdown (headings
-    // → bullets, and a heading-less root gets a fallback title), so persisting it
-    // on a no-op would needlessly reshape the source and notify the lead. The
-    // editor tracks whether any edit happened; if not, just leave edit mode.
-    if (editorRef.current && !editorRef.current.isDirty()) {
+    // No-op guard: if the editor isn't mounted yet (lazy Suspense still loading —
+    // ref is null, so nothing could have been edited) OR the user made no
+    // structural edit (open-and-Save), leave edit mode WITHOUT persisting. flush()
+    // serializes to canonical markdown (headings → bullets, heading-less root gets
+    // a fallback title), so persisting a no-op would needlessly reshape the source
+    // and announce a phantom edit to the lead.
+    if (!editorRef.current || !editorRef.current.isDirty()) {
       setMode("preview");
       return;
     }
