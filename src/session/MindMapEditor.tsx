@@ -14,6 +14,9 @@ import { parseTestPlanMarkdown, mindTreeToMarkdown, type MindTree } from "./mind
 export interface MindMapEditorHandle {
   /** Current tree serialized to markdown, or null before the editor mounts. */
   flush: () => string | null;
+  /** Whether the user has made any structural edit since mount — lets Save treat
+   *  an open-and-Save (no edit) as a no-op without rewriting the stored source. */
+  isDirty: () => boolean;
 }
 
 // mind-elixir needs a unique id per node; a module counter is enough (ids are
@@ -73,6 +76,9 @@ const MindMapEditor = forwardRef<
   // The live instance, exposed via the imperative handle so Save can read the
   // current tree synchronously (the debounced onChange may not have fired yet).
   const mindRef = useRef<MindElixirInstance | null>(null);
+  // Set on the first real operation (after the ready guard). Save reads it to
+  // treat an untouched open-and-Save as a no-op — no rewrite, no lead notify.
+  const dirtyRef = useRef(false);
   // Keep the latest callbacks/labels in refs so the init effect runs exactly
   // once per mount — re-initializing would discard the user's in-progress edits.
   const onChangeRef = useRef(onChange);
@@ -88,6 +94,7 @@ const MindMapEditor = forwardRef<
         if (!mind) return null;
         return mindTreeToMarkdown(fromNodeObj(mind.getData().nodeData), rootLabelRef.current);
       },
+      isDirty: () => dirtyRef.current,
     }),
     [],
   );
@@ -133,6 +140,7 @@ const MindMapEditor = forwardRef<
     let emitTimer: ReturnType<typeof setTimeout> | null = null;
     const emit = () => {
       if (!ready) return;
+      dirtyRef.current = true;
       if (emitTimer) clearTimeout(emitTimer);
       emitTimer = setTimeout(() => {
         const data = mind.getData();

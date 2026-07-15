@@ -53,7 +53,14 @@ export function parseTestPlanMarkdown(md: string): MindTree {
       isHeading = true;
     } else {
       const b = BULLET.exec(line);
-      if (!b) continue;
+      if (!b) {
+        // A continuation line — a wrapped list item's tail (indented prose, not a
+        // new heading or bullet). Append it to the current node so the wrapped
+        // text is kept as one topic instead of dropped.
+        const top = stack[stack.length - 1].node;
+        if (top !== root) top.topic = `${top.topic} ${line.trim()}`.trim();
+        continue;
+      }
       const indent = b[1].replace(/\t/g, "  ").length;
       depth = BULLET_BASE + Math.floor(indent / 2);
       topic = b[2].trim();
