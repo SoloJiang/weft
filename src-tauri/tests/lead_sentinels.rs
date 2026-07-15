@@ -2,7 +2,7 @@
 //! `<weft:plan_card>{...}` and `<weft:list_repos/>` markers out of assistant
 //! text so the engine can persist card rows and answer list_repos via stdin
 //! separately.
-use weft::lead_chat::sentinels::{extract_sentinels, Sentinel};
+use weft::lead_chat::sentinels::{extract_sentinels, extract_sentinels_with, Sentinel};
 
 #[test]
 fn extracts_action_card() {
@@ -45,6 +45,48 @@ fn plan_card_mixes_with_action_card_in_order() {
     assert_eq!(found.len(), 2);
     assert!(matches!(found[0], Sentinel::PlanCard(_)));
     assert!(matches!(found[1], Sentinel::ActionCard(_)));
+}
+
+#[test]
+fn extracts_test_cases_raw_markdown() {
+    let t = "推导如下：<weft:test_cases>\n# 登录\n## 异常\n- 密码错误\n  - 三次锁定\n</weft:test_cases>之后讨论方案。";
+    let (clean, found) = extract_sentinels(t);
+    assert_eq!(clean, "推导如下：之后讨论方案。");
+    assert_eq!(found.len(), 1);
+    match &found[0] {
+        Sentinel::TestCases(md) => {
+            // Raw markdown body, verbatim — including newlines, no JSON.
+            assert!(md.contains("# 登录"));
+            assert!(md.contains("- 密码错误"));
+            assert!(md.starts_with('\n'));
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+/// Worker semantics: test_cases is lead-only — a worker quoting the protocol
+/// keeps the block verbatim in its text (nothing extracted, nothing lost),
+/// while the other sentinels still extract as usual.
+#[test]
+fn worker_keeps_test_cases_verbatim_but_extracts_other_sentinels() {
+    let t = "引用协议：<weft:test_cases>\n- a\n</weft:test_cases> 以及 <weft:list_repos/>";
+    let (clean, found) = extract_sentinels_with(t, false);
+    assert!(clean.contains("<weft:test_cases>"), "block must stay in the body");
+    assert!(clean.contains("- a"));
+    assert_eq!(found.len(), 1);
+    assert!(matches!(found[0], Sentinel::ListRepos));
+    // Lead semantics on the same text: the block extracts.
+    let (lead_clean, lead_found) = extract_sentinels_with(t, true);
+    assert!(!lead_clean.contains("<weft:test_cases>"));
+    assert_eq!(lead_found.len(), 2);
+}
+
+#[test]
+fn skips_malformed_test_cases_unclosed() {
+    let t = "before <weft:test_cases>\n- a\n no close";
+    let (clean, found) = extract_sentinels(t);
+    assert_eq!(clean, t);
+    assert!(found.is_empty());
 }
 
 #[test]

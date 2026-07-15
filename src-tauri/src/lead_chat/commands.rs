@@ -62,6 +62,20 @@ The human reviews and confirms in weft; you can re-propose after more discussion
 To withdraw or pause pending directions — when the human says to hold off / cancel, or the plan is no longer settled — call cancel_directions with a short rationale; never call propose_directions with an empty directions list to express a cancel. \
 After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), and reply with bus_post to a worker's direction id — a direct bus_post reliably reaches that worker even if it is currently idle. bus_broadcast only reaches participants already active on the bus, so to be sure a specific worker sees something, bus_post it directly rather than relying on a broadcast. Reading the bus is your job; do not assume silence means nothing happened.";
 
+/// Phase-1.5 test-case derivation (soft policy, no extra gate): schema of the
+/// `<weft:test_cases>` sentinel (RAW markdown body — multi-line markdown inside
+/// a JSON string invites escaping mistakes) and the `<weft:test_cases_updated>`
+/// feedback posted when the human edits the document in weft.
+const TEST_CASES_DIRECTIVES: &str = r#"Between understanding the need and shaping the approach, derive the issue's TEST CASES as a markdown tree when the issue is substantial enough to benefit — skip silently for trivial fixes, and always follow an explicit human ask to create or skip them. Deriving cases is a discovery tool: enumerate normal paths, boundaries, error paths, and acceptance checks, and when a case exposes an open question, resolve it in conversation BEFORE shaping the approach. Later, check the technical approach against these cases — a case the approach cannot satisfy is a gap in the approach. For any non-trivial derivation, follow the weft-derive-test-cases skill available in your workspace (draft outline → enrich from code → adversarial review → clarify → finalize); its quality bars always apply: every leaf decidable (concrete action + observable result, never 「正常展示」/「符合预期」), the tree in user language only (no APIs, fields, SDKs, DB, logs, or analytics).
+To emit or update the document, output exactly:
+<weft:test_cases>
+# <title>
+## <group>
+- <case or sub-group>
+  - <case>
+</weft:test_cases>
+The body is RAW markdown (a # title plus nested unordered lists; leaves are individual cases) — never JSON, no code fences. The sentinel is the document's ONLY home: weft renders it as an interactive mindmap card, so do not repeat the cases in your prose — around it, write only a short lead-in and the open questions the derivation exposed. Re-emitting replaces the whole document. The human can view and edit it in weft; when they save an edit you receive <weft:test_cases_updated>{"source":"user","content":"..."}</weft:test_cases_updated> as a hidden message — carry the new content forward and do not re-emit unless you are changing it. Use language matching the user's locale for titles and cases."#;
+
 /// The plan-card gate protocol (phase 3 of the lead policy): schema of the
 /// `<weft:plan_card>` sentinel and the `<weft:plan_decision>` feedback the UI
 /// posts back. Its own const (raw string keeps the JSON readable) because it is
@@ -83,7 +97,7 @@ const SENTINEL_DIRECTIVES: &str = r#"When the user has no suitable repo for the 
 /// the human has approved the plan card (or explicitly skipped the discussion),
 /// and may re-propose after more discussion.
 pub fn lead_prompt() -> String {
-    format!("{BASE_PROMPT}\n\n{PLAN_CARD_DIRECTIVES}\n\n{SENTINEL_DIRECTIVES}")
+    format!("{BASE_PROMPT}\n\n{TEST_CASES_DIRECTIVES}\n\n{PLAN_CARD_DIRECTIVES}\n\n{SENTINEL_DIRECTIVES}")
 }
 
 /// Agent-output language directive (ARCHITECTURE §4.8, layer 2). Appended to the
@@ -449,6 +463,27 @@ mod tests {
         assert!(!prompt.contains("Ask clarifying questions only when"));
         // Workers still own their direction's implementation.
         assert!(prompt.contains("that stays the worker's job"));
+    }
+
+    /// Phase 1.5: the test-case derivation is a soft policy — adaptive, no new
+    /// gate — with a RAW-markdown sentinel and an edit-feedback loop.
+    #[test]
+    fn lead_prompt_derives_test_cases_before_shaping() {
+        let prompt = lead_prompt();
+        assert!(prompt.contains("<weft:test_cases>"));
+        assert!(prompt.contains("Between understanding the need and shaping the approach"));
+        assert!(prompt.contains("skip silently for trivial fixes"));
+        assert!(prompt.contains("RAW markdown"));
+        assert!(prompt.contains("<weft:test_cases_updated>"));
+        // Discovery loop: cases expose questions BEFORE the approach is shaped,
+        // and the approach is later checked against the cases.
+        assert!(prompt.contains("resolve it in conversation BEFORE shaping the approach"));
+        assert!(prompt.contains("a case the approach cannot satisfy is a gap in the approach"));
+        // The built-in methodology skill is referenced, with its two hard
+        // quality bars inlined as the always-on floor.
+        assert!(prompt.contains("weft-derive-test-cases"));
+        assert!(prompt.contains("every leaf decidable"));
+        assert!(prompt.contains("user language only"));
     }
 
     /// plan_decision feedback gets its own sentinel tag; everything else keeps
@@ -1367,14 +1402,47 @@ pub async fn post_lead_tool_result(
         .await
 }
 
+/// The issue's test-case document for the panel (None = never derived).
+#[tauri::command]
+pub async fn get_test_plan(
+    db: State<'_, Db>,
+    thread_id: i32,
+) -> Result<Option<crate::store::entities::test_plan::Model>, String> {
+    repo::get_test_plan(&db, thread_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Save a panel edit of the test-case document (source="user"). The caller
+/// separately posts `test_cases_updated` via post_lead_tool_result so the lead
+/// learns the new content — persisting must succeed even when the lead is
+/// stopped, hence the two steps.
+#[tauri::command]
+pub async fn save_test_plan(
+    db: State<'_, Db>,
+    thread_id: i32,
+    content: String,
+) -> Result<(), String> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("test plan content must not be empty".into());
+    }
+    repo::upsert_test_plan(&db, thread_id, content, "user")
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Wrap a UI feedback payload in its sentinel tag for hidden delivery to the
 /// lead. The tag follows `payload.tool`: `plan_decision` (plan-card approval)
-/// gets its own tag; everything else stays `repo_action` (the historical
-/// default the repo-onboarding flows rely on).
+/// and `test_cases_updated` (panel edit save) get their own tags; everything
+/// else stays `repo_action` (the historical default the repo-onboarding flows
+/// rely on).
 fn hidden_feedback_text(payload: &serde_json::Value) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string(payload)?;
     let tag = match payload.get("tool").and_then(|v| v.as_str()) {
         Some("plan_decision") => "plan_decision",
+        Some("test_cases_updated") => "test_cases_updated",
         _ => "repo_action",
     };
     Ok(format!("<weft:{tag}>{json}</weft:{tag}>"))

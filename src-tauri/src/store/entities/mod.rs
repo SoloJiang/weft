@@ -9,6 +9,7 @@ pub mod repo_ref;
 pub mod session;
 pub mod skill_enable;
 pub mod skill_source;
+pub mod test_plan;
 pub mod thread;
 pub mod workspace;
 pub mod worktree;

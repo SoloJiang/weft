@@ -256,6 +256,8 @@ pub fn run() {
             lead_chat::commands::auto_verify_check,
             lead_chat::commands::discover_slash,
             lead_chat::commands::post_lead_tool_result,
+            lead_chat::commands::get_test_plan,
+            lead_chat::commands::save_test_plan,
             lead_chat::commands::chat_open_worker,
             lead_chat::commands::chat_send,
             lead_chat::commands::chat_interrupt,

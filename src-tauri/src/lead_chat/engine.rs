@@ -712,6 +712,62 @@ async fn apply_lead_sentinels(
             super::sentinels::Sentinel::PlanCard(json) => {
                 persist_card_row(app, db, inner, thread_id, "plan_card", &json).await;
             }
+            super::sentinels::Sentinel::TestCases(md) => {
+                // Issue-level document — only the LEAD may write it. Chat-mode
+                // workers share this engine (session_id set); a worker echoing
+                // protocol text (or prompt-injected repo content) must not
+                // replace the issue's cases from its own timeline. (Extraction
+                // is already lead-gated; this is defense in depth.)
+                if inner.session_id.is_some() {
+                    eprintln!(
+                        "[weft] worker sentinel: test_cases ignored (lead-only, issue-level doc)"
+                    );
+                    continue;
+                }
+                // A user edit saved MID-TURN supersedes whatever this turn
+                // emits — the emit was authored without seeing it. The queue
+                // check is the fast path (undelivered feedback); the write
+                // itself is an ATOMIC compare-and-swap in SQL, so a save
+                // landing at any point before the UPDATE still wins.
+                if has_pending_user_test_update(&inner.turn) {
+                    eprintln!(
+                        "[weft] lead sentinel: test_cases skipped — a queued user edit \
+                         supersedes this turn's emit"
+                    );
+                    continue;
+                }
+                // Raw markdown body: upsert the document (single source of
+                // truth), then drop a summary card into the timeline — the
+                // panel always reads the table, never the card.
+                let md = md.trim();
+                if md.is_empty() {
+                    eprintln!("[weft] lead sentinel: test_cases body is empty — dropped");
+                } else {
+                    match repo::lead_upsert_test_plan(
+                        db,
+                        thread_id,
+                        md,
+                        inner.clock.started_millis,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            let summary = super::test_plan::summarize(md).to_string();
+                            persist_card_row(app, db, inner, thread_id, "test_cases", &summary)
+                                .await;
+                        }
+                        Ok(false) => {
+                            eprintln!(
+                                "[weft] lead sentinel: test_cases skipped — a user edit \
+                                 saved mid-turn supersedes this emit"
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[weft] lead sentinel: upsert test_plan failed: {e}")
+                        }
+                    }
+                }
+            }
             super::sentinels::Sentinel::ListRepos => {
                 // Look up workspace via the thread row (engine doesn't cache it; one
                 // extra query per call is cheap and avoids a wider refactor).
@@ -772,6 +828,17 @@ async fn apply_lead_sentinels(
     }
 }
 
+/// True when an undelivered user edit of the test-case document is still
+/// queued for this engine: the in-flight turn was authored WITHOUT seeing it,
+/// so any `<weft:test_cases>` it emits is stale relative to the user's save
+/// and must not overwrite the user-sourced row.
+fn has_pending_user_test_update(turn: &TurnState) -> bool {
+    turn.queue
+        .iter()
+        .any(|o| o.text.contains("<weft:test_cases_updated>"))
+}
+
+
 /// Persist one card sentinel (`action_card` / `plan_card`) as its own timeline
 /// row and push it to the UI. Rejects anything that isn't a JSON object so the
 /// UI can rely on the card's fields; errors are logged, never fatal.
@@ -822,7 +889,8 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     // `stripped` = the cleaned body differs from what streamed (sentinels removed),
     // so the live row still shows the raw tags and must be replaced, not just status.
     let (clean, stripped) = if status == "complete" {
-        let (clean, sentinels) = super::sentinels::extract_sentinels(&text);
+        let (clean, sentinels) =
+            super::sentinels::extract_sentinels_with(&text, inner.session_id.is_none());
         let stripped = clean != text;
         apply_lead_sentinels(app, db, inner, thread_id, sentinels).await;
         (clean, stripped)
@@ -959,6 +1027,12 @@ pub struct TurnClock {
     pub started: Option<std::time::Instant>,
     /// Last stdout line seen from the child (any event counts as activity).
     pub last_activity: std::time::Instant,
+    /// Unix-MILLISECONDS stamp of the in-flight turn's start (0 = never
+    /// begun). Same clock as `test_plan.updated_at`, so "did the user save
+    /// mid-turn?" is a plain comparison — millisecond resolution keeps an
+    /// idle-save immediately followed by the feedback turn (same second)
+    /// from being misread as a mid-turn save.
+    pub started_millis: u64,
 }
 
 impl Default for TurnClock {
@@ -966,6 +1040,7 @@ impl Default for TurnClock {
         Self {
             started: None,
             last_activity: std::time::Instant::now(),
+            started_millis: 0,
         }
     }
 }
@@ -974,6 +1049,10 @@ impl TurnClock {
     pub(crate) fn begin_turn(&mut self) {
         self.started = Some(std::time::Instant::now());
         self.last_activity = std::time::Instant::now();
+        self.started_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
     }
     /// Re-sync with the queue state after a turn ends (queued pop = new turn).
     fn on_turn_end(&mut self, still_busy: bool) {
@@ -2980,19 +3059,27 @@ fn spawn_reader(
                         // action_card lives as its own row so the UI can render the
                         // card without parsing prose; list_repos triggers a stdin
                         // reply (handled below) and produces no row of its own.
-                        let (clean, sentinels) = super::sentinels::extract_sentinels(&full);
+                        let (clean, sentinels) = super::sentinels::extract_sentinels_with(
+                            &full,
+                            inner.session_id.is_none(),
+                        );
                         let content = serde_json::json!({ "text": clean }).to_string();
                         match inner.current.take() {
                             Some((id, _, _)) => {
                                 let _ =
                                     repo::update_lead_message(&db, id, &content, "complete").await;
+                                // When sentinels were stripped, the live row still
+                                // shows the raw streamed tags — send the cleaned
+                                // body so the UI replaces it without a reload
+                                // (test_cases bodies are entire documents).
+                                let stripped = clean != full;
                                 let _ = app.emit(
                                     EVENT,
                                     Push::Finalize {
                                         thread_id,
                                         message_id: id,
                                         status: "complete".into(),
-                                        content: None,
+                                        content: if stripped { Some(clean.clone()) } else { None },
                                     },
                                 );
                                 emit_lead_out(
@@ -3501,6 +3588,27 @@ mod tests {
         assert!(usage_events_authoritative("claude"));
         assert!(usage_events_authoritative("codex"));
         assert!(!usage_events_authoritative("opencode"));
+    }
+
+    /// A queued (undelivered) user edit of the test cases marks any in-flight
+    /// lead emit as stale; ordinary queued messages do not.
+    #[test]
+    fn pending_user_test_update_detection() {
+        let mk = |text: &str| Outgoing {
+            text: text.into(),
+            images: vec![],
+            tracked: false,
+            origin_tag: None,
+            queue_id: None,
+            has_attachments: false,
+        };
+        let mut turn = TurnState::default();
+        assert!(!has_pending_user_test_update(&turn));
+        turn.queue.push_back(mk("hello lead"));
+        assert!(!has_pending_user_test_update(&turn));
+        turn.queue
+            .push_back(mk("<weft:test_cases_updated>{\"source\":\"user\",\"content\":\"# v\"}</weft:test_cases_updated>"));
+        assert!(has_pending_user_test_update(&turn));
     }
 
     #[test]

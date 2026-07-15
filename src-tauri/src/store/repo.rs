@@ -2,7 +2,7 @@
 
 use super::entities::{
     app_setting, direction, im_route, lead_message, plan, repo_profile, repo_ref, session,
-    skill_enable, skill_source, thread, workspace, worktree,
+    skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use super::Db;
 use crate::slug::unique_slug;
@@ -1424,6 +1424,10 @@ pub async fn delete_workspace_cascade(
             .filter(plan::Column::ThreadId.eq(*thread_id))
             .exec(&db.0)
             .await?;
+        test_plan::Entity::delete_many()
+            .filter(test_plan::Column::ThreadId.eq(*thread_id))
+            .exec(&db.0)
+            .await?;
     }
     if !repo_session_ids.is_empty() {
         lead_message::Entity::delete_many()
@@ -1489,28 +1493,61 @@ pub async fn delete_thread_cascade(
     db: &Db,
     thread_id: i32,
 ) -> Result<Vec<(i32, String, String, bool, bool)>> {
+    use sea_orm::TransactionTrait;
+    // One TRANSACTION for the whole cascade. Atomicity gives both halves of
+    // the safety story at once: concurrent writers can't observe (and race)
+    // the intermediate state between the thread row's delete and the
+    // owned-row sweep, and a crash/error mid-cascade rolls back to a fully
+    // retryable issue instead of stranding orphaned owned rows whose anchor
+    // is already gone.
+    let txn = db.0.begin().await?;
     let dirs = direction::Entity::find()
         .filter(direction::Column::ThreadId.eq(thread_id))
-        .all(&db.0)
+        .all(&txn)
         .await?;
     // (repo_id, worktree path, branch, created_branch, created_checkout)
     let mut removed: Vec<(i32, String, String, bool, bool)> = Vec::new();
     for d in &dirs {
         let wts = worktree::Entity::find()
             .filter(worktree::Column::DirectionId.eq(d.id))
-            .all(&db.0)
+            .all(&txn)
             .await?;
         for w in wts {
             removed.push((w.repo_id, w.path.clone(), w.branch.clone(), w.created_branch, w.created_checkout));
-            worktree::Entity::delete_by_id(w.id).exec(&db.0).await?;
+            worktree::Entity::delete_by_id(w.id).exec(&txn).await?;
         }
         session::Entity::delete_many()
             .filter(session::Column::DirectionId.eq(d.id))
-            .exec(&db.0)
+            .exec(&txn)
             .await?;
-        direction::Entity::delete_by_id(d.id).exec(&db.0).await?;
+        direction::Entity::delete_by_id(d.id).exec(&txn).await?;
     }
-    thread::Entity::delete_by_id(thread_id).exec(&db.0).await?;
+    // The thread row anchors the thread write fence
+    // (ensure_thread_workspace_accepts_writes errs once it is gone); inside
+    // the transaction its delete becomes visible together with the owned-row
+    // sweep, so a racing save/sentinel either lands entirely before the
+    // cascade (then dies with it) or is rejected by the fence after commit.
+    thread::Entity::delete_by_id(thread_id).exec(&txn).await?;
+    // Thread-owned rows (no FK cascades in sqlite here): chat history, the
+    // pending plan, IM bindings, and the test-case document all die with the
+    // issue — otherwise deleted-issue content lingers in weft.db and backups.
+    im_route::Entity::delete_many()
+        .filter(im_route::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    lead_message::Entity::delete_many()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    plan::Entity::delete_many()
+        .filter(plan::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    test_plan::Entity::delete_many()
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
     Ok(removed)
 }
 
@@ -1688,6 +1725,130 @@ pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) 
         a.update(&db.0).await?;
     }
     Ok(())
+}
+
+/// Unix milliseconds as a string — `test_plan.updated_at`'s clock. Millisecond
+/// resolution (vs the store's usual seconds) lets the lead-emit CAS separate
+/// "saved just before this turn started" from "saved mid-turn".
+fn now_millis() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Upsert the issue's test-case document (0..1 per thread — UNIQUE thread_id).
+/// `source` records the last writer: "lead" (sentinel) or "user" (panel edit).
+/// Fenced like every other thread-owned write: the thread must still exist and
+/// its workspace must accept writes — a late panel save or lead sentinel after
+/// `delete_thread_cascade` must not recreate an orphan row (no FK cascades).
+pub async fn upsert_test_plan(
+    db: &Db,
+    thread_id: i32,
+    content: &str,
+    source: &str,
+) -> Result<test_plan::Model> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let written = if let Some(existing) = test_plan::Entity::find()
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .one(&db.0)
+        .await?
+    {
+        let mut a: test_plan::ActiveModel = existing.into();
+        a.content = Set(content.to_string());
+        a.source = Set(source.to_string());
+        a.updated_at = Set(now_millis());
+        a.update(&db.0).await?
+    } else {
+        let a = test_plan::ActiveModel {
+            thread_id: Set(thread_id),
+            content: Set(content.to_string()),
+            source: Set(source.to_string()),
+            updated_at: Set(now_millis()),
+            ..Default::default()
+        };
+        a.insert(&db.0).await?
+    };
+    // Post-write fence (same shape as create_thread/add_repo_ref): a cascade
+    // that passed its test_plan delete pass between our pre-check and this
+    // write would leave this row an unreachable orphan — re-check and undo.
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = test_plan::Entity::delete_by_id(written.id).exec(&db.0).await;
+        return Err(err);
+    }
+    Ok(written)
+}
+
+/// Lead-emit upsert with an ATOMIC supersede check: the condition rides the SQL
+/// UPDATE itself (not a separate read), so a user save landing between any
+/// pre-read and this write still wins. A USER-sourced row stamped at/after the
+/// emitting turn began (`turn_started_millis`, same clock as `updated_at`) was
+/// saved mid-turn — the emit predates it. Returns false when superseded.
+pub async fn lead_upsert_test_plan(
+    db: &Db,
+    thread_id: i32,
+    content: &str,
+    turn_started_millis: u64,
+) -> Result<bool> {
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    let updated = test_plan::Entity::update_many()
+        .col_expr(test_plan::Column::Content, Expr::value(content))
+        .col_expr(test_plan::Column::Source, Expr::value("lead"))
+        .col_expr(test_plan::Column::UpdatedAt, Expr::value(now_millis()))
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .filter(Expr::cust_with_values(
+            // updated_at holds decimal digits only; CAST keeps legacy
+            // second-resolution rows (shorter strings) comparing numerically.
+            "NOT (source = 'user' AND CAST(updated_at AS INTEGER) >= ?)",
+            [turn_started_millis as i64],
+        ))
+        .exec(&db.0)
+        .await?;
+    if updated.rows_affected == 0 {
+        let exists = test_plan::Entity::find()
+            .filter(test_plan::Column::ThreadId.eq(thread_id))
+            .one(&db.0)
+            .await?
+            .is_some();
+        if exists {
+            return Ok(false); // superseded by a newer user save
+        }
+        // First document for this thread. A user save racing this insert hits
+        // the UNIQUE(thread_id) — that specific conflict means "superseded".
+        // Anything else (locked db, I/O, schema) is a real failure and must
+        // propagate, not masquerade as a user edit winning.
+        let a = test_plan::ActiveModel {
+            thread_id: Set(thread_id),
+            content: Set(content.to_string()),
+            source: Set("lead".to_string()),
+            updated_at: Set(now_millis()),
+            ..Default::default()
+        };
+        if let Err(e) = a.insert(&db.0).await {
+            if e.to_string().contains("UNIQUE constraint failed") {
+                return Ok(false);
+            }
+            return Err(e.into());
+        }
+    }
+    // Post-write fence, mirroring upsert_test_plan.
+    if let Err(err) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = test_plan::Entity::delete_many()
+            .filter(test_plan::Column::ThreadId.eq(thread_id))
+            .exec(&db.0)
+            .await;
+        return Err(err);
+    }
+    Ok(true)
+}
+
+/// The issue's test-case document, if one has been derived.
+pub async fn get_test_plan(db: &Db, thread_id: i32) -> Result<Option<test_plan::Model>> {
+    Ok(test_plan::Entity::find()
+        .filter(test_plan::Column::ThreadId.eq(thread_id))
+        .one(&db.0)
+        .await?)
 }
 
 /// Persist the lead engine's last-known meta snapshot (JSON `PersistedMeta`)
@@ -2717,6 +2878,86 @@ mod tests {
         assert_eq!(all[0].content, updated.content);
         // a missing row is a no-op
         assert!(resolve_action_card(&db, 9999, "x").await.unwrap().is_none());
+    }
+
+    /// Deleting an issue removes every thread-owned row — chat history, plan,
+    /// IM routes, and the test-case document — not just directions/sessions.
+    #[tokio::test]
+    async fn thread_cascade_deletes_thread_owned_rows() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        upsert_test_plan(&db, t.id, "# doc\n- case\n", "lead").await.unwrap();
+        insert_lead_message(&db, t.id, None, 1, "assistant", "text", "{\"text\":\"hi\"}", "complete")
+            .await
+            .unwrap();
+        delete_thread_cascade(&db, t.id).await.unwrap();
+        assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
+        assert!(list_lead_messages(&db, t.id).await.unwrap().is_empty());
+        assert!(get_thread(&db, t.id).await.unwrap().is_none());
+        // The write fence: a late save/sentinel can't recreate an orphan row.
+        assert!(
+            upsert_test_plan(&db, t.id, "# late\n- x\n", "user").await.is_err(),
+            "upsert after deletion must be rejected"
+        );
+        assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
+    }
+
+    /// test_plan upsert enforces 0..1 per thread (M0035 UNIQUE thread_id):
+    /// the second write updates in place and flips the source.
+    #[tokio::test]
+    async fn test_plan_upserts_one_doc_per_thread() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        assert!(get_test_plan(&db, t.id).await.unwrap().is_none());
+        let first = upsert_test_plan(&db, t.id, "# v1\n- a\n", "lead").await.unwrap();
+        assert_eq!(first.source, "lead");
+        let second = upsert_test_plan(&db, t.id, "# v2\n- a\n- b\n", "user")
+            .await
+            .unwrap();
+        assert_eq!(second.id, first.id, "same row updated, not a new one");
+        let read = get_test_plan(&db, t.id).await.unwrap().expect("doc exists");
+        assert_eq!(read.content, "# v2\n- a\n- b\n");
+        assert_eq!(read.source, "user");
+    }
+
+    /// The lead-emit CAS lives in the SQL predicate itself: a user row saved at
+    /// or after the turn began wins; older user rows and lead rows are
+    /// replaced; a missing row inserts.
+    #[tokio::test]
+    async fn lead_upsert_cas_respects_newer_user_saves() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "w").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        // No row yet → insert.
+        assert!(lead_upsert_test_plan(&db, t.id, "# v1\n- a\n", 5_000).await.unwrap());
+        // Simulate a USER save stamped at t=10_000ms.
+        upsert_test_plan(&db, t.id, "# user\n- edited\n", "user").await.unwrap();
+        test_plan::Entity::update_many()
+            .col_expr(test_plan::Column::UpdatedAt, Expr::value("10000"))
+            .filter(test_plan::Column::ThreadId.eq(t.id))
+            .exec(&db.0)
+            .await
+            .unwrap();
+        // A turn that started BEFORE the save (t=9_000) is stale → rejected.
+        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 9_000).await.unwrap());
+        let row = get_test_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(row.content, "# user\n- edited\n");
+        assert_eq!(row.source, "user");
+        // Same-millisecond boundary: still the user's (>= is conservative).
+        assert!(!lead_upsert_test_plan(&db, t.id, "# stale\n- x\n", 10_000).await.unwrap());
+        // A turn that started AFTER the save (t=11_000) saw it as input → wins.
+        assert!(lead_upsert_test_plan(&db, t.id, "# revised\n- y\n", 11_000).await.unwrap());
+        let row = get_test_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(row.source, "lead");
+        assert_eq!(row.content, "# revised\n- y\n");
     }
 
     /// Engine meta snapshots roundtrip through thread.lead_meta / session.meta,

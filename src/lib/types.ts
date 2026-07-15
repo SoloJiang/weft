@@ -219,11 +219,24 @@ export interface LeadMessage {
     | "meta"
     | "action_card"
     | "plan_card"
+    | "test_cases"
     | "settled";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
   created_at: string;
+}
+
+/** An issue's test-case document (0..1 per thread): markdown tree derived by
+ *  the lead in phase 1.5 and editable in the TestPlanPanel. */
+export interface TestPlan {
+  id: number;
+  thread_id: number;
+  /** Markdown tree — `#` title + nested unordered lists; leaves are cases. */
+  content: string;
+  /** Last writer: "lead" | "user". */
+  source: string;
+  updated_at: string;
 }
 
 /** Incremental pushes on the `lead-chat` Tauri event (engine → UI). */

@@ -25,7 +25,8 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Copy each skill into the two target dirs under `cwd`. A skill whose name
-/// already exists in EITHER target (repo-owned) is skipped entirely.
+/// already exists in EITHER target (repo-owned) is skipped entirely. weft's
+/// built-in skills are appended after the enabled ones.
 pub fn materialize(skills: &[ParsedSkill], cwd: &Path) {
     for sk in skills {
         let exists = TARGET_DIRS
@@ -42,12 +43,72 @@ pub fn materialize(skills: &[ParsedSkill], cwd: &Path) {
             }
         }
     }
+    materialize_builtins(cwd);
+}
+
+/// weft's built-in skills, compiled into the binary. The `<!-- weft-builtin -->`
+/// marker (placed AFTER the frontmatter — skill loaders require `---` on the
+/// first line) distinguishes our copy from a user-owned same-name skill: a
+/// marked (or absent) target is (re)written so upgrades ship silently with the
+/// app; an unmarked existing skill is the user's and wins.
+const BUILTIN_TEST_CASES: &str = include_str!("builtin_test_cases.md");
+const BUILTIN_MARKER: &str = "<!-- weft-builtin -->";
+
+pub(crate) fn materialize_builtins(cwd: &Path) {
+    write_builtin(cwd, "weft-derive-test-cases", BUILTIN_TEST_CASES);
+}
+
+fn write_builtin(cwd: &Path, name: &str, content: &str) {
+    for d in TARGET_DIRS {
+        let dir = cwd.join(d).join(name);
+        let file = dir.join("SKILL.md");
+        if let Ok(existing) = std::fs::read_to_string(&file) {
+            if !existing.contains(BUILTIN_MARKER) {
+                continue; // user-owned same-name skill wins
+            }
+            if existing == content {
+                continue; // already current
+            }
+        }
+        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, content).is_ok() {
+            crate::git::git_exclude(cwd, &format!("{d}/{name}"));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::skills::parse::ParsedSkill;
+
+    /// Built-in skill semantics: fresh cwd gets it, a stale weft-marked copy is
+    /// upgraded in place, and a user-owned same-name skill is never touched.
+    #[test]
+    fn builtin_writes_upgrades_and_yields_to_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        // Fresh: written to both targets, frontmatter FIRST (skill loaders
+        // require `---` on line one), marker after it.
+        materialize_builtins(cwd);
+        let p = cwd.join(".claude/skills/weft-derive-test-cases/SKILL.md");
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.starts_with("---\n"), "frontmatter must be the first block");
+        assert!(body.contains(BUILTIN_MARKER));
+        assert!(body.contains("weft-derive-test-cases"));
+        // weft's own parser surfaces the metadata (description non-empty).
+        let parsed = crate::skills::cwd_skills(cwd, &[".claude/skills"]);
+        let sk = parsed.iter().find(|s| s.name == "weft-derive-test-cases").expect("parsed");
+        assert!(!sk.description.is_empty(), "frontmatter description must parse");
+        assert!(cwd.join(".agents/skills/weft-derive-test-cases/SKILL.md").exists());
+        // Stale weft copy: upgraded to the current binary's content.
+        std::fs::write(&p, format!("{BUILTIN_MARKER}\nold version")).unwrap();
+        materialize_builtins(cwd);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), BUILTIN_TEST_CASES);
+        // User-owned (no marker): wins, never overwritten.
+        std::fs::write(&p, "my own skill").unwrap();
+        materialize_builtins(cwd);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "my own skill");
+    }
 
     fn mkskill(base: &std::path::Path, name: &str) -> ParsedSkill {
         let d = base.join(name);

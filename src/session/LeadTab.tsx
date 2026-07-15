@@ -5,6 +5,7 @@ import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
 import { ChatComposer } from "./ChatComposer";
 import { SessionInfoPanel } from "./SessionInfoPanel";
+import { TestPlanPanel } from "./TestPlanPanel";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
@@ -73,15 +74,16 @@ export function LeadTab({
     skillsDirtyAt,
     markSkillsDirty,
     mergeLeadMeta,
-    leadRailOpen,
-    setLeadRailOpen,
+    leadRail,
+    setLeadRail,
   } = useStore();
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
   const [promptState, setPromptState] = useState<PromptState | null>(null);
-  // The Session rail is a store toggle (flipped from the top bar — this surface
-  // is header-less); the embedded curator panel (compact) never shows it.
-  const railOpen = !compact && leadRailOpen;
+  // The right rail is a store toggle (info flips from the top bar — this
+  // surface is header-less; tests opens from a test-cases card); the embedded
+  // curator panel (compact) never shows either.
+  const rail = compact ? "none" : leadRail;
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
   // The lead's working dir — resolves relative file paths it mentions in chat.
   const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
@@ -182,6 +184,13 @@ export function LeadTab({
     });
   };
 
+  // Bumping when the lead re-emits the document makes the open panel refetch:
+  // the latest test_cases card id only grows (append-only timeline).
+  const testPlanRefreshKey = msgs.reduce(
+    (acc, m) => (m.kind === "test_cases" ? m.id : acc),
+    0,
+  );
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
@@ -217,6 +226,7 @@ export function LeadTab({
           onRemove={(id) => void api.leadDequeue(tid, id)}
           onEdit={(id, text) => void api.leadEditQueued(tid, id, text)}
           onReorder={(order) => void api.leadReorderQueue(tid, order)}
+          onOpenTestPlan={compact ? undefined : () => setLeadRail("tests")}
         />
         <ChatComposer
           slashCommands={leadSlash[tid] ?? []}
@@ -291,14 +301,25 @@ export function LeadTab({
         </Dialog>
       </section>
 
-      {railOpen && (
+      {rail === "info" && (
         <SessionInfoPanel
           meta={leadMeta[tid]}
           skills={skills}
           subtasks={directionsByThread[tid]}
-          onClose={() => setLeadRailOpen(false)}
+          onClose={() => setLeadRail("none")}
           onReload={onReload}
           busy={turn.state === "busy"}
+        />
+      )}
+      {rail === "tests" && (
+        <TestPlanPanel
+          // Key by thread: switching issues remounts the panel, so issue A's
+          // edit mode/draft can never be saved into issue B.
+          key={tid}
+          threadId={tid}
+          refreshKey={testPlanRefreshKey}
+          onClose={() => setLeadRail("none")}
+          onSendToLead={(text) => void sendLeadChat(tid, text, [], [])}
         />
       )}
     </div>
