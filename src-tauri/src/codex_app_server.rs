@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::lead_chat::proto::ChatEvent;
@@ -468,7 +468,9 @@ pub enum ThreadMsg {
 }
 
 struct Inner {
-    stdin: ChildStdin,
+    /// Channel to the dedicated stdin writer task. Holds no `ChildStdin` directly,
+    /// so async writes never need the state lock.
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
     next_id: i64,
     /// our request id → awaiting caller (Ok(result) / Err(message)).
     pending: HashMap<i64, oneshot::Sender<Result<Value, String>>>,
@@ -545,11 +547,10 @@ impl Client {
                 let _ = self.reply_result(id, result).await;
             }
             None => {
-                let mut g = self.0.lock().await;
-                if let Some(inner) = g.as_mut() {
+                let g = self.0.lock().await;
+                if let Some(inner) = g.as_ref() {
                     let line = encode_error_response(id, -32601, "unsupported request");
-                    let _ = inner.stdin.write_all(line.as_bytes()).await;
-                    let _ = inner.stdin.flush().await;
+                    let _ = inner.write_tx.send(line.into_bytes());
                 }
             }
         }
@@ -615,8 +616,22 @@ impl Client {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tauri::async_runtime::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(bytes) = write_rx.recv().await {
+                if stdin.write_all(&bytes).await.is_err() {
+                    break;
+                }
+                if stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
         *g = Some(Inner {
-            stdin,
+            write_tx,
             next_id: 1,
             pending: HashMap::new(),
             threads: HashMap::new(),
@@ -759,11 +774,11 @@ impl Client {
             inner.next_id += 1;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
+            let line = encode_request(id, method, params);
             inner
-                .stdin
-                .write_all(encode_request(id, method, params).as_bytes())
-                .await?;
-            inner.stdin.flush().await?;
+                .write_tx
+                .send(line.into_bytes())
+                .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
             (id, rx)
         };
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
@@ -781,15 +796,15 @@ impl Client {
 
     /// Fire-and-forget notification (no reply expected).
     pub async fn notify(&self, method: &str, params: Option<Value>) -> anyhow::Result<()> {
-        let mut g = self.0.lock().await;
+        let g = self.0.lock().await;
         let inner = g
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
+        let line = encode_notification(method, params);
         inner
-            .stdin
-            .write_all(encode_notification(method, params).as_bytes())
-            .await?;
-        inner.stdin.flush().await?;
+            .write_tx
+            .send(line.into_bytes())
+            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
 
@@ -868,13 +883,15 @@ impl Client {
     /// has its own shape: approval `{decision}`, permissions `{permissions}`,
     /// elicitation `{action}` — the caller builds the right one.
     pub async fn reply_result(&self, id: &Value, result: Value) -> anyhow::Result<()> {
-        let mut g = self.0.lock().await;
+        let g = self.0.lock().await;
         let inner = g
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
         let line = encode_response(id, result);
-        inner.stdin.write_all(line.as_bytes()).await?;
-        inner.stdin.flush().await?;
+        inner
+            .write_tx
+            .send(line.into_bytes())
+            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
 

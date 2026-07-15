@@ -82,7 +82,7 @@ pub fn command_for(tool: &str) -> String {
     };
     let cmd = found.unwrap_or_else(|| tool.to_string());
     if let Err(err) = validate_command(&cmd) {
-        tracing::warn!("invalid tool command override for {tool}: {err}; falling back to {tool}");
+        eprintln!("[weft][tool_command] invalid override for {tool}: {err}; falling back to {tool}");
         return tool.to_string();
     }
     cmd
@@ -97,7 +97,7 @@ pub fn effective(pin: Option<&str>, tool: &str) -> String {
         _ => command_for(tool),
     };
     if let Err(err) = validate_command(&cmd) {
-        tracing::warn!("invalid per-session command pin for {tool}: {err}; falling back to {tool}");
+        eprintln!("[weft][tool_command] invalid pin for {tool}: {err}; falling back to {tool}");
         return tool.to_string();
     }
     cmd
