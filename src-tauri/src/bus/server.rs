@@ -87,6 +87,15 @@ async fn handle_ask(
         .get("tool_name")
         .and_then(|v| v.as_str())
         .unwrap_or("tool");
+
+    // weft's OWN injected MCP tools are never permission-gated: the human
+    // governs them through weft's surfaces (Needs-you, the board, the
+    // direction-confirm flow), so a per-call prompt to read the task or post
+    // to the bus is pure interruption. Short-circuit before summarizing.
+    if is_weft_internal_tool(tool_name) {
+        return hook_decision("allow", "weft-internal tool (auto-approved)");
+    }
+
     let (summary, detail) = summarize(tool_name, req.get("tool_input"));
 
     // A standing rule (full access / always-allow) decides without surfacing.
@@ -111,6 +120,26 @@ async fn handle_ask(
             Json(json!({})).into_response()
         }
     }
+}
+
+/// A tool weft itself injected (`weft_planner` / `weft_bus` / `weft_curator` /
+/// `weft_global`). The Ask Bridge auto-approves these — the human already
+/// governs them through weft's own review surfaces, not per-call prompts.
+///
+/// Matched by the EXACT server segment of the `mcp__<server>__<tool>` name, NOT
+/// a `weft_` prefix: a user's own MCP server named e.g. `weft_analytics` yields
+/// `mcp__weft_analytics__…` and must still surface normally (mirrors the
+/// frontend's precise `WEFT_INTERNAL_MCP` set, not an open regex).
+fn is_weft_internal_tool(tool_name: &str) -> bool {
+    tool_name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .is_some_and(|(server, _)| {
+            matches!(
+                server,
+                "weft_planner" | "weft_bus" | "weft_curator" | "weft_global"
+            )
+        })
 }
 
 /// The PreToolUse hook response carrying a permission decision.
@@ -861,4 +890,29 @@ pub async fn serve(
         let _ = axum::serve(listener, app).await;
     });
     Ok((base, handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_weft_internal_tool;
+
+    #[test]
+    fn weft_internal_tools_auto_allow_exact_servers_only() {
+        // weft's own injected servers → auto-allow.
+        assert!(is_weft_internal_tool("mcp__weft_planner__get_test_cases"));
+        assert!(is_weft_internal_tool("mcp__weft_planner__get_task"));
+        assert!(is_weft_internal_tool("mcp__weft_bus__bus_inbox"));
+        assert!(is_weft_internal_tool("mcp__weft_bus__set_task_status"));
+        assert!(is_weft_internal_tool("mcp__weft_curator__get_repo_map"));
+        assert!(is_weft_internal_tool("mcp__weft_global__list_workspaces"));
+        // A user's own `weft_*`-named server must still surface (no prefix match).
+        assert!(!is_weft_internal_tool("mcp__weft_analytics__query"));
+        assert!(!is_weft_internal_tool("mcp__weftly__do"));
+        // Non-MCP tools (Bash, file ops) surface as before.
+        assert!(!is_weft_internal_tool("Bash"));
+        assert!(!is_weft_internal_tool("mcp__github__create_pr"));
+        // Malformed names never match.
+        assert!(!is_weft_internal_tool("mcp__weft_bus"));
+        assert!(!is_weft_internal_tool("weft_bus__x"));
+    }
 }
