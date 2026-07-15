@@ -153,7 +153,20 @@ const MindMapEditor = forwardRef<
     // arbitrary node HTML in the webview. Block that paste in the capture phase
     // (before mind-elixir's handler); ordinary text paste is unaffected.
     const onPaste = (e: ClipboardEvent) => {
-      if ((e.clipboardData?.getData("text/plain") ?? "").includes("MIND-ELIXIR-WAIT-COPY")) {
+      // Decode exactly like mind-elixir's paste path (JSON.parse then check the
+      // `magic` field) rather than a substring scan — an escaped marker
+      // (`MIND-ELIXIR-WAIT-COPY`) would slip a raw `includes` but still parse
+      // to the accepted magic. Non-JSON clipboard is ordinary text; let it through.
+      let isNodePayload = false;
+      try {
+        const parsed = JSON.parse(e.clipboardData?.getData("text/plain") ?? "") as {
+          magic?: unknown;
+        };
+        isNodePayload = parsed?.magic === "MIND-ELIXIR-WAIT-COPY";
+      } catch {
+        isNodePayload = false;
+      }
+      if (isNodePayload) {
         e.preventDefault();
         e.stopImmediatePropagation();
       }
