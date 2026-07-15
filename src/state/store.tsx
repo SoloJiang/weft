@@ -407,6 +407,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     showNeeds: boolean;
   } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
+  // Latest proposal in a ref so confirmProposal can read the SHOWN version without
+  // recreating the callback (mirrors activeThreadIdRef).
+  const proposalRef = useRef(proposal);
+  proposalRef.current = proposal;
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
@@ -1958,11 +1962,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           await refreshProposal(tid);
           return;
         }
-        // Confirm LIVE state, exactly like the full ScopeReview path (which also
-        // calls confirmProposal with no version): the backend materializes the
-        // proposal as it currently stands. No version snapshot means there is no
-        // stale-snapshot / navigate-on-mismatch machinery left to get wrong.
-        const ids = await api.confirmProposal(tid);
+        // Confirm the SHOWN version atomically: pass the loaded proposal's version
+        // (created_at) to the backend, which — under confirm's per-thread gate —
+        // materializes only if it still matches, else returns no ids. This guards
+        // a one-click against a single→single re-propose that swapped the scope
+        // after the card rendered, WITHOUT any frontend snapshot/navigate machinery:
+        // on a mismatch we just refresh so the card re-renders the fresh scope (the
+        // user re-confirms from there). The full ScopeReview path benefits equally.
+        const expectedVersion = proposalRef.current?.created_at;
+        const ids = await api.confirmProposal(tid, expectedVersion);
+        if (expectedVersion != null && ids.length === 0) {
+          if (activeThreadIdRef.current === tid) await refreshProposal(tid);
+          return;
+        }
         setProposal(null);
         setReviewingProposal(false);
         await loadThreadChildren(tid);
