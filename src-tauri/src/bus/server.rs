@@ -80,6 +80,7 @@ async fn handle_ask(
     Path((thread, dir)): Path<(i32, String)>,
     Query(q): Query<HashMap<String, String>>,
     State(asks): State<AskRegistry>,
+    State(db): State<Db>,
     Json(req): Json<Value>,
 ) -> Response {
     let tool = q.get("tool").map(|s| s.as_str()).unwrap_or("claude");
@@ -91,9 +92,16 @@ async fn handle_ask(
     // weft's OWN injected MCP tools are never permission-gated: the human
     // governs them through weft's surfaces (Needs-you, the board, the
     // direction-confirm flow), so a per-call prompt to read the task or post
-    // to the bus is pure interruption. Short-circuit before summarizing.
+    // to the bus is pure interruption. Short-circuit before summarizing — but
+    // ONLY when weft actually injected this server for THIS session. A repo/user
+    // MCP server that reused a weft server name (e.g. its own `weft_planner`) in
+    // a session where weft never injected it must still surface the card.
     if is_weft_internal_tool(tool_name) {
-        return hook_decision("allow", "weft-internal tool (auto-approved)");
+        if let Some((server, _)) = split_internal_tool(tool_name) {
+            if session_injected(&db, thread, &dir, server).await {
+                return hook_decision("allow", "weft-internal tool (auto-approved)");
+            }
+        }
     }
 
     let (summary, detail) = summarize(tool_name, req.get("tool_input"));
@@ -202,6 +210,45 @@ fn split_internal_tool(tool_name: &str) -> Option<(&str, &str)> {
 fn is_weft_internal_tool(tool_name: &str) -> bool {
     split_internal_tool(tool_name)
         .is_some_and(|pair| AUTO_APPROVED_INTERNAL_TOOLS.contains(&pair))
+}
+
+/// The weft servers a session injects, by thread `kind` and whether it is a
+/// worker lane (its ask `dir` is a direction id, not `LEAD`). This MIRRORS the
+/// injection branch in `lead_chat::commands::start_lead` — the one place that
+/// decides what each session gets — so the Ask Bridge only auto-approves a server
+/// weft actually put in THIS session:
+///   worker lane        → weft_bus
+///   concierge (kind)   → weft_global (never the per-thread bus)
+///   curator (kind)     → weft_curator + weft_bus
+///   per-issue lead     → weft_planner + weft_bus
+fn session_servers(kind: Option<&str>, is_worker: bool) -> &'static [&'static str] {
+    if is_worker {
+        return &["weft_bus"];
+    }
+    match kind {
+        Some("concierge") => &["weft_global"],
+        Some("curator") => &["weft_curator", "weft_bus"],
+        _ => &["weft_planner", "weft_bus"],
+    }
+}
+
+/// Whether weft injected `server` for the session identified by (thread, dir).
+/// Worker lanes get only the bus (no thread lookup); the lead family keys off the
+/// thread kind. On a missing/failed lookup the kind is `None`, which maps to the
+/// per-issue lead set — the most common session, and still a closed set, so an
+/// uninjected server is never auto-approved.
+async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool {
+    let is_worker = dir != crate::bus::LEAD;
+    let kind = if is_worker {
+        None
+    } else {
+        crate::store::repo::get_thread(db, thread)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.kind)
+    };
+    session_servers(kind.as_deref(), is_worker).contains(&server)
 }
 
 /// The PreToolUse hook response carrying a permission decision.
@@ -956,7 +1003,38 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::is_weft_internal_tool;
+    use super::{is_weft_internal_tool, session_servers};
+
+    #[test]
+    fn session_servers_mirror_injection_policy() {
+        // Worker lane injects only the bus, regardless of any thread kind.
+        assert_eq!(session_servers(None, true), &["weft_bus"]);
+        assert_eq!(session_servers(Some("concierge"), true), &["weft_bus"]);
+        // Lead family keys off the thread kind.
+        assert_eq!(session_servers(Some("concierge"), false), &["weft_global"]);
+        assert_eq!(
+            session_servers(Some("curator"), false),
+            &["weft_curator", "weft_bus"]
+        );
+        assert_eq!(
+            session_servers(Some("issue"), false),
+            &["weft_planner", "weft_bus"]
+        );
+        // Unknown/missing kind falls back to the common per-issue lead set.
+        assert_eq!(session_servers(None, false), &["weft_planner", "weft_bus"]);
+    }
+
+    #[test]
+    fn provenance_blocks_uninjected_servers() {
+        // A worker session never injects weft_global/weft_planner, so those
+        // (even with an allowlisted exact tool name) are not provably weft's.
+        assert!(!session_servers(None, true).contains(&"weft_global"));
+        assert!(!session_servers(None, true).contains(&"weft_planner"));
+        // Concierge injects only weft_global — not the per-thread bus.
+        assert!(!session_servers(Some("concierge"), false).contains(&"weft_bus"));
+        // Curator has no planner.
+        assert!(!session_servers(Some("curator"), false).contains(&"weft_planner"));
+    }
 
     #[test]
     fn weft_internal_known_tools_auto_allow() {
