@@ -506,7 +506,7 @@ export function AddRepoDialog({ open, onOpenChange }: DProps) {
                 <Textarea
                   autoFocus
                   rows={3}
-                  placeholder={"https://github.com/acme/web-app.git\ngit@github.com:acme/api.git"}
+                  placeholder={t("dialog.repoUrlPlaceholder")}
                   value={url}
                   onChange={(e) => setUrl(e.currentTarget.value)}
                   disabled={busy}

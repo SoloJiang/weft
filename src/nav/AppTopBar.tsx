@@ -270,7 +270,7 @@ export function AppTopBar() {
       >
         <span className="flex items-center gap-1.5">
           <Languages size={14} />
-          {lang === "zh" ? "中" : "EN"}
+          {lang === "zh" ? t("settings.langZh") : t("settings.langEn")}
         </span>
       </button>
 

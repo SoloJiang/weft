@@ -1668,10 +1668,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (sessionId == null) return;
       // Review-then-repair: the skill reviews, the same agent fixes what it
       // found and re-verifies — the human only sees the post-fix state.
-      const directive =
-        currentLang() === "zh"
-          ? "review 结束后，直接修复发现的问题并重新跑检查自验，然后简要汇报。"
-          : "After the review, fix the findings directly, re-run the checks to verify, then report briefly.";
+      const directive = i18n.t("lead.autoReviewDirective");
       const cmd = `/${resolveReviewSkill()} ${directive}`;
       await api.chatSend(sessionId, cmd);
     },

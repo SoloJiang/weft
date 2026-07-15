@@ -344,7 +344,7 @@ function GeneralSettings() {
           <div className="flex w-[360px] max-w-[42vw] items-center gap-2">
             <Input
               value={projectsDir}
-              placeholder="/Users/you/code"
+              placeholder={t("settings.projectsDirPlaceholder")}
               onChange={(e) => setProjectsDir(e.currentTarget.value)}
               className="h-8 min-w-0 bg-bg/80 font-mono text-[12px]"
             />
@@ -384,8 +384,8 @@ function GeneralSettings() {
               setLangState(v as Lang);
             }}
             options={[
-              { value: "zh", label: "中文" },
-              { value: "en", label: "English" },
+              { value: "zh", label: t("settings.langZh") },
+              { value: "en", label: t("settings.langEn") },
             ]}
           />
         </SettingRow>
@@ -627,8 +627,8 @@ function AppearanceSettings() {
             setLangState(v as Lang);
           }}
           options={[
-            { value: "zh", label: "中文" },
-            { value: "en", label: "English" },
+            { value: "zh", label: t("settings.langZh") },
+            { value: "en", label: t("settings.langEn") },
           ]}
         />
       </SettingRow>
@@ -701,7 +701,7 @@ function AutomationSettings() {
         <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>
           <Input
             value={reviewSkill}
-            placeholder="superpowers:requesting-code-review"
+            placeholder={t("settings.reviewSkillPlaceholder")}
             onChange={(e) => setReviewSkill(e.currentTarget.value)}
             className="h-8 w-[360px] max-w-[42vw] bg-bg/80 font-mono text-[12px]"
           />
@@ -931,7 +931,7 @@ function ImSettings() {
                 <ImField label={t("settings.imAppId")} hint={t("settings.imAppIdHint")}>
                   <Input
                     value={appId}
-                    placeholder="cli_xxxxxxxxxxxx"
+                    placeholder={t("settings.imAppIdPlaceholder")}
                     onChange={(e) => setAppId(e.currentTarget.value)}
                     className="h-8 w-full bg-bg/80 font-mono text-[12px]"
                   />
