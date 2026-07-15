@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import MindElixir, {
   type MindElixirInstance,
   type NodeObj,
@@ -8,6 +8,13 @@ import { en, zh_CN } from "mind-elixir/i18n";
 import "mind-elixir/style.css";
 
 import { parseTestPlanMarkdown, mindTreeToMarkdown, type MindTree } from "./mindTree";
+
+/** Imperative handle: Save reads the live tree synchronously, bypassing the
+ *  debounced onChange so the final edit before a quick Save is never lost. */
+export interface MindMapEditorHandle {
+  /** Current tree serialized to markdown, or null before the editor mounts. */
+  flush: () => string | null;
+}
 
 // mind-elixir needs a unique id per node; a module counter is enough (ids are
 // never persisted — we serialize topics/structure back to markdown, not ids).
@@ -52,25 +59,38 @@ const PALETTE = ["#26a6ba", "#f27d53", "#8aa9c9", "#7c9885", "#b087c9", "#c9a15f
  * exactly what is on screen. Lazy-loaded so mind-elixir stays out of the main
  * bundle (the panel is rarely open, and never in edit mode until asked).
  */
-export default function MindMapEditor({
-  markdown,
-  rootLabel,
-  locale,
-  onChange,
-}: {
-  markdown: string;
-  /** Names the root when the document has no single heading of its own. */
-  rootLabel: string;
-  locale: "en" | "zh";
-  onChange: (markdown: string) => void;
-}) {
+const MindMapEditor = forwardRef<
+  MindMapEditorHandle,
+  {
+    markdown: string;
+    /** Names the root when the document has no single heading of its own. */
+    rootLabel: string;
+    locale: "en" | "zh";
+    onChange: (markdown: string) => void;
+  }
+>(function MindMapEditor({ markdown, rootLabel, locale, onChange }, ref) {
   const elRef = useRef<HTMLDivElement>(null);
+  // The live instance, exposed via the imperative handle so Save can read the
+  // current tree synchronously (the debounced onChange may not have fired yet).
+  const mindRef = useRef<MindElixirInstance | null>(null);
   // Keep the latest callbacks/labels in refs so the init effect runs exactly
   // once per mount — re-initializing would discard the user's in-progress edits.
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const rootLabelRef = useRef(rootLabel);
   rootLabelRef.current = rootLabel;
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      flush: () => {
+        const mind = mindRef.current;
+        if (!mind) return null;
+        return mindTreeToMarkdown(fromNodeObj(mind.getData().nodeData), rootLabelRef.current);
+      },
+    }),
+    [],
+  );
 
   useEffect(() => {
     const el = elRef.current;
@@ -96,6 +116,7 @@ export default function MindMapEditor({
     };
     const mind: MindElixirInstance = new MindElixir(options);
     mind.init({ nodeData: toNodeObj(tree) });
+    mindRef.current = mind;
     // Fit the whole tree into the panel on open — mind-elixir's default view
     // centers the root at native scale, which pushes a right-growing tree off
     // the edge in a narrow column. A rAF lets the initial layout settle first.
@@ -128,6 +149,7 @@ export default function MindMapEditor({
       if (emitTimer) clearTimeout(emitTimer);
       mind.bus.removeListener("operation", emit);
       mind.destroy();
+      mindRef.current = null;
     };
     // Init once per mount. `markdown` is the seed only; after mount THIS editor
     // is the source of truth (it pushes changes out, never takes them back in),
@@ -137,4 +159,6 @@ export default function MindMapEditor({
   }, []);
 
   return <div ref={elRef} className="mind-elixir h-full w-full" />;
-}
+});
+
+export default MindMapEditor;

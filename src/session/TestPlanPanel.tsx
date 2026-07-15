@@ -11,6 +11,7 @@ import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { clampPanelWidth } from "./panelWidth";
 import { cn } from "../lib/cn";
 import type { NodePath } from "./MindMapView";
+import type { MindMapEditorHandle } from "./MindMapEditor";
 
 // markmap + d3 (preview) and mind-elixir (editor) stay out of the main bundle;
 // the panel is rarely open, and the editor loads only when editing begins.
@@ -87,6 +88,9 @@ export function TestPlanPanel({
   // preview and say so. (Thread switches remount via key, so mode is fresh.)
   // The toast's `t` lives in a ref: locale toggles swap the `t` identity, and
   // a translation change must never re-run this effect and discard a draft.
+  // The live mindmap editor (edit mode only) — Save flushes its current tree
+  // through this rather than trusting the debounced draft.
+  const editorRef = useRef<MindMapEditorHandle>(null);
   const tRef = useRef(t);
   tRef.current = t;
   useEffect(() => {
@@ -119,7 +123,10 @@ export function TestPlanPanel({
   };
 
   const saveEdit = async () => {
-    const content = draft.trim();
+    // Flush the editor's live tree — a rename/add/drag right before Save schedules
+    // its onChange on a debounce that may not have fired, so `draft` can lag. Fall
+    // back to `draft` if the editor is gone (unmounted between click and read).
+    const content = (editorRef.current?.flush() ?? draft).trim();
     if (!content) {
       toast(t("testPlan.emptyError"));
       return;
@@ -182,6 +189,7 @@ export function TestPlanPanel({
           <div className="min-h-0 flex-1 overflow-hidden rounded-[var(--radius-md)] border border-border bg-surface">
             <Suspense fallback={<div className="p-4 text-xs text-ink-faint">{t("testPlan.loading")}</div>}>
               <MindMapEditor
+                ref={editorRef}
                 markdown={plan.content}
                 rootLabel={t("testPlan.defaultTitle")}
                 locale={currentLang()}

@@ -33,6 +33,10 @@ const BULLET_BASE = 7;
 export function parseTestPlanMarkdown(md: string): MindTree {
   const root: MindTree = { topic: "", children: [] };
   const stack: { depth: number; node: MindTree }[] = [{ depth: 0, node: root }];
+  // Which nodes came from a heading (vs a bullet). Only a genuine single-heading
+  // root is unwrapped below; a heading-less outline whose sole top-level node is
+  // a bullet keeps the synthetic root so its one branch isn't promoted to title.
+  const fromHeading = new WeakSet<MindTree>();
 
   for (const raw of md.split("\n")) {
     const line = raw.replace(/\s+$/, "");
@@ -40,10 +44,12 @@ export function parseTestPlanMarkdown(md: string): MindTree {
 
     let depth: number;
     let topic: string;
+    let isHeading = false;
     const h = HEADING.exec(line);
     if (h) {
       depth = h[1].length;
       topic = h[2].trim();
+      isHeading = true;
     } else {
       const b = BULLET.exec(line);
       if (!b) continue;
@@ -55,12 +61,18 @@ export function parseTestPlanMarkdown(md: string): MindTree {
 
     while (stack.length > 1 && stack[stack.length - 1].depth >= depth) stack.pop();
     const node: MindTree = { topic, children: [] };
+    if (isHeading) fromHeading.add(node);
     stack[stack.length - 1].node.children.push(node);
     stack.push({ depth, node });
   }
 
-  // A single `#` root is the norm — unwrap the synthetic holder in that case.
-  if (root.topic === "" && root.children.length === 1) return root.children[0];
+  // A single `#` heading root is the norm — unwrap the synthetic holder only then.
+  // A heading-less document with one top-level bullet keeps the holder so the
+  // bullet stays a branch (fallbackTitle names the root) instead of becoming it.
+  const sole = root.children[0];
+  if (root.topic === "" && root.children.length === 1 && fromHeading.has(sole)) {
+    return sole;
+  }
   return root;
 }
 
