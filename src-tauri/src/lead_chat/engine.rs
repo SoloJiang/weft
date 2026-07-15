@@ -1621,6 +1621,27 @@ pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyho
     }
 }
 
+/// Snapshot of engine state taken while reserving a send slot. Carrying it
+/// across await points lets later phases re-verify the reservation is still
+/// valid before mutating the engine.
+struct SendContext {
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn: i32,
+    direct: bool,
+    is_command: bool,
+    tool: String,
+    origin_tag: Option<String>,
+}
+
+/// True when the reservation made in `send` Phase 1 is still valid in Phase 3.
+/// Stop/reset can race while the engine lock is dropped, so we re-check
+/// `stopped`, turn identity, and (for direct sends) the busy flag before
+/// writing to stdin, queueing, or spawning.
+fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
+    !inner.stopped && inner.turn_id == ctx.turn && (!ctx.direct || inner.turn.busy)
+}
+
 /// Send a human message: optimistic-persist + either write through or queue.
 /// `images` ride the outbound message as base64 blocks; `files` are appended
 /// as plain paths (the agent reads them with its own tools).
@@ -1723,15 +1744,6 @@ pub async fn send(
     // snapshot the fields needed for persistence. All slow IO (DB writes,
     // image spills, stdin writes) happens after the lock drops so
     // stop/interrupt/status stay responsive for the session.
-    struct SendContext {
-        thread_id: i32,
-        session_id: Option<i32>,
-        turn: i32,
-        direct: bool,
-        is_command: bool,
-        tool: String,
-        origin_tag: Option<String>,
-    }
     let ctx = {
         let mut inner = eng.lock().await;
         let direct = inner.turn.try_begin_send();
@@ -1857,6 +1869,15 @@ pub async fn send(
     let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_codex_appserver;
     {
         let mut inner = eng.lock().await;
+        // Stop/reset can race between Phase 1 and Phase 3. If the reservation
+        // was invalidated while the lock was dropped, abort instead of writing
+        // to a dead stdin, queueing on a drained turn, or spawning after stop.
+        if !send_reservation_valid(&inner, &ctx) {
+            drop(inner);
+            let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
+            emit_finalize(app, ctx.thread_id, row_id, "interrupted");
+            return Err(anyhow::anyhow!("engine stopped before send could complete"));
+        }
         if ctx.direct && !spawn_now && !is_codex_appserver {
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
@@ -4114,6 +4135,47 @@ mod tests {
             hidden_delivery("codex", false, false, true),
             HiddenDelivery::Noop
         );
+    }
+
+    #[test]
+    fn send_reservation_valid_requires_stopped_turn_and_busy_flag() {
+        let mut inner = test_inner("claude");
+        inner.turn_id = 5;
+        inner.turn.busy = true;
+        let direct_ctx = SendContext {
+            thread_id: 1,
+            session_id: None,
+            turn: 5,
+            direct: true,
+            is_command: false,
+            tool: "claude".into(),
+            origin_tag: None,
+        };
+        assert!(send_reservation_valid(&inner, &direct_ctx));
+
+        // Stopped engine invalidates any reservation.
+        inner.stopped = true;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        inner.stopped = false;
+
+        // Turn identity mismatch means the reservation was reset.
+        inner.turn_id = 6;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        inner.turn_id = 5;
+
+        // Direct send must still hold the busy flag it reserved.
+        inner.turn.busy = false;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        inner.turn.busy = true;
+
+        // Queued sends don't own busy, but still respect stopped/turn identity.
+        let queued_ctx = SendContext {
+            direct: false,
+            ..direct_ctx
+        };
+        assert!(send_reservation_valid(&inner, &queued_ctx));
+        inner.stopped = true;
+        assert!(!send_reservation_valid(&inner, &queued_ctx));
     }
 
     #[test]
