@@ -256,6 +256,13 @@ function subtaskDot(status: string): string {
   }
 }
 
+/** MCP server connection status → dot color. */
+function mcpDot(status: string): string {
+  if (status === "connected") return "bg-running";
+  if (status === "failed") return "bg-danger";
+  return "bg-idle";
+}
+
 // Display-only row (not interactive → no hover affordance): tool icon, name,
 // status dot.
 function SubtaskRow({ direction }: { direction: Direction }) {
@@ -283,8 +290,7 @@ function SubtaskRow({ direction }: { direction: Direction }) {
 function McpRow({ name, status, tools }: { name: string; status: string; tools: string[] }) {
   const [open, setOpen] = useState(true); // 默认展开
   const { t } = useTranslation();
-  const dot =
-    status === "connected" ? "bg-running" : status === "failed" ? "bg-danger" : "bg-idle";
+  const dot = mcpDot(status);
   const hasTools = tools.length > 0;
   return (
     // -mx-1.5 pulls the row out so the status dot lines up with the section

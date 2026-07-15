@@ -27,7 +27,9 @@ export function resolvePref(pref: ThemePref): ResolvedTheme {
 
 /** Cycle order for the quick toggle: System → Light → Dark → System. */
 export function nextPref(pref: ThemePref): ThemePref {
-  return pref === "system" ? "light" : pref === "light" ? "dark" : "system";
+  if (pref === "system") return "light";
+  if (pref === "light") return "dark";
+  return "system";
 }
 
 /** Saved preference, else "system". Tolerates legacy "dark"/"light" values. */
@@ -48,10 +50,11 @@ export function applyResolved(r: ResolvedTheme) {
 
 // --- shared module-level store: every useTheme() consumer stays in sync ---
 
-let state: { pref: ThemePref; resolved: ResolvedTheme } = (() => {
-  const pref = readPref();
-  return { pref, resolved: resolvePref(pref) };
-})();
+const initialPref = readPref();
+let state: { pref: ThemePref; resolved: ResolvedTheme } = {
+  pref: initialPref,
+  resolved: resolvePref(initialPref),
+};
 applyResolved(state.resolved);
 
 const listeners = new Set<() => void>();

@@ -33,7 +33,9 @@ export async function ensureNotifyPermission(): Promise<NotifyPermission> {
   if (p !== "prompt") return p;
   try {
     const r = await requestPermission();
-    return r === "granted" ? "granted" : r === "denied" ? "denied" : "prompt";
+    if (r === "granted") return "granted";
+    if (r === "denied") return "denied";
+    return "prompt";
   } catch {
     return "denied";
   }

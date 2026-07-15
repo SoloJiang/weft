@@ -10,6 +10,12 @@ import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
 
+function progressBarColor(attention: number, failing: number): string {
+  if (attention > 0) return "bg-waiting";
+  if (failing > 0) return "bg-danger";
+  return "bg-brand";
+}
+
 const COLUMNS: { key: Phase; label: string; dot: string }[] = [
   { key: "planning", label: "wsboard.planning", dot: "bg-idle" },
   { key: "working", label: "thread.colRunning", dot: "bg-running" },
@@ -157,6 +163,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   ).length;
   const total = Math.max(o.direction_ids.length, 1);
   const donePct = Math.min(100, Math.round((done / total) * 100));
+  const progressColor = progressBarColor(attention, failing);
 
   return (
     <motion.button
@@ -208,10 +215,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
         <div className="flex items-center gap-2">
           <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-bg">
             <span
-              className={cn(
-                "block h-full rounded-full",
-                attention > 0 ? "bg-waiting" : failing > 0 ? "bg-danger" : "bg-brand",
-              )}
+              className={cn("block h-full rounded-full", progressColor)}
               style={{ width: `${donePct}%` }}
             />
           </div>

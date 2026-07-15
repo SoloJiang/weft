@@ -13,14 +13,14 @@ import {
   Sun,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { currentLang, setLang } from "../i18n";
 import { Button } from "../components/ui/Button";
 import { cn } from "../lib/cn";
 import { useStore } from "../state/store";
-import { useTheme } from "../state/theme";
+import { useTheme, type ThemePref } from "../state/theme";
 import { AddRepoDialog } from "./dialogs";
 
 export function AppTopBar() {
@@ -55,8 +55,17 @@ export function AppTopBar() {
   } = useStore();
   const { t } = useTranslation();
   const { pref, cycle } = useTheme();
-  const themeLabel =
-    pref === "system" ? t("settings.system") : pref === "light" ? t("settings.light") : t("settings.dark");
+  const themeLabels: Record<ThemePref, string> = {
+    system: t("settings.system"),
+    light: t("settings.light"),
+    dark: t("settings.dark"),
+  };
+  const themeLabel = themeLabels[pref];
+  const themeIcons: Record<ThemePref, ReactNode> = {
+    system: <Monitor size={15} />,
+    light: <Sun size={15} />,
+    dark: <Moon size={15} />,
+  };
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const lang = currentLang();
   const thread = threads.find((th) => th.id === activeThreadId);
@@ -271,7 +280,7 @@ export function AppTopBar() {
         title={`${t("palette.theme")} · ${themeLabel}`}
         className="grid h-8 w-8 place-items-center rounded-[var(--radius-md)] text-ink-muted transition-colors hover:bg-brand-ghost hover:text-ink"
       >
-        {pref === "system" ? <Monitor size={15} /> : pref === "light" ? <Sun size={15} /> : <Moon size={15} />}
+        {themeIcons[pref]}
       </button>
       <AddRepoDialog open={repoDialogOpen} onOpenChange={setRepoDialogOpen} />
     </header>

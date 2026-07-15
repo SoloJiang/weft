@@ -56,6 +56,13 @@ export interface OpenSession {
   nativeId: string | null;
 }
 
+type LeadWorkerState = "busy" | "idle" | "stopped";
+const SESSION_STATUS: Record<LeadWorkerState, SessionStatus> = {
+  busy: "running",
+  idle: "idle",
+  stopped: "exited",
+};
+
 interface Store {
   workspaces: Workspace[];
   activeWorkspaceId: number | null;
@@ -455,7 +462,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
   useEffect(() => {
-    void (async () => {
+    async function initTools() {
       try {
         const [info, tools] = await Promise.all([api.getDefaultTool(), api.detectTools()]);
         setDefaultToolState(info.tool);
@@ -463,9 +470,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setInstalledTools(tools);
       } catch (e) {
         // Pure-vite dev without the Tauri backend: keep the static defaults.
-      console.error(e);
+        console.error(e);
+      }
     }
-    })();
+    void initTools();
   }, []);
   const setDefaultTool = useCallback((tl: string) => {
     setDefaultToolState(tl);
@@ -1102,8 +1110,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // if the worker's idle push raced in before this adoption, the live slot still
     // says busy, but the dot/live-counts must show idle (not stuck "running").
     const ts = workerTurnRef.current[sid]?.state;
-    const status: SessionStatus =
-      ts === "idle" ? "idle" : ts === "stopped" ? "exited" : slot.busy ? "running" : "idle";
+    let status: SessionStatus = "idle";
+    if (ts === "stopped") {
+      status = "exited";
+    } else if (ts !== "idle" && slot.busy) {
+      status = "running";
+    }
     setSessions((m) =>
       m[sid]
         ? m
@@ -1178,7 +1190,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let un: (() => void) | undefined;
     let cancelled = false;
-    void (async () => {
+    async function attach() {
       un = await listen("worker-revived", () => void hydrateLiveWorkers());
       if (cancelled) {
         un();
@@ -1186,7 +1198,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return;
       }
       void hydrateLiveWorkers();
-    })();
+    }
+    void attach();
     return () => {
       cancelled = true;
       un?.();
@@ -1417,8 +1430,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                   ...m,
                   [sid]: {
                     ...m[sid],
-                    status:
-                      p.state === "busy" ? "running" : p.state === "idle" ? "idle" : "exited",
+                    status: SESSION_STATUS[p.state],
                   },
                 }
               : m,
@@ -1429,15 +1441,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // — works for any worker (known, revived, or headless) and reads the phase
           // at completion time, so a planning→working transition mid-turn is honored.
           if (p.state === "idle" && prevTurn !== "idle") {
-            void (async () => {
+            async function runAutoVerify() {
               try {
                 const dirId = await api.autoVerifyCheck(sid);
                 if (dirId != null) verifyDirectionRef.current(dirId);
               } catch (e) {
                 /* best-effort auto-verify */
-      console.error(e);
-    }
-            })();
+                console.error(e);
+              }
+            }
+            void runAutoVerify();
           }
 
         } else {
@@ -1493,13 +1506,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const discoverLeadSlash = useCallback((threadId: number) => {
-    void (async () => {
+    async function discover() {
       try {
         await api.leadEnsure(threadId, currentLang());
       } catch (e) {
         /* discovery can still try the non-resident fallback below */
-      console.error(e);
-    }
+        console.error(e);
+      }
       try {
         const cmds = await api.discoverSlash(threadId, null);
         if (cmds.length > 0) {
@@ -1507,9 +1520,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }
       } catch (e) {
         /* slash discovery is best-effort */
-      console.error(e);
+        console.error(e);
+      }
     }
-    })();
+    void discover();
   }, []);
 
   const loadLeadChat = useCallback(async (threadId: number) => {
@@ -1796,7 +1810,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const ensureCuratorThreadId = useCallback(async (ws: number): Promise<number> => {
     const inflight = curatorEnsureRef.current.get(ws);
     if (inflight) return inflight;
-    const p = (async () => {
+    async function ensureCurator() {
       const id = await api.openCuratorChat(ws); // get-or-create; returns the id
       const list = await api.listThreads(ws);
       if (activeWorkspaceIdRef.current === ws) {
@@ -1804,7 +1818,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setCuratorThreadId(id);
       }
       return id;
-    })();
+    }
+    const p = ensureCurator();
     curatorEnsureRef.current.set(ws, p);
     try {
       return await p;
