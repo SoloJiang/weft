@@ -1934,6 +1934,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // The full ScopeReview path passes no version (the user reviewed live state).
     if (expectedVersion != null) {
       const current = await api.getProposal(activeThreadId);
+      // If the user switched threads during the fetch, abandon quietly — writing
+      // this thread's proposal into the shared state (or opening its review) would
+      // show/act on the wrong thread's scope (mirrors the ref guard other async
+      // proposal refreshes use here).
+      if (activeThreadIdRef.current !== activeThreadId) return;
       setProposal(current);
       const stillMatches =
         current != null &&
