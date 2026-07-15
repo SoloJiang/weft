@@ -1638,8 +1638,20 @@ struct SendContext {
 /// Stop/reset can race while the engine lock is dropped, so we re-check
 /// `stopped`, turn identity, and (for direct sends) the busy flag before
 /// writing to stdin, queueing, or spawning.
+///
+/// Queued sends do not reserve a specific turn; they only observed that the
+/// engine was busy in Phase 1. The active turn may finish (and `turn_id`
+/// advance) while the lock is dropped, so queued sends tolerate a turn-id
+/// change as long as the engine itself has not been stopped.
 fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
-    !inner.stopped && inner.turn_id == ctx.turn && (!ctx.direct || inner.turn.busy)
+    if inner.stopped {
+        return false;
+    }
+    if ctx.direct {
+        inner.turn_id == ctx.turn && inner.turn.busy
+    } else {
+        true
+    }
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
@@ -1885,6 +1897,15 @@ pub async fn send(
                 return Err(e);
             }
         } else if !ctx.direct {
+            // The queue cap was checked in Phase 1, but multiple queued sends
+            // can race through DB/attachment I/O and observe the same count.
+            // Re-check under the lock before appending to keep the limit real.
+            if visible_queued(&inner.turn) >= MAX_QUEUED {
+                drop(inner);
+                let _ = repo::update_lead_message(db, row_id, &content, "error").await;
+                emit_finalize(app, ctx.thread_id, row_id, "error");
+                return Err(anyhow::anyhow!("queue_full"));
+            }
             inner.turn.queue.push_back(out.clone());
         }
         let _ = app.emit(
@@ -4168,11 +4189,14 @@ mod tests {
         assert!(!send_reservation_valid(&inner, &direct_ctx));
         inner.turn.busy = true;
 
-        // Queued sends don't own busy, but still respect stopped/turn identity.
+        // Queued sends don't own busy and tolerate the active turn advancing
+        // while the lock was dropped; only a stop invalidates them.
         let queued_ctx = SendContext {
             direct: false,
             ..direct_ctx
         };
+        assert!(send_reservation_valid(&inner, &queued_ctx));
+        inner.turn_id = 6;
         assert!(send_reservation_valid(&inner, &queued_ctx));
         inner.stopped = true;
         assert!(!send_reservation_valid(&inner, &queued_ctx));
