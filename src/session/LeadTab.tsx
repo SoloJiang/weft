@@ -5,7 +5,7 @@ import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
 import { ChatComposer } from "./ChatComposer";
 import { SessionInfoPanel } from "./SessionInfoPanel";
-import { TestPlanPanel } from "./TestPlanPanel";
+import { TestPlanPanel, testPlanCaseCount } from "./TestPlanPanel";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
@@ -87,6 +87,12 @@ export function LeadTab({
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
   // The lead's working dir — resolves relative file paths it mentions in chat.
   const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
+  // Live test-case count for the plan card, sourced from the test_plan table so
+  // it matches what the panel's View opens. Bumped by a user panel edit (which
+  // rewrites the table WITHOUT a test_cases card); lead re-emits refetch via the
+  // test_cases card id below.
+  const [testCaseCount, setTestCaseCount] = useState(0);
+  const [testPlanEditNonce, setTestPlanEditNonce] = useState(0);
 
   // The thread this chat renders. Defaults to the globally-active thread (the
   // ThreadBoard usage); the embedded curator panel passes its own thread id so
@@ -156,6 +162,39 @@ export function LeadTab({
     };
   }, [tid]);
 
+  // The latest test_cases card id only grows (append-only timeline). The lead
+  // ALWAYS emits a test_cases card when it (re)writes the test_plan table, so
+  // this id tracks every lead-side write; bumping the open panel makes it
+  // refetch too. (test_cases rows are lead-only, so the unfiltered messages give
+  // the same id as the visible timeline.)
+  const testPlanRefreshKey = (leadMessages[tid ?? -1] ?? []).reduce(
+    (acc, m) => (m.kind === "test_cases" ? m.id : acc),
+    0,
+  );
+
+  // Recount the plan card against the LIVE test plan on thread switch, lead
+  // re-emit (refreshKey), and user panel edit (editNonce) — the card must show
+  // the same count the View button opens, even after an edit that posts no
+  // test_cases card. `alive` drops responses raced by a newer trigger/thread.
+  useEffect(() => {
+    if (tid == null) {
+      setTestCaseCount(0);
+      return;
+    }
+    let alive = true;
+    void api
+      .getTestPlan(tid)
+      .then((p) => {
+        if (alive) setTestCaseCount(p ? testPlanCaseCount(p.content) : 0);
+      })
+      .catch(() => {
+        if (alive) setTestCaseCount(0);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [tid, testPlanRefreshKey, testPlanEditNonce]);
+
   if (tid == null) return null;
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
@@ -183,13 +222,6 @@ export function LeadTab({
       promptText,
     });
   };
-
-  // Bumping when the lead re-emits the document makes the open panel refetch:
-  // the latest test_cases card id only grows (append-only timeline).
-  const testPlanRefreshKey = msgs.reduce(
-    (acc, m) => (m.kind === "test_cases" ? m.id : acc),
-    0,
-  );
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
@@ -227,6 +259,7 @@ export function LeadTab({
           onEdit={(id, text) => void api.leadEditQueued(tid, id, text)}
           onReorder={(order) => void api.leadReorderQueue(tid, order)}
           onOpenTestPlan={compact ? undefined : () => setLeadRail("tests")}
+          testCaseCount={testCaseCount}
         />
         <ChatComposer
           slashCommands={leadSlash[tid] ?? []}
@@ -320,6 +353,7 @@ export function LeadTab({
           refreshKey={testPlanRefreshKey}
           onClose={() => setLeadRail("none")}
           onSendToLead={(text) => void sendLeadChat(tid, text, [], [])}
+          onEdited={() => setTestPlanEditNonce((n) => n + 1)}
         />
       )}
     </div>

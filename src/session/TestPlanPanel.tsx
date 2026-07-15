@@ -22,6 +22,35 @@ const clampW = (x: number) => clampPanelWidth(x, MIN_W, MAX_W);
 type Mode = "preview" | "edit";
 
 /**
+ * Count the leaf cases in a test-plan markdown tree — a list item with no
+ * deeper list item directly below it (nested items are groupings). Faithfully
+ * mirrors the backend `lead_chat::test_plan::summarize` `caseCount`, the single
+ * source of truth the timeline summary card carries. Reproduced here so the plan
+ * card can count against the LIVE document (this table) instead of a stale
+ * summary row, keeping "shaped against N cases" in step with what View opens.
+ */
+export function testPlanCaseCount(md: string): number {
+  // Indent (leading-whitespace width) of each list item, in document order.
+  const indents: number[] = [];
+  for (const line of md.split("\n")) {
+    const trimmed = line.trimStart();
+    const indent = line.length - trimmed.length;
+    // `#`/`##` are the title and group headings, never individual cases.
+    if (trimmed.startsWith("# ") || trimmed.startsWith("## ")) continue;
+    if (!trimmed.startsWith("- ") && !trimmed.startsWith("* ")) continue;
+    if (!trimmed.slice(2).trim()) continue;
+    indents.push(indent);
+  }
+  let count = 0;
+  for (let i = 0; i < indents.length; i++) {
+    const next = indents[i + 1];
+    // A leaf: the next item (if any) is not more deeply indented.
+    if (next === undefined || next <= indents[i]) count += 1;
+  }
+  return count;
+}
+
+/**
  * The issue's test-case document as a real third column (same pattern as
  * DiffPanel): markmap preview, markdown source editing, node-anchored
  * ask/suggest actions that post back into the chat, and a fullscreen dialog.
@@ -33,6 +62,7 @@ export function TestPlanPanel({
   refreshKey,
   onClose,
   onSendToLead,
+  onEdited,
 }: {
   threadId: number;
   /** Bump when the lead re-emits (latest test_cases card id) → refetch. */
@@ -40,6 +70,9 @@ export function TestPlanPanel({
   onClose: () => void;
   /** Deliver a node-anchored question/suggestion as a chat message to the lead. */
   onSendToLead?: (text: string) => void;
+  /** A user save rewrote the test_plan table (no test_cases card is emitted for
+   *  panel edits) — lets the host recount the plan card against the new doc. */
+  onEdited?: () => void;
 }) {
   const { t } = useTranslation();
   const [w, setW] = useState(() => clampW(Number(localStorage.getItem("weft-testplan-w")) || 560));
@@ -129,6 +162,9 @@ export function TestPlanPanel({
         p ? { ...p, content, source: "user" } : { id: 0, thread_id: threadId, content, source: "user", updated_at: "" },
       );
       setMode("preview");
+      // The table changed but no test_cases card lands for panel edits — tell the
+      // host so the plan card recounts against the saved document.
+      onEdited?.();
       // Best-effort: the lead learns the new content; persisting already
       // succeeded, so a stopped lead only means it catches up via the
       // get_test_cases planner tool later.

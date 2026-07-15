@@ -62,6 +62,7 @@ export function ChatTimeline({
   onEdit = () => {},
   onReorder = () => {},
   onOpenTestPlan,
+  testCaseCount = 0,
 }: {
   messages: LeadMessage[];
   busy: boolean;
@@ -72,6 +73,10 @@ export function ChatTimeline({
   onReorder?: (order: number[]) => void;
   /** Open the test-plan panel from a test_cases card (lead host only). */
   onOpenTestPlan?: () => void;
+  /** Live leaf-case count of the issue's test_plan (0 = none). Sourced from the
+   *  table by the host so the plan card matches what the panel opens, not the
+   *  stale test_cases summary row (a user edit posts no new summary). */
+  testCaseCount?: number;
   /** The tool call executing right now (transient), if any. */
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
@@ -187,6 +192,7 @@ export function ChatTimeline({
               cwd={cwd}
               queuedCount={queue.length}
               onOpenTestPlan={onOpenTestPlan}
+              testCaseCount={testCaseCount}
             />
           </div>
         )}
@@ -381,6 +387,7 @@ function TimelineRow({
   cwd,
   queuedCount = 0,
   onOpenTestPlan,
+  testCaseCount = 0,
 }: {
   m: LeadMessage;
   all: LeadMessage[];
@@ -396,6 +403,8 @@ function TimelineRow({
   queuedCount?: number;
   /** Open the test-plan panel (lead host only; worker timelines render read-only). */
   onOpenTestPlan?: () => void;
+  /** Live leaf-case count of the issue's test_plan, for the plan card row. */
+  testCaseCount?: number;
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
@@ -535,6 +544,11 @@ function TimelineRow({
       }
       await api.resolveActionCard(m.id, title || t("planCard.label"));
     };
+    // The product thesis (cases inform the plan) is otherwise invisible: link
+    // the plan card to the issue's test cases when the issue has derived any.
+    // `testCaseCount` is the LIVE test_plan count the host fetched (not the stale
+    // test_cases summary), so it matches what the panel's View opens even after a
+    // user edit; the link only shows when the panel is openable (lead host).
     return (
       <PlanCardBlock
         title={title}
@@ -545,6 +559,8 @@ function TimelineRow({
         readOnly={readOnly}
         cwd={cwd}
         onApprove={onApprove}
+        testCaseCount={onOpenTestPlan ? testCaseCount : 0}
+        onOpenTestCases={onOpenTestPlan}
       />
     );
   }
