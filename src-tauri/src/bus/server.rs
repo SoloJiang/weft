@@ -224,7 +224,19 @@ fn session_servers_for_kind(kind: &str) -> &'static [&'static str] {
 /// thread — nothing is auto-approved and the tool surfaces the Needs-you card.
 async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool {
     if dir != crate::bus::LEAD {
-        return server == "weft_bus";
+        // Worker lane: only the bus, and only when `dir` is a REAL direction of
+        // this thread. Fail closed for a stale/deleted direction or a forged
+        // route (an engine/hook outliving its direction, a leftover .weft-ask).
+        if server != "weft_bus" {
+            return false;
+        }
+        let Ok(direction_id) = dir.parse::<i32>() else {
+            return false;
+        };
+        return matches!(
+            crate::store::repo::get_direction(db, direction_id).await,
+            Ok(Some(d)) if d.thread_id == thread
+        );
     }
     match crate::store::repo::get_thread(db, thread).await {
         Ok(Some(t)) => session_servers_for_kind(&t.kind).contains(&server),
