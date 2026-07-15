@@ -147,8 +147,8 @@ interface Store {
   /** Whether the board canvas is showing the proposal's scope-confirm. */
   reviewingProposal: boolean;
   setReviewingProposal: (v: boolean) => void;
-  /** Thread id whose proposal is currently confirming/dispatching, else null. */
-  confirmingProposal: number | null;
+  /** Threads whose proposal is currently confirming/dispatching (per-thread). */
+  confirmingProposal: ReadonlySet<number>;
   /** Active issue-level tab: console first, board second. */
   threadTab: ThreadTab;
   setThreadTab: (tab: ThreadTab) => void;
@@ -416,10 +416,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
-  // Thread whose proposal is being confirmed/dispatched right now (or null). The
-  // fast-dispatch card reads this instead of local state so a virtualized-row
-  // unmount can't drop the in-flight guard mid-dispatch.
-  const [confirmingProposal, setConfirmingProposal] = useState<number | null>(null);
+  // Threads whose proposal is confirming/dispatching right now. A SET (not a
+  // single slot) so a concurrent fast confirm on thread B can't clobber thread
+  // A's in-flight marker; the fast-dispatch card reads this instead of local
+  // state so a virtualized-row unmount can't drop the guard mid-dispatch.
+  const [confirmingProposal, setConfirmingProposal] = useState<ReadonlySet<number>>(
+    () => new Set(),
+  );
   const [threadTab, setThreadTab] = useState<ThreadTab>("lead");
   // Start collapsed when the window opens below the floor (e.g. restored at a
   // narrow size); the resize effect below keeps it in sync on threshold crosses.
@@ -1923,7 +1926,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // In-flight flag lives in the store, NOT the fast card's local state: the
       // card sits in a virtualized row that can unmount mid-dispatch (scrolled
       // away), which would drop a local guard and let a second click re-dispatch.
-      setConfirmingProposal(tid);
+      setConfirmingProposal((s) => new Set(s).add(tid));
       try {
         // Flush any in-flight base-branch save before materializing. If it REJECTED
         // (a re-propose moved the lane, or a DB error), the backend still holds the
@@ -1937,6 +1940,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         } catch {
           // handled by the latch below
         }
+        // The base-save flush is async — if the user switched threads during it,
+        // abandon without touching this thread's proposal or opening its review
+        // (the same active-thread guard the version re-check below applies).
+        if (activeThreadIdRef.current !== tid) return "abandoned";
         // Also abort if any EARLIER link in the chain failed — the chain's
         // `.catch(() => {})` swallows predecessors for serialization, so the final
         // promise may resolve even when a prior save rejected.
@@ -1976,7 +1983,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         for (const id of ids) void dispatchDirection(id);
         return "dispatched";
       } finally {
-        setConfirmingProposal((cur) => (cur === tid ? null : cur));
+        setConfirmingProposal((s) => {
+          if (!s.has(tid)) return s;
+          const next = new Set(s);
+          next.delete(tid);
+          return next;
+        });
       }
     },
     [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal],

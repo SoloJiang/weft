@@ -88,7 +88,7 @@ export function ChatTimeline({
   /** Confirm-and-dispatch a single-direction proposal in one click (lead host). */
   onConfirmProposal?: (version: string) => Promise<ConfirmOutcome>;
   /** Thread id whose proposal is confirming/dispatching (store-owned in-flight). */
-  confirmingProposal?: number | null;
+  confirmingProposal?: ReadonlySet<number>;
   /** The active thread's live plan, binding the LATEST proposal card to its
    *  open/confirmed state. Omit (worker hosts) → proposal cards render settled. */
   proposal?: ResolvedProposal | null;
@@ -489,7 +489,7 @@ function TimelineRow({
   onReviewProposal: () => void;
   onConfirmProposal?: (version: string) => Promise<ConfirmOutcome>;
   /** Thread id whose proposal is confirming/dispatching (store-owned in-flight). */
-  confirmingProposal?: number | null;
+  confirmingProposal?: ReadonlySet<number>;
   proposal: ResolvedProposal | null;
   runAction?: RunAction;
   actionsBusy?: Record<string, boolean>;
@@ -747,7 +747,7 @@ function TimelineRow({
         <ProposalFastCard
           count={count}
           direction={only}
-          confirming={confirmingProposal === threadId}
+          confirming={threadId != null && (confirmingProposal?.has(threadId) ?? false)}
           // Pass the SHOWN proposal's version; confirmProposal re-checks it at
           // click time and routes to Review if the backend re-proposed since,
           // so one-click never dispatches a scope different from the card.
