@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, Copy, Sparkles } from "lucide-react";
-import type { LeadMessage, PermissionAsk, QueuedItem, ResolvedProposal } from "../lib/types";
+import { ArrowRight, Check, Copy, GitBranch, Sparkles } from "lucide-react";
+import type {
+  LeadMessage,
+  PermissionAsk,
+  QueuedItem,
+  ResolvedDirection,
+  ResolvedProposal,
+} from "../lib/types";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { QueueStack } from "./QueueStack";
 import {
@@ -77,7 +83,7 @@ export function ChatTimeline({
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
   /** Confirm-and-dispatch a single-direction proposal in one click (lead host). */
-  onConfirmProposal?: () => void;
+  onConfirmProposal?: () => Promise<void>;
   /** The active thread's live plan, binding the LATEST proposal card to its
    *  open/confirmed state. Omit (worker hosts) → proposal cards render settled. */
   proposal?: ResolvedProposal | null;
@@ -372,6 +378,83 @@ function isLatestProposal(m: LeadMessage, all: LeadMessage[]): boolean {
   return false;
 }
 
+// The single-direction proposal card: one-click "Confirm & dispatch" plus a
+// secondary "Review & create". Its own component so the in-flight guard
+// (`confirming`) is a proper hook: a rapid double-click must not fire two
+// confirms — backend confirm is idempotent (same ids), but the second dispatch
+// would race the first before session state updates and dedupes. Mirrors
+// ScopeReview's confirming state (disable + label swap while in flight).
+function ProposalFastCard({
+  count,
+  direction,
+  onConfirm,
+  onReview,
+}: {
+  count: number;
+  direction: ResolvedDirection;
+  onConfirm: () => Promise<void>;
+  onReview: () => void;
+}) {
+  const { t } = useTranslation();
+  const [confirming, setConfirming] = useState(false);
+  // "" = the repo's default branch; surface only an EXPLICIT non-default base so
+  // the user sees they're dispatching off a non-default branch before one click
+  // (the Review path shows this via BaseBranchField).
+  const base = direction.base_branch.trim();
+  async function confirm() {
+    setConfirming(true);
+    try {
+      await onConfirm();
+    } finally {
+      // On success confirmProposal clears the proposal and this card unmounts;
+      // on failure (e.g. a base-save abort refreshes but keeps it) the card
+      // stays — re-enable so the user can retry.
+      setConfirming(false);
+    }
+  }
+  return (
+    <div className="rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5">
+      <div className="flex items-center gap-2.5">
+        <Sparkles size={15} className="shrink-0 text-accent" />
+        <div className="min-w-0 flex-1">
+          <p className="text-[12.5px] font-medium text-ink">{t("lead.proposalReady", { count })}</p>
+          <p className="truncate text-[11px] text-ink-muted">
+            <span className="font-medium text-ink">{direction.name}</span>
+            <span className="mx-1 rounded-[var(--radius-sm)] bg-bg px-1 py-px font-mono text-[10px] text-ink-faint">
+              {direction.repo?.repo_name ?? ""}
+            </span>
+            {direction.reason}
+          </p>
+          {base && (
+            <p className="mt-1 flex items-center gap-1 text-[10.5px] text-ink-faint">
+              <GitBranch size={11} className="shrink-0" />
+              <span>{t("scope.baseBranch")}</span>
+              <span className="font-mono text-ink-muted">{base}</span>
+            </p>
+          )}
+        </div>
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <button
+          onClick={() => void confirm()}
+          disabled={confirming}
+          className="flex items-center gap-1 rounded-[var(--radius-md)] bg-accent px-2.5 py-1 text-[11px] font-medium text-accent-ink transition-colors hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {confirming ? t("lead.confirmingDispatch") : t("lead.confirmDispatch")}
+          {!confirming && <ArrowRight size={12} />}
+        </button>
+        <button
+          onClick={onReview}
+          disabled={confirming}
+          className="rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-muted transition-colors hover:text-ink disabled:opacity-60"
+        >
+          {t("lead.reviewCreate")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TimelineRow({
   m,
   all,
@@ -390,7 +473,7 @@ function TimelineRow({
   m: LeadMessage;
   all: LeadMessage[];
   onReviewProposal: () => void;
-  onConfirmProposal?: () => void;
+  onConfirmProposal?: () => Promise<void>;
   proposal: ResolvedProposal | null;
   runAction?: RunAction;
   actionsBusy?: Record<string, boolean>;
@@ -615,45 +698,33 @@ function TimelineRow({
     if (!open) {
       return <SettledLine label={t("lead.proposalResolved", { count })} />;
     }
-    // Single-direction fast path: with exactly one direction the write scope
-    // is unambiguous (the one repo shown), so the review→confirm round-trip
+    // Single-direction fast path: with exactly one direction the write scope is
+    // unambiguous (the one repo shown), so the review→confirm round-trip
     // collapses to a one-click "Confirm & dispatch" — the human still confirms
     // the write (safety gate preserved), just without opening ScopeReview.
     // "Review" stays as the secondary path for tuning base branch etc.
+    //
+    // Three guards keep the fast path honest, else it falls through to Review:
+    //  • count === 1 — the proposal ROW lands in the timeline BEFORE getProposal
+    //    refreshes `proposal` (store's lead-chat push appends the row, then fires
+    //    the fetch), so a stale single-dir `proposal` can pair with a freshly
+    //    arrived MULTI-dir row and one-click a multi-direction plan past
+    //    ScopeReview. Gate on the row's own direction count matching the loaded
+    //    proposal (both 1) so a stale/mismatched pair routes to Review instead.
+    //  • repo known — an unknown repo makes confirmProposal skip the lane and
+    //    dispatch ZERO ids (a silent no-op). Review surfaces the unknown-repo
+    //    warning, so route unknown repos there.
+    //  • onConfirmProposal wired — lead host only (worker hosts render settled).
     const dirs = proposal.directions;
-    if (dirs.length === 1 && onConfirmProposal) {
-      const d = dirs[0];
+    const only = dirs.length === 1 ? dirs[0] : null;
+    if (only && count === 1 && only.repo?.known === true && onConfirmProposal) {
       return (
-        <div className="rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5">
-          <div className="flex items-center gap-2.5">
-            <Sparkles size={15} className="shrink-0 text-accent" />
-            <div className="min-w-0 flex-1">
-              <p className="text-[12.5px] font-medium text-ink">{t("lead.proposalReady", { count })}</p>
-              <p className="truncate text-[11px] text-ink-muted">
-                <span className="font-medium text-ink">{d.name}</span>
-                <span className="mx-1 rounded-[var(--radius-sm)] bg-bg px-1 py-px font-mono text-[10px] text-ink-faint">
-                  {d.repo?.repo_name ?? ""}
-                </span>
-                {d.reason}
-              </p>
-            </div>
-          </div>
-          <div className="mt-2 flex items-center gap-2">
-            <button
-              onClick={onConfirmProposal}
-              className="flex items-center gap-1 rounded-[var(--radius-md)] bg-accent px-2.5 py-1 text-[11px] font-medium text-accent-ink transition-colors hover:brightness-110"
-            >
-              {t("lead.confirmDispatch")}
-              <ArrowRight size={12} />
-            </button>
-            <button
-              onClick={onReviewProposal}
-              className="rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-muted transition-colors hover:text-ink"
-            >
-              {t("lead.reviewCreate")}
-            </button>
-          </div>
-        </div>
+        <ProposalFastCard
+          count={count}
+          direction={only}
+          onConfirm={onConfirmProposal}
+          onReview={onReviewProposal}
+        />
       );
     }
     return (

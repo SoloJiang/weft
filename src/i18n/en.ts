@@ -206,6 +206,7 @@ export const en = {
     proposalWithdrawn: "Withdrew directions: {{rationale}}",
     reviewCreate: "Review & create",
     confirmDispatch: "Confirm & dispatch",
+    confirmingDispatch: "Dispatching…",
     starting: "Starting the lead…",
     stopped: "The lead stopped.",
     restart: "Restart lead",
