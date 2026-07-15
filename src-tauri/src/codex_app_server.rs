@@ -575,6 +575,18 @@ impl Client {
         }
     }
 
+    /// Teardown used when the stdin writer fails: notify every pending caller
+    /// with an error, then kill and reap the child so the connection is not
+    /// left half-alive stalling until the request timeout.
+    async fn fail_pending_and_reap(&self, message: &str) {
+        if let Some(mut inner) = self.0.lock().await.take() {
+            for (_, tx) in inner.pending.drain() {
+                let _ = tx.send(Err(message.to_string()));
+            }
+            let _ = inner._child.kill().await;
+        }
+    }
+
     async fn connect(&self) -> anyhow::Result<()> {
         // The app-scoped global client has no per-session pin; use the global codex
         // override (alias).
@@ -618,13 +630,21 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let client_for_writer = self.clone();
         tauri::async_runtime::spawn(async move {
             let mut stdin = stdin;
+            let fail = || async {
+                client_for_writer
+                    .fail_pending_and_reap("codex app-server stdin writer failed")
+                    .await;
+            };
             while let Some(bytes) = write_rx.recv().await {
                 if stdin.write_all(&bytes).await.is_err() {
+                    fail().await;
                     break;
                 }
                 if stdin.flush().await.is_err() {
+                    fail().await;
                     break;
                 }
             }

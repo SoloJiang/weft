@@ -418,6 +418,9 @@ pub async fn clone_repo(
 ) -> R<entities::repo_ref::Model> {
     validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
+    if path.symlink_metadata().is_ok() {
+        return Err(format!("repo path already exists: {}", path.display()));
+    }
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::clone_repo(&url, &p))
         .await
@@ -449,6 +452,9 @@ pub async fn create_repo(
 ) -> R<entities::repo_ref::Model> {
     validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
+    if path.symlink_metadata().is_ok() {
+        return Err(format!("repo path already exists: {}", path.display()));
+    }
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::init_repo(&p))
         .await
