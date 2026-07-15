@@ -220,7 +220,7 @@ interface Store {
   proposal: ResolvedProposal | null;
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
-  confirmProposal: () => Promise<void>;
+  confirmProposal: (expectedVersion?: string) => Promise<void>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
@@ -1905,7 +1905,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // confirm/approve abort while the thread still has ANY unrecovered lane failure.
   const baseSaveFailed = useRef<Map<number, Set<string>>>(new Map());
 
-  const confirmProposal = useCallback(async () => {
+  const confirmProposal = useCallback(async (expectedVersion?: string) => {
     if (activeThreadId == null) return;
     // Flush any in-flight base-branch save before materializing. If it REJECTED
     // (e.g. a re-propose moved the lane, or a DB error), the backend still holds the
@@ -1926,6 +1926,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       baseSaveFailed.current.delete(activeThreadId);
       await refreshProposal(activeThreadId);
       return;
+    }
+    // One-click fast path: the card renders from the loaded `proposal`, which can
+    // lag a re-propose (the row lands before getProposal resolves). When a version
+    // is passed, re-fetch and bail to Review if the backend has moved on — so a
+    // blind one-click never confirms a scope different from what the card showed.
+    // The full ScopeReview path passes no version (the user reviewed live state).
+    if (expectedVersion != null) {
+      const current = await api.getProposal(activeThreadId);
+      setProposal(current);
+      const stillMatches =
+        current != null &&
+        current.status === "proposed" &&
+        current.created_at === expectedVersion &&
+        current.directions.length === 1 &&
+        current.directions[0]?.repo?.known === true;
+      if (!stillMatches) {
+        setReviewingProposal(true);
+        return;
+      }
     }
     const ids = await api.confirmProposal(activeThreadId);
     setProposal(null);

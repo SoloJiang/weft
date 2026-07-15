@@ -204,7 +204,7 @@ export function LeadTab({
             setReviewingProposal(true);
             onReview();
           }}
-          onConfirmProposal={() => confirmProposal()}
+          onConfirmProposal={(version) => confirmProposal(version)}
           proposal={proposal}
           runAction={run}
           actionsBusy={actionsBusy}

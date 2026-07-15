@@ -10,6 +10,7 @@ import type {
   ResolvedProposal,
 } from "../lib/types";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
+import { Button } from "../components/ui/Button";
 import { QueueStack } from "./QueueStack";
 import {
   Attachment,
@@ -83,7 +84,7 @@ export function ChatTimeline({
   activity?: { name: string; summary: string } | null;
   onReviewProposal: () => void;
   /** Confirm-and-dispatch a single-direction proposal in one click (lead host). */
-  onConfirmProposal?: () => Promise<void>;
+  onConfirmProposal?: (version: string) => Promise<void>;
   /** The active thread's live plan, binding the LATEST proposal card to its
    *  open/confirmed state. Omit (worker hosts) → proposal cards render settled. */
   proposal?: ResolvedProposal | null;
@@ -401,6 +402,10 @@ function ProposalFastCard({
   // the user sees they're dispatching off a non-default branch before one click
   // (the Review path shows this via BaseBranchField).
   const base = direction.base_branch.trim();
+  // "impl-only" means the worker builds directly instead of planning first — a
+  // non-default mode that changes how it's instructed, so surface it (ScopeReview
+  // shows this badge). The default "plan+impl" is the expected flow, left implicit.
+  const buildsDirectly = direction.mandate === "impl-only";
   async function confirm() {
     setConfirming(true);
     try {
@@ -412,44 +417,48 @@ function ProposalFastCard({
       setConfirming(false);
     }
   }
+  // Vertical, left-aligned structure: header, then the direction details, then
+  // actions — every row shares the card's left edge (no icon-indented column).
   return (
-    <div className="rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5">
-      <div className="flex items-center gap-2.5">
-        <Sparkles size={15} className="shrink-0 text-accent" />
-        <div className="min-w-0 flex-1">
-          <p className="text-[12.5px] font-medium text-ink">{t("lead.proposalReady", { count })}</p>
-          <p className="truncate text-[11px] text-ink-muted">
-            <span className="font-medium text-ink">{direction.name}</span>
-            <span className="mx-1 rounded-[var(--radius-sm)] bg-bg px-1 py-px font-mono text-[10px] text-ink-faint">
-              {direction.repo?.repo_name ?? ""}
-            </span>
-            {direction.reason}
-          </p>
-          {base && (
-            <p className="mt-1 flex items-center gap-1 text-[10.5px] text-ink-faint">
-              <GitBranch size={11} className="shrink-0" />
-              <span>{t("scope.baseBranch")}</span>
-              <span className="font-mono text-ink-muted">{base}</span>
-            </p>
-          )}
-        </div>
+    <div className="flex flex-col gap-2 rounded-[var(--radius-md)] border border-accent/40 bg-accent-ghost px-3 py-2.5">
+      <div className="flex items-center gap-1.5">
+        <Sparkles size={14} className="shrink-0 text-accent" />
+        <span className="text-[12.5px] font-medium text-ink">{t("lead.proposalReady", { count })}</span>
       </div>
-      <div className="mt-2 flex items-center gap-2">
-        <button
-          onClick={() => void confirm()}
-          disabled={confirming}
-          className="flex items-center gap-1 rounded-[var(--radius-md)] bg-accent px-2.5 py-1 text-[11px] font-medium text-accent-ink transition-colors hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
-        >
+      <div className="flex flex-col gap-1">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate text-[12px] font-medium text-ink">{direction.name}</span>
+          <span className="shrink-0 rounded-[var(--radius-sm)] bg-bg px-1 py-px font-mono text-[10px] text-ink-faint">
+            {direction.repo?.repo_name ?? ""}
+          </span>
+        </div>
+        {direction.reason && (
+          <p className="text-[11px] leading-relaxed text-ink-muted">{direction.reason}</p>
+        )}
+        {(base || buildsDirectly) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-ink-faint">
+            {base && (
+              <span className="flex items-center gap-1">
+                <GitBranch size={11} className="shrink-0" />
+                {t("scope.baseBranch")}
+                <span className="font-mono text-ink-muted">{base}</span>
+              </span>
+            )}
+            {buildsDirectly && (
+              <span className="rounded-[var(--radius-sm)] bg-bg px-1.5 py-px font-medium text-ink-muted">
+                {t("scope.mandateImpl")}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="flex items-center gap-2">
+        <Button variant="primary" size="sm" disabled={confirming} onClick={() => void confirm()}>
           {confirming ? t("lead.confirmingDispatch") : t("lead.confirmDispatch")}
-          {!confirming && <ArrowRight size={12} />}
-        </button>
-        <button
-          onClick={onReview}
-          disabled={confirming}
-          className="rounded-[var(--radius-md)] px-2 py-1 text-[11px] text-ink-muted transition-colors hover:text-ink disabled:opacity-60"
-        >
+        </Button>
+        <Button variant="ghost" size="sm" disabled={confirming} onClick={onReview}>
           {t("lead.reviewCreate")}
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -473,7 +482,7 @@ function TimelineRow({
   m: LeadMessage;
   all: LeadMessage[];
   onReviewProposal: () => void;
-  onConfirmProposal?: () => Promise<void>;
+  onConfirmProposal?: (version: string) => Promise<void>;
   proposal: ResolvedProposal | null;
   runAction?: RunAction;
   actionsBusy?: Record<string, boolean>;
@@ -722,7 +731,10 @@ function TimelineRow({
         <ProposalFastCard
           count={count}
           direction={only}
-          onConfirm={onConfirmProposal}
+          // Pass the SHOWN proposal's version; confirmProposal re-checks it at
+          // click time and routes to Review if the backend re-proposed since,
+          // so one-click never dispatches a scope different from the card.
+          onConfirm={() => onConfirmProposal(proposal.created_at)}
           onReview={onReviewProposal}
         />
       );
