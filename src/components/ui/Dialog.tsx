@@ -51,4 +51,39 @@ export function DialogContent({
   );
 }
 
+/**
+ * A bare, roomy dialog for hosting a whole panel (e.g. ScopeReview) over the
+ * current view instead of navigating away — the content brings its own header
+ * and footer, so this adds only the portal, overlay, sizing, and an sr-only
+ * title for accessibility. Caps at 86vh and lets the child's own scroll region
+ * handle overflow (the child chain must carry `min-h-0`).
+ */
+export function DialogPanel({
+  title,
+  children,
+  className,
+}: {
+  title: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <RD.Portal>
+      <RD.Overlay className="weft-overlay fixed inset-0 z-50 bg-black/55 backdrop-blur-[1px]" />
+      <RD.Content
+        aria-describedby={undefined}
+        className={cn(
+          "weft-pop fixed left-1/2 top-1/2 z-50 flex max-h-[86vh] w-[min(900px,calc(100vw-3rem))]",
+          "-translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-[var(--radius-lg)]",
+          "border border-border bg-bg shadow-[0_8px_28px_-8px_rgba(0,0,0,0.6)]",
+          className,
+        )}
+      >
+        <RD.Title className="sr-only">{title}</RD.Title>
+        {children}
+      </RD.Content>
+    </RD.Portal>
+  );
+}
+
 export const DialogClose = RD.Close;
