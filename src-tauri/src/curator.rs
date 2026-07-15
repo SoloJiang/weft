@@ -1504,9 +1504,13 @@ fn run_state_clear_all_for_test() {
 /// Serialize the tests that mutate the process-global run-state registry. cargo
 /// runs tests in parallel, and they share both the registry AND repo id 1 (each
 /// fresh in-memory DB starts its autoincrement at 1), so without this a
-/// `clear_all`/`run_finish_err` in one test could race another's assertion. Every
-/// run-state test takes this lock first. Poison-tolerant (a panicking test must not
-/// wedge the rest).
+/// `clear_all`/`run_finish_err` in one test could race another's assertion.
+///
+/// RULE: every test that touches the registry takes this lock FIRST — including
+/// INDIRECT writers: `edit_profile` (clear_failure), `profile_repo_agent`
+/// (run_begin/run_finish_*), and the analyze/reanalyze passes. Missing it is
+/// exactly the "expected failed, got running/idle" flake CI sees on slow
+/// runners. Poison-tolerant (a panicking test must not wedge the rest).
 #[cfg(test)]
 fn test_run_state_guard() -> std::sync::MutexGuard<'static, ()> {
     static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2785,6 +2789,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_creates_row_for_placeholder() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A repo can be calibrated while it is still an unanalyzed placeholder
         // (no profile row). The edit must upsert one, not error.
         let db = mem().await;
@@ -2802,6 +2810,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_manual_tier_clears_persisted_failure() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A manual canonical-tier edit RECOVERS a failed repo. Since the views now
         // read `analysis_state` from the persisted row, clearing only the in-memory
         // map would leave the DB column at "failed" — the edit must persist "idle".
@@ -2822,6 +2834,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_classification_edit_clears_stale_layer() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // The layered map PREFERS the agent's `layer` over the tier/category fallback,
         // so a tier/category edit must clear the stored layer — otherwise the repo stays
         // in its old band despite the new tier. A summary-only edit must NOT clear it.
@@ -2872,6 +2888,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_summary_only_keeps_persisted_failure() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A summary-only edit INHERITS the prior tier without re-classifying, so it
         // must NOT silently clear a real failure (no re-run happened).
         let db = mem().await;
@@ -2892,6 +2912,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_invalidates_map_doc() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A manual profile edit changes the map's INVENTORY surface (a tier edit
         // cascades to component tiers; summary changes the narrative) without
         // touching relations, so it must invalidate the workspace map doc — the
@@ -2965,6 +2989,10 @@ mod tests {
 
     #[tokio::test]
     async fn curator_set_classification_survives_reanalysis() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // The curator's set_classification path (edit_profile with tier + category)
         // pins BOTH the tier and the role/category; a later agent re-analysis must
         // revert NEITHER. Mirrors the imsdk case: a frontend/local SDK the agent
@@ -3005,6 +3033,10 @@ mod tests {
 
     #[tokio::test]
     async fn tier_only_edit_does_not_freeze_a_stale_role() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A tier-only edit (the detail picker, category = None) must NOT pin the prior
         // agent category — otherwise re-tiering to frontend would permanently freeze a
         // stale backend role. It clears the role so a later analysis can re-derive it.
@@ -3321,6 +3353,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_summary_only_leaves_tier_and_ownership() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A summary-only edit (tier = None) updates the summary and pins ONLY the
         // summary; the legacy tier is left untouched (and unowned) so it still
         // qualifies for the agent's backfill/migration.
@@ -3341,6 +3377,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_tier_only_does_not_pin_summary() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // Calibrating only the tier pins the tier but NOT the (agent) summary, so a
         // later agent pass can still refresh the summary.
         let db = mem().await;
@@ -3398,6 +3438,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_profile_rejects_deleted_repo() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A stale edit after the repo is gone must error, not recreate an orphan.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
@@ -3436,6 +3480,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_tier_cascades_to_components() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A canonical-tier edit rewrites every component's tier to match, so the
         // expanded view (grouping by component tier) stays in sync with the overview.
         let db = mem().await;
@@ -3456,6 +3504,10 @@ mod tests {
 
     #[tokio::test]
     async fn edit_summary_only_keeps_component_tiers() {
+        // edit_profile touches the process-global run-state map (clear_failure):
+        // serialize with every other run-state test or parallel tests with the same
+        // in-memory repo ids stomp each other's phases (the macOS CI flake).
+        let _g = super::test_run_state_guard();
         // A summary-only edit (tier = None) must leave component tiers unchanged.
         let db = mem().await;
         let ws = repo::create_workspace(&db, "ws_summary_only").await.unwrap();
