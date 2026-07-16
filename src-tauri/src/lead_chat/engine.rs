@@ -1609,8 +1609,12 @@ async fn rollback_canceled_send(
     eng: &EngineRef,
     ctx: &SendContext,
     queue_status: &str,
+    // true = the canceled send's user row already landed in the timeline, so the
+    // reserved turn id stays consumed (the row carries it); false = pre-persistence
+    // failure (no row), so the counter rewinds.
+    row_persisted: bool,
 ) {
-    let (stopped, thread_id, session_id, drained) = {
+    let (thread_id, session_id, drained) = {
         let mut inner = eng.lock().await;
         if !ctx.direct
             || inner.reset_epoch != ctx.reset_epoch
@@ -1620,7 +1624,15 @@ async fn rollback_canceled_send(
             return;
         }
         inner.turn.busy = false;
-        inner.turn_id -= 1;
+        // Keep the turn id CONSUMED when the canceled send's user row was already
+        // persisted: that row sits in the timeline carrying this id, and rewinding
+        // the counter would hand the same id to the NEXT send — mixing two logical
+        // turns in restart recovery and same-turn UI grouping. Only a pre-row
+        // failure (nothing persisted) rewinds; spawn-failure rollbacks
+        // (reset_failed_hidden_turn) already leave the id consumed.
+        if !row_persisted {
+            inner.turn_id -= 1;
+        }
         inner.current_origin_tag = None;
         inner.clock.started = None;
         inner.interrupting = false;
@@ -1629,11 +1641,16 @@ async fn rollback_canceled_send(
         // released — finalizing a message that is about to be delivered.
         let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
         inner.turn.queue.clear();
-        (inner.stopped, inner.thread_id, inner.session_id, drained)
+        // Persist + emit UNDER the lock: a replacement send's Phase 1 takes this
+        // same lock and persists "running" inside it, so releasing first would
+        // let this idle/stopped write land AFTER the new turn's running write —
+        // leaving DB/UI idle while a turn runs (breaking live counts and
+        // boot-revive decisions).
+        let status = if inner.stopped { STATUS_STOPPED } else { "idle" };
+        persist_activity(db, inner.session_id, inner.thread_id, status).await;
+        emit_turn_state(app, inner.thread_id, inner.session_id, false, Vec::new());
+        (inner.thread_id, inner.session_id, drained)
     };
-    let status = if stopped { STATUS_STOPPED } else { "idle" };
-    persist_activity(db, ctx.session_id, ctx.thread_id, status).await;
-    emit_turn_state(app, thread_id, session_id, false, Vec::new());
     if !drained.is_empty() {
         match repo::set_queued_status_by_ids(db, &drained, queue_status).await {
             Ok(rows) => {
@@ -1929,7 +1946,7 @@ pub async fn send(
             // Phase 1 already reserved turn state; undo it (and restore the
             // engine invariants — activity, queue, interrupt flag) so the
             // session isn't left with a stuck busy flag or an orphaned turn id.
-            rollback_canceled_send(app, db, eng, &ctx, "error").await;
+            rollback_canceled_send(app, db, eng, &ctx, "error", false).await;
             return Err(e.into());
         }
     };
@@ -2003,7 +2020,7 @@ pub async fn send(
             // interrupt flag, anything queued behind the canceled turn) — the
             // rollback is ownership-guarded, so if a stop/reset cleared the turn
             // itself or a newer reservation owns the state, it no-ops.
-            rollback_canceled_send(app, db, eng, &ctx, "interrupted").await;
+            rollback_canceled_send(app, db, eng, &ctx, "interrupted", true).await;
             let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
             emit_finalize(app, ctx.thread_id, row_id, "interrupted");
             return Err(anyhow::anyhow!(
@@ -2187,8 +2204,8 @@ async fn spawn_codex_turn(
     // Per-session app-server: reuse the engine's connection or spawn one with this
     // session's `-c mcp_servers` bus flags. Its own process keeps the per-thread
     // MCP isolated (app-server MCP is app-scoped).
-    let client = match existing {
-        Some(c) if c.is_alive().await => c,
+    let (client, freshly_connected) = match existing {
+        Some(c) if c.is_alive().await => (c, false),
         _ => {
             // Pre-accept folder trust (like the exec adapter's prepare) so the
             // app-server's first thread/start doesn't block on codex's trust prompt.
@@ -2196,8 +2213,12 @@ async fn spawn_codex_turn(
             let c =
                 crate::codex_app_server::Client::connect_session(&program, &extra_args, &cwd)
                     .await?;
-            eng.lock().await.codex_client = Some(c.clone());
-            c
+            // NOT published to the engine yet: the stop check below must pass
+            // first. Publishing early would let this task's stop-cleanup tear a
+            // RESTARTED send's client out of the registry (a restart may reuse
+            // whatever is registered), or let a restarted send adopt a connection
+            // the stop already doomed.
+            (c, true)
         }
     };
     let cwd = cwd.to_string_lossy().into_owned();
@@ -2236,12 +2257,22 @@ async fn spawn_codex_turn(
         g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch)
     };
     if stop_won {
-        if let Some(c) = eng.lock().await.codex_client.take() {
-            c.shutdown().await;
+        // Never touch the registry here: a restarted send may have published a
+        // fresh client by now — ours was never published, so taking whatever is
+        // registered could sever the NEW session's connection. Shut down only the
+        // connection THIS task made; a reused registered client was already shut
+        // down by the stop itself (stop_quiet takes it).
+        if freshly_connected {
+            client.shutdown().await;
         }
         return Err(anyhow::anyhow!(
             "engine stopped during codex app-server connect"
         ));
+    }
+    // The turn is still valid: NOW it is safe to publish the fresh connection for
+    // reuse by later sends and the stop path.
+    if freshly_connected {
+        eng.lock().await.codex_client = Some(client.clone());
     }
     // codex has no thread/start system-prompt field, so (like the exec adapter)
     // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
