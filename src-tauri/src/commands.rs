@@ -11,6 +11,32 @@ fn e<E: ToString>(x: E) -> String {
     x.to_string()
 }
 
+/// Pre-flight for a new repo target `<dest>/<name>` (clone + create): reject a
+/// symlink (even to an empty directory — git would write the checkout through it,
+/// landing outside `dest`) and any existing non-empty path, but allow a REAL
+/// empty directory: both `git clone` and `git init` support initializing into
+/// one, and rejecting it would regress a previously valid flow.
+fn reject_occupied_repo_target(path: &std::path::Path) -> R<()> {
+    let Ok(meta) = path.symlink_metadata() else {
+        return Ok(()); // does not exist — free to create
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!("repo path is a symlink: {}", path.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("repo path already exists: {}", path.display()));
+    }
+    let mut entries =
+        std::fs::read_dir(path).map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    if entries.next().is_some() {
+        return Err(format!(
+            "repo path already exists and is not empty: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Ensure `path` resolves to a location inside `dest`. Prevents symlink or
 /// non-canonical `dest` from causing the actual repo to land elsewhere.
 fn ensure_path_under_dest(path: &std::path::Path, dest: &std::path::Path) -> R<()> {
@@ -432,9 +458,7 @@ pub async fn clone_repo(
 ) -> R<entities::repo_ref::Model> {
     validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
-    if path.symlink_metadata().is_ok() {
-        return Err(format!("repo path already exists: {}", path.display()));
-    }
+    reject_occupied_repo_target(&path)?;
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::clone_repo(&url, &p))
         .await
@@ -466,9 +490,7 @@ pub async fn create_repo(
 ) -> R<entities::repo_ref::Model> {
     validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
-    if path.symlink_metadata().is_ok() {
-        return Err(format!("repo path already exists: {}", path.display()));
-    }
+    reject_occupied_repo_target(&path)?;
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::init_repo(&p))
         .await
@@ -2351,6 +2373,43 @@ mod tests {
         assert_eq!(keys, expected);
         assert!(!keys.contains(&crate::lead_chat::commands::lead_key(keep_thread.id)));
         assert!(!keys.contains(&(keep_worker.id as i64)));
+    }
+
+    #[test]
+    fn occupied_repo_target_allows_only_real_empty_dirs() {
+        let root = std::env::temp_dir().join(format!("weft-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Nonexistent → free to create.
+        assert!(reject_occupied_repo_target(&root.join("fresh")).is_ok());
+        // A REAL empty directory is a valid target (git init/clone support it).
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(reject_occupied_repo_target(&empty).is_ok());
+        // Non-empty directory → rejected.
+        let full = root.join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("x"), "x").unwrap();
+        assert!(reject_occupied_repo_target(&full).is_err());
+        // Plain file → rejected.
+        let file = root.join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(reject_occupied_repo_target(&file).is_err());
+        // Symlink — even to an empty directory — rejected: git would write the
+        // checkout through it, outside the chosen destination.
+        let link = root.join("link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&empty, &link).unwrap();
+            assert!(reject_occupied_repo_target(&link).is_err());
+            // Dangling symlink too (symlink_metadata sees it; exists() would not).
+            let dangling = root.join("dangling");
+            std::os::unix::fs::symlink(root.join("nowhere"), &dangling).unwrap();
+            assert!(reject_occupied_repo_target(&dangling).is_err());
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

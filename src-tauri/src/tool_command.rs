@@ -44,13 +44,34 @@ pub fn set_overrides(map: HashMap<String, String>) {
     };
     *g = map
         .into_iter()
-        .filter(|(_tool, cmd)| validate_command(cmd).is_ok())
+        .filter(|(_tool, cmd)| validate_override(cmd).is_ok())
         .collect();
+}
+
+/// Validate a configured OVERRIDE: either a bare PATH-resolved name
+/// (`cc-claude`) or an ABSOLUTE executable path (`/opt/homebrew/bin/claude` — a
+/// GUI-launched install whose CLI isn't on Weft's augmented PATH, which is
+/// exactly what the Settings copy tells users to configure). Values go straight
+/// to `Command::new` (no shell), so a path is used verbatim as the program —
+/// only control characters are rejected. Relative paths stay rejected: they'd
+/// resolve against whichever cwd a session happens to spawn in.
+fn validate_override(cmd: &str) -> Result<(), String> {
+    if cmd.starts_with('/') {
+        if cmd.chars().any(|c| c.is_control()) {
+            return Err("command path cannot contain control characters".into());
+        }
+        return Ok(());
+    }
+    validate_command(cmd)
 }
 
 /// Reject commands that are clearly not bare PATH-resolved binary names.
 /// Allows typical aliases like `cc-claude` but forbids absolute/relative paths,
 /// shell metacharacters, and whitespace that could switch to a different command.
+/// This is the PIN-strict variant: per-session pins are historical snapshots, so
+/// a legacy absolute-path pin falls back to the CONFIGURED command (see
+/// `effective`) instead of resurrecting a stale location; live overrides accept
+/// absolute paths via [`validate_override`].
 fn validate_command(cmd: &str) -> Result<(), String> {
     if cmd.is_empty() {
         return Err("command cannot be empty".into());
@@ -81,7 +102,7 @@ pub fn command_for(tool: &str) -> String {
         Err(p) => p.into_inner().get(tool).cloned(),
     };
     let cmd = found.unwrap_or_else(|| tool.to_string());
-    if let Err(err) = validate_command(&cmd) {
+    if let Err(err) = validate_override(&cmd) {
         eprintln!("[weft][tool_command] invalid override for {tool}: {err}; falling back to {tool}");
         return tool.to_string();
     }
@@ -112,7 +133,7 @@ pub fn parse_overrides(json: &str) -> HashMap<String, String> {
         .into_iter()
         .filter_map(|(tool, cmd)| {
             let cmd = cmd.trim().to_string();
-            if cmd.is_empty() || cmd == tool || validate_command(&cmd).is_err() {
+            if cmd.is_empty() || cmd == tool || validate_override(&cmd).is_err() {
                 return None;
             }
             Some((tool, cmd))
@@ -173,6 +194,18 @@ mod tests {
         assert_eq!(effective(Some("/opt/claude"), "claude"), "cc-claude");
         assert_eq!(effective(Some("claude --evil"), "claude"), "cc-claude");
 
+        // An ABSOLUTE-path override is honored (a GUI-launched install whose CLI
+        // is not on Weft's PATH) — while an absolute PIN still falls back to that
+        // configured command (pins are historical snapshots, overrides are the
+        // user's current intent).
+        set_overrides(HashMap::from([(
+            "claude".to_string(),
+            "/opt/homebrew/bin/claude".to_string(),
+        )]));
+        assert_eq!(command_for("claude"), "/opt/homebrew/bin/claude");
+        assert_eq!(effective(None, "claude"), "/opt/homebrew/bin/claude");
+        assert_eq!(effective(Some("/opt/claude"), "claude"), "/opt/homebrew/bin/claude");
+
         set_overrides(HashMap::new()); // leave the global map clean
     }
 
@@ -216,6 +249,7 @@ mod tests {
 
     #[test]
     fn command_validation_rejects_paths_and_shell_meta() {
+        // Pin-strict variant: bare names only.
         assert!(validate_command("claude").is_ok());
         assert!(validate_command("cc-claude").is_ok());
         assert!(validate_command("claude.exe").is_ok());
@@ -224,15 +258,24 @@ mod tests {
         assert!(validate_command("claude;rm -rf /").is_err());
         assert!(validate_command("claude --danger").is_err());
         assert!(validate_command("").is_err());
+        // Override variant: bare names AND absolute paths (spawned via
+        // Command::new, no shell — spaces in app-bundle paths are fine).
+        assert!(validate_override("cc-claude").is_ok());
+        assert!(validate_override("/usr/bin/claude").is_ok());
+        assert!(validate_override("/Applications/Some App.app/Contents/MacOS/cli").is_ok());
+        assert!(validate_override("./claude").is_err());
+        assert!(validate_override("claude;evil").is_err());
+        assert!(validate_override("/opt/bad\nline").is_err());
     }
 
     #[test]
-    fn parse_drops_invalid_overrides() {
+    fn parse_keeps_absolute_paths_and_drops_invalid_overrides() {
         let m = parse_overrides(
             r#"{"claude":"cc-claude","codex":"/opt/codex","opencode":"claude;evil"}"#,
         );
         assert_eq!(m.get("claude").map(String::as_str), Some("cc-claude"));
-        assert!(!m.contains_key("codex"));
+        // Absolute executable paths are valid overrides (no shell involved).
+        assert_eq!(m.get("codex").map(String::as_str), Some("/opt/codex"));
         assert!(!m.contains_key("opencode"));
     }
 }

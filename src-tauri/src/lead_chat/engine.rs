@@ -1577,18 +1577,33 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
 /// or decrement the turn id of THAT turn, canceling or corrupting it. A leaked
 /// increment on our abandoned id is harmless (turn ids are monotonic); a wrong
 /// decrement is not.
-async fn rollback_send_reservation(eng: &EngineRef, ctx: &SendContext) {
+/// Returns true when the reservation was actually undone (the caller may then
+/// need to re-persist the session activity Phase 1 optimistically set to
+/// "running").
+async fn rollback_send_reservation(eng: &EngineRef, ctx: &SendContext) -> bool {
     if !ctx.direct {
-        return;
+        return false;
     }
     let mut inner = eng.lock().await;
     if inner.reset_epoch != ctx.reset_epoch || inner.turn_id != ctx.turn || !inner.turn.busy {
-        return;
+        return false;
     }
     inner.turn.busy = false;
     inner.turn_id -= 1;
     inner.current_origin_tag = None;
     inner.clock.started = None;
+    true
+}
+
+/// After [`rollback_send_reservation`] undid a direct reservation, re-persist the
+/// session activity that Phase 1 optimistically wrote as "running": the engine is
+/// idle again — or was stopped all along (a stop can land between
+/// ensure_running_for_send and Phase 1, and its unlocked "stopped" write can be
+/// overtaken by Phase 1's locked "running" write).
+async fn repersist_rolled_back_activity(db: &Db, eng: &EngineRef, ctx: &SendContext) {
+    let stopped = eng.lock().await.stopped;
+    let status = if stopped { STATUS_STOPPED } else { "idle" };
+    persist_activity(db, ctx.session_id, ctx.thread_id, status).await;
 }
 
 pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
@@ -1873,7 +1888,9 @@ pub async fn send(
         Err(e) => {
             // Phase 1 already reserved turn state; undo it so the session isn't
             // left with a stuck busy flag or an orphaned turn id.
-            rollback_send_reservation(eng, &ctx).await;
+            if rollback_send_reservation(eng, &ctx).await {
+                repersist_rolled_back_activity(db, eng, &ctx).await;
+            }
             return Err(e.into());
         }
     };
@@ -1941,6 +1958,16 @@ pub async fn send(
         // to a dead stdin, queueing on a drained turn, or spawning after stop.
         if !send_reservation_valid(&inner, &ctx) {
             drop(inner);
+            // A stop can land between ensure_running_for_send and Phase 1, so
+            // Phase 1 reserved busy/turn_id on an already-stopped engine — leaving
+            // that reservation in place would queue every later send behind a turn
+            // nothing will ever drain. The rollback is ownership-guarded (a
+            // stop/reset that cleared the turn itself, or a newer reservation,
+            // makes it a no-op), and when it does undo, the activity Phase 1
+            // persisted as "running" is re-persisted to reflect reality.
+            if rollback_send_reservation(eng, &ctx).await {
+                repersist_rolled_back_activity(db, eng, &ctx).await;
+            }
             let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
             emit_finalize(app, ctx.thread_id, row_id, "interrupted");
             return Err(anyhow::anyhow!(
