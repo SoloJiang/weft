@@ -153,14 +153,19 @@ mod tests {
         set_overrides(HashMap::new());
         assert_eq!(command_for("claude"), "claude");
         assert_eq!(command_for("codex"), "codex");
+        // With no override configured, invalid/legacy pins fall back to the bare identity.
+        assert_eq!(effective(Some("/opt/claude"), "claude"), "claude");
+        assert_eq!(effective(Some("claude --evil"), "claude"), "claude");
 
         // A configured override is returned; unconfigured tools still fall back.
         set_overrides(HashMap::from([("claude".to_string(), "cc-claude".to_string())]));
         assert_eq!(command_for("claude"), "cc-claude");
         assert_eq!(command_for("codex"), "codex");
 
-        // A per-session pin wins over the global override.
+        // A per-session pin wins over the global override; a valid bare pin that
+        // differs from the identity is honored as-is.
         assert_eq!(effective(Some("claude"), "claude"), "claude");
+        assert_eq!(effective(Some("cc-claude"), "claude"), "cc-claude");
         // Blank/whitespace pin is ignored → falls through to the global override.
         assert_eq!(effective(Some("  "), "claude"), "cc-claude");
         assert_eq!(effective(None, "claude"), "cc-claude");
@@ -229,16 +234,5 @@ mod tests {
         assert_eq!(m.get("claude").map(String::as_str), Some("cc-claude"));
         assert!(!m.contains_key("codex"));
         assert!(!m.contains_key("opencode"));
-    }
-
-    #[test]
-    fn effective_falls_back_on_invalid_pin() {
-        set_overrides(HashMap::new());
-        // With no global override, invalid pins fall back to the bare identity.
-        assert_eq!(effective(Some("/opt/claude"), "claude"), "claude");
-        assert_eq!(effective(Some("claude --evil"), "claude"), "claude");
-        // Valid bare pins are honored.
-        assert_eq!(effective(Some("cc-claude"), "claude"), "cc-claude");
-        set_overrides(HashMap::new()); // leave the global map clean
     }
 }
