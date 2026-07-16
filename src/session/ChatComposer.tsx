@@ -605,15 +605,19 @@ function ChatComposerBody({
   );
 }
 
-/** Context readout for the composer toolbar: usage plus the model inline; the
- *  tooltip carries the numbers — "57k / 200k · model · effort", k-scaled, no
- *  unit word. With tokens but no window (window probe failed / unknown model)
- *  the bare token count still shows — it's the only usage signal. Before the
- *  first usage event only the model shows; nothing known → hidden. */
+/** Context readout for the composer toolbar: usage, the model, AND the
+ *  reasoning effort inline — the effort is a live behavior knob, so it earns a
+ *  visible slot next to the model instead of hiding in a tooltip. The tooltip
+ *  carries only the numbers ("57k / 200k", k-scaled, no unit word); with
+ *  nothing numeric to add it isn't rendered at all. With tokens but no window
+ *  (window probe failed / unknown model) the bare token count still shows —
+ *  it's the only usage signal. Before the first usage event only the model
+ *  (+ effort) shows; nothing known → hidden. */
 function ContextGauge({ meta }: { meta?: SessionMeta }) {
   const ct = meta?.contextTokens;
   const win = meta?.window;
   const model = meta?.model;
+  const effort = meta?.reasoningEffort;
   if (ct == null && !model) return null;
   const pct =
     ct != null && win != null && win > 0 ? Math.min(100, Math.round((ct / win) * 100)) : null;
@@ -623,19 +627,28 @@ function ContextGauge({ meta }: { meta?: SessionMeta }) {
     usage = win != null ? `${fmtK(ct)} / ${fmtK(win)}` : fmtK(ct);
   }
   const windowOnly = ct == null && win != null ? fmtK(win) : null;
-  const detail = [usage ?? windowOnly, model, meta?.reasoningEffort].filter(Boolean).join(" · ");
+  const detail = usage ?? windowOnly;
+  const gauge = (
+    <span className="flex min-w-0 items-center gap-1.5 text-[11px] tabular-nums text-ink-faint">
+      {pct != null && (
+        <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
+          <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
+        </span>
+      )}
+      {pct != null && <span className="shrink-0">{pct}%</span>}
+      {pct == null && ct != null && <span className="shrink-0">{fmtK(ct)}</span>}
+      {model && <span className="min-w-0 truncate font-mono text-[10.5px]">{model}</span>}
+      {effort && (
+        <span className="shrink-0 font-mono text-[10.5px]">
+          {model ? `· ${effort}` : effort}
+        </span>
+      )}
+    </span>
+  );
+  if (!detail) return gauge;
   return (
     <Tooltip label={detail} className="min-w-0">
-      <span className="flex min-w-0 items-center gap-1.5 text-[11px] tabular-nums text-ink-faint">
-        {pct != null && (
-          <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
-            <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
-          </span>
-        )}
-        {pct != null && <span className="shrink-0">{pct}%</span>}
-        {pct == null && ct != null && <span className="shrink-0">{fmtK(ct)}</span>}
-        {model && <span className="min-w-0 truncate font-mono text-[10.5px]">{model}</span>}
-      </span>
+      {gauge}
     </Tooltip>
   );
 }
