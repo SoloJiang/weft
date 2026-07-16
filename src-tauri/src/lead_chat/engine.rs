@@ -538,7 +538,16 @@ fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing
     );
 }
 
-async fn rollback_failed_turn(app: &AppHandle, db: &Db, eng: &EngineRef, turn_id: i32) {
+/// `status` distinguishes WHY the turn died: "error" for a genuine failure,
+/// "interrupted" when a stop/interrupt canceled it (a guard-canceled spawn must
+/// not be reported as an agent failure).
+async fn rollback_failed_turn(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    turn_id: i32,
+    status: &str,
+) {
     let mut inner = eng.lock().await;
     let Some(drained) = reset_failed_hidden_turn(&mut inner, turn_id) else {
         return;
@@ -553,10 +562,10 @@ async fn rollback_failed_turn(app: &AppHandle, db: &Db, eng: &EngineRef, turn_id
     // concurrent send's freshly inserted queued row and fail a message that is
     // about to be delivered.
     if !drained.is_empty() {
-        match repo::set_queued_status_by_ids(db, &drained, "error").await {
+        match repo::set_queued_status_by_ids(db, &drained, status).await {
             Ok(rows) => {
                 for m in rows {
-                    emit_finalize(app, thread_id, m.id, "error");
+                    emit_finalize(app, thread_id, m.id, status);
                 }
             }
             Err(e) => eprintln!("[weft] failed-turn queue finalize failed: {e}"),
@@ -571,11 +580,25 @@ async fn rollback_failed_visible_turn(
     turn_id: i32,
     message_id: i32,
     content: &str,
+    status: &str,
 ) {
     let thread_id = { eng.lock().await.thread_id };
-    let _ = repo::update_lead_message(db, message_id, content, "error").await;
-    emit_finalize(app, thread_id, message_id, "error");
-    rollback_failed_turn(app, db, eng, turn_id).await;
+    let _ = repo::update_lead_message(db, message_id, content, status).await;
+    emit_finalize(app, thread_id, message_id, status);
+    rollback_failed_turn(app, db, eng, turn_id, status).await;
+}
+
+/// After a spawn attempt fails, decide the rollback status: if the send's
+/// reservation is no longer valid, a stop/interrupt/reset raced the spawn
+/// window and the guard canceled it — that is the USER's cancel
+/// ("interrupted"), not an agent failure ("error").
+async fn spawn_failure_status(eng: &EngineRef, ctx: &SendContext) -> &'static str {
+    let g = eng.lock().await;
+    if send_reservation_valid(&g, ctx) {
+        "error"
+    } else {
+        "interrupted"
+    }
 }
 
 /// Finalize tool rows still awaiting a result, marking each `status` and pushing
@@ -959,6 +982,11 @@ async fn cleanup_disconnected_turn(
     let current = inner.current.take().map(|(id, text, _)| (id, text));
     let orphan_tools: Vec<(i32, serde_json::Value)> =
         inner.tool_rows.drain().map(|(_, v)| v).collect();
+    // Capture EXACTLY the still-queued rows this cleanup drains (the
+    // captured-ids rule every rollback path follows): a session-wide sweep
+    // after the lock drops could also catch a send's row inserted meanwhile —
+    // that send's Phase 3 rejects on the bumped epoch and finalizes its own row.
+    let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
     inner.interrupting = false;
     inner.child = None;
     inner.stdin = None;
@@ -1006,7 +1034,16 @@ async fn cleanup_disconnected_turn(
         }
     }
     finalize_orphan_tool_rows(app, db, thread_id, orphan_tools, status).await;
-    mark_queued_status(app, db, thread_id, session_id, status).await;
+    if !drained.is_empty() {
+        match repo::set_queued_status_by_ids(db, &drained, status).await {
+            Ok(rows) => {
+                for m in rows {
+                    emit_finalize(app, thread_id, m.id, status);
+                }
+            }
+            Err(e) => eprintln!("[weft] disconnect queue finalize failed: {e}"),
+        }
+    }
 }
 
 enum DisconnectedTurnRow {
@@ -2045,7 +2082,7 @@ pub async fn send(
         if ctx.direct && !spawn_now && !is_codex_appserver {
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
-                rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
+                rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, "error").await;
                 return Err(e);
             }
         } else if !ctx.direct {
@@ -2126,7 +2163,10 @@ pub async fn send(
         if let Err(e) =
             spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(ctx.reset_epoch)).await
         {
-            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
+            // A guard-canceled spawn (stop/interrupt raced the window) is the
+            // user's cancel — finalize "interrupted", not "error".
+            let status = spawn_failure_status(eng, &ctx).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
             return Err(e);
         }
     } else if ctx.direct && is_codex_appserver {
@@ -2139,7 +2179,8 @@ pub async fn send(
         )
         .await
         {
-            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
+            let status = spawn_failure_status(eng, &ctx).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
             return Err(e);
         }
     } else if let Some(pturn) = promoted {
@@ -2152,6 +2193,13 @@ pub async fn send(
             queue_id: None,
             ..out.clone()
         };
+        // For guard-cancel detection the promoted send is direct-shaped: it owns
+        // the fresh turn it claimed at promotion.
+        let promoted_ctx = SendContext {
+            direct: true,
+            turn: pturn,
+            ..ctx.clone()
+        };
         if per_turn(&ctx.tool) && !is_codex_appserver {
             if let Err(e) = spawn_turn(
                 app.clone(),
@@ -2162,7 +2210,8 @@ pub async fn send(
             )
             .await
             {
-                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content).await;
+                let status = spawn_failure_status(eng, &promoted_ctx).await;
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
                 return Err(e);
             }
         } else if is_codex_appserver {
@@ -2175,7 +2224,8 @@ pub async fn send(
             )
             .await
             {
-                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content).await;
+                let status = spawn_failure_status(eng, &promoted_ctx).await;
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
                 return Err(e);
             }
         }
@@ -2616,7 +2666,7 @@ async fn codex_consumer(
                     // Ownership-guarded (turn_id + busy): no-ops when the stop
                     // already reset the turn itself.
                     if let Some(turn_id) = next_turn_id {
-                        rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                        rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
                     }
                 } else if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
                     match client.start_turn(&thread, &n.text).await {
@@ -2637,7 +2687,7 @@ async fn codex_consumer(
                             // A Stop during the failed start: roll the queued turn back
                             // interrupted instead of resurrecting it on exec.
                             if eng.lock().await.interrupting {
-                                rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                                rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
                             } else {
                                 eprintln!(
                                     "[weft][codex] flush via app-server failed ({e}); trying exec"
@@ -2665,7 +2715,7 @@ async fn codex_consumer(
                                     }
                                     Err(e2) => {
                                         eprintln!("[weft][codex] exec fallback for queued turn failed: {e2}");
-                                        rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                                        rollback_failed_turn(&app, &db, &eng, turn_id, "error").await;
                                     }
                                 }
                             }
@@ -3121,7 +3171,7 @@ async fn send_hidden_inner(
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
-                rollback_failed_turn(app, db, eng, turn_id).await;
+                rollback_failed_turn(app, db, eng, turn_id, "error").await;
                 return Err(e);
             }
             Ok(())
@@ -3151,7 +3201,7 @@ async fn send_hidden_inner(
                 spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(hidden_epoch)).await
             };
             if let Err(e) = res {
-                rollback_failed_turn(app, db, eng, turn_id).await;
+                rollback_failed_turn(app, db, eng, turn_id, "error").await;
                 return Err(e);
             }
             Ok(())
@@ -3722,7 +3772,7 @@ fn spawn_reader(
                                 .await
                                 {
                                     eprintln!("[weft] queued per-turn delivery failed: {err}");
-                                    rollback_failed_turn(&a, &d, &e, next_turn_id).await;
+                                    rollback_failed_turn(&a, &d, &e, next_turn_id, "error").await;
                                 } else {
                                     mark_queued_delivered(&a, &d, thread_id, session_id, &next)
                                         .await;
@@ -3732,7 +3782,7 @@ fn spawn_reader(
                             if let Err(e) = write_user(&mut inner, &next).await {
                                 eprintln!("[weft] queued resident delivery failed: {e}");
                                 drop(inner);
-                                rollback_failed_turn(&app, &db, &eng, next_turn_id).await;
+                                rollback_failed_turn(&app, &db, &eng, next_turn_id, "error").await;
                                 return;
                             } else {
                                 mark_queued_delivered(&app, &db, thread_id, session_id, &next)
@@ -3851,7 +3901,7 @@ fn spawn_reader(
                     .await
                     {
                         eprintln!("[weft] queued per-turn delivery failed: {err}");
-                        rollback_failed_turn(&a, &d, &e, next_turn_id).await;
+                        rollback_failed_turn(&a, &d, &e, next_turn_id, "error").await;
                     } else {
                         mark_queued_delivered(&a, &d, thread_id, session_id, &next).await;
                     }
