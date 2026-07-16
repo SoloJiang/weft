@@ -1097,6 +1097,12 @@ pub struct EngineInner {
     pub interrupting: bool,
     /// Bumped per spawn; stale reader tasks compare and exit.
     pub generation: u64,
+    /// Bumped whenever a stop/reset clears the turn (stop_quiet). A send captures
+    /// this at Phase 1; if it advances before the send commits, the send was
+    /// invalidated by a stop — even one immediately followed by a restart, which
+    /// resets `stopped`/`busy` and so slips past those flags — and must not
+    /// deliver onto the fresh turn.
+    pub reset_epoch: u64,
     /// Set on idle when skills changed; the next send silently restarts the
     /// resident process so it picks up newly-injected skills. UI never sees it.
     pub pending_skill_refresh: bool,
@@ -1624,6 +1630,7 @@ pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyho
 /// Snapshot of engine state taken while reserving a send slot. Carrying it
 /// across await points lets later phases re-verify the reservation is still
 /// valid before mutating the engine.
+#[derive(Clone)]
 struct SendContext {
     thread_id: i32,
     session_id: Option<i32>,
@@ -1632,6 +1639,9 @@ struct SendContext {
     is_command: bool,
     tool: String,
     origin_tag: Option<String>,
+    /// The engine's reset_epoch captured at Phase 1. If it advances before the send
+    /// commits, a stop/reset invalidated this send (see send_reservation_valid).
+    reset_epoch: u64,
 }
 
 /// True when the reservation made in `send` Phase 1 is still valid in Phase 3.
@@ -1645,6 +1655,12 @@ struct SendContext {
 /// change as long as the engine itself has not been stopped.
 fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
     if inner.stopped {
+        return false;
+    }
+    // A stop/reset since Phase 1 — even one immediately followed by a restart that
+    // cleared `stopped` and set `busy` again — bumps reset_epoch (stop_quiet). That
+    // invalidates this send so it can't be delivered onto a turn the user canceled.
+    if inner.reset_epoch != ctx.reset_epoch {
         return false;
     }
     if ctx.direct {
@@ -1776,6 +1792,11 @@ pub async fn send(
             // This send starts a turn now → its tag IS the in-flight turn's tag.
             inner.current_origin_tag = origin_tag.clone();
             crate::power::on_turn_began(app);
+            // Persist "running" WHILE holding the lock so it is ordered before any
+            // concurrent stop's "stopped" write: stop_quiet must take this same lock
+            // first, so its later "stopped" write can't be overtaken and leave a
+            // stopped session recorded as running (which boot-revive would resume).
+            persist_activity(db, inner.session_id, inner.thread_id, "running").await;
         }
         SendContext {
             thread_id: inner.thread_id,
@@ -1785,12 +1806,9 @@ pub async fn send(
             is_command: text.trim_start().starts_with('/'),
             tool: inner.tool.clone(),
             origin_tag: origin_tag.clone(),
+            reset_epoch: inner.reset_epoch,
         }
     };
-
-    if ctx.direct {
-        persist_activity(db, ctx.session_id, ctx.thread_id, "running").await;
-    }
 
     let kind = if ctx.is_command { "command" } else { "text" };
     let status = if ctx.direct { "complete" } else { "queued" };
@@ -1927,21 +1945,11 @@ pub async fn send(
         );
     }
 
-    // Phase 4: turn spawning runs without the engine lock. A stop can still race
-    // in the window between Phase 3's lock-drop and the spawn below; re-check the
-    // reservation right before dispatching so a stopped/reset engine never gets a
-    // fresh child. (The resident-write path above is already guarded inside the
-    // Phase 3 lock.)
-    if spawn_now || (ctx.direct && is_codex_appserver) {
-        let valid = {
-            let inner = eng.lock().await;
-            send_reservation_valid(&inner, &ctx)
-        };
-        if !valid {
-            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
-            return Err(anyhow::anyhow!("engine stopped before the turn could spawn"));
-        }
-    }
+    // Phase 4: turn spawning runs without the engine lock. The spawn helpers
+    // (spawn_turn / spawn_codex_turn) re-check `stopped` atomically with the child
+    // snapshot, so a stop landing in the Phase-3-to-spawn window can't launch a
+    // child; a stop that reset the engine earlier was already rejected above by
+    // send_reservation_valid's reset_epoch check.
     if spawn_now {
         if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
             rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
@@ -1974,6 +1982,14 @@ async fn spawn_codex_turn(
 ) -> anyhow::Result<()> {
     let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
         let i = eng.lock().await;
+        // Atomic with the snapshot: don't start a codex turn for a stopped engine
+        // (a stop racing the send's Phase-3-to-spawn window, which is widest on the
+        // app-server path because connection/start awaits happen after this). The
+        // caller rolls back or falls through — and the exec fallback (spawn_turn)
+        // makes the same check — so returning here is safe.
+        if i.stopped {
+            return Err(anyhow::anyhow!("engine stopped; not starting a codex turn"));
+        }
         (
             i.native_id.clone(),
             i.cwd.clone(),
@@ -2514,6 +2530,13 @@ fn codex_change_approval_summary(params: &serde_json::Value) -> String {
 /// stream from stdout, EOF ends the turn (the reader then flushes the queue).
 async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
+    // Atomic with the child snapshot below: never launch a per-turn process for a
+    // stopped engine — a stop that raced into the send's Phase-3-to-spawn window,
+    // or a queued turn drained just as the human stopped. Every caller already
+    // rolls back or propagates a spawn error, so returning here is safe.
+    if inner.stopped {
+        return Err(anyhow::anyhow!("engine stopped; not spawning a turn"));
+    }
     // Per-turn argv (incl. codex's message-on-argv and opencode's /cmd→--command
     // peel) is built by the tool's adapter; `prepare` does the folder-trust
     // pre-accept. Identical output to the former inline match.
@@ -2959,6 +2982,11 @@ pub async fn stop_quiet(
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    // Invalidate any send that reserved against the turn we just cleared — even one
+    // whose Phase 1 ran before this stop but whose Phase 3 runs after, and even a
+    // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
+    // past those flags). send_reservation_valid compares the captured reset_epoch.
+    inner.reset_epoch += 1;
     (target.0, target.1, current, orphan_tools)
 }
 
@@ -4063,6 +4091,7 @@ mod tests {
             current: None,
             interrupting: false,
             generation: 0,
+            reset_epoch: 0,
             pending_skill_refresh: false,
             pending_command_refresh: false,
             last_context_tokens: None,
@@ -4193,8 +4222,20 @@ mod tests {
             is_command: false,
             tool: "claude".into(),
             origin_tag: None,
+            reset_epoch: 0,
         };
         assert!(send_reservation_valid(&inner, &direct_ctx));
+
+        // A reset_epoch bump (a stop/reset since Phase 1 — including a stop that was
+        // immediately restarted, which leaves turn_id/busy looking valid) invalidates
+        // BOTH a direct and a queued reservation.
+        inner.reset_epoch = 1;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        assert!(!send_reservation_valid(
+            &inner,
+            &SendContext { direct: false, ..direct_ctx.clone() }
+        ));
+        inner.reset_epoch = 0;
 
         // Stopped engine invalidates any reservation.
         inner.stopped = true;
@@ -4264,6 +4305,7 @@ mod tests {
             current: None,
             interrupting: false,
             generation: 0,
+            reset_epoch: 0,
             pending_skill_refresh: false,
             pending_command_refresh: false,
             last_context_tokens: None,
