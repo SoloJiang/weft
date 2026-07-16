@@ -3,12 +3,13 @@ import { useTranslation } from "react-i18next";
 import { Maximize2, Pencil, X } from "lucide-react";
 
 import { api } from "../lib/api";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import type { TestPlan } from "../lib/types";
 import { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
 import { Button } from "../components/ui/Button";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
-import { clampPanelWidth } from "./panelWidth";
+import { useResizablePanel } from "./useResizablePanel";
 import { cn } from "../lib/cn";
 import type { NodePath } from "./MindMapView";
 import type { MindMapEditorHandle } from "./MindMapEditor";
@@ -17,10 +18,6 @@ import type { MindMapEditorHandle } from "./MindMapEditor";
 // the panel is rarely open, and the editor loads only when editing begins.
 const MindMapView = lazy(() => import("./MindMapView"));
 const MindMapEditor = lazy(() => import("./MindMapEditor"));
-
-const MIN_W = 360;
-const MAX_W = 860;
-const clampW = (x: number) => clampPanelWidth(x, MIN_W, MAX_W);
 
 type Mode = "preview" | "edit";
 
@@ -78,8 +75,12 @@ export function TestPlanPanel({
   onEdited?: () => void;
 }) {
   const { t } = useTranslation();
-  const [w, setW] = useState(() => clampW(Number(localStorage.getItem("weft-testplan-w")) || 560));
-  const [dragging, setDragging] = useState(false);
+  const { width: w, dragging, startDrag } = useResizablePanel({
+    storageKey: STORAGE_KEYS.testPlanPanelWidth,
+    min: 360,
+    max: 860,
+    default: 560,
+  });
   const [plan, setPlan] = useState<TestPlan | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [mode, setMode] = useState<Mode>("preview");
@@ -88,32 +89,6 @@ export function TestPlanPanel({
   const [fullscreen, setFullscreen] = useState(false);
   const [selectedPath, setSelectedPath] = useState<NodePath | null>(null);
   const [noteDraft, setNoteDraft] = useState("");
-
-  useEffect(() => {
-    localStorage.setItem("weft-testplan-w", String(w));
-  }, [w]);
-
-  useEffect(() => {
-    const onResize = () => setW((cur) => clampW(cur));
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-
-  useEffect(() => {
-    if (!dragging) return;
-    const move = (e: PointerEvent) => setW(clampW(window.innerWidth - e.clientX));
-    const up = () => setDragging(false);
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    return () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-  }, [dragging]);
 
   // Refetch on open, thread switch, and lead re-emit. Drop stale responses.
   // A re-emit while EDITING would make Save overwrite the freshly derived
@@ -305,7 +280,7 @@ export function TestPlanPanel({
     >
       {/* resize handle on the column's left edge */}
       <div
-        onPointerDown={() => setDragging(true)}
+        onPointerDown={() => startDrag()}
         className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-brand/40"
       />
       <div className="flex min-w-0 flex-1 flex-col">

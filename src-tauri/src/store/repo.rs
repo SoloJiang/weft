@@ -1702,19 +1702,56 @@ pub async fn insert_lead_message(
     content: &str,
     status: &str,
 ) -> Result<lead_message::Model> {
-    Ok(lead_message::ActiveModel {
-        thread_id: Set(thread_id),
-        session_id: Set(session_id),
-        turn_id: Set(turn_id),
-        role: Set(role.to_string()),
-        kind: Set(kind.to_string()),
-        content: Set(content.to_string()),
-        status: Set(status.to_string()),
-        created_at: Set(now()),
-        ..Default::default()
+    use sea_orm::ConnectionTrait;
+    // Deletion fence, atomic via ONE conditional INSERT: delete_thread cascades
+    // the rows away BEFORE stopping the engines, so a still-running
+    // reader/consumer can reach this insert after the cascade — and a bare
+    // exists-check could observe the thread just before the cascade commits yet
+    // insert after it (no FK rejects the orphan).
+    //
+    // Why not a transaction: under WAL (store/mod.rs enables it) a deferred
+    // read→write upgrade fails with SQLITE_BUSY_SNAPSHOT whenever ANY writer —
+    // not just a delete — commits after the snapshot, so two ordinary
+    // concurrent sends (or a send racing a status/meta write) would spuriously
+    // fail message delivery. A single INSERT … SELECT … WHERE EXISTS statement
+    // is atomic under SQLite and only waits on the normal busy_timeout for
+    // writer contention: actual deletions land as rows_affected == 0, unrelated
+    // writers never poison it. Bound-parameter Statement, the idiom this module
+    // already uses where the ORM cannot express the shape.
+    //
+    // This is the single INSERT choke point (set_lead_status /
+    // set_lead_native_id route their meta inserts through here); UPDATE-shaped
+    // writes are naturally fenced — their rows are gone.
+    let res = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO lead_message \
+             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ? \
+             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
+            [
+                thread_id.into(),
+                session_id.into(),
+                turn_id.into(),
+                role.into(),
+                kind.into(),
+                content.into(),
+                status.into(),
+                now().into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("thread {thread_id} no longer exists (deleted)");
     }
-    .insert(&db.0)
-    .await?)
+    let id = i32::try_from(res.last_insert_id())
+        .map_err(|_| anyhow::anyhow!("lead_message id out of i32 range"))?;
+    lead_message::Entity::find_by_id(id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("inserted lead_message {id} not found"))
 }
 
 pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) -> Result<()> {
@@ -2042,6 +2079,31 @@ pub async fn set_queued_status(
     update_all_queued_status(db, thread_id, session_id, status).await
 }
 
+/// Flip the given rows to `status` — only those still `queued`. By-id variant of
+/// [`set_queued_status`] for callers that must finalize ONLY the rows they
+/// drained: a blanket per-session sweep could catch a CONCURRENT send's row,
+/// inserted after the caller released the engine lock, and finalize a message
+/// that is about to be delivered.
+pub async fn set_queued_status_by_ids(
+    db: &Db,
+    ids: &[i32],
+    status: &str,
+) -> Result<Vec<lead_message::Model>> {
+    let mut updated = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(m) = lead_message::Entity::find_by_id(*id).one(&db.0).await? else {
+            continue;
+        };
+        if m.status != "queued" {
+            continue;
+        }
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set(status.to_string());
+        updated.push(a.update(&db.0).await?);
+    }
+    Ok(updated)
+}
+
 fn queued_query(thread_id: i32, session_id: Option<i32>) -> sea_orm::Select<lead_message::Entity> {
     let q = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
@@ -2164,6 +2226,17 @@ pub async fn set_lead_status(db: &Db, thread_id: i32, status: &str) -> Result<()
             a.update(&db.0).await?;
         }
         None => {
+            // Fence against deleted threads: delete_thread cascades the rows away
+            // and THEN stops the engines, whose status persistence lands here —
+            // inserting a fresh meta row at that point would recreate orphan
+            // timeline data for a thread that no longer exists.
+            let thread_exists = thread::Entity::find_by_id(thread_id)
+                .one(&db.0)
+                .await?
+                .is_some();
+            if !thread_exists {
+                return Ok(());
+            }
             let content = serde_json::json!({ "status": status }).to_string();
             insert_lead_message(
                 db, thread_id, None, 0, "system", "meta", &content, "complete",
@@ -2281,6 +2354,17 @@ mod tests {
 
     async fn mem() -> Db {
         Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    /// A live thread id for message tests: insert_lead_message refuses to write
+    /// rows for a deleted/nonexistent thread (the deletion fence), so tests must
+    /// target a real thread row instead of a bare literal id.
+    async fn live_thread(db: &Db) -> i32 {
+        let ws = create_workspace(db, "msg-ws").await.unwrap();
+        create_thread(db, ws.id, "msg-t", "feature", "claude")
+            .await
+            .unwrap()
+            .id
     }
 
     async fn worker_fixture(
@@ -2828,9 +2912,10 @@ mod tests {
     #[tokio::test]
     async fn lead_message_roundtrip() {
         let db = mem().await;
+        let t = live_thread(&db).await;
         let m = insert_lead_message(
             &db,
-            1,
+            t,
             None,
             1,
             "user",
@@ -2840,22 +2925,23 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(m.thread_id, 1);
+        assert_eq!(m.thread_id, t);
         update_lead_message(&db, m.id, r#"{"text":"hi!"}"#, "complete")
             .await
             .unwrap();
-        let all = list_lead_messages(&db, 1).await.unwrap();
+        let all = list_lead_messages(&db, t).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].content, r#"{"text":"hi!"}"#);
-        assert_eq!(next_turn_id(&db, 1).await.unwrap(), 2);
+        assert_eq!(next_turn_id(&db, t).await.unwrap(), 2);
     }
 
     #[tokio::test]
     async fn resolve_action_card_persists_resolved_marker() {
         let db = mem().await;
+        let t = live_thread(&db).await;
         let card = insert_lead_message(
             &db,
-            1,
+            t,
             None,
             1,
             "system",
@@ -2874,7 +2960,7 @@ mod tests {
         // existing fields are preserved, not clobbered
         assert_eq!(v["title"], "Add a repo");
         // and it survives reload (persisted, not session-local)
-        let all = list_lead_messages(&db, 1).await.unwrap();
+        let all = list_lead_messages(&db, t).await.unwrap();
         assert_eq!(all[0].content, updated.content);
         // a missing row is a no-op
         assert!(resolve_action_card(&db, 9999, "x").await.unwrap().is_none());
@@ -2995,9 +3081,10 @@ mod tests {
     #[tokio::test]
     async fn stale_streaming_messages_mark_interrupted_on_reopen() {
         let db = mem().await;
+        let t = live_thread(&db).await;
         let streaming = insert_lead_message(
             &db,
-            4,
+            t,
             Some(9),
             1,
             "assistant",
@@ -3009,7 +3096,7 @@ mod tests {
         .unwrap();
         let queued = insert_lead_message(
             &db,
-            4,
+            t,
             Some(9),
             2,
             "user",
@@ -3020,11 +3107,11 @@ mod tests {
         .await
         .unwrap();
 
-        mark_incomplete_turns_interrupted(&db, 4, Some(9))
+        mark_incomplete_turns_interrupted(&db, t, Some(9))
             .await
             .unwrap();
 
-        let all = list_lead_messages(&db, 4).await.unwrap();
+        let all = list_lead_messages(&db, t).await.unwrap();
         assert_eq!(
             all.iter().find(|m| m.id == streaming.id).unwrap().status,
             "interrupted"
@@ -3078,9 +3165,10 @@ mod tests {
     #[tokio::test]
     async fn queued_flips_to_complete() {
         let db = mem().await;
+        let t = live_thread(&db).await;
         insert_lead_message(
             &db,
-            2,
+            t,
             None,
             2,
             "user",
@@ -3090,18 +3178,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let updated = complete_queued(&db, 2, None).await.unwrap().unwrap();
+        let updated = complete_queued(&db, t, None).await.unwrap().unwrap();
         assert_eq!(updated.status, "complete");
-        let all = list_lead_messages(&db, 2).await.unwrap();
+        let all = list_lead_messages(&db, t).await.unwrap();
         assert_eq!(all[0].status, "complete");
     }
 
     #[tokio::test]
     async fn queued_status_updates_are_session_scoped() {
         let db = mem().await;
+        let t = live_thread(&db).await;
         let lead = insert_lead_message(
             &db,
-            7,
+            t,
             None,
             1,
             "user",
@@ -3113,7 +3202,7 @@ mod tests {
         .unwrap();
         let worker = insert_lead_message(
             &db,
-            7,
+            t,
             Some(3),
             1,
             "user",
@@ -3124,9 +3213,9 @@ mod tests {
         .await
         .unwrap();
 
-        let completed = complete_queued(&db, 7, Some(3)).await.unwrap().unwrap();
+        let completed = complete_queued(&db, t, Some(3)).await.unwrap().unwrap();
         assert_eq!(completed.id, worker.id);
-        let failed = set_queued_status(&db, 7, None, "interrupted")
+        let failed = set_queued_status(&db, t, None, "interrupted")
             .await
             .unwrap();
 
@@ -3134,7 +3223,7 @@ mod tests {
             failed.iter().map(|m| m.id).collect::<Vec<_>>(),
             vec![lead.id]
         );
-        let all = list_lead_messages(&db, 7).await.unwrap();
+        let all = list_lead_messages(&db, t).await.unwrap();
         assert_eq!(
             all.iter().find(|m| m.id == worker.id).unwrap().status,
             "complete"
@@ -3148,15 +3237,16 @@ mod tests {
     #[tokio::test]
     async fn lead_native_id_upserts() {
         let db = mem().await;
-        assert!(lead_native_id(&db, 3).await.unwrap().is_none());
-        set_lead_native_id(&db, 3, "abc").await.unwrap();
-        set_lead_native_id(&db, 3, "def").await.unwrap();
+        let t = live_thread(&db).await;
+        assert!(lead_native_id(&db, t).await.unwrap().is_none());
+        set_lead_native_id(&db, t, "abc").await.unwrap();
+        set_lead_native_id(&db, t, "def").await.unwrap();
         assert_eq!(
-            lead_native_id(&db, 3).await.unwrap().as_deref(),
+            lead_native_id(&db, t).await.unwrap().as_deref(),
             Some("def")
         );
         // meta row stays single + out of turn numbering
-        assert_eq!(list_lead_messages(&db, 3).await.unwrap().len(), 1);
+        assert_eq!(list_lead_messages(&db, t).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3181,23 +3271,44 @@ mod tests {
     #[tokio::test]
     async fn lead_status_round_trips_and_preserves_native_id() {
         let db = mem().await;
-        set_lead_native_id(&db, 7, "nat-xyz").await.unwrap();
-        set_lead_status(&db, 7, "running").await.unwrap();
+        // Real thread rows: set_lead_status only INSERTS its meta row for threads
+        // that still exist (the fence below), so the round-trip cases must run
+        // against live threads — which is also what production does.
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t7 = create_thread(&db, ws.id, "a", "feature", "claude")
+            .await
+            .unwrap();
+        let t8 = create_thread(&db, ws.id, "b", "feature", "claude")
+            .await
+            .unwrap();
+        set_lead_native_id(&db, t7.id, "nat-xyz").await.unwrap();
+        set_lead_status(&db, t7.id, "running").await.unwrap();
         assert_eq!(
-            lead_status(&db, 7).await.unwrap().as_deref(),
+            lead_status(&db, t7.id).await.unwrap().as_deref(),
             Some("running")
         );
         assert_eq!(
-            lead_native_id(&db, 7).await.unwrap().as_deref(),
+            lead_native_id(&db, t7.id).await.unwrap().as_deref(),
             Some("nat-xyz")
         );
         // opposite write order must also coexist (status first, native id second)
-        set_lead_status(&db, 8, "idle").await.unwrap();
-        set_lead_native_id(&db, 8, "nat-8").await.unwrap();
-        assert_eq!(lead_status(&db, 8).await.unwrap().as_deref(), Some("idle"));
+        set_lead_status(&db, t8.id, "idle").await.unwrap();
+        set_lead_native_id(&db, t8.id, "nat-8").await.unwrap();
         assert_eq!(
-            lead_native_id(&db, 8).await.unwrap().as_deref(),
+            lead_status(&db, t8.id).await.unwrap().as_deref(),
+            Some("idle")
+        );
+        assert_eq!(
+            lead_native_id(&db, t8.id).await.unwrap().as_deref(),
             Some("nat-8")
+        );
+        // The fence: a deleted/nonexistent thread gets NO meta row — stop() after
+        // delete_thread's cascade must not recreate orphan timeline data.
+        set_lead_status(&db, 999, "stopped").await.unwrap();
+        assert_eq!(
+            lead_status(&db, 999).await.unwrap(),
+            None,
+            "no meta row may be inserted for a deleted thread"
         );
     }
 
@@ -4186,10 +4297,11 @@ mod tests {
     #[tokio::test]
     async fn complete_by_id_targets_the_named_row() {
         let db = mem().await;
-        let a = insert_lead_message(&db, 2, None, 1, "user", "text", "{}", "queued")
+        let t = live_thread(&db).await;
+        let a = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "queued")
             .await
             .unwrap();
-        let b = insert_lead_message(&db, 2, None, 2, "user", "text", "{}", "queued")
+        let b = insert_lead_message(&db, t, None, 2, "user", "text", "{}", "queued")
             .await
             .unwrap();
         // deliver b first (simulates reorder: b before a)
@@ -4623,21 +4735,22 @@ mod tests {
     #[tokio::test]
     async fn delivery_seq_overrides_id_order() {
         let db = mem().await;
-        let a = insert_lead_message(&db, 5, None, 1, "user", "text", r#"{"text":"A"}"#, "complete")
+        let t = live_thread(&db).await;
+        let a = insert_lead_message(&db, t, None, 1, "user", "text", r#"{"text":"A"}"#, "complete")
             .await
             .unwrap();
-        let b = insert_lead_message(&db, 5, None, 2, "user", "text", r#"{"text":"B"}"#, "complete")
+        let b = insert_lead_message(&db, t, None, 2, "user", "text", r#"{"text":"B"}"#, "complete")
             .await
             .unwrap();
-        let c = insert_lead_message(&db, 5, None, 3, "user", "text", r#"{"text":"C"}"#, "complete")
+        let c = insert_lead_message(&db, t, None, 3, "user", "text", r#"{"text":"C"}"#, "complete")
             .await
             .unwrap();
 
         // Assign a delivery seq to B as if it was delivered after C (reorder scenario).
         // max(COALESCE(seq,id)) over [a.id, b.id, c.id] = c.id, so B.seq = c.id + 1.
-        assign_delivery_seq(&db, 5, b.id).await.unwrap();
+        assign_delivery_seq(&db, t, b.id).await.unwrap();
 
-        let msgs = list_lead_messages(&db, 5).await.unwrap();
+        let msgs = list_lead_messages(&db, t).await.unwrap();
         let ids: Vec<i32> = msgs.iter().map(|m| m.id).collect();
         // COALESCE(seq, id) ordering: A → a.id, C → c.id, B → c.id+1
         assert_eq!(ids, vec![a.id, c.id, b.id], "B must sort after C once its seq > C.id");

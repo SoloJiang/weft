@@ -1,13 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { X } from "lucide-react";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { DiffView } from "./DiffView";
-import { clampPanelWidth } from "./panelWidth";
+import { useResizablePanel } from "./useResizablePanel";
 import { cn } from "../lib/cn";
-
-const MIN_W = 360;
-const MAX_W = 860;
-const clampW = (x: number) => clampPanelWidth(x, MIN_W, MAX_W);
 
 /**
  * The worktree diff as a real third column (not a floating overlay): opening it
@@ -30,22 +27,12 @@ export function DiffPanel({
   onAsk?: (text: string) => void;
 }) {
   const { t } = useTranslation();
-  const [w, setW] = useState(() =>
-    clampW(Number(localStorage.getItem("weft-diff-w")) || 520),
-  );
-  const [dragging, setDragging] = useState(false);
-
-  useEffect(() => {
-    localStorage.setItem("weft-diff-w", String(w));
-  }, [w]);
-
-  // Re-clamp on window shrink (e.g. 1000 → 600) so a wide panel set on a big
-  // screen can't crowd out the main column at the floor.
-  useEffect(() => {
-    const onResize = () => setW((cur) => clampW(cur));
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
+  const { width: w, dragging, startDrag } = useResizablePanel({
+    storageKey: STORAGE_KEYS.diffPanelWidth,
+    min: 360,
+    max: 860,
+    default: 520,
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -55,22 +42,6 @@ export function DiffPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
-
-  useEffect(() => {
-    if (!dragging) return;
-    const move = (e: PointerEvent) => setW(clampW(window.innerWidth - e.clientX));
-    const up = () => setDragging(false);
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    return () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-  }, [dragging]);
 
   return (
     <div
@@ -85,7 +56,7 @@ export function DiffPanel({
       <div
         onPointerDown={(e) => {
           e.preventDefault();
-          setDragging(true);
+          startDrag();
         }}
         className={cn(
           "absolute left-0 top-0 z-10 h-full w-1.5 cursor-col-resize transition-colors",

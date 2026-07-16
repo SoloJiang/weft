@@ -371,11 +371,17 @@ fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
     inner.turn_id
 }
 
-fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> bool {
+/// Returns `None` when the turn isn't ours to reset (id advanced / not busy);
+/// `Some(drained)` — the queue_ids of the still-queued rows cleared here — when
+/// it reset. The caller finalizes EXACTLY those rows: a session-wide queued
+/// sweep after the lock drops could catch a concurrent send's row inserted
+/// meanwhile and fail a message that is about to be delivered.
+fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec<i32>> {
     if inner.turn_id != turn_id || !inner.turn.busy {
-        return false;
+        return None;
     }
     inner.turn.busy = false;
+    let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
     inner.turn.queue.clear();
     inner.clock.started = None;
     inner.current_origin_tag = None;
@@ -383,7 +389,7 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> bool {
     inner.stdin = None;
     inner.current = None;
     inner.interrupting = false;
-    true
+    Some(drained)
 }
 
 fn emit_finalize(app: &AppHandle, thread_id: i32, message_id: i32, status: &str) {
@@ -487,10 +493,6 @@ async fn mark_queued_status(
     }
 }
 
-async fn mark_queued_failed(app: &AppHandle, db: &Db, thread_id: i32, session_id: Option<i32>) {
-    mark_queued_status(app, db, thread_id, session_id, "error").await;
-}
-
 fn emit_turn_state(
     app: &AppHandle,
     thread_id: i32,
@@ -536,17 +538,39 @@ fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing
     );
 }
 
-async fn rollback_failed_turn(app: &AppHandle, db: &Db, eng: &EngineRef, turn_id: i32) {
+/// `status` distinguishes WHY the turn died: "error" for a genuine failure,
+/// "interrupted" when a stop/interrupt canceled it (a guard-canceled spawn must
+/// not be reported as an agent failure).
+async fn rollback_failed_turn(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    turn_id: i32,
+    status: &str,
+) {
     let mut inner = eng.lock().await;
-    if !reset_failed_hidden_turn(&mut inner, turn_id) {
+    let Some(drained) = reset_failed_hidden_turn(&mut inner, turn_id) else {
         return;
-    }
+    };
     let thread_id = inner.thread_id;
     let session_id = inner.session_id;
     persist_activity(db, session_id, thread_id, "idle").await;
     emit_turn_state(app, thread_id, session_id, false, Vec::new());
     drop(inner);
-    mark_queued_failed(app, db, thread_id, session_id).await;
+    // Finalize EXACTLY the rows drained under the lock (same rule as
+    // rollback_canceled_send): a session-wide sweep here could catch a
+    // concurrent send's freshly inserted queued row and fail a message that is
+    // about to be delivered.
+    if !drained.is_empty() {
+        match repo::set_queued_status_by_ids(db, &drained, status).await {
+            Ok(rows) => {
+                for m in rows {
+                    emit_finalize(app, thread_id, m.id, status);
+                }
+            }
+            Err(e) => eprintln!("[weft] failed-turn queue finalize failed: {e}"),
+        }
+    }
 }
 
 async fn rollback_failed_visible_turn(
@@ -556,11 +580,58 @@ async fn rollback_failed_visible_turn(
     turn_id: i32,
     message_id: i32,
     content: &str,
+    status: &str,
 ) {
     let thread_id = { eng.lock().await.thread_id };
-    let _ = repo::update_lead_message(db, message_id, content, "error").await;
-    emit_finalize(app, thread_id, message_id, "error");
-    rollback_failed_turn(app, db, eng, turn_id).await;
+    let _ = repo::update_lead_message(db, message_id, content, status).await;
+    emit_finalize(app, thread_id, message_id, status);
+    rollback_failed_turn(app, db, eng, turn_id, status).await;
+}
+
+/// After a spawn attempt fails, decide the rollback status: if the send's
+/// reservation is no longer valid, a stop/interrupt/reset raced the spawn
+/// window and the guard canceled it — that is the USER's cancel
+/// ("interrupted"), not an agent failure ("error").
+async fn spawn_failure_status(eng: &EngineRef, ctx: &SendContext) -> &'static str {
+    let g = eng.lock().await;
+    if send_reservation_valid(&g, ctx) {
+        "error"
+    } else {
+        "interrupted"
+    }
+}
+
+/// The drain-shaped sibling of [`spawn_failure_status`]: rollback status for a
+/// DEQUEUED delivery that failed — "interrupted" when the stop/interrupt/epoch
+/// guard canceled it (the user's cancel), "error" for a genuine failure.
+async fn drain_failure_status(eng: &EngineRef, dequeue_epoch: u64) -> &'static str {
+    let g = eng.lock().await;
+    if g.stopped || g.interrupting || g.reset_epoch != dequeue_epoch {
+        "interrupted"
+    } else {
+        "error"
+    }
+}
+
+/// A dequeued (popped) message is no longer in the in-memory queue, so a
+/// rollback's drained-ids sweep cannot see its row — finalize it explicitly, or
+/// a canceled/failed dequeued message stays `queued` in the DB forever.
+async fn finalize_dequeued_row(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    out: &Outgoing,
+    status: &str,
+) {
+    let Some(id) = out.queue_id else { return };
+    match repo::set_queued_status_by_ids(db, &[id], status).await {
+        Ok(rows) => {
+            for m in rows {
+                emit_finalize(app, thread_id, m.id, status);
+            }
+        }
+        Err(e) => eprintln!("[weft] dequeued row finalize failed: {e}"),
+    }
 }
 
 /// Finalize tool rows still awaiting a result, marking each `status` and pushing
@@ -944,6 +1015,11 @@ async fn cleanup_disconnected_turn(
     let current = inner.current.take().map(|(id, text, _)| (id, text));
     let orphan_tools: Vec<(i32, serde_json::Value)> =
         inner.tool_rows.drain().map(|(_, v)| v).collect();
+    // Capture EXACTLY the still-queued rows this cleanup drains (the
+    // captured-ids rule every rollback path follows): a session-wide sweep
+    // after the lock drops could also catch a send's row inserted meanwhile —
+    // that send's Phase 3 rejects on the bumped epoch and finalizes its own row.
+    let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
     inner.interrupting = false;
     inner.child = None;
     inner.stdin = None;
@@ -951,6 +1027,14 @@ async fn cleanup_disconnected_turn(
     inner.clock = TurnClock::default();
     inner.current_origin_tag = None;
     inner.stopped = true;
+    // This reset carries STOP semantics (stopped=true, queued rows finalized), so
+    // in-flight sends racing Phase 1→3 must die with it: bump the epoch, exactly
+    // like stop_quiet — else a quick restart clears `stopped` and a stale queued
+    // send (which ignores turn_id/busy) would enqueue or deliver a message whose
+    // row this cleanup already finalized. Continuity resets (resident respawn,
+    // child-EOF recovery) deliberately do NOT bump: their in-flight sends are
+    // still wanted and Phase 3 promotes them onto the fresh engine.
+    inner.reset_epoch += 1;
     persist_activity(db, session_id, thread_id, "stopped").await;
     let _ = app.emit(
         EVENT,
@@ -983,7 +1067,16 @@ async fn cleanup_disconnected_turn(
         }
     }
     finalize_orphan_tool_rows(app, db, thread_id, orphan_tools, status).await;
-    mark_queued_status(app, db, thread_id, session_id, status).await;
+    if !drained.is_empty() {
+        match repo::set_queued_status_by_ids(db, &drained, status).await {
+            Ok(rows) => {
+                for m in rows {
+                    emit_finalize(app, thread_id, m.id, status);
+                }
+            }
+            Err(e) => eprintln!("[weft] disconnect queue finalize failed: {e}"),
+        }
+    }
 }
 
 enum DisconnectedTurnRow {
@@ -1097,6 +1190,12 @@ pub struct EngineInner {
     pub interrupting: bool,
     /// Bumped per spawn; stale reader tasks compare and exit.
     pub generation: u64,
+    /// Bumped whenever a stop/reset clears the turn (stop_quiet). A send captures
+    /// this at Phase 1; if it advances before the send commits, the send was
+    /// invalidated by a stop — even one immediately followed by a restart, which
+    /// resets `stopped`/`busy` and so slips past those flags — and must not
+    /// deliver onto the fresh turn.
+    pub reset_epoch: u64,
     /// Set on idle when skills changed; the next send silently restarts the
     /// resident process so it picks up newly-injected skills. UI never sees it.
     pub pending_skill_refresh: bool,
@@ -1390,6 +1489,10 @@ impl LeadChatState {
         self.0.get(&key).map(|r| r.value().clone())
     }
 
+    pub fn remove(&self, key: i64) -> Option<EngineRef> {
+        self.0.remove(&key).map(|r| r.1)
+    }
+
     /// Atomic get-or-insert: concurrent constructors (e.g. React StrictMode's
     /// double-mount firing two ensures) must converge on ONE engine — a lost
     /// race would orphan a duplicate headless process writing the same session.
@@ -1557,6 +1660,94 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
     }
 }
 
+/// Undo the turn reservation made by `send` Phase 1 when later persistence
+/// fails. Leaves the engine idle and forgets the incremented turn id so the
+/// next send can start a fresh turn.
+///
+/// Only undoes a reservation this send still OWNS: the lock was dropped for the
+/// failing DB work, so a stop/reset (reset_epoch) or a newer direct reservation
+/// (turn_id) may own the state by now — undoing then would clear the busy flag
+/// or decrement the turn id of THAT turn, canceling or corrupting it. A leaked
+/// increment on our abandoned id is harmless (turn ids are monotonic); a wrong
+/// decrement is not.
+/// Undo a canceled direct send's Phase-1 reservation and restore the engine's
+/// invariants — ownership-guarded: `reset_epoch` + `turn_id` + `busy` must all
+/// still match this send, else a stop/reset cleared the turn itself or a newer
+/// reservation owns the state, and this no-ops.
+///
+/// When it does undo, three invariants are restored, not just the busy flag:
+/// - `interrupting` is cleared: the interrupt that canceled this send targeted
+///   OUR nascent turn, and for per-turn/codex paths no child or TurnEnd will
+///   ever exist to clear the flag — leaving it set would reject every later
+///   direct send until restart.
+/// - messages that queued behind the canceled turn are cleared and finalized
+///   `queue_status` ("interrupted" for a cancel, "error" for a persistence
+///   failure): an idle engine must never keep a non-empty queue — nothing
+///   drains it, and a later send would run ahead of it.
+/// - the session activity Phase 1 optimistically persisted as "running" is
+///   re-persisted ("stopped"/"idle" per current state): a stop landing between
+///   ensure_running_for_send and Phase 1 has its unlocked "stopped" write
+///   overtaken by Phase 1's locked "running" write.
+async fn rollback_canceled_send(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    ctx: &SendContext,
+    queue_status: &str,
+    // true = the canceled send's user row already landed in the timeline, so the
+    // reserved turn id stays consumed (the row carries it); false = pre-persistence
+    // failure (no row), so the counter rewinds.
+    row_persisted: bool,
+) {
+    let (thread_id, drained) = {
+        let mut inner = eng.lock().await;
+        if !ctx.direct
+            || inner.reset_epoch != ctx.reset_epoch
+            || inner.turn_id != ctx.turn
+            || !inner.turn.busy
+        {
+            return;
+        }
+        inner.turn.busy = false;
+        // Keep the turn id CONSUMED when the canceled send's user row was already
+        // persisted: that row sits in the timeline carrying this id, and rewinding
+        // the counter would hand the same id to the NEXT send — mixing two logical
+        // turns in restart recovery and same-turn UI grouping. Only a pre-row
+        // failure (nothing persisted) rewinds; spawn-failure rollbacks
+        // (reset_failed_hidden_turn) already leave the id consumed.
+        if !row_persisted {
+            inner.turn_id -= 1;
+        }
+        inner.current_origin_tag = None;
+        inner.clock.started = None;
+        inner.interrupting = false;
+        // Capture EXACTLY the rows drained here: a blanket per-session sweep
+        // would also catch a concurrent send's row inserted after this lock is
+        // released — finalizing a message that is about to be delivered.
+        let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
+        inner.turn.queue.clear();
+        // Persist + emit UNDER the lock: a replacement send's Phase 1 takes this
+        // same lock and persists "running" inside it, so releasing first would
+        // let this idle/stopped write land AFTER the new turn's running write —
+        // leaving DB/UI idle while a turn runs (breaking live counts and
+        // boot-revive decisions).
+        let status = if inner.stopped { STATUS_STOPPED } else { "idle" };
+        persist_activity(db, inner.session_id, inner.thread_id, status).await;
+        emit_turn_state(app, inner.thread_id, inner.session_id, false, Vec::new());
+        (inner.thread_id, drained)
+    };
+    if !drained.is_empty() {
+        match repo::set_queued_status_by_ids(db, &drained, queue_status).await {
+            Ok(rows) => {
+                for m in rows {
+                    emit_finalize(app, thread_id, m.id, queue_status);
+                }
+            }
+            Err(e) => eprintln!("[weft] canceled-send queue finalize failed: {e}"),
+        }
+    }
+}
+
 pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
     let mut content = vec![serde_json::json!({ "type": "text", "text": out.text })];
     for (media_type, data) in &out.images {
@@ -1600,6 +1791,73 @@ pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyho
             ))
         }
     }
+}
+
+/// Snapshot of engine state taken while reserving a send slot. Carrying it
+/// across await points lets later phases re-verify the reservation is still
+/// valid before mutating the engine.
+#[derive(Clone)]
+struct SendContext {
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn: i32,
+    direct: bool,
+    is_command: bool,
+    tool: String,
+    origin_tag: Option<String>,
+    /// The engine's reset_epoch captured at Phase 1. If it advances before the send
+    /// commits, a stop/reset invalidated this send (see send_reservation_valid).
+    reset_epoch: u64,
+}
+
+/// True when the reservation made in `send` Phase 1 is still valid in Phase 3.
+/// Stop/reset can race while the engine lock is dropped, so we re-check
+/// `stopped`, turn identity, and (for direct sends) the busy flag before
+/// writing to stdin, queueing, or spawning.
+///
+/// Queued sends do not reserve a specific turn; they only observed that the
+/// engine was busy in Phase 1. The active turn may finish (and `turn_id`
+/// advance) while the lock is dropped, so queued sends tolerate a turn-id
+/// change as long as the engine itself has not been stopped.
+fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
+    if inner.stopped {
+        return false;
+    }
+    // A stop/reset since Phase 1 — even one immediately followed by a restart that
+    // cleared `stopped` and set `busy` again — bumps reset_epoch (stop_quiet). That
+    // invalidates this send so it can't be delivered onto a turn the user canceled.
+    if inner.reset_epoch != ctx.reset_epoch {
+        return false;
+    }
+    // An interrupt can land while a direct send is still in Phase 2, before there is
+    // any stdin write / child / active turn for interrupt() to act on — it only sets
+    // `interrupting`. A direct send IS that turn, so honor the cancel and don't
+    // deliver it. (Queued sends target a later turn and survive interrupting the
+    // current one, so they are not rejected here.)
+    if ctx.direct && inner.interrupting {
+        return false;
+    }
+    if ctx.direct {
+        inner.turn_id == ctx.turn && inner.turn.busy
+    } else {
+        // Queued sends don't own the busy flag: whether to enqueue (still busy),
+        // promote into a fresh direct turn (turn ended → idle), or cancel
+        // (interrupt teardown in flight) is decided at Phase 3 commit time from
+        // CURRENT state. Only a stop/reset (checked above) invalidates them here.
+        true
+    }
+}
+
+/// Phase-3 promotion: a queued send found the engine IDLE at commit time (the
+/// active turn ended while the send persisted), so it claims a fresh direct turn
+/// instead of appending to a queue nothing will drain. Pure state transition —
+/// the caller persists status / dispatches. Returns the promoted turn id.
+fn promote_queued_reservation(inner: &mut EngineInner, origin_tag: Option<String>) -> i32 {
+    let _ = inner.turn.try_begin_send();
+    inner.turn_id += 1;
+    inner.clock.begin_turn();
+    inner.current_origin_tag = origin_tag;
+    inner.turn_id
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
@@ -1699,32 +1957,50 @@ pub async fn send(
         }
     }
     ensure_running_for_send(app, db, eng).await?;
-    let mut inner = eng.lock().await;
-    let thread_id = inner.thread_id;
-    let sid = inner.session_id;
-    let is_command = text.trim_start().starts_with('/');
-    let kind = if is_command { "command" } else { "text" };
-    let direct = inner.turn.try_begin_send();
-    // Count only tracked (user-visible) items: hidden plumbing deliveries
-    // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
-    if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
-        return Err(anyhow::anyhow!("queue_full"));
-    }
-    if direct {
-        inner.turn_id += 1;
-        inner.clock.begin_turn();
-        // This send starts a turn now → its tag IS the in-flight turn's tag.
-        inner.current_origin_tag = origin_tag.clone();
-        crate::power::on_turn_began(app);
-        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
-    }
-    let turn = inner.turn_id;
-    let status = if direct { "complete" } else { "queued" };
+
+    // Phase 1: acquire the lock only long enough to reserve turn state and
+    // snapshot the fields needed for persistence. All slow IO (DB writes,
+    // image spills, stdin writes) happens after the lock drops so
+    // stop/interrupt/status stay responsive for the session.
+    let ctx = {
+        let mut inner = eng.lock().await;
+        let direct = inner.turn.try_begin_send();
+        // Count only tracked (user-visible) items: hidden plumbing deliveries
+        // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
+        if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
+            return Err(anyhow::anyhow!("queue_full"));
+        }
+        if direct {
+            inner.turn_id += 1;
+            inner.clock.begin_turn();
+            // This send starts a turn now → its tag IS the in-flight turn's tag.
+            inner.current_origin_tag = origin_tag.clone();
+            crate::power::on_turn_began(app);
+            // Persist "running" WHILE holding the lock so it is ordered before any
+            // concurrent stop's "stopped" write: stop_quiet must take this same lock
+            // first, so its later "stopped" write can't be overtaken and leave a
+            // stopped session recorded as running (which boot-revive would resume).
+            persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+        }
+        SendContext {
+            thread_id: inner.thread_id,
+            session_id: inner.session_id,
+            turn: inner.turn_id,
+            direct,
+            is_command: text.trim_start().starts_with('/'),
+            tool: inner.tool.clone(),
+            origin_tag: origin_tag.clone(),
+            reset_epoch: inner.reset_epoch,
+        }
+    };
+
+    let kind = if ctx.is_command { "command" } else { "text" };
+    let status = if ctx.direct { "complete" } else { "queued" };
     let image_uris: Vec<String> = images
         .iter()
         .map(|(mt, data)| format!("data:{mt};base64,{data}"))
         .collect();
-    let content = if is_command {
+    let content = if ctx.is_command {
         let trimmed = text.trim_start();
         let mut it = trimmed.splitn(2, ' ');
         serde_json::json!({
@@ -1735,16 +2011,39 @@ pub async fn send(
     } else {
         serde_json::json!({ "text": text, "images": image_uris, "files": files }).to_string()
     };
-    let m =
-        repo::insert_lead_message(db, thread_id, sid, turn, "user", kind, &content, status).await?;
+
+    // Phase 2: persist the user row and spill per-turn image attachments without
+    // holding the engine lock.
+    let m = match repo::insert_lead_message(
+        db,
+        ctx.thread_id,
+        ctx.session_id,
+        ctx.turn,
+        "user",
+        kind,
+        &content,
+        status,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            // Phase 1 already reserved turn state; undo it (and restore the
+            // engine invariants — activity, queue, interrupt flag) so the
+            // session isn't left with a stuck busy flag or an orphaned turn id.
+            rollback_canceled_send(app, db, eng, &ctx, "error", false).await;
+            return Err(e.into());
+        }
+    };
     let row_id = m.id;
     let _ = app.emit(
         EVENT,
         Push::Message {
-            thread_id,
+            thread_id: ctx.thread_id,
             message: m,
         },
     );
+
     let mut outbound = text.to_string();
     // Capture BEFORE images may be spilled to temp files below (per-turn dialects
     // clear out.images after spill; has_attachments must reflect the original inputs).
@@ -1757,7 +2056,7 @@ pub async fn send(
     }
     // Per-turn dialects take no inline image blocks: spill pasted images to
     // temp files and hand over paths — every agent can read those itself.
-    let images = if per_turn(&inner.tool) && !images.is_empty() {
+    let images = if per_turn(&ctx.tool) && !images.is_empty() {
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
         let _ = std::fs::create_dir_all(&dir);
@@ -1780,45 +2079,188 @@ pub async fn send(
         images,
         tracked: true,
         // Rides the turn (and the queue, if queued) so output frames recover it.
-        origin_tag: origin_tag.clone(),
-        queue_id: if direct { None } else { Some(row_id) },
+        origin_tag: ctx.origin_tag.clone(),
+        queue_id: if ctx.direct { None } else { Some(row_id) },
         has_attachments,
     };
-    // codex (app-server): a per-session connection drives the turn after the lock
-    // drops (streaming via item/agentMessage/delta). system_prompt is prepended to
-    // a new thread's first turn; per-thread bus MCP rides the connection's own
-    // `-c mcp_servers` spawn args. Falls back to exec if the app-server is
-    // unreachable.
-    let is_codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
-    let spawn_now = direct && per_turn(&inner.tool) && !is_codex_appserver;
-    if direct && !spawn_now && !is_codex_appserver {
-        if let Err(e) = write_user(&mut inner, &out).await {
+
+    // Phase 3: re-acquire the lock and COMMIT against CURRENT state — deliver,
+    // enqueue, promote, or abort is decided here, not enforced from the Phase-1
+    // snapshot (which only decided the row's optimistic status). The lock drops
+    // before any turn-spawning awaits.
+    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
+    let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_codex_appserver;
+    // Set when a queued send found the engine idle and claimed a fresh turn.
+    let mut promoted: Option<i32> = None;
+    {
+        let mut inner = eng.lock().await;
+        // Stop/reset can race between Phase 1 and Phase 3. If the reservation
+        // was invalidated while the lock was dropped, abort instead of writing
+        // to a dead stdin, queueing on a drained turn, or spawning after stop.
+        if !send_reservation_valid(&inner, &ctx) {
             drop(inner);
-            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
-            return Err(e);
+            // A stop/interrupt can land between ensure_running_for_send and
+            // Phase 3, leaving Phase 1's reservation on an engine that will
+            // never run it. Undo it and restore the invariants (busy, activity,
+            // interrupt flag, anything queued behind the canceled turn) — the
+            // rollback is ownership-guarded, so if a stop/reset cleared the turn
+            // itself or a newer reservation owns the state, it no-ops.
+            rollback_canceled_send(app, db, eng, &ctx, "interrupted", true).await;
+            let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
+            emit_finalize(app, ctx.thread_id, row_id, "interrupted");
+            return Err(anyhow::anyhow!(
+                "send could not be delivered: the turn ended or the engine stopped while it was persisting"
+            ));
         }
-    } else if !direct {
-        inner.turn.queue.push_back(out.clone());
+        if ctx.direct && !spawn_now && !is_codex_appserver {
+            if let Err(e) = write_user(&mut inner, &out).await {
+                drop(inner);
+                rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, "error").await;
+                return Err(e);
+            }
+        } else if !ctx.direct {
+            if inner.turn.busy {
+                // The queue cap was checked in Phase 1, but multiple queued sends
+                // can race through DB/attachment I/O and observe the same count.
+                // Re-check under the lock before appending to keep the limit real.
+                if visible_queued(&inner.turn) >= MAX_QUEUED {
+                    drop(inner);
+                    let _ = repo::update_lead_message(db, row_id, &content, "error").await;
+                    emit_finalize(app, ctx.thread_id, row_id, "error");
+                    return Err(anyhow::anyhow!("queue_full"));
+                }
+                inner.turn.queue.push_back(out.clone());
+            } else if inner.interrupting {
+                // The turn this send queued behind is mid-interrupt-teardown;
+                // promoting into that teardown would hand the interrupt a fresh
+                // turn to kill. Cancel instead — the composer restores the draft
+                // on the error path, so nothing is lost.
+                drop(inner);
+                let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
+                emit_finalize(app, ctx.thread_id, row_id, "interrupted");
+                return Err(anyhow::anyhow!(
+                    "send could not be delivered: the turn was interrupted while it was persisting"
+                ));
+            } else {
+                // The active turn ENDED while this send persisted: nothing drains
+                // an idle queue, so deliver NOW by promoting into a fresh direct
+                // turn — the same commit-time decision a direct send makes.
+                promoted = Some(promote_queued_reservation(&mut inner, ctx.origin_tag.clone()));
+                crate::power::on_turn_began(app);
+                // Under the lock for the same ordering reason as Phase 1's direct
+                // write: a concurrent stop's "stopped" write must not be overtaken.
+                persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+                if !per_turn(&ctx.tool) && !is_codex_appserver {
+                    // Resident tool: deliver through the live stdin under this
+                    // lock, exactly like a direct resident send.
+                    if let Err(e) = write_user(&mut inner, &out).await {
+                        // Still under the lock, so the promotion is provably ours
+                        // to undo inline. (The promoted id has no persisted row —
+                        // the queued row keeps its original turn — so rewinding
+                        // the counter is safe here.)
+                        inner.turn.busy = false;
+                        inner.turn_id -= 1;
+                        inner.current_origin_tag = None;
+                        inner.clock.started = None;
+                        // The promotion persisted "running" above; put the DB and
+                        // the UI back to idle UNDER this same lock (the ordering
+                        // rule every rollback follows), or live counts and
+                        // boot-revive would treat this non-running session as
+                        // active after a dead resident stdin.
+                        persist_activity(db, inner.session_id, inner.thread_id, "idle").await;
+                        emit_turn_state(app, inner.thread_id, inner.session_id, false, Vec::new());
+                        drop(inner);
+                        let _ = repo::update_lead_message(db, row_id, &content, "error").await;
+                        emit_finalize(app, ctx.thread_id, row_id, "error");
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let _ = app.emit(
+            EVENT,
+            Push::Turn {
+                thread_id: ctx.thread_id,
+                session_id: ctx.session_id,
+                state: if inner.turn.busy { "busy" } else { "idle" }.into(),
+                queue: queue_items(&inner.turn),
+            },
+        );
     }
-    let _ = app.emit(
-        EVENT,
-        Push::Turn {
-            thread_id,
-            session_id: sid,
-            state: if inner.turn.busy { "busy" } else { "idle" }.into(),
-            queue: queue_items(&inner.turn),
-        },
-    );
-    drop(inner);
+
+    // Phase 4: turn spawning runs without the engine lock. The spawn helpers
+    // re-check `stopped` AND the send's reset_epoch atomically with the child
+    // snapshot, so neither a plain stop nor a stop-then-restart landing in the
+    // Phase-3-to-spawn window can launch a child for a canceled send.
     if spawn_now {
-        if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
-            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+        if let Err(e) =
+            spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(ctx.reset_epoch)).await
+        {
+            // A guard-canceled spawn (stop/interrupt raced the window) is the
+            // user's cancel — finalize "interrupted", not "error".
+            let status = spawn_failure_status(eng, &ctx).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
             return Err(e);
         }
-    } else if direct && is_codex_appserver {
-        if let Err(e) = spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await {
-            rollback_failed_visible_turn(app, db, eng, turn, row_id, &content).await;
+    } else if ctx.direct && is_codex_appserver {
+        if let Err(e) = spawn_codex_turn_or_exec(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(ctx.reset_epoch),
+        )
+        .await
+        {
+            let status = spawn_failure_status(eng, &ctx).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
             return Err(e);
+        }
+    } else if let Some(pturn) = promoted {
+        // The promoted send owns a fresh turn now. Flip its row to delivered
+        // (complete + delivery seq + finalize emit, same as a drained queue item),
+        // then spawn the turn for per-turn tools; resident stdin was already
+        // written under the Phase 3 lock.
+        mark_queued_delivered(app, db, ctx.thread_id, ctx.session_id, &out).await;
+        let dispatched = Outgoing {
+            queue_id: None,
+            ..out.clone()
+        };
+        // For guard-cancel detection the promoted send is direct-shaped: it owns
+        // the fresh turn it claimed at promotion.
+        let promoted_ctx = SendContext {
+            direct: true,
+            turn: pturn,
+            ..ctx.clone()
+        };
+        if per_turn(&ctx.tool) && !is_codex_appserver {
+            if let Err(e) = spawn_turn(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                dispatched,
+                Some(ctx.reset_epoch),
+            )
+            .await
+            {
+                let status = spawn_failure_status(eng, &promoted_ctx).await;
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
+                return Err(e);
+            }
+        } else if is_codex_appserver {
+            if let Err(e) = spawn_codex_turn_or_exec(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                dispatched,
+                Some(ctx.reset_epoch),
+            )
+            .await
+            {
+                let status = spawn_failure_status(eng, &promoted_ctx).await;
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -1839,9 +2281,21 @@ async fn spawn_codex_turn(
     db: Db,
     eng: EngineRef,
     out: Outgoing,
+    expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
     let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
         let i = eng.lock().await;
+        // Atomic with the snapshot: don't start a codex turn for a stopped engine
+        // (a stop racing the send's Phase-3-to-spawn window, which is widest on the
+        // app-server path because connection/start awaits happen after this) — nor
+        // for a send whose reservation epoch a stop-then-restart invalidated, nor
+        // when an interrupt is in flight (no child exists for it to kill in this
+        // window; spawning would run the canceled turn). The caller rolls back or
+        // falls through — and the exec fallback (spawn_turn) makes the same check
+        // — so returning here is safe.
+        if i.stopped || i.interrupting || expected_epoch.is_some_and(|e| e != i.reset_epoch) {
+            return Err(anyhow::anyhow!("engine stopped; not starting a codex turn"));
+        }
         (
             i.native_id.clone(),
             i.cwd.clone(),
@@ -1859,8 +2313,8 @@ async fn spawn_codex_turn(
     // Per-session app-server: reuse the engine's connection or spawn one with this
     // session's `-c mcp_servers` bus flags. Its own process keeps the per-thread
     // MCP isolated (app-server MCP is app-scoped).
-    let client = match existing {
-        Some(c) if c.is_alive().await => c,
+    let (client, freshly_connected) = match existing {
+        Some(c) if c.is_alive().await => (c, false),
         _ => {
             // Pre-accept folder trust (like the exec adapter's prepare) so the
             // app-server's first thread/start doesn't block on codex's trust prompt.
@@ -1868,8 +2322,12 @@ async fn spawn_codex_turn(
             let c =
                 crate::codex_app_server::Client::connect_session(&program, &extra_args, &cwd)
                     .await?;
-            eng.lock().await.codex_client = Some(c.clone());
-            c
+            // NOT published to the engine yet: the stop check below must pass
+            // first. Publishing early would let this task's stop-cleanup tear a
+            // RESTARTED send's client out of the registry (a restart may reuse
+            // whatever is registered), or let a restarted send adopt a connection
+            // the stop already doomed.
+            (c, true)
         }
     };
     let cwd = cwd.to_string_lossy().into_owned();
@@ -1879,7 +2337,20 @@ async fn spawn_codex_turn(
         // Don't commit the native id yet: if `turn/start` below fails and we fall
         // back to exec, a None native id lets exec start fresh WITH the system
         // prompt prepended, instead of resuming an empty thread that never got it.
-        None => (client.start_thread(&cwd).await?, true),
+        None => match client.start_thread(&cwd).await {
+            Ok(t) => (t, true),
+            Err(e) => {
+                // A freshly connected client is NOT published yet (that happens
+                // after the stop check below), so the or_exec fallback has
+                // nothing in the registry to take — dropping the handle here
+                // would leak the app-server child (reader/writer tasks hold
+                // clones) alive alongside the exec fallback. Shut it down.
+                if freshly_connected {
+                    client.shutdown_and_reap().await;
+                }
+                return Err(e);
+            }
+        },
     };
     if !client.is_subscribed(&thread).await {
         // First attach this process: a pre-existing thread is resumed so the
@@ -1896,6 +2367,38 @@ async fn spawn_codex_turn(
             thread.clone(),
         );
         tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
+    }
+    // stop_quiet may have run during the connect / start_thread / subscribe awaits
+    // above, when there was no `codex_client` for it to shut down. If the stop won
+    // that race — including a stop-then-restart, which clears `stopped` but bumps
+    // the epoch — tear the freshly connected client down and abort rather than
+    // starting a turn the user canceled. (The early snapshot check only covers
+    // stops that happened before the connect.)
+    let stop_won = {
+        // Check AND publish under ONE lock acquisition: a stop landing between a
+        // separate check and a later publish would register a client for a turn
+        // the user just canceled. Once published atomically here, a later stop
+        // reaches the client through the registry (stop_quiet takes it and shuts
+        // it down, failing start_turn below) — that is the designed teardown.
+        let mut g = eng.lock().await;
+        let won = g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        if !won && freshly_connected {
+            g.codex_client = Some(client.clone());
+        }
+        won
+    };
+    if stop_won {
+        // Never touch the registry here: a restarted send may have published a
+        // fresh client by now — ours was never published, so taking whatever is
+        // registered could sever the NEW session's connection. Shut down only the
+        // connection THIS task made; a reused registered client was already shut
+        // down by the stop itself (stop_quiet takes it).
+        if freshly_connected {
+            client.shutdown_and_reap().await;
+        }
+        return Err(anyhow::anyhow!(
+            "engine stopped during codex app-server connect"
+        ));
     }
     // codex has no thread/start system-prompt field, so (like the exec adapter)
     // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
@@ -1930,8 +2433,11 @@ async fn spawn_codex_turn_or_exec(
     db: Db,
     eng: EngineRef,
     out: Outgoing,
+    expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
+    if let Err(e) =
+        spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone(), expected_epoch).await
+    {
         // Stop pressed while the app-server start was pending and it then errored:
         // don't resurrect the canceled turn on exec — propagate so the caller rolls
         // it back (otherwise the interrupted turn runs anyway on the fallback).
@@ -1947,7 +2453,7 @@ async fn spawn_codex_turn_or_exec(
             c.shutdown().await;
         }
         eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
-        spawn_turn(app, db, eng, out).await?;
+        spawn_turn(app, db, eng, out, expected_epoch).await?;
     }
     Ok(())
 }
@@ -2151,6 +2657,10 @@ async fn codex_consumer(
                 } else {
                     None
                 };
+                // Captured at dequeue, under this lock: if the flush below falls
+                // back to exec after a stop-then-restart, `stopped` is clear again
+                // but the epoch has advanced — the canceled message must not launch.
+                let dequeue_epoch = inner.reset_epoch;
                 let still_busy = inner.turn.busy;
                 persist_activity(
                     &db,
@@ -2175,7 +2685,29 @@ async fn codex_consumer(
                 // it for the next turn).
                 client.clear_active_turn(&thread).await;
                 // Flush: start the next queued message as a fresh turn on this thread.
-                if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
+                // Gated on the dequeue-time epoch: a stop — or stop-then-restart,
+                // which clears `stopped` but bumps the epoch — since the pop must
+                // not deliver the canceled message on the app-server path either
+                // (the exec fallback below already checks it). The TOCTOU after
+                // this check is bounded: stop shuts the client down, failing
+                // pending requests and closing this consumer.
+                let flush_stop_won = {
+                    let g = eng.lock().await;
+                    g.stopped || g.reset_epoch != dequeue_epoch
+                };
+                if flush_stop_won {
+                    // Ownership-guarded (turn_id + busy): no-ops when the stop
+                    // already reset the turn itself.
+                    if let Some(turn_id) = next_turn_id {
+                        rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
+                    }
+                    // The popped message is no longer in the in-memory queue, so
+                    // the rollback's drained sweep can't see its row — finalize it
+                    // explicitly or it stays `queued` forever.
+                    if let Some(n) = next.as_ref() {
+                        finalize_dequeued_row(&app, &db, thread_id, n, "interrupted").await;
+                    }
+                } else if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
                     match client.start_turn(&thread, &n.text).await {
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
@@ -2194,7 +2726,9 @@ async fn codex_consumer(
                             // A Stop during the failed start: roll the queued turn back
                             // interrupted instead of resurrecting it on exec.
                             if eng.lock().await.interrupting {
-                                rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                                rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
+                                finalize_dequeued_row(&app, &db, thread_id, &n, "interrupted")
+                                    .await;
                             } else {
                                 eprintln!(
                                     "[weft][codex] flush via app-server failed ({e}); trying exec"
@@ -2207,8 +2741,14 @@ async fn codex_consumer(
                                 if let Some(c) = stale {
                                     c.shutdown().await;
                                 }
-                                match spawn_turn(app.clone(), db.clone(), eng.clone(), n.clone())
-                                    .await
+                                match spawn_turn(
+                                    app.clone(),
+                                    db.clone(),
+                                    eng.clone(),
+                                    n.clone(),
+                                    Some(dequeue_epoch),
+                                )
+                                .await
                                 {
                                     Ok(()) => {
                                         mark_queued_delivered(&app, &db, thread_id, session_id, &n)
@@ -2216,7 +2756,14 @@ async fn codex_consumer(
                                     }
                                     Err(e2) => {
                                         eprintln!("[weft][codex] exec fallback for queued turn failed: {e2}");
-                                        rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                                        // The guard inside spawn_turn may have canceled
+                                        // (stop/interrupt/epoch) rather than failed.
+                                        let status =
+                                            drain_failure_status(&eng, dequeue_epoch).await;
+                                        rollback_failed_turn(&app, &db, &eng, turn_id, status)
+                                            .await;
+                                        finalize_dequeued_row(&app, &db, thread_id, &n, status)
+                                            .await;
                                     }
                                 }
                             }
@@ -2380,8 +2927,28 @@ fn codex_change_approval_summary(params: &serde_json::Value) -> String {
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
 /// stream from stdout, EOF ends the turn (the reader then flushes the queue).
-async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> anyhow::Result<()> {
+async fn spawn_turn(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    out: Outgoing,
+    expected_epoch: Option<u64>,
+) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
+    // Atomic with the child snapshot below: never launch a per-turn process for a
+    // stopped engine — a stop that raced into the send's Phase-3-to-spawn window,
+    // or a queued turn drained just as the human stopped. Send-originated spawns
+    // also pass their reservation's reset_epoch: a stop-THEN-RESTART clears
+    // `stopped` again, but bumps the epoch, so the canceled send still can't
+    // launch a child onto the restarted engine. `interrupting` is checked too:
+    // an interrupt landing in this window has no child to kill — it only sets
+    // the flag — and spawning anyway would run the very turn the user canceled.
+    // Every caller already rolls back or propagates a spawn error, so returning
+    // here is safe.
+    if inner.stopped || inner.interrupting || expected_epoch.is_some_and(|e| e != inner.reset_epoch)
+    {
+        return Err(anyhow::anyhow!("engine stopped; not spawning a turn"));
+    }
     // Per-turn argv (incl. codex's message-on-argv and opencode's /cmd→--command
     // peel) is built by the tool's adapter; `prepare` does the folder-trust
     // pre-accept. Identical output to the former inline match.
@@ -2652,7 +3219,7 @@ async fn send_hidden_inner(
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
-                rollback_failed_turn(app, db, eng, turn_id).await;
+                rollback_failed_turn(app, db, eng, turn_id, "error").await;
                 return Err(e);
             }
             Ok(())
@@ -2663,14 +3230,26 @@ async fn send_hidden_inner(
             // on the same thread.
             let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
+            // Captured under the lock: a stop-then-restart before the spawn task
+            // runs clears `stopped` but bumps the epoch — a canceled hidden turn
+            // (bus read / tool-result nudge) must not launch on the restarted
+            // engine, same guard as user-visible sends and queued deliveries.
+            let hidden_epoch = inner.reset_epoch;
             drop(inner);
             let res = if codex_appserver {
-                spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await
+                spawn_codex_turn_or_exec(
+                    app.clone(),
+                    db.clone(),
+                    eng.clone(),
+                    out,
+                    Some(hidden_epoch),
+                )
+                .await
             } else {
-                spawn_turn(app.clone(), db.clone(), eng.clone(), out).await
+                spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(hidden_epoch)).await
             };
             if let Err(e) = res {
-                rollback_failed_turn(app, db, eng, turn_id).await;
+                rollback_failed_turn(app, db, eng, turn_id, "error").await;
                 return Err(e);
             }
             Ok(())
@@ -2827,6 +3406,11 @@ pub async fn stop_quiet(
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    // Invalidate any send that reserved against the turn we just cleared — even one
+    // whose Phase 1 ran before this stop but whose Phase 3 runs after, and even a
+    // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
+    // past those flags). send_reservation_valid compares the captured reset_epoch.
+    inner.reset_epoch += 1;
     (target.0, target.1, current, orphan_tools)
 }
 
@@ -3219,14 +3803,29 @@ fn spawn_reader(
                         inner.turn_id += 1;
                         let next_turn_id = inner.turn_id;
                         let session_id = inner.session_id;
+                        // Captured at dequeue, under this lock: a stop-then-restart
+                        // before the spawned task runs clears `stopped` but bumps the
+                        // epoch, and the canceled queued message must not launch.
+                        let dequeue_epoch = inner.reset_epoch;
                         if per_turn(&inner.tool) {
                             let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                             tauri::async_runtime::spawn(async move {
-                                if let Err(err) =
-                                    spawn_turn(a.clone(), d.clone(), e.clone(), next.clone()).await
+                                if let Err(err) = spawn_turn(
+                                    a.clone(),
+                                    d.clone(),
+                                    e.clone(),
+                                    next.clone(),
+                                    Some(dequeue_epoch),
+                                )
+                                .await
                                 {
                                     eprintln!("[weft] queued per-turn delivery failed: {err}");
-                                    rollback_failed_turn(&a, &d, &e, next_turn_id).await;
+                                    // The spawn guard may have CANCELED (stop/interrupt/
+                                    // epoch) rather than failed; and the popped row is
+                                    // no longer in the queue for the rollback to sweep.
+                                    let status = drain_failure_status(&e, dequeue_epoch).await;
+                                    rollback_failed_turn(&a, &d, &e, next_turn_id, status).await;
+                                    finalize_dequeued_row(&a, &d, thread_id, &next, status).await;
                                 } else {
                                     mark_queued_delivered(&a, &d, thread_id, session_id, &next)
                                         .await;
@@ -3236,7 +3835,12 @@ fn spawn_reader(
                             if let Err(e) = write_user(&mut inner, &next).await {
                                 eprintln!("[weft] queued resident delivery failed: {e}");
                                 drop(inner);
-                                rollback_failed_turn(&app, &db, &eng, next_turn_id).await;
+                                // A stop may have closed this stdin (cancel, not
+                                // failure); and the popped row is no longer in the
+                                // queue for the rollback to sweep.
+                                let status = drain_failure_status(&eng, dequeue_epoch).await;
+                                rollback_failed_turn(&app, &db, &eng, next_turn_id, status).await;
+                                finalize_dequeued_row(&app, &db, thread_id, &next, status).await;
                                 return;
                             } else {
                                 mark_queued_delivered(&app, &db, thread_id, session_id, &next)
@@ -3340,13 +3944,27 @@ fn spawn_reader(
                 let next_turn_id = inner.turn_id;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
+                // Captured at dequeue, under this lock — see the per-turn drain
+                // above: stop-then-restart must not launch a canceled message.
+                let dequeue_epoch = inner.reset_epoch;
                 let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                 tauri::async_runtime::spawn(async move {
-                    if let Err(err) =
-                        spawn_turn(a.clone(), d.clone(), e.clone(), next.clone()).await
+                    if let Err(err) = spawn_turn(
+                        a.clone(),
+                        d.clone(),
+                        e.clone(),
+                        next.clone(),
+                        Some(dequeue_epoch),
+                    )
+                    .await
                     {
                         eprintln!("[weft] queued per-turn delivery failed: {err}");
-                        rollback_failed_turn(&a, &d, &e, next_turn_id).await;
+                        // The spawn guard may have CANCELED (stop/interrupt/epoch)
+                        // rather than failed; and the popped row is no longer in
+                        // the queue for the rollback to sweep.
+                        let status = drain_failure_status(&e, dequeue_epoch).await;
+                        rollback_failed_turn(&a, &d, &e, next_turn_id, status).await;
+                        finalize_dequeued_row(&a, &d, thread_id, &next, status).await;
                     } else {
                         mark_queued_delivered(&a, &d, thread_id, session_id, &next).await;
                     }
@@ -3806,24 +4424,30 @@ mod tests {
     #[tokio::test]
     async fn terminal_error_without_current_row_is_persisted() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
+        // Real thread row: insert_lead_message refuses deleted/nonexistent
+        // threads (the deletion fence).
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
 
-        let m = insert_terminal_assistant_if_missing(&db, 7, None, 3, "error")
+        let m = insert_terminal_assistant_if_missing(&db, t.id, None, 3, "error")
             .await
             .unwrap()
             .expect("error turn should create an assistant row");
 
-        assert_eq!(m.thread_id, 7);
+        assert_eq!(m.thread_id, t.id);
         assert_eq!(m.turn_id, 3);
         assert_eq!(m.role, "assistant");
         assert_eq!(m.kind, "text");
         assert_eq!(m.status, "error");
         let content: serde_json::Value = serde_json::from_str(&m.content).unwrap();
         assert_eq!(content["terminal"], "error_before_output");
-        let all = repo::list_lead_messages(&db, 7).await.unwrap();
+        let all = repo::list_lead_messages(&db, t.id).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, m.id);
 
-        let complete = insert_terminal_assistant_if_missing(&db, 7, None, 4, "complete")
+        let complete = insert_terminal_assistant_if_missing(&db, t.id, None, 4, "complete")
             .await
             .unwrap();
         assert!(complete.is_none());
@@ -3832,12 +4456,16 @@ mod tests {
     #[tokio::test]
     async fn disconnected_busy_turn_without_current_row_persists_terminal_error() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-
-        let row = persist_disconnected_turn_row(&db, 7, None, 3, "error", true, None)
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
             .await
             .unwrap();
 
-        let all = repo::list_lead_messages(&db, 7).await.unwrap();
+        let row = persist_disconnected_turn_row(&db, t.id, None, 3, "error", true, None)
+            .await
+            .unwrap();
+
+        let all = repo::list_lead_messages(&db, t.id).await.unwrap();
         assert_eq!(all.len(), 1);
         match row {
             Some(DisconnectedTurnRow::Inserted(m)) => assert_eq!(m.id, all[0].id),
@@ -3931,6 +4559,7 @@ mod tests {
             current: None,
             interrupting: false,
             generation: 0,
+            reset_epoch: 0,
             pending_skill_refresh: false,
             pending_command_refresh: false,
             last_context_tokens: None,
@@ -3975,7 +4604,7 @@ mod tests {
         });
         let turn_id = mark_hidden_turn_started(&mut inner);
 
-        assert!(reset_failed_hidden_turn(&mut inner, turn_id));
+        assert!(reset_failed_hidden_turn(&mut inner, turn_id).is_some());
 
         assert!(!inner.turn.busy);
         assert!(inner.turn.queue.is_empty());
@@ -3991,7 +4620,7 @@ mod tests {
         let old_turn = mark_hidden_turn_started(&mut inner);
         inner.turn_id += 1;
 
-        assert!(!reset_failed_hidden_turn(&mut inner, old_turn));
+        assert!(reset_failed_hidden_turn(&mut inner, old_turn).is_none());
         assert!(inner.turn.busy);
     }
 
@@ -4049,6 +4678,91 @@ mod tests {
     }
 
     #[test]
+    fn send_reservation_valid_requires_stopped_turn_and_busy_flag() {
+        let mut inner = test_inner("claude");
+        inner.turn_id = 5;
+        inner.turn.busy = true;
+        let direct_ctx = SendContext {
+            thread_id: 1,
+            session_id: None,
+            turn: 5,
+            direct: true,
+            is_command: false,
+            tool: "claude".into(),
+            origin_tag: None,
+            reset_epoch: 0,
+        };
+        assert!(send_reservation_valid(&inner, &direct_ctx));
+
+        // A reset_epoch bump (a stop/reset since Phase 1 — including a stop that was
+        // immediately restarted, which leaves turn_id/busy looking valid) invalidates
+        // BOTH a direct and a queued reservation.
+        inner.reset_epoch = 1;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        assert!(!send_reservation_valid(
+            &inner,
+            &SendContext { direct: false, ..direct_ctx.clone() }
+        ));
+        inner.reset_epoch = 0;
+
+        // An interrupt mid-send cancels a DIRECT reservation (the direct send IS the
+        // current turn), but not a queued one, which targets a later turn.
+        inner.interrupting = true;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        assert!(send_reservation_valid(
+            &inner,
+            &SendContext { direct: false, ..direct_ctx.clone() }
+        ));
+        inner.interrupting = false;
+
+        // Stopped engine invalidates any reservation.
+        inner.stopped = true;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        inner.stopped = false;
+
+        // Turn identity mismatch means the reservation was reset.
+        inner.turn_id = 6;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        inner.turn_id = 5;
+
+        // Direct send must still hold the busy flag it reserved.
+        inner.turn.busy = false;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        inner.turn.busy = true;
+
+        // Queued sends don't own the busy flag: the enqueue/promote/cancel decision
+        // is made at Phase 3 commit time from CURRENT state, so validation lets them
+        // through regardless of turn advance (turn_id) or the turn having ended
+        // (busy=false → Phase 3 promotes instead of stranding the message).
+        let queued_ctx = SendContext {
+            direct: false,
+            ..direct_ctx
+        };
+        assert!(send_reservation_valid(&inner, &queued_ctx)); // busy = true
+        inner.turn_id = 6; // active turn advanced, still busy → tolerated
+        assert!(send_reservation_valid(&inner, &queued_ctx));
+        inner.turn.busy = false; // turn ended → still valid; Phase 3 promotes
+        assert!(send_reservation_valid(&inner, &queued_ctx));
+        inner.turn.busy = true;
+        // An explicit stop still invalidates a queued reservation.
+        inner.stopped = true;
+        assert!(!send_reservation_valid(&inner, &queued_ctx));
+    }
+
+    #[test]
+    fn promote_queued_reservation_claims_a_fresh_direct_turn() {
+        let mut inner = test_inner("claude");
+        inner.turn_id = 7;
+        assert!(!inner.turn.busy, "precondition: engine idle");
+        let promoted = promote_queued_reservation(&mut inner, Some("tag".into()));
+        assert_eq!(promoted, 8, "promotion claims the NEXT turn id");
+        assert_eq!(inner.turn_id, 8);
+        assert!(inner.turn.busy, "promotion reserves the turn (busy)");
+        assert_eq!(inner.current_origin_tag.as_deref(), Some("tag"));
+        assert!(inner.clock.started.is_some(), "promotion starts the turn clock");
+    }
+
+    #[test]
     fn turn_clock_follows_queue() {
         let mut c = TurnClock::default();
         assert!(c.started.is_none());
@@ -4081,6 +4795,7 @@ mod tests {
             current: None,
             interrupting: false,
             generation: 0,
+            reset_epoch: 0,
             pending_skill_refresh: false,
             pending_command_refresh: false,
             last_context_tokens: None,
@@ -4236,6 +4951,12 @@ mod tests {
     #[tokio::test]
     async fn queue_edit_preserves_images_and_files_in_persisted_row() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
+        // A real thread row: insert_lead_message refuses deleted/nonexistent
+        // threads (the deletion fence).
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         // Insert a queued message that has images and files in its content.
         let original = serde_json::json!({
             "text": "original text",
@@ -4243,9 +4964,10 @@ mod tests {
             "files": ["/tmp/attach.txt"]
         })
         .to_string();
-        let row = repo::insert_lead_message(&db, 1, None, 1, "user", "text", &original, "queued")
-            .await
-            .unwrap();
+        let row =
+            repo::insert_lead_message(&db, t.id, None, 1, "user", "text", &original, "queued")
+                .await
+                .unwrap();
 
         // Simulate what queue_edit now does: read row, update text only.
         let existing = repo::get_message(&db, row.id).await.unwrap().unwrap();

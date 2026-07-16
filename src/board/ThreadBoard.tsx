@@ -51,6 +51,12 @@ const SETTABLE: { key: string; label: string; dot: string }[] = [
   { key: "done", label: "thread.colDone", dot: "bg-accent" },
 ];
 
+function deriveTestsKind(failed: number, passed: number, total: number): "fail" | "pass" | "pend" {
+  if (failed > 0) return "fail";
+  if (total > 0 && passed === total) return "pass";
+  return "pend";
+}
+
 export function ThreadBoard() {
   const {
     threads,
@@ -222,8 +228,7 @@ function DirectionCard({
     asks.some((a) => a.dir === String(direction.id));
   const firstWrite = liveWrites[0];
 
-  const testsKind =
-    failed > 0 ? "fail" : allChecks.length > 0 && passed === allChecks.length ? "pass" : "pend";
+  const testsKind = deriveTestsKind(failed, passed, allChecks.length);
   // The review-column primary action is honest: open the actual diff for human
   // eyes (Task→PR is the delivery boundary; weft does not fake a PR step).
   const action = hasNeed

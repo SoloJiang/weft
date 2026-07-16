@@ -252,6 +252,7 @@ export const en = {
     queueDelete: "Delete",
     queueDrag: "Reorder",
     queueAttachmentOnly: "{{count}} image",
+    autoReviewDirective: "After the review, fix the findings directly, re-run the checks to verify, then report briefly.",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",
@@ -501,6 +502,7 @@ export const en = {
     repoName: "Name",
     repoPath: "Local git path",
     repoUrl: "Git URL(s)",
+    repoUrlPlaceholder: "https://github.com/acme/web-app.git\ngit@github.com:acme/api.git",
     repoLocation: "Location",
     repoMode_local: "Local",
     repoMode_clone: "Clone",
@@ -554,7 +556,11 @@ export const en = {
     dark: "Dark",
     language: "Language",
     languageHint: "UI copy language. Agent output follows it by default.",
+    langZh: "中文",
+    langEn: "English",
+    projectsDirPlaceholder: "/Users/you/code",
     reviewSkill: "Global review skill",
+    reviewSkillPlaceholder: "superpowers:requesting-code-review",
     reviewSkillHint: "Leave empty to auto-detect (prefers superpowers' requesting-code-review); review runs inside the task's own session",
     autoReview: "Auto review",
     autoReviewHint: "When a task flows into the review column, run the review skill and fix its findings automatically",
@@ -663,6 +669,7 @@ export const en = {
       "Scan with Feishu on your phone to create a new PersonalAgent bot — no developer console needed.",
     imManualModeHint: "Already have a Feishu app? Enter its App ID / App Secret to bind it.",
     imAppId: "App ID",
+    imAppIdPlaceholder: "cli_xxxxxxxxxxxx",
     imAppIdHint:
       "Create a self-built app on Feishu Open Platform; subscribe im.message.receive_v1 over long connection.",
     imAppSecret: "App Secret",
@@ -712,6 +719,7 @@ export const en = {
     backupRecoveryKeyDialog:
       "Your backup does NOT include the decryption key. Download the Recovery Key file and store it safely (password manager or offline). Without this file, the backup cannot be restored.",
     backupRecoveryKeyDownload: "Download Recovery Key",
+    backupRecoveryKeyPlaceholder: "/path/to/weft-recovery-key.json",
     backupCancel: "Cancel",
     backupStatusNever: "Never backed up",
     backupStatusAgo: "Last backup",
@@ -763,6 +771,11 @@ export const en = {
     renameFailed: "Rename failed. Please try again.",
     deleteWorkspaceFailed: "Couldn't delete the workspace. Please try again.",
     deleteWorktreeFailed: "Couldn't delete the worktree. Please try again.",
+  },
+  status: {
+    running: "Running",
+    idle: "Idle",
+    exited: "Exited",
   },
   ai: {
     shellSnippet: "Shell snippet",

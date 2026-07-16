@@ -221,6 +221,14 @@ fn refresh_tool_path() -> String {
 /// [`resolve_tool_path`]) but does NOT consult the Codex app-bundle fallback,
 /// which a bare PATH spawn can't reach.
 pub fn resolves_on_path(program: &str) -> bool {
+    // Absolute executable paths are valid overrides/pins (see tool_command) and
+    // don't live on PATH: the file's existence IS the resolution check — without
+    // this, the send pre-flight reports agent_not_found for a configured
+    // absolute CLI that Command::new would spawn just fine.
+    let p = std::path::Path::new(program);
+    if p.is_absolute() {
+        return p.is_file();
+    }
     if which_on_path(program, &tool_path()).is_some() {
         return true;
     }

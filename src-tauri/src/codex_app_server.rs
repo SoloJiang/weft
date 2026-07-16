@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::lead_chat::proto::ChatEvent;
@@ -468,7 +468,12 @@ pub enum ThreadMsg {
 }
 
 struct Inner {
-    stdin: ChildStdin,
+    /// Channel to the dedicated stdin writer task. Holds no `ChildStdin` directly,
+    /// so async writes never need the state lock.
+    // Each entry is (bytes, optional flush-ack): the writer task acks AFTER
+    // write_all + flush succeed, so request() can arm its reply timeout only once
+    // the bytes actually reached the child's stdin (see `request`).
+    write_tx: mpsc::UnboundedSender<(Vec<u8>, Option<oneshot::Sender<()>>)>,
     next_id: i64,
     /// our request id → awaiting caller (Ok(result) / Err(message)).
     pending: HashMap<i64, oneshot::Sender<Result<Value, String>>>,
@@ -545,11 +550,10 @@ impl Client {
                 let _ = self.reply_result(id, result).await;
             }
             None => {
-                let mut g = self.0.lock().await;
-                if let Some(inner) = g.as_mut() {
+                let g = self.0.lock().await;
+                if let Some(inner) = g.as_ref() {
                     let line = encode_error_response(id, -32601, "unsupported request");
-                    let _ = inner.stdin.write_all(line.as_bytes()).await;
-                    let _ = inner.stdin.flush().await;
+                    let _ = inner.write_tx.send((line.into_bytes(), None));
                 }
             }
         }
@@ -570,6 +574,18 @@ impl Client {
         if let Some(mut inner) = self.0.lock().await.take() {
             // SIGKILL + wait → the child is reaped synchronously here; closing
             // stdin/stdout also drops the per-session consumer task.
+            let _ = inner._child.kill().await;
+        }
+    }
+
+    /// Teardown used when the stdin writer fails: notify every pending caller
+    /// with an error, then kill and reap the child so the connection is not
+    /// left half-alive stalling until the request timeout.
+    async fn fail_pending_and_reap(&self, message: &str) {
+        if let Some(mut inner) = self.0.lock().await.take() {
+            for (_, tx) in inner.pending.drain() {
+                let _ = tx.send(Err(message.to_string()));
+            }
             let _ = inner._child.kill().await;
         }
     }
@@ -615,8 +631,36 @@ impl Client {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+
+        let (write_tx, mut write_rx) =
+            mpsc::unbounded_channel::<(Vec<u8>, Option<oneshot::Sender<()>>)>();
+        let client_for_writer = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut stdin = stdin;
+            let fail = || async {
+                client_for_writer
+                    .fail_pending_and_reap("codex app-server stdin writer failed")
+                    .await;
+            };
+            while let Some((bytes, ack)) = write_rx.recv().await {
+                if stdin.write_all(&bytes).await.is_err() {
+                    fail().await;
+                    break;
+                }
+                if stdin.flush().await.is_err() {
+                    fail().await;
+                    break;
+                }
+                // Ack only after write_all + flush both succeeded; a failed write
+                // drops the ack sender, which request() observes as an error.
+                if let Some(a) = ack {
+                    let _ = a.send(());
+                }
+            }
+        });
+
         *g = Some(Inner {
-            stdin,
+            write_tx,
             next_id: 1,
             pending: HashMap::new(),
             threads: HashMap::new(),
@@ -750,7 +794,7 @@ impl Client {
     /// Send a request and await its reply (`result` on success, `error.message`
     /// on failure), with a hard timeout so a wedged server can't hang a caller.
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let (id, rx) = {
+        let (id, rx, flushed) = {
             let mut g = self.0.lock().await;
             let inner = g
                 .as_mut()
@@ -759,13 +803,32 @@ impl Client {
             inner.next_id += 1;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
+            let (flush_tx, flush_rx) = oneshot::channel();
+            let line = encode_request(id, method, params);
             inner
-                .stdin
-                .write_all(encode_request(id, method, params).as_bytes())
-                .await?;
-            inner.stdin.flush().await?;
-            (id, rx)
+                .write_tx
+                .send((line.into_bytes(), Some(flush_tx)))
+                .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
+            (id, rx, flush_rx)
         };
+        // Arm the reply timeout only AFTER the bytes actually flushed to the
+        // child's stdin: with the background writer, enqueue-then-time would let a
+        // blocked writer burn the whole budget and a "timed out" side-effecting
+        // call (turn/start) be delivered LATE — starting a duplicate, uncancelable
+        // turn after the caller already fell back. A flush that cannot complete
+        // within the same budget means the connection is factually dead: reap it
+        // so the queued bytes die with the process instead of firing later.
+        match tokio::time::timeout(Duration::from_secs(60), flushed).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                anyhow::bail!("codex app-server {method}: writer closed before flush")
+            }
+            Err(_) => {
+                self.fail_pending_and_reap("codex app-server stdin flush stalled")
+                    .await;
+                anyhow::bail!("codex app-server {method}: stdin flush stalled")
+            }
+        }
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => anyhow::bail!("codex app-server {method}: {e}"),
@@ -781,15 +844,15 @@ impl Client {
 
     /// Fire-and-forget notification (no reply expected).
     pub async fn notify(&self, method: &str, params: Option<Value>) -> anyhow::Result<()> {
-        let mut g = self.0.lock().await;
+        let g = self.0.lock().await;
         let inner = g
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
+        let line = encode_notification(method, params);
         inner
-            .stdin
-            .write_all(encode_notification(method, params).as_bytes())
-            .await?;
-        inner.stdin.flush().await?;
+            .write_tx
+            .send((line.into_bytes(), None))
+            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
 
@@ -868,13 +931,15 @@ impl Client {
     /// has its own shape: approval `{decision}`, permissions `{permissions}`,
     /// elicitation `{action}` — the caller builds the right one.
     pub async fn reply_result(&self, id: &Value, result: Value) -> anyhow::Result<()> {
-        let mut g = self.0.lock().await;
+        let g = self.0.lock().await;
         let inner = g
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("codex app-server not connected"))?;
         let line = encode_response(id, result);
-        inner.stdin.write_all(line.as_bytes()).await?;
-        inner.stdin.flush().await?;
+        inner
+            .write_tx
+            .send((line.into_bytes(), None))
+            .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
 

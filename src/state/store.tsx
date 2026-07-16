@@ -13,6 +13,7 @@ import { createDeltaCoalescer } from "./deltaCoalescer";
 import { mergeLeadSnapshot } from "./leadSnapshot";
 import i18n, { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
@@ -57,6 +58,13 @@ export interface OpenSession {
   threadId: number;
   nativeId: string | null;
 }
+
+type LeadWorkerState = "busy" | "idle" | "stopped";
+const SESSION_STATUS: Record<LeadWorkerState, SessionStatus> = {
+  busy: "running",
+  idle: "idle",
+  stopped: "exited",
+};
 
 interface Store {
   workspaces: Workspace[];
@@ -348,6 +356,16 @@ export const useStore = () => {
 // readable main); below it the surfaces can't coexist, hence the raised floor.
 const NAV_AUTOCOLLAPSE_BELOW = 1000;
 
+/** Adoption-time session status: ONE pure derivation reconciling a possibly
+ * raced turn push (the lead-chat listener may have recorded idle/stopped before
+ * this adoption ran) with the slot's busy flag — per the discriminated-state
+ * rule, instead of a mutable `let` reassigned across `if`/`else`. */
+function adoptionStatus(turnState: string | undefined, busy: boolean): SessionStatus {
+  if (turnState === "stopped") return "exited";
+  if (turnState !== "idle" && busy) return "running";
+  return "idle";
+}
+
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<number | null>(null);
@@ -425,10 +443,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // App settings, persisted to localStorage.
   const [projectsDir, setProjectsDirState] = useState(
-    () => localStorage.getItem("weft-projects-dir") ?? "",
+    () => localStorage.getItem(STORAGE_KEYS.projectsDir) ?? "",
   );
   const setProjectsDir = useCallback((p: string) => {
-    localStorage.setItem("weft-projects-dir", p);
+    localStorage.setItem(STORAGE_KEYS.projectsDir, p);
     setProjectsDirState(p);
   }, []);
   const [defaultTool, setDefaultToolState] = useState("codex");
@@ -438,8 +456,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshInstalledTools = useCallback(async () => {
     try {
       setInstalledTools(await api.detectTools());
-    } catch {
+    } catch (e) {
       // Pure-vite dev without the Tauri backend.
+      console.error(e);
     }
   }, []);
   // Re-resolve the effective default tool — saving an alias can change it (a
@@ -450,21 +469,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const info = await api.getDefaultTool();
       setDefaultToolState(info.tool);
       setConfiguredTool(info.configured);
-    } catch {
+    } catch (e) {
       // Pure-vite dev without the Tauri backend.
+      console.error(e);
     }
   }, []);
   useEffect(() => {
-    void (async () => {
+    async function initTools() {
       try {
         const [info, tools] = await Promise.all([api.getDefaultTool(), api.detectTools()]);
         setDefaultToolState(info.tool);
         setConfiguredTool(info.configured);
         setInstalledTools(tools);
-      } catch {
+      } catch (e) {
         // Pure-vite dev without the Tauri backend: keep the static defaults.
+        console.error(e);
       }
-    })();
+    }
+    void initTools();
   }, []);
   const setDefaultTool = useCallback((tl: string) => {
     setDefaultToolState(tl);
@@ -473,43 +495,43 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
   // The global review skill: "" = auto-detect from the agent's own slash list.
   const [reviewSkill, setReviewSkillState] = useState(
-    () => localStorage.getItem("weft-review-skill") ?? "",
+    () => localStorage.getItem(STORAGE_KEYS.reviewSkill) ?? "",
   );
   const setReviewSkill = useCallback((s: string) => {
-    localStorage.setItem("weft-review-skill", s);
+    localStorage.setItem(STORAGE_KEYS.reviewSkill, s);
     setReviewSkillState(s);
   }, []);
   // Auto-review: entering the review column runs the review skill (with a
   // self-repair directive) in the sub-task's own session. Default ON.
   const [autoReview, setAutoReviewState] = useState(
-    () => localStorage.getItem("weft-auto-review") !== "0",
+    () => localStorage.getItem(STORAGE_KEYS.autoReview) !== "0",
   );
   const setAutoReview = useCallback((on: boolean) => {
-    localStorage.setItem("weft-auto-review", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.autoReview, on ? "1" : "0");
     setAutoReviewState(on);
   }, []);
   // System notifications: new Needs-you items / review-ready sub-tasks raise an
   // OS notification while the window is unfocused. Default ON.
   const [notifyEnabled, setNotifyEnabledState] = useState(
-    () => localStorage.getItem("weft-notify") !== "0",
+    () => localStorage.getItem(STORAGE_KEYS.notify) !== "0",
   );
   const setNotifyEnabled = useCallback((on: boolean) => {
-    localStorage.setItem("weft-notify", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.notify, on ? "1" : "0");
     setNotifyEnabledState(on);
   }, []);
   // Keep-awake: hold a "prevent idle sleep" OS assertion while any session is
   // busy (the display may still turn off). Default ON; synced to the backend
   // on launch — its state is in-memory (same pattern as dangerous mode).
   const [keepAwake, setKeepAwakeState] = useState(
-    () => localStorage.getItem("weft-keep-awake") !== "0",
+    () => localStorage.getItem(STORAGE_KEYS.keepAwake) !== "0",
   );
   const setKeepAwake = useCallback((on: boolean) => {
-    localStorage.setItem("weft-keep-awake", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.keepAwake, on ? "1" : "0");
     setKeepAwakeState(on);
     void api.setKeepAwake(on);
   }, []);
   useEffect(() => {
-    void api.setKeepAwake(localStorage.getItem("weft-keep-awake") !== "0");
+    void api.setKeepAwake(localStorage.getItem(STORAGE_KEYS.keepAwake) !== "0");
   }, []);
   // Auto-check for app updates on launch and hourly thereafter (silent; only
   // surface when found, and don't re-nag a version the user already dismissed).
@@ -524,9 +546,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (cancelled || !info) return;
         if (info.version === dismissedUpdateRef.current) return; // already dismissed this one
         setUpdateAvailable((prev) => (prev?.version === info.version ? prev : info));
-      } catch {
+      } catch (e) {
         /* updater unavailable in dev or offline */
-      }
+      console.error(e);
+    }
     };
     void run();
     const UPDATE_POLL_MS = 60 * 60 * 1000; // re-check hourly for long-running sessions
@@ -547,10 +570,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
   }, []);
   const [dangerousMode, setDangerousModeState] = useState(
-    () => localStorage.getItem("weft-dangerous") === "1",
+    () => localStorage.getItem(STORAGE_KEYS.dangerousMode) === "1",
   );
   const setDangerousMode = useCallback((on: boolean) => {
-    localStorage.setItem("weft-dangerous", on ? "1" : "0");
+    localStorage.setItem(STORAGE_KEYS.dangerousMode, on ? "1" : "0");
     setDangerousModeState(on);
     void api.setDangerousMode(on);
     // Turning it on retro-approves the existing permission backlog (the backend
@@ -562,30 +585,30 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Sync the persisted Dangerous-mode flag to the backend on launch (the bus
   // registry starts fresh each run).
   useEffect(() => {
-    void api.setDangerousMode(localStorage.getItem("weft-dangerous") === "1");
+    void api.setDangerousMode(localStorage.getItem(STORAGE_KEYS.dangerousMode) === "1");
   }, []);
 
   // Runaway guardrails (§7): idle + wall-clock caps in MINUTES, persisted. The
   // backend seeds its defaults from the WEFT_* env, so we only push when the user
   // has an explicit saved value — an env override survives an untouched install.
   const [idleCapMins, setIdleCapMins] = useState(
-    () => Number(localStorage.getItem("weft-idle-cap-mins") ?? "30"),
+    () => Number(localStorage.getItem(STORAGE_KEYS.idleCapMins) ?? "30"),
   );
   const [wallCapMins, setWallCapMins] = useState(
-    () => Number(localStorage.getItem("weft-wall-cap-mins") ?? "120"),
+    () => Number(localStorage.getItem(STORAGE_KEYS.wallCapMins) ?? "120"),
   );
   const setGuardrails = useCallback((idleMins: number, wallMins: number) => {
     const idle = Math.max(0, Math.round(idleMins));
     const wall = Math.max(0, Math.round(wallMins));
-    localStorage.setItem("weft-idle-cap-mins", String(idle));
-    localStorage.setItem("weft-wall-cap-mins", String(wall));
+    localStorage.setItem(STORAGE_KEYS.idleCapMins, String(idle));
+    localStorage.setItem(STORAGE_KEYS.wallCapMins, String(wall));
     setIdleCapMins(idle);
     setWallCapMins(wall);
     void api.setGuardrails(idle * 60, wall * 60);
   }, []);
   useEffect(() => {
-    const i = localStorage.getItem("weft-idle-cap-mins");
-    const w = localStorage.getItem("weft-wall-cap-mins");
+    const i = localStorage.getItem(STORAGE_KEYS.idleCapMins);
+    const w = localStorage.getItem(STORAGE_KEYS.wallCapMins);
     if (i != null && w != null) void api.setGuardrails(Number(i) * 60, Number(w) * 60);
   }, []);
 
@@ -614,7 +637,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // restore the last-used workspace instead of snapping to the first one.
       // Only fall back to the first when the saved id is gone (deleted) or there
       // is none yet.
-      const saved = Number(localStorage.getItem("weft-active-workspace"));
+      const saved = Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace));
       if (saved && ws.some((w) => w.id === saved)) return saved;
       return ws[0]?.id ?? null;
     });
@@ -628,7 +651,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setRepoProfiles([]);
     setRepoEdges([]);
     // Remember the choice so a relaunch/reload lands here, not on the first one.
-    localStorage.setItem("weft-active-workspace", String(id));
+    localStorage.setItem(STORAGE_KEYS.activeWorkspace, String(id));
     // Drop the previous workspace's curator thread id so it is re-ensured lazily.
     setCuratorThreadId(null);
     // Repos side panel: open state resets each visit (canvas starts full-width);
@@ -673,7 +696,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setReviewingProposal(false);
       try {
         setProposal(await api.getProposal(threadId));
-      } catch {
+      } catch (e) {
         setProposal(null);
       }
       await loadThreadChildren(threadId);
@@ -688,8 +711,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     try {
       setOverview(await api.workspaceOverview(activeWorkspaceId));
-    } catch {
+    } catch (e) {
       /* ignore */
+      console.error(e);
     }
   }, [activeWorkspaceId]);
 
@@ -754,8 +778,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         delete next[workspaceId];
         return next;
       });
-      if (Number(localStorage.getItem("weft-active-workspace")) === workspaceId) {
-        localStorage.removeItem("weft-active-workspace");
+      if (Number(localStorage.getItem(STORAGE_KEYS.activeWorkspace)) === workspaceId) {
+        localStorage.removeItem(STORAGE_KEYS.activeWorkspace);
       }
       if (activeWorkspaceIdRef.current !== workspaceId) return;
 
@@ -842,8 +866,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (ws !== activeWorkspaceIdRef.current) return; // user switched during the fetch
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
-    } catch {
+    } catch (e) {
       /* ignore */
+      console.error(e);
     }
   }, []);
 
@@ -1097,9 +1122,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Reconcile status with any turn state the lead-chat listener already recorded:
     // if the worker's idle push raced in before this adoption, the live slot still
     // says busy, but the dot/live-counts must show idle (not stuck "running").
-    const ts = workerTurnRef.current[sid]?.state;
-    const status: SessionStatus =
-      ts === "idle" ? "idle" : ts === "stopped" ? "exited" : slot.busy ? "running" : "idle";
+    const status = adoptionStatus(workerTurnRef.current[sid]?.state, slot.busy);
     setSessions((m) =>
       m[sid]
         ? m
@@ -1146,16 +1169,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             try {
               const dirs = await api.listDirections(tid);
               setDirections((m) => ({ ...m, [tid]: dirs }));
-            } catch {
+            } catch (e) {
               /* best-effort: a thread whose directions fail to load just won't
                  show its running count until opened */
-            }
+      console.error(e);
+    }
           }),
         );
         for (const slot of slots) adoptWorker(slot);
       } while (hydratePendingRef.current);
-    } catch {
+    } catch (e) {
       /* best-effort hydration */
+      console.error(e);
     } finally {
       hydratingRef.current = false;
     }
@@ -1172,7 +1197,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let un: (() => void) | undefined;
     let cancelled = false;
-    void (async () => {
+    async function attach() {
       un = await listen("worker-revived", () => void hydrateLiveWorkers());
       if (cancelled) {
         un();
@@ -1180,7 +1205,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return;
       }
       void hydrateLiveWorkers();
-    })();
+    }
+    void attach();
     return () => {
       cancelled = true;
       un?.();
@@ -1221,7 +1247,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       let wts;
       try {
         wts = await api.listWorktrees(directionId);
-      } catch {
+      } catch (e) {
         return;
       }
       // Skip reclaimed worktrees (exists=false): the directory is gone, so
@@ -1241,7 +1267,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       let wts;
       try {
         wts = await api.listWorktrees(directionId);
-      } catch {
+      } catch (e) {
         return;
       }
       // Skip reclaimed worktrees (exists=false): a resume would drive a worker
@@ -1435,8 +1461,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                   ...m,
                   [sid]: {
                     ...m[sid],
-                    status:
-                      p.state === "busy" ? "running" : p.state === "idle" ? "idle" : "exited",
+                    status: SESSION_STATUS[p.state],
                   },
                 }
               : m,
@@ -1447,14 +1472,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // — works for any worker (known, revived, or headless) and reads the phase
           // at completion time, so a planning→working transition mid-turn is honored.
           if (p.state === "idle" && prevTurn !== "idle") {
-            void (async () => {
+            async function runAutoVerify() {
               try {
                 const dirId = await api.autoVerifyCheck(sid);
                 if (dirId != null) verifyDirectionRef.current(dirId);
-              } catch {
+              } catch (e) {
                 /* best-effort auto-verify */
+                console.error(e);
               }
-            })();
+            }
+            void runAutoVerify();
           }
 
         } else {
@@ -1511,21 +1538,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const discoverLeadSlash = useCallback((threadId: number) => {
-    void (async () => {
+    async function discover() {
       try {
         await api.leadEnsure(threadId, currentLang());
-      } catch {
+      } catch (e) {
         /* discovery can still try the non-resident fallback below */
+        console.error(e);
       }
       try {
         const cmds = await api.discoverSlash(threadId, null);
         if (cmds.length > 0) {
           setLeadSlash((s) => ({ ...s, [threadId]: cmds }));
         }
-      } catch {
+      } catch (e) {
         /* slash discovery is best-effort */
+        console.error(e);
       }
-    })();
+    }
+    void discover();
   }, []);
 
   const loadLeadChat = useCallback(async (threadId: number) => {
@@ -1562,8 +1592,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         ...m,
         [threadId]: fillMetaHoles(m[threadId], metaFromSnapshot(st)),
       }));
-    } catch {
+    } catch (e) {
       /* engine state is cosmetic at load time */
+      console.error(e);
     }
   }, [discoverLeadSlash]);
 
@@ -1603,8 +1634,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
     try {
       await api.setTaskStatus(directionId, status);
-    } catch {
+    } catch (e) {
       /* reverts on next poll */
+      console.error(e);
     }
   }, []);
 
@@ -1626,8 +1658,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const res = await api.verifyDirection(directionId);
         setChecksByDirection((m) => ({ ...m, [directionId]: res }));
       } while (verifyAgainRef.current.has(directionId));
-    } catch {
+    } catch (e) {
       /* leave prior results */
+      console.error(e);
     } finally {
       verifyAgainRef.current.delete(directionId);
       verifyingRef.current.delete(directionId);
@@ -1675,10 +1708,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (sessionId == null) return;
       // Review-then-repair: the skill reviews, the same agent fixes what it
       // found and re-verifies — the human only sees the post-fix state.
-      const directive =
-        currentLang() === "zh"
-          ? "review 结束后，直接修复发现的问题并重新跑检查自验，然后简要汇报。"
-          : "After the review, fix the findings directly, re-run the checks to verify, then report briefly.";
+      const directive = i18n.t("lead.autoReviewDirective");
       const cmd = `/${resolveReviewSkill()} ${directive}`;
       await api.chatSend(sessionId, cmd);
     },
@@ -1718,8 +1748,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Permission Asks are global (not workspace-scoped); always refresh them.
     try {
       setAsks(await api.pendingAsks());
-    } catch {
+    } catch (e) {
       /* server may not be ready */
+      console.error(e);
     }
     if (activeWorkspaceId == null) {
       setNeeds([]);
@@ -1729,14 +1760,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     try {
       setNeeds(await api.needsYou(activeWorkspaceId));
       setWriteTriggers(await api.writeTriggers(activeWorkspaceId));
-    } catch {
+    } catch (e) {
       /* bus may not be ready */
+      console.error(e);
     }
     // per-workspace counts so the switcher can flag OTHER workspaces.
     try {
       setNeedsByWorkspace(Object.fromEntries(await api.workspaceNeedsCounts()));
-    } catch {
+    } catch (e) {
       /* ignore */
+      console.error(e);
     }
   }, [activeWorkspaceId]);
 
@@ -1761,8 +1794,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (activeWorkspaceIdRef.current !== ws) return;
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
-    } catch {
+    } catch (e) {
       /* workspace may be empty */
+      console.error(e);
     }
   }, [activeWorkspaceId]);
 
@@ -1813,7 +1847,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const ensureCuratorThreadId = useCallback(async (ws: number): Promise<number> => {
     const inflight = curatorEnsureRef.current.get(ws);
     if (inflight) return inflight;
-    const p = (async () => {
+    async function ensureCurator() {
       const id = await api.openCuratorChat(ws); // get-or-create; returns the id
       const list = await api.listThreads(ws);
       if (activeWorkspaceIdRef.current === ws) {
@@ -1821,7 +1855,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setCuratorThreadId(id);
       }
       return id;
-    })();
+    }
+    const p = ensureCurator();
     curatorEnsureRef.current.set(ws, p);
     try {
       return await p;
@@ -1915,7 +1950,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const refreshProposal = useCallback(async (threadId: number) => {
     try {
       setProposal(await api.getProposal(threadId));
-    } catch {
+    } catch (e) {
       setProposal(null);
     }
   }, []);
@@ -1952,8 +1987,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     pendingBaseSave.current.delete(activeThreadId);
     try {
       await pending;
-    } catch {
+    } catch (e) {
       // handled by the latch below
+      console.error(e);
     }
     // Also abort if any EARLIER link in the chain failed — the chain's
     // `.catch(() => {})` swallows predecessors for serialization, so the final
@@ -2040,9 +2076,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       pendingBaseSave.current.delete(item.thread_id);
       try {
         await pending;
-      } catch {
+      } catch (e) {
         // handled by the latch below
-      }
+      console.error(e);
+    }
       // Also abort if any EARLIER link in the chain failed — the chain's
       // `.catch(() => {})` swallows predecessors for serialization, so the final
       // promise may resolve even when a prior save rejected.
@@ -2079,9 +2116,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       pendingBaseSave.current.delete(item.thread_id);
       try {
         await pending;
-      } catch {
+      } catch (e) {
         // handled by the latch check below
-      }
+      console.error(e);
+    }
       // If that save REJECTED, a re-proposal may have moved/replaced the lanes (the
       // server-side base setter rejects when item.index's lane was replaced), so
       // item.index is no longer trustworthy — denying by it could deny the WRONG lane.
@@ -2111,16 +2149,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // mode → once a day, suggest turning it on.
       if ((answer === "always" || answer === "full") && !dangerousMode) {
         const today = new Date().toISOString().slice(0, 10);
-        if (localStorage.getItem("weft-danger-nudge") !== today) {
-          localStorage.setItem("weft-danger-nudge", today);
+        if (localStorage.getItem(STORAGE_KEYS.dangerNudge) !== today) {
+          localStorage.setItem(STORAGE_KEYS.dangerNudge, today);
           setDangerNudge("ask");
         }
       }
       try {
         await api.answerPermission(askId, answer);
-      } catch {
+      } catch (e) {
         /* already resolved/expired */
-      }
+      console.error(e);
+    }
     },
     [dangerousMode],
   );
@@ -2209,9 +2248,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         const p = await api.getProposal(thread);
         if (alive && p) setProposal(p);
-      } catch {
+      } catch (e) {
         /* planner not ready */
-      }
+      console.error(e);
+    }
     };
     void tick();
     const h = setInterval(tick, 2500);
@@ -2264,16 +2304,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         const m = await api.threadMessages(activeThreadId);
         if (alive) setMessages(m);
-      } catch {
+      } catch (e) {
         /* bus may not be ready */
-      }
+      console.error(e);
+    }
       // reflect agent-driven status changes (set via the bus MCP tool)
       try {
         const dirs = await api.listDirections(activeThreadId);
         if (alive) setDirections((m) => ({ ...m, [activeThreadId]: dirs }));
-      } catch {
+      } catch (e) {
         /* ignore */
-      }
+      console.error(e);
+    }
     };
     void tick();
     const h = setInterval(tick, 1500);

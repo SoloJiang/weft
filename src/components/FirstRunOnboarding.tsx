@@ -18,9 +18,22 @@ import {
   renamePendingRepo,
   type PendingRepo,
 } from "./firstRunOnboardingRepos";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 import { submitOnboarding, InvalidReposError } from "./firstRunOnboardingSubmit";
 
-const STORAGE_KEY = "weft-first-run-onboarding-v2-dismissed";
+const STORAGE_KEY = STORAGE_KEYS.onboardingDismissed;
+
+function stepBadgeClasses(i: number, current: number): string {
+  if (i === current) return "border-brand bg-brand text-brand-ink";
+  if (i < current) return "border-brand/60 bg-brand-ghost text-brand";
+  return "border-border bg-surface text-ink-faint";
+}
+
+function stepLabelClasses(i: number, current: number): string {
+  if (i === current) return "text-ink";
+  if (i < current) return "text-ink-muted";
+  return "text-ink-faint";
+}
 
 const NODES: Record<string, [number, number]> = {
   api: [150, 40],
@@ -124,17 +137,13 @@ export function FirstRunOnboarding() {
               onClick={() => setStep(i)}
               className={cn(
                 "flex min-w-0 items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1 text-[12px] transition-colors",
-                i === step ? "text-ink" : i < step ? "text-ink-muted" : "text-ink-faint",
+                stepLabelClasses(i, step),
               )}
             >
               <span
                 className={cn(
                   "grid h-5 w-5 shrink-0 place-items-center rounded-full border font-mono text-[10px]",
-                  i === step
-                    ? "border-brand bg-brand text-brand-ink"
-                    : i < step
-                      ? "border-brand/60 bg-brand-ghost text-brand"
-                      : "border-border bg-surface text-ink-faint",
+                  stepBadgeClasses(i, step),
                 )}
               >
                 {i < step ? <Check size={11} /> : i + 1}

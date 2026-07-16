@@ -1,11 +1,10 @@
 import { useCallback, useSyncExternalStore } from "react";
+import { STORAGE_KEYS } from "../lib/storageKeys";
 
 /** Persisted user choice. "system" follows the OS appearance live. */
 export type ThemePref = "system" | "light" | "dark";
 /** Concrete appearance reflected on <html data-theme>. */
 export type ResolvedTheme = "light" | "dark";
-
-const KEY = "weft-theme";
 
 function darkQuery(): MediaQueryList | null {
   try {
@@ -27,13 +26,15 @@ export function resolvePref(pref: ThemePref): ResolvedTheme {
 
 /** Cycle order for the quick toggle: System → Light → Dark → System. */
 export function nextPref(pref: ThemePref): ThemePref {
-  return pref === "system" ? "light" : pref === "light" ? "dark" : "system";
+  if (pref === "system") return "light";
+  if (pref === "light") return "dark";
+  return "system";
 }
 
 /** Saved preference, else "system". Tolerates legacy "dark"/"light" values. */
 export function readPref(): ThemePref {
   try {
-    const saved = localStorage.getItem(KEY);
+    const saved = localStorage.getItem(STORAGE_KEYS.theme);
     if (saved === "system" || saved === "dark" || saved === "light") return saved;
   } catch {
     /* private mode / no storage */
@@ -48,10 +49,11 @@ export function applyResolved(r: ResolvedTheme) {
 
 // --- shared module-level store: every useTheme() consumer stays in sync ---
 
-let state: { pref: ThemePref; resolved: ResolvedTheme } = (() => {
-  const pref = readPref();
-  return { pref, resolved: resolvePref(pref) };
-})();
+const initialPref = readPref();
+let state: { pref: ThemePref; resolved: ResolvedTheme } = {
+  pref: initialPref,
+  resolved: resolvePref(initialPref),
+};
 applyResolved(state.resolved);
 
 const listeners = new Set<() => void>();
@@ -67,7 +69,7 @@ function commit(pref: ThemePref) {
 
 function setPrefGlobal(pref: ThemePref) {
   try {
-    localStorage.setItem(KEY, pref);
+    localStorage.setItem(STORAGE_KEYS.theme, pref);
   } catch {
     /* private mode / no storage */
   }

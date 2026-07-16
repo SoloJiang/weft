@@ -11,6 +11,70 @@ fn e<E: ToString>(x: E) -> String {
     x.to_string()
 }
 
+/// Pre-flight for a new repo target `<dest>/<name>` (clone + create): reject a
+/// symlink (even to an empty directory — git would write the checkout through it,
+/// landing outside `dest`) and any existing non-empty path, but allow a REAL
+/// empty directory: both `git clone` and `git init` support initializing into
+/// one, and rejecting it would regress a previously valid flow.
+fn reject_occupied_repo_target(path: &std::path::Path) -> R<()> {
+    let Ok(meta) = path.symlink_metadata() else {
+        return Ok(()); // does not exist — free to create
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!("repo path is a symlink: {}", path.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("repo path already exists: {}", path.display()));
+    }
+    let mut entries =
+        std::fs::read_dir(path).map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    if entries.next().is_some() {
+        return Err(format!(
+            "repo path already exists and is not empty: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure `path` resolves to a location inside `dest`. Prevents symlink or
+/// non-canonical `dest` from causing the actual repo to land elsewhere.
+fn ensure_path_under_dest(path: &std::path::Path, dest: &std::path::Path) -> R<()> {
+    let dest_canon = std::fs::canonicalize(dest)
+        .map_err(|_| "destination directory does not exist or is not accessible")?;
+    let path_canon = std::fs::canonicalize(path)
+        .map_err(|_| "created repo path could not be resolved")?;
+    if !path_canon.starts_with(&dest_canon) {
+        return Err("repo path resolved outside the destination directory".into());
+    }
+    Ok(())
+}
+
+/// Validate a repo name before it is used as a directory segment under `dest`.
+/// Rejects empty names, path separators, `..`, and any character that would be
+/// unsafe or surprising on a filesystem.
+fn validate_repo_name(name: &str) -> R<()> {
+    if name.is_empty() {
+        return Err("repo name cannot be empty".into());
+    }
+    if name == "." || name == ".." {
+        return Err("repo name cannot be '.' or '..'".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("repo name cannot contain path separators or '..'".into());
+    }
+    // Conservative allow-list: alphanumeric, dot, dash, underscore, space.
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ' ')
+    {
+        return Err(
+            "repo name may only contain letters, digits, spaces, '.', '-', '_'".into(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn create_workspace(db: State<'_, Db>, name: String) -> R<entities::workspace::Model> {
     repo::create_workspace(&db, &name).await.map_err(e)
@@ -172,7 +236,7 @@ async fn stop_workspace_engines(app: &tauri::AppHandle, db: &Db, workspace_id: i
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     let keys = workspace_engine_keys(db, workspace_id).await?;
     for key in keys {
-        if let Some(eng) = state.get(key) {
+        if let Some(eng) = state.remove(key) {
             crate::lead_chat::engine::stop(app, &eng).await;
         }
     }
@@ -197,6 +261,20 @@ async fn workspace_engine_keys(
         for session in repo::sessions_for_repo(db, repo.id).await.map_err(e)? {
             keys.insert(session.id as i64);
         }
+    }
+    Ok(keys)
+}
+
+/// Engine registry keys for ONE thread: the lead (`-thread_id`) plus every
+/// chat-mode worker keyed by `session_id`. Collected from live session rows, so
+/// a caller that also deletes those rows (delete_thread) MUST call this BEFORE
+/// the cascade — afterwards the sessions are gone and their engines become
+/// unreachable, leaking child processes.
+async fn thread_engine_keys(db: &Db, thread_id: i32) -> R<std::collections::BTreeSet<i64>> {
+    let mut keys = std::collections::BTreeSet::<i64>::new();
+    keys.insert(crate::lead_chat::commands::lead_key(thread_id));
+    for session in repo::sessions_for_thread(db, thread_id).await.map_err(e)? {
+        keys.insert(session.id as i64);
     }
     Ok(keys)
 }
@@ -378,12 +456,15 @@ pub async fn clone_repo(
     dest: String,
     name: String,
 ) -> R<entities::repo_ref::Model> {
+    validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
+    reject_occupied_repo_target(&path)?;
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::clone_repo(&url, &p))
         .await
         .map_err(|err| err.to_string())?
         .map_err(e)?;
+    ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
     let r = register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await?;
     // If the row points somewhere other than the dir we just cloned, dedup
     // resolved to a DIFFERENT live repo (a dead-checkout match was already
@@ -407,12 +488,15 @@ pub async fn create_repo(
     name: String,
     dest: String,
 ) -> R<entities::repo_ref::Model> {
+    validate_repo_name(&name)?;
     let path = std::path::Path::new(&dest).join(&name);
+    reject_occupied_repo_target(&path)?;
     let p = path.clone();
     tokio::task::spawn_blocking(move || crate::git::init_repo(&p))
         .await
         .map_err(|err| err.to_string())?
         .map_err(e)?;
+    ensure_path_under_dest(&path, std::path::Path::new(&dest))?;
     register_repo(&db, workspace_id, &name, &path.to_string_lossy()).await
 }
 
@@ -1114,10 +1198,28 @@ pub fn list_worktree_files(cwd: String) -> R<FileTree> {
 
 
 #[tauri::command]
-pub async fn delete_thread(db: State<'_, Db>, thread_id: i32) -> R<()> {
+pub async fn delete_thread(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+) -> R<()> {
+    // Collect the engine keys FIRST (the cascade deletes the session rows that
+    // make workers discoverable), then cascade BEFORE stopping: once the rows are
+    // gone, a concurrent send or bus wake can no longer resolve the thread/session
+    // and revive an engine under a key this loop already processed — the revival
+    // paths all look those rows up. Stopping after the cascade leaves no orphans
+    // either: set_lead_status fences its meta-row insert on the thread still
+    // existing, and per-session status updates no-op on deleted rows.
+    let keys = thread_engine_keys(&db, thread_id).await?;
     let removed = repo::delete_thread_cascade(&db, thread_id)
         .await
         .map_err(e)?;
+    let state = app.state::<crate::lead_chat::engine::LeadChatState>();
+    for key in keys {
+        if let Some(eng) = state.remove(key) {
+            crate::lead_chat::engine::stop(&app, &eng).await;
+        }
+    }
     materialize::cleanup_worktrees(&db, &removed)
         .await
         .map_err(e)
@@ -1242,6 +1344,17 @@ pub async fn set_tool_command(
             "unknown tool {tool:?}; expected one of {:?}",
             crate::detect::TOOL_PRIORITY
         ));
+    }
+    // Validate BEFORE repo::set_tool_command mutates anything: it reconciles the
+    // per-session pins and persists the raw value first, and parse_overrides
+    // would then drop an invalid value on reload — with apply_to_existing=true
+    // the pins are already cleared by then, silently retargeting existing
+    // sessions to the default binary even though the override never took effect.
+    // Blank / identity values mean "clear the override" and skip validation.
+    let trimmed = command.trim();
+    if !trimmed.is_empty() && trimmed != tool {
+        crate::tool_command::validate_override_value(trimmed)
+            .map_err(|err| format!("invalid command for {tool}: {err}"))?;
     }
     let (map, prev) = repo::set_tool_command(&db, &tool, &command, apply_to_existing)
         .await
@@ -2272,6 +2385,88 @@ mod tests {
         assert_eq!(keys, expected);
         assert!(!keys.contains(&crate::lead_chat::commands::lead_key(keep_thread.id)));
         assert!(!keys.contains(&(keep_worker.id as i64)));
+    }
+
+    #[test]
+    fn occupied_repo_target_allows_only_real_empty_dirs() {
+        let root = std::env::temp_dir().join(format!("weft-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Nonexistent → free to create.
+        assert!(reject_occupied_repo_target(&root.join("fresh")).is_ok());
+        // A REAL empty directory is a valid target (git init/clone support it).
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(reject_occupied_repo_target(&empty).is_ok());
+        // Non-empty directory → rejected.
+        let full = root.join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("x"), "x").unwrap();
+        assert!(reject_occupied_repo_target(&full).is_err());
+        // Plain file → rejected.
+        let file = root.join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(reject_occupied_repo_target(&file).is_err());
+        // Symlink — even to an empty directory — rejected: git would write the
+        // checkout through it, outside the chosen destination.
+        let link = root.join("link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&empty, &link).unwrap();
+            assert!(reject_occupied_repo_target(&link).is_err());
+            // Dangling symlink too (symlink_metadata sees it; exists() would not).
+            let dangling = root.join("dangling");
+            std::os::unix::fs::symlink(root.join("nowhere"), &dangling).unwrap();
+            assert!(reject_occupied_repo_target(&dangling).is_err());
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn thread_engine_keys_cover_lead_and_worker_sessions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "target", "feature", "claude")
+            .await
+            .unwrap();
+        let other = repo::create_thread(&db, ws.id, "other", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db, thread.id, "web task", "claude", repo_ref.id, "change", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        let other_direction = repo::create_direction(
+            &db, other.id, "other task", "claude", repo_ref.id, "change", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        let worker = repo::create_session(&db, direction.id, repo_ref.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        let other_worker =
+            repo::create_session(&db, other_direction.id, repo_ref.id, "claude", "/tmp/other")
+                .await
+                .unwrap();
+
+        // A thread's keys cover BOTH the lead (-thread_id) AND its worker sessions —
+        // the worker session keys are exactly what delete_thread previously failed to
+        // stop (it removed only the lead), leaking worker children.
+        let keys = thread_engine_keys(&db, thread.id).await.unwrap();
+        let expected = std::collections::BTreeSet::from([
+            crate::lead_chat::commands::lead_key(thread.id),
+            worker.id as i64,
+        ]);
+        assert_eq!(keys, expected);
+        // A sibling thread's lead and workers must not be swept in.
+        assert!(!keys.contains(&crate::lead_chat::commands::lead_key(other.id)));
+        assert!(!keys.contains(&(other_worker.id as i64)));
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ roxmltree = "0.20"
 keepawake = "0.6"
 # Package renamed open-lark -> openlark (0.15+); lib import path stays `open_lark::*`.
 openlark = { version = "0.17", default-features = false, features = ["communication", "cardkit", "websocket"] }
-tauri-plugin-process = "2.3.1"
+tauri-plugin-process = "2"
 # SQLCipher: replace SQLite with the encrypted variant statically. The feature
 # must be declared on the top-level manifest so it propagates via Cargo feature
 # unification to sqlx-sqlite's indirect dep on libsqlite3-sys.
