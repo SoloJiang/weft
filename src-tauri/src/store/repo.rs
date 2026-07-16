@@ -1702,46 +1702,43 @@ pub async fn insert_lead_message(
     content: &str,
     status: &str,
 ) -> Result<lead_message::Model> {
-    use sea_orm::ConnectionTrait;
-    // Deletion fence, ATOMIC with the insert: delete_thread cascades the rows
+    use sea_orm::TransactionTrait;
+    // Deletion fence, atomic via a transaction: delete_thread cascades the rows
     // away BEFORE stopping the engines, so a still-running reader/consumer can
-    // reach this insert after the cascade — and a separate exists-check could
+    // reach this insert after the cascade — and a bare exists-check could
     // observe the thread just before the cascade commits yet insert after it
-    // (no FK rejects the orphan). A single INSERT … SELECT … WHERE EXISTS
-    // statement is atomic under SQLite, so the row lands only if the thread
-    // still exists at insert time. This is the single INSERT choke point
+    // (no FK rejects the orphan). Sharing ONE SQLite transaction closes that
+    // gap: under WAL (store/mod.rs enables it) a deferred read→write upgrade
+    // FAILS with SQLITE_BUSY_SNAPSHOT when another writer committed after our
+    // snapshot, and under a rollback journal the lock-upgrade deadlock breaks
+    // with SQLITE_BUSY — either way the racy insert is refused with an error
+    // instead of landing an orphan row. This is the single INSERT choke point
     // (set_lead_status / set_lead_native_id route their meta inserts through
     // here); UPDATE-shaped writes are naturally fenced — their rows are gone.
-    let res = db
-        .0
-        .execute(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO lead_message \
-             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ? \
-             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
-            [
-                thread_id.into(),
-                session_id.into(),
-                turn_id.into(),
-                role.into(),
-                kind.into(),
-                content.into(),
-                status.into(),
-                now().into(),
-                thread_id.into(),
-            ],
-        ))
-        .await?;
-    if res.rows_affected() == 0 {
+    let txn = db.0.begin().await?;
+    let exists = thread::Entity::find_by_id(thread_id)
+        .one(&txn)
+        .await?
+        .is_some();
+    if !exists {
+        txn.rollback().await?;
         anyhow::bail!("thread {thread_id} no longer exists (deleted)");
     }
-    let id = i32::try_from(res.last_insert_id())
-        .map_err(|_| anyhow::anyhow!("lead_message id out of i32 range"))?;
-    lead_message::Entity::find_by_id(id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("inserted lead_message {id} not found"))
+    let m = lead_message::ActiveModel {
+        thread_id: Set(thread_id),
+        session_id: Set(session_id),
+        turn_id: Set(turn_id),
+        role: Set(role.to_string()),
+        kind: Set(kind.to_string()),
+        content: Set(content.to_string()),
+        status: Set(status.to_string()),
+        created_at: Set(now()),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await?;
+    txn.commit().await?;
+    Ok(m)
 }
 
 pub async fn update_lead_message(db: &Db, id: i32, content: &str, status: &str) -> Result<()> {
