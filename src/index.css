@@ -396,6 +396,32 @@ svg.markmap .markmap-foreign {
   font-weight: 600;
 }
 
+/* markstream-react re-skin: the renderer ships its own scoped utility sheet
+   (.markstream-react .my-5 { … } etc., specificity 0,2,0), so Weft's rhythm is
+   re-imposed at 0,2,1 via the .weft-md prefix. Only structural deviations are
+   overridden — everything unstyled by markstream already falls through to the
+   .weft-md element rules above. */
+.weft-md .markstream-react ul,
+.weft-md .markstream-react ol {
+  margin: 0.4em 0;
+  padding-left: 1.3em;
+}
+.weft-md .markstream-react li {
+  margin: 0.15em 0;
+  padding-left: 0;
+}
+.weft-md .markstream-react table {
+  margin: 0.5em 0;
+  font-size: 0.95em;
+}
+.weft-md .markstream-react blockquote {
+  font-style: normal;
+}
+/* GFM task-list items: the checkbox replaces the bullet. */
+.weft-md .markstream-react li:has(.checkbox-node) {
+  list-style: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyHref, filePathsRehype } from "../../src/lib/fileLinkMarkdown.ts";
+import { classifyHref } from "../../src/lib/fileLinkMarkdown.ts";
 import { displayPath, hasLineLabelSyntax, isPathLike, splitTextForPaths } from "../../src/lib/filePathParsing.ts";
 import {
   compactToolTarget,
@@ -554,71 +554,6 @@ test("peels balanced parentheses around tool paths", () => {
   });
 });
 
-test("wraps assistant prose file references for markdown rendering", () => {
-  const tree = {
-    type: "root",
-    children: [
-      {
-        type: "element",
-        tagName: "p",
-        children: [
-          {
-            type: "text",
-            value:
-              "取消接口在 cancel/route.ts (line 43)，删除接口见 jobs/[id]/route.ts (line 122)。",
-          },
-        ],
-      },
-    ],
-  };
-  filePathsRehype()(tree);
-  assert.deepEqual(tree.children[0].children, [
-    { type: "text", value: "取消接口在 " },
-    {
-      type: "element",
-      tagName: "span",
-      properties: { dataFilepath: "cancel/route.ts:43" },
-      children: [{ type: "text", value: "cancel/route.ts:43" }],
-    },
-    { type: "text", value: "，删除接口见 " },
-    {
-      type: "element",
-      tagName: "span",
-      properties: { dataFilepath: "jobs/[id]/route.ts:122" },
-      children: [{ type: "text", value: "jobs/[id]/route.ts:122" }],
-    },
-    { type: "text", value: "。" },
-  ]);
-});
-
-test("does not wrap paths inside markdown links or inline code in rehype prose pass", () => {
-  const tree = {
-    type: "root",
-    children: [
-      {
-        type: "element",
-        tagName: "p",
-        children: [
-          {
-            type: "element",
-            tagName: "a",
-            properties: { href: "src/App.tsx" },
-            children: [{ type: "text", value: "src/App.tsx" }],
-          },
-          { type: "text", value: " " },
-          {
-            type: "element",
-            tagName: "code",
-            children: [{ type: "text", value: "src/app/layout.tsx" }],
-          },
-        ],
-      },
-    ],
-  };
-  filePathsRehype()(tree);
-  assert.equal(tree.children[0].children[0].tagName, "a");
-  assert.equal(tree.children[0].children[2].tagName, "code");
-});
 
 test("classifies markdown hrefs that point at local files", () => {
   assert.deepEqual(classifyHref("src/App.tsx"), { kind: "file", token: "src/App.tsx" });
