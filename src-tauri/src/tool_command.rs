@@ -96,6 +96,15 @@ fn validate_command(cmd: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a Settings-supplied override value at the WRITE entry — public
+/// wrapper over the same rules `set_overrides`/`parse_overrides` apply on load.
+/// Rejecting here (before any pins/settings are mutated) beats persisting a raw
+/// invalid value that reload would silently drop after the pin reconcile already
+/// ran. Blank / identity values mean "clear" and are the caller's business.
+pub fn validate_override_value(cmd: &str) -> Result<(), String> {
+    validate_override(cmd)
+}
+
 /// The global command for a tool identity: the configured override, else the
 /// identity itself (a bare name resolved on `PATH` at spawn).
 pub fn command_for(tool: &str) -> String {

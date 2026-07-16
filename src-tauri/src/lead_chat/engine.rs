@@ -2520,7 +2520,23 @@ async fn codex_consumer(
                 // it for the next turn).
                 client.clear_active_turn(&thread).await;
                 // Flush: start the next queued message as a fresh turn on this thread.
-                if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
+                // Gated on the dequeue-time epoch: a stop — or stop-then-restart,
+                // which clears `stopped` but bumps the epoch — since the pop must
+                // not deliver the canceled message on the app-server path either
+                // (the exec fallback below already checks it). The TOCTOU after
+                // this check is bounded: stop shuts the client down, failing
+                // pending requests and closing this consumer.
+                let flush_stop_won = {
+                    let g = eng.lock().await;
+                    g.stopped || g.reset_epoch != dequeue_epoch
+                };
+                if flush_stop_won {
+                    // Ownership-guarded (turn_id + busy): no-ops when the stop
+                    // already reset the turn itself.
+                    if let Some(turn_id) = next_turn_id {
+                        rollback_failed_turn(&app, &db, &eng, turn_id).await;
+                    }
+                } else if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
                     match client.start_turn(&thread, &n.text).await {
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
@@ -3030,11 +3046,23 @@ async fn send_hidden_inner(
             // on the same thread.
             let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
+            // Captured under the lock: a stop-then-restart before the spawn task
+            // runs clears `stopped` but bumps the epoch — a canceled hidden turn
+            // (bus read / tool-result nudge) must not launch on the restarted
+            // engine, same guard as user-visible sends and queued deliveries.
+            let hidden_epoch = inner.reset_epoch;
             drop(inner);
             let res = if codex_appserver {
-                spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out, None).await
+                spawn_codex_turn_or_exec(
+                    app.clone(),
+                    db.clone(),
+                    eng.clone(),
+                    out,
+                    Some(hidden_epoch),
+                )
+                .await
             } else {
-                spawn_turn(app.clone(), db.clone(), eng.clone(), out, None).await
+                spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(hidden_epoch)).await
             };
             if let Err(e) = res {
                 rollback_failed_turn(app, db, eng, turn_id).await;

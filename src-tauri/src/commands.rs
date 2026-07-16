@@ -1203,22 +1203,23 @@ pub async fn delete_thread(
     db: State<'_, Db>,
     thread_id: i32,
 ) -> R<()> {
-    // Collect the engine keys (lead + every worker session) from the live session
-    // rows, then stop every engine BEFORE the cascade: stop() persists status, and
-    // set_lead_status's missing-meta path INSERTS a meta lead_message — stopping
-    // after the cascade would write orphan timeline rows for the deleted thread.
-    // (The cascade also deletes the session rows that make workers discoverable,
-    // which is why the keys must be collected first.)
+    // Collect the engine keys FIRST (the cascade deletes the session rows that
+    // make workers discoverable), then cascade BEFORE stopping: once the rows are
+    // gone, a concurrent send or bus wake can no longer resolve the thread/session
+    // and revive an engine under a key this loop already processed — the revival
+    // paths all look those rows up. Stopping after the cascade leaves no orphans
+    // either: set_lead_status fences its meta-row insert on the thread still
+    // existing, and per-session status updates no-op on deleted rows.
     let keys = thread_engine_keys(&db, thread_id).await?;
+    let removed = repo::delete_thread_cascade(&db, thread_id)
+        .await
+        .map_err(e)?;
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(key) {
             crate::lead_chat::engine::stop(&app, &eng).await;
         }
     }
-    let removed = repo::delete_thread_cascade(&db, thread_id)
-        .await
-        .map_err(e)?;
     materialize::cleanup_worktrees(&db, &removed)
         .await
         .map_err(e)
@@ -1343,6 +1344,17 @@ pub async fn set_tool_command(
             "unknown tool {tool:?}; expected one of {:?}",
             crate::detect::TOOL_PRIORITY
         ));
+    }
+    // Validate BEFORE repo::set_tool_command mutates anything: it reconciles the
+    // per-session pins and persists the raw value first, and parse_overrides
+    // would then drop an invalid value on reload — with apply_to_existing=true
+    // the pins are already cleared by then, silently retargeting existing
+    // sessions to the default binary even though the override never took effect.
+    // Blank / identity values mean "clear the override" and skip validation.
+    let trimmed = command.trim();
+    if !trimmed.is_empty() && trimmed != tool {
+        crate::tool_command::validate_override_value(trimmed)
+            .map_err(|err| format!("invalid command for {tool}: {err}"))?;
     }
     let (map, prev) = repo::set_tool_command(&db, &tool, &command, apply_to_existing)
         .await

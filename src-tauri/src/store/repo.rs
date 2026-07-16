@@ -2189,6 +2189,17 @@ pub async fn set_lead_status(db: &Db, thread_id: i32, status: &str) -> Result<()
             a.update(&db.0).await?;
         }
         None => {
+            // Fence against deleted threads: delete_thread cascades the rows away
+            // and THEN stops the engines, whose status persistence lands here —
+            // inserting a fresh meta row at that point would recreate orphan
+            // timeline data for a thread that no longer exists.
+            let thread_exists = thread::Entity::find_by_id(thread_id)
+                .one(&db.0)
+                .await?
+                .is_some();
+            if !thread_exists {
+                return Ok(());
+            }
             let content = serde_json::json!({ "status": status }).to_string();
             insert_lead_message(
                 db, thread_id, None, 0, "system", "meta", &content, "complete",
@@ -3206,23 +3217,44 @@ mod tests {
     #[tokio::test]
     async fn lead_status_round_trips_and_preserves_native_id() {
         let db = mem().await;
-        set_lead_native_id(&db, 7, "nat-xyz").await.unwrap();
-        set_lead_status(&db, 7, "running").await.unwrap();
+        // Real thread rows: set_lead_status only INSERTS its meta row for threads
+        // that still exist (the fence below), so the round-trip cases must run
+        // against live threads — which is also what production does.
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t7 = create_thread(&db, ws.id, "a", "feature", "claude")
+            .await
+            .unwrap();
+        let t8 = create_thread(&db, ws.id, "b", "feature", "claude")
+            .await
+            .unwrap();
+        set_lead_native_id(&db, t7.id, "nat-xyz").await.unwrap();
+        set_lead_status(&db, t7.id, "running").await.unwrap();
         assert_eq!(
-            lead_status(&db, 7).await.unwrap().as_deref(),
+            lead_status(&db, t7.id).await.unwrap().as_deref(),
             Some("running")
         );
         assert_eq!(
-            lead_native_id(&db, 7).await.unwrap().as_deref(),
+            lead_native_id(&db, t7.id).await.unwrap().as_deref(),
             Some("nat-xyz")
         );
         // opposite write order must also coexist (status first, native id second)
-        set_lead_status(&db, 8, "idle").await.unwrap();
-        set_lead_native_id(&db, 8, "nat-8").await.unwrap();
-        assert_eq!(lead_status(&db, 8).await.unwrap().as_deref(), Some("idle"));
+        set_lead_status(&db, t8.id, "idle").await.unwrap();
+        set_lead_native_id(&db, t8.id, "nat-8").await.unwrap();
         assert_eq!(
-            lead_native_id(&db, 8).await.unwrap().as_deref(),
+            lead_status(&db, t8.id).await.unwrap().as_deref(),
+            Some("idle")
+        );
+        assert_eq!(
+            lead_native_id(&db, t8.id).await.unwrap().as_deref(),
             Some("nat-8")
+        );
+        // The fence: a deleted/nonexistent thread gets NO meta row — stop() after
+        // delete_thread's cascade must not recreate orphan timeline data.
+        set_lead_status(&db, 999, "stopped").await.unwrap();
+        assert_eq!(
+            lead_status(&db, 999).await.unwrap(),
+            None,
+            "no meta row may be inserted for a deleted thread"
         );
     }
 
