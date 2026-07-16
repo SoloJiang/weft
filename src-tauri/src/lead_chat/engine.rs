@@ -2237,7 +2237,20 @@ async fn spawn_codex_turn(
         // Don't commit the native id yet: if `turn/start` below fails and we fall
         // back to exec, a None native id lets exec start fresh WITH the system
         // prompt prepended, instead of resuming an empty thread that never got it.
-        None => (client.start_thread(&cwd).await?, true),
+        None => match client.start_thread(&cwd).await {
+            Ok(t) => (t, true),
+            Err(e) => {
+                // A freshly connected client is NOT published yet (that happens
+                // after the stop check below), so the or_exec fallback has
+                // nothing in the registry to take — dropping the handle here
+                // would leak the app-server child (reader/writer tasks hold
+                // clones) alive alongside the exec fallback. Shut it down.
+                if freshly_connected {
+                    client.shutdown().await;
+                }
+                return Err(e);
+            }
+        },
     };
     if !client.is_subscribed(&thread).await {
         // First attach this process: a pre-existing thread is resumed so the
@@ -4794,6 +4807,12 @@ mod tests {
     #[tokio::test]
     async fn queue_edit_preserves_images_and_files_in_persisted_row() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
+        // A real thread row: insert_lead_message refuses deleted/nonexistent
+        // threads (the deletion fence).
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
         // Insert a queued message that has images and files in its content.
         let original = serde_json::json!({
             "text": "original text",
@@ -4801,9 +4820,10 @@ mod tests {
             "files": ["/tmp/attach.txt"]
         })
         .to_string();
-        let row = repo::insert_lead_message(&db, 1, None, 1, "user", "text", &original, "queued")
-            .await
-            .unwrap();
+        let row =
+            repo::insert_lead_message(&db, t.id, None, 1, "user", "text", &original, "queued")
+                .await
+                .unwrap();
 
         // Simulate what queue_edit now does: read row, update text only.
         let existing = repo::get_message(&db, row.id).await.unwrap().unwrap();
