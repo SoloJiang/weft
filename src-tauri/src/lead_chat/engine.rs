@@ -1663,6 +1663,14 @@ fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
     if inner.reset_epoch != ctx.reset_epoch {
         return false;
     }
+    // An interrupt can land while a direct send is still in Phase 2, before there is
+    // any stdin write / child / active turn for interrupt() to act on — it only sets
+    // `interrupting`. A direct send IS that turn, so honor the cancel and don't
+    // deliver it. (Queued sends target a later turn and survive interrupting the
+    // current one, so they are not rejected here.)
+    if ctx.direct && inner.interrupting {
+        return false;
+    }
     if ctx.direct {
         inner.turn_id == ctx.turn && inner.turn.busy
     } else {
@@ -2044,6 +2052,19 @@ async fn spawn_codex_turn(
             thread.clone(),
         );
         tauri::async_runtime::spawn(async move { codex_consumer(a, d, e, c, th, rx).await });
+    }
+    // stop_quiet may have run during the connect / start_thread / subscribe awaits
+    // above, when there was no `codex_client` for it to shut down. If the stop won
+    // that race, tear the freshly connected client down and abort rather than
+    // starting a turn on a stopped engine. (The early snapshot check only covers
+    // stops that happened before the connect.)
+    if eng.lock().await.stopped {
+        if let Some(c) = eng.lock().await.codex_client.take() {
+            c.shutdown().await;
+        }
+        return Err(anyhow::anyhow!(
+            "engine stopped during codex app-server connect"
+        ));
     }
     // codex has no thread/start system-prompt field, so (like the exec adapter)
     // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
@@ -4236,6 +4257,16 @@ mod tests {
             &SendContext { direct: false, ..direct_ctx.clone() }
         ));
         inner.reset_epoch = 0;
+
+        // An interrupt mid-send cancels a DIRECT reservation (the direct send IS the
+        // current turn), but not a queued one, which targets a later turn.
+        inner.interrupting = true;
+        assert!(!send_reservation_valid(&inner, &direct_ctx));
+        assert!(send_reservation_valid(
+            &inner,
+            &SendContext { direct: false, ..direct_ctx.clone() }
+        ));
+        inner.interrupting = false;
 
         // Stopped engine invalidates any reservation.
         inner.stopped = true;
