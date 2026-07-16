@@ -239,6 +239,20 @@ async fn workspace_engine_keys(
     Ok(keys)
 }
 
+/// Engine registry keys for ONE thread: the lead (`-thread_id`) plus every
+/// chat-mode worker keyed by `session_id`. Collected from live session rows, so
+/// a caller that also deletes those rows (delete_thread) MUST call this BEFORE
+/// the cascade — afterwards the sessions are gone and their engines become
+/// unreachable, leaking child processes.
+async fn thread_engine_keys(db: &Db, thread_id: i32) -> R<std::collections::BTreeSet<i64>> {
+    let mut keys = std::collections::BTreeSet::<i64>::new();
+    keys.insert(crate::lead_chat::commands::lead_key(thread_id));
+    for session in repo::sessions_for_thread(db, thread_id).await.map_err(e)? {
+        keys.insert(session.id as i64);
+    }
+    Ok(keys)
+}
+
 #[tauri::command]
 pub async fn list_workspaces(db: State<'_, Db>) -> R<Vec<entities::workspace::Model>> {
     let hidden = repo::get_setting(&db, repo::K_CONCIERGE_WORKSPACE)
@@ -1167,14 +1181,21 @@ pub async fn delete_thread(
     db: State<'_, Db>,
     thread_id: i32,
 ) -> R<()> {
+    // Collect the engine keys (lead + every worker session) BEFORE the cascade
+    // deletes the session rows — afterwards the worker sessions are gone and their
+    // engines become unreachable, so their child processes would keep running
+    // while cleanup_worktrees pulls the worktrees out from under them.
+    let keys = thread_engine_keys(&db, thread_id).await?;
     let removed = repo::delete_thread_cascade(&db, thread_id)
         .await
         .map_err(e)?;
-    // Stop and drop any resident engine for this thread so the deletion doesn't
-    // leak child processes or background tasks.
+    // Stop and drop every resident engine for this thread — the lead AND its
+    // workers — so the deletion doesn't leak child processes or background tasks.
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
-    if let Some(eng) = state.remove(-(thread_id as i64)) {
-        crate::lead_chat::engine::stop(&app, &eng).await;
+    for key in keys {
+        if let Some(eng) = state.remove(key) {
+            crate::lead_chat::engine::stop(&app, &eng).await;
+        }
     }
     materialize::cleanup_worktrees(&db, &removed)
         .await
@@ -2330,6 +2351,51 @@ mod tests {
         assert_eq!(keys, expected);
         assert!(!keys.contains(&crate::lead_chat::commands::lead_key(keep_thread.id)));
         assert!(!keys.contains(&(keep_worker.id as i64)));
+    }
+
+    #[tokio::test]
+    async fn thread_engine_keys_cover_lead_and_worker_sessions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "target", "feature", "claude")
+            .await
+            .unwrap();
+        let other = repo::create_thread(&db, ws.id, "other", "feature", "claude")
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db, thread.id, "web task", "claude", repo_ref.id, "change", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        let other_direction = repo::create_direction(
+            &db, other.id, "other task", "claude", repo_ref.id, "change", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        let worker = repo::create_session(&db, direction.id, repo_ref.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        let other_worker =
+            repo::create_session(&db, other_direction.id, repo_ref.id, "claude", "/tmp/other")
+                .await
+                .unwrap();
+
+        // A thread's keys cover BOTH the lead (-thread_id) AND its worker sessions —
+        // the worker session keys are exactly what delete_thread previously failed to
+        // stop (it removed only the lead), leaking worker children.
+        let keys = thread_engine_keys(&db, thread.id).await.unwrap();
+        let expected = std::collections::BTreeSet::from([
+            crate::lead_chat::commands::lead_key(thread.id),
+            worker.id as i64,
+        ]);
+        assert_eq!(keys, expected);
+        // A sibling thread's lead and workers must not be swept in.
+        assert!(!keys.contains(&crate::lead_chat::commands::lead_key(other.id)));
+        assert!(!keys.contains(&(other_worker.id as i64)));
     }
 
     #[tokio::test]
