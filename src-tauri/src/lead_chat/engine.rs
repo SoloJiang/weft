@@ -1570,16 +1570,25 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
 /// Undo the turn reservation made by `send` Phase 1 when later persistence
 /// fails. Leaves the engine idle and forgets the incremented turn id so the
 /// next send can start a fresh turn.
-async fn rollback_send_reservation(eng: &EngineRef, direct: bool) {
-    let mut inner = eng.lock().await;
-    if direct {
-        inner.turn.busy = false;
-        if inner.turn_id > 0 {
-            inner.turn_id -= 1;
-        }
-        inner.current_origin_tag = None;
-        inner.clock.started = None;
+///
+/// Only undoes a reservation this send still OWNS: the lock was dropped for the
+/// failing DB work, so a stop/reset (reset_epoch) or a newer direct reservation
+/// (turn_id) may own the state by now — undoing then would clear the busy flag
+/// or decrement the turn id of THAT turn, canceling or corrupting it. A leaked
+/// increment on our abandoned id is harmless (turn ids are monotonic); a wrong
+/// decrement is not.
+async fn rollback_send_reservation(eng: &EngineRef, ctx: &SendContext) {
+    if !ctx.direct {
+        return;
     }
+    let mut inner = eng.lock().await;
+    if inner.reset_epoch != ctx.reset_epoch || inner.turn_id != ctx.turn || !inner.turn.busy {
+        return;
+    }
+    inner.turn.busy = false;
+    inner.turn_id -= 1;
+    inner.current_origin_tag = None;
+    inner.clock.started = None;
 }
 
 pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
@@ -1674,14 +1683,24 @@ fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
     if ctx.direct {
         inner.turn_id == ctx.turn && inner.turn.busy
     } else {
-        // Queued sends don't own the busy flag and tolerate the active turn
-        // ADVANCING (a new turn started) while the lock was dropped. But if the
-        // turn ENDED during Phase 2 — the engine is now idle — appending would
-        // strand the message, because nothing drains an idle queue (on_turn_end
-        // only fires at a turn's end). Treat idle as invalid so the caller
-        // finalizes the row instead of silently queueing it on a drained turn.
-        inner.turn.busy
+        // Queued sends don't own the busy flag: whether to enqueue (still busy),
+        // promote into a fresh direct turn (turn ended → idle), or cancel
+        // (interrupt teardown in flight) is decided at Phase 3 commit time from
+        // CURRENT state. Only a stop/reset (checked above) invalidates them here.
+        true
     }
+}
+
+/// Phase-3 promotion: a queued send found the engine IDLE at commit time (the
+/// active turn ended while the send persisted), so it claims a fresh direct turn
+/// instead of appending to a queue nothing will drain. Pure state transition —
+/// the caller persists status / dispatches. Returns the promoted turn id.
+fn promote_queued_reservation(inner: &mut EngineInner, origin_tag: Option<String>) -> i32 {
+    let _ = inner.turn.try_begin_send();
+    inner.turn_id += 1;
+    inner.clock.begin_turn();
+    inner.current_origin_tag = origin_tag;
+    inner.turn_id
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
@@ -1854,7 +1873,7 @@ pub async fn send(
         Err(e) => {
             // Phase 1 already reserved turn state; undo it so the session isn't
             // left with a stuck busy flag or an orphaned turn id.
-            rollback_send_reservation(eng, ctx.direct).await;
+            rollback_send_reservation(eng, &ctx).await;
             return Err(e.into());
         }
     };
@@ -1907,10 +1926,14 @@ pub async fn send(
         has_attachments,
     };
 
-    // Phase 3: re-acquire the lock to commit the outbound message to the agent
-    // or queue, then drop it before any turn-spawning awaits.
+    // Phase 3: re-acquire the lock and COMMIT against CURRENT state — deliver,
+    // enqueue, promote, or abort is decided here, not enforced from the Phase-1
+    // snapshot (which only decided the row's optimistic status). The lock drops
+    // before any turn-spawning awaits.
     let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
     let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_codex_appserver;
+    // Set when a queued send found the engine idle and claimed a fresh turn.
+    let mut promoted: Option<i32> = None;
     {
         let mut inner = eng.lock().await;
         // Stop/reset can race between Phase 1 and Phase 3. If the reservation
@@ -1931,16 +1954,54 @@ pub async fn send(
                 return Err(e);
             }
         } else if !ctx.direct {
-            // The queue cap was checked in Phase 1, but multiple queued sends
-            // can race through DB/attachment I/O and observe the same count.
-            // Re-check under the lock before appending to keep the limit real.
-            if visible_queued(&inner.turn) >= MAX_QUEUED {
+            if inner.turn.busy {
+                // The queue cap was checked in Phase 1, but multiple queued sends
+                // can race through DB/attachment I/O and observe the same count.
+                // Re-check under the lock before appending to keep the limit real.
+                if visible_queued(&inner.turn) >= MAX_QUEUED {
+                    drop(inner);
+                    let _ = repo::update_lead_message(db, row_id, &content, "error").await;
+                    emit_finalize(app, ctx.thread_id, row_id, "error");
+                    return Err(anyhow::anyhow!("queue_full"));
+                }
+                inner.turn.queue.push_back(out.clone());
+            } else if inner.interrupting {
+                // The turn this send queued behind is mid-interrupt-teardown;
+                // promoting into that teardown would hand the interrupt a fresh
+                // turn to kill. Cancel instead — the composer restores the draft
+                // on the error path, so nothing is lost.
                 drop(inner);
-                let _ = repo::update_lead_message(db, row_id, &content, "error").await;
-                emit_finalize(app, ctx.thread_id, row_id, "error");
-                return Err(anyhow::anyhow!("queue_full"));
+                let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
+                emit_finalize(app, ctx.thread_id, row_id, "interrupted");
+                return Err(anyhow::anyhow!(
+                    "send could not be delivered: the turn was interrupted while it was persisting"
+                ));
+            } else {
+                // The active turn ENDED while this send persisted: nothing drains
+                // an idle queue, so deliver NOW by promoting into a fresh direct
+                // turn — the same commit-time decision a direct send makes.
+                promoted = Some(promote_queued_reservation(&mut inner, ctx.origin_tag.clone()));
+                crate::power::on_turn_began(app);
+                // Under the lock for the same ordering reason as Phase 1's direct
+                // write: a concurrent stop's "stopped" write must not be overtaken.
+                persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+                if !per_turn(&ctx.tool) && !is_codex_appserver {
+                    // Resident tool: deliver through the live stdin under this
+                    // lock, exactly like a direct resident send.
+                    if let Err(e) = write_user(&mut inner, &out).await {
+                        // Still under the lock, so the promotion is provably ours
+                        // to undo inline.
+                        inner.turn.busy = false;
+                        inner.turn_id -= 1;
+                        inner.current_origin_tag = None;
+                        inner.clock.started = None;
+                        drop(inner);
+                        let _ = repo::update_lead_message(db, row_id, &content, "error").await;
+                        emit_finalize(app, ctx.thread_id, row_id, "error");
+                        return Err(e);
+                    }
+                }
             }
-            inner.turn.queue.push_back(out.clone());
         }
         let _ = app.emit(
             EVENT,
@@ -1954,19 +2015,65 @@ pub async fn send(
     }
 
     // Phase 4: turn spawning runs without the engine lock. The spawn helpers
-    // (spawn_turn / spawn_codex_turn) re-check `stopped` atomically with the child
-    // snapshot, so a stop landing in the Phase-3-to-spawn window can't launch a
-    // child; a stop that reset the engine earlier was already rejected above by
-    // send_reservation_valid's reset_epoch check.
+    // re-check `stopped` AND the send's reset_epoch atomically with the child
+    // snapshot, so neither a plain stop nor a stop-then-restart landing in the
+    // Phase-3-to-spawn window can launch a child for a canceled send.
     if spawn_now {
-        if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
+        if let Err(e) =
+            spawn_turn(app.clone(), db.clone(), eng.clone(), out, Some(ctx.reset_epoch)).await
+        {
             rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
             return Err(e);
         }
     } else if ctx.direct && is_codex_appserver {
-        if let Err(e) = spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await {
+        if let Err(e) = spawn_codex_turn_or_exec(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(ctx.reset_epoch),
+        )
+        .await
+        {
             rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
             return Err(e);
+        }
+    } else if let Some(pturn) = promoted {
+        // The promoted send owns a fresh turn now. Flip its row to delivered
+        // (complete + delivery seq + finalize emit, same as a drained queue item),
+        // then spawn the turn for per-turn tools; resident stdin was already
+        // written under the Phase 3 lock.
+        mark_queued_delivered(app, db, ctx.thread_id, ctx.session_id, &out).await;
+        let dispatched = Outgoing {
+            queue_id: None,
+            ..out.clone()
+        };
+        if per_turn(&ctx.tool) && !is_codex_appserver {
+            if let Err(e) = spawn_turn(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                dispatched,
+                Some(ctx.reset_epoch),
+            )
+            .await
+            {
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content).await;
+                return Err(e);
+            }
+        } else if is_codex_appserver {
+            if let Err(e) = spawn_codex_turn_or_exec(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                dispatched,
+                Some(ctx.reset_epoch),
+            )
+            .await
+            {
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content).await;
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -1987,15 +2094,17 @@ async fn spawn_codex_turn(
     db: Db,
     eng: EngineRef,
     out: Outgoing,
+    expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
     let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
         let i = eng.lock().await;
         // Atomic with the snapshot: don't start a codex turn for a stopped engine
         // (a stop racing the send's Phase-3-to-spawn window, which is widest on the
-        // app-server path because connection/start awaits happen after this). The
+        // app-server path because connection/start awaits happen after this) — nor
+        // for a send whose reservation epoch a stop-then-restart invalidated. The
         // caller rolls back or falls through — and the exec fallback (spawn_turn)
         // makes the same check — so returning here is safe.
-        if i.stopped {
+        if i.stopped || expected_epoch.is_some_and(|e| e != i.reset_epoch) {
             return Err(anyhow::anyhow!("engine stopped; not starting a codex turn"));
         }
         (
@@ -2055,10 +2164,15 @@ async fn spawn_codex_turn(
     }
     // stop_quiet may have run during the connect / start_thread / subscribe awaits
     // above, when there was no `codex_client` for it to shut down. If the stop won
-    // that race, tear the freshly connected client down and abort rather than
-    // starting a turn on a stopped engine. (The early snapshot check only covers
+    // that race — including a stop-then-restart, which clears `stopped` but bumps
+    // the epoch — tear the freshly connected client down and abort rather than
+    // starting a turn the user canceled. (The early snapshot check only covers
     // stops that happened before the connect.)
-    if eng.lock().await.stopped {
+    let stop_won = {
+        let g = eng.lock().await;
+        g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch)
+    };
+    if stop_won {
         if let Some(c) = eng.lock().await.codex_client.take() {
             c.shutdown().await;
         }
@@ -2099,8 +2213,11 @@ async fn spawn_codex_turn_or_exec(
     db: Db,
     eng: EngineRef,
     out: Outgoing,
+    expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    if let Err(e) = spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone()).await {
+    if let Err(e) =
+        spawn_codex_turn(app.clone(), db.clone(), eng.clone(), out.clone(), expected_epoch).await
+    {
         // Stop pressed while the app-server start was pending and it then errored:
         // don't resurrect the canceled turn on exec — propagate so the caller rolls
         // it back (otherwise the interrupted turn runs anyway on the fallback).
@@ -2116,7 +2233,7 @@ async fn spawn_codex_turn_or_exec(
             c.shutdown().await;
         }
         eprintln!("[weft][codex] app-server unavailable ({e}) — falling back to exec");
-        spawn_turn(app, db, eng, out).await?;
+        spawn_turn(app, db, eng, out, expected_epoch).await?;
     }
     Ok(())
 }
@@ -2376,8 +2493,14 @@ async fn codex_consumer(
                                 if let Some(c) = stale {
                                     c.shutdown().await;
                                 }
-                                match spawn_turn(app.clone(), db.clone(), eng.clone(), n.clone())
-                                    .await
+                                match spawn_turn(
+                                    app.clone(),
+                                    db.clone(),
+                                    eng.clone(),
+                                    n.clone(),
+                                    None,
+                                )
+                                .await
                                 {
                                     Ok(()) => {
                                         mark_queued_delivered(&app, &db, thread_id, session_id, &n)
@@ -2549,13 +2672,22 @@ fn codex_change_approval_summary(params: &serde_json::Value) -> String {
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
 /// stream from stdout, EOF ends the turn (the reader then flushes the queue).
-async fn spawn_turn(app: AppHandle, db: Db, eng: EngineRef, out: Outgoing) -> anyhow::Result<()> {
+async fn spawn_turn(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    out: Outgoing,
+    expected_epoch: Option<u64>,
+) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
     // Atomic with the child snapshot below: never launch a per-turn process for a
     // stopped engine — a stop that raced into the send's Phase-3-to-spawn window,
-    // or a queued turn drained just as the human stopped. Every caller already
-    // rolls back or propagates a spawn error, so returning here is safe.
-    if inner.stopped {
+    // or a queued turn drained just as the human stopped. Send-originated spawns
+    // also pass their reservation's reset_epoch: a stop-THEN-RESTART clears
+    // `stopped` again, but bumps the epoch, so the canceled send still can't
+    // launch a child onto the restarted engine. Every caller already rolls back
+    // or propagates a spawn error, so returning here is safe.
+    if inner.stopped || expected_epoch.is_some_and(|e| e != inner.reset_epoch) {
         return Err(anyhow::anyhow!("engine stopped; not spawning a turn"));
     }
     // Per-turn argv (incl. codex's message-on-argv and opencode's /cmd→--command
@@ -2841,9 +2973,9 @@ async fn send_hidden_inner(
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
             drop(inner);
             let res = if codex_appserver {
-                spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out).await
+                spawn_codex_turn_or_exec(app.clone(), db.clone(), eng.clone(), out, None).await
             } else {
-                spawn_turn(app.clone(), db.clone(), eng.clone(), out).await
+                spawn_turn(app.clone(), db.clone(), eng.clone(), out, None).await
             };
             if let Err(e) = res {
                 rollback_failed_turn(app, db, eng, turn_id).await;
@@ -3404,7 +3536,7 @@ fn spawn_reader(
                             let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                             tauri::async_runtime::spawn(async move {
                                 if let Err(err) =
-                                    spawn_turn(a.clone(), d.clone(), e.clone(), next.clone()).await
+                                    spawn_turn(a.clone(), d.clone(), e.clone(), next.clone(), None).await
                                 {
                                     eprintln!("[weft] queued per-turn delivery failed: {err}");
                                     rollback_failed_turn(&a, &d, &e, next_turn_id).await;
@@ -3524,7 +3656,7 @@ fn spawn_reader(
                 let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                 tauri::async_runtime::spawn(async move {
                     if let Err(err) =
-                        spawn_turn(a.clone(), d.clone(), e.clone(), next.clone()).await
+                        spawn_turn(a.clone(), d.clone(), e.clone(), next.clone(), None).await
                     {
                         eprintln!("[weft] queued per-turn delivery failed: {err}");
                         rollback_failed_turn(&a, &d, &e, next_turn_id).await;
@@ -4283,9 +4415,10 @@ mod tests {
         assert!(!send_reservation_valid(&inner, &direct_ctx));
         inner.turn.busy = true;
 
-        // Queued sends don't own the busy flag and tolerate the active turn
-        // ADVANCING (a new turn started) while the lock was dropped — as long as
-        // the engine is still busy.
+        // Queued sends don't own the busy flag: the enqueue/promote/cancel decision
+        // is made at Phase 3 commit time from CURRENT state, so validation lets them
+        // through regardless of turn advance (turn_id) or the turn having ended
+        // (busy=false → Phase 3 promotes instead of stranding the message).
         let queued_ctx = SendContext {
             direct: false,
             ..direct_ctx
@@ -4293,14 +4426,25 @@ mod tests {
         assert!(send_reservation_valid(&inner, &queued_ctx)); // busy = true
         inner.turn_id = 6; // active turn advanced, still busy → tolerated
         assert!(send_reservation_valid(&inner, &queued_ctx));
-        // But if the turn ENDED (engine idle) in that window, queueing would strand
-        // the message — nothing drains an idle queue — so the reservation is invalid.
-        inner.turn.busy = false;
-        assert!(!send_reservation_valid(&inner, &queued_ctx));
+        inner.turn.busy = false; // turn ended → still valid; Phase 3 promotes
+        assert!(send_reservation_valid(&inner, &queued_ctx));
         inner.turn.busy = true;
-        // An explicit stop also invalidates a queued reservation.
+        // An explicit stop still invalidates a queued reservation.
         inner.stopped = true;
         assert!(!send_reservation_valid(&inner, &queued_ctx));
+    }
+
+    #[test]
+    fn promote_queued_reservation_claims_a_fresh_direct_turn() {
+        let mut inner = test_inner("claude");
+        inner.turn_id = 7;
+        assert!(!inner.turn.busy, "precondition: engine idle");
+        let promoted = promote_queued_reservation(&mut inner, Some("tag".into()));
+        assert_eq!(promoted, 8, "promotion claims the NEXT turn id");
+        assert_eq!(inner.turn_id, 8);
+        assert!(inner.turn.busy, "promotion reserves the turn (busy)");
+        assert_eq!(inner.current_origin_tag.as_deref(), Some("tag"));
+        assert!(inner.clock.started.is_some(), "promotion starts the turn clock");
     }
 
     #[test]
