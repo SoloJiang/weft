@@ -17,48 +17,26 @@ import MarkdownRender, {
 } from "markstream-react";
 import "markstream-react/index.css";
 import {
-  getMarkdown,
   parseMarkdownToStructure,
   type CodeBlockNode,
   type HtmlBlockNode,
   type HtmlInlineNode,
   type InlineCodeNode,
   type LinkNode,
-  type MarkdownIt,
   type ParsedNode,
   type TextNode,
 } from "stream-markdown-parser";
 import { codeToHtml } from "shiki";
 import { api } from "../lib/api";
 import { injectCaret, WEFT_CARET_TYPE } from "../lib/markdownCaret";
+import { allowHref, createWeftMarkdown, UNSAFE_HREF } from "../lib/markdownParser";
 import { classifyHref, isPathLike } from "../lib/fileLinks";
 import { hasLineLabelSyntax, splitTextForPaths } from "../lib/filePathParsing";
 import { cn } from "../lib/cn";
 import { FilePathRef, InsideRefContext } from "./FilePathRef";
 import { ShellSnippet } from "./ai-elements";
 
-// Script-y schemes are never handed to the DOM href or the OS opener.
-const UNSAFE_HREF = /^\s*(?:javascript|data|vbscript):/i;
-
 const CODE_CHIP = "rounded bg-raised px-1 py-0.5 font-mono text-[11.5px] text-ink";
-
-/** Weft's link policy, applied at the markdown-it layer. Anything an agent may
- *  legitimately mention stays a link (file:, vscode://, ms-settings:, relative
- *  paths, …); only script-y schemes are rejected. This also REPLACES
- *  markdown-it-ts's stock `validateLink`, which mis-drops links (verified: a
- *  `` `code` `` span + `[x](file:///…)` + a later link in one paragraph eats the
- *  file link) — keep this override even if the policy ever becomes allow-all. */
-function allowHref(url: string): boolean {
-  return !UNSAFE_HREF.test(url);
-}
-
-/** Per-instance markdown-it setup shared by every Weft markdown surface. */
-function configureWeftMarkdownIt(md: MarkdownIt): void {
-  (md as { validateLink?: (url: string) => boolean }).validateLink = allowHref;
-  // No TeX in Weft chat: agents write dollar amounts far more often than math
-  // (`$100 and $200` would otherwise parse as an inline formula).
-  md.disable(["math", "math_block", "explicit_math_block"], true);
-}
 
 /** Session working dir for resolving relative file paths — provided by the
  *  <Markdown> host, consumed by the module-registered node components. */
@@ -195,6 +173,22 @@ function WeftLink(props: NodeComponentProps<LinkNode>) {
   if (!href || UNSAFE_HREF.test(href)) return <>{children}</>;
   // In-page anchor: let the DOM handle the jump, never the OS opener.
   if (href.startsWith("#")) return <a href={href}>{children}</a>;
+  // linkify's fuzzy mode turns bare code-file names whose extension doubles as
+  // a country TLD (`server.py`, `lib.rs`) into http:// links. A schemaless
+  // autolink whose label reads as a single path takes the file-ref route the
+  // label would have taken as plain prose; real domains (`example.com`,
+  // `weft.dev`) are not path-like and stay web links.
+  const label = String(node.text ?? "");
+  if (label && href === `http://${label}`) {
+    const segs = splitTextForPaths(label);
+    if (segs.length === 1 && segs[0].type === "path") {
+      return (
+        <FilePathRef token={segs[0].value} cwd={cwd}>
+          {segs[0].label ?? label}
+        </FilePathRef>
+      );
+    }
+  }
   const c = classifyHref(href);
   if (c.kind === "file") {
     return (
@@ -278,8 +272,12 @@ function WeftText({ node }: NodeComponentProps<TextNode>) {
  *  markstream's diagram components — Weft ships none of those optional peers. */
 function WeftCodeBlock({ node }: NodeComponentProps<CodeBlockNode>) {
   const { t } = useTranslation();
-  const language = parseLanguage(node.language);
-  const code = String(node.code ?? "");
+  // A ```diff fence parses into split original/updated sides — node.code holds
+  // only the updated text and node.language comes back empty. The transcript
+  // wants the literal patch, so diff blocks render their fence body (raw,
+  // ± markers intact) under shiki's diff grammar.
+  const language = node.diff ? "diff" : parseLanguage(node.language);
+  const code = node.diff ? String(node.raw ?? "") : String(node.code ?? "");
   if (isShellLanguage(language)) {
     return (
       <ShellSnippet
@@ -294,9 +292,13 @@ function WeftCodeBlock({ node }: NodeComponentProps<CodeBlockNode>) {
 }
 
 /** Raw inline HTML: keep the text content, drop the markup — no live elements
- *  ever mount from raw HTML (a raw `<a href>` must never navigate the webview). */
+ *  ever mount from raw HTML (a raw `<a href>` must never navigate the webview).
+ *  A childless node (`<img …>`, void/self-closing snippets) has no text to
+ *  keep, so its source renders escaped instead of vanishing. */
 function WeftHtmlInline(props: NodeComponentProps<HtmlInlineNode>) {
-  return <>{renderNodeChildren(props.node.children, props, "h")}</>;
+  const children = renderNodeChildren(props.node.children, props, "h");
+  if (children) return <>{children}</>;
+  return <>{String(props.node.content ?? props.node.raw ?? "")}</>;
 }
 
 /** Raw HTML blocks render as escaped source text — the words stay visible in
@@ -364,10 +366,7 @@ export const Markdown = memo(function Markdown({
   // call constructs a fresh markdown-it), so this lives and dies with the
   // component; the id only namespaces generated DOM ids.
   const instanceId = useId();
-  const md = useMemo(
-    () => getMarkdown(`weft-${instanceId}`, { apply: [configureWeftMarkdownIt] }),
-    [instanceId],
-  );
+  const md = useMemo(() => createWeftMarkdown(`weft-${instanceId}`), [instanceId]);
   const theme = useShikiTheme();
   const final = !caret;
   // Nodes mode (parse outside the renderer): direct control over ParseOptions,
