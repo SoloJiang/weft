@@ -9,7 +9,6 @@ import {
 } from "lucide-react";
 import { Button } from "./ui/Button";
 import { Select } from "./ui/Select";
-import { ToolIcon, toolFullName } from "./ToolIcon";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
@@ -368,19 +367,11 @@ function OnboardingStage({
       </div>
       <p className="mt-1 text-[12px] leading-relaxed text-ink-faint">{t("onboarding.scopeBody")}</p>
       <div className="mt-5 flex flex-col gap-2">
-        <ScopeLane repo="api" role={t("scope.writes")} reason={t("onboarding.scopeApi")} tool="claude" tone="write" />
-        <ScopeLane repo="web-app" role={t("scope.writes")} reason={t("onboarding.scopeWeb")} tool="codex" tone="write" />
-        <ScopeLane repo="mobile" role={t("scope.writes")} reason={t("onboarding.scopeMobile")} tool="opencode" tone="write" />
-        <ScopeLane repo="design-tokens" role={t("onboarding.readOnly")} reason={t("onboarding.scopeTokens")} tone="read" />
-        <ScopeLane repo="docs" role={t("onboarding.readOnly")} reason={t("onboarding.scopeDocs")} tone="read" />
-        <ScopeLane repo="infra" role={t("onboarding.none")} reason={t("onboarding.scopeInfra")} tone="none" muted />
+        <ScopeLane order={1} repo="api" reason={t("onboarding.scopeApi")} />
+        <ScopeLane order={2} repo="web-app" reason={t("onboarding.scopeWeb")} />
+        <ScopeLane order={2} repo="mobile" reason={t("onboarding.scopeMobile")} />
       </div>
-      <div className="mt-4 flex flex-wrap items-center gap-3 text-[11.5px] text-ink-faint">
-        <span className="text-accent">3 {t("scope.writes")}</span>
-        <span className="text-brand">2 {t("onboarding.readOnly")}</span>
-        <span>1 {t("onboarding.none")}</span>
-        <span className="ml-auto">{t("onboarding.scopeOrder")}</span>
-      </div>
+      <p className="mt-3 text-[11.5px] text-ink-faint">{t("onboarding.scopeOrder")}</p>
     </section>
   );
 }
@@ -416,59 +407,14 @@ function OnboardingGraph() {
   );
 }
 
-function ScopeLane({
-  repo,
-  role,
-  reason,
-  tool,
-  tone,
-  muted,
-}: {
-  repo: string;
-  role: string;
-  reason: string;
-  tool?: string;
-  tone: "write" | "read" | "none";
-  muted?: boolean;
-}) {
-  const toneStyles: Record<typeof tone, { border: string; dot: string; pill: string }> = {
-    write: {
-      border: "border-accent/45",
-      dot: "bg-accent",
-      pill: "border-accent/35 bg-accent-ghost text-accent",
-    },
-    read: {
-      border: "border-brand/35",
-      dot: "bg-brand",
-      pill: "border-brand/35 bg-brand-ghost text-brand",
-    },
-    none: {
-      border: "border-border",
-      dot: "bg-border-strong",
-      pill: "border-border text-ink-faint",
-    },
-  };
-  const { border: rowBorder, dot: dotColor, pill: pillClasses } = toneStyles[tone];
+function ScopeLane({ order, repo, reason }: { order: number; repo: string; reason: string }) {
   return (
-    <div
-      className={cn(
-        "flex items-center gap-3 rounded-[var(--radius-md)] border bg-bg px-3 py-2.5 text-[12px]",
-        rowBorder,
-        muted && "opacity-55",
-      )}
-    >
-      <span className={cn("h-0.5 w-8 shrink-0 rounded-full", dotColor)} />
-      <span className="min-w-[112px] font-mono font-semibold text-ink">{repo}</span>
-      <span className={cn("rounded-full border px-2 py-px text-[10.5px]", pillClasses)}>
-        {role}
+    <div className="flex items-center gap-3 rounded-[var(--radius-md)] border border-accent/45 bg-bg px-3 py-2.5 text-[12px]">
+      <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full border border-accent/50 bg-bg font-mono text-[11px] text-accent">
+        {order}
       </span>
+      <span className="min-w-[112px] font-mono font-semibold text-ink">{repo}</span>
       <span className="min-w-0 flex-1 truncate text-[11.5px] text-ink-faint">{reason}</span>
-      {tool && (
-        <span className="flex shrink-0 items-center gap-1 rounded bg-brand-ghost px-1.5 py-px text-[10.5px] text-brand">
-          <ToolIcon tool={tool} size={11} />
-          {toolFullName(tool)}
-        </span>
-      )}
       <GitBranch size={13} className="text-ink-faint" />
     </div>
   );

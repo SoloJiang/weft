@@ -789,7 +789,7 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
             if !has_directions {
                 return text_result(
                     "error: propose_directions requires a non-empty `directions` array; \
-                     to withdraw pending directions, call cancel_directions"
+                     to withdraw pending tasks, call cancel_directions"
                         .into(),
                 );
             }
@@ -806,7 +806,7 @@ async fn call_planner(db: &Db, thread: i32, name: &str, args: &Value) -> Value {
                     // happened — the console renders it as an interactive card.
                     emit_proposal_row(db, thread, &proposal.rationale, n).await;
                     text_result(format!(
-                        "proposed {n} direction(s); the human will review and confirm in weft"
+                        "proposed {n} task(s); the human will review and confirm in weft"
                     ))
                 }
                 Err(e) => text_result(format!("error: {e}")),
@@ -863,7 +863,7 @@ async fn withdraw_and_emit(db: &Db, thread: i32, rationale: &str) -> Value {
     match crate::planner::withdraw_proposal(db, thread, rationale).await {
         Ok(true) => {
             emit_proposal_row(db, thread, rationale, 0).await;
-            text_result("withdrew pending directions".into())
+            text_result("withdrew pending tasks".into())
         }
         Ok(false) => text_result(
             "nothing to withdraw: no pending proposal (it may be confirmed or already dispatched)"
@@ -901,7 +901,7 @@ fn planner_specs() -> Value {
         },
         {
             "name": "propose_directions",
-            "description": "Propose how to split this task into directions. Each direction targets EXACTLY ONE repo it will modify (by name, from the repo map) and MUST include a `reason` explaining why that repo must change. Reads are free — an agent may read any repo without declaring it, so never list reads. To modify N repos, propose N directions. The human reviews each as a Needs-you card and approves before any worktree is created.",
+            "description": "Propose how to split the work into tasks. Each task targets EXACTLY ONE repo it will modify (by name, from the repo map) and MUST include a `reason` explaining why that repo must change. Reads are free — an agent may read any repo without declaring it, so never list reads. To modify N repos, propose N tasks. The human reviews each as a Needs-you card and approves before any worktree is created.",
             "inputSchema": { "type": "object", "properties": {
                 "rationale": str_prop(),
                 "directions": { "type": "array", "items": { "type": "object", "properties": {
@@ -909,7 +909,7 @@ fn planner_specs() -> Value {
                     "repo": str_prop(),
                     "reason": str_prop(),
                     "mandate": { "type": "string", "enum": ["plan+impl", "impl-only"],
-                        "description": "Granularity of the role: plan+impl (default) — the worker plans its own direction first, then builds; impl-only — the direction is small/fully specified, the worker builds straight away. Do NOT write the direction's implementation plan yourself; that is the worker's job." },
+                        "description": "Granularity of the role: plan+impl (default) — the worker plans its own task first, then builds; impl-only — the task is small/fully specified, the worker builds straight away. Do NOT write the task's implementation plan yourself; that is the worker's job." },
                     "base_branch": { "type": "string",
                         "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." }
                 }, "required": ["name", "repo", "reason"] } }
@@ -917,7 +917,7 @@ fn planner_specs() -> Value {
         },
         {
             "name": "cancel_directions",
-            "description": "Withdraw the pending proposed directions. Use when the human says to hold off / cancel, or the write boundary is no longer settled — it clears the current proposal so nothing is dispatched and the review card collapses. Provide a short rationale. Do NOT call propose_directions with an empty directions list to cancel; use this.",
+            "description": "Withdraw the pending proposed tasks. Use when the human says to hold off / cancel, or the write boundary is no longer settled — it clears the current proposal so nothing is dispatched and the review card collapses. Provide a short rationale. Do NOT call propose_directions with an empty directions list to cancel; use this.",
             "inputSchema": { "type": "object", "properties": {
                 "rationale": str_prop()
             }, "required": ["rationale"] }
@@ -930,20 +930,20 @@ fn tool_specs() -> Value {
     json!([
         {
             "name": "bus_post",
-            "description": "Post a message to another direction's inbox in this thread.",
+            "description": "Post a message to another task's inbox in this thread.",
             "inputSchema": { "type": "object",
                 "properties": { "to": str_prop(), "text": str_prop() },
                 "required": ["to", "text"] }
         },
         {
             "name": "bus_broadcast",
-            "description": "Send a message to every other direction in this thread.",
+            "description": "Send a message to every other task in this thread.",
             "inputSchema": { "type": "object",
                 "properties": { "text": str_prop() }, "required": ["text"] }
         },
         {
             "name": "bus_inbox",
-            "description": "Read and clear your unread messages from other directions.",
+            "description": "Read and clear your unread messages from other tasks.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -965,13 +965,13 @@ fn tool_specs() -> Value {
         },
         {
             "name": "announce_interface_change",
-            "description": "Broadcast a contract/interface change to the other directions.",
+            "description": "Broadcast a contract/interface change to the other tasks.",
             "inputSchema": { "type": "object",
                 "properties": { "summary": str_prop() }, "required": ["summary"] }
         },
         {
             "name": "set_task_status",
-            "description": "Move your task on the board as work really progresses: queued (not started), planning (working out this direction's plan), working (actively building), review (done coding, awaiting the human's look), done (delivered/accepted). Reversible — set it back to working if the human asks for changes. Use this to keep the human's board honest instead of leaving it to guesswork.",
+            "description": "Move your task on the board as work really progresses: queued (not started), planning (working out this task's plan), working (actively building), review (done coding, awaiting the human's look), done (delivered/accepted). Reversible — set it back to working if the human asks for changes. Use this to keep the human's board honest instead of leaving it to guesswork.",
             "inputSchema": { "type": "object",
                 "properties": { "status": str_prop() }, "required": ["status"] }
         }

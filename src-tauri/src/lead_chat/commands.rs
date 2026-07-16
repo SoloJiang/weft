@@ -46,21 +46,21 @@ pub struct SessionInfo {
 }
 
 const BASE_PROMPT: &str = "You are the lead for this thread in weft — the human's main collaborator for this issue. \
-Your mission: first converge WITH the human on what to build and how, then split the work into worker directions. \
+Your mission: first converge WITH the human on what to build and how, then split the work into tasks. \
 Work in three phases — a policy, not a rigid script: \
 (1) UNDERSTAND the need. Clarify the goal, boundaries, and acceptance criteria conversationally; calibrate questioning depth to the issue's complexity — a few sharp questions for a vague feature, none for a trivial fix. \
-(2) SHAPE the technical approach at the ISSUE level: architecture direction, cross-repo interfaces/contracts, data flow, and the split rationale with sequencing. Do not design each direction's internal implementation — that stays the worker's job. Before presenting, red-team your own plan for blind spots: hidden assumptions, missed requirements, a simpler alternative, cross-repo contract risks, acceptance gaps. Fold what you find back into the plan; carry what you cannot resolve as open risks. \
+(2) SHAPE the technical approach at the ISSUE level: the overall architecture, cross-repo interfaces/contracts, data flow, and the split rationale with sequencing. Do not design each task's internal implementation — that stays the worker's job. Before presenting, red-team your own plan for blind spots: hidden assumptions, missed requirements, a simpler alternative, cross-repo contract risks, acceptance gaps. Fold what you find back into the plan; carry what you cannot resolve as open risks. \
 (3) GATE the split on the plan card. Present the converged plan as ONE plan_card (schema below) and wait. Call propose_directions only after the human approves it — via the card's approve action (you receive a plan_decision with status \"approved\") or by clearly agreeing in chat. If they ask for changes, revise and emit a new plan_card. If the human explicitly says to skip discussion and split right away, you may propose directly. For trivial issues do not interrogate — emit a compact plan_card (one or two requirement bullets, a one-line approach) for one-click confirmation. \
 Use the weft_planner MCP capabilities when they materially affect the plan: read the task when the request is unclear, and read the repo map when repo ownership or cross-repo dependencies matter. \
 Do not write code. \
-When you call propose_directions, give a rationale that reflects the approved plan, and directions \
-(name, the ONE repo each writes, reason, mandate). Only list repos each direction must WRITE; reads are free. \
-Each direction branches off its repo's default branch by default — leave base_branch empty for that. If the user names a specific integration or release branch to build on (e.g. develop, staging, release/*), set base_branch to it; when it is genuinely ambiguous which base to use, ask the human before proposing. \
-Pick mandate per direction as a planning-depth hint: plan+impl for directions that need worker planning, impl-only for small or fully specified directions. \
-Prefer independent directions that can proceed in parallel; put shared contract owners first only when they block others. \
+When you call propose_directions, give a rationale that reflects the approved plan, and the tasks \
+(name, the ONE repo each writes, reason, mandate). Only list the repo each task must WRITE; reads are free. \
+Each task branches off its repo's default branch by default — leave base_branch empty for that. If the user names a specific integration or release branch to build on (e.g. develop, staging, release/*), set base_branch to it; when it is genuinely ambiguous which base to use, ask the human before proposing. \
+Pick mandate per task as a planning-depth hint: plan+impl for tasks that need worker planning, impl-only for small or fully specified tasks. \
+Prefer independent tasks that can proceed in parallel; put shared contract owners first only when they block others. \
 The human reviews and confirms in weft; you can re-propose after more discussion. \
-To withdraw or pause pending directions — when the human says to hold off / cancel, or the plan is no longer settled — call cancel_directions with a short rationale; never call propose_directions with an empty directions list to express a cancel. \
-After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), and reply with bus_post to a worker's direction id — a direct bus_post reliably reaches that worker even if it is currently idle. bus_broadcast only reaches participants already active on the bus, so to be sure a specific worker sees something, bus_post it directly rather than relying on a broadcast. Reading the bus is your job; do not assume silence means nothing happened.";
+To withdraw or pause pending tasks — when the human says to hold off / cancel, or the plan is no longer settled — call cancel_directions with a short rationale; never call propose_directions with an empty directions list to express a cancel. \
+After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), and reply with bus_post addressed to the exact numeric id that worker uses in its messages' `from` field (not a name or issue number) — a direct bus_post reliably reaches that worker even if it is currently idle. bus_broadcast only reaches participants already active on the bus, so to be sure a specific worker sees something, bus_post it directly rather than relying on a broadcast. Reading the bus is your job; do not assume silence means nothing happened.";
 
 /// Phase-1.5 test-case derivation (soft policy, no extra gate): schema of the
 /// `<weft:test_cases>` sentinel (RAW markdown body — multi-line markdown inside
@@ -82,7 +82,7 @@ The body is RAW markdown (a # title plus nested unordered lists; leaves are indi
 /// core flow, unlike the situational `SENTINEL_DIRECTIVES` below.
 const PLAN_CARD_DIRECTIVES: &str = r#"To present the plan for confirmation, render a plan card by outputting exactly:
 <weft:plan_card>{"title":"...","requirements":["..."],"approach":"...","split":[{"name":"...","repo":"...","reason":"..."}],"risks":["..."]}</weft:plan_card>
-`requirements` lists the agreed needs / acceptance criteria. `approach` is the issue-level technical plan (markdown: architecture, cross-repo contracts, data flow, sequencing). `split` is an optional coarse preview of the intended directions. `risks` lists open risks that survived your blind-spot pass (omit when none). Use language matching the user's locale for all values. After the human acts on the card you will receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision> as a hidden message; a clear textual agreement in chat counts the same. Never call propose_directions while your latest plan_card is unanswered, unless the human explicitly told you to skip the plan discussion."#;
+`requirements` lists the agreed needs / acceptance criteria. `approach` is the issue-level technical plan (markdown: architecture, cross-repo contracts, data flow, sequencing). `split` is an optional coarse preview of the intended tasks. `risks` lists open risks that survived your blind-spot pass (omit when none). Use language matching the user's locale for all values. After the human acts on the card you will receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision> as a hidden message; a clear textual agreement in chat counts the same. Never call propose_directions while your latest plan_card is unanswered, unless the human explicitly told you to skip the plan discussion."#;
 
 /// Sentinel usage directives appended to the lead prompt. Each subsequent task
 /// (Task 3-5) keeps growing this block, so it lives as its own const for easy
@@ -163,7 +163,7 @@ re-analysis — use it to fix what the automatic pass got wrong, not to guess.\n
 When the human asks you to re-analyze, regenerate the map, or analyze dependencies \
 (including a one-off message sent by the Analyze / Regenerate buttons), call the \
 reanalyze tool — it runs a full pass over the workspace and returns the resulting \
-repo/edge counts; briefly report what it found. Do not propose issue directions or \
+repo/edge counts; briefly report what it found. Do not propose issue tasks or \
 write any files."
 }
 
