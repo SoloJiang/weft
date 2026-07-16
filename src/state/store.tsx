@@ -9,6 +9,8 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
+import { createDeltaCoalescer } from "./deltaCoalescer";
+import { mergeLeadSnapshot } from "./leadSnapshot";
 import i18n, { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
@@ -1312,9 +1314,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // auto-verify fires once per real turn end (see the turn handler).
   const lastWorkerTurnRef = useRef<Record<number, string>>({});
 
+  // The engine forwards every raw token chunk as its own `delta` push;
+  // applying each one directly re-renders the transcript (and re-parses the
+  // streaming message's markdown) per chunk. Deltas therefore buffer and land
+  // as ONE state update per animation frame. Shared between the lead-chat
+  // listener and loadLeadChat's snapshot replace (which must drain it first),
+  // so it lives in a lazily-initialized ref rather than the listener effect.
+  const leadDeltasRef = useRef<ReturnType<typeof createDeltaCoalescer> | null>(null);
+  leadDeltasRef.current ??= createDeltaCoalescer((batch) => {
+    setLeadMessages((m) => {
+      let next = m;
+      for (const { threadId, messageId, text } of batch) {
+        next = {
+          ...next,
+          [threadId]: (next[threadId] ?? []).map((x) => {
+            if (x.id !== messageId) return x;
+            let existing = "";
+            try {
+              existing = (JSON.parse(x.content).text as string) ?? "";
+            } catch {
+              /* fresh row */
+            }
+            return { ...x, content: JSON.stringify({ text: existing + text }) };
+          }),
+        };
+      }
+      return next;
+    });
+  });
+
   useEffect(() => {
+    const deltas = leadDeltasRef.current;
+    if (!deltas) return;
     const un = listen<LeadChatPush>("lead-chat", (e) => {
       const p = e.payload;
+      if (p.type === "delta") {
+        deltas.push(p.thread_id, p.message_id, p.text);
+        return;
+      }
+      // Every other push may depend on (finalize replaces the streamed body)
+      // or order against (tool rows) the streamed text — pending appends land
+      // first so events apply in arrival order, exactly as before coalescing.
+      deltas.flushNow();
       if (p.type === "message") {
         setLeadMessages((m) => {
           const list = m[p.thread_id] ?? [];
@@ -1342,20 +1383,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             })
             .catch(() => {});
         }
-      } else if (p.type === "delta") {
-        setLeadMessages((m) => ({
-          ...m,
-          [p.thread_id]: (m[p.thread_id] ?? []).map((x) => {
-            if (x.id !== p.message_id) return x;
-            let text = "";
-            try {
-              text = (JSON.parse(x.content).text as string) ?? "";
-            } catch {
-              /* fresh row */
-            }
-            return { ...x, content: JSON.stringify({ text: text + p.text }) };
-          }),
-        }));
       } else if (p.type === "finalize") {
         setLeadMessages((m) => ({
           ...m,
@@ -1478,6 +1505,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
     });
     return () => {
+      deltas.flushNow();
       void un.then((f) => f());
     };
   }, []);
@@ -1502,9 +1530,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const loadLeadChat = useCallback(async (threadId: number) => {
     const msgs = await api.listLeadMessages(threadId);
+    // Drain-then-reconcile, same tick: pending chunks land on the current rows
+    // first (never onto the snapshot — that would duplicate any chunk the
+    // backend's ~150ms persist throttle already wrote), then mergeLeadSnapshot
+    // keeps the local accumulated text where it extends a still-streaming
+    // snapshot row (events outrun the persist throttle, so the snapshot can be
+    // behind the live transcript). No await sits between the drain and the
+    // set, so no new delta can interleave.
+    leadDeltasRef.current?.flushNow();
     setLeadMessages((m) => ({
       ...m,
-      [threadId]: msgs.filter((x) => x.kind !== "meta"),
+      [threadId]: mergeLeadSnapshot(m[threadId] ?? [], msgs),
     }));
     // Fire the engine up and refresh slash commands, including workspace skills.
     discoverLeadSlash(threadId);
