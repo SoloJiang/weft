@@ -1313,32 +1313,38 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // auto-verify fires once per real turn end (see the turn handler).
   const lastWorkerTurnRef = useRef<Record<number, string>>({});
 
-  useEffect(() => {
-    // The engine forwards every raw token chunk as its own `delta` push;
-    // applying each one directly re-renders the transcript (and re-parses the
-    // streaming message's markdown) per chunk. Deltas therefore buffer and
-    // land as ONE state update per animation frame.
-    const deltas = createDeltaCoalescer((batch) => {
-      setLeadMessages((m) => {
-        let next = m;
-        for (const { threadId, messageId, text } of batch) {
-          next = {
-            ...next,
-            [threadId]: (next[threadId] ?? []).map((x) => {
-              if (x.id !== messageId) return x;
-              let existing = "";
-              try {
-                existing = (JSON.parse(x.content).text as string) ?? "";
-              } catch {
-                /* fresh row */
-              }
-              return { ...x, content: JSON.stringify({ text: existing + text }) };
-            }),
-          };
-        }
-        return next;
-      });
+  // The engine forwards every raw token chunk as its own `delta` push;
+  // applying each one directly re-renders the transcript (and re-parses the
+  // streaming message's markdown) per chunk. Deltas therefore buffer and land
+  // as ONE state update per animation frame. Shared between the lead-chat
+  // listener and loadLeadChat's snapshot replace (which must drain it first),
+  // so it lives in a lazily-initialized ref rather than the listener effect.
+  const leadDeltasRef = useRef<ReturnType<typeof createDeltaCoalescer> | null>(null);
+  leadDeltasRef.current ??= createDeltaCoalescer((batch) => {
+    setLeadMessages((m) => {
+      let next = m;
+      for (const { threadId, messageId, text } of batch) {
+        next = {
+          ...next,
+          [threadId]: (next[threadId] ?? []).map((x) => {
+            if (x.id !== messageId) return x;
+            let existing = "";
+            try {
+              existing = (JSON.parse(x.content).text as string) ?? "";
+            } catch {
+              /* fresh row */
+            }
+            return { ...x, content: JSON.stringify({ text: existing + text }) };
+          }),
+        };
+      }
+      return next;
     });
+  });
+
+  useEffect(() => {
+    const deltas = leadDeltasRef.current;
+    if (!deltas) return;
     const un = listen<LeadChatPush>("lead-chat", (e) => {
       const p = e.payload;
       if (p.type === "delta") {
@@ -1523,6 +1529,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const loadLeadChat = useCallback(async (threadId: number) => {
     const msgs = await api.listLeadMessages(threadId);
+    // Drain-then-replace, same tick: the backend persists accumulated stream
+    // text every ~150ms, so this snapshot may already contain chunks that are
+    // still buffered in the coalescer — flushing them after the replace would
+    // append them twice. Draining first lands them on the OLD rows, which the
+    // snapshot then supersedes (the pre-coalescing semantics). No await sits
+    // between the drain and the set, so no new delta can interleave.
+    leadDeltasRef.current?.flushNow();
     setLeadMessages((m) => ({
       ...m,
       [threadId]: msgs.filter((x) => x.kind !== "meta"),
