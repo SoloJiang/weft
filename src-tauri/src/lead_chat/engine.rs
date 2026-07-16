@@ -951,6 +951,14 @@ async fn cleanup_disconnected_turn(
     inner.clock = TurnClock::default();
     inner.current_origin_tag = None;
     inner.stopped = true;
+    // This reset carries STOP semantics (stopped=true, queued rows finalized), so
+    // in-flight sends racing Phase 1→3 must die with it: bump the epoch, exactly
+    // like stop_quiet — else a quick restart clears `stopped` and a stale queued
+    // send (which ignores turn_id/busy) would enqueue or deliver a message whose
+    // row this cleanup already finalized. Continuity resets (resident respawn,
+    // child-EOF recovery) deliberately do NOT bump: their in-flight sends are
+    // still wanted and Phase 3 promotes them onto the fresh engine.
+    inner.reset_epoch += 1;
     persist_activity(db, session_id, thread_id, "stopped").await;
     let _ = app.emit(
         EVENT,
