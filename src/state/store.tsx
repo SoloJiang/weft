@@ -10,6 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { createDeltaCoalescer } from "./deltaCoalescer";
+import { mergeLeadSnapshot } from "./leadSnapshot";
 import i18n, { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
@@ -1529,16 +1530,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const loadLeadChat = useCallback(async (threadId: number) => {
     const msgs = await api.listLeadMessages(threadId);
-    // Drain-then-replace, same tick: the backend persists accumulated stream
-    // text every ~150ms, so this snapshot may already contain chunks that are
-    // still buffered in the coalescer — flushing them after the replace would
-    // append them twice. Draining first lands them on the OLD rows, which the
-    // snapshot then supersedes (the pre-coalescing semantics). No await sits
-    // between the drain and the set, so no new delta can interleave.
+    // Drain-then-reconcile, same tick: pending chunks land on the current rows
+    // first (never onto the snapshot — that would duplicate any chunk the
+    // backend's ~150ms persist throttle already wrote), then mergeLeadSnapshot
+    // keeps the local accumulated text where it extends a still-streaming
+    // snapshot row (events outrun the persist throttle, so the snapshot can be
+    // behind the live transcript). No await sits between the drain and the
+    // set, so no new delta can interleave.
     leadDeltasRef.current?.flushNow();
     setLeadMessages((m) => ({
       ...m,
-      [threadId]: msgs.filter((x) => x.kind !== "meta"),
+      [threadId]: mergeLeadSnapshot(m[threadId] ?? [], msgs),
     }));
     // Fire the engine up and refresh slash commands, including workspace skills.
     discoverLeadSlash(threadId);
