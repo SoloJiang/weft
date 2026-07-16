@@ -4,7 +4,7 @@ import { toast } from "../components/Toast";
 import i18n from "../i18n";
 
 export { isPathLike, parsePathToken, displayPath, splitTextForPaths } from "./filePathParsing";
-export { classifyHref, filePathsRehype, type HrefKind } from "./fileLinkMarkdown";
+export { classifyHref, type HrefKind } from "./fileLinkMarkdown";
 
 /**
  * Turning the file paths agents mention in chat into real, openable references.
