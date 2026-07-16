@@ -4290,24 +4290,30 @@ mod tests {
     #[tokio::test]
     async fn terminal_error_without_current_row_is_persisted() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
+        // Real thread row: insert_lead_message refuses deleted/nonexistent
+        // threads (the deletion fence).
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
 
-        let m = insert_terminal_assistant_if_missing(&db, 7, None, 3, "error")
+        let m = insert_terminal_assistant_if_missing(&db, t.id, None, 3, "error")
             .await
             .unwrap()
             .expect("error turn should create an assistant row");
 
-        assert_eq!(m.thread_id, 7);
+        assert_eq!(m.thread_id, t.id);
         assert_eq!(m.turn_id, 3);
         assert_eq!(m.role, "assistant");
         assert_eq!(m.kind, "text");
         assert_eq!(m.status, "error");
         let content: serde_json::Value = serde_json::from_str(&m.content).unwrap();
         assert_eq!(content["terminal"], "error_before_output");
-        let all = repo::list_lead_messages(&db, 7).await.unwrap();
+        let all = repo::list_lead_messages(&db, t.id).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, m.id);
 
-        let complete = insert_terminal_assistant_if_missing(&db, 7, None, 4, "complete")
+        let complete = insert_terminal_assistant_if_missing(&db, t.id, None, 4, "complete")
             .await
             .unwrap();
         assert!(complete.is_none());
@@ -4316,12 +4322,16 @@ mod tests {
     #[tokio::test]
     async fn disconnected_busy_turn_without_current_row_persists_terminal_error() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
-
-        let row = persist_disconnected_turn_row(&db, 7, None, 3, "error", true, None)
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
             .await
             .unwrap();
 
-        let all = repo::list_lead_messages(&db, 7).await.unwrap();
+        let row = persist_disconnected_turn_row(&db, t.id, None, 3, "error", true, None)
+            .await
+            .unwrap();
+
+        let all = repo::list_lead_messages(&db, t.id).await.unwrap();
         assert_eq!(all.len(), 1);
         match row {
             Some(DisconnectedTurnRow::Inserted(m)) => assert_eq!(m.id, all[0].id),
