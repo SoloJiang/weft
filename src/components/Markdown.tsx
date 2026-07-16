@@ -30,6 +30,7 @@ import {
 } from "stream-markdown-parser";
 import { codeToHtml } from "shiki";
 import { api } from "../lib/api";
+import { injectCaret, WEFT_CARET_TYPE } from "../lib/markdownCaret";
 import { classifyHref, isPathLike } from "../lib/fileLinks";
 import { hasLineLabelSyntax, splitTextForPaths } from "../lib/filePathParsing";
 import { cn } from "../lib/cn";
@@ -298,11 +299,15 @@ function WeftHtmlInline(props: NodeComponentProps<HtmlInlineNode>) {
   return <>{renderNodeChildren(props.node.children, props, "h")}</>;
 }
 
-/** Raw HTML blocks are dropped. (Common harmless tags — <div>, <br>, <b>, … —
- *  never reach here: the parser folds them into regular paragraph/hardbreak/
- *  strong nodes first.) */
-function WeftHtmlBlock(_props: NodeComponentProps<HtmlBlockNode>) {
-  return null;
+/** Raw HTML blocks render as escaped source text — the words stay visible in
+ *  the transcript, but nothing ever mounts as live DOM (a `<script>` block is
+ *  just text here). Common harmless tags inside paragraphs — <div>, <br>,
+ *  <b>, … — never reach this: the parser folds them into regular paragraph/
+ *  hardbreak/strong nodes first. */
+function WeftHtmlBlock({ node }: NodeComponentProps<HtmlBlockNode>) {
+  const source = String(node.content ?? node.raw ?? "");
+  if (!source.trim()) return null;
+  return <div className="whitespace-pre-wrap">{source}</div>;
 }
 
 /** The blinking caret, injected into the parsed tree while streaming (see
@@ -326,57 +331,8 @@ setCustomComponents("weft", {
   infographic: WeftCodeBlock,
   html_inline: WeftHtmlInline,
   html_block: WeftHtmlBlock,
-  weft_caret: WeftCaret,
+  [WEFT_CARET_TYPE]: WeftCaret,
 } as unknown as CustomComponentMap);
-
-function caretNode(): ParsedNode {
-  return { type: "weft_caret", raw: "" } as unknown as ParsedNode;
-}
-
-/**
- * Place the caret right after the last visible content so the streaming cursor
- * hugs the text (the `nodes`-mode port of the old `caretRehype`). Descends into
- * the deepest trailing container and inserts the caret inline there; a trailing
- * leaf block (code fence, hr, image) gets the caret right after it instead.
- * Mutation is safe: every parse returns a fresh node tree.
- */
-function injectCaret(nodes: ParsedNode[]): void {
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const n = nodes[i] as ParsedNode & { children?: ParsedNode[]; content?: string };
-    if (n.type === "text" && String(n.content ?? "").trim() === "") continue;
-    if (Array.isArray(n.children) && appendCaret(n.children)) {
-      // markstream's streaming differ reuses a previous top-level node whenever
-      // type+raw+loading match — children are not inspected. The caret-bearing
-      // node must therefore not look identical to its caretless successor, or
-      // the final (caret-off) parse would keep this object and the caret would
-      // never leave the DOM.
-      n.raw = `${n.raw}​<weft-caret>`;
-      return;
-    }
-    nodes.splice(i + 1, 0, caretNode()); // leaf block → caret in its own slot after it
-    return;
-  }
-}
-
-/** Child-level worker for `injectCaret`: true when the caret landed somewhere
- *  inside `nodes`. */
-function appendCaret(nodes: ParsedNode[]): boolean {
-  for (let i = nodes.length - 1; i >= 0; i--) {
-    const n = nodes[i] as ParsedNode & { children?: ParsedNode[]; content?: string };
-    if (n.type === "text") {
-      if (String(n.content ?? "").trim() === "") continue; // skip inter-block whitespace
-      nodes.splice(i + 1, 0, caretNode());
-      return true;
-    }
-    if (Array.isArray(n.children)) {
-      if (!appendCaret(n.children)) nodes.splice(i + 1, 0, caretNode());
-      return true;
-    }
-    nodes.splice(i + 1, 0, caretNode()); // empty/void element → caret right after it
-    return true;
-  }
-  return false;
-}
 
 /**
  * Renders agent output as markdown — headings, lists, code, tables, links —
