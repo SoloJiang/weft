@@ -1602,7 +1602,7 @@ async fn rollback_canceled_send(
     ctx: &SendContext,
     queue_status: &str,
 ) {
-    let (stopped, thread_id, session_id, had_queue) = {
+    let (stopped, thread_id, session_id, drained) = {
         let mut inner = eng.lock().await;
         if !ctx.direct
             || inner.reset_epoch != ctx.reset_epoch
@@ -1616,15 +1616,25 @@ async fn rollback_canceled_send(
         inner.current_origin_tag = None;
         inner.clock.started = None;
         inner.interrupting = false;
-        let had_queue = !inner.turn.queue.is_empty();
+        // Capture EXACTLY the rows drained here: a blanket per-session sweep
+        // would also catch a concurrent send's row inserted after this lock is
+        // released — finalizing a message that is about to be delivered.
+        let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
         inner.turn.queue.clear();
-        (inner.stopped, inner.thread_id, inner.session_id, had_queue)
+        (inner.stopped, inner.thread_id, inner.session_id, drained)
     };
     let status = if stopped { STATUS_STOPPED } else { "idle" };
     persist_activity(db, ctx.session_id, ctx.thread_id, status).await;
     emit_turn_state(app, thread_id, session_id, false, Vec::new());
-    if had_queue {
-        mark_queued_status(app, db, thread_id, session_id, queue_status).await;
+    if !drained.is_empty() {
+        match repo::set_queued_status_by_ids(db, &drained, queue_status).await {
+            Ok(rows) => {
+                for m in rows {
+                    emit_finalize(app, thread_id, m.id, queue_status);
+                }
+            }
+            Err(e) => eprintln!("[weft] canceled-send queue finalize failed: {e}"),
+        }
     }
 }
 
@@ -2482,6 +2492,10 @@ async fn codex_consumer(
                 } else {
                     None
                 };
+                // Captured at dequeue, under this lock: if the flush below falls
+                // back to exec after a stop-then-restart, `stopped` is clear again
+                // but the epoch has advanced — the canceled message must not launch.
+                let dequeue_epoch = inner.reset_epoch;
                 let still_busy = inner.turn.busy;
                 persist_activity(
                     &db,
@@ -2543,7 +2557,7 @@ async fn codex_consumer(
                                     db.clone(),
                                     eng.clone(),
                                     n.clone(),
-                                    None,
+                                    Some(dequeue_epoch),
                                 )
                                 .await
                                 {
@@ -3577,11 +3591,21 @@ fn spawn_reader(
                         inner.turn_id += 1;
                         let next_turn_id = inner.turn_id;
                         let session_id = inner.session_id;
+                        // Captured at dequeue, under this lock: a stop-then-restart
+                        // before the spawned task runs clears `stopped` but bumps the
+                        // epoch, and the canceled queued message must not launch.
+                        let dequeue_epoch = inner.reset_epoch;
                         if per_turn(&inner.tool) {
                             let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                             tauri::async_runtime::spawn(async move {
-                                if let Err(err) =
-                                    spawn_turn(a.clone(), d.clone(), e.clone(), next.clone(), None).await
+                                if let Err(err) = spawn_turn(
+                                    a.clone(),
+                                    d.clone(),
+                                    e.clone(),
+                                    next.clone(),
+                                    Some(dequeue_epoch),
+                                )
+                                .await
                                 {
                                     eprintln!("[weft] queued per-turn delivery failed: {err}");
                                     rollback_failed_turn(&a, &d, &e, next_turn_id).await;
@@ -3698,10 +3722,19 @@ fn spawn_reader(
                 let next_turn_id = inner.turn_id;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
+                // Captured at dequeue, under this lock — see the per-turn drain
+                // above: stop-then-restart must not launch a canceled message.
+                let dequeue_epoch = inner.reset_epoch;
                 let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                 tauri::async_runtime::spawn(async move {
-                    if let Err(err) =
-                        spawn_turn(a.clone(), d.clone(), e.clone(), next.clone(), None).await
+                    if let Err(err) = spawn_turn(
+                        a.clone(),
+                        d.clone(),
+                        e.clone(),
+                        next.clone(),
+                        Some(dequeue_epoch),
+                    )
+                    .await
                     {
                         eprintln!("[weft] queued per-turn delivery failed: {err}");
                         rollback_failed_turn(&a, &d, &e, next_turn_id).await;

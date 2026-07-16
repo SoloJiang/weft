@@ -2042,6 +2042,31 @@ pub async fn set_queued_status(
     update_all_queued_status(db, thread_id, session_id, status).await
 }
 
+/// Flip the given rows to `status` — only those still `queued`. By-id variant of
+/// [`set_queued_status`] for callers that must finalize ONLY the rows they
+/// drained: a blanket per-session sweep could catch a CONCURRENT send's row,
+/// inserted after the caller released the engine lock, and finalize a message
+/// that is about to be delivered.
+pub async fn set_queued_status_by_ids(
+    db: &Db,
+    ids: &[i32],
+    status: &str,
+) -> Result<Vec<lead_message::Model>> {
+    let mut updated = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(m) = lead_message::Entity::find_by_id(*id).one(&db.0).await? else {
+            continue;
+        };
+        if m.status != "queued" {
+            continue;
+        }
+        let mut a: lead_message::ActiveModel = m.into();
+        a.status = Set(status.to_string());
+        updated.push(a.update(&db.0).await?);
+    }
+    Ok(updated)
+}
+
 fn queued_query(thread_id: i32, session_id: Option<i32>) -> sea_orm::Select<lead_message::Entity> {
     let q = lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))

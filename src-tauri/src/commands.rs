@@ -1203,22 +1203,22 @@ pub async fn delete_thread(
     db: State<'_, Db>,
     thread_id: i32,
 ) -> R<()> {
-    // Collect the engine keys (lead + every worker session) BEFORE the cascade
-    // deletes the session rows — afterwards the worker sessions are gone and their
-    // engines become unreachable, so their child processes would keep running
-    // while cleanup_worktrees pulls the worktrees out from under them.
+    // Collect the engine keys (lead + every worker session) from the live session
+    // rows, then stop every engine BEFORE the cascade: stop() persists status, and
+    // set_lead_status's missing-meta path INSERTS a meta lead_message — stopping
+    // after the cascade would write orphan timeline rows for the deleted thread.
+    // (The cascade also deletes the session rows that make workers discoverable,
+    // which is why the keys must be collected first.)
     let keys = thread_engine_keys(&db, thread_id).await?;
-    let removed = repo::delete_thread_cascade(&db, thread_id)
-        .await
-        .map_err(e)?;
-    // Stop and drop every resident engine for this thread — the lead AND its
-    // workers — so the deletion doesn't leak child processes or background tasks.
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(key) {
             crate::lead_chat::engine::stop(&app, &eng).await;
         }
     }
+    let removed = repo::delete_thread_cascade(&db, thread_id)
+        .await
+        .map_err(e)?;
     materialize::cleanup_worktrees(&db, &removed)
         .await
         .map_err(e)

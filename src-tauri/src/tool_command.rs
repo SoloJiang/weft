@@ -69,12 +69,11 @@ fn validate_override(cmd: &str) -> Result<(), String> {
 }
 
 /// Reject commands that are clearly not bare PATH-resolved binary names.
-/// Allows typical aliases like `cc-claude` but forbids absolute/relative paths,
-/// shell metacharacters, and whitespace that could switch to a different command.
-/// This is the PIN-strict variant: per-session pins are historical snapshots, so
-/// a legacy absolute-path pin falls back to the CONFIGURED command (see
-/// `effective`) instead of resurrecting a stale location; live overrides accept
-/// absolute paths via [`validate_override`].
+/// Allows typical aliases like `cc-claude` but forbids relative paths, shell
+/// metacharacters, and whitespace that could switch to a different command.
+/// This is the non-absolute branch of [`validate_override`] — absolute paths are
+/// accepted there, for overrides AND pins alike: a pin freezes the exact command
+/// a session was using, which may legitimately be an absolute executable path.
 fn validate_command(cmd: &str) -> Result<(), String> {
     if cmd.is_empty() {
         return Err("command cannot be empty".into());
@@ -120,7 +119,12 @@ pub fn effective(pin: Option<&str>, tool: &str) -> String {
         Some(p) if !p.trim().is_empty() => p.trim().to_string(),
         _ => return command_for(tool),
     };
-    if let Err(err) = validate_command(&cmd) {
+    // Pins use the SAME rules as overrides (bare name or absolute path): when a
+    // new override excludes existing sessions, the store pins each row to the
+    // command it was ALREADY using — which may be an absolute path — and that
+    // pin must keep working or those sessions get silently retargeted anyway.
+    // Garbage pins (whitespace/metacharacters/relative paths) still fall back.
+    if let Err(err) = validate_override(&cmd) {
         eprintln!("[weft][tool_command] invalid pin for {tool}: {err}; falling back to configured command");
         return command_for(tool);
     }
@@ -177,8 +181,9 @@ mod tests {
         set_overrides(HashMap::new());
         assert_eq!(command_for("claude"), "claude");
         assert_eq!(command_for("codex"), "codex");
-        // With no override configured, invalid/legacy pins fall back to the bare identity.
-        assert_eq!(effective(Some("/opt/claude"), "claude"), "claude");
+        // Absolute-path pins are honored (a pin freezes the exact command a session
+        // was using); garbage pins fall back to the identity.
+        assert_eq!(effective(Some("/opt/claude"), "claude"), "/opt/claude");
         assert_eq!(effective(Some("claude --evil"), "claude"), "claude");
 
         // A configured override is returned; unconfigured tools still fall back.
@@ -193,21 +198,21 @@ mod tests {
         // Blank/whitespace pin is ignored → falls through to the global override.
         assert_eq!(effective(Some("  "), "claude"), "cc-claude");
         assert_eq!(effective(None, "claude"), "cc-claude");
-        // Invalid/legacy pins also fall back to the configured command, not the bare identity.
-        assert_eq!(effective(Some("/opt/claude"), "claude"), "cc-claude");
+        // An absolute-path pin is honored over the override (it froze the exact
+        // command the session was already using — e.g. the PREVIOUS absolute
+        // override, pinned when the user excluded existing sessions); garbage
+        // pins still fall back to the configured command.
+        assert_eq!(effective(Some("/opt/claude"), "claude"), "/opt/claude");
         assert_eq!(effective(Some("claude --evil"), "claude"), "cc-claude");
 
-        // An ABSOLUTE-path override is honored (a GUI-launched install whose CLI
-        // is not on Weft's PATH) — while an absolute PIN still falls back to that
-        // configured command (pins are historical snapshots, overrides are the
-        // user's current intent).
+        // An ABSOLUTE-path override is honored too (a GUI-launched install whose
+        // CLI is not on Weft's PATH).
         set_overrides(HashMap::from([(
             "claude".to_string(),
             "/opt/homebrew/bin/claude".to_string(),
         )]));
         assert_eq!(command_for("claude"), "/opt/homebrew/bin/claude");
         assert_eq!(effective(None, "claude"), "/opt/homebrew/bin/claude");
-        assert_eq!(effective(Some("/opt/claude"), "claude"), "/opt/homebrew/bin/claude");
 
         set_overrides(HashMap::new()); // leave the global map clean
     }
