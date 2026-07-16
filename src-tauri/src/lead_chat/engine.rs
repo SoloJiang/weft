@@ -2070,11 +2070,20 @@ pub async fn send(
                     // lock, exactly like a direct resident send.
                     if let Err(e) = write_user(&mut inner, &out).await {
                         // Still under the lock, so the promotion is provably ours
-                        // to undo inline.
+                        // to undo inline. (The promoted id has no persisted row —
+                        // the queued row keeps its original turn — so rewinding
+                        // the counter is safe here.)
                         inner.turn.busy = false;
                         inner.turn_id -= 1;
                         inner.current_origin_tag = None;
                         inner.clock.started = None;
+                        // The promotion persisted "running" above; put the DB and
+                        // the UI back to idle UNDER this same lock (the ordering
+                        // rule every rollback follows), or live counts and
+                        // boot-revive would treat this non-running session as
+                        // active after a dead resident stdin.
+                        persist_activity(db, inner.session_id, inner.thread_id, "idle").await;
+                        emit_turn_state(app, inner.thread_id, inner.session_id, false, Vec::new());
                         drop(inner);
                         let _ = repo::update_lead_message(db, row_id, &content, "error").await;
                         emit_finalize(app, ctx.thread_id, row_id, "error");
@@ -2253,8 +2262,17 @@ async fn spawn_codex_turn(
     // starting a turn the user canceled. (The early snapshot check only covers
     // stops that happened before the connect.)
     let stop_won = {
-        let g = eng.lock().await;
-        g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch)
+        // Check AND publish under ONE lock acquisition: a stop landing between a
+        // separate check and a later publish would register a client for a turn
+        // the user just canceled. Once published atomically here, a later stop
+        // reaches the client through the registry (stop_quiet takes it and shuts
+        // it down, failing start_turn below) — that is the designed teardown.
+        let mut g = eng.lock().await;
+        let won = g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        if !won && freshly_connected {
+            g.codex_client = Some(client.clone());
+        }
+        won
     };
     if stop_won {
         // Never touch the registry here: a restarted send may have published a
@@ -2268,11 +2286,6 @@ async fn spawn_codex_turn(
         return Err(anyhow::anyhow!(
             "engine stopped during codex app-server connect"
         ));
-    }
-    // The turn is still valid: NOW it is safe to publish the fresh connection for
-    // reuse by later sends and the stop path.
-    if freshly_connected {
-        eng.lock().await.codex_client = Some(client.clone());
     }
     // codex has no thread/start system-prompt field, so (like the exec adapter)
     // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed

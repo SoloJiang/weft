@@ -470,7 +470,10 @@ pub enum ThreadMsg {
 struct Inner {
     /// Channel to the dedicated stdin writer task. Holds no `ChildStdin` directly,
     /// so async writes never need the state lock.
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    // Each entry is (bytes, optional flush-ack): the writer task acks AFTER
+    // write_all + flush succeed, so request() can arm its reply timeout only once
+    // the bytes actually reached the child's stdin (see `request`).
+    write_tx: mpsc::UnboundedSender<(Vec<u8>, Option<oneshot::Sender<()>>)>,
     next_id: i64,
     /// our request id → awaiting caller (Ok(result) / Err(message)).
     pending: HashMap<i64, oneshot::Sender<Result<Value, String>>>,
@@ -550,7 +553,7 @@ impl Client {
                 let g = self.0.lock().await;
                 if let Some(inner) = g.as_ref() {
                     let line = encode_error_response(id, -32601, "unsupported request");
-                    let _ = inner.write_tx.send(line.into_bytes());
+                    let _ = inner.write_tx.send((line.into_bytes(), None));
                 }
             }
         }
@@ -629,7 +632,8 @@ impl Client {
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
 
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (write_tx, mut write_rx) =
+            mpsc::unbounded_channel::<(Vec<u8>, Option<oneshot::Sender<()>>)>();
         let client_for_writer = self.clone();
         tauri::async_runtime::spawn(async move {
             let mut stdin = stdin;
@@ -638,7 +642,7 @@ impl Client {
                     .fail_pending_and_reap("codex app-server stdin writer failed")
                     .await;
             };
-            while let Some(bytes) = write_rx.recv().await {
+            while let Some((bytes, ack)) = write_rx.recv().await {
                 if stdin.write_all(&bytes).await.is_err() {
                     fail().await;
                     break;
@@ -646,6 +650,11 @@ impl Client {
                 if stdin.flush().await.is_err() {
                     fail().await;
                     break;
+                }
+                // Ack only after write_all + flush both succeeded; a failed write
+                // drops the ack sender, which request() observes as an error.
+                if let Some(a) = ack {
+                    let _ = a.send(());
                 }
             }
         });
@@ -785,7 +794,7 @@ impl Client {
     /// Send a request and await its reply (`result` on success, `error.message`
     /// on failure), with a hard timeout so a wedged server can't hang a caller.
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let (id, rx) = {
+        let (id, rx, flushed) = {
             let mut g = self.0.lock().await;
             let inner = g
                 .as_mut()
@@ -794,13 +803,32 @@ impl Client {
             inner.next_id += 1;
             let (tx, rx) = oneshot::channel();
             inner.pending.insert(id, tx);
+            let (flush_tx, flush_rx) = oneshot::channel();
             let line = encode_request(id, method, params);
             inner
                 .write_tx
-                .send(line.into_bytes())
+                .send((line.into_bytes(), Some(flush_tx)))
                 .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
-            (id, rx)
+            (id, rx, flush_rx)
         };
+        // Arm the reply timeout only AFTER the bytes actually flushed to the
+        // child's stdin: with the background writer, enqueue-then-time would let a
+        // blocked writer burn the whole budget and a "timed out" side-effecting
+        // call (turn/start) be delivered LATE — starting a duplicate, uncancelable
+        // turn after the caller already fell back. A flush that cannot complete
+        // within the same budget means the connection is factually dead: reap it
+        // so the queued bytes die with the process instead of firing later.
+        match tokio::time::timeout(Duration::from_secs(60), flushed).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                anyhow::bail!("codex app-server {method}: writer closed before flush")
+            }
+            Err(_) => {
+                self.fail_pending_and_reap("codex app-server stdin flush stalled")
+                    .await;
+                anyhow::bail!("codex app-server {method}: stdin flush stalled")
+            }
+        }
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => anyhow::bail!("codex app-server {method}: {e}"),
@@ -823,7 +851,7 @@ impl Client {
         let line = encode_notification(method, params);
         inner
             .write_tx
-            .send(line.into_bytes())
+            .send((line.into_bytes(), None))
             .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
@@ -910,7 +938,7 @@ impl Client {
         let line = encode_response(id, result);
         inner
             .write_tx
-            .send(line.into_bytes())
+            .send((line.into_bytes(), None))
             .map_err(|_| anyhow::anyhow!("codex app-server writer closed"))?;
         Ok(())
     }
