@@ -601,6 +601,39 @@ async fn spawn_failure_status(eng: &EngineRef, ctx: &SendContext) -> &'static st
     }
 }
 
+/// The drain-shaped sibling of [`spawn_failure_status`]: rollback status for a
+/// DEQUEUED delivery that failed — "interrupted" when the stop/interrupt/epoch
+/// guard canceled it (the user's cancel), "error" for a genuine failure.
+async fn drain_failure_status(eng: &EngineRef, dequeue_epoch: u64) -> &'static str {
+    let g = eng.lock().await;
+    if g.stopped || g.interrupting || g.reset_epoch != dequeue_epoch {
+        "interrupted"
+    } else {
+        "error"
+    }
+}
+
+/// A dequeued (popped) message is no longer in the in-memory queue, so a
+/// rollback's drained-ids sweep cannot see its row — finalize it explicitly, or
+/// a canceled/failed dequeued message stays `queued` in the DB forever.
+async fn finalize_dequeued_row(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    out: &Outgoing,
+    status: &str,
+) {
+    let Some(id) = out.queue_id else { return };
+    match repo::set_queued_status_by_ids(db, &[id], status).await {
+        Ok(rows) => {
+            for m in rows {
+                emit_finalize(app, thread_id, m.id, status);
+            }
+        }
+        Err(e) => eprintln!("[weft] dequeued row finalize failed: {e}"),
+    }
+}
+
 /// Finalize tool rows still awaiting a result, marking each `status` and pushing
 /// the update. Called wherever a turn ends — clean TurnEnd, stop/takeover,
 /// runaway kill, or process EOF — so a `tool_use` whose `tool_result` never
@@ -2668,6 +2701,12 @@ async fn codex_consumer(
                     if let Some(turn_id) = next_turn_id {
                         rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
                     }
+                    // The popped message is no longer in the in-memory queue, so
+                    // the rollback's drained sweep can't see its row — finalize it
+                    // explicitly or it stays `queued` forever.
+                    if let Some(n) = next.as_ref() {
+                        finalize_dequeued_row(&app, &db, thread_id, n, "interrupted").await;
+                    }
                 } else if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
                     match client.start_turn(&thread, &n.text).await {
                         Ok(t) => {
@@ -2688,6 +2727,8 @@ async fn codex_consumer(
                             // interrupted instead of resurrecting it on exec.
                             if eng.lock().await.interrupting {
                                 rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
+                                finalize_dequeued_row(&app, &db, thread_id, &n, "interrupted")
+                                    .await;
                             } else {
                                 eprintln!(
                                     "[weft][codex] flush via app-server failed ({e}); trying exec"
@@ -2715,7 +2756,14 @@ async fn codex_consumer(
                                     }
                                     Err(e2) => {
                                         eprintln!("[weft][codex] exec fallback for queued turn failed: {e2}");
-                                        rollback_failed_turn(&app, &db, &eng, turn_id, "error").await;
+                                        // The guard inside spawn_turn may have canceled
+                                        // (stop/interrupt/epoch) rather than failed.
+                                        let status =
+                                            drain_failure_status(&eng, dequeue_epoch).await;
+                                        rollback_failed_turn(&app, &db, &eng, turn_id, status)
+                                            .await;
+                                        finalize_dequeued_row(&app, &db, thread_id, &n, status)
+                                            .await;
                                     }
                                 }
                             }
@@ -3772,7 +3820,12 @@ fn spawn_reader(
                                 .await
                                 {
                                     eprintln!("[weft] queued per-turn delivery failed: {err}");
-                                    rollback_failed_turn(&a, &d, &e, next_turn_id, "error").await;
+                                    // The spawn guard may have CANCELED (stop/interrupt/
+                                    // epoch) rather than failed; and the popped row is
+                                    // no longer in the queue for the rollback to sweep.
+                                    let status = drain_failure_status(&e, dequeue_epoch).await;
+                                    rollback_failed_turn(&a, &d, &e, next_turn_id, status).await;
+                                    finalize_dequeued_row(&a, &d, thread_id, &next, status).await;
                                 } else {
                                     mark_queued_delivered(&a, &d, thread_id, session_id, &next)
                                         .await;
@@ -3782,7 +3835,12 @@ fn spawn_reader(
                             if let Err(e) = write_user(&mut inner, &next).await {
                                 eprintln!("[weft] queued resident delivery failed: {e}");
                                 drop(inner);
-                                rollback_failed_turn(&app, &db, &eng, next_turn_id, "error").await;
+                                // A stop may have closed this stdin (cancel, not
+                                // failure); and the popped row is no longer in the
+                                // queue for the rollback to sweep.
+                                let status = drain_failure_status(&eng, dequeue_epoch).await;
+                                rollback_failed_turn(&app, &db, &eng, next_turn_id, status).await;
+                                finalize_dequeued_row(&app, &db, thread_id, &next, status).await;
                                 return;
                             } else {
                                 mark_queued_delivered(&app, &db, thread_id, session_id, &next)
@@ -3901,7 +3959,12 @@ fn spawn_reader(
                     .await
                     {
                         eprintln!("[weft] queued per-turn delivery failed: {err}");
-                        rollback_failed_turn(&a, &d, &e, next_turn_id, "error").await;
+                        // The spawn guard may have CANCELED (stop/interrupt/epoch)
+                        // rather than failed; and the popped row is no longer in
+                        // the queue for the rollback to sweep.
+                        let status = drain_failure_status(&e, dequeue_epoch).await;
+                        rollback_failed_turn(&a, &d, &e, next_turn_id, status).await;
+                        finalize_dequeued_row(&a, &d, thread_id, &next, status).await;
                     } else {
                         mark_queued_delivered(&a, &d, thread_id, session_id, &next).await;
                     }
