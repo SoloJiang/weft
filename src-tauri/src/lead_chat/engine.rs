@@ -1650,7 +1650,13 @@ fn send_reservation_valid(inner: &EngineInner, ctx: &SendContext) -> bool {
     if ctx.direct {
         inner.turn_id == ctx.turn && inner.turn.busy
     } else {
-        true
+        // Queued sends don't own the busy flag and tolerate the active turn
+        // ADVANCING (a new turn started) while the lock was dropped. But if the
+        // turn ENDED during Phase 2 — the engine is now idle — appending would
+        // strand the message, because nothing drains an idle queue (on_turn_end
+        // only fires at a turn's end). Treat idle as invalid so the caller
+        // finalizes the row instead of silently queueing it on a drained turn.
+        inner.turn.busy
     }
 }
 
@@ -1888,7 +1894,9 @@ pub async fn send(
             drop(inner);
             let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
             emit_finalize(app, ctx.thread_id, row_id, "interrupted");
-            return Err(anyhow::anyhow!("engine stopped before send could complete"));
+            return Err(anyhow::anyhow!(
+                "send could not be delivered: the turn ended or the engine stopped while it was persisting"
+            ));
         }
         if ctx.direct && !spawn_now && !is_codex_appserver {
             if let Err(e) = write_user(&mut inner, &out).await {
@@ -1919,7 +1927,21 @@ pub async fn send(
         );
     }
 
-    // Phase 4: turn spawning runs without the engine lock.
+    // Phase 4: turn spawning runs without the engine lock. A stop can still race
+    // in the window between Phase 3's lock-drop and the spawn below; re-check the
+    // reservation right before dispatching so a stopped/reset engine never gets a
+    // fresh child. (The resident-write path above is already guarded inside the
+    // Phase 3 lock.)
+    if spawn_now || (ctx.direct && is_codex_appserver) {
+        let valid = {
+            let inner = eng.lock().await;
+            send_reservation_valid(&inner, &ctx)
+        };
+        if !valid {
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
+            return Err(anyhow::anyhow!("engine stopped before the turn could spawn"));
+        }
+    }
     if spawn_now {
         if let Err(e) = spawn_turn(app.clone(), db.clone(), eng.clone(), out).await {
             rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content).await;
@@ -4189,15 +4211,22 @@ mod tests {
         assert!(!send_reservation_valid(&inner, &direct_ctx));
         inner.turn.busy = true;
 
-        // Queued sends don't own busy and tolerate the active turn advancing
-        // while the lock was dropped; only a stop invalidates them.
+        // Queued sends don't own the busy flag and tolerate the active turn
+        // ADVANCING (a new turn started) while the lock was dropped — as long as
+        // the engine is still busy.
         let queued_ctx = SendContext {
             direct: false,
             ..direct_ctx
         };
+        assert!(send_reservation_valid(&inner, &queued_ctx)); // busy = true
+        inner.turn_id = 6; // active turn advanced, still busy → tolerated
         assert!(send_reservation_valid(&inner, &queued_ctx));
-        inner.turn_id = 6;
-        assert!(send_reservation_valid(&inner, &queued_ctx));
+        // But if the turn ENDED (engine idle) in that window, queueing would strand
+        // the message — nothing drains an idle queue — so the reservation is invalid.
+        inner.turn.busy = false;
+        assert!(!send_reservation_valid(&inner, &queued_ctx));
+        inner.turn.busy = true;
+        // An explicit stop also invalidates a queued reservation.
         inner.stopped = true;
         assert!(!send_reservation_valid(&inner, &queued_ctx));
     }
