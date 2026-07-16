@@ -9,6 +9,7 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
+import { createDeltaCoalescer } from "./deltaCoalescer";
 import i18n, { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
@@ -1313,8 +1314,41 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const lastWorkerTurnRef = useRef<Record<number, string>>({});
 
   useEffect(() => {
+    // The engine forwards every raw token chunk as its own `delta` push;
+    // applying each one directly re-renders the transcript (and re-parses the
+    // streaming message's markdown) per chunk. Deltas therefore buffer and
+    // land as ONE state update per animation frame.
+    const deltas = createDeltaCoalescer((batch) => {
+      setLeadMessages((m) => {
+        let next = m;
+        for (const { threadId, messageId, text } of batch) {
+          next = {
+            ...next,
+            [threadId]: (next[threadId] ?? []).map((x) => {
+              if (x.id !== messageId) return x;
+              let existing = "";
+              try {
+                existing = (JSON.parse(x.content).text as string) ?? "";
+              } catch {
+                /* fresh row */
+              }
+              return { ...x, content: JSON.stringify({ text: existing + text }) };
+            }),
+          };
+        }
+        return next;
+      });
+    });
     const un = listen<LeadChatPush>("lead-chat", (e) => {
       const p = e.payload;
+      if (p.type === "delta") {
+        deltas.push(p.thread_id, p.message_id, p.text);
+        return;
+      }
+      // Every other push may depend on (finalize replaces the streamed body)
+      // or order against (tool rows) the streamed text — pending appends land
+      // first so events apply in arrival order, exactly as before coalescing.
+      deltas.flushNow();
       if (p.type === "message") {
         setLeadMessages((m) => {
           const list = m[p.thread_id] ?? [];
@@ -1342,20 +1376,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             })
             .catch(() => {});
         }
-      } else if (p.type === "delta") {
-        setLeadMessages((m) => ({
-          ...m,
-          [p.thread_id]: (m[p.thread_id] ?? []).map((x) => {
-            if (x.id !== p.message_id) return x;
-            let text = "";
-            try {
-              text = (JSON.parse(x.content).text as string) ?? "";
-            } catch {
-              /* fresh row */
-            }
-            return { ...x, content: JSON.stringify({ text: text + p.text }) };
-          }),
-        }));
       } else if (p.type === "finalize") {
         setLeadMessages((m) => ({
           ...m,
@@ -1478,6 +1498,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
     });
     return () => {
+      deltas.flushNow();
       void un.then((f) => f());
     };
   }, []);
