@@ -2246,7 +2246,7 @@ async fn spawn_codex_turn(
                 // would leak the app-server child (reader/writer tasks hold
                 // clones) alive alongside the exec fallback. Shut it down.
                 if freshly_connected {
-                    client.shutdown().await;
+                    client.shutdown_and_reap().await;
                 }
                 return Err(e);
             }
@@ -2294,7 +2294,7 @@ async fn spawn_codex_turn(
         // connection THIS task made; a reused registered client was already shut
         // down by the stop itself (stop_quiet takes it).
         if freshly_connected {
-            client.shutdown().await;
+            client.shutdown_and_reap().await;
         }
         return Err(anyhow::anyhow!(
             "engine stopped during codex app-server connect"
