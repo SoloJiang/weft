@@ -1577,33 +1577,55 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
 /// or decrement the turn id of THAT turn, canceling or corrupting it. A leaked
 /// increment on our abandoned id is harmless (turn ids are monotonic); a wrong
 /// decrement is not.
-/// Returns true when the reservation was actually undone (the caller may then
-/// need to re-persist the session activity Phase 1 optimistically set to
-/// "running").
-async fn rollback_send_reservation(eng: &EngineRef, ctx: &SendContext) -> bool {
-    if !ctx.direct {
-        return false;
-    }
-    let mut inner = eng.lock().await;
-    if inner.reset_epoch != ctx.reset_epoch || inner.turn_id != ctx.turn || !inner.turn.busy {
-        return false;
-    }
-    inner.turn.busy = false;
-    inner.turn_id -= 1;
-    inner.current_origin_tag = None;
-    inner.clock.started = None;
-    true
-}
-
-/// After [`rollback_send_reservation`] undid a direct reservation, re-persist the
-/// session activity that Phase 1 optimistically wrote as "running": the engine is
-/// idle again — or was stopped all along (a stop can land between
-/// ensure_running_for_send and Phase 1, and its unlocked "stopped" write can be
-/// overtaken by Phase 1's locked "running" write).
-async fn repersist_rolled_back_activity(db: &Db, eng: &EngineRef, ctx: &SendContext) {
-    let stopped = eng.lock().await.stopped;
+/// Undo a canceled direct send's Phase-1 reservation and restore the engine's
+/// invariants — ownership-guarded: `reset_epoch` + `turn_id` + `busy` must all
+/// still match this send, else a stop/reset cleared the turn itself or a newer
+/// reservation owns the state, and this no-ops.
+///
+/// When it does undo, three invariants are restored, not just the busy flag:
+/// - `interrupting` is cleared: the interrupt that canceled this send targeted
+///   OUR nascent turn, and for per-turn/codex paths no child or TurnEnd will
+///   ever exist to clear the flag — leaving it set would reject every later
+///   direct send until restart.
+/// - messages that queued behind the canceled turn are cleared and finalized
+///   `queue_status` ("interrupted" for a cancel, "error" for a persistence
+///   failure): an idle engine must never keep a non-empty queue — nothing
+///   drains it, and a later send would run ahead of it.
+/// - the session activity Phase 1 optimistically persisted as "running" is
+///   re-persisted ("stopped"/"idle" per current state): a stop landing between
+///   ensure_running_for_send and Phase 1 has its unlocked "stopped" write
+///   overtaken by Phase 1's locked "running" write.
+async fn rollback_canceled_send(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    ctx: &SendContext,
+    queue_status: &str,
+) {
+    let (stopped, thread_id, session_id, had_queue) = {
+        let mut inner = eng.lock().await;
+        if !ctx.direct
+            || inner.reset_epoch != ctx.reset_epoch
+            || inner.turn_id != ctx.turn
+            || !inner.turn.busy
+        {
+            return;
+        }
+        inner.turn.busy = false;
+        inner.turn_id -= 1;
+        inner.current_origin_tag = None;
+        inner.clock.started = None;
+        inner.interrupting = false;
+        let had_queue = !inner.turn.queue.is_empty();
+        inner.turn.queue.clear();
+        (inner.stopped, inner.thread_id, inner.session_id, had_queue)
+    };
     let status = if stopped { STATUS_STOPPED } else { "idle" };
     persist_activity(db, ctx.session_id, ctx.thread_id, status).await;
+    emit_turn_state(app, thread_id, session_id, false, Vec::new());
+    if had_queue {
+        mark_queued_status(app, db, thread_id, session_id, queue_status).await;
+    }
 }
 
 pub(crate) async fn write_user(inner: &mut EngineInner, out: &Outgoing) -> anyhow::Result<()> {
@@ -1886,11 +1908,10 @@ pub async fn send(
     {
         Ok(m) => m,
         Err(e) => {
-            // Phase 1 already reserved turn state; undo it so the session isn't
-            // left with a stuck busy flag or an orphaned turn id.
-            if rollback_send_reservation(eng, &ctx).await {
-                repersist_rolled_back_activity(db, eng, &ctx).await;
-            }
+            // Phase 1 already reserved turn state; undo it (and restore the
+            // engine invariants — activity, queue, interrupt flag) so the
+            // session isn't left with a stuck busy flag or an orphaned turn id.
+            rollback_canceled_send(app, db, eng, &ctx, "error").await;
             return Err(e.into());
         }
     };
@@ -1958,16 +1979,13 @@ pub async fn send(
         // to a dead stdin, queueing on a drained turn, or spawning after stop.
         if !send_reservation_valid(&inner, &ctx) {
             drop(inner);
-            // A stop can land between ensure_running_for_send and Phase 1, so
-            // Phase 1 reserved busy/turn_id on an already-stopped engine — leaving
-            // that reservation in place would queue every later send behind a turn
-            // nothing will ever drain. The rollback is ownership-guarded (a
-            // stop/reset that cleared the turn itself, or a newer reservation,
-            // makes it a no-op), and when it does undo, the activity Phase 1
-            // persisted as "running" is re-persisted to reflect reality.
-            if rollback_send_reservation(eng, &ctx).await {
-                repersist_rolled_back_activity(db, eng, &ctx).await;
-            }
+            // A stop/interrupt can land between ensure_running_for_send and
+            // Phase 3, leaving Phase 1's reservation on an engine that will
+            // never run it. Undo it and restore the invariants (busy, activity,
+            // interrupt flag, anything queued behind the canceled turn) — the
+            // rollback is ownership-guarded, so if a stop/reset cleared the turn
+            // itself or a newer reservation owns the state, it no-ops.
+            rollback_canceled_send(app, db, eng, &ctx, "interrupted").await;
             let _ = repo::update_lead_message(db, row_id, &content, "interrupted").await;
             emit_finalize(app, ctx.thread_id, row_id, "interrupted");
             return Err(anyhow::anyhow!(

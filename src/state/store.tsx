@@ -354,6 +354,16 @@ export const useStore = () => {
 // readable main); below it the surfaces can't coexist, hence the raised floor.
 const NAV_AUTOCOLLAPSE_BELOW = 1000;
 
+/** Adoption-time session status: ONE pure derivation reconciling a possibly
+ * raced turn push (the lead-chat listener may have recorded idle/stopped before
+ * this adoption ran) with the slot's busy flag — per the discriminated-state
+ * rule, instead of a mutable `let` reassigned across `if`/`else`. */
+function adoptionStatus(turnState: string | undefined, busy: boolean): SessionStatus {
+  if (turnState === "stopped") return "exited";
+  if (turnState !== "idle" && busy) return "running";
+  return "idle";
+}
+
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<number | null>(null);
@@ -1110,13 +1120,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // Reconcile status with any turn state the lead-chat listener already recorded:
     // if the worker's idle push raced in before this adoption, the live slot still
     // says busy, but the dot/live-counts must show idle (not stuck "running").
-    const ts = workerTurnRef.current[sid]?.state;
-    let status: SessionStatus = "idle";
-    if (ts === "stopped") {
-      status = "exited";
-    } else if (ts !== "idle" && slot.busy) {
-      status = "running";
-    }
+    const status = adoptionStatus(workerTurnRef.current[sid]?.state, slot.busy);
     setSessions((m) =>
       m[sid]
         ? m

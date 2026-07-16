@@ -56,7 +56,10 @@ pub fn set_overrides(map: HashMap<String, String>) {
 /// only control characters are rejected. Relative paths stay rejected: they'd
 /// resolve against whichever cwd a session happens to spawn in.
 fn validate_override(cmd: &str) -> Result<(), String> {
-    if cmd.starts_with('/') {
+    // Platform-aware absolute-path detection: `/…` on unix, drive-letter and UNC
+    // paths (`C:\…`, `\\server\…`) on Windows — Path::is_absolute knows both, so
+    // Windows users can configure absolute CLI paths too.
+    if std::path::Path::new(cmd).is_absolute() {
         if cmd.chars().any(|c| c.is_control()) {
             return Err("command path cannot contain control characters".into());
         }
