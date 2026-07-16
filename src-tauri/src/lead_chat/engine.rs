@@ -371,11 +371,17 @@ fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
     inner.turn_id
 }
 
-fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> bool {
+/// Returns `None` when the turn isn't ours to reset (id advanced / not busy);
+/// `Some(drained)` — the queue_ids of the still-queued rows cleared here — when
+/// it reset. The caller finalizes EXACTLY those rows: a session-wide queued
+/// sweep after the lock drops could catch a concurrent send's row inserted
+/// meanwhile and fail a message that is about to be delivered.
+fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec<i32>> {
     if inner.turn_id != turn_id || !inner.turn.busy {
-        return false;
+        return None;
     }
     inner.turn.busy = false;
+    let drained: Vec<i32> = inner.turn.queue.iter().filter_map(|o| o.queue_id).collect();
     inner.turn.queue.clear();
     inner.clock.started = None;
     inner.current_origin_tag = None;
@@ -383,7 +389,7 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> bool {
     inner.stdin = None;
     inner.current = None;
     inner.interrupting = false;
-    true
+    Some(drained)
 }
 
 fn emit_finalize(app: &AppHandle, thread_id: i32, message_id: i32, status: &str) {
@@ -487,10 +493,6 @@ async fn mark_queued_status(
     }
 }
 
-async fn mark_queued_failed(app: &AppHandle, db: &Db, thread_id: i32, session_id: Option<i32>) {
-    mark_queued_status(app, db, thread_id, session_id, "error").await;
-}
-
 fn emit_turn_state(
     app: &AppHandle,
     thread_id: i32,
@@ -538,15 +540,28 @@ fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing
 
 async fn rollback_failed_turn(app: &AppHandle, db: &Db, eng: &EngineRef, turn_id: i32) {
     let mut inner = eng.lock().await;
-    if !reset_failed_hidden_turn(&mut inner, turn_id) {
+    let Some(drained) = reset_failed_hidden_turn(&mut inner, turn_id) else {
         return;
-    }
+    };
     let thread_id = inner.thread_id;
     let session_id = inner.session_id;
     persist_activity(db, session_id, thread_id, "idle").await;
     emit_turn_state(app, thread_id, session_id, false, Vec::new());
     drop(inner);
-    mark_queued_failed(app, db, thread_id, session_id).await;
+    // Finalize EXACTLY the rows drained under the lock (same rule as
+    // rollback_canceled_send): a session-wide sweep here could catch a
+    // concurrent send's freshly inserted queued row and fail a message that is
+    // about to be delivered.
+    if !drained.is_empty() {
+        match repo::set_queued_status_by_ids(db, &drained, "error").await {
+            Ok(rows) => {
+                for m in rows {
+                    emit_finalize(app, thread_id, m.id, "error");
+                }
+            }
+            Err(e) => eprintln!("[weft] failed-turn queue finalize failed: {e}"),
+        }
+    }
 }
 
 async fn rollback_failed_visible_turn(
@@ -1614,7 +1629,7 @@ async fn rollback_canceled_send(
     // failure (no row), so the counter rewinds.
     row_persisted: bool,
 ) {
-    let (thread_id, session_id, drained) = {
+    let (thread_id, drained) = {
         let mut inner = eng.lock().await;
         if !ctx.direct
             || inner.reset_epoch != ctx.reset_epoch
@@ -1649,7 +1664,7 @@ async fn rollback_canceled_send(
         let status = if inner.stopped { STATUS_STOPPED } else { "idle" };
         persist_activity(db, inner.session_id, inner.thread_id, status).await;
         emit_turn_state(app, inner.thread_id, inner.session_id, false, Vec::new());
-        (inner.thread_id, inner.session_id, drained)
+        (inner.thread_id, drained)
     };
     if !drained.is_empty() {
         match repo::set_queued_status_by_ids(db, &drained, queue_status).await {
@@ -2190,10 +2205,12 @@ async fn spawn_codex_turn(
         // Atomic with the snapshot: don't start a codex turn for a stopped engine
         // (a stop racing the send's Phase-3-to-spawn window, which is widest on the
         // app-server path because connection/start awaits happen after this) — nor
-        // for a send whose reservation epoch a stop-then-restart invalidated. The
-        // caller rolls back or falls through — and the exec fallback (spawn_turn)
-        // makes the same check — so returning here is safe.
-        if i.stopped || expected_epoch.is_some_and(|e| e != i.reset_epoch) {
+        // for a send whose reservation epoch a stop-then-restart invalidated, nor
+        // when an interrupt is in flight (no child exists for it to kill in this
+        // window; spawning would run the canceled turn). The caller rolls back or
+        // falls through — and the exec fallback (spawn_turn) makes the same check
+        // — so returning here is safe.
+        if i.stopped || i.interrupting || expected_epoch.is_some_and(|e| e != i.reset_epoch) {
             return Err(anyhow::anyhow!("engine stopped; not starting a codex turn"));
         }
         (
@@ -2825,9 +2842,13 @@ async fn spawn_turn(
     // or a queued turn drained just as the human stopped. Send-originated spawns
     // also pass their reservation's reset_epoch: a stop-THEN-RESTART clears
     // `stopped` again, but bumps the epoch, so the canceled send still can't
-    // launch a child onto the restarted engine. Every caller already rolls back
-    // or propagates a spawn error, so returning here is safe.
-    if inner.stopped || expected_epoch.is_some_and(|e| e != inner.reset_epoch) {
+    // launch a child onto the restarted engine. `interrupting` is checked too:
+    // an interrupt landing in this window has no child to kill — it only sets
+    // the flag — and spawning anyway would run the very turn the user canceled.
+    // Every caller already rolls back or propagates a spawn error, so returning
+    // here is safe.
+    if inner.stopped || inner.interrupting || expected_epoch.is_some_and(|e| e != inner.reset_epoch)
+    {
         return Err(anyhow::anyhow!("engine stopped; not spawning a turn"));
     }
     // Per-turn argv (incl. codex's message-on-argv and opencode's /cmd→--command
@@ -4470,7 +4491,7 @@ mod tests {
         });
         let turn_id = mark_hidden_turn_started(&mut inner);
 
-        assert!(reset_failed_hidden_turn(&mut inner, turn_id));
+        assert!(reset_failed_hidden_turn(&mut inner, turn_id).is_some());
 
         assert!(!inner.turn.busy);
         assert!(inner.turn.queue.is_empty());
@@ -4486,7 +4507,7 @@ mod tests {
         let old_turn = mark_hidden_turn_started(&mut inner);
         inner.turn_id += 1;
 
-        assert!(!reset_failed_hidden_turn(&mut inner, old_turn));
+        assert!(reset_failed_hidden_turn(&mut inner, old_turn).is_none());
         assert!(inner.turn.busy);
     }
 
