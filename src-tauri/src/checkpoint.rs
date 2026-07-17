@@ -375,6 +375,32 @@ fn prune_ignored_from_index(shadow: &Path, wt: &Path) -> Result<()> {
     )
 }
 
+/// Fold one NESTED .gitignore into the global exclude body, prefixing each
+/// rule with its directory scope: unanchored patterns (no slash) match at any
+/// depth below it (`dir/**/pat`), anchored ones (leading slash or containing
+/// a slash) stay dir-relative (`dir/pat`). Comments/blanks are dropped;
+/// leading `!` is preserved.
+fn fold_scoped_gitignore(body: &mut String, dir: &str, content: &str) {
+    for line in content.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (bang, pat) = match line.strip_prefix('!') {
+            Some(p) => ("!", p),
+            None => ("", line),
+        };
+        let anchored = pat.starts_with('/') || pat.trim_end_matches('/').contains('/');
+        let scoped = if anchored {
+            format!("{dir}/{}", pat.trim_start_matches('/'))
+        } else {
+            format!("{dir}/**/{pat}")
+        };
+        body.push_str(bang);
+        body.push_str(&scoped);
+        body.push('\n');
+    }
+}
+
 /// `git init --bare` the shadow repo on first use and write its default
 /// exclude list (see [`EXCLUDES`]).
 fn ensure_shadow(shadow: &Path) -> Result<()> {
@@ -426,24 +452,38 @@ fn sync_excludes(shadow: &Path, wt: &Path) -> Result<()> {
     };
     let mut body = EXCLUDES.join("\n");
     body.push('\n');
-    let mut fold = |extra: String| {
+    fn push_folded(body: &mut String, extra: String) {
         body.push_str(&extra);
         if !extra.ends_with('\n') {
             body.push('\n');
         }
-    };
+    }
+    // The real repo's repo-local excludes.
     if let Ok(extra) = std::fs::read_to_string(common.join("info").join("exclude")) {
-        fold(extra);
+        push_folded(&mut body, extra);
     }
     // The CURRENT root .gitignore, verbatim (its rules are already
     // global-scoped). Shadow git ops otherwise see only the worktree's copy —
     // which a restore may have just replaced with an OLDER checkpoint version,
     // so `clean` would delete files the current rules protect (a rule added
     // after the checkpoint). Folding it here keeps protection pinned to NOW.
-    // (Nested .gitignore files are path-scoped and not folded — rare enough
-    // that the root case covers the realistic risk.)
     if let Ok(extra) = std::fs::read_to_string(wt.join(".gitignore")) {
-        fold(extra);
+        push_folded(&mut body, extra);
+    }
+    // NESTED current .gitignore files: their rules are path-scoped, so they
+    // are folded with the directory as prefix (`config/x` → `config/**/x` for
+    // unanchored patterns, `config/x` for anchored ones; negations kept).
+    if let Ok(nested) = real_git(
+        wt,
+        &["ls-files", "-co", "--exclude-standard", "-z", "--", ":(glob)**/.gitignore"],
+    ) {
+        for rel in nested.split('\0').filter(|s| !s.is_empty() && *s != ".gitignore") {
+            if let Ok(extra) = std::fs::read_to_string(wt.join(rel)) {
+                if let Some(dir) = rel.strip_suffix("/.gitignore") {
+                    fold_scoped_gitignore(&mut body, dir, &extra);
+                }
+            }
+        }
     }
     // A repo-local `core.excludesFile` (absolute or `~/`; relative resolves
     // against the worktree, matching git's cwd-relative open).
@@ -463,7 +503,7 @@ fn sync_excludes(shadow: &Path, wt: &Path) -> Result<()> {
                 }
             };
             if let Ok(extra) = std::fs::read_to_string(path) {
-                fold(extra);
+                push_folded(&mut body, extra);
             }
         }
     }
@@ -1111,6 +1151,34 @@ mod tests {
         // A plain worktree (the rest of the suite) reports none.
         let (_d2, plain, _s2, _b2) = fixture();
         assert!(!has_initialized_submodules(&plain));
+    }
+
+    /// Codex-review round 13: a rule in a NESTED .gitignore added after the
+    /// checkpoint protects at restore time too (folded with its dir scope).
+    #[test]
+    fn restore_honors_current_nested_gitignore_rules() {
+        let (_dir, wt, shadow, base) = fixture();
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        let cfg = wt.join("config");
+        std::fs::create_dir_all(&cfg).expect("config dir");
+        std::fs::write(cfg.join(".gitignore"), "secret.env\n").expect("nested gitignore");
+        std::fs::write(cfg.join("secret.env"), "TOKEN=1").expect("secret");
+        std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
+        assert_eq!(
+            std::fs::read_to_string(cfg.join("secret.env")).expect("nested secret survives"),
+            "TOKEN=1",
+            "current NESTED .gitignore rule must protect the file from clean"
+        );
+        // And the scoped folding itself.
+        let mut body = String::new();
+        fold_scoped_gitignore(&mut body, "config", "# c\nsecret.env\n/sub/x.log\n!keep.me\nbuild/\n");
+        assert_eq!(
+            body,
+            "config/**/secret.env\nconfig/sub/x.log\n!config/**/keep.me\nconfig/**/build/\n"
+        );
     }
 
     /// Codex-review round 12: a rule added to .gitignore AFTER the checkpoint
