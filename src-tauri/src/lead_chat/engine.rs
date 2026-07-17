@@ -2073,7 +2073,7 @@ pub async fn send(
     // Phase 3/4 dispatch (write_user / spawn) so it captures the pre-turn
     // worktree state. Queued sends checkpoint at their dequeue instead.
     if ctx.direct {
-        snapshot_turn_checkpoint(db, ctx.session_id, ctx.turn, row_id).await;
+        snapshot_turn_checkpoint(app, db, ctx.session_id, ctx.turn, row_id).await;
     }
 
     let mut outbound = text.to_string();
@@ -2181,7 +2181,7 @@ pub async fn send(
                 // Same pre-turn checkpoint as a direct send, taken between the
                 // promotion and the dispatch (the resident write below; per-turn
                 // / codex spawns in Phase 4).
-                snapshot_turn_checkpoint(db, inner.session_id, inner.turn_id, row_id).await;
+                snapshot_turn_checkpoint(app, db, inner.session_id, inner.turn_id, row_id).await;
                 crate::power::on_turn_began(app);
                 // Under the lock for the same ordering reason as Phase 1's direct
                 // write: a concurrent stop's "stopped" write must not be overtaken.
@@ -2772,7 +2772,7 @@ async fn codex_consumer(
                     // the queued row's id), awaited before turn/start dispatches
                     // the message to the agent.
                     if let Some(qid) = n.queue_id {
-                        snapshot_turn_checkpoint(&db, session_id, turn_id, qid).await;
+                        snapshot_turn_checkpoint(&app, &db, session_id, turn_id, qid).await;
                     }
                     match client.start_turn(&thread, &n.text).await {
                         Ok(t) => {
@@ -3866,6 +3866,7 @@ async fn session_worktree(
 /// checkpoint hiccup can never block or break a turn. Callers await it BEFORE
 /// the turn's message is dispatched to the agent.
 async fn snapshot_turn_checkpoint(
+    app: &AppHandle,
     db: &Db,
     session_id: Option<i32>,
     turn_id: i32,
@@ -3874,12 +3875,13 @@ async fn snapshot_turn_checkpoint(
     let Some(sid) = session_id else {
         return; // the lead has no worktree to checkpoint
     };
-    if let Err(e) = snapshot_turn_checkpoint_impl(db, sid, turn_id, user_row_id).await {
+    if let Err(e) = snapshot_turn_checkpoint_impl(app, db, sid, turn_id, user_row_id).await {
         eprintln!("[weft] code checkpoint skipped for session {sid} turn {turn_id}: {e}");
     }
 }
 
 async fn snapshot_turn_checkpoint_impl(
+    app: &AppHandle,
     db: &Db,
     session_id: i32,
     turn_id: i32,
@@ -3894,8 +3896,23 @@ async fn snapshot_turn_checkpoint_impl(
     if !wt.created_checkout {
         return Ok(());
     }
+    // A sibling session mid-turn means the other agent is writing the shared
+    // worktree RIGHT NOW: a snapshot taken mid-write would capture a partial
+    // state a later code rewind would faithfully restore. Skip this turn's
+    // checkpoint (the turn itself is never blocked; the message just gets no
+    // code-rewind target, which resolve_code_target reports honestly).
+    if sibling_turn_busy(app, db, wt.direction_id, wt.repo_id, session_id).await? {
+        eprintln!("[weft] code checkpoint skipped for session {session_id} turn {turn_id}: sibling session busy on the worktree");
+        return Ok(());
+    }
     let path = std::path::PathBuf::from(&wt.path);
     if !path.is_dir() {
+        return Ok(());
+    }
+    // A worktree with an initialized submodule can never be restored
+    // completely (nested-repo edits are invisible to the parent's
+    // snapshot/restore) — record no checkpoints for it at all.
+    if crate::checkpoint::has_initialized_submodules(&path) {
         return Ok(());
     }
     let shadow = crate::checkpoint::shadow_repo_for(wt.id)?;
@@ -3945,6 +3962,11 @@ async fn resolve_code_target(
 ) -> anyhow::Result<CodeTarget> {
     if !wt.created_checkout {
         return Err(anyhow::anyhow!("该 worktree 是复用的检出，不支持代码回退"));
+    }
+    // An initialized submodule would be silently UNDER-restored (nested-repo
+    // edits are invisible to the parent's snapshot/restore) — refuse honestly.
+    if crate::checkpoint::has_initialized_submodules(std::path::Path::new(&wt.path)) {
+        return Err(anyhow::anyhow!("该 worktree 含 submodule，暂不支持代码回退"));
     }
     let Some(ckpt) = repo::code_checkpoint_for(db, wt.id, message_id).await? else {
         return Err(anyhow::anyhow!("该消息没有代码检查点（旧会话或快照失败）"));
@@ -4446,7 +4468,7 @@ fn spawn_reader(
                                 // Pre-turn checkpoint for the dequeued turn,
                                 // awaited before the spawn dispatches its message.
                                 if let Some(qid) = next.queue_id {
-                                    snapshot_turn_checkpoint(&d, session_id, next_turn_id, qid)
+                                    snapshot_turn_checkpoint(&a, &d, session_id, next_turn_id, qid)
                                         .await;
                                 }
                                 if let Err(err) = spawn_turn(
@@ -4475,7 +4497,7 @@ fn spawn_reader(
                             // before the resident write dispatches its message
                             // (both run under this lock).
                             if let Some(qid) = next.queue_id {
-                                snapshot_turn_checkpoint(&db, session_id, next_turn_id, qid).await;
+                                snapshot_turn_checkpoint(&app, &db, session_id, next_turn_id, qid).await;
                             }
                             if let Err(e) = write_user(&mut inner, &next).await {
                                 eprintln!("[weft] queued resident delivery failed: {e}");

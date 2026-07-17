@@ -10,6 +10,17 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// True when the worktree has at least one INITIALIZED submodule. Checkpoints
+/// record only the parent gitlink for those — nested-repo contents are
+/// invisible to both snapshot and restore — so a code rewind would silently
+/// leave the submodule's post-checkpoint edits behind. Code rewind refuses
+/// such worktrees honestly instead of under-restoring.
+pub fn has_initialized_submodules(wt: &Path) -> bool {
+    real_git_opt(wt, &["submodule", "status"])
+        .map(|out| out.lines().any(|l| !l.is_empty() && !l.starts_with('-')))
+        .unwrap_or(false)
+}
+
 /// Directories never indexed into a checkpoint (dependency/build output), on
 /// top of the worktree's own .gitignore (git's default). `.git/` is
 /// belt-and-braces — git already skips it during untracked discovery.
@@ -100,6 +111,12 @@ pub fn restore(
     head_sha: &str,
     base_commit: &str,
 ) -> Result<bool> {
+    // Hard refusal (also enforced at rewind's resolve step): a worktree with
+    // an initialized submodule can only ever be UNDER-restored — nested-repo
+    // edits are invisible to the parent's snapshot/restore.
+    if has_initialized_submodules(wt) {
+        bail!("worktree contains an initialized submodule — code rewind is not supported for it");
+    }
     // Validate BEFORE any mutation: if the shadow repo lost the checkpoint
     // object, read-tree would fail AFTER a reset --hard already moved the
     // user's branch — refusing here keeps the worktree byte-identical.
@@ -723,5 +740,39 @@ mod tests {
             "new-secret",
             "newly-ignored file must keep its CURRENT contents, not the snapshot's"
         );
+    }
+
+    /// Codex-review round 5: a worktree with an INITIALIZED submodule must be
+    /// refused (restore would silently leave nested-repo edits behind).
+    #[test]
+    fn initialized_submodule_is_detected_and_refused() {
+        let (dir, wt, shadow, base) = fixture();
+        // A real submodule: sub repo + `submodule add` (file protocol).
+        let sub = dir.path().join("subsrc");
+        std::fs::create_dir_all(&sub).expect("sub dir");
+        crate::git::init_repo(&sub).expect("init sub");
+        std::fs::write(sub.join("s.txt"), "sub").expect("sub file");
+        git_ok(&sub, &["add", "-A"]);
+        git_ok(&sub, &["commit", "-qm", "sub init"]);
+        git_ok(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.to_str().expect("utf8"),
+                "vendor/sub",
+            ],
+        );
+        git_ok(&wt, &["commit", "-qm", "add submodule"]);
+        assert!(has_initialized_submodules(&wt), "initialized submodule detected");
+
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        assert!(r.is_err(), "restore must refuse a submodule worktree");
+        // A plain worktree (the rest of the suite) reports none.
+        let (_d2, plain, _s2, _b2) = fixture();
+        assert!(!has_initialized_submodules(&plain));
     }
 }
