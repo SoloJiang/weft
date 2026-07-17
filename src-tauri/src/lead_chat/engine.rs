@@ -3658,17 +3658,19 @@ async fn rewind_reserved(
     let anchor = prev_user.and_then(|m| m.native_anchor.clone());
     // Fallback ordinal for claude's text cut: the target's 1-based position
     // among same-text user rows of this session, up to and including itself.
-    let ordinal = session_rows[..=pos]
+    // Counted under the SAME whitespace-normalized identity the transcript
+    // cut uses (rewind::ordinal_of), or a `hello  world`/`hello world` pair
+    // would fork at a different point than the timeline truncates at.
+    let user_texts: Vec<String> = session_rows[..=pos]
         .iter()
-        .filter(|m| {
-            m.role == "user"
-                && serde_json::from_str::<serde_json::Value>(&m.content)
-                    .ok()
-                    .and_then(|v| v["text"].as_str().map(String::from))
-                    .as_deref()
-                    == Some(rewound_text.as_str())
+        .filter(|m| m.role == "user")
+        .filter_map(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.content)
+                .ok()
+                .and_then(|v| v["text"].as_str().map(String::from))
         })
-        .count();
+        .collect();
+    let ordinal = super::rewind::ordinal_of(&user_texts, &rewound_text);
 
     // Resolve the session's worktree ONCE: mandatory for the code half,
     // best-effort for a conversation-only rewind (it only drives the

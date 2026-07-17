@@ -186,8 +186,23 @@ fn user_text(line: &str) -> Option<String> {
     }
 }
 
-fn normalize_ws(s: &str) -> String {
+/// Whitespace-insensitive text identity, shared by every cut/match path so a
+/// DB-side ordinal and a transcript-side match can never disagree (a `hello
+/// world` vs `hello  world` pair once produced exactly that fork/truncate
+/// mismatch).
+pub(crate) fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 1-based position of `target` among `texts` under [`normalize_ws`] identity.
+/// The engine computes a fallback cut ordinal from DB rows with this, so it
+/// matches the transcript-side normalized matching exactly. 0 = no match.
+pub(crate) fn ordinal_of(texts: &[String], target: &str) -> usize {
+    let want = normalize_ws(target);
+    if want.is_empty() {
+        return 0;
+    }
+    texts.iter().filter(|t| normalize_ws(t) == want).count()
 }
 
 fn is_control_line(line: &str) -> bool {
@@ -796,5 +811,20 @@ mod tests {
         assert_eq!(strip_outer_quotes("hello"), "hello");
         assert_eq!(strip_outer_quotes("\""), "\"", "a lone quote is not a layer");
         assert_eq!(strip_outer_quotes("\"\""), "");
+    }
+
+    #[test]
+    fn ordinal_of_counts_by_normalized_identity() {
+        // Codex-review regression: DB-side ordinal must count `hello  world`
+        // and `hello world` as the same message, or the transcript cut (which
+        // normalizes) picks a different line than the timeline truncation.
+        let texts = vec![
+            "hello  world".to_string(), // normalized-equal to the target
+            "unrelated".to_string(),
+            "hello world".to_string(), // the target itself
+        ];
+        assert_eq!(ordinal_of(&texts, "hello world"), 2);
+        assert_eq!(ordinal_of(&texts, "absent"), 0);
+        assert_eq!(ordinal_of(&texts, ""), 0);
     }
 }

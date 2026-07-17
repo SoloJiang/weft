@@ -88,7 +88,12 @@ pub fn restore(
     head_sha: &str,
     base_commit: &str,
 ) -> Result<bool> {
-    // Safety snapshot first: restoring without a backup would be unrecoverable.
+    // Validate BEFORE any mutation: if the shadow repo lost the checkpoint
+    // object, read-tree would fail AFTER a reset --hard already moved the
+    // user's branch — refusing here keeps the worktree byte-identical.
+    shadow_git(shadow, wt, &["cat-file", "-e", &format!("{shadow_sha}^{{tree}}")])
+        .context("checkpoint object missing from the shadow repo — refusing to touch the worktree")?;
+    // Safety snapshot next: restoring without a backup would be unrecoverable.
     snapshot_to_ref(wt, shadow, &backup_ref(session_id), "rewind backup")?;
     let current = real_git(wt, &["rev-parse", "HEAD"])?;
     if current != head_sha {
@@ -108,6 +113,7 @@ pub fn restore(
     // LATER snapshot, and those files would then survive `clean`), so after
     // `checkout-index` every path absent from the snapshot is untracked and
     // `clean` removes it. Ignored/excluded files are untouched (no -x).
+    sync_excludes(shadow, wt)?;
     shadow_git(shadow, wt, &["read-tree", shadow_sha])?;
     shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
     shadow_git(shadow, wt, &["clean", "-fd"])?;
@@ -126,6 +132,7 @@ fn backup_ref(session_id: i32) -> String {
 /// Identical consecutive states reuse the parent commit. Returns the sha.
 fn snapshot_to_ref(wt: &Path, shadow: &Path, ref_name: &str, message: &str) -> Result<String> {
     ensure_shadow(shadow)?;
+    sync_excludes(shadow, wt)?;
     shadow_git(shadow, wt, &["add", "-A"])?;
     let tree = shadow_git(shadow, wt, &["write-tree"])?;
     let parent = shadow_git(shadow, wt, &["rev-parse", "--verify", "--quiet", ref_name])
@@ -178,6 +185,37 @@ fn ensure_shadow(shadow: &Path) -> Result<()> {
     let info = shadow.join("info");
     std::fs::create_dir_all(&info)?;
     std::fs::write(info.join("exclude"), EXCLUDES.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// Fold the REAL repo's local excludes (`<git-common-dir>/info/exclude`) into
+/// the shadow's own exclude file. Shadow git ops read excludes from the
+/// shadow's git dir, so a path the real repo ignores only via its local
+/// info/exclude (often secrets or machine-local config) would be untracked in
+/// the shadow — and `clean` would then DELETE it on restore. Recomputed each
+/// call so edits to the real file are picked up. (`.gitignore` files in the
+/// work tree and `core.excludesFile` are already honored by git itself.)
+fn sync_excludes(shadow: &Path, wt: &Path) -> Result<()> {
+    let common = real_git(wt, &["rev-parse", "--git-common-dir"])?;
+    let common = {
+        let p = PathBuf::from(common);
+        if p.is_absolute() {
+            p
+        } else {
+            wt.join(p)
+        }
+    };
+    let mut body = EXCLUDES.join("\n");
+    body.push('\n');
+    if let Ok(extra) = std::fs::read_to_string(common.join("info").join("exclude")) {
+        body.push_str(&extra);
+        if !extra.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    let info = shadow.join("info");
+    std::fs::create_dir_all(&info)?;
+    std::fs::write(info.join("exclude"), body)?;
     Ok(())
 }
 
@@ -452,6 +490,83 @@ mod tests {
             git_ok(&wt, &["rev-parse", "HEAD"]),
             bogus_base,
             "HEAD untouched"
+        );
+    }
+
+    /// Codex-review regression: a missing/corrupt checkpoint object must fail
+    /// BEFORE the backup snapshot and any reset — never after the worktree
+    /// has been moved.
+    #[test]
+    fn restore_with_missing_checkpoint_object_changes_nothing() {
+        let (_dir, wt, shadow, base) = fixture();
+        let head_before = git_ok(&wt, &["rev-parse", "HEAD"]);
+        let r = restore(
+            &wt,
+            &shadow,
+            7,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            &head_before,
+            &base,
+        );
+        assert!(r.is_err(), "unknown checkpoint object must refuse");
+        assert_eq!(git_ok(&wt, &["rev-parse", "HEAD"]), head_before, "HEAD untouched");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+            "one",
+            "worktree untouched"
+        );
+        // The backup ref must not exist either (validation precedes it).
+        assert!(
+            Command::new("git")
+                .arg(format!("--git-dir={}", shadow.display()))
+                .args(["rev-parse", "--verify", "--quiet", "refs/heads/rewind-backup-s7"])
+                .current_dir(&wt)
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true),
+            "no backup ref written"
+        );
+    }
+
+    /// Codex-review regression: a path ignored only via the REAL repo's local
+    /// `.git/info/exclude` (typical for secrets / machine config) must neither
+    /// enter snapshots nor be deleted by `clean` on restore.
+    #[test]
+    fn restore_preserves_real_repo_local_excludes() {
+        let (_dir, wt, shadow, base) = fixture();
+        // Ignore secret.local ONLY in the real repo's local exclude file.
+        let info = wt.join(".git/info");
+        std::fs::create_dir_all(&info).expect("info dir");
+        std::fs::write(info.join("exclude"), "secret.local\n").expect("info/exclude");
+
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        // After the checkpoint: modify a tracked file and create the ignored file.
+        std::fs::write(wt.join("a.txt"), "changed").expect("modify");
+        std::fs::write(wt.join("secret.local"), "do-not-lose").expect("secret");
+        // A file ignored only by .gitignore would survive `clean` too — but
+        // secret.local is ignored only via the real repo's info/exclude.
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+            "one",
+            "tracked change restored"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("secret.local")).expect("secret survives"),
+            "do-not-lose",
+            "real-repo-local ignored file must survive the restore clean"
+        );
+        // And it was never tracked into the shadow snapshot either.
+        let listed = Command::new("git")
+            .arg(format!("--git-dir={}", shadow.display()))
+            .args(["ls-tree", "-r", "--name-only", &first.shadow_sha])
+            .current_dir(&wt)
+            .output()
+            .expect("ls-tree");
+        assert!(
+            !String::from_utf8_lossy(&listed.stdout).contains("secret.local"),
+            "secret never snapshot-tracked"
         );
     }
 }
