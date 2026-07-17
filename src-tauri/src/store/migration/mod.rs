@@ -49,6 +49,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0035TestPlan),
             Box::new(M0036LeadMessageNativeAnchor),
             Box::new(M0037CodeCheckpoint),
+            Box::new(M0038CodeCheckpointNestedRepos),
         ]
     }
 }
@@ -1661,6 +1662,51 @@ impl MigrationTrait for M0037CodeCheckpoint {
     }
 }
 
+/// Adds `nested_repos` (TEXT, default '[]') to `code_checkpoint`: the snapshot
+/// manifest of nested git repo dirs, so a restore can delete exactly the
+/// nested repos created AFTER the checkpoint (git clean -fd never touches
+/// nested repos). Duplicate tolerated (fresh DBs reflect the entity already).
+pub struct M0038CodeCheckpointNestedRepos;
+impl MigrationName for M0038CodeCheckpointNestedRepos {
+    fn name(&self) -> &str {
+        "m0038_code_checkpoint_nested_repos"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0038CodeCheckpointNestedRepos {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("nested_repos"))
+                            .string()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .drop_column(Alias::new("nested_repos"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1810,13 +1856,15 @@ mod tests {
         use crate::store::Db;
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let c = insert_code_checkpoint(&db, 1, 7, 100, 1, "shadow-sha", "head-sha")
+        let c = insert_code_checkpoint(&db, 1, 7, 100, 1, "shadow-sha", "head-sha", "[\"gen\"]")
             .await
             .unwrap();
         let found = code_checkpoint_for(&db, 1, 100).await.unwrap().unwrap();
         assert_eq!(found.id, c.id);
         assert_eq!(found.shadow_sha, "shadow-sha");
         assert_eq!(found.head_sha, "head-sha");
+        // m0038: the nested-repos manifest column exists and round-trips.
+        assert_eq!(found.nested_repos, "[\"gen\"]");
     }
 
     /// M0029: raw-query path rewrites gateway components without touching

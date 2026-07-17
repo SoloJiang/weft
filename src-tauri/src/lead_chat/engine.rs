@@ -1989,6 +1989,13 @@ pub async fn send(
     // stop/interrupt/status stay responsive for the session.
     let ctx = {
         let mut inner = eng.lock().await;
+        // Recheck the rewind reservation under the ADMISSION lock: the early
+        // check at fn top released the mutex long ago, and a rewind may have
+        // started since — a send admitted now would be interrupted and its
+        // rows deleted by the rewind's stop/truncate steps.
+        if inner.rewinding {
+            return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
         let direct = inner.turn.try_begin_send();
         // Count only tracked (user-visible) items: hidden plumbing deliveries
         // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
@@ -3785,6 +3792,7 @@ async fn rewind_reserved(
                 &t.shadow_sha,
                 &t.head_sha,
                 &t.base_commit,
+                &t.nested_repos,
             )
         })
         .await??;
@@ -3931,6 +3939,7 @@ async fn snapshot_turn_checkpoint_impl(
         turn_id,
         &snap.shadow_sha,
         &snap.head_sha,
+        &serde_json::json!(snap.nested_repos).to_string(),
     )
     .await?;
     Ok(())
@@ -3948,6 +3957,9 @@ struct CodeTarget {
     base_commit: String,
     shadow_sha: String,
     head_sha: String,
+    /// Nested git repo dirs present at the checkpoint — the restore removes
+    /// exactly the nested repos NOT in this manifest (created after it).
+    nested_repos: Vec<String>,
 }
 
 /// The checkpoint a code rewind restores to. Errors honestly when the lane
@@ -3984,6 +3996,7 @@ async fn resolve_code_target(
         base_commit: wt.base_commit.clone(),
         shadow_sha: ckpt.shadow_sha,
         head_sha: ckpt.head_sha,
+        nested_repos: serde_json::from_str(&ckpt.nested_repos).unwrap_or_default(),
     })
 }
 

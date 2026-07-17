@@ -76,6 +76,9 @@ pub fn remove_shadow(worktree_id: i32) {
 pub struct Snapshot {
     pub shadow_sha: String,
     pub head_sha: String,
+    /// Nested git repo dirs (relative paths) present at snapshot time — the
+    /// manifest a restore uses to delete only post-checkpoint nested repos.
+    pub nested_repos: Vec<String>,
 }
 
 /// Snapshot the pre-turn state of worktree `wt` for session `session_id` (ref
@@ -89,10 +92,31 @@ pub fn snapshot(wt: &Path, shadow: &Path, session_id: i32, turn_id: i32) -> Resu
         &format!("turn {turn_id}"),
     )?;
     let head_sha = real_git(wt, &["rev-parse", "HEAD"])?;
+    let nested_repos = list_nested_repos(wt)?;
     Ok(Snapshot {
         shadow_sha,
         head_sha,
+        nested_repos,
     })
+}
+
+/// Nested git repositories (dirs containing `.git`) that are untracked by the
+/// parent repo, as sorted relative paths. `git clean -fd` never removes
+/// nested repos, so a restore must handle them explicitly: ones NOT in the
+/// snapshot's manifest (created after the checkpoint) are removed, ones in it
+/// are kept. Uses the real repo's own untracked view (its gitignore/excludes);
+/// git lists an embedded repo as a `<path>/` entry (no --directory, which
+/// would collapse it into the outermost untracked dir and hide it).
+pub fn list_nested_repos(wt: &Path) -> Result<Vec<String>> {
+    let out = real_git(wt, &["ls-files", "-o", "--exclude-standard", "-z"])?;
+    let mut dirs: Vec<String> = out
+        .split('\0')
+        .filter(|e| e.ends_with('/'))
+        .filter(|e| wt.join(e).join(".git").exists())
+        .map(|e| e.trim_end_matches('/').to_string())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Restore worktree `wt` to the checkpoint `shadow_sha` (the state BEFORE the
@@ -103,6 +127,9 @@ pub fn snapshot(wt: &Path, shadow: &Path, session_id: i32, turn_id: i32) -> Resu
 /// but never across `base_commit` (the lane's fork point; empty disables that
 /// guard), and never when `head_sha` is not an ancestor of HEAD (the branch
 /// was rewritten externally — then only the working tree is restored).
+/// `recorded_nested` is the checkpoint's manifest of nested git repos: any
+/// nested repo NOT in it (created after the checkpoint) is removed — `git
+/// clean -fd` never touches nested repos on its own.
 pub fn restore(
     wt: &Path,
     shadow: &Path,
@@ -110,6 +137,7 @@ pub fn restore(
     shadow_sha: &str,
     head_sha: &str,
     base_commit: &str,
+    recorded_nested: &[String],
 ) -> Result<bool> {
     // Hard refusal (also enforced at rewind's resolve step): a worktree with
     // an initialized submodule can only ever be UNDER-restored — nested-repo
@@ -160,6 +188,18 @@ pub fn restore(
     }
     shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
     shadow_git(shadow, wt, &["clean", "-fd"])?;
+    // `clean -fd` deliberately leaves nested git repositories (it needs -ff),
+    // so remove exactly the ones created AFTER the checkpoint — those absent
+    // from the snapshot's manifest. Ones recorded there stay untouched.
+    for d in list_nested_repos(wt)? {
+        if !recorded_nested.iter().any(|r| r == &d) {
+            let p = wt.join(&d);
+            if p.exists() {
+                std::fs::remove_dir_all(&p)
+                    .with_context(|| format!("remove post-checkpoint nested repo {}", p.display()))?;
+            }
+        }
+    }
     Ok(true)
 }
 
@@ -475,7 +515,7 @@ mod tests {
         );
 
         let restored =
-            restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base).expect("restore");
+            restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
         assert!(restored);
         assert_eq!(
             visible_files(&wt),
@@ -507,7 +547,7 @@ mod tests {
         let (_dir, wt, shadow, base) = fixture();
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
         std::fs::write(wt.join("added.txt"), "new").expect("add");
-        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base).expect("restore");
+        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
         // The backup captured the pre-restore (mutated) state: added.txt is in
         // its tree even though the restore removed it from the worktree.
         let backup = shadow_git(&shadow, &wt, &["rev-parse", "refs/heads/rewind-backup-s7"])
@@ -530,7 +570,7 @@ mod tests {
         git_ok(&wt, &["commit", "-qm", "agent commit"]);
         assert_ne!(git_ok(&wt, &["rev-parse", "HEAD"]), first.head_sha);
 
-        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base).expect("restore");
+        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
         assert_eq!(
             git_ok(&wt, &["rev-parse", "HEAD"]),
             first.head_sha,
@@ -563,7 +603,7 @@ mod tests {
             "head_sha must NOT be an ancestor of the rewritten HEAD"
         );
 
-        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base).expect("restore");
+        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
         assert_eq!(
             git_ok(&wt, &["rev-parse", "HEAD"]),
             side_head,
@@ -597,6 +637,7 @@ mod tests {
             &first.shadow_sha,
             &first.head_sha,
             &bogus_base,
+            &first.nested_repos,
         );
         assert!(r.is_err(), "crossing base_commit must refuse");
         assert_eq!(
@@ -624,6 +665,7 @@ mod tests {
             "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             &head_before,
             &base,
+            &[],
         );
         assert!(r.is_err(), "unknown checkpoint object must refuse");
         assert_eq!(git_ok(&wt, &["rev-parse", "HEAD"]), head_before, "HEAD untouched");
@@ -662,7 +704,7 @@ mod tests {
         std::fs::write(wt.join("secret.local"), "do-not-lose").expect("secret");
         // A file ignored only by .gitignore would survive `clean` too — but
         // secret.local is ignored only via the real repo's info/exclude.
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(
             std::fs::read_to_string(wt.join("a.txt")).expect("read"),
@@ -699,7 +741,7 @@ mod tests {
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
         std::fs::write(wt.join("a.txt"), "changed").expect("modify");
         std::fs::write(wt.join("machine.local"), "do-not-lose").expect("machine file");
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert_eq!(
@@ -732,7 +774,7 @@ mod tests {
         std::fs::write(wt.join("secret.local"), "new-secret").expect("secret v2");
         std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
 
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert_eq!(
@@ -740,6 +782,41 @@ mod tests {
             "new-secret",
             "newly-ignored file must keep its CURRENT contents, not the snapshot's"
         );
+    }
+
+    /// Codex-review round 6: `git clean -fd` never removes nested git repos —
+    /// a repo the agent `git init`ed AFTER the checkpoint must be deleted by
+    /// the restore, while one present AT the checkpoint must be kept.
+    #[test]
+    fn restore_removes_only_post_checkpoint_nested_repos() {
+        let (dir, wt, shadow, base) = fixture();
+        // A nested repo that exists BEFORE the checkpoint.
+        let pre = wt.join("vendor/lib");
+        std::fs::create_dir_all(&pre).expect("pre dir");
+        crate::git::init_repo(&pre).expect("init pre");
+        std::fs::write(pre.join("keep.txt"), "pre").expect("pre file");
+        git_ok(&pre, &["add", "-A"]);
+        git_ok(&pre, &["commit", "-qm", "pre"]);
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        assert_eq!(first.nested_repos, vec!["vendor/lib".to_string()]);
+
+        // A nested repo created AFTER the checkpoint (agent ran git init).
+        let post = wt.join("gen/out");
+        std::fs::create_dir_all(&post).expect("post dir");
+        crate::git::init_repo(&post).expect("init post");
+        std::fs::write(post.join("new.txt"), "post").expect("post file");
+        std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
+
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
+        assert!(!post.exists(), "post-checkpoint nested repo removed");
+        assert_eq!(
+            std::fs::read_to_string(pre.join("keep.txt")).expect("pre kept"),
+            "pre",
+            "pre-existing nested repo must survive"
+        );
+        let _ = dir;
     }
 
     /// Codex-review round 5: a worktree with an INITIALIZED submodule must be
@@ -769,7 +846,7 @@ mod tests {
         assert!(has_initialized_submodules(&wt), "initialized submodule detected");
 
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
         assert!(r.is_err(), "restore must refuse a submodule worktree");
         // A plain worktree (the rest of the suite) reports none.
         let (_d2, plain, _s2, _b2) = fixture();

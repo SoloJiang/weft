@@ -23,6 +23,12 @@ pub struct Model {
     /// to it when the agent committed after the snapshot (never across the
     /// worktree's base_commit).
     pub head_sha: String,
+    /// JSON array of nested git repo dirs (relative paths) present at snapshot
+    /// time. `git clean -fd` never removes nested repositories, so a restore
+    /// deletes exactly the nested repos NOT in this list (created after the
+    /// checkpoint) and keeps the ones that were already there.
+    #[sea_orm(default_value = "[]")]
+    pub nested_repos: String,
     pub created_at: String,
 }
 
