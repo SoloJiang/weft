@@ -1251,6 +1251,10 @@ pub struct EngineInner {
     /// window where a concurrent send's turn would be silently interrupted
     /// and its rows deleted by the rewind's stop/truncate steps.
     pub rewinding: bool,
+    /// The worktree this worker runs in (None for the lead console): lets
+    /// send's admission honor a worktree-level restore reservation without a
+    /// DB lookup. Sibling sessions of one worktree share the same id.
+    pub worktree_id: Option<i32>,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -1996,6 +2000,14 @@ pub async fn send(
         if inner.rewinding {
             return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
         }
+        // A code restore holds a reservation on the whole WORKTREE: sibling
+        // sessions of the same worktree must not start editing it mid-restore.
+        if inner
+            .worktree_id
+            .is_some_and(crate::checkpoint::restore_reserved)
+        {
+            return Err(anyhow::anyhow!("该 worktree 正在回退代码，请稍后重试"));
+        }
         let direct = inner.turn.try_begin_send();
         // Count only tracked (user-visible) items: hidden plumbing deliveries
         // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
@@ -2113,6 +2125,19 @@ pub async fn send(
     } else {
         images
     };
+    // Persist the EXACT dispatched text for image-bearing per-turn rows: the
+    // spill loop above omits a path when decode/write fails, and rewind's
+    // native text match can't reconstruct that retroactively. (Text/files
+    // appendices are deterministic; only images need this.)
+    if per_turn(&ctx.tool) && !image_uris.is_empty() {
+        let with_dispatched = serde_json::json!({
+            "text": text,
+            "images": image_uris,
+            "files": files,
+            "dispatched": &outbound,
+        });
+        let _ = repo::update_lead_message(db, row_id, &with_dispatched.to_string(), status).await;
+    }
     let out = Outgoing {
         text: outbound,
         images,
@@ -3773,12 +3798,14 @@ async fn rewind_reserved(
     };
 
     // The code restore runs after the fork and before the restart: both halves
-    // land (or fail) while the session is still fully intact. It is refused
-    // while a sibling session on the same worktree is mid-turn (the rewind
-    // reservation only covers THIS engine), and serialized against concurrent
-    // shadow ops via the per-worktree op lock.
+    // land (or fail) while the session is still fully intact. The worktree is
+    // RESERVED first, then siblings are re-checked — a sibling send admitted
+    // before the reservation shows up busy now; one after it is refused at
+    // admission, so no agent edits the worktree mid-restore. Shadow ops are
+    // serialized per worktree via the op lock.
     let mut code_restored = false;
     if let Some(t) = code_target {
+        let reservation = crate::checkpoint::begin_restore_reservation(t.worktree_id);
         if sibling_turn_busy(app, db, t.direction_id, t.repo_id, t.session_id).await? {
             return Err(anyhow::anyhow!("另一个会话正在使用该 worktree，请先中断它"));
         }
@@ -3796,6 +3823,7 @@ async fn rewind_reserved(
             )
         })
         .await??;
+        drop(reservation);
     }
     if mode == RewindMode::Code {
         return Ok(RewindOutcome {
@@ -4003,8 +4031,10 @@ async fn resolve_code_target(
 /// True when a DIFFERENT session sharing this (direction, repo) worktree has
 /// a turn in flight — a code restore would wipe its edits mid-write. The
 /// rewind reservation only covers this session's own engine, so siblings are
-/// checked explicitly. (Best-effort, not airtight: a sibling can still start
-/// after this check, a sub-second window the restore's safety backup covers.)
+/// checked explicitly. Uses try_lock: a peer whose mutex is held (e.g. while
+/// IT is checkpointing or dispatching) counts as busy — conservative and
+/// deadlock-free (this check itself runs while our own lock may be held).
+/// (Best-effort after all: a false positive just skips/refuses one round.)
 async fn sibling_turn_busy(
     app: &AppHandle,
     db: &Db,
@@ -4019,8 +4049,16 @@ async fn sibling_turn_busy(
             continue;
         }
         if let Some(e) = state.get(s.id as i64) {
-            if e.lock().await.turn.busy {
-                return Ok(true);
+            match e.try_lock() {
+                Ok(g) => {
+                    if g.turn.busy {
+                        return Ok(true);
+                    }
+                }
+                // The peer's mutex is held right now — treat as busy rather
+                // than await it (two resident siblings could otherwise
+                // deadlock waiting on each other's lock).
+                Err(_) => return Ok(true),
             }
         }
     }
@@ -5256,6 +5294,7 @@ mod tests {
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
+            worktree_id: None,
         }
     }
 
@@ -5495,6 +5534,7 @@ mod tests {
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
+            worktree_id: None,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));

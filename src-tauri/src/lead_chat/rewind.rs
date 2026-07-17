@@ -29,6 +29,11 @@ use serde_json::Value;
 /// (no appendix in the text block).
 pub(crate) fn dispatched_text(per_turn_tool: bool, row_id: i32, content_json: &str) -> String {
     let v: Value = serde_json::from_str(content_json).unwrap_or_default();
+    // The exact prompt send() persisted for image-bearing rows (a failed
+    // decode/write omits that path, which no reconstruction can know).
+    if let Some(d) = v["dispatched"].as_str() {
+        return d.to_string();
+    }
     let mut out = v["text"].as_str().unwrap_or_default().to_string();
     let mut list = |key: &str| -> Vec<String> {
         v[key]
@@ -928,5 +933,13 @@ mod tests {
         // message holding the QUOTED dispatched form matches.
         let msgs = vec![oc_user("m1", &[&format!("\"{want_files}\"")])];
         assert_eq!(match_user_cut(&msgs, want_files, 1).as_deref(), Some("m1"));
+        // Codex-review round 7: a persisted `dispatched` field (send() stamps
+        // it for image-bearing rows, where spill failures are unknowable)
+        // always wins over reconstruction.
+        let stamped = r#"{"text":"look","images":["data:image/png;base64,iVBOR"],"files":[],"dispatched":"look\n\nAttached images (read them as needed):\n- /tmp/weft-attachments/msg7-0.png\n"}"#;
+        assert_eq!(
+            dispatched_text(true, 7, stamped),
+            "look\n\nAttached images (read them as needed):\n- /tmp/weft-attachments/msg7-0.png\n"
+        );
     }
 }

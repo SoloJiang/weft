@@ -46,6 +46,37 @@ pub fn op_lock(worktree_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     OP_LOCKS.entry(worktree_id).or_default().clone()
 }
 
+/// Worktree-level restore reservation: a code/both rewind holds this across
+/// its restore, and every worker send re-checks it at admission — closing the
+/// TOCTOU where a sibling turn starts between the rewind's sibling-busy check
+/// and the restore itself and then edits the files being restored.
+static RESTORE_RESERVATIONS: std::sync::LazyLock<dashmap::DashSet<i32>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
+
+/// Held while a code restore runs on a worktree. Dropped = reservation lifted.
+pub struct RestoreReservation {
+    worktree_id: i32,
+}
+impl Drop for RestoreReservation {
+    fn drop(&mut self) {
+        RESTORE_RESERVATIONS.remove(&self.worktree_id);
+    }
+}
+
+/// Reserve a worktree for an upcoming restore. Re-check siblings AFTER taking
+/// this: a send admitted before the reservation shows up busy then; a send
+/// after it is refused at admission.
+pub fn begin_restore_reservation(worktree_id: i32) -> RestoreReservation {
+    RESTORE_RESERVATIONS.insert(worktree_id);
+    RestoreReservation { worktree_id }
+}
+
+/// True while a restore reservation is held on this worktree (worker sends
+/// must refuse admission).
+pub fn restore_reserved(worktree_id: i32) -> bool {
+    RESTORE_RESERVATIONS.contains(&worktree_id)
+}
+
 /// `<weft_home>/checkpoints/<worktree_id>.git` — the shadow bare repo for one
 /// worktree. The parent dir is created; the repo itself is `git init --bare`'d
 /// lazily on the first snapshot.
