@@ -12,6 +12,7 @@ pub mod backup;
 mod brief;
 pub mod bus;
 mod check;
+mod checkpoint;
 mod claude;
 mod codex;
 mod codex_app_server;
@@ -265,6 +266,8 @@ pub fn run() {
             lead_chat::commands::chat_dequeue,
             lead_chat::commands::chat_edit_queued,
             lead_chat::commands::chat_reorder_queue,
+            lead_chat::commands::chat_rewind,
+            lead_chat::commands::lead_rewind,
             lead_chat::commands::lead_dequeue,
             lead_chat::commands::lead_edit_queued,
             lead_chat::commands::lead_reorder_queue,

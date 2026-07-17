@@ -84,6 +84,17 @@ pub fn thread_resume_params(thread_id: &str) -> Value {
     json!({ "threadId": thread_id })
 }
 
+/// thread/fork: fork the thread, omitting turns after `last_turn_id` from the
+/// fork — the official fork-at-point. None = full-history fork (the key is
+/// omitted, not null), which a rewind never wants: "back to before the first
+/// message" starts a fresh thread instead.
+pub fn thread_fork_params(thread_id: &str, last_turn_id: Option<&str>) -> Value {
+    match last_turn_id {
+        Some(t) => json!({ "threadId": thread_id, "lastTurnId": t }),
+        None => json!({ "threadId": thread_id }),
+    }
+}
+
 /// turn/start: `input` is a Vec<UserInput>; a plain message is the `text` variant
 /// (serde tag "type" = "text"). NOT a single object, NOT "input_text".
 pub fn turn_start_params(thread_id: &str, text: &str) -> Value {
@@ -250,6 +261,7 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             ) => Some(ChatEvent::Assistant {
                 texts: vec![],
                 tools: vec![appserver_tool_call(item)],
+                uuid: None,
             }),
             _ => None,
         },
@@ -273,6 +285,7 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                     .map(|t| vec![t.to_string()])
                     .unwrap_or_default(),
                 tools: vec![],
+                uuid: None,
             }),
             // userMessage / reasoning carry no display payload of their own.
             Some("userMessage" | "reasoning") | None => None,
@@ -916,6 +929,18 @@ impl Client {
             .await
             .map(|_| ())
     }
+    /// Fork `thread_id`, omitting turns after `last_turn_id` from the fork.
+    /// Returns the NEW thread id. See [`thread_fork_params`] for the None case.
+    pub async fn fork_thread(
+        &self,
+        thread_id: &str,
+        last_turn_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let r = self
+            .request("thread/fork", thread_fork_params(thread_id, last_turn_id))
+            .await?;
+        thread_id_of(&r).ok_or_else(|| anyhow::anyhow!("thread/fork: no thread.id"))
+    }
     pub async fn start_turn(&self, thread_id: &str, text: &str) -> anyhow::Result<String> {
         let r = self
             .request("turn/start", turn_start_params(thread_id, text))
@@ -974,6 +999,33 @@ mod tests {
         .unwrap();
         assert_eq!(v["params"]["threadId"], "t_1");
         assert_eq!(v["params"]["turnId"], "turn_9");
+    }
+
+    #[test]
+    fn fork_params_carry_last_turn_id_only_when_set() {
+        let v: Value = serde_json::from_str(
+            encode_request(11, "thread/fork", thread_fork_params("t_1", Some("turn_3"))).trim(),
+        )
+        .unwrap();
+        assert_eq!(v["method"], "thread/fork");
+        assert_eq!(v["params"]["threadId"], "t_1");
+        assert_eq!(v["params"]["lastTurnId"], "turn_3");
+        // None = full-history fork: the key is omitted, never null.
+        let v2: Value = serde_json::from_str(
+            encode_request(12, "thread/fork", thread_fork_params("t_1", None)).trim(),
+        )
+        .unwrap();
+        assert_eq!(v2["params"]["threadId"], "t_1");
+        assert!(v2["params"].get("lastTurnId").is_none());
+    }
+
+    #[test]
+    fn fork_response_yields_new_thread_id() {
+        // thread/fork answers with the forked thread — same envelope as
+        // thread/start, so thread_id_of extracts `result.thread.id`.
+        let r = json!({"thread": {"id": "t_fork_2", "turns": []}});
+        assert_eq!(thread_id_of(&r).as_deref(), Some("t_fork_2"));
+        assert!(thread_id_of(&json!({"thread": {}})).is_none());
     }
 
     #[test]
@@ -1140,7 +1192,7 @@ mod tests {
             "item/completed",
             &json!({"item":{"id":"i","type":"agentMessage","text":"done"}}),
         ) {
-            Some(ChatEvent::Assistant { texts, tools }) => {
+            Some(ChatEvent::Assistant { texts, tools, .. }) => {
                 assert_eq!(texts, vec!["done".to_string()]);
                 assert!(tools.is_empty());
             }

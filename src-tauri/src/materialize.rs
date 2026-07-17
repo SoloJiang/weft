@@ -425,16 +425,19 @@ pub async fn materialize_direction(
 }
 
 /// Physically remove worktrees and their namespaced branches (called during
-/// cascade delete). `removed` is the (repo_id, path, branch, created_branch,
-/// created_checkout) list returned by `repo::delete_thread_cascade`. Per the
-/// zero-accumulation principle the worktree's namespaced branch is torn down
-/// too — but ONLY when weft created it (`created_branch`); a pre-existing branch
-/// the worktree merely checked out (the `-b` fallback) is preserved. Similarly,
-/// `git worktree remove` is only called when `created_checkout` is true — a
-/// reused pre-existing path must survive cascade cleanup.
-pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, String, String, bool, bool)]) -> Result<()> {
+/// cascade delete). `removed` is the (worktree_id, repo_id, path, branch,
+/// created_branch, created_checkout) list returned by the repo cascade fns.
+/// Per the zero-accumulation principle the worktree's namespaced branch is torn
+/// down too — but ONLY when weft created it (`created_branch`); a pre-existing
+/// branch the worktree merely checked out (the `-b` fallback) is preserved.
+/// Similarly, `git worktree remove` is only called when `created_checkout` is
+/// true — a reused pre-existing path must survive cascade cleanup. Each
+/// worktree's code-checkpoint shadow repo goes with it (its DB rows were
+/// already deleted by the cascade).
+pub async fn cleanup_worktrees(db: &Db, removed: &[(i32, i32, String, String, bool, bool)]) -> Result<()> {
     use sea_orm::EntityTrait;
-    for (repo_id, path, branch, created_branch, created_checkout) in removed {
+    for (wt_id, repo_id, path, branch, created_branch, created_checkout) in removed {
+        crate::checkpoint::remove_shadow(*wt_id);
         if let Some(r) = entities::repo_ref::Entity::find_by_id(*repo_id)
             .one(&db.0)
             .await?
@@ -511,8 +514,9 @@ pub async fn rollback_direction(db: &Db, direction_id: i32) -> Result<()> {
 /// tearing the direction down. The row is deliberately retained as the record that
 /// Weft created this branch here: it lets `delete_thread`'s cascade still clean the
 /// branch later (zero-accumulation) and drives the `exists=false` state the board
-/// uses to disable the now-defunct worktree's actions. Idempotent: a missing row,
-/// or an already-removed directory, is a no-op.
+/// uses to disable the now-defunct worktree's actions. Code checkpoints (shadow
+/// repo + rows) die with the checkout — there is nothing left to restore into.
+/// Idempotent: a missing row, or an already-removed directory, is a no-op.
 pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> {
     use sea_orm::EntityTrait;
     let Some(wt) = entities::worktree::Entity::find_by_id(worktree_id)
@@ -570,6 +574,10 @@ pub async fn remove_direction_worktree(db: &Db, worktree_id: i32) -> Result<()> 
     if path.exists() {
         anyhow::bail!("worktree directory could not be removed: {}", wt.path);
     }
+    // Code checkpoints die with the checkout: drop the shadow repo and its rows
+    // (the worktree row itself is deliberately retained — see the doc above).
+    crate::checkpoint::remove_shadow(worktree_id);
+    repo::delete_code_checkpoints_for_worktree(db, worktree_id).await?;
     Ok(())
 }
 
@@ -2823,7 +2831,7 @@ mod tests {
             .await.unwrap();
 
         // Cascade cleanup of a reused (created_checkout=false, created_branch=false) entry.
-        let removed = vec![(r.id, wt.to_string_lossy().to_string(), "feat/reused".to_string(), false, false)];
+        let removed = vec![(1, r.id, wt.to_string_lossy().to_string(), "feat/reused".to_string(), false, false)];
         cleanup_worktrees(&db, &removed).await.unwrap();
 
         // Dir + contents survive...

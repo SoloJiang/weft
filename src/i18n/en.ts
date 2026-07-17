@@ -334,6 +334,30 @@ export const en = {
     backToReadonly: "Back to read-only",
     promptOk: "OK",
     promptCancel: "Cancel",
+    rewindTip: "Rewind the conversation to before this message",
+    rewindTitle: "Rewind the conversation?",
+    rewindBody:
+      "Messages after this one will be removed and the agent will forget them. This message's text goes back into the input box so you can edit and resend it.",
+    rewindConfirm: "Rewind",
+    rewindModeConversation: "Conversation only",
+    rewindModeConversationDesc:
+      "Messages after this one are removed and the agent forgets them; its text goes back into the input box.",
+    rewindModeCode: "Code only",
+    rewindModeCodeDesc:
+      "Worktree files are restored to before this message. Uncommitted changes are overwritten — a safety snapshot is kept.",
+    rewindModeBoth: "Both",
+    rewindModeBothDesc: "Rewind the conversation and restore the worktree code.",
+    rewindCodeTitle: "Rewind the code?",
+    rewindCodeBody:
+      "Files in the worktree will be restored to their state before this message. Current uncommitted changes will be overwritten — a safety snapshot is kept.",
+    rewindCodeConfirm: "Rewind code",
+    rewindBothTitle: "Rewind conversation and code?",
+    rewindBothBody:
+      "Messages after this one will be removed and the agent will forget them (this message's text goes back into the input box), and worktree files will be restored to before this message. Uncommitted changes will be overwritten — a safety snapshot is kept.",
+    rewindBothConfirm: "Rewind both",
+    rewoundMarker: "Rewound from here",
+    rewindPickerTitle: "Rewind to a message",
+    rewindPickerEmpty: "No messages to rewind to.",
   },
   diff: {
     tab: "Diff",

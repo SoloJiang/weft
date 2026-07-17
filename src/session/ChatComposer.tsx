@@ -58,6 +58,10 @@ const IME_ENTER_GRACE_MS = 100;
 /** Max messages that can wait in the queue while a turn runs. */
 const MAX_QUEUED = 5;
 
+/** Window for the Esc-Esc chord that opens the rewind picker: the second Esc
+ *  (on an already-empty draft) must land within this of the previous Esc. */
+const REWIND_ESC_WINDOW_MS = 700;
+
 export function ChatComposer({
   slashCommands,
   localSlash,
@@ -73,6 +77,8 @@ export function ChatComposer({
   onNeedSlashCommands,
   tool,
   contextMeta,
+  initialValue,
+  onRewindPicker,
 }: {
   slashCommands: SlashCmd[];
   /** Extra "local" slash items, prepended to the palette under a divider.
@@ -104,9 +110,15 @@ export function ChatComposer({
   tool?: string;
   /** Session meta for the inline context gauge (tokens/window/model). */
   contextMeta?: SessionMeta;
+  /** Initial draft text (e.g. a rewound message prefilled for edit/resend).
+   *  Only applied at mount — pair with a `key` change to inject a new value. */
+  initialValue?: string;
+  /** Esc pressed on an already-empty draft twice in quick succession — the host
+   *  opens its rewind-target picker. Omit where rewind is unavailable. */
+  onRewindPicker?: () => void;
 }) {
   return (
-    <PromptInputProvider>
+    <PromptInputProvider initialValue={initialValue}>
       <ChatComposerBody
         slashCommands={slashCommands}
         localSlash={localSlash}
@@ -122,6 +134,7 @@ export function ChatComposer({
         onNeedSlashCommands={onNeedSlashCommands}
         tool={tool}
         contextMeta={contextMeta}
+        onRewindPicker={onRewindPicker}
       />
     </PromptInputProvider>
   );
@@ -146,6 +159,7 @@ interface ChatComposerBodyProps {
   onNeedSlashCommands?: () => void;
   tool?: string;
   contextMeta?: SessionMeta;
+  onRewindPicker?: () => void;
 }
 
 function ChatComposerBody({
@@ -163,6 +177,7 @@ function ChatComposerBody({
   onNeedSlashCommands,
   tool,
   contextMeta,
+  onRewindPicker,
 }: ChatComposerBodyProps) {
   const { t } = useTranslation();
   const { value: text, setValue: setText } = usePromptInput();
@@ -177,6 +192,7 @@ function ChatComposerBody({
   const wrapRef = useRef<HTMLDivElement>(null);
   const askedSlashRef = useRef(false);
   const lastSendRef = useRef(0);
+  const lastEscRef = useRef(0);
   const composingRef = useRef(false);
   const lastCompositionEndRef = useRef<number | null>(null);
 
@@ -377,6 +393,21 @@ function ChatComposerBody({
       blockImeEnter(e);
       return;
     }
+    // Esc clears the draft (also dismissing an open slash palette, since its
+    // query is the draft). A second Esc on an already-empty draft inside the
+    // window opens the host's rewind picker; the timestamp is stamped on every
+    // Esc so a clear immediately followed by an empty-Esc chains into it.
+    if (e.key === "Escape") {
+      e.preventDefault();
+      const now = Date.now();
+      if (text === "") {
+        if (now - lastEscRef.current < REWIND_ESC_WINDOW_MS) onRewindPicker?.();
+      } else {
+        setText("");
+      }
+      lastEscRef.current = now;
+      return;
+    }
     if (!paletteOpen) return;
 
     if (e.key === "ArrowDown") {
@@ -400,10 +431,6 @@ function ChatComposerBody({
       e.preventDefault();
       submitComposer();
       return;
-    }
-    if (e.key === "Escape") {
-      e.preventDefault();
-      setText("");
     }
   };
 

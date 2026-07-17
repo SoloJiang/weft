@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, Copy, Sparkles } from "lucide-react";
+import { ArrowRight, Check, Copy, Sparkles, Undo2 } from "lucide-react";
 import type { LeadMessage, PermissionAsk, QueuedItem, ResolvedProposal } from "../lib/types";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { QueueStack } from "./QueueStack";
@@ -61,6 +61,7 @@ export function ChatTimeline({
   onRemove = () => {},
   onEdit = () => {},
   onReorder = () => {},
+  onRewind,
   onOpenTestPlan,
   testCaseCount = 0,
 }: {
@@ -71,6 +72,9 @@ export function ChatTimeline({
   onRemove?: (id: number) => void;
   onEdit?: (id: number, text: string) => void;
   onReorder?: (order: number[]) => void;
+  /** Rewind the conversation to just before a completed user message; omit →
+   *  no rewind affordance on user rows. */
+  onRewind?: (id: number) => void;
   /** Open the test-plan panel from a test_cases card (lead host only). */
   onOpenTestPlan?: () => void;
   /** Live leaf-case count of the issue's test_plan (0 = none). Sourced from the
@@ -193,6 +197,7 @@ export function ChatTimeline({
               queuedCount={queue.length}
               onOpenTestPlan={onOpenTestPlan}
               testCaseCount={testCaseCount}
+              onRewind={onRewind}
             />
           </div>
         )}
@@ -388,6 +393,7 @@ function TimelineRow({
   queuedCount = 0,
   onOpenTestPlan,
   testCaseCount = 0,
+  onRewind,
 }: {
   m: LeadMessage;
   all: LeadMessage[];
@@ -405,9 +411,24 @@ function TimelineRow({
   onOpenTestPlan?: () => void;
   /** Live leaf-case count of the issue's test_plan, for the plan card row. */
   testCaseCount?: number;
+  /** Rewind affordance for completed user text rows (worker hosts only). */
+  onRewind?: (id: number) => void;
 }) {
   const { t } = useTranslation();
   const c = parse(m.content);
+
+  // Rewind marker: a quiet centered divider left where a conversation rewind
+  // truncated the timeline. System-owned, no hover actions — handled before
+  // every other kind so it can never fall through to a bubble.
+  if (m.kind === "rewind") {
+    return (
+      <div className="flex items-center gap-3 px-2 py-1">
+        <span className="h-px flex-1 bg-border" />
+        <span className="shrink-0 text-[11px] text-ink-faint">{t("session.rewoundMarker")}</span>
+        <span className="h-px flex-1 bg-border" />
+      </div>
+    );
+  }
 
   if (m.kind === "tool") {
     const content = parse(m.content);
@@ -689,7 +710,14 @@ function TimelineRow({
             <p className="self-end text-[11px] text-danger">{t("lead.errored")}</p>
           )}
         </div>
-        {text && <CopyMessageButton text={text} align="end" />}
+        {text && (
+          <MessageActionsRow align="end">
+            {onRewind && m.kind === "text" && m.status === "complete" && (
+              <RewindMessageButton onClick={() => onRewind(m.id)} />
+            )}
+            <CopyMessageButton text={text} />
+          </MessageActionsRow>
+        )}
       </Message>
     );
   }
@@ -723,7 +751,9 @@ function TimelineRow({
         )}
       </div>
       {assistantText && m.status !== "streaming" && (
-        <CopyMessageButton text={assistantText} align="start" />
+        <MessageActionsRow align="start">
+          <CopyMessageButton text={assistantText} />
+        </MessageActionsRow>
       )}
     </Message>
   );
@@ -765,14 +795,34 @@ function isPlanSplitItem(value: unknown): value is PlanCardSplitItem {
 }
 
 /**
- * Per-message copy affordance: a small icon button under a chat bubble, revealed
- * on hover of the row (the parent carries `group`) or on keyboard focus. The
- * action row reserves a fixed height even while hidden so hovering never changes
- * row geometry and a hover-driven reflow can't jump the scroll position. Copies
- * the raw message text (markdown source for assistant turns), matching the rest
- * of the app's clipboard affordances.
+ * Per-message action row (copy, rewind, …): small icon buttons under a chat
+ * bubble, revealed on hover of the row (the parent carries `group`) or on
+ * keyboard focus. The action row reserves a fixed height even while hidden so
+ * hovering never changes row geometry and a hover-driven reflow can't jump the
+ * scroll position.
  */
-function CopyMessageButton({ text, align }: { text: string; align: "start" | "end" }) {
+function MessageActionsRow({
+  align,
+  children,
+}: {
+  align: "start" | "end";
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "mt-0.5 flex h-5 w-full items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100",
+        align === "end" ? "justify-end" : "justify-start",
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** Copies the raw message text (markdown source for assistant turns), matching
+ *  the rest of the app's clipboard affordances. */
+function CopyMessageButton({ text }: { text: string }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const onCopy = () => {
@@ -782,21 +832,32 @@ function CopyMessageButton({ text, align }: { text: string; align: "start" | "en
   };
   const label = copied ? t("lead.copied") : t("lead.copyMessage");
   return (
-    <div
-      className={cn(
-        "mt-0.5 flex h-5 w-full items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100",
-        align === "end" ? "justify-end" : "justify-start",
-      )}
+    <button
+      type="button"
+      onClick={onCopy}
+      title={label}
+      aria-label={label}
+      className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[11px] text-ink-faint outline-none transition-colors hover:bg-surface hover:text-ink focus-visible:bg-surface focus-visible:text-ink"
     >
-      <button
-        type="button"
-        onClick={onCopy}
-        title={label}
-        aria-label={label}
-        className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[11px] text-ink-faint outline-none transition-colors hover:bg-surface hover:text-ink focus-visible:bg-surface focus-visible:text-ink"
-      >
-        {copied ? <Check size={12} className="text-running" /> : <Copy size={12} />}
-      </button>
-    </div>
+      {copied ? <Check size={12} className="text-running" /> : <Copy size={12} />}
+    </button>
+  );
+}
+
+/** Rewind the conversation to just before this user message (the host confirms
+ *  in a dialog, calls chat_rewind/lead_rewind, then prefills the composer). */
+function RewindMessageButton({ onClick }: { onClick: () => void }) {
+  const { t } = useTranslation();
+  const label = t("session.rewindTip");
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[11px] text-ink-faint outline-none transition-colors hover:bg-surface hover:text-ink focus-visible:bg-surface focus-visible:text-ink"
+    >
+      <Undo2 size={12} />
+    </button>
   );
 }

@@ -10,6 +10,7 @@ pub mod out_hub;
 pub mod proto;
 pub mod repo_state;
 pub mod revive;
+pub mod rewind;
 pub mod sentinels;
 pub mod test_plan;
 pub mod window;

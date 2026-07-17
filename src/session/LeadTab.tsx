@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { currentLang } from "../i18n";
 import { useStore } from "../state/store";
 import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
@@ -9,6 +10,7 @@ import { TestPlanPanel, testPlanCaseCount } from "./TestPlanPanel";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
+import { RewindDialog, RewindPickerDialog } from "./RewindDialog";
 import { useRepoActions } from "./useRepoActions";
 import { api } from "../lib/api";
 import type { EnabledSkill } from "../lib/types";
@@ -100,6 +102,12 @@ export function LeadTab({
   // test_cases card id below.
   const [testCaseCount, setTestCaseCount] = useState(0);
   const [testPlanEditNonce, setTestPlanEditNonce] = useState(0);
+  // Conversation rewind: the message id awaiting confirm (null = dialog closed),
+  // the Esc-Esc picker's open flag, and the composer prefill (seq bumps to
+  // remount-inject the rewound text). The lead rewinds conversation-only.
+  const [rewindId, setRewindId] = useState<number | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [prefill, setPrefill] = useState<{ text: string; seq: number }>({ text: "", seq: 0 });
 
   // The thread this chat renders. Defaults to the globally-active thread (the
   // ThreadBoard usage); the embedded curator panel passes its own thread id so
@@ -215,6 +223,20 @@ export function LeadTab({
   const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
   // The lead engine runs the thread's lead_tool (not always claude).
   const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
+  // Rewind is scoped to claude/codex/opencode leads — the tools with native
+  // fork support (same gate as the worker); the lead rewinds conversation-only.
+  const canRewind = leadTool === "claude" || leadTool === "codex" || leadTool === "opencode";
+
+  // Dialog confirm: the backend truncates from the picked message on and
+  // returns its text — prefill the composer with it. The "rewound" push
+  // reloads the timeline independently (store listener).
+  const confirmRewind = async () => {
+    if (rewindId == null) return;
+    // lang mirrors lead_send: a rewind-triggered engine rebuild (cold start)
+    // would otherwise stick the lead to the default "en" for this run.
+    const r = await api.leadRewind(tid, rewindId, currentLang());
+    setPrefill((p) => ({ text: r.rewound_text, seq: p.seq + 1 }));
+  };
 
   // 重载会话:先注入新启用的 skill 到 lead cwd(并标记静默 re-spawn,claude 下条消息拾取),
   // **注入完成后**再 bump skillsDirtyAt,让带外 meta effect 重扫 cwd —— 避免重扫抢在
@@ -273,8 +295,11 @@ export function LeadTab({
           onReorder={(order) => void api.leadReorderQueue(tid, order)}
           onOpenTestPlan={compact ? undefined : () => setLeadRail("tests")}
           testCaseCount={testCaseCount}
+          onRewind={canRewind ? (id) => setRewindId(id) : undefined}
         />
         <ChatComposer
+          key={prefill.seq}
+          initialValue={prefill.text}
           slashCommands={leadSlash[tid] ?? []}
           localSlash={localSlash}
           onLocalSlash={onLocalSlash}
@@ -288,6 +313,7 @@ export function LeadTab({
           }
           onStop={() => void interruptLead(tid)}
           onNeedSlashCommands={() => discoverLeadSlash(tid)}
+          onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
           onTakeOver={async () => {
             const st = await api.leadState(tid);
             if (!st.native_id) return false;
@@ -345,6 +371,22 @@ export function LeadTab({
             </DialogContent>
           )}
         </Dialog>
+        <RewindDialog
+          open={rewindId != null}
+          onOpenChange={(o) => {
+            if (!o) setRewindId(null);
+          }}
+          onConfirm={confirmRewind}
+        />
+        <RewindPickerDialog
+          open={pickerOpen}
+          onOpenChange={setPickerOpen}
+          messages={msgs}
+          onPick={(id) => {
+            setPickerOpen(false);
+            setRewindId(id);
+          }}
+        />
       </section>
 
       {rail === "info" && (

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { FolderTree, GitCompare, Info } from "lucide-react";
 import { useStore } from "../state/store";
 import { api } from "../lib/api";
-import type { EnabledSkill, ObserveRef } from "../lib/types";
+import type { EnabledSkill, ObserveRef, RewindMode } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
 import { ChatComposer } from "./ChatComposer";
@@ -12,6 +12,7 @@ import { FileTreePanel } from "./FileTreePanel";
 import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
+import { ALL_REWIND_MODES, RewindDialog, RewindPickerDialog } from "./RewindDialog";
 import { appLink, resumeCommand } from "../lib/resume";
 import { useImeComposition } from "../lib/useImeComposition";
 
@@ -49,6 +50,12 @@ export function WorkerConversation() {
   const [rail, setRail] = useState<"info" | "diff" | "files" | "none">("info");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
+  // Conversation rewind: the message id awaiting confirm (null = dialog closed),
+  // the Esc-Esc picker's open flag, and the composer prefill (seq bumps to
+  // remount-inject the rewound text).
+  const [rewindId, setRewindId] = useState<number | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [prefill, setPrefill] = useState<{ text: string; seq: number }>({ text: "", seq: 0 });
 
   const directionId = viewing?.directionId ?? null;
   const repoId = viewing?.repoId ?? null;
@@ -183,6 +190,22 @@ export function WorkerConversation() {
   // unlike the async `ref` — so relative file refs resolve against this worker.
   const cwd = live?.info.worktree ?? ref?.worktree;
 
+  // Conversation rewind (Phase 1) is scoped to claude/codex/opencode workers —
+  // the tools with native fork support; others get no rewind affordance at all.
+  const canRewind =
+    sid != null && (ref?.tool === "claude" || ref?.tool === "codex" || ref?.tool === "opencode");
+
+  // Dialog confirm: the backend truncates from the picked message on (and, for
+  // the code modes, restores the worktree), then returns the message's text —
+  // prefill the composer with it only when the conversation was rewound (a
+  // code-only rewind leaves the chat untouched, so its text would be noise).
+  // The "rewound" push reloads the timeline independently (store listener).
+  const confirmRewind = async (mode: RewindMode) => {
+    if (sid == null || rewindId == null) return;
+    const r = await api.chatRewind(sid, rewindId, mode);
+    if (mode !== "code") setPrefill((p) => ({ text: r.rewound_text, seq: p.seq + 1 }));
+  };
+
   // 重载会话:先让 flagSessionSkillRefresh 把新启用的 skill 注入 cwd(并标记静默 re-spawn),
   // **注入完成后**再 bump skillsDirtyAt —— 上面的带外 meta effect 据此重扫 cwd。若先 bump,
   // 重扫会抢在 inject_for 之前跑、把陈旧/空列表当权威合并,且之后没有触发再纠正。
@@ -268,8 +291,11 @@ export function WorkerConversation() {
             onRemove={sid != null ? (id) => void api.chatDequeue(sid, id) : undefined}
             onEdit={sid != null ? (id, text) => void api.chatEditQueued(sid, id, text) : undefined}
             onReorder={sid != null ? (order) => void api.chatReorderQueue(sid, order) : undefined}
+            onRewind={canRewind ? (id) => setRewindId(id) : undefined}
           />
           <ChatComposer
+            key={prefill.seq}
+            initialValue={prefill.text}
             slashCommands={(sid != null ? workerSlash[sid] : undefined) ?? []}
             onNeedSlashCommands={() => sid != null && discoverWorkerSlash(sid)}
             tool={ref?.tool}
@@ -279,6 +305,7 @@ export function WorkerConversation() {
             placeholder={loadError ?? t("session.message")}
             onSend={(v, images, fs) => sendToWorker(directionId, repoId, v, images, fs)}
             onStop={() => sid != null && void api.chatInterrupt(sid)}
+            onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
             onTakeOver={async () => {
               if (!ref || !nativeId || sid == null) return false;
               await api.chatStop(sid);
@@ -321,6 +348,24 @@ export function WorkerConversation() {
           onClose={() => setRail("info")}
         />
       )}
+
+      <RewindDialog
+        open={rewindId != null}
+        onOpenChange={(o) => {
+          if (!o) setRewindId(null);
+        }}
+        onConfirm={confirmRewind}
+        modes={ALL_REWIND_MODES}
+      />
+      <RewindPickerDialog
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        messages={msgs}
+        onPick={(id) => {
+          setPickerOpen(false);
+          setRewindId(id);
+        }}
+      />
     </div>
   );
 }

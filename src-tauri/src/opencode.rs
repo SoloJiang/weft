@@ -201,8 +201,9 @@ async fn ensure_base(command: &str) -> anyhow::Result<String> {
 }
 
 /// Read a child stream to EOF, sending the first `http://…` URL found and
-/// discarding the rest (so the child never blocks on a full pipe).
-fn drain_for_url<R: AsyncRead + Unpin + Send + 'static>(
+/// discarding the rest (so the child never blocks on a full pipe). Shared
+/// with the rewind fork's temporary serve (`lead_chat::rewind`).
+pub(crate) fn drain_for_url<R: AsyncRead + Unpin + Send + 'static>(
     stream: Option<R>,
     tx: tokio::sync::mpsc::Sender<String>,
 ) {
@@ -218,7 +219,7 @@ fn drain_for_url<R: AsyncRead + Unpin + Send + 'static>(
 }
 
 /// Extract `http://host:port` from a serve log line (drops a trailing slash).
-fn parse_url(line: &str) -> Option<String> {
+pub(crate) fn parse_url(line: &str) -> Option<String> {
     let rest = &line[line.find("http://")?..];
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     Some(rest[..end].trim_end_matches('/').to_string())

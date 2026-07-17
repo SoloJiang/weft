@@ -275,6 +275,8 @@ pub async fn lead_engine(
         tool_rows: std::collections::HashMap::new(),
         stopped,
         codex_client: None,
+        turn_user_row: None,
+        last_assistant_uuid: None,
     };
     // Restore the last persisted meta snapshot so the Session panel is populated
     // right away after an app relaunch (not "after first message").
@@ -1132,6 +1134,8 @@ pub(crate) async fn chat_open_worker_impl(
                 tool_rows: std::collections::HashMap::new(),
                 stopped: sess.status == "stopped",
                 codex_client: None,
+                turn_user_row: None,
+                last_assistant_uuid: None,
             };
             // Restore the last persisted meta snapshot so the Session panel is
             // populated right away after an app relaunch (not "after first message").
@@ -1244,6 +1248,8 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         tool_rows: std::collections::HashMap::new(),
         stopped: sess.status == "stopped",
         codex_client: None,
+        turn_user_row: None,
+        last_assistant_uuid: None,
     };
     // Same persisted-meta restore as chat_open_worker_impl: this constructor
     // also races a fresh relaunch (slash discovery / direct chat_send), and an
@@ -1318,6 +1324,46 @@ pub async fn chat_reorder_queue(app: AppHandle, db: State<'_, Db>, session_id: i
         engine::queue_reorder(&app, &db, &eng, order).await.map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn chat_rewind(
+    app: AppHandle,
+    db: State<'_, Db>,
+    session_id: i32,
+    message_id: i32,
+    mode: String,
+) -> Result<engine::RewindOutcome, String> {
+    let mode = engine::RewindMode::parse(&mode)?;
+    // worker_engine (not a bare state lookup) so a restored session's engine
+    // is rebuilt first — rewind must work right after an app relaunch too.
+    let eng = worker_engine(&app, &db, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    engine::rewind(&app, &db, &eng, message_id, mode)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Lead-console conversation rewind (also covers curator threads — they run
+/// lead-kind engines keyed by -thread_id). Conversation only: the lead has no
+/// worktree, so there is no code half to restore.
+#[tauri::command]
+pub async fn lead_rewind(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+    message_id: i32,
+    lang: Option<String>,
+) -> Result<engine::RewindOutcome, String> {
+    // lead_engine (not a bare state lookup) so the engine is rebuilt first —
+    // rewind must work right after an app relaunch too.
+    let eng = lead_engine(&app, &db, thread_id, lang.as_deref().unwrap_or("en"))
+        .await
+        .map_err(|e| e.to_string())?;
+    engine::rewind(&app, &db, &eng, message_id, engine::RewindMode::Conversation)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

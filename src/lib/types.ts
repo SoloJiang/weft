@@ -220,10 +220,16 @@ export interface LeadMessage {
     | "action_card"
     | "plan_card"
     | "test_cases"
-    | "settled";
+    | "settled"
+    /** Marker row the backend inserts where a conversation rewind truncated the
+     *  timeline; content is {"from_message_id": number, "deleted": number}. */
+    | "rewind";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
+  /** Engine-side rewind anchor (claude assistant uuid / codex turn id), recorded
+   *  on the user row that opened a turn. Backend-owned; the UI never reads it. */
+  native_anchor?: string | null;
   created_at: string;
 }
 
@@ -296,7 +302,32 @@ export type LeadChatPush =
       message_id: number;
       content: string;
       status: string;
+    }
+  | {
+      /** A conversation rewind truncated this thread's rows for one session
+       *  (null = lead console): reload the thread's messages. */
+      type: "rewound";
+      thread_id: number;
+      session_id: number | null;
     };
+
+/** Rewind scope for `chat_rewind`: the conversation rows, the worktree code
+ *  (files restored to before the message, uncommitted changes overwritten with
+ *  a safety snapshot kept), or both. The lead console only ever uses
+ *  "conversation" (via `lead_rewind`, which takes no mode). */
+export type RewindMode = "conversation" | "code" | "both";
+
+/** Result of `chat_rewind` / `lead_rewind`: the selected message's text (goes
+ *  back into the composer for edit/resend — only meaningful when the
+ *  conversation was rewound), how many rows were deleted, the session's new
+ *  native id (null = a fresh native session starts on next send), and whether
+ *  worktree files were restored. */
+export interface RewindOutcome {
+  rewound_text: string;
+  deleted: number;
+  native_id: string | null;
+  code_restored: boolean;
+}
 
 /** One slash command for the composer palette: the token plus whatever metadata
  *  the CLI reported (claude adds description + arg hint; opencode adds a

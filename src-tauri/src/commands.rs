@@ -134,7 +134,10 @@ async fn delete_workspace_after_fence(
         .await
         .map_err(e)?;
     extend_removed_repo_paths(db, &mut repo_paths, &removed).await?;
-    for (repo_id, path, branch, created_branch, created_checkout) in &removed {
+    for (wt_id, repo_id, path, branch, created_branch, created_checkout) in &removed {
+        // The worktree's code-checkpoint shadow repo goes with it (its rows
+        // were already deleted by the cascade).
+        crate::checkpoint::remove_shadow(*wt_id);
         let Some(repo_path) = repo_paths.get(repo_id) else {
             continue;
         };
@@ -158,9 +161,9 @@ async fn delete_workspace_after_fence(
 async fn extend_removed_repo_paths(
     db: &Db,
     repo_paths: &mut std::collections::HashMap<i32, String>,
-    removed: &[(i32, String, String, bool, bool)],
+    removed: &[(i32, i32, String, String, bool, bool)],
 ) -> R<()> {
-    for (repo_id, _, _, _, _) in removed {
+    for (_, repo_id, _, _, _, _) in removed {
         if repo_paths.contains_key(repo_id) {
             continue;
         }
@@ -639,7 +642,10 @@ pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
     // cleanup_worktrees needs for the git path lookup); instead we use the
     // pre-fetched path directly.
     let repo_path = std::path::Path::new(&repo.local_git_path);
-    for (_repo_id, path, branch, created_branch, created_checkout) in &removed {
+    for (wt_id, _repo_id, path, branch, created_branch, created_checkout) in &removed {
+        // The worktree's code-checkpoint shadow repo goes with it (its rows
+        // were already deleted by the cascade).
+        crate::checkpoint::remove_shadow(*wt_id);
         if *created_checkout {
             if let Err(err) = crate::git::remove_worktree(repo_path, std::path::Path::new(path)) {
                 eprintln!("[weft] worktree remove failed for {path}: {err}");
@@ -2486,6 +2492,7 @@ mod tests {
             repo_ref.local_git_path.clone(),
         )]);
         let removed = vec![(
+            1,
             external_repo.id,
             "/tmp/api-wt".to_string(),
             "feature/api".to_string(),
