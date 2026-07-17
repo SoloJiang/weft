@@ -3656,21 +3656,23 @@ async fn rewind_reserved(
     // turn's end = the native state right before the target was sent).
     let prev_user = session_rows[..pos].iter().rev().find(|m| m.role == "user");
     let anchor = prev_user.and_then(|m| m.native_anchor.clone());
-    // Fallback ordinal for claude's text cut: the target's 1-based position
-    // among same-text user rows of this session, up to and including itself.
-    // Counted under the SAME whitespace-normalized identity the transcript
-    // cut uses (rewind::ordinal_of), or a `hello  world`/`hello world` pair
-    // would fork at a different point than the timeline truncates at.
+    // The text the native side actually stores: send() appends attachment
+    // instructions/spill paths, so the match must use the reconstructed
+    // DISPATCHED text (the raw content.text only ever matches bare messages).
+    // The composer prefill still uses the raw rewound_text.
+    let per_turn_tool = per_turn(&snap.tool);
+    let match_text = super::rewind::dispatched_text(per_turn_tool, target.id, &target.content);
+    // Fallback ordinal for claude's/opencode's text cut: the target's 1-based
+    // position among same-text user rows of this session, up to and including
+    // itself. Counted under the SAME whitespace-normalized identity the
+    // transcript cut uses (rewind::ordinal_of), or a `hello  world`/`hello
+    // world` pair would fork at a different point than the timeline truncates.
     let user_texts: Vec<String> = session_rows[..=pos]
         .iter()
         .filter(|m| m.role == "user")
-        .filter_map(|m| {
-            serde_json::from_str::<serde_json::Value>(&m.content)
-                .ok()
-                .and_then(|v| v["text"].as_str().map(String::from))
-        })
+        .map(|m| super::rewind::dispatched_text(per_turn_tool, m.id, &m.content))
         .collect();
-    let ordinal = super::rewind::ordinal_of(&user_texts, &rewound_text);
+    let ordinal = super::rewind::ordinal_of(&user_texts, &match_text);
 
     // Resolve the session's worktree ONCE: mandatory for the code half,
     // best-effort for a conversation-only rewind (it only drives the
@@ -3715,7 +3717,7 @@ async fn rewind_reserved(
                                 return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
                             }
                             super::rewind::ClaudeCut::BeforeUserText {
-                                text: rewound_text.clone(),
+                                text: match_text.clone(),
                                 ordinal,
                             }
                         }
@@ -3754,7 +3756,7 @@ async fn rewind_reserved(
                     }
                     let program = crate::tool_command::effective(snap.command.as_deref(), &snap.tool);
                     Some(
-                        super::rewind::fork_opencode_at(&program, &snap.cwd, old, &rewound_text, ordinal)
+                        super::rewind::fork_opencode_at(&program, &snap.cwd, old, &match_text, ordinal)
                             .await?,
                     )
                 }
@@ -3764,9 +3766,17 @@ async fn rewind_reserved(
     };
 
     // The code restore runs after the fork and before the restart: both halves
-    // land (or fail) while the session is still fully intact.
+    // land (or fail) while the session is still fully intact. It is refused
+    // while a sibling session on the same worktree is mid-turn (the rewind
+    // reservation only covers THIS engine), and serialized against concurrent
+    // shadow ops via the per-worktree op lock.
     let mut code_restored = false;
     if let Some(t) = code_target {
+        if sibling_turn_busy(app, db, t.direction_id, t.repo_id, t.session_id).await? {
+            return Err(anyhow::anyhow!("另一个会话正在使用该 worktree，请先中断它"));
+        }
+        let op_lock = crate::checkpoint::op_lock(t.worktree_id);
+        let _op = op_lock.lock().await;
         code_restored = tokio::task::spawn_blocking(move || {
             crate::checkpoint::restore(
                 &t.path,
@@ -3889,6 +3899,9 @@ async fn snapshot_turn_checkpoint_impl(
         return Ok(());
     }
     let shadow = crate::checkpoint::shadow_repo_for(wt.id)?;
+    // Serialized per worktree: sibling sessions share one shadow index.
+    let op_lock = crate::checkpoint::op_lock(wt.id);
+    let _op = op_lock.lock().await;
     let snap = tokio::task::spawn_blocking(move || {
         crate::checkpoint::snapshot(&path, &shadow, session_id, turn_id)
     })
@@ -3910,6 +3923,9 @@ async fn snapshot_turn_checkpoint_impl(
 /// mutation begins.
 struct CodeTarget {
     session_id: i32,
+    worktree_id: i32,
+    direction_id: i32,
+    repo_id: i32,
     path: std::path::PathBuf,
     shadow: std::path::PathBuf,
     base_commit: String,
@@ -3938,12 +3954,42 @@ async fn resolve_code_target(
     };
     Ok(CodeTarget {
         session_id: sid,
+        worktree_id: wt.id,
+        direction_id: wt.direction_id,
+        repo_id: wt.repo_id,
         path: std::path::PathBuf::from(&wt.path),
         shadow: crate::checkpoint::shadow_repo_for(wt.id)?,
         base_commit: wt.base_commit.clone(),
         shadow_sha: ckpt.shadow_sha,
         head_sha: ckpt.head_sha,
     })
+}
+
+/// True when a DIFFERENT session sharing this (direction, repo) worktree has
+/// a turn in flight — a code restore would wipe its edits mid-write. The
+/// rewind reservation only covers this session's own engine, so siblings are
+/// checked explicitly. (Best-effort, not airtight: a sibling can still start
+/// after this check, a sub-second window the restore's safety backup covers.)
+async fn sibling_turn_busy(
+    app: &AppHandle,
+    db: &Db,
+    direction_id: i32,
+    repo_id: i32,
+    our_session_id: i32,
+) -> anyhow::Result<bool> {
+    let sessions = repo::sessions_for(db, direction_id, repo_id).await?;
+    let state = app.state::<LeadChatState>();
+    for s in sessions {
+        if s.id == our_session_id {
+            continue;
+        }
+        if let Some(e) = state.get(s.id as i64) {
+            if e.lock().await.turn.busy {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// The rewind divider row: one system/rewind marker inserted where the

@@ -23,6 +23,18 @@ const EXCLUDES: &[&str] = &[
     "__pycache__/",
 ];
 
+/// Worktree-scoped serialization for shadow mutations: sibling sessions of
+/// one worktree share ONE shadow repo (a single mutable index), and a restore
+/// rewrites the worktree itself — a snapshot and a restore (or two restores)
+/// from different sessions must never interleave.
+static OP_LOCKS: std::sync::LazyLock<dashmap::DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// The per-worktree lock serializing shadow mutations (snapshot AND restore).
+pub fn op_lock(worktree_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    OP_LOCKS.entry(worktree_id).or_default().clone()
+}
+
 /// `<weft_home>/checkpoints/<worktree_id>.git` — the shadow bare repo for one
 /// worktree. The parent dir is created; the repo itself is `git init --bare`'d
 /// lazily on the first snapshot.
@@ -115,6 +127,20 @@ pub fn restore(
     // `clean` removes it. Ignored/excluded files are untouched (no -x).
     sync_excludes(shadow, wt)?;
     shadow_git(shadow, wt, &["read-tree", shadow_sha])?;
+    // A path that is ignored NOW but was tracked INTO the snapshot THEN (e.g.
+    // it became a machine-local secret after the checkpoint) must be left
+    // completely alone: `clean` already skips ignored paths, but
+    // `checkout-index -f` would overwrite their current contents first. Prune
+    // them from the shadow index so neither step can touch them.
+    let ignored = shadow_git(shadow, wt, &["ls-files", "-c", "-i", "-z", "--exclude-standard"])?;
+    if !ignored.is_empty() {
+        shadow_git_stdin(
+            shadow,
+            wt,
+            &["update-index", "--force-remove", "-z", "--stdin"],
+            ignored.as_bytes(),
+        )?;
+    }
     shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
     shadow_git(shadow, wt, &["clean", "-fd"])?;
     Ok(true)
@@ -264,6 +290,38 @@ fn shadow_git(shadow: &Path, wt: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// [`shadow_git`] variant feeding `input` to stdin (for `-z --stdin` plumbing
+/// like bulk `update-index`). Stdout is NOT captured (nothing to return).
+fn shadow_git_stdin(shadow: &Path, wt: &Path, args: &[&str], input: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .env("PATH", crate::detect::tool_path())
+        .arg(format!("--git-dir={}", shadow.display()))
+        .arg(format!("--work-tree={}", wt.display()))
+        .args(args)
+        .current_dir(wt)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn git {:?}", args))?;
+    if let Some(mut s) = child.stdin.take() {
+        // Dropped on scope end → EOF for the reader.
+        let _ = s.write_all(input);
+    }
+    let out = child
+        .wait_with_output()
+        .with_context(|| format!("wait git {:?}", args))?;
+    if !out.status.success() {
+        bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
 }
 
 /// Run git in the worktree's REAL repo (HEAD read / reset / ancestry checks).
@@ -631,6 +689,39 @@ mod tests {
             std::fs::read_to_string(wt.join("machine.local")).expect("machine.local survives"),
             "do-not-lose",
             "path ignored via repo-local core.excludesFile must survive"
+        );
+    }
+
+    /// Codex-review round 4: a file tracked into a snapshot and ignored ONLY
+    /// LATER (it became a machine-local secret after the checkpoint) must be
+    /// left completely alone — `clean` already skips ignored paths, and now
+    /// `checkout-index` can't overwrite their current contents either.
+    #[test]
+    fn restore_leaves_newly_ignored_tracked_file_alone() {
+        let (_dir, wt, shadow, base) = fixture();
+        // secret.local exists (untracked) and is NOT ignored at snapshot time.
+        std::fs::write(wt.join("secret.local"), "old-secret").expect("secret v1");
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        // Sanity: it WAS tracked into the snapshot (the exact scenario).
+        let listed = Command::new("git")
+            .arg(format!("--git-dir={}", shadow.display()))
+            .args(["ls-tree", "-r", "--name-only", &first.shadow_sha])
+            .current_dir(&wt)
+            .output()
+            .expect("ls-tree");
+        assert!(String::from_utf8_lossy(&listed.stdout).contains("secret.local"));
+        // Only NOW does it become ignored (it turned machine-specific) and change.
+        std::fs::write(wt.join(".git/info/exclude"), "secret.local\n").expect("info/exclude");
+        std::fs::write(wt.join("secret.local"), "new-secret").expect("secret v2");
+        std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
+
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("secret.local")).expect("secret.local untouched"),
+            "new-secret",
+            "newly-ignored file must keep its CURRENT contents, not the snapshot's"
         );
     }
 }

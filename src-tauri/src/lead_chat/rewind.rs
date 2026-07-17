@@ -15,6 +15,50 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _, Result};
 use serde_json::Value;
 
+/// Rebuild the EXACT text the engine dispatched to the agent for a user row
+/// (the transcript stores this, not the raw input): `send` appends attachment
+/// instructions and spilled-image paths to the prompt, so a native text match
+/// built from the raw `content.text` can never hit for attachment-bearing
+/// messages. Mirrors the construction in engine's send() — keep in sync with
+/// it. Images spill under `<tmp>/weft-attachments/msg<row_id>-<i>.<ext>`;
+/// send() only appends a path when the spill write succeeded, so a failed
+/// spill degrades to the same honest no-match as before.
+///
+/// `per_turn_tool` selects the dialect path: per-turn dialects (codex exec,
+/// opencode) get the image-spill appendix; resident claude gets images inline
+/// (no appendix in the text block).
+pub(crate) fn dispatched_text(per_turn_tool: bool, row_id: i32, content_json: &str) -> String {
+    let v: Value = serde_json::from_str(content_json).unwrap_or_default();
+    let mut out = v["text"].as_str().unwrap_or_default().to_string();
+    let mut list = |key: &str| -> Vec<String> {
+        v[key]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    let files = list("files");
+    if !files.is_empty() {
+        out.push_str("\n\nAttached files (read them as needed):\n");
+        for f in &files {
+            out.push_str(&format!("- {f}\n"));
+        }
+    }
+    let images = list("images");
+    if per_turn_tool && !images.is_empty() {
+        let dir = std::env::temp_dir().join("weft-attachments");
+        out.push_str("\n\nAttached images (read them as needed):\n");
+        for (i, uri) in images.iter().enumerate() {
+            let mt = uri
+                .strip_prefix("data:")
+                .and_then(|r| r.split(';').next())
+                .unwrap_or_default();
+            let ext = mt.rsplit('/').next().unwrap_or("png");
+            out.push_str(&format!("- {}\n", dir.join(format!("msg{row_id}-{i}.{ext}")).display()));
+        }
+    }
+    out
+}
+
 /// Where to cut the claude transcript.
 pub enum ClaudeCut {
     /// Keep everything up to AND including the line carrying this assistant
@@ -408,8 +452,10 @@ fn match_user_cut(messages: &[Value], text: &str, ordinal: usize) -> Option<Stri
         // system-prompt prefixing in the argv), so a looser rule (e.g. an
         // ends-with tolerance) can mistake an earlier message that merely
         // ENDS WITH the target text for the target itself — forking at the
-        // wrong point while the timeline truncates at the right one.
-        if stored == want || strip_outer_quotes(&stored) == want {
+        // wrong point while the timeline truncates at the right one. Both
+        // forms are compared whitespace-normalized (the quote strip can leave
+        // an edge space when text ends just before the closing quote).
+        if stored == want || normalize_ws(strip_outer_quotes(&stored)) == want {
             seen += 1;
             if seen == ordinal {
                 return m["info"]["id"].as_str().map(String::from);
@@ -853,5 +899,34 @@ mod tests {
         assert_eq!(ordinal_of(&texts, "hello world"), 2);
         assert_eq!(ordinal_of(&texts, "absent"), 0);
         assert_eq!(ordinal_of(&texts, ""), 0);
+    }
+
+    /// Codex-review round 4: the native text match must use the DISPATCHED
+    /// text (send() appends attachment instructions/spill paths), not the raw
+    /// content.text — otherwise attachment-bearing messages never match.
+    #[test]
+    fn dispatched_text_rebuilds_attachment_appendices() {
+        // Bare message: identity.
+        let bare = r#"{"text":"hello","images":[],"files":[]}"#;
+        assert_eq!(dispatched_text(false, 7, bare), "hello");
+        assert_eq!(dispatched_text(true, 7, bare), "hello");
+        // Files: same appendix for every dialect.
+        let with_files = r#"{"text":"check this","images":[],"files":["src/a.rs","b.md"]}"#;
+        let want_files = "check this\n\nAttached files (read them as needed):\n- src/a.rs\n- b.md\n";
+        assert_eq!(dispatched_text(false, 7, with_files), want_files);
+        assert_eq!(dispatched_text(true, 7, with_files), want_files);
+        // Images: spilled only for per-turn dialects, keyed by the row id.
+        let with_img = r#"{"text":"look","images":["data:image/png;base64,iVBOR"],"files":[]}"#;
+        let tmp = std::env::temp_dir().join("weft-attachments");
+        let want_img = format!(
+            "look\n\nAttached images (read them as needed):\n- {}\n",
+            tmp.join("msg7-0.png").display()
+        );
+        assert_eq!(dispatched_text(true, 7, with_img), want_img);
+        assert_eq!(dispatched_text(false, 7, with_img), "look", "resident claude gets images inline");
+        // Reconstructed text drives the native match: a stored opencode user
+        // message holding the QUOTED dispatched form matches.
+        let msgs = vec![oc_user("m1", &[&format!("\"{want_files}\"")])];
+        assert_eq!(match_user_cut(&msgs, want_files, 1).as_deref(), Some("m1"));
     }
 }

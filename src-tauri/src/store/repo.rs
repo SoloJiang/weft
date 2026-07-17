@@ -1723,6 +1723,16 @@ pub async fn sessions_for_repo(db: &Db, repo_id: i32) -> Result<Vec<session::Mod
         .await?)
 }
 
+/// Every session ever opened for one (direction, repo) slot — normally one,
+/// but racing opens can create more; rewind's sibling-busy guard needs them.
+pub async fn sessions_for(db: &Db, direction_id: i32, repo_id: i32) -> Result<Vec<session::Model>> {
+    Ok(session::Entity::find()
+        .filter(session::Column::DirectionId.eq(direction_id))
+        .filter(session::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?)
+}
+
 // ---- chat timeline (lead console + chat-mode workers) ----
 
 #[allow(clippy::too_many_arguments)]
