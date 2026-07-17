@@ -50,6 +50,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0036LeadMessageNativeAnchor),
             Box::new(M0037CodeCheckpoint),
             Box::new(M0038CodeCheckpointNestedRepos),
+            Box::new(M0039CodeCheckpointIndexTree),
         ]
     }
 }
@@ -1707,6 +1708,51 @@ impl MigrationTrait for M0038CodeCheckpointNestedRepos {
     }
 }
 
+/// Adds `index_tree` (TEXT, default '') to `code_checkpoint`: the tree of the
+/// real repo's index at snapshot time, so a restore can put the user's staged
+/// state back instead of resetting the index to HEAD. Duplicate tolerated
+/// (fresh DBs reflect the entity already).
+pub struct M0039CodeCheckpointIndexTree;
+impl MigrationName for M0039CodeCheckpointIndexTree {
+    fn name(&self) -> &str {
+        "m0039_code_checkpoint_index_tree"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0039CodeCheckpointIndexTree {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("index_tree"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .drop_column(Alias::new("index_tree"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1856,7 +1902,7 @@ mod tests {
         use crate::store::Db;
 
         let db = Db::connect("sqlite::memory:").await.unwrap();
-        let c = insert_code_checkpoint(&db, 1, 7, 100, 1, "shadow-sha", "head-sha", "[\"gen\"]")
+        let c = insert_code_checkpoint(&db, 1, 7, 100, 1, "shadow-sha", "head-sha", "[\"gen\"]", "idx-1")
             .await
             .unwrap();
         let found = code_checkpoint_for(&db, 1, 100).await.unwrap().unwrap();
@@ -1865,6 +1911,8 @@ mod tests {
         assert_eq!(found.head_sha, "head-sha");
         // m0038: the nested-repos manifest column exists and round-trips.
         assert_eq!(found.nested_repos, "[\"gen\"]");
+        // m0039: the staged-index tree column exists and round-trips.
+        assert_eq!(found.index_tree, "idx-1");
     }
 
     /// M0029: raw-query path rewrites gateway components without touching

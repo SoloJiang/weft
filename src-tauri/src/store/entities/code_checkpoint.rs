@@ -29,6 +29,13 @@ pub struct Model {
     /// checkpoint) and keeps the ones that were already there.
     #[sea_orm(default_value = "[]")]
     pub nested_repos: String,
+    /// Tree of the REAL repo's index at snapshot time (`git write-tree`) — a
+    /// restore puts the staged state back exactly, instead of resetting the
+    /// index to HEAD and silently unstaging the user's pre-turn work. Empty
+    /// for checkpoints recorded before this column existed (restore falls
+    /// back to HEAD).
+    #[sea_orm(default_value = "")]
+    pub index_tree: String,
     pub created_at: String,
 }
 

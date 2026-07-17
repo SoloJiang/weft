@@ -3836,6 +3836,7 @@ async fn rewind_reserved(
                 &t.head_sha,
                 &t.base_commit,
                 &t.nested_repos,
+                &t.index_tree,
             )
         })
         .await??;
@@ -4049,6 +4050,7 @@ async fn snapshot_turn_checkpoint_impl(
         &snap.shadow_sha,
         &snap.head_sha,
         &serde_json::json!(snap.nested_repos).to_string(),
+        &snap.index_tree,
     )
     .await?;
     Ok(())
@@ -4069,6 +4071,9 @@ struct CodeTarget {
     /// Nested git repo dirs present at the checkpoint — the restore removes
     /// exactly the nested repos NOT in this manifest (created after it).
     nested_repos: Vec<String>,
+    /// Tree of the real index at the checkpoint ("" for pre-m0039 rows →
+    /// the restore falls back to HEAD).
+    index_tree: String,
 }
 
 /// The checkpoint a code rewind restores to. Errors honestly when the lane
@@ -4113,6 +4118,7 @@ async fn resolve_code_target(
         shadow_sha: ckpt.shadow_sha,
         head_sha: ckpt.head_sha,
         nested_repos,
+        index_tree: ckpt.index_tree,
     })
 }
 

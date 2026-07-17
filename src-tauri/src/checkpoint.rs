@@ -131,6 +131,9 @@ pub struct Snapshot {
     /// Nested git repo dirs (relative paths) present at snapshot time — the
     /// manifest a restore uses to delete only post-checkpoint nested repos.
     pub nested_repos: Vec<String>,
+    /// Tree of the REAL repo's index at snapshot time (`git write-tree`) — a
+    /// restore puts the user's staged state back exactly.
+    pub index_tree: String,
 }
 
 /// Snapshot the pre-turn state of worktree `wt` for session `session_id` (ref
@@ -145,10 +148,12 @@ pub fn snapshot(wt: &Path, shadow: &Path, session_id: i32, turn_id: i32) -> Resu
     )?;
     let head_sha = real_git(wt, &["rev-parse", "HEAD"])?;
     let nested_repos = list_nested_repos(wt)?;
+    let index_tree = real_git(wt, &["write-tree"])?;
     Ok(Snapshot {
         shadow_sha,
         head_sha,
         nested_repos,
+        index_tree,
     })
 }
 
@@ -172,12 +177,16 @@ pub fn list_nested_repos(wt: &Path) -> Result<Vec<String>> {
 }
 
 /// What a successful restore leaves behind for compensation: the safety
-/// snapshot of the PRE-restore state plus the real HEAD at that moment, so a
-/// failed LATER step (e.g. DB persistence) can put everything back.
+/// snapshot of the PRE-restore state plus the real HEAD and index tree at
+/// that moment, so a failed LATER step (e.g. DB persistence) can put
+/// everything back.
 #[derive(Clone, Debug)]
 pub struct RestoreReceipt {
     pub backup_sha: String,
     pub pre_head: String,
+    /// Tree of the real index BEFORE the restore — restored on rollback so a
+    /// staged pre-restore state survives the compensation too.
+    pub pre_index_tree: String,
 }
 
 /// Restore worktree `wt` to the checkpoint `shadow_sha` (the state BEFORE the
@@ -199,6 +208,7 @@ pub fn restore(
     head_sha: &str,
     base_commit: &str,
     recorded_nested: &[String],
+    index_tree: &str,
 ) -> Result<RestoreReceipt> {
     // Hard refusal (also enforced at rewind's resolve step): a worktree with
     // an initialized submodule can only ever be UNDER-restored — nested-repo
@@ -224,7 +234,12 @@ pub fn restore(
     // The receipt exists BEFORE any destructive step: a mid-restore failure
     // (a failed reset, read-tree, checkout, clean, or nested removal) rolls
     // everything back right here, not just the caller's later steps.
-    let receipt = RestoreReceipt { backup_sha, pre_head };
+    let pre_index_tree = real_git(wt, &["write-tree"])?;
+    let receipt = RestoreReceipt {
+        backup_sha,
+        pre_head,
+        pre_index_tree,
+    };
     let destructive = || -> Result<()> {
         if receipt.pre_head != head_sha {
             if !base_commit.is_empty()
@@ -252,12 +267,15 @@ pub fn restore(
         prune_ignored_from_index(shadow, wt)?;
         shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
         shadow_git(shadow, wt, &["clean", "-fd"])?;
-        // The real repo's INDEX must not stay staged with post-checkpoint
-        // content: worktree files are restored but a stale index would let the
-        // next commit record content the worktree no longer has. Resetting it
-        // to HEAD mirrors the restored state honestly (restored uncommitted
-        // changes show as plain unstaged edits).
-        real_git(wt, &["read-tree", "HEAD"])?;
+        // The real repo's INDEX goes back to the checkpoint's staged state
+        // exactly (the user's pre-turn staging is preserved, not flattened to
+        // HEAD); checkpoints recorded before index_tree existed fall back to
+        // HEAD (the round-10 stale-index guard's neutral state).
+        if index_tree.is_empty() {
+            real_git(wt, &["read-tree", "HEAD"])?;
+        } else {
+            real_git(wt, &["read-tree", index_tree])?;
+        }
         Ok(())
     };
     if let Err(e) = destructive() {
@@ -285,8 +303,8 @@ pub fn rollback_restore(wt: &Path, shadow: &Path, receipt: &RestoreReceipt) -> R
     shadow_git(shadow, wt, &["read-tree", &receipt.backup_sha])?;
     shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
     shadow_git(shadow, wt, &["clean", "-fd"])?;
-    // Same stale-index guard as restore: nothing staged may survive a rollback.
-    real_git(wt, &["read-tree", "HEAD"])?;
+    // And the staged state goes back to what it was before the restore.
+    real_git(wt, &["read-tree", &receipt.pre_index_tree])?;
     Ok(())
 }
 
@@ -700,7 +718,7 @@ mod tests {
         );
 
         let receipt =
-            restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
+            restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree).expect("restore");
         assert_eq!(receipt.pre_head, git_ok(&wt, &["rev-parse", "HEAD"]));
         assert_eq!(
             visible_files(&wt),
@@ -732,7 +750,7 @@ mod tests {
         let (_dir, wt, shadow, base) = fixture();
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
         std::fs::write(wt.join("added.txt"), "new").expect("add");
-        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
+        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree).expect("restore");
         // The backup captured the pre-restore (mutated) state: added.txt is in
         // its tree even though the restore removed it from the worktree.
         let backup = shadow_git(&shadow, &wt, &["rev-parse", "refs/heads/rewind-backup-s7"])
@@ -755,7 +773,7 @@ mod tests {
         git_ok(&wt, &["commit", "-qm", "agent commit"]);
         assert_ne!(git_ok(&wt, &["rev-parse", "HEAD"]), first.head_sha);
 
-        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
+        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree).expect("restore");
         assert_eq!(
             git_ok(&wt, &["rev-parse", "HEAD"]),
             first.head_sha,
@@ -788,7 +806,7 @@ mod tests {
             "head_sha must NOT be an ancestor of the rewritten HEAD"
         );
 
-        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
+        restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree).expect("restore");
         assert_eq!(
             git_ok(&wt, &["rev-parse", "HEAD"]),
             side_head,
@@ -823,6 +841,7 @@ mod tests {
             &first.head_sha,
             &bogus_base,
             &first.nested_repos,
+            &first.index_tree,
         );
         assert!(r.is_err(), "crossing base_commit must refuse");
         assert_eq!(
@@ -851,6 +870,7 @@ mod tests {
             &head_before,
             &base,
             &[],
+            "",
         );
         assert!(r.is_err(), "unknown checkpoint object must refuse");
         assert_eq!(git_ok(&wt, &["rev-parse", "HEAD"]), head_before, "HEAD untouched");
@@ -889,7 +909,7 @@ mod tests {
         std::fs::write(wt.join("secret.local"), "do-not-lose").expect("secret");
         // A file ignored only by .gitignore would survive `clean` too — but
         // secret.local is ignored only via the real repo's info/exclude.
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(
             std::fs::read_to_string(wt.join("a.txt")).expect("read"),
@@ -926,7 +946,7 @@ mod tests {
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
         std::fs::write(wt.join("a.txt"), "changed").expect("modify");
         std::fs::write(wt.join("machine.local"), "do-not-lose").expect("machine file");
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert_eq!(
@@ -959,7 +979,7 @@ mod tests {
         std::fs::write(wt.join("secret.local"), "new-secret").expect("secret v2");
         std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
 
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert_eq!(
@@ -988,7 +1008,7 @@ mod tests {
         std::fs::write(post.join("new.txt"), "post").expect("post file");
         std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
 
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert!(post.exists(), "restore leaves the nested repo in place");
@@ -1015,7 +1035,7 @@ mod tests {
         assert_eq!(first.nested_repos, vec!["vendor/lib".to_string()]);
         std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
 
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_err(), "checkpoint with nested repos must refuse");
         assert_eq!(
             std::fs::read_to_string(wt.join("a.txt")).expect("read"),
@@ -1048,7 +1068,7 @@ mod tests {
         }
         let before: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
 
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         #[cfg(unix)]
         {
             assert!(r.is_err(), "undeletable file must fail the restore mid-way");
@@ -1064,6 +1084,26 @@ mod tests {
         let _ = (r, before);
     }
 
+    /// Codex-review round 14: staged state at the checkpoint is restored
+    /// exactly — the user's pre-turn staging is NOT flattened to HEAD.
+    #[test]
+    fn restore_preserves_the_checkpoints_staged_index() {
+        let (_dir, wt, shadow, base) = fixture();
+        // User stages v2 of a.txt BEFORE the checkpoint.
+        std::fs::write(wt.join("a.txt"), "v2").expect("v2");
+        git_ok(&wt, &["add", "a.txt"]);
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        assert!(!first.index_tree.is_empty(), "index tree captured");
+        // Then the worktree drifts again (agent edit, unstaged).
+        std::fs::write(wt.join("a.txt"), "v3").expect("v3");
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "v2");
+        // The staged delta (v1 → v2) is staged again, not lost to HEAD (v1).
+        let staged = git_ok(&wt, &["diff", "--cached", "--name-only"]);
+        assert_eq!(staged, "a.txt", "the checkpoint's staged state is back");
+    }
+
     /// Codex-review round 8: rollback_restore puts branch and worktree back to
     /// the pre-restore state (compensation for a failed post-restore step).
     #[test]
@@ -1076,7 +1116,7 @@ mod tests {
         let before: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
 
         let receipt =
-            restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos)
+            restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree)
                 .expect("restore");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert!(!wt.join("drift.txt").exists(), "restore removed the new file");
@@ -1096,7 +1136,7 @@ mod tests {
         // Stage (not commit) a post-checkpoint change.
         std::fs::write(wt.join("a.txt"), "staged-v2").expect("modify");
         git_ok(&wt, &["add", "a.txt"]);
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert_eq!(
@@ -1146,7 +1186,7 @@ mod tests {
         assert!(has_initialized_submodules(&wt), "initialized submodule detected");
 
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_err(), "restore must refuse a submodule worktree");
         // A plain worktree (the rest of the suite) reports none.
         let (_d2, plain, _s2, _b2) = fixture();
@@ -1164,7 +1204,7 @@ mod tests {
         std::fs::write(cfg.join(".gitignore"), "secret.env\n").expect("nested gitignore");
         std::fs::write(cfg.join("secret.env"), "TOKEN=1").expect("secret");
         std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert_eq!(
@@ -1192,7 +1232,7 @@ mod tests {
         std::fs::write(wt.join(".gitignore"), "node_modules/\nsecret.env\n").expect("extend gitignore");
         std::fs::write(wt.join("secret.env"), "TOKEN=1").expect("secret");
         std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
-        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos, &first.index_tree);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert_eq!(

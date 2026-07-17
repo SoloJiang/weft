@@ -1876,6 +1876,7 @@ pub async fn insert_code_checkpoint(
     shadow_sha: &str,
     head_sha: &str,
     nested_repos: &str,
+    index_tree: &str,
 ) -> Result<code_checkpoint::Model> {
     let a = code_checkpoint::ActiveModel {
         worktree_id: Set(worktree_id),
@@ -1885,6 +1886,7 @@ pub async fn insert_code_checkpoint(
         shadow_sha: Set(shadow_sha.to_string()),
         head_sha: Set(head_sha.to_string()),
         nested_repos: Set(nested_repos.to_string()),
+        index_tree: Set(index_tree.to_string()),
         created_at: Set(now()),
         ..Default::default()
     };
@@ -3679,11 +3681,11 @@ mod tests {
         insert_lead_message(&db, t, Some(s.id), 2, "user", "text", "{}", "complete")
             .await
             .unwrap();
-        insert_code_checkpoint(&db, 11, s.id, m1.id, 1, "sha-1", "head-1", "[]")
+        insert_code_checkpoint(&db, 11, s.id, m1.id, 1, "sha-1", "head-1", "[]", "idx-1")
             .await
             .unwrap();
         // A checkpoint for the KEPT turn must survive the sweep.
-        insert_code_checkpoint(&db, 11, s.id, 999, 1, "sha-0", "head-0", "[]")
+        insert_code_checkpoint(&db, 11, s.id, 999, 1, "sha-0", "head-0", "[]", "")
             .await
             .unwrap();
 
@@ -3777,13 +3779,13 @@ mod tests {
     async fn code_checkpoint_insert_lookup_truncate() {
         let db = mem().await;
         // Rows need no live worktree/session (no FKs), so plain literals do.
-        let c1 = insert_code_checkpoint(&db, 11, 7, 100, 1, "sha-1", "head-1", "[\"gen\"]")
+        let c1 = insert_code_checkpoint(&db, 11, 7, 100, 1, "sha-1", "head-1", "[\"gen\"]", "idx-1")
             .await
             .unwrap();
-        insert_code_checkpoint(&db, 11, 7, 200, 2, "sha-2", "head-2", "[]")
+        insert_code_checkpoint(&db, 11, 7, 200, 2, "sha-2", "head-2", "[]", "")
             .await
             .unwrap();
-        insert_code_checkpoint(&db, 22, 8, 100, 1, "sha-other", "head-other", "[]")
+        insert_code_checkpoint(&db, 22, 8, 100, 1, "sha-other", "head-other", "[]", "")
             .await
             .unwrap();
 
