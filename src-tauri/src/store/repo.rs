@@ -1834,7 +1834,7 @@ pub async fn set_lead_message_anchor(db: &Db, message_id: i32, anchor: &str) -> 
 /// NULL) are untouched. Returns the deleted rows' ids (empty when the target
 /// isn't on this timeline).
 pub async fn truncate_lead_messages(
-    db: &Db,
+    c: &impl sea_orm::ConnectionTrait,
     thread_id: i32,
     session_id: Option<i32>,
     from_message_id: i32,
@@ -1848,7 +1848,7 @@ pub async fn truncate_lead_messages(
     let rows = q
         .order_by(Expr::cust("COALESCE(seq, id)"), Order::Asc)
         .order_by_asc(lead_message::Column::Id)
-        .all(&db.0)
+        .all(c)
         .await?;
     let Some(pos) = rows.iter().position(|m| m.id == from_message_id) else {
         return Ok(Vec::new());
@@ -1856,7 +1856,7 @@ pub async fn truncate_lead_messages(
     let ids: Vec<i32> = rows[pos..].iter().map(|m| m.id).collect();
     lead_message::Entity::delete_many()
         .filter(lead_message::Column::Id.is_in(ids.iter().copied()))
-        .exec(&db.0)
+        .exec(c)
         .await?;
     Ok(ids)
 }
@@ -1911,7 +1911,7 @@ pub async fn code_checkpoint_for(
 /// span, which reordered queued rows can break). The restore consumed the
 /// target's checkpoint BEFORE this runs. Returns rows deleted.
 pub async fn truncate_code_checkpoints(
-    db: &Db,
+    c: &impl sea_orm::ConnectionTrait,
     worktree_id: i32,
     lead_message_ids: &[i32],
 ) -> Result<u64> {
@@ -1921,9 +1921,97 @@ pub async fn truncate_code_checkpoints(
     Ok(code_checkpoint::Entity::delete_many()
         .filter(code_checkpoint::Column::WorktreeId.eq(worktree_id))
         .filter(code_checkpoint::Column::LeadMessageId.is_in(lead_message_ids.iter().copied()))
-        .exec(&db.0)
+        .exec(c)
         .await?
         .rows_affected)
+}
+
+/// Conversation rewind's persistence in ONE transaction: timeline truncation,
+/// the code-checkpoint sweep, and the fork's native id (worker session row or
+/// lead meta row). Any failure rolls ALL of it back — never a truncated
+/// timeline still pointing at the old native history (review P1).
+pub async fn rewind_persist(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    from_message_id: i32,
+    worktree_id: Option<i32>,
+    native_id: Option<&str>,
+) -> Result<Vec<i32>> {
+    use sea_orm::TransactionTrait;
+    let txn = db.0.begin().await?;
+    let deleted_ids = truncate_lead_messages(&txn, thread_id, session_id, from_message_id).await?;
+    if let Some(w) = worktree_id {
+        truncate_code_checkpoints(&txn, w, &deleted_ids).await?;
+    }
+    match session_id {
+        Some(sid) => {
+            if let Some(s) = session::Entity::find_by_id(sid).one(&txn).await? {
+                let mut a: session::ActiveModel = s.into();
+                a.native_session_id = Set(native_id.map(str::to_string));
+                a.update(&txn).await?;
+            }
+        }
+        None => set_lead_native_id_txn(&txn, thread_id, native_id).await?,
+    }
+    txn.commit().await?;
+    Ok(deleted_ids)
+}
+
+/// The lead native-id write inside [`rewind_persist`]'s transaction — mirrors
+/// `set_lead_native_id_opt` (merge into the meta row; clear deletes the row
+/// when nothing else is stored) but runs on the txn and skips
+/// insert_lead_message's thread fence (the truncation just proved it exists).
+async fn set_lead_native_id_txn(
+    c: &impl sea_orm::ConnectionTrait,
+    thread_id: i32,
+    native_id: Option<&str>,
+) -> Result<()> {
+    let meta = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("meta"))
+        .one(c)
+        .await?;
+    match (meta, native_id) {
+        (Some(m), Some(id)) => {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
+            v["native_id"] = serde_json::json!(id);
+            let mut a: lead_message::ActiveModel = m.into();
+            a.content = Set(v.to_string());
+            a.update(c).await?;
+        }
+        (Some(m), None) => {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("native_id");
+            }
+            if v.as_object().is_some_and(|o| o.is_empty()) {
+                lead_message::Entity::delete_by_id(m.id).exec(c).await?;
+            } else {
+                let mut a: lead_message::ActiveModel = m.into();
+                a.content = Set(v.to_string());
+                a.update(c).await?;
+            }
+        }
+        (None, Some(id)) => {
+            let content = serde_json::json!({ "native_id": id }).to_string();
+            let a = lead_message::ActiveModel {
+                thread_id: Set(thread_id),
+                turn_id: Set(0),
+                role: Set("system".to_string()),
+                kind: Set("meta".to_string()),
+                content: Set(content),
+                status: Set("complete".to_string()),
+                created_at: Set(now()),
+                ..Default::default()
+            };
+            a.insert(c).await?;
+        }
+        (None, None) => {}
+    }
+    Ok(())
 }
 
 /// Drop every checkpoint row of a worktree — cascade cleanup when the worktree
@@ -3490,7 +3578,7 @@ mod tests {
             .await
             .unwrap();
 
-        let deleted = truncate_lead_messages(&db, t, Some(7), cut.id)
+        let deleted = truncate_lead_messages(&db.0, t, Some(7), cut.id)
             .await
             .unwrap();
         assert_eq!(deleted.len(), 3);
@@ -3559,7 +3647,7 @@ mod tests {
 
         // Rewind to before b: only b and b_reply may go — an id-based cut
         // (id >= b.id) would also kill a and a_reply.
-        let deleted = truncate_lead_messages(&db, t, Some(7), b.id)
+        let deleted = truncate_lead_messages(&db.0, t, Some(7), b.id)
             .await
             .unwrap();
         assert_eq!(deleted, vec![b.id, b_reply.id]);
@@ -3570,6 +3658,52 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(remaining, vec![first.id, first_reply.id, a.id, a_reply.id]);
+    }
+
+    /// rewind_persist commits truncation + checkpoint sweep + native id in one
+    /// transaction (worker path here): all three effects visible after commit.
+    #[tokio::test]
+    async fn rewind_persist_is_atomic_and_complete() {
+        let db = mem().await;
+        let (_ws, r, _t, d) = worker_fixture(&db).await;
+        let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd")
+            .await
+            .unwrap();
+        set_session_native_id_opt(&db, s.id, Some("old-native"))
+            .await
+            .unwrap();
+        let t = d.thread_id;
+        let m1 = insert_lead_message(&db, t, Some(s.id), 1, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        insert_lead_message(&db, t, Some(s.id), 2, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        insert_code_checkpoint(&db, 11, s.id, m1.id, 1, "sha-1", "head-1", "[]")
+            .await
+            .unwrap();
+        // A checkpoint for the KEPT turn must survive the sweep.
+        insert_code_checkpoint(&db, 11, s.id, 999, 1, "sha-0", "head-0", "[]")
+            .await
+            .unwrap();
+
+        let deleted = rewind_persist(&db, t, Some(s.id), m1.id, Some(11), Some("new-native"))
+            .await
+            .unwrap();
+        assert_eq!(deleted.len(), 2, "both timeline rows deleted");
+        assert!(list_lead_messages(&db, t).await.unwrap().is_empty());
+        assert!(
+            code_checkpoint_for(&db, 11, m1.id).await.unwrap().is_none(),
+            "abandoned turn's checkpoint swept"
+        );
+        assert!(
+            code_checkpoint_for(&db, 11, 999).await.unwrap().is_some(),
+            "unrelated checkpoint kept"
+        );
+        assert_eq!(
+            get_session(&db, s.id).await.unwrap().unwrap().native_session_id,
+            Some("new-native".to_string())
+        );
     }
 
     #[tokio::test]
@@ -3664,7 +3798,7 @@ mod tests {
 
         // Truncate drops the checkpoints keyed by the deleted timeline rows of
         // THIS worktree only.
-        let deleted = truncate_code_checkpoints(&db, 11, &[100, 200]).await.unwrap();
+        let deleted = truncate_code_checkpoints(&db.0, 11, &[100, 200]).await.unwrap();
         assert_eq!(deleted, 2);
         assert!(code_checkpoint_for(&db, 11, 100).await.unwrap().is_none());
         assert!(

@@ -3843,24 +3843,21 @@ async fn rewind_reserved(
     }
 
     // Fork (and any restore) succeeded: restart the engine and persist the
-    // truncation + forked native id. A failure HERE, after a restore already
-    // happened, is compensated by rolling the worktree back to its
-    // pre-restore state — never half-applied.
+    // truncation + forked native id — atomically (one transaction), so a DB
+    // failure can't leave a truncated timeline pointing at the old native
+    // history. A failure HERE, after a restore already happened, is still
+    // compensated by rolling the worktree back to its pre-restore state.
     let persist = async {
         stop_quiet(eng).await;
-        let deleted_ids =
-            repo::truncate_lead_messages(db, snap.thread_id, snap.session_id, message_id).await?;
-        // The abandoned future's checkpoints die with its timeline (the
-        // restore above already consumed the target's own checkpoint).
-        if let Some(w) = &wt {
-            repo::truncate_code_checkpoints(db, w.id, &deleted_ids).await?;
-        }
-        // Persist the fork's native id AFTER the truncation: a fresh lead meta
-        // row inserted before the sweep would fall inside its id range.
-        match snap.session_id {
-            Some(sid) => repo::set_session_native_id_opt(db, sid, new_native.as_deref()).await?,
-            None => repo::set_lead_native_id_opt(db, snap.thread_id, new_native.as_deref()).await?,
-        }
+        let deleted_ids = repo::rewind_persist(
+            db,
+            snap.thread_id,
+            snap.session_id,
+            message_id,
+            wt.as_ref().map(|w| w.id),
+            new_native.as_deref(),
+        )
+        .await?;
         eng.lock().await.native_id = new_native.clone();
         Ok::<Vec<i32>, anyhow::Error>(deleted_ids)
     };
@@ -4041,6 +4038,13 @@ async fn resolve_code_target(
     let Some(ckpt) = repo::code_checkpoint_for(db, wt.id, message_id).await? else {
         return Err(anyhow::anyhow!("该消息没有代码检查点（旧会话或快照失败）"));
     };
+    // A nested repo present AT the checkpoint was never content-tracked — a
+    // restore would keep its post-checkpoint edits silently. Refuse honestly
+    // (restore bails on the same condition as a backstop).
+    let nested_repos: Vec<String> = serde_json::from_str(&ckpt.nested_repos).unwrap_or_default();
+    if !nested_repos.is_empty() {
+        return Err(anyhow::anyhow!("该检查点包含嵌套 git 仓库，暂不支持代码回退"));
+    }
     let Some(sid) = session_id else {
         return Err(anyhow::anyhow!("lead 会话没有 worktree，不支持代码回退"));
     };
@@ -4054,7 +4058,7 @@ async fn resolve_code_target(
         base_commit: wt.base_commit.clone(),
         shadow_sha: ckpt.shadow_sha,
         head_sha: ckpt.head_sha,
-        nested_repos: serde_json::from_str(&ckpt.nested_repos).unwrap_or_default(),
+        nested_repos,
     })
 }
 

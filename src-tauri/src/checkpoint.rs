@@ -195,6 +195,13 @@ pub fn restore(
     if has_initialized_submodules(wt) {
         bail!("worktree contains an initialized submodule — code rewind is not supported for it");
     }
+    // Same refusal for nested repos present AT the checkpoint: their contents
+    // were never tracked, so edits made inside them after the checkpoint
+    // would silently survive the rewind. (Repos created AFTER it are removed
+    // by the restore — that direction is exact.)
+    if !recorded_nested.is_empty() {
+        bail!("checkpoint contains pre-existing nested git repositories — code rewind is not supported for it");
+    }
     // Validate BEFORE any mutation: if the shadow repo lost the checkpoint
     // object, read-tree would fail AFTER a reset --hard already moved the
     // user's branch — refusing here keeps the worktree byte-identical.
@@ -202,58 +209,69 @@ pub fn restore(
         .context("checkpoint object missing from the shadow repo — refusing to touch the worktree")?;
     // Safety snapshot next: restoring without a backup would be unrecoverable.
     let backup_sha = snapshot_to_ref(wt, shadow, &backup_ref(session_id), "rewind backup")?;
-    let current = real_git(wt, &["rev-parse", "HEAD"])?;
-    if current != head_sha {
-        if !base_commit.is_empty()
-            && !real_git_ok(wt, &["merge-base", "--is-ancestor", base_commit, head_sha])
-        {
-            bail!(
-                "checkpoint HEAD {head_sha} no longer descends from the lane's base commit {base_commit} — refusing to reset"
-            );
-        }
-        if real_git_ok(wt, &["merge-base", "--is-ancestor", head_sha, "HEAD"]) {
-            real_git(wt, &["reset", "--hard", head_sha])?;
-        }
-    }
-    // Working-tree restore. `read-tree` replaces the shadow index wholesale
-    // (a plain `checkout <sha> -- .` would keep stale index entries from a
-    // LATER snapshot, and those files would then survive `clean`), so after
-    // `checkout-index` every path absent from the snapshot is untracked and
-    // `clean` removes it. Ignored/excluded files are untouched (no -x).
-    sync_excludes(shadow, wt)?;
-    shadow_git(shadow, wt, &["read-tree", shadow_sha])?;
-    // A path that is ignored NOW but was tracked INTO the snapshot THEN (e.g.
-    // it became a machine-local secret after the checkpoint) must be left
-    // completely alone: `clean` already skips ignored paths, but
-    // `checkout-index -f` would overwrite their current contents first. Prune
-    // them from the shadow index so neither step can touch them.
-    let ignored = shadow_git(shadow, wt, &["ls-files", "-c", "-i", "-z", "--exclude-standard"])?;
-    if !ignored.is_empty() {
-        shadow_git_stdin(
-            shadow,
-            wt,
-            &["update-index", "--force-remove", "-z", "--stdin"],
-            ignored.as_bytes(),
-        )?;
-    }
-    shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
-    shadow_git(shadow, wt, &["clean", "-fd"])?;
-    // `clean -fd` deliberately leaves nested git repositories (it needs -ff),
-    // so remove exactly the ones created AFTER the checkpoint — those absent
-    // from the snapshot's manifest. Ones recorded there stay untouched.
-    for d in list_nested_repos(wt)? {
-        if !recorded_nested.iter().any(|r| r == &d) {
-            let p = wt.join(&d);
-            if p.exists() {
-                std::fs::remove_dir_all(&p)
-                    .with_context(|| format!("remove post-checkpoint nested repo {}", p.display()))?;
+    let pre_head = real_git(wt, &["rev-parse", "HEAD"])?;
+    // The receipt exists BEFORE any destructive step: a mid-restore failure
+    // (a failed reset, read-tree, checkout, clean, or nested removal) rolls
+    // everything back right here, not just the caller's later steps.
+    let receipt = RestoreReceipt { backup_sha, pre_head };
+    let destructive = || -> Result<()> {
+        if receipt.pre_head != head_sha {
+            if !base_commit.is_empty()
+                && !real_git_ok(wt, &["merge-base", "--is-ancestor", base_commit, head_sha])
+            {
+                bail!(
+                    "checkpoint HEAD {head_sha} no longer descends from the lane's base commit {base_commit} — refusing to reset"
+                );
+            }
+            if real_git_ok(wt, &["merge-base", "--is-ancestor", head_sha, "HEAD"]) {
+                real_git(wt, &["reset", "--hard", head_sha])?;
             }
         }
+        // Working-tree restore. `read-tree` replaces the shadow index wholesale
+        // (a plain `checkout <sha> -- .` would keep stale index entries from a
+        // LATER snapshot, and those files would then survive `clean`), so after
+        // `checkout-index` every path absent from the snapshot is untracked and
+        // `clean` removes it. Ignored/excluded files are untouched (no -x).
+        sync_excludes(shadow, wt)?;
+        shadow_git(shadow, wt, &["read-tree", shadow_sha])?;
+        // A path that is ignored NOW but was tracked INTO the snapshot THEN (e.g.
+        // it became a machine-local secret after the checkpoint) must be left
+        // completely alone: `clean` already skips ignored paths, but
+        // `checkout-index -f` would overwrite their current contents first. Prune
+        // them from the shadow index so neither step can touch them.
+        let ignored = shadow_git(shadow, wt, &["ls-files", "-c", "-i", "-z", "--exclude-standard"])?;
+        if !ignored.is_empty() {
+            shadow_git_stdin(
+                shadow,
+                wt,
+                &["update-index", "--force-remove", "-z", "--stdin"],
+                ignored.as_bytes(),
+            )?;
+        }
+        shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
+        shadow_git(shadow, wt, &["clean", "-fd"])?;
+        // `clean -fd` deliberately leaves nested git repositories (it needs -ff),
+        // so remove exactly the ones created AFTER the checkpoint — those absent
+        // from the snapshot's manifest. Ones recorded there stay untouched.
+        for d in list_nested_repos(wt)? {
+            if !recorded_nested.iter().any(|r| r == &d) {
+                let p = wt.join(&d);
+                if p.exists() {
+                    std::fs::remove_dir_all(&p)
+                        .with_context(|| format!("remove post-checkpoint nested repo {}", p.display()))?;
+                }
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = destructive() {
+        // Self-compensate: leave the worktree exactly as restore found it.
+        if let Err(rb) = rollback_restore(wt, shadow, &receipt) {
+            return Err(e.context(format!("compensation rollback also failed: {rb}")));
+        }
+        return Err(e);
     }
-    Ok(RestoreReceipt {
-        backup_sha,
-        pre_head: current,
-    })
+    Ok(receipt)
 }
 
 /// Best-effort compensation when a step AFTER a successful restore fails
@@ -861,15 +879,11 @@ mod tests {
     #[test]
     fn restore_removes_only_post_checkpoint_nested_repos() {
         let (dir, wt, shadow, base) = fixture();
-        // A nested repo that exists BEFORE the checkpoint.
-        let pre = wt.join("vendor/lib");
-        std::fs::create_dir_all(&pre).expect("pre dir");
-        crate::git::init_repo(&pre).expect("init pre");
-        std::fs::write(pre.join("keep.txt"), "pre").expect("pre file");
-        git_ok(&pre, &["add", "-A"]);
-        git_ok(&pre, &["commit", "-qm", "pre"]);
+        // Round-9 semantics: a nested repo present AT the checkpoint makes the
+        // restore refuse (its contents are untracked); only ones created AFTER
+        // are removed. So this fixture's snapshot has an EMPTY manifest.
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
-        assert_eq!(first.nested_repos, vec!["vendor/lib".to_string()]);
+        assert!(first.nested_repos.is_empty());
 
         // A nested repo created AFTER the checkpoint (agent ran git init).
         let post = wt.join("gen/out");
@@ -882,12 +896,74 @@ mod tests {
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
         assert!(!post.exists(), "post-checkpoint nested repo removed");
+        let _ = dir;
+    }
+
+    /// Codex-review round 9: a checkpoint whose manifest names pre-existing
+    /// nested repos is refused outright (their contents are untracked — the
+    /// rewind would silently keep later edits).
+    #[test]
+    fn restore_refuses_checkpoint_with_nested_repos() {
+        let (dir, wt, shadow, base) = fixture();
+        let pre = wt.join("vendor/lib");
+        std::fs::create_dir_all(&pre).expect("pre dir");
+        crate::git::init_repo(&pre).expect("init pre");
+        std::fs::write(pre.join("keep.txt"), "pre").expect("pre file");
+        git_ok(&pre, &["add", "-A"]);
+        git_ok(&pre, &["commit", "-qm", "pre"]);
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        assert_eq!(first.nested_repos, vec!["vendor/lib".to_string()]);
+        std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
+
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        assert!(r.is_err(), "checkpoint with nested repos must refuse");
         assert_eq!(
-            std::fs::read_to_string(pre.join("keep.txt")).expect("pre kept"),
-            "pre",
-            "pre-existing nested repo must survive"
+            std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+            "changed",
+            "refusal happens before any mutation"
         );
         let _ = dir;
+    }
+
+    /// Codex-review round 9: a step failing MID-restore (here: an undeletable
+    /// nested repo) self-compensates — branch and worktree return to the
+    /// pre-restore state exactly.
+    #[test]
+    fn mid_restore_failure_rolls_everything_back() {
+        let (_dir, wt, shadow, base) = fixture();
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        std::fs::write(wt.join("a.txt"), "drifted").expect("modify");
+        // A nested repo created after the checkpoint, made undeletable (the
+        // whole subtree read-only, so remove_dir_all fails before deleting).
+        let post = wt.join("gen/out");
+        std::fs::create_dir_all(&post).expect("post dir");
+        crate::git::init_repo(&post).expect("init post");
+        std::fs::write(post.join("new.txt"), "post").expect("post file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [&wt.join("gen"), &post] {
+                let mut perms = std::fs::metadata(d).expect("meta").permissions();
+                perms.set_mode(0o555);
+                std::fs::set_permissions(d, perms).expect("chmod");
+            }
+        }
+        let before: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
+
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        #[cfg(unix)]
+        {
+            assert!(r.is_err(), "undeletable nested repo must fail the restore");
+            let after: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
+            assert_eq!(before, after, "self-compensation returns the exact tree");
+            assert_eq!(
+                std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+                "drifted",
+                "content back to pre-restore"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = (r, before);
     }
 
     /// Codex-review round 8: rollback_restore puts branch and worktree back to
