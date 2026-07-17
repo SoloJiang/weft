@@ -15,6 +15,15 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _, Result};
 use serde_json::Value;
 
+/// Whether a user row actually reached the native session (and so is part of
+/// the history a fork can match): delivered turns (`complete`, or
+/// `interrupted` mid-turn) count; `queued` (never sent) and `error` rows
+/// (synthetic failure paths like agent-not-found) never entered the native
+/// history and must not skew the text-match ordinal or the anchor choice.
+pub(crate) fn native_delivered(role: &str, status: &str) -> bool {
+    role == "user" && matches!(status, "complete" | "interrupted")
+}
+
 /// Rebuild the EXACT text the engine dispatched to the agent for a user row
 /// (the transcript stores this, not the raw input): `send` appends attachment
 /// instructions and spilled-image paths to the prompt, so a native text match

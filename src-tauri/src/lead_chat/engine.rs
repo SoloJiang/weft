@@ -3685,8 +3685,13 @@ async fn rewind_reserved(
         .unwrap_or_default();
 
     // The cut anchor lives on the nearest user row BEFORE the target (its
-    // turn's end = the native state right before the target was sent).
-    let prev_user = session_rows[..pos].iter().rev().find(|m| m.role == "user");
+    // turn's end = the native state right before the target was sent). Only
+    // DELIVERED rows count — queued/error user rows never reached the native
+    // history and would skew both the anchor and the ordinal (review P2).
+    let prev_user = session_rows[..pos]
+        .iter()
+        .rev()
+        .find(|m| super::rewind::native_delivered(&m.role, &m.status));
     let anchor = prev_user.and_then(|m| m.native_anchor.clone());
     // The text the native side actually stores: send() appends attachment
     // instructions/spill paths, so the match must use the reconstructed
@@ -3701,7 +3706,7 @@ async fn rewind_reserved(
     // world` pair would fork at a different point than the timeline truncates.
     let user_texts: Vec<String> = session_rows[..=pos]
         .iter()
-        .filter(|m| m.role == "user")
+        .filter(|m| super::rewind::native_delivered(&m.role, &m.status))
         .map(|m| super::rewind::dispatched_text(per_turn_tool, m.id, &m.content))
         .collect();
     let ordinal = super::rewind::ordinal_of(&user_texts, &match_text);
@@ -3837,6 +3842,7 @@ async fn rewind_reserved(
                 &t.base_commit,
                 &t.nested_repos,
                 &t.index_tree,
+                Some(&t.branch),
             )
         })
         .await??;
@@ -3846,9 +3852,11 @@ async fn rewind_reserved(
     }
     if mode == RewindMode::Code {
         // Code-only has no persistence to roll back into it — deleting now is
-        // as durable as it gets (still best-effort).
+        // as durable as it gets; a deletion failure is surfaced, not hidden.
         if let Some((p, recorded)) = nested_cleanup {
-            cleanup_unrecorded_nested(p, recorded).await;
+            cleanup_unrecorded_nested(p, recorded)
+                .await
+                .map_err(|e| anyhow::anyhow!("代码已回退，但删除检查点之后新建的嵌套仓库失败：{e}"))?;
         }
         return Ok(RewindOutcome {
             rewound_text: String::new(),
@@ -3907,9 +3915,12 @@ async fn rewind_reserved(
         }
     };
     // Conversation + code are durably rewound — only NOW can post-checkpoint
-    // nested repos be deleted (rollback can no longer need them).
+    // nested repos be deleted (rollback can no longer need them). A deletion
+    // failure is surfaced: a leftover repo contradicts the promised rewind.
     if let Some((p, recorded)) = nested_cleanup {
-        cleanup_unrecorded_nested(p, recorded).await;
+        cleanup_unrecorded_nested(p, recorded)
+            .await
+            .map_err(|e| anyhow::anyhow!("回退已完成，但删除检查点之后新建的嵌套仓库失败：{e}"))?;
     }
     let deleted = deleted_ids.len() as u64;
     // The divider row every surface renders between the kept past and the
@@ -3947,16 +3958,15 @@ async fn rewind_reserved(
 /// rewind is durable (committed persistence or a code-only restore): the
 /// shadow backup records embedded repos as gitlinks, so a rollback can't
 /// recreate them and they must survive until rollback is off the table.
-async fn cleanup_unrecorded_nested(path: std::path::PathBuf, recorded: Vec<String>) {
-    match tokio::task::spawn_blocking(move || {
+/// Failures are PROPAGATED — a leftover nested repo contradicts the promised
+/// rewind and must be surfaced, not just logged.
+async fn cleanup_unrecorded_nested(path: std::path::PathBuf, recorded: Vec<String>) -> anyhow::Result<usize> {
+    let removed = tokio::task::spawn_blocking(move || {
         crate::checkpoint::remove_unrecorded_nested_repos(&path, &recorded)
     })
     .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => eprintln!("[weft] post-rewind nested repo cleanup failed: {e}"),
-        Err(e) => eprintln!("[weft] post-rewind nested cleanup task failed: {e}"),
-    }
+    .map_err(|e| anyhow::anyhow!("nested cleanup task failed: {e}"))??;
+    Ok(removed)
 }
 
 /// The worktree a worker session runs in (via its direction + repo), or None
@@ -4074,6 +4084,9 @@ struct CodeTarget {
     /// Tree of the real index at the checkpoint ("" for pre-m0039 rows →
     /// the restore falls back to HEAD).
     index_tree: String,
+    /// The lane's recorded branch: a reset --hard must only ever move THIS
+    /// branch (the agent may have switched the checkout elsewhere).
+    branch: String,
 }
 
 /// The checkpoint a code rewind restores to. Errors honestly when the lane
@@ -4119,6 +4132,7 @@ async fn resolve_code_target(
         head_sha: ckpt.head_sha,
         nested_repos,
         index_tree: ckpt.index_tree,
+        branch: wt.branch.clone(),
     })
 }
 
