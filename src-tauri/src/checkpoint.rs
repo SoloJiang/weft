@@ -89,11 +89,22 @@ pub fn worktree_op_reserved(worktree_id: i32) -> bool {
 
 /// `<weft_home>/checkpoints/<worktree_id>.git` — the shadow bare repo for one
 /// worktree. The parent dir is created; the repo itself is `git init --bare`'d
-/// lazily on the first snapshot.
+/// lazily on the first snapshot. Owner-only (0700) on unix: the shadow holds
+/// full blobs of every snapshotted file, including things not yet ignored.
 pub fn shadow_repo_for(worktree_id: i32) -> std::io::Result<PathBuf> {
     let dir = crate::paths::weft_home()?.join("checkpoints");
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{worktree_id}.git")))
+    let shadow = dir.join(format!("{worktree_id}.git"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for d in [&dir, &shadow] {
+            // Tighten every call (an earlier weft may have created them loose);
+            // dir perms alone gate traversal, no need to walk objects.
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(shadow)
 }
 
 /// Remove a worktree's shadow repo (worktree teardown cascade). Best-effort:
@@ -237,17 +248,8 @@ pub fn restore(
         // A path that is ignored NOW but was tracked INTO the snapshot THEN (e.g.
         // it became a machine-local secret after the checkpoint) must be left
         // completely alone: `clean` already skips ignored paths, but
-        // `checkout-index -f` would overwrite their current contents first. Prune
-        // them from the shadow index so neither step can touch them.
-        let ignored = shadow_git(shadow, wt, &["ls-files", "-c", "-i", "-z", "--exclude-standard"])?;
-        if !ignored.is_empty() {
-            shadow_git_stdin(
-                shadow,
-                wt,
-                &["update-index", "--force-remove", "-z", "--stdin"],
-                ignored.as_bytes(),
-            )?;
-        }
+        // `checkout-index -f` would overwrite their current contents first.
+        prune_ignored_from_index(shadow, wt)?;
         shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
         shadow_git(shadow, wt, &["clean", "-fd"])?;
         // The real repo's INDEX must not stay staged with post-checkpoint
@@ -321,6 +323,11 @@ fn backup_ref(session_id: i32) -> String {
 fn snapshot_to_ref(wt: &Path, shadow: &Path, ref_name: &str, message: &str) -> Result<String> {
     ensure_shadow(shadow)?;
     sync_excludes(shadow, wt)?;
+    // Ignore rules don't UNTRACK paths already in the shadow index: a file
+    // captured by an earlier snapshot and only LATER ignored (became a
+    // secret) would otherwise be re-recorded into every new checkpoint —
+    // prune it out before adding.
+    prune_ignored_from_index(shadow, wt)?;
     shadow_git(shadow, wt, &["add", "-A"])?;
     let tree = shadow_git(shadow, wt, &["write-tree"])?;
     let parent = shadow_git(shadow, wt, &["rev-parse", "--verify", "--quiet", ref_name])
@@ -351,6 +358,23 @@ fn snapshot_to_ref(wt: &Path, shadow: &Path, ref_name: &str, message: &str) -> R
     Ok(sha)
 }
 
+/// Drop every path ignored under the CURRENT rules from the shadow index
+/// (rules don't untrack already-indexed paths on their own). Used before
+/// every snapshot (don't record newly-protected content) and before every
+/// restore checkout (don't overwrite it either).
+fn prune_ignored_from_index(shadow: &Path, wt: &Path) -> Result<()> {
+    let ignored = shadow_git(shadow, wt, &["ls-files", "-c", "-i", "-z", "--exclude-standard"])?;
+    if ignored.is_empty() {
+        return Ok(());
+    }
+    shadow_git_stdin(
+        shadow,
+        wt,
+        &["update-index", "--force-remove", "-z", "--stdin"],
+        ignored.as_bytes(),
+    )
+}
+
 /// `git init --bare` the shadow repo on first use and write its default
 /// exclude list (see [`EXCLUDES`]).
 fn ensure_shadow(shadow: &Path) -> Result<()> {
@@ -369,6 +393,12 @@ fn ensure_shadow(shadow: &Path) -> Result<()> {
             "git init --bare failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+    #[cfg(unix)]
+    {
+        // git-init just created the dir with the process umask — tighten now.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(shadow, std::fs::Permissions::from_mode(0o700));
     }
     let info = shadow.join("info");
     std::fs::create_dir_all(&info)?;
@@ -403,6 +433,16 @@ fn sync_excludes(shadow: &Path, wt: &Path) -> Result<()> {
         }
     };
     if let Ok(extra) = std::fs::read_to_string(common.join("info").join("exclude")) {
+        fold(extra);
+    }
+    // The CURRENT root .gitignore, verbatim (its rules are already
+    // global-scoped). Shadow git ops otherwise see only the worktree's copy —
+    // which a restore may have just replaced with an OLDER checkpoint version,
+    // so `clean` would delete files the current rules protect (a rule added
+    // after the checkpoint). Folding it here keeps protection pinned to NOW.
+    // (Nested .gitignore files are path-scoped and not folded — rare enough
+    // that the root case covers the realistic risk.)
+    if let Ok(extra) = std::fs::read_to_string(wt.join(".gitignore")) {
         fold(extra);
     }
     // A repo-local `core.excludesFile` (absolute or `~/`; relative resolves
@@ -1071,5 +1111,72 @@ mod tests {
         // A plain worktree (the rest of the suite) reports none.
         let (_d2, plain, _s2, _b2) = fixture();
         assert!(!has_initialized_submodules(&plain));
+    }
+
+    /// Codex-review round 12: a rule added to .gitignore AFTER the checkpoint
+    /// must still protect at restore time, even though checkout restores the
+    /// older .gitignore (which lacks the rule).
+    #[test]
+    fn restore_honors_current_gitignore_rules() {
+        let (_dir, wt, shadow, base) = fixture();
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        // After the checkpoint: extend .gitignore and create the protected file.
+        std::fs::write(wt.join(".gitignore"), "node_modules/\nsecret.env\n").expect("extend gitignore");
+        std::fs::write(wt.join("secret.env"), "TOKEN=1").expect("secret");
+        std::fs::write(wt.join("a.txt"), "changed").expect("modify tracked");
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("secret.env")).expect("secret.env survives"),
+            "TOKEN=1",
+            "the CURRENT .gitignore rule must protect the file from clean"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".gitignore")).expect("read"),
+            "node_modules/\n",
+            ".gitignore itself rewinds to the checkpoint version"
+        );
+    }
+
+    /// Codex-review round 12: a path ignored only AFTER being captured by an
+    /// earlier snapshot must not be re-recorded into later snapshots.
+    #[test]
+    fn snapshot_prunes_newly_ignored_index_paths() {
+        let (_dir, wt, shadow, _base) = fixture();
+        std::fs::write(wt.join("secret.env"), "TOKEN=1").expect("secret");
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        // Sanity: it WAS captured then.
+        let t1 = Command::new("git")
+            .arg(format!("--git-dir={}", shadow.display()))
+            .args(["ls-tree", "-r", "--name-only", &first.shadow_sha])
+            .current_dir(&wt)
+            .output()
+            .expect("ls-tree");
+        assert!(String::from_utf8_lossy(&t1.stdout).contains("secret.env"));
+        // Only NOW ignore it; the next snapshot must prune it from the index.
+        std::fs::write(wt.join(".git/info/exclude"), "secret.env\n").expect("info/exclude");
+        let second = snapshot(&wt, &shadow, 7, 2).expect("snapshot 2");
+        let t2 = Command::new("git")
+            .arg(format!("--git-dir={}", shadow.display()))
+            .args(["ls-tree", "-r", "--name-only", &second.shadow_sha])
+            .current_dir(&wt)
+            .output()
+            .expect("ls-tree");
+        assert!(
+            !String::from_utf8_lossy(&t2.stdout).contains("secret.env"),
+            "newly-ignored path must leave the shadow index"
+        );
+    }
+
+    /// Codex-review round 12: the shadow repo directory is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn shadow_repo_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, wt, shadow, _base) = fixture();
+        snapshot(&wt, &shadow, 7, 1).expect("snapshot");
+        let mode = std::fs::metadata(&shadow).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "shadow repo must be owner-only");
     }
 }
