@@ -250,6 +250,12 @@ pub fn restore(
         }
         shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
         shadow_git(shadow, wt, &["clean", "-fd"])?;
+        // The real repo's INDEX must not stay staged with post-checkpoint
+        // content: worktree files are restored but a stale index would let the
+        // next commit record content the worktree no longer has. Resetting it
+        // to HEAD mirrors the restored state honestly (restored uncommitted
+        // changes show as plain unstaged edits).
+        real_git(wt, &["read-tree", "HEAD"])?;
         // `clean -fd` deliberately leaves nested git repositories (it needs -ff),
         // so remove exactly the ones created AFTER the checkpoint — those absent
         // from the snapshot's manifest. Ones recorded there stay untouched.
@@ -289,6 +295,8 @@ pub fn rollback_restore(wt: &Path, shadow: &Path, receipt: &RestoreReceipt) -> R
     shadow_git(shadow, wt, &["read-tree", &receipt.backup_sha])?;
     shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
     shadow_git(shadow, wt, &["clean", "-fd"])?;
+    // Same stale-index guard as restore: nothing staged may survive a rollback.
+    real_git(wt, &["read-tree", "HEAD"])?;
     Ok(())
 }
 
@@ -986,6 +994,26 @@ mod tests {
         rollback_restore(&wt, &shadow, &receipt).expect("rollback");
         let after: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
         assert_eq!(before, after, "rollback returns the tree byte-for-byte");
+    }
+
+    /// Codex-review round 10: a stale real-repo INDEX (agent staged without
+    /// committing) must not survive the restore — the next commit would
+    /// otherwise record content the worktree no longer has.
+    #[test]
+    fn restore_resets_the_real_index() {
+        let (_dir, wt, shadow, base) = fixture();
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        // Stage (not commit) a post-checkpoint change.
+        std::fs::write(wt.join("a.txt"), "staged-v2").expect("modify");
+        git_ok(&wt, &["add", "a.txt"]);
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
+        assert_eq!(
+            git_ok(&wt, &["status", "--porcelain"]),
+            "",
+            "index matches the restored tree — nothing stale staged"
+        );
     }
 
     /// Codex-review round 8: restore reservations are ref-counted — one

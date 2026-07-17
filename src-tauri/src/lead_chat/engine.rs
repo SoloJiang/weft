@@ -3806,16 +3806,22 @@ async fn rewind_reserved(
     let mut code_restored = false;
     // Compensation context for a post-restore persistence failure (both mode):
     // put the worktree back so a rewind can't end half-applied. The
-    // reservation lives to the end of the function, covering compensation too.
+    // reservation AND the shadow op lock live to the end of the function,
+    // covering persistence and any compensation — a second rewind can't
+    // restore between our restore and our rollback.
     let mut compensation: Option<(std::path::PathBuf, std::path::PathBuf, crate::checkpoint::RestoreReceipt)> = None;
     let mut _reservation = None;
+    let mut _op_arc = None;
+    let mut _op_guard = None;
     if let Some(t) = code_target {
         let reservation = crate::checkpoint::begin_restore_reservation(t.worktree_id);
         if sibling_turn_busy(app, db, t.direction_id, t.repo_id, t.session_id).await? {
             return Err(anyhow::anyhow!("另一个会话正在使用该 worktree，请先中断它"));
         }
-        let op_lock = crate::checkpoint::op_lock(t.worktree_id);
-        let _op = op_lock.lock().await;
+        _op_arc = Some(crate::checkpoint::op_lock(t.worktree_id));
+        if let Some(a) = _op_arc.as_ref() {
+            _op_guard = Some(a.lock().await);
+        }
         let (wt_path, wt_shadow) = (t.path.clone(), t.shadow.clone());
         let receipt = tokio::task::spawn_blocking(move || {
             crate::checkpoint::restore(
@@ -3865,14 +3871,26 @@ async fn rewind_reserved(
         Ok(ids) => ids,
         Err(e) => {
             if let Some((p, s, receipt)) = compensation {
+                // spawn_blocking gives Result<Result<()>, JoinError> — check
+                // BOTH layers: a normal rollback error is Ok(Err(..)) and
+                // must not be silently dropped (the whole point of
+                // compensating).
                 let rb = tokio::task::spawn_blocking(move || {
                     crate::checkpoint::rollback_restore(&p, &s, &receipt)
                 })
                 .await;
-                if let Err(rb_err) = rb {
-                    return Err(anyhow::anyhow!(
-                        "回退持久化失败（{e}），且补偿回滚也失败（{rb_err}）——worktree 已回退，backup ref 仍在可手动恢复"
-                    ));
+                match rb {
+                    Ok(Ok(())) => {}
+                    Ok(Err(rb_err)) => {
+                        return Err(anyhow::anyhow!(
+                            "回退持久化失败（{e}），且补偿回滚也失败（{rb_err}）——worktree 已回退，backup ref 仍在可手动恢复"
+                        ));
+                    }
+                    Err(join_err) => {
+                        return Err(anyhow::anyhow!(
+                            "回退持久化失败（{e}），且补偿回滚异常终止（{join_err}）——worktree 已回退，backup ref 仍在可手动恢复"
+                        ));
+                    }
                 }
             }
             return Err(e);
