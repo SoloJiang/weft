@@ -153,10 +153,14 @@ pub enum Push {
         status: String,
     },
     /// A conversation rewind truncated this (thread, session) timeline: every
-    /// open surface must reload from the DB.
+    /// open surface must reload from the DB. Carries the session's NEW native
+    /// id (None = a fresh native session starts on next send) so live session
+    /// state (Open App / Take Over commands) can't point at the abandoned
+    /// pre-rewind conversation.
     Rewound {
         thread_id: i32,
         session_id: Option<i32>,
+        native_id: Option<String>,
     },
 }
 
@@ -3944,6 +3948,7 @@ async fn rewind_reserved(
         Push::Rewound {
             thread_id: snap.thread_id,
             session_id: snap.session_id,
+            native_id: new_native.clone(),
         },
     );
     Ok(RewindOutcome {

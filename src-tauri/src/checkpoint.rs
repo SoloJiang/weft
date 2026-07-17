@@ -61,12 +61,18 @@ pub struct WorktreeOpGuard {
 }
 impl Drop for WorktreeOpGuard {
     fn drop(&mut self) {
-        if let Some(mut e) = WT_OP_RESERVATIONS.get_mut(&self.worktree_id) {
-            *e -= 1;
-            if *e == 0 {
-                drop(e);
-                WT_OP_RESERVATIONS.remove(&self.worktree_id);
+        let zero = match WT_OP_RESERVATIONS.get_mut(&self.worktree_id) {
+            Some(mut e) => {
+                *e -= 1;
+                *e == 0
             }
+            None => false,
+        };
+        if zero {
+            // Atomic check-and-remove under one shard op: a reservation begun
+            // AFTER our decrement (count back to 1) must NOT be removed —
+            // the drop(e)/remove window would otherwise delete a live hold.
+            WT_OP_RESERVATIONS.remove_if(&self.worktree_id, |_, v| *v == 0);
         }
     }
 }
@@ -242,6 +248,18 @@ pub fn restore(
         pre_index_tree,
     };
     let destructive = || -> Result<()> {
+        // Verify the checkout BEFORE anything else mutates: a reset moves the
+        // checked-out branch, but checkout-index/clean overwrite uncommitted
+        // work on ANY branch — a checkout switched away from the lane (with or
+        // without commits) must refuse the whole restore, not just the reset.
+        if let Some(expected) = expected_branch {
+            let current = real_git(wt, &["branch", "--show-current"])?;
+            if current != expected {
+                bail!(
+                    "worktree is on branch {current:?}, expected {expected:?} — refusing to restore over an unrelated checkout"
+                );
+            }
+        }
         if receipt.pre_head != head_sha {
             if !base_commit.is_empty()
                 && !real_git_ok(wt, &["merge-base", "--is-ancestor", base_commit, head_sha])
@@ -251,20 +269,6 @@ pub fn restore(
                 );
             }
             if real_git_ok(wt, &["merge-base", "--is-ancestor", head_sha, "HEAD"]) {
-                // A reset moves whatever branch is checked out RIGHT NOW: if
-                // the agent switched branches after the checkpoint (scratch
-                // work, or worse an unrelated user branch), resetting would
-                // silently rewind THAT branch's commits. Verify the checkout
-                // still sits on the lane's recorded branch first (a detached
-                // HEAD fails the check too).
-                if let Some(expected) = expected_branch {
-                    let current = real_git(wt, &["branch", "--show-current"])?;
-                    if current != expected {
-                        bail!(
-                            "worktree is on branch {current:?}, expected {expected:?} — refusing to reset an unrelated branch"
-                        );
-                    }
-                }
                 real_git(wt, &["reset", "--hard", head_sha])?;
             }
         }
@@ -1349,6 +1353,35 @@ mod tests {
             Some("scratch"),
         );
         assert!(r2.is_ok(), "reset on the expected branch proceeds: {r2:?}");
+    }
+
+    /// Codex-review round 16: the branch check fires even when NO reset would
+    /// happen (switched branch, uncommitted work) — checkout/clean would
+    /// otherwise destroy it while reporting success.
+    #[test]
+    fn restore_refuses_switched_branch_without_commits() {
+        let (_dir, wt, shadow, base) = fixture();
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        let lane = git_ok(&wt, &["branch", "--show-current"]);
+        git_ok(&wt, &["switch", "-c", "scratch"]);
+        std::fs::write(wt.join("a.txt"), "uncommitted scratch").expect("modify");
+        let r = restore(
+            &wt,
+            &shadow,
+            7,
+            &first.shadow_sha,
+            &first.head_sha,
+            &base,
+            &first.nested_repos,
+            &first.index_tree,
+            Some(&lane),
+        );
+        assert!(r.is_err(), "switched branch must refuse even without commits");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+            "uncommitted scratch",
+            "uncommitted work untouched"
+        );
     }
 
     /// Codex-review round 15: only actually-delivered user rows count toward
