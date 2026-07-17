@@ -2004,7 +2004,7 @@ pub async fn send(
         // sessions of the same worktree must not start editing it mid-restore.
         if inner
             .worktree_id
-            .is_some_and(crate::checkpoint::restore_reserved)
+            .is_some_and(crate::checkpoint::worktree_op_reserved)
         {
             return Err(anyhow::anyhow!("该 worktree 正在回退代码，请稍后重试"));
         }
@@ -3813,8 +3813,11 @@ async fn rewind_reserved(
     let mut _reservation = None;
     let mut _op_arc = None;
     let mut _op_guard = None;
+    // Post-checkpoint nested repos to delete once the rewind is DURABLE (they
+    // can't be recreated by rollback, so deletion waits until it can't roll).
+    let mut nested_cleanup: Option<(std::path::PathBuf, Vec<String>)> = None;
     if let Some(t) = code_target {
-        let reservation = crate::checkpoint::begin_restore_reservation(t.worktree_id);
+        let reservation = crate::checkpoint::begin_worktree_op_reservation(t.worktree_id);
         if sibling_turn_busy(app, db, t.direction_id, t.repo_id, t.session_id).await? {
             return Err(anyhow::anyhow!("另一个会话正在使用该 worktree，请先中断它"));
         }
@@ -3823,6 +3826,7 @@ async fn rewind_reserved(
             _op_guard = Some(a.lock().await);
         }
         let (wt_path, wt_shadow) = (t.path.clone(), t.shadow.clone());
+        nested_cleanup = Some((t.path.clone(), t.nested_repos.clone()));
         let receipt = tokio::task::spawn_blocking(move || {
             crate::checkpoint::restore(
                 &t.path,
@@ -3840,6 +3844,11 @@ async fn rewind_reserved(
         _reservation = Some(reservation);
     }
     if mode == RewindMode::Code {
+        // Code-only has no persistence to roll back into it — deleting now is
+        // as durable as it gets (still best-effort).
+        if let Some((p, recorded)) = nested_cleanup {
+            cleanup_unrecorded_nested(p, recorded).await;
+        }
         return Ok(RewindOutcome {
             rewound_text: String::new(),
             deleted: 0,
@@ -3896,6 +3905,11 @@ async fn rewind_reserved(
             return Err(e);
         }
     };
+    // Conversation + code are durably rewound — only NOW can post-checkpoint
+    // nested repos be deleted (rollback can no longer need them).
+    if let Some((p, recorded)) = nested_cleanup {
+        cleanup_unrecorded_nested(p, recorded).await;
+    }
     let deleted = deleted_ids.len() as u64;
     // The divider row every surface renders between the kept past and the
     // rewound future. Best-effort: the rewind itself already happened.
@@ -3926,6 +3940,22 @@ async fn rewind_reserved(
         native_id: new_native,
         code_restored,
     })
+}
+
+/// Best-effort deletion of post-checkpoint nested repos, called ONLY once the
+/// rewind is durable (committed persistence or a code-only restore): the
+/// shadow backup records embedded repos as gitlinks, so a rollback can't
+/// recreate them and they must survive until rollback is off the table.
+async fn cleanup_unrecorded_nested(path: std::path::PathBuf, recorded: Vec<String>) {
+    match tokio::task::spawn_blocking(move || {
+        crate::checkpoint::remove_unrecorded_nested_repos(&path, &recorded)
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("[weft] post-rewind nested repo cleanup failed: {e}"),
+        Err(e) => eprintln!("[weft] post-rewind nested cleanup task failed: {e}"),
+    }
 }
 
 /// The worktree a worker session runs in (via its direction + repo), or None
@@ -3979,9 +4009,13 @@ async fn snapshot_turn_checkpoint_impl(
     }
     // A sibling session mid-turn means the other agent is writing the shared
     // worktree RIGHT NOW: a snapshot taken mid-write would capture a partial
-    // state a later code rewind would faithfully restore. Skip this turn's
-    // checkpoint (the turn itself is never blocked; the message just gets no
-    // code-rewind target, which resolve_code_target reports honestly).
+    // state a later code rewind would faithfully restore. The worktree op
+    // reservation is taken FIRST, then siblings re-checked — a sibling send
+    // admitted before it shows busy now; one after it is refused at
+    // admission. Skip this turn's checkpoint on contention (the turn itself
+    // is never blocked; the message just gets no code-rewind target, which
+    // resolve_code_target reports honestly).
+    let op_guard = crate::checkpoint::begin_worktree_op_reservation(wt.id);
     if sibling_turn_busy(app, db, wt.direction_id, wt.repo_id, session_id).await? {
         eprintln!("[weft] code checkpoint skipped for session {session_id} turn {turn_id}: sibling session busy on the worktree");
         return Ok(());
@@ -4004,6 +4038,8 @@ async fn snapshot_turn_checkpoint_impl(
         crate::checkpoint::snapshot(&path, &shadow, session_id, turn_id)
     })
     .await??;
+    drop(_op);
+    drop(op_guard);
     repo::insert_code_checkpoint(
         db,
         wt.id,

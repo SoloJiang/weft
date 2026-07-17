@@ -46,43 +46,43 @@ pub fn op_lock(worktree_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     OP_LOCKS.entry(worktree_id).or_default().clone()
 }
 
-/// Worktree-level restore reservation: a code/both rewind holds this across
-/// its restore, and every worker send re-checks it at admission — closing the
-/// TOCTOU where a sibling turn starts between the rewind's sibling-busy check
-/// and the restore itself and then edits the files being restored. REF-COUNTED:
-/// concurrent restores on one worktree each hold a count, so the first to
-/// finish can't lift the protection of a restore still waiting/running.
-static RESTORE_RESERVATIONS: std::sync::LazyLock<dashmap::DashMap<i32, usize>> =
+/// Worktree-level op reservation: held across a sensitive worktree operation
+/// (a code restore, or a pre-turn snapshot) and re-checked by every worker
+/// send at admission — closing the TOCTOU where a sibling turn starts between
+/// the op's sibling-busy check and the op itself and then edits the files
+/// being restored/snapshotted. REF-COUNTED: concurrent ops on one worktree
+/// each hold a count, so the first to finish can't lift another's protection.
+static WT_OP_RESERVATIONS: std::sync::LazyLock<dashmap::DashMap<i32, usize>> =
     std::sync::LazyLock::new(dashmap::DashMap::new);
 
-/// Held while a code restore runs on a worktree. Dropped = one hold released.
-pub struct RestoreReservation {
+/// Held while a sensitive worktree op runs. Dropped = one hold released.
+pub struct WorktreeOpGuard {
     worktree_id: i32,
 }
-impl Drop for RestoreReservation {
+impl Drop for WorktreeOpGuard {
     fn drop(&mut self) {
-        if let Some(mut e) = RESTORE_RESERVATIONS.get_mut(&self.worktree_id) {
+        if let Some(mut e) = WT_OP_RESERVATIONS.get_mut(&self.worktree_id) {
             *e -= 1;
             if *e == 0 {
                 drop(e);
-                RESTORE_RESERVATIONS.remove(&self.worktree_id);
+                WT_OP_RESERVATIONS.remove(&self.worktree_id);
             }
         }
     }
 }
 
-/// Reserve a worktree for an upcoming restore. Re-check siblings AFTER taking
-/// this: a send admitted before the reservation shows up busy then; a send
-/// after it is refused at admission.
-pub fn begin_restore_reservation(worktree_id: i32) -> RestoreReservation {
-    *RESTORE_RESERVATIONS.entry(worktree_id).or_insert(0) += 1;
-    RestoreReservation { worktree_id }
+/// Reserve a worktree for an upcoming sensitive op. Re-check siblings AFTER
+/// taking this: a send admitted before the reservation shows up busy then; a
+/// send after it is refused at admission.
+pub fn begin_worktree_op_reservation(worktree_id: i32) -> WorktreeOpGuard {
+    *WT_OP_RESERVATIONS.entry(worktree_id).or_insert(0) += 1;
+    WorktreeOpGuard { worktree_id }
 }
 
-/// True while at least one restore reservation is held on this worktree
-/// (worker sends must refuse admission).
-pub fn restore_reserved(worktree_id: i32) -> bool {
-    RESTORE_RESERVATIONS
+/// True while at least one op reservation is held on this worktree (worker
+/// sends must refuse admission).
+pub fn worktree_op_reserved(worktree_id: i32) -> bool {
+    WT_OP_RESERVATIONS
         .get(&worktree_id)
         .is_some_and(|c| *c > 0)
 }
@@ -256,18 +256,6 @@ pub fn restore(
         // to HEAD mirrors the restored state honestly (restored uncommitted
         // changes show as plain unstaged edits).
         real_git(wt, &["read-tree", "HEAD"])?;
-        // `clean -fd` deliberately leaves nested git repositories (it needs -ff),
-        // so remove exactly the ones created AFTER the checkpoint — those absent
-        // from the snapshot's manifest. Ones recorded there stay untouched.
-        for d in list_nested_repos(wt)? {
-            if !recorded_nested.iter().any(|r| r == &d) {
-                let p = wt.join(&d);
-                if p.exists() {
-                    std::fs::remove_dir_all(&p)
-                        .with_context(|| format!("remove post-checkpoint nested repo {}", p.display()))?;
-                }
-            }
-        }
         Ok(())
     };
     if let Err(e) = destructive() {
@@ -298,6 +286,26 @@ pub fn rollback_restore(wt: &Path, shadow: &Path, receipt: &RestoreReceipt) -> R
     // Same stale-index guard as restore: nothing staged may survive a rollback.
     real_git(wt, &["read-tree", "HEAD"])?;
     Ok(())
+}
+
+/// Delete nested git repos created AFTER the checkpoint (absent from its
+/// manifest). Runs ONLY after the rewind is durably committed (persistence
+/// succeeded): the shadow backup can't recreate these repos (embedded repos
+/// are gitlinks to it), so deleting them any earlier would make a later
+/// rollback lose them permanently. Returns how many were removed.
+pub fn remove_unrecorded_nested_repos(wt: &Path, recorded_nested: &[String]) -> Result<usize> {
+    let mut removed = 0usize;
+    for d in list_nested_repos(wt)? {
+        if !recorded_nested.iter().any(|r| r == &d) {
+            let p = wt.join(&d);
+            if p.exists() {
+                std::fs::remove_dir_all(&p)
+                    .with_context(|| format!("remove post-checkpoint nested repo {}", p.display()))?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn session_ref(session_id: i32) -> String {
@@ -885,11 +893,11 @@ mod tests {
     /// a repo the agent `git init`ed AFTER the checkpoint must be deleted by
     /// the restore, while one present AT the checkpoint must be kept.
     #[test]
-    fn restore_removes_only_post_checkpoint_nested_repos() {
+    fn restore_keeps_post_checkpoint_nested_repos_until_commit() {
         let (dir, wt, shadow, base) = fixture();
-        // Round-9 semantics: a nested repo present AT the checkpoint makes the
-        // restore refuse (its contents are untracked); only ones created AFTER
-        // are removed. So this fixture's snapshot has an EMPTY manifest.
+        // Round-11 semantics: restore no longer deletes nested repos (a later
+        // rollback couldn't recreate them); the engine deletes them only
+        // after the rewind is durable, via remove_unrecorded_nested_repos.
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
         assert!(first.nested_repos.is_empty());
 
@@ -903,7 +911,11 @@ mod tests {
         let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
         assert!(r.is_ok(), "restore: {r:?}");
         assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
-        assert!(!post.exists(), "post-checkpoint nested repo removed");
+        assert!(post.exists(), "restore leaves the nested repo in place");
+        // The committed-rewind cleanup removes it (and only it).
+        let removed = remove_unrecorded_nested_repos(&wt, &first.nested_repos).expect("cleanup");
+        assert_eq!(removed, 1);
+        assert!(!post.exists(), "post-checkpoint nested repo removed post-commit");
         let _ = dir;
     }
 
@@ -941,27 +953,25 @@ mod tests {
         let (_dir, wt, shadow, base) = fixture();
         let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
         std::fs::write(wt.join("a.txt"), "drifted").expect("modify");
-        // A nested repo created after the checkpoint, made undeletable (the
-        // whole subtree read-only, so remove_dir_all fails before deleting).
-        let post = wt.join("gen/out");
-        std::fs::create_dir_all(&post).expect("post dir");
-        crate::git::init_repo(&post).expect("init post");
-        std::fs::write(post.join("new.txt"), "post").expect("post file");
+        // A plain untracked file in a read-only dir: `git clean -fd` exits
+        // non-zero on it (verified: "failed to remove" + exit 1), failing the
+        // destructive phase mid-restore.
+        let rodir = wt.join("rodir");
+        std::fs::create_dir_all(&rodir).expect("rodir");
+        std::fs::write(rodir.join("x.txt"), "x").expect("x");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for d in [&wt.join("gen"), &post] {
-                let mut perms = std::fs::metadata(d).expect("meta").permissions();
-                perms.set_mode(0o555);
-                std::fs::set_permissions(d, perms).expect("chmod");
-            }
+            let mut perms = std::fs::metadata(&rodir).expect("meta").permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(&rodir, perms).expect("chmod");
         }
         let before: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
 
         let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos);
         #[cfg(unix)]
         {
-            assert!(r.is_err(), "undeletable nested repo must fail the restore");
+            assert!(r.is_err(), "undeletable file must fail the restore mid-way");
             let after: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
             assert_eq!(before, after, "self-compensation returns the exact tree");
             assert_eq!(
@@ -1020,13 +1030,13 @@ mod tests {
     /// restore finishing can't lift another's protection.
     #[test]
     fn restore_reservation_is_ref_counted() {
-        let a = begin_restore_reservation(42);
-        let b = begin_restore_reservation(42);
-        assert!(restore_reserved(42));
+        let a = begin_worktree_op_reservation(42);
+        let b = begin_worktree_op_reservation(42);
+        assert!(worktree_op_reserved(42));
         drop(a);
-        assert!(restore_reserved(42), "second hold still protects");
+        assert!(worktree_op_reserved(42), "second hold still protects");
         drop(b);
-        assert!(!restore_reserved(42));
+        assert!(!worktree_op_reserved(42));
     }
 
     /// Codex-review round 5: a worktree with an INITIALIZED submodule must be
