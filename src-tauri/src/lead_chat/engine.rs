@@ -3804,6 +3804,11 @@ async fn rewind_reserved(
     // admission, so no agent edits the worktree mid-restore. Shadow ops are
     // serialized per worktree via the op lock.
     let mut code_restored = false;
+    // Compensation context for a post-restore persistence failure (both mode):
+    // put the worktree back so a rewind can't end half-applied. The
+    // reservation lives to the end of the function, covering compensation too.
+    let mut compensation: Option<(std::path::PathBuf, std::path::PathBuf, crate::checkpoint::RestoreReceipt)> = None;
+    let mut _reservation = None;
     if let Some(t) = code_target {
         let reservation = crate::checkpoint::begin_restore_reservation(t.worktree_id);
         if sibling_turn_busy(app, db, t.direction_id, t.repo_id, t.session_id).await? {
@@ -3811,7 +3816,8 @@ async fn rewind_reserved(
         }
         let op_lock = crate::checkpoint::op_lock(t.worktree_id);
         let _op = op_lock.lock().await;
-        code_restored = tokio::task::spawn_blocking(move || {
+        let (wt_path, wt_shadow) = (t.path.clone(), t.shadow.clone());
+        let receipt = tokio::task::spawn_blocking(move || {
             crate::checkpoint::restore(
                 &t.path,
                 &t.shadow,
@@ -3823,7 +3829,9 @@ async fn rewind_reserved(
             )
         })
         .await??;
-        drop(reservation);
+        compensation = Some((wt_path, wt_shadow, receipt));
+        code_restored = true;
+        _reservation = Some(reservation);
     }
     if mode == RewindMode::Code {
         return Ok(RewindOutcome {
@@ -3834,24 +3842,46 @@ async fn rewind_reserved(
         });
     }
 
-    // Fork (and any restore) succeeded: restart primitive — kill the child,
-    // shut down the codex client, invalidate in-flight send reservations.
-    stop_quiet(eng).await;
-
-    let deleted_ids = repo::truncate_lead_messages(db, snap.thread_id, snap.session_id, message_id).await?;
+    // Fork (and any restore) succeeded: restart the engine and persist the
+    // truncation + forked native id. A failure HERE, after a restore already
+    // happened, is compensated by rolling the worktree back to its
+    // pre-restore state — never half-applied.
+    let persist = async {
+        stop_quiet(eng).await;
+        let deleted_ids =
+            repo::truncate_lead_messages(db, snap.thread_id, snap.session_id, message_id).await?;
+        // The abandoned future's checkpoints die with its timeline (the
+        // restore above already consumed the target's own checkpoint).
+        if let Some(w) = &wt {
+            repo::truncate_code_checkpoints(db, w.id, &deleted_ids).await?;
+        }
+        // Persist the fork's native id AFTER the truncation: a fresh lead meta
+        // row inserted before the sweep would fall inside its id range.
+        match snap.session_id {
+            Some(sid) => repo::set_session_native_id_opt(db, sid, new_native.as_deref()).await?,
+            None => repo::set_lead_native_id_opt(db, snap.thread_id, new_native.as_deref()).await?,
+        }
+        eng.lock().await.native_id = new_native.clone();
+        Ok::<Vec<i32>, anyhow::Error>(deleted_ids)
+    };
+    let deleted_ids = match persist.await {
+        Ok(ids) => ids,
+        Err(e) => {
+            if let Some((p, s, receipt)) = compensation {
+                let rb = tokio::task::spawn_blocking(move || {
+                    crate::checkpoint::rollback_restore(&p, &s, &receipt)
+                })
+                .await;
+                if let Err(rb_err) = rb {
+                    return Err(anyhow::anyhow!(
+                        "回退持久化失败（{e}），且补偿回滚也失败（{rb_err}）——worktree 已回退，backup ref 仍在可手动恢复"
+                    ));
+                }
+            }
+            return Err(e);
+        }
+    };
     let deleted = deleted_ids.len() as u64;
-    // The abandoned future's checkpoints die with its timeline (the restore
-    // above already consumed the target's own checkpoint).
-    if let Some(w) = &wt {
-        repo::truncate_code_checkpoints(db, w.id, &deleted_ids).await?;
-    }
-    // Persist the fork's native id AFTER the truncation: a fresh lead meta row
-    // inserted before the sweep would fall inside its id range and be deleted.
-    match snap.session_id {
-        Some(sid) => repo::set_session_native_id_opt(db, sid, new_native.as_deref()).await?,
-        None => repo::set_lead_native_id_opt(db, snap.thread_id, new_native.as_deref()).await?,
-    }
-    eng.lock().await.native_id = new_native.clone();
     // The divider row every surface renders between the kept past and the
     // rewound future. Best-effort: the rewind itself already happened.
     insert_rewind_marker(

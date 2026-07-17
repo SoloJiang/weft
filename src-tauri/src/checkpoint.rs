@@ -49,17 +49,25 @@ pub fn op_lock(worktree_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 /// Worktree-level restore reservation: a code/both rewind holds this across
 /// its restore, and every worker send re-checks it at admission — closing the
 /// TOCTOU where a sibling turn starts between the rewind's sibling-busy check
-/// and the restore itself and then edits the files being restored.
-static RESTORE_RESERVATIONS: std::sync::LazyLock<dashmap::DashSet<i32>> =
-    std::sync::LazyLock::new(dashmap::DashSet::new);
+/// and the restore itself and then edits the files being restored. REF-COUNTED:
+/// concurrent restores on one worktree each hold a count, so the first to
+/// finish can't lift the protection of a restore still waiting/running.
+static RESTORE_RESERVATIONS: std::sync::LazyLock<dashmap::DashMap<i32, usize>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
 
-/// Held while a code restore runs on a worktree. Dropped = reservation lifted.
+/// Held while a code restore runs on a worktree. Dropped = one hold released.
 pub struct RestoreReservation {
     worktree_id: i32,
 }
 impl Drop for RestoreReservation {
     fn drop(&mut self) {
-        RESTORE_RESERVATIONS.remove(&self.worktree_id);
+        if let Some(mut e) = RESTORE_RESERVATIONS.get_mut(&self.worktree_id) {
+            *e -= 1;
+            if *e == 0 {
+                drop(e);
+                RESTORE_RESERVATIONS.remove(&self.worktree_id);
+            }
+        }
     }
 }
 
@@ -67,14 +75,16 @@ impl Drop for RestoreReservation {
 /// this: a send admitted before the reservation shows up busy then; a send
 /// after it is refused at admission.
 pub fn begin_restore_reservation(worktree_id: i32) -> RestoreReservation {
-    RESTORE_RESERVATIONS.insert(worktree_id);
+    *RESTORE_RESERVATIONS.entry(worktree_id).or_insert(0) += 1;
     RestoreReservation { worktree_id }
 }
 
-/// True while a restore reservation is held on this worktree (worker sends
-/// must refuse admission).
+/// True while at least one restore reservation is held on this worktree
+/// (worker sends must refuse admission).
 pub fn restore_reserved(worktree_id: i32) -> bool {
-    RESTORE_RESERVATIONS.contains(&worktree_id)
+    RESTORE_RESERVATIONS
+        .get(&worktree_id)
+        .is_some_and(|c| *c > 0)
 }
 
 /// `<weft_home>/checkpoints/<worktree_id>.git` — the shadow bare repo for one
@@ -150,6 +160,15 @@ pub fn list_nested_repos(wt: &Path) -> Result<Vec<String>> {
     Ok(dirs)
 }
 
+/// What a successful restore leaves behind for compensation: the safety
+/// snapshot of the PRE-restore state plus the real HEAD at that moment, so a
+/// failed LATER step (e.g. DB persistence) can put everything back.
+#[derive(Clone, Debug)]
+pub struct RestoreReceipt {
+    pub backup_sha: String,
+    pub pre_head: String,
+}
+
 /// Restore worktree `wt` to the checkpoint `shadow_sha` (the state BEFORE the
 /// turn that checkpoint opened). First snapshots the CURRENT state onto
 /// `refs/heads/rewind-backup-s<session_id>` so the restore is recoverable, and
@@ -169,7 +188,7 @@ pub fn restore(
     head_sha: &str,
     base_commit: &str,
     recorded_nested: &[String],
-) -> Result<bool> {
+) -> Result<RestoreReceipt> {
     // Hard refusal (also enforced at rewind's resolve step): a worktree with
     // an initialized submodule can only ever be UNDER-restored — nested-repo
     // edits are invisible to the parent's snapshot/restore.
@@ -182,7 +201,7 @@ pub fn restore(
     shadow_git(shadow, wt, &["cat-file", "-e", &format!("{shadow_sha}^{{tree}}")])
         .context("checkpoint object missing from the shadow repo — refusing to touch the worktree")?;
     // Safety snapshot next: restoring without a backup would be unrecoverable.
-    snapshot_to_ref(wt, shadow, &backup_ref(session_id), "rewind backup")?;
+    let backup_sha = snapshot_to_ref(wt, shadow, &backup_ref(session_id), "rewind backup")?;
     let current = real_git(wt, &["rev-parse", "HEAD"])?;
     if current != head_sha {
         if !base_commit.is_empty()
@@ -231,7 +250,28 @@ pub fn restore(
             }
         }
     }
-    Ok(true)
+    Ok(RestoreReceipt {
+        backup_sha,
+        pre_head: current,
+    })
+}
+
+/// Best-effort compensation when a step AFTER a successful restore fails
+/// (e.g. timeline truncation on a locked DB): put the branch and the working
+/// tree back to the pre-restore state the receipt captured, so a `both`
+/// rewind can't end half-applied (restored code + un-rewound conversation).
+/// Skips the fresh backup (the receipt's ref IS the state to return to) and
+/// doesn't re-validate nested repos — this is a mitigation, not a guarantee.
+pub fn rollback_restore(wt: &Path, shadow: &Path, receipt: &RestoreReceipt) -> Result<()> {
+    let current = real_git(wt, &["rev-parse", "HEAD"])?;
+    if current != receipt.pre_head {
+        real_git(wt, &["reset", "--hard", &receipt.pre_head])?;
+    }
+    sync_excludes(shadow, wt)?;
+    shadow_git(shadow, wt, &["read-tree", &receipt.backup_sha])?;
+    shadow_git(shadow, wt, &["checkout-index", "-f", "-a"])?;
+    shadow_git(shadow, wt, &["clean", "-fd"])?;
+    Ok(())
 }
 
 fn session_ref(session_id: i32) -> String {
@@ -545,9 +585,9 @@ mod tests {
             "changed state must commit anew"
         );
 
-        let restored =
+        let receipt =
             restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos).expect("restore");
-        assert!(restored);
+        assert_eq!(receipt.pre_head, git_ok(&wt, &["rev-parse", "HEAD"]));
         assert_eq!(
             visible_files(&wt),
             vec![
@@ -848,6 +888,41 @@ mod tests {
             "pre-existing nested repo must survive"
         );
         let _ = dir;
+    }
+
+    /// Codex-review round 8: rollback_restore puts branch and worktree back to
+    /// the pre-restore state (compensation for a failed post-restore step).
+    #[test]
+    fn rollback_restore_undoes_a_restore_exactly() {
+        let (_dir, wt, shadow, base) = fixture();
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        // Post-checkpoint drift: modify tracked, create a new file.
+        std::fs::write(wt.join("a.txt"), "drifted").expect("modify");
+        std::fs::write(wt.join("drift.txt"), "new").expect("new file");
+        let before: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
+
+        let receipt =
+            restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base, &first.nested_repos)
+                .expect("restore");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
+        assert!(!wt.join("drift.txt").exists(), "restore removed the new file");
+
+        rollback_restore(&wt, &shadow, &receipt).expect("rollback");
+        let after: std::collections::BTreeMap<_, _> = visible_files(&wt).into_iter().collect();
+        assert_eq!(before, after, "rollback returns the tree byte-for-byte");
+    }
+
+    /// Codex-review round 8: restore reservations are ref-counted — one
+    /// restore finishing can't lift another's protection.
+    #[test]
+    fn restore_reservation_is_ref_counted() {
+        let a = begin_restore_reservation(42);
+        let b = begin_restore_reservation(42);
+        assert!(restore_reserved(42));
+        drop(a);
+        assert!(restore_reserved(42), "second hold still protects");
+        drop(b);
+        assert!(!restore_reserved(42));
     }
 
     /// Codex-review round 5: a worktree with an INITIALIZED submodule must be
