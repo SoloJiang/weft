@@ -1814,20 +1814,41 @@ pub async fn set_lead_message_anchor(db: &Db, message_id: i32, anchor: &str) -> 
 /// to the composer) and every later row of ONE (thread, session) timeline —
 /// queued rows included (they belong to the abandoned future). Other sessions
 /// and the lead timeline (session_id NULL) are untouched. Returns rows deleted.
+/// Conversation rewind: delete the target row itself (its text is handed back
+/// to the composer) and every LATER row of ONE (thread, session) timeline —
+/// queued rows included (they belong to the abandoned future). "Later" is the
+/// timeline's delivery order (`COALESCE(seq, id), id`), NOT raw id order: a
+/// reordered queued row can carry a smaller id than a row it was delivered
+/// after, and an id-based cut would keep abandoned user rows while deleting
+/// retained assistant rows. Other sessions and the lead timeline (session_id
+/// NULL) are untouched. Returns the deleted rows' ids (empty when the target
+/// isn't on this timeline).
 pub async fn truncate_lead_messages(
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
     from_message_id: i32,
-) -> Result<u64> {
-    let mut q = lead_message::Entity::delete_many()
-        .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(lead_message::Column::Id.gte(from_message_id));
+) -> Result<Vec<i32>> {
+    use sea_orm::Order;
+    let mut q = lead_message::Entity::find().filter(lead_message::Column::ThreadId.eq(thread_id));
     q = match session_id {
         Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
         None => q.filter(lead_message::Column::SessionId.is_null()),
     };
-    Ok(q.exec(&db.0).await?.rows_affected)
+    let rows = q
+        .order_by(Expr::cust("COALESCE(seq, id)"), Order::Asc)
+        .order_by_asc(lead_message::Column::Id)
+        .all(&db.0)
+        .await?;
+    let Some(pos) = rows.iter().position(|m| m.id == from_message_id) else {
+        return Ok(Vec::new());
+    };
+    let ids: Vec<i32> = rows[pos..].iter().map(|m| m.id).collect();
+    lead_message::Entity::delete_many()
+        .filter(lead_message::Column::Id.is_in(ids.iter().copied()))
+        .exec(&db.0)
+        .await?;
+    Ok(ids)
 }
 
 // ---- code checkpoints (shadow-repo pre-turn snapshots) ----
@@ -1872,19 +1893,22 @@ pub async fn code_checkpoint_for(
         .await?)
 }
 
-/// Conversation rewind drops the abandoned future's checkpoints: the target
-/// turn's own checkpoint and every later one of this worktree (lead_message
-/// ids are monotonic, so `>= from` names exactly the truncated span). The
-/// restore consumed the target's checkpoint BEFORE this runs. Returns rows
-/// deleted.
+/// Conversation rewind drops the abandoned future's checkpoints: every
+/// checkpoint keyed by one of the deleted timeline rows (the same
+/// delivery-ordered suffix `truncate_lead_messages` removed — NOT an id-based
+/// span, which reordered queued rows can break). The restore consumed the
+/// target's checkpoint BEFORE this runs. Returns rows deleted.
 pub async fn truncate_code_checkpoints(
     db: &Db,
     worktree_id: i32,
-    from_lead_message_id: i32,
+    lead_message_ids: &[i32],
 ) -> Result<u64> {
+    if lead_message_ids.is_empty() {
+        return Ok(0);
+    }
     Ok(code_checkpoint::Entity::delete_many()
         .filter(code_checkpoint::Column::WorktreeId.eq(worktree_id))
-        .filter(code_checkpoint::Column::LeadMessageId.gte(from_lead_message_id))
+        .filter(code_checkpoint::Column::LeadMessageId.is_in(lead_message_ids.iter().copied()))
         .exec(&db.0)
         .await?
         .rows_affected)
@@ -3457,7 +3481,8 @@ mod tests {
         let deleted = truncate_lead_messages(&db, t, Some(7), cut.id)
             .await
             .unwrap();
-        assert_eq!(deleted, 3);
+        assert_eq!(deleted.len(), 3);
+        assert!(deleted.contains(&cut.id) && deleted.contains(&after.id) && deleted.contains(&queued.id));
 
         let remaining: Vec<i32> = list_lead_messages(&db, t)
             .await
@@ -3471,6 +3496,68 @@ mod tests {
         assert!(!remaining.contains(&cut.id), "target row itself is deleted");
         assert!(!remaining.contains(&after.id), "later rows are deleted");
         assert!(!remaining.contains(&queued.id), "queued rows are deleted");
+    }
+
+    /// Codex-review regression: queued rows are stamped a delivery `seq` at
+    /// dequeue (`max(COALESCE(seq,id)) + 1`), so a message queued earlier can
+    /// be delivered LATER while keeping a smaller id. The truncation must
+    /// follow the delivery order (`COALESCE(seq, id), id`), not raw id order.
+    #[tokio::test]
+    async fn truncate_lead_messages_follows_delivery_order() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        // Production shape: turn 1 completes; b and a queue behind it; the
+        // queue delivers a FIRST (a.seq < b.seq), then b. Reply rows are
+        // inserted as their turns run, so b (queued first) holds a smaller id
+        // than a yet displays after a's whole exchange.
+        let first = insert_lead_message(&db, t, Some(7), 1, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        let first_reply = insert_lead_message(&db, t, Some(7), 1, "assistant", "text", "{}", "complete")
+            .await
+            .unwrap();
+        let b = insert_lead_message(&db, t, Some(7), 2, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        let a = insert_lead_message(&db, t, Some(7), 3, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        assign_delivery_seq(&db, t, a.id).await.unwrap(); // a dequeued first
+        let a_reply = insert_lead_message(&db, t, Some(7), 3, "assistant", "text", "{}", "complete")
+            .await
+            .unwrap();
+        assign_delivery_seq(&db, t, b.id).await.unwrap(); // b dequeued second
+        let b_reply = insert_lead_message(&db, t, Some(7), 2, "assistant", "text", "{}", "complete")
+            .await
+            .unwrap();
+
+        // Sanity: delivery order is first, first_reply, a, a_reply, b, b_reply
+        // — with b.id < a.id despite b displaying later.
+        assert!(b.id < a.id);
+        let ordered: Vec<i32> = list_lead_messages(&db, t)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![first.id, first_reply.id, a.id, a_reply.id, b.id, b_reply.id]
+        );
+
+        // Rewind to before b: only b and b_reply may go — an id-based cut
+        // (id >= b.id) would also kill a and a_reply.
+        let deleted = truncate_lead_messages(&db, t, Some(7), b.id)
+            .await
+            .unwrap();
+        assert_eq!(deleted, vec![b.id, b_reply.id]);
+        let remaining: Vec<i32> = list_lead_messages(&db, t)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(remaining, vec![first.id, first_reply.id, a.id, a_reply.id]);
     }
 
     #[tokio::test]
@@ -3562,9 +3649,9 @@ mod tests {
         assert_eq!(found.turn_id, 1);
         assert!(code_checkpoint_for(&db, 11, 999).await.unwrap().is_none());
 
-        // Truncate drops the target turn's own checkpoint and later ones of
-        // THIS worktree only (message ids are monotonic).
-        let deleted = truncate_code_checkpoints(&db, 11, 100).await.unwrap();
+        // Truncate drops the checkpoints keyed by the deleted timeline rows of
+        // THIS worktree only.
+        let deleted = truncate_code_checkpoints(&db, 11, &[100, 200]).await.unwrap();
         assert_eq!(deleted, 2);
         assert!(code_checkpoint_for(&db, 11, 100).await.unwrap().is_none());
         assert!(

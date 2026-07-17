@@ -355,9 +355,8 @@ async fn serve_listen_url(child: &mut tokio::process::Child) -> Result<String> {
 /// message whose text matches `text`, whitespace-normalized on both sides
 /// (same normalization as claude's BeforeUserText cut). `opencode run` wraps
 /// the positional message in literal double quotes when storing it (1.17.9
-/// spike), so the quote-stripped form counts as equal too; the FIRST user
-/// message additionally tolerates a prepended system prompt (stored text
-/// merely ENDING WITH the sent text).
+/// spike), so the quote-stripped form counts as equal too. Exact identity
+/// only — no suffix/prefix tolerance, which can select the wrong message.
 fn match_user_cut(messages: &[Value], text: &str, ordinal: usize) -> Option<String> {
     if ordinal == 0 {
         return None;
@@ -366,7 +365,6 @@ fn match_user_cut(messages: &[Value], text: &str, ordinal: usize) -> Option<Stri
     if want.is_empty() {
         return None;
     }
-    let mut user_idx = 0usize;
     let mut seen = 0usize;
     for m in messages {
         if m["info"]["role"].as_str() != Some("user") {
@@ -376,12 +374,12 @@ fn match_user_cut(messages: &[Value], text: &str, ordinal: usize) -> Option<Stri
         if stored.is_empty() {
             continue;
         }
-        let unquoted = strip_outer_quotes(&stored);
-        let hit = stored == want || unquoted == want;
-        let first_turn_tolerant =
-            user_idx == 0 && (stored.ends_with(&want) || unquoted.ends_with(&want));
-        user_idx += 1;
-        if hit || first_turn_tolerant {
+        // Exact identity only. Weft sends the opencode message verbatim (no
+        // system-prompt prefixing in the argv), so a looser rule (e.g. an
+        // ends-with tolerance) can mistake an earlier message that merely
+        // ENDS WITH the target text for the target itself — forking at the
+        // wrong point while the timeline truncates at the right one.
+        if stored == want || strip_outer_quotes(&stored) == want {
             seen += 1;
             if seen == ordinal {
                 return m["info"]["id"].as_str().map(String::from);
@@ -761,24 +759,24 @@ mod tests {
     }
 
     #[test]
-    fn opencode_cut_first_message_tolerates_prepended_prompt() {
-        // A system-prompt prepend (codex-style) would land INSIDE the stored
-        // text, before the sent text; tolerate it on the first user turn only.
+    fn opencode_cut_never_matches_suffixes() {
+        // Codex-review regression: a stored first message that merely ENDS
+        // WITH the target text must NOT be selected over the message that IS
+        // the target — the fork would cut before the first message while the
+        // timeline truncates at the later one (divergent histories).
         let msgs = vec![
-            oc_user("m1", &["\"SYSTEM PROMPT\n\nhello world\""]),
-            oc_assistant("a1", "hi"),
-            oc_user("m2", &["\"hello world\""]),
+            oc_user("m1", &["\"please implement hello\""]),
+            oc_assistant("a1", "done"),
+            oc_user("m2", &["\"hello\""]),
         ];
-        assert_eq!(match_user_cut(&msgs, "hello world", 1).as_deref(), Some("m1"));
-        assert_eq!(match_user_cut(&msgs, "hello world", 2).as_deref(), Some("m2"));
-        // The tolerance is first-turn-only: an unquoted later message whose
-        // text merely ENDS WITH the target must not match.
-        let msgs3 = vec![
-            oc_user("m1", &["\"exact\""]),
-            oc_user("m2", &["\"prefix exact\""]),
+        assert_eq!(match_user_cut(&msgs, "hello", 1).as_deref(), Some("m2"));
+        // And without an exact candidate it is a plain no-match (no tolerated
+        // prefix path to fall into), even on the first user message.
+        let msgs2 = vec![
+            oc_user("m1", &["\"please implement hello\""]),
+            oc_assistant("a1", "done"),
         ];
-        assert_eq!(match_user_cut(&msgs3, "exact", 1).as_deref(), Some("m1"));
-        assert_eq!(match_user_cut(&msgs3, "exact", 2), None);
+        assert_eq!(match_user_cut(&msgs2, "hello", 1), None);
     }
 
     #[test]

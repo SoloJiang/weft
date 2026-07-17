@@ -277,6 +277,7 @@ pub async fn lead_engine(
         codex_client: None,
         turn_user_row: None,
         last_assistant_uuid: None,
+        rewinding: false,
     };
     // Restore the last persisted meta snapshot so the Session panel is populated
     // right away after an app relaunch (not "after first message").
@@ -1136,6 +1137,7 @@ pub(crate) async fn chat_open_worker_impl(
                 codex_client: None,
                 turn_user_row: None,
                 last_assistant_uuid: None,
+                rewinding: false,
             };
             // Restore the last persisted meta snapshot so the Session panel is
             // populated right away after an app relaunch (not "after first message").
@@ -1250,6 +1252,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         codex_client: None,
         turn_user_row: None,
         last_assistant_uuid: None,
+        rewinding: false,
     };
     // Same persisted-meta restore as chat_open_worker_impl: this constructor
     // also races a fresh relaunch (slash discovery / direct chat_send), and an

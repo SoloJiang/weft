@@ -1245,6 +1245,12 @@ pub struct EngineInner {
     /// Last assistant-event uuid seen in the in-flight turn (claude only —
     /// other dialects report no transcript uuid).
     pub last_assistant_uuid: Option<String>,
+    /// A conversation/code rewind is in flight. Set under the same lock as
+    /// rewind's busy check, so a send either lands first (busy → rewind
+    /// refuses) or loses to the reservation and errors out — closing the
+    /// window where a concurrent send's turn would be silently interrupted
+    /// and its rows deleted by the rewind's stop/truncate steps.
+    pub rewinding: bool,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -1885,6 +1891,12 @@ pub async fn send(
     files: Vec<String>,
     origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
+    // A rewind holds its reservation from the busy check to the final
+    // truncate; sends error out for that window rather than racing the
+    // rewind's stop/truncate steps.
+    if eng.lock().await.rewinding {
+        return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+    }
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
@@ -3553,7 +3565,8 @@ pub struct RewindOutcome {
 /// the target row and everything after it, and hand the target's text back
 /// for the composer. The original native session stays untouched as the
 /// natural backup. The turn must be idle — rewind refuses a busy engine
-/// rather than auto-interrupting.
+/// rather than auto-interrupting, and holds a reservation (`inner.rewinding`)
+/// from that check to the final truncate so no new turn can start in between.
 ///
 /// `mode` adds the code half (worker sessions only — the lead has no
 /// worktree): Code restores the worktree to the message's pre-turn checkpoint
@@ -3561,6 +3574,33 @@ pub struct RewindOutcome {
 /// rewinds the conversation. A missing checkpoint fails the whole rewind
 /// before anything is forked/truncated.
 pub async fn rewind(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    message_id: i32,
+    mode: RewindMode,
+) -> anyhow::Result<RewindOutcome> {
+    {
+        let mut inner = eng.lock().await;
+        if inner.turn.busy {
+            return Err(anyhow::anyhow!("先中断当前 turn"));
+        }
+        if inner.rewinding {
+            return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        // Reserve the engine for the whole operation, under the same lock as
+        // the busy check: a send either lands first (busy → we refuse here) or
+        // loses to this reservation and errors out in `send` — no turn can
+        // start mid-rewind for the stop/truncate steps to silently consume.
+        inner.rewinding = true;
+    }
+    let result = rewind_reserved(app, db, eng, message_id, mode).await;
+    eng.lock().await.rewinding = false;
+    result
+}
+
+/// The body of [`rewind`], run with the engine's rewind reservation held.
+async fn rewind_reserved(
     app: &AppHandle,
     db: &Db,
     eng: &EngineRef,
@@ -3750,11 +3790,12 @@ pub async fn rewind(
     // shut down the codex client, invalidate in-flight send reservations.
     stop_quiet(eng).await;
 
-    let deleted = repo::truncate_lead_messages(db, snap.thread_id, snap.session_id, message_id).await?;
+    let deleted_ids = repo::truncate_lead_messages(db, snap.thread_id, snap.session_id, message_id).await?;
+    let deleted = deleted_ids.len() as u64;
     // The abandoned future's checkpoints die with its timeline (the restore
     // above already consumed the target's own checkpoint).
     if let Some(w) = &wt {
-        repo::truncate_code_checkpoints(db, w.id, message_id).await?;
+        repo::truncate_code_checkpoints(db, w.id, &deleted_ids).await?;
     }
     // Persist the fork's native id AFTER the truncation: a fresh lead meta row
     // inserted before the sweep would fall inside its id range and be deleted.
@@ -5131,6 +5172,7 @@ mod tests {
             codex_client: None,
             turn_user_row: None,
             last_assistant_uuid: None,
+            rewinding: false,
         }
     }
 
@@ -5369,6 +5411,7 @@ mod tests {
             codex_client: None,
             turn_user_row: None,
             last_assistant_uuid: None,
+            rewinding: false,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));
