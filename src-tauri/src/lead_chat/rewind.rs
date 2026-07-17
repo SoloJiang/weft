@@ -228,12 +228,15 @@ fn assistant_with_tool_use(line: &str) -> bool {
 }
 
 /// Rewrite one kept line for the fork: structurally set `sessionId` to the
-/// new id, then run a BYTE-level old→new replace over the serialization —
-/// hook outputs embed the session id escaped inside strings (spike), which
-/// the structured pass alone misses.
+/// new id, then rewrite only the EMBEDDED PROTOCOL SHAPES the structured pass
+/// can't reach (spike: hook payloads carry the id escaped inside strings).
+/// A bare uuid in user/assistant/tool text is CONTENT, not protocol — a
+/// global byte replace would let the fork disagree with the Weft timeline
+/// (codex review), so it is deliberately left untouched.
 fn rewrite_line(line: &str, old_id: &str, new_id: &str) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(line) else {
-        return line.replace(old_id, new_id);
+        // Not JSON (shouldn't exist in a transcript) — nothing safe to rewrite.
+        return line.to_string();
     };
     if let Some(obj) = v.as_object_mut() {
         if obj.contains_key("sessionId") {
@@ -241,9 +244,21 @@ fn rewrite_line(line: &str, old_id: &str, new_id: &str) -> String {
         }
     }
     match serde_json::to_string(&v) {
-        Ok(s) => s.replace(old_id, new_id),
-        Err(_) => line.replace(old_id, new_id),
+        Ok(s) => rewrite_protocol_embeds(&s, old_id, new_id),
+        Err(_) => line.to_string(),
     }
+}
+
+/// Embedded protocol fields carrying the session id inside STRINGS: hook
+/// payloads embed it as escaped snake_case JSON (`\"session_id\":\"<id>\"`)
+/// and as the transcript path (`<id>.jsonl`). Only these exact wrappers are
+/// rewritten; the same uuid anywhere else (e.g. pasted into a chat message)
+/// is content and stays verbatim.
+fn rewrite_protocol_embeds(s: &str, old_id: &str, new_id: &str) -> String {
+    let escaped = format!("\\\"session_id\\\":\\\"{old_id}\\\"");
+    let path_form = format!("{old_id}.jsonl");
+    s.replace(&escaped, &format!("\\\"session_id\\\":\\\"{new_id}\\\""))
+        .replace(&path_form, &format!("{new_id}.jsonl"))
 }
 
 /// claude session ids are RFC 4122 uuids; mint a v4 (no uuid crate in-tree).
@@ -617,20 +632,32 @@ mod tests {
     }
 
     #[test]
-    fn escaped_session_id_is_rewritten_byte_level() {
-        // The old id appears as the sessionId field AND escaped inside a hook
-        // output string — the structured pass alone misses the second one.
+    fn embedded_protocol_ids_are_rewritten_but_content_is_not() {
+        // The old id appears: (1) as the sessionId field, (2) escaped inside a
+        // hook payload as `\"session_id\":\"<old>\"` and as the transcript
+        // path — all protocol, all rewritten; (3) pasted into visible user
+        // text — content, deliberately NOT rewritten (the fork must not
+        // disagree with the Weft timeline).
         let hook = format!(
-            "{{\"type\":\"system\",\"sessionId\":\"sid-old\",\"hook\":\"ran in \\\"sid-old\\\" ok\"}}"
+            "{{\"type\":\"system\",\"sessionId\":\"sid-old\",\"hook\":\"in \\\"session_id\\\":\\\"sid-old\\\" and ~/.claude/projects/x/sid-old.jsonl ok\"}}"
         );
-        let lines = vec![user_line("u1", "sid-old", "first"), hook];
+        let lines = vec![
+            user_line("u1", "sid-old", "my session is sid-old, please remember it"),
+            hook,
+        ];
         let (dir, src) = fixture("sid-old", &lines);
         let new_id = fork_transcript_file(&src, "sid-old", &ClaudeCut::AfterUuid("u1".into()))
             .expect("fork")
             .expect("some");
         let out = read_fork(dir.path(), &new_id);
-        assert!(!out.contains("sid-old"), "no old id anywhere: {out}");
-        assert!(out.contains(&new_id), "new id present: {out}");
+        // Protocol shapes rewritten.
+        assert!(!out.contains("\\\"session_id\\\":\\\"sid-old\\\""), "escaped protocol id rewritten: {out}");
+        assert!(out.contains(&format!("{new_id}.jsonl")), "transcript path rewritten: {out}");
+        // Bare mention in user-visible text survives verbatim.
+        assert!(
+            out.contains("my session is sid-old, please remember it"),
+            "content mention must NOT be rewritten: {out}"
+        );
         // Every kept line parses and carries the new sessionId.
         for l in out.lines() {
             let v: Value = serde_json::from_str(l).expect("line parses");

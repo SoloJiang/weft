@@ -188,13 +188,14 @@ fn ensure_shadow(shadow: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fold the REAL repo's local excludes (`<git-common-dir>/info/exclude`) into
-/// the shadow's own exclude file. Shadow git ops read excludes from the
-/// shadow's git dir, so a path the real repo ignores only via its local
-/// info/exclude (often secrets or machine-local config) would be untracked in
-/// the shadow — and `clean` would then DELETE it on restore. Recomputed each
-/// call so edits to the real file are picked up. (`.gitignore` files in the
-/// work tree and `core.excludesFile` are already honored by git itself.)
+/// Fold the REAL repo's local ignore sources into the shadow's own exclude
+/// file: `<git-common-dir>/info/exclude` AND a repo-local `core.excludesFile`
+/// (set in the real repo's `.git/config`). Shadow git ops read excludes only
+/// from the shadow's git dir and ITS config, so a path the real repo ignores
+/// via either local channel (often secrets or machine-local config) would be
+/// untracked in the shadow — and `clean` would DELETE it on restore.
+/// Recomputed each call so edits are picked up. (`.gitignore` files in the
+/// work tree and USER-level `core.excludesFile` are honored by git itself.)
 fn sync_excludes(shadow: &Path, wt: &Path) -> Result<()> {
     let common = real_git(wt, &["rev-parse", "--git-common-dir"])?;
     let common = {
@@ -207,10 +208,35 @@ fn sync_excludes(shadow: &Path, wt: &Path) -> Result<()> {
     };
     let mut body = EXCLUDES.join("\n");
     body.push('\n');
-    if let Ok(extra) = std::fs::read_to_string(common.join("info").join("exclude")) {
+    let mut fold = |extra: String| {
         body.push_str(&extra);
         if !extra.ends_with('\n') {
             body.push('\n');
+        }
+    };
+    if let Ok(extra) = std::fs::read_to_string(common.join("info").join("exclude")) {
+        fold(extra);
+    }
+    // A repo-local `core.excludesFile` (absolute or `~/`; relative resolves
+    // against the worktree, matching git's cwd-relative open).
+    if let Some(set) = real_git_opt(wt, &["config", "--get", "core.excludesFile"]) {
+        let p = set.trim();
+        if !p.is_empty() {
+            let path = if let Some(rest) = p.strip_prefix("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(rest))
+                    .unwrap_or_else(|| PathBuf::from(p))
+            } else {
+                let pb = PathBuf::from(p);
+                if pb.is_absolute() {
+                    pb
+                } else {
+                    wt.join(pb)
+                }
+            };
+            if let Ok(extra) = std::fs::read_to_string(path) {
+                fold(extra);
+            }
         }
     }
     let info = shadow.join("info");
@@ -268,6 +294,22 @@ fn real_git_ok(wt: &Path, args: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Output on success, None on any failure (optional lookups like
+/// `git config --get`, which exits 1 when the key is unset).
+fn real_git_opt(wt: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .env("PATH", crate::detect::tool_path())
+        .args(args)
+        .current_dir(wt)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +609,28 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&listed.stdout).contains("secret.local"),
             "secret never snapshot-tracked"
+        );
+    }
+
+    /// Codex-review round 3: a repo-local `core.excludesFile` (config the
+    /// shadow repo never reads) must protect paths from the restore clean too.
+    #[test]
+    fn restore_preserves_repo_local_excludes_file() {
+        let (_dir, wt, shadow, base) = fixture();
+        let excl = wt.join("local-excludes.txt");
+        std::fs::write(&excl, "machine.local\n").expect("excludes file");
+        git_ok(&wt, &["config", "core.excludesFile", excl.to_str().expect("utf8")]);
+
+        let first = snapshot(&wt, &shadow, 7, 1).expect("snapshot 1");
+        std::fs::write(wt.join("a.txt"), "changed").expect("modify");
+        std::fs::write(wt.join("machine.local"), "do-not-lose").expect("machine file");
+        let r = restore(&wt, &shadow, 7, &first.shadow_sha, &first.head_sha, &base);
+        assert!(r.is_ok(), "restore: {r:?}");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "one");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("machine.local")).expect("machine.local survives"),
+            "do-not-lose",
+            "path ignored via repo-local core.excludesFile must survive"
         );
     }
 }
