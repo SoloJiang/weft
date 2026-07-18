@@ -417,6 +417,14 @@ svg.markmap .markmap-foreign {
 .weft-md .markstream-react blockquote {
   font-style: normal;
 }
+/* Virtuoso is the sole virtualization layer for chat rows. Markstream's root
+   content-visibility:auto reports its 600px intrinsic placeholder as the row's
+   real height while offscreen, then corrects it during a scroll. That fights
+   Virtuoso's measurements, moves the viewport, and briefly skips child paint. */
+.weft-chat-virtualizer .weft-md > .markstream-react.markdown-renderer {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
 /* GFM task-list items: the checkbox replaces the bullet. */
 .weft-md .markstream-react li:has(.checkbox-node) {
   list-style: none;

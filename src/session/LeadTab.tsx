@@ -67,6 +67,7 @@ export function LeadTab({
     activeWorkspaceId,
     threads,
     leadMessages,
+    leadHistoryStatus,
     leadTurn,
     leadSlash,
     leadActivity,
@@ -266,6 +267,9 @@ export function LeadTab({
       <section className="flex min-w-0 flex-1 flex-col bg-bg">
         <ChatTimeline
           messages={msgs}
+          historyStatus={leadHistoryStatus[tid] ?? "loading"}
+          timelineKey={`lead:${tid}`}
+          onRetryHistory={() => void loadLeadChat(tid)}
           asks={asks.filter((a) => a.thread === tid && (a.dir === "lead" || a.dir === ""))}
           busy={turn.state === "busy"}
           activity={leadActivity[tid]}

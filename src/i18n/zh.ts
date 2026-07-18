@@ -226,6 +226,8 @@ export const zh = {
     repoGuideStepReturn: "结果会回到聊天里，lead 可以基于更新后的工作区继续推进。",
     working: "处理中…",
     loading: "加载中",
+    historyLoadError: "对话加载失败。",
+    retryHistory: "重试",
     stop: "停止",
     queuedN: "已排队 {{count}}",
     interrupted: "已中断",

@@ -11,6 +11,11 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { createDeltaCoalescer } from "./deltaCoalescer";
 import { mergeLeadSnapshot } from "./leadSnapshot";
+import {
+  beginChatHistoryLoad,
+  failChatHistoryLoad,
+  type ChatHistoryStatus,
+} from "./chatHistory";
 import i18n, { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
 import { STORAGE_KEYS } from "../lib/storageKeys";
@@ -81,6 +86,8 @@ interface Store {
 
   /** Lead chat: weft-owned timeline per thread (engine pushes, no polling). */
   leadMessages: Record<number, LeadMessage[]>;
+  /** Persisted timeline hydration state per thread. Missing means not loaded. */
+  leadHistoryStatus: Record<number, ChatHistoryStatus>;
   /** Lead engine turn state per thread: busy/idle/stopped + queued items. */
   leadTurn: Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>;
   /** Slash commands the lead's CLI reports as available (init event). */
@@ -1296,6 +1303,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // ── Lead chat (weft-owned conversation; engine pushes via `lead-chat`) ──
   const [leadMessages, setLeadMessages] = useState<Record<number, LeadMessage[]>>({});
+  const [leadHistoryStatus, setLeadHistoryStatus] = useState<
+    Record<number, ChatHistoryStatus>
+  >({});
   const [leadTurn, setLeadTurn] = useState<
     Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>
   >({});
@@ -1571,7 +1581,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const loadLeadChat = useCallback(async (threadId: number) => {
-    const msgs = await api.listLeadMessages(threadId);
+    setLeadHistoryStatus((statuses) => ({
+      ...statuses,
+      [threadId]: beginChatHistoryLoad(statuses[threadId]),
+    }));
+
+    let msgs: LeadMessage[];
+    try {
+      msgs = await api.listLeadMessages(threadId);
+    } catch (e) {
+      console.error(e);
+      setLeadHistoryStatus((statuses) => ({
+        ...statuses,
+        [threadId]: failChatHistoryLoad(statuses[threadId]),
+      }));
+      return;
+    }
     // Drain-then-reconcile, same tick: pending chunks land on the current rows
     // first (never onto the snapshot — that would duplicate any chunk the
     // backend's ~150ms persist throttle already wrote), then mergeLeadSnapshot
@@ -1583,6 +1608,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setLeadMessages((m) => ({
       ...m,
       [threadId]: mergeLeadSnapshot(m[threadId] ?? [], msgs),
+    }));
+    // Set ready only after the rows are queued. Even without React batching,
+    // the timeline can never expose a confirmed-empty frame before its data.
+    setLeadHistoryStatus((statuses) => ({
+      ...statuses,
+      [threadId]: "ready",
     }));
     // Fire the engine up and refresh slash commands, including workspace skills.
     discoverLeadSlash(threadId);
@@ -2384,6 +2415,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     messages,
     postHuman,
     leadMessages,
+    leadHistoryStatus,
     leadTurn,
     leadSlash,
     loadLeadChat,

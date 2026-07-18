@@ -15,6 +15,15 @@ import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ALL_REWIND_MODES, RewindDialog, RewindPickerDialog } from "./RewindDialog";
 import { appLink, resumeCommand } from "../lib/resume";
 import { useImeComposition } from "../lib/useImeComposition";
+import {
+  failChatHistoryLoad,
+  workerChatHistoryStatus,
+} from "../state/chatHistory";
+
+type WorkerSessionLookup =
+  | { slotKey: string | null; status: "loading"; ref: null; error: null }
+  | { slotKey: string | null; status: "ready"; ref: ObserveRef | null; error: null }
+  | { slotKey: string | null; status: "error"; ref: null; error: string };
 
 /**
  * The worker conversation — same model as the lead console (LeadTab): a single,
@@ -27,6 +36,7 @@ export function WorkerConversation() {
     viewing,
     sessions,
     leadMessages,
+    leadHistoryStatus,
     workerTurn,
     workerSlash,
     workerActivity,
@@ -46,9 +56,17 @@ export function WorkerConversation() {
     setActiveSidePanel,
   } = useStore();
   const { t } = useTranslation();
-  const [ref, setRef] = useState<ObserveRef | null>(null);
+  const directionId = viewing?.directionId ?? null;
+  const repoId = viewing?.repoId ?? null;
+  const slotKey = directionId == null || repoId == null ? null : `${directionId}:${repoId}`;
+  const [sessionLookup, setSessionLookup] = useState<WorkerSessionLookup>({
+    slotKey: null,
+    status: "loading",
+    ref: null,
+    error: null,
+  });
+  const [sessionLookupRetry, setSessionLookupRetry] = useState(0);
   const [rail, setRail] = useState<"info" | "diff" | "files" | "none">("info");
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
   // Conversation rewind: the message id awaiting confirm (null = dialog closed),
   // the Esc-Esc picker's open flag, and the composer prefill (seq bumps to
@@ -57,8 +75,14 @@ export function WorkerConversation() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [prefill, setPrefill] = useState<{ text: string; seq: number }>({ text: "", seq: 0 });
 
-  const directionId = viewing?.directionId ?? null;
-  const repoId = viewing?.repoId ?? null;
+  // Effects clear a previous slot after commit. Keying the lookup lets render
+  // reject stale data synchronously during the slot-switch frame itself.
+  const activeSessionLookup: WorkerSessionLookup =
+    sessionLookup.slotKey === slotKey
+      ? sessionLookup
+      : { slotKey, status: "loading", ref: null, error: null };
+  const ref = activeSessionLookup.ref;
+  const loadError = activeSessionLookup.error;
 
   // Mirror the live diff/files panel to the store so the nav rail can yield room
   // to it on narrow windows; clear it when this session unmounts.
@@ -99,15 +123,15 @@ export function WorkerConversation() {
   // never render with stale data while sessionFor refreshes. A relative file ref
   // clicked in that window would otherwise resolve against the prior worktree.
   useEffect(() => {
-    setRef(null);
-  }, [directionId, repoId]);
+    setSessionLookup({ slotKey, status: "loading", ref: null, error: null });
+  }, [slotKey]);
 
   // Resolve the worker's session ref (worktree/branch/tool/session_id/native_id).
   // Polls while not live so a backgrounded worker's status stays fresh.
   useEffect(() => {
     setRail(viewing?.sidePanel ?? "info");
     if (directionId == null || repoId == null) {
-      setRef(null);
+      setSessionLookup({ slotKey, status: "ready", ref: null, error: null });
       return;
     }
     let alive = true;
@@ -116,13 +140,18 @@ export function WorkerConversation() {
         .sessionFor(directionId, repoId)
         .then((r) => {
           if (alive) {
-            setRef(r);
-            setLoadError(null);
+            setSessionLookup({ slotKey, status: "ready", ref: r, error: null });
             if (r && r.session_id != null) hydrateWorkerMeta(r.session_id, r);
           }
         })
         .catch((e: unknown) => {
-          if (alive) setLoadError(String(e));
+          if (!alive) return;
+          setSessionLookup((current) => {
+            if (current.slotKey !== slotKey) return current;
+            const status = failChatHistoryLoad(current.status);
+            if (status === "ready") return current;
+            return { slotKey, status: "error", ref: null, error: String(e) };
+          });
         });
     void load();
     const h = setInterval(load, 2000);
@@ -130,7 +159,7 @@ export function WorkerConversation() {
       alive = false;
       clearInterval(h);
     };
-  }, [directionId, repoId, viewing?.sidePanel, hydrateWorkerMeta]);
+  }, [directionId, repoId, slotKey, viewing?.sidePanel, hydrateWorkerMeta, sessionLookupRetry]);
 
   // Enabled skills for the panel (workspace-level, CLI-agnostic). Re-fetch when
   // skills change so the silent skill-refresh is reflected without a restart.
@@ -178,6 +207,14 @@ export function WorkerConversation() {
   // Effective session id: the live engine's, else the persisted ref's. resume
   // reuses the same row, so this is stable across attach.
   const sid = live?.info.session_id ?? ref?.session_id ?? null;
+  const historyStatus = workerChatHistoryStatus(
+    sid,
+    activeSessionLookup.status,
+    threadId == null ? undefined : leadHistoryStatus[threadId],
+  );
+  const timelineKey = sid == null
+    ? `worker-slot:${directionId}:${repoId}`
+    : `worker:${sid}`;
   const turn = sid != null ? workerTurn[sid] : undefined;
   const busy = (turn?.state ?? "stopped") === "busy";
   const msgs =
@@ -281,6 +318,15 @@ export function WorkerConversation() {
         <div className="flex min-h-0 flex-1 flex-col">
           <ChatTimeline
             messages={msgs}
+            historyStatus={historyStatus}
+            timelineKey={timelineKey}
+            onRetryHistory={() => {
+              if (threadId != null) void loadLeadChat(threadId);
+              if (activeSessionLookup.status === "error") {
+                setSessionLookup({ slotKey, status: "loading", ref: null, error: null });
+                setSessionLookupRetry((n) => n + 1);
+              }
+            }}
             asks={workerAsks}
             busy={busy}
             activity={sid != null ? workerActivity[sid] : undefined}
