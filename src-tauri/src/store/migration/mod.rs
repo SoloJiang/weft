@@ -1,6 +1,7 @@
 use crate::store::entities::{
-    app_setting, backup_config, direction, im_route, lead_message, plan, repo_profile, repo_ref,
-    session, skill_enable, skill_source, test_plan, thread, workspace, worktree,
+    app_setting, backup_config, code_checkpoint, direction, im_route, lead_message, plan,
+    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
+    worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -46,6 +47,10 @@ impl MigratorTrait for Migrator {
             Box::new(M0033RepoLayerRank),
             Box::new(M0034SessionMetaSnapshot),
             Box::new(M0035TestPlan),
+            Box::new(M0036LeadMessageNativeAnchor),
+            Box::new(M0037CodeCheckpoint),
+            Box::new(M0038CodeCheckpointNestedRepos),
+            Box::new(M0039CodeCheckpointIndexTree),
         ]
     }
 }
@@ -1588,6 +1593,166 @@ impl MigrationTrait for M0035TestPlan {
     }
 }
 
+/// Adds nullable `native_anchor` (TEXT) to `lead_message`. The engine records
+/// it on the user row that opened a turn: claude = the turn's last assistant
+/// event uuid, codex app-server = the turn id. Conversation rewind cuts the
+/// native session at the anchor of the nearest user row before the target. A
+/// fresh db already has it (M0007 reflects the entity); sqlite has no ADD
+/// COLUMN IF NOT EXISTS, so the duplicate is tolerated.
+pub struct M0036LeadMessageNativeAnchor;
+impl MigrationName for M0036LeadMessageNativeAnchor {
+    fn name(&self) -> &str {
+        "m0036_lead_message_native_anchor"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0036LeadMessageNativeAnchor {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("lead_message"))
+                    .add_column(ColumnDef::new(Alias::new("native_anchor")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("lead_message"))
+                    .drop_column(Alias::new("native_anchor"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Creates the code_checkpoint table: one row per pre-turn code checkpoint
+/// (shadow-repo commit + real HEAD) recorded at a worker's user-turn start,
+/// consumed by code rewind. A fresh db already has it (the entity drives
+/// create_table_from_entity); IF NOT EXISTS tolerates the duplicate like
+/// M0036's column-add does.
+pub struct M0037CodeCheckpoint;
+impl MigrationName for M0037CodeCheckpoint {
+    fn name(&self) -> &str {
+        "m0037_code_checkpoint"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0037CodeCheckpoint {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut stmt = schema.create_table_from_entity(code_checkpoint::Entity);
+        stmt.if_not_exists();
+        manager.create_table(stmt).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("code_checkpoint")).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
+/// Adds `nested_repos` (TEXT, default '[]') to `code_checkpoint`: the snapshot
+/// manifest of nested git repo dirs, so a restore can delete exactly the
+/// nested repos created AFTER the checkpoint (git clean -fd never touches
+/// nested repos). Duplicate tolerated (fresh DBs reflect the entity already).
+pub struct M0038CodeCheckpointNestedRepos;
+impl MigrationName for M0038CodeCheckpointNestedRepos {
+    fn name(&self) -> &str {
+        "m0038_code_checkpoint_nested_repos"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0038CodeCheckpointNestedRepos {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("nested_repos"))
+                            .string()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .drop_column(Alias::new("nested_repos"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds `index_tree` (TEXT, default '') to `code_checkpoint`: the tree of the
+/// real repo's index at snapshot time, so a restore can put the user's staged
+/// state back instead of resetting the index to HEAD. Duplicate tolerated
+/// (fresh DBs reflect the entity already).
+pub struct M0039CodeCheckpointIndexTree;
+impl MigrationName for M0039CodeCheckpointIndexTree {
+    fn name(&self) -> &str {
+        "m0039_code_checkpoint_index_tree"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0039CodeCheckpointIndexTree {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("index_tree"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("code_checkpoint"))
+                    .drop_column(Alias::new("index_tree"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1710,6 +1875,44 @@ mod tests {
             .unwrap();
         let s = create_session(&db, d.id, r.id, "claude", "/tmp/cwd").await.unwrap();
         assert_eq!(s.meta, "", "session.meta must exist and default to empty");
+    }
+
+    /// M0036: lead_message.native_anchor is present after migration and defaults to NULL.
+    #[tokio::test]
+    async fn m0036_native_anchor_column_added() {
+        use crate::store::Db;
+        use crate::store::repo::{create_thread, create_workspace, insert_lead_message};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let m = insert_lead_message(&db, t.id, None, 1, "user", "text", r#"{"text":"hi"}"#, "complete")
+            .await
+            .unwrap();
+        // Selecting the row back requires the column to exist.
+        assert_eq!(m.native_anchor, None, "native_anchor must exist and default to NULL");
+    }
+
+    /// M0037: code_checkpoint exists after migration and round-trips a row.
+    #[tokio::test]
+    async fn m0037_code_checkpoint_table_created() {
+        use crate::store::repo::{code_checkpoint_for, insert_code_checkpoint};
+        use crate::store::Db;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let c = insert_code_checkpoint(&db, 1, 7, 100, 1, "shadow-sha", "head-sha", "[\"gen\"]", "idx-1")
+            .await
+            .unwrap();
+        let found = code_checkpoint_for(&db, 1, 100).await.unwrap().unwrap();
+        assert_eq!(found.id, c.id);
+        assert_eq!(found.shadow_sha, "shadow-sha");
+        assert_eq!(found.head_sha, "head-sha");
+        // m0038: the nested-repos manifest column exists and round-trips.
+        assert_eq!(found.nested_repos, "[\"gen\"]");
+        // m0039: the staged-index tree column exists and round-trips.
+        assert_eq!(found.index_tree, "idx-1");
     }
 
     /// M0029: raw-query path rewrites gateway components without touching

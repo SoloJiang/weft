@@ -152,6 +152,16 @@ pub enum Push {
         content: String,
         status: String,
     },
+    /// A conversation rewind truncated this (thread, session) timeline: every
+    /// open surface must reload from the DB. Carries the session's NEW native
+    /// id (None = a fresh native session starts on next send) so live session
+    /// state (Open App / Take Over commands) can't point at the abandoned
+    /// pre-rewind conversation.
+    Rewound {
+        thread_id: i32,
+        session_id: Option<i32>,
+        native_id: Option<String>,
+    },
 }
 
 /// 进行中 turn 最多排队多少条人类消息（满后 send 拒绝入队）。
@@ -1232,6 +1242,23 @@ pub struct EngineInner {
     /// Per-session `codex app-server` connection (app-server transport only),
     /// spawned lazily on the first turn with this session's `-c mcp_servers` args.
     pub codex_client: Option<crate::codex_app_server::Client>,
+    /// Rewind anchor bookkeeping for the in-flight turn: the user row that
+    /// opened it. Written with the turn's native anchor at a clean TurnEnd
+    /// (claude: `last_assistant_uuid`; codex app-server: the turn id).
+    pub turn_user_row: Option<i32>,
+    /// Last assistant-event uuid seen in the in-flight turn (claude only —
+    /// other dialects report no transcript uuid).
+    pub last_assistant_uuid: Option<String>,
+    /// A conversation/code rewind is in flight. Set under the same lock as
+    /// rewind's busy check, so a send either lands first (busy → rewind
+    /// refuses) or loses to the reservation and errors out — closing the
+    /// window where a concurrent send's turn would be silently interrupted
+    /// and its rows deleted by the rewind's stop/truncate steps.
+    pub rewinding: bool,
+    /// The worktree this worker runs in (None for the lead console): lets
+    /// send's admission honor a worktree-level restore reservation without a
+    /// DB lookup. Sibling sessions of one worktree share the same id.
+    pub worktree_id: Option<i32>,
 }
 
 pub type EngineRef = Arc<tokio::sync::Mutex<EngineInner>>;
@@ -1872,6 +1899,12 @@ pub async fn send(
     files: Vec<String>,
     origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
+    // A rewind holds its reservation from the busy check to the final
+    // truncate; sends error out for that window rather than racing the
+    // rewind's stop/truncate steps.
+    if eng.lock().await.rewinding {
+        return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+    }
     // Skill-refresh: a flag set on idle means newly-injected skills are waiting.
     // Silently bounce the resident process so the relaunch (resume) reads them.
     // Invisible: no "stopped" emit; UI goes straight idle→busy on this send.
@@ -1964,6 +1997,21 @@ pub async fn send(
     // stop/interrupt/status stay responsive for the session.
     let ctx = {
         let mut inner = eng.lock().await;
+        // Recheck the rewind reservation under the ADMISSION lock: the early
+        // check at fn top released the mutex long ago, and a rewind may have
+        // started since — a send admitted now would be interrupted and its
+        // rows deleted by the rewind's stop/truncate steps.
+        if inner.rewinding {
+            return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        // A code restore holds a reservation on the whole WORKTREE: sibling
+        // sessions of the same worktree must not start editing it mid-restore.
+        if inner
+            .worktree_id
+            .is_some_and(crate::checkpoint::worktree_op_reserved)
+        {
+            return Err(anyhow::anyhow!("该 worktree 正在回退代码，请稍后重试"));
+        }
         let direct = inner.turn.try_begin_send();
         // Count only tracked (user-visible) items: hidden plumbing deliveries
         // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
@@ -2044,6 +2092,13 @@ pub async fn send(
         },
     );
 
+    // Pre-turn code checkpoint (worker sessions only), awaited BEFORE the
+    // Phase 3/4 dispatch (write_user / spawn) so it captures the pre-turn
+    // worktree state. Queued sends checkpoint at their dequeue instead.
+    if ctx.direct {
+        snapshot_turn_checkpoint(app, db, ctx.session_id, ctx.turn, row_id).await;
+    }
+
     let mut outbound = text.to_string();
     // Capture BEFORE images may be spilled to temp files below (per-turn dialects
     // clear out.images after spill; has_attachments must reflect the original inputs).
@@ -2074,6 +2129,19 @@ pub async fn send(
     } else {
         images
     };
+    // Persist the EXACT dispatched text for image-bearing per-turn rows: the
+    // spill loop above omits a path when decode/write fails, and rewind's
+    // native text match can't reconstruct that retroactively. (Text/files
+    // appendices are deterministic; only images need this.)
+    if per_turn(&ctx.tool) && !image_uris.is_empty() {
+        let with_dispatched = serde_json::json!({
+            "text": text,
+            "images": image_uris,
+            "files": files,
+            "dispatched": &outbound,
+        });
+        let _ = repo::update_lead_message(db, row_id, &with_dispatched.to_string(), status).await;
+    }
     let out = Outgoing {
         text: outbound,
         images,
@@ -2146,6 +2214,10 @@ pub async fn send(
                 // an idle queue, so deliver NOW by promoting into a fresh direct
                 // turn — the same commit-time decision a direct send makes.
                 promoted = Some(promote_queued_reservation(&mut inner, ctx.origin_tag.clone()));
+                // Same pre-turn checkpoint as a direct send, taken between the
+                // promotion and the dispatch (the resident write below; per-turn
+                // / codex spawns in Phase 4).
+                snapshot_turn_checkpoint(app, db, inner.session_id, inner.turn_id, row_id).await;
                 crate::power::on_turn_began(app);
                 // Under the lock for the same ordering reason as Phase 1's direct
                 // write: a concurrent stop's "stopped" write must not be overtaken.
@@ -2176,6 +2248,14 @@ pub async fn send(
                     }
                 }
             }
+        }
+        // Rewind anchor bookkeeping: the row that opens a turn is where the
+        // turn's native anchor lands at a clean TurnEnd. A queued row waits
+        // for its dequeue (the flush paths re-stamp it then); hidden plumbing
+        // turns carry no row (None).
+        if ctx.direct || promoted.is_some() {
+            inner.turn_user_row = Some(row_id);
+            inner.last_assistant_uuid = None;
         }
         let _ = app.emit(
             EVENT,
@@ -2546,7 +2626,7 @@ async fn codex_consumer(
                     },
                 );
             }
-            ThreadMsg::Event(ChatEvent::Assistant { texts, tools }) => {
+            ThreadMsg::Event(ChatEvent::Assistant { texts, tools, .. }) => {
                 // Codex streams text via deltas; non-text items are tool calls →
                 // inline `kind:"tool"` rows, filled by their item.completed result.
                 let mut inner = eng.lock().await;
@@ -2593,6 +2673,10 @@ async fn codex_consumer(
                 is_error,
                 context_tokens,
             }) => {
+                // Rewind anchor for this turn (codex app-server: the turn id).
+                // Grabbed BEFORE the lock section — and before the clear at the
+                // bottom of this arm — so it names the turn that just ended.
+                let finished_turn = client.active_turn(&thread).await;
                 let mut inner = eng.lock().await;
                 let thread_id = inner.thread_id;
                 let session_id = inner.session_id;
@@ -2620,6 +2704,14 @@ async fn codex_consumer(
                     "complete"
                 };
                 inner.interrupting = false;
+                // A cleanly finished turn stamps its rewind anchor (the app-server
+                // turn id) on the user row that opened it. Interrupted/error turns
+                // write nothing — the previous completed turn's anchor stands.
+                if status == "complete" {
+                    if let (Some(row), Some(anchor)) = (inner.turn_user_row, finished_turn) {
+                        let _ = repo::set_lead_message_anchor(&db, row, &anchor).await;
+                    }
+                }
                 // An interrupted/failed turn can leave a tool row whose
                 // item.completed never arrived; finalize it so it stops spinning.
                 let orphans: Vec<(i32, serde_json::Value)> =
@@ -2648,6 +2740,10 @@ async fn codex_consumer(
                     );
                 }
                 let next = inner.turn.on_turn_end();
+                // Rewind bookkeeping passes to the dequeued turn: its user row is
+                // the queued row's id (None for plumbing turns or going idle).
+                inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+                inner.last_assistant_uuid = None;
                 // Next turn's tag becomes the in-flight tag (None when going idle),
                 // so the dequeued turn's output frames carry its own origin_tag.
                 inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
@@ -2708,6 +2804,12 @@ async fn codex_consumer(
                         finalize_dequeued_row(&app, &db, thread_id, n, "interrupted").await;
                     }
                 } else if let (Some(n), Some(turn_id)) = (next, next_turn_id) {
+                    // Pre-turn checkpoint for the dequeued turn (its user row is
+                    // the queued row's id), awaited before turn/start dispatches
+                    // the message to the agent.
+                    if let Some(qid) = n.queue_id {
+                        snapshot_turn_checkpoint(&app, &db, session_id, turn_id, qid).await;
+                    }
                     match client.start_turn(&thread, &n.text).await {
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
@@ -3453,6 +3555,703 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
     );
 }
 
+/// Which halves of a rewind to perform: conversation (native fork + timeline
+/// truncation), code (shadow-repo worktree restore), or both. The wire values
+/// are the frontend contract (`chat_rewind`'s `mode` arg).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RewindMode {
+    Conversation,
+    Code,
+    Both,
+}
+
+impl RewindMode {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "conversation" => Ok(Self::Conversation),
+            "code" => Ok(Self::Code),
+            "both" => Ok(Self::Both),
+            _ => Err(format!("invalid rewind mode: {s}")),
+        }
+    }
+}
+
+/// What a rewind hands back to the composer (conversation fields are
+/// zero-valued for a code-only rewind).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RewindOutcome {
+    /// The target message's text, to prefill the composer for edit + resend.
+    /// Empty for a code-only rewind (the timeline is untouched there).
+    pub rewound_text: String,
+    /// Timeline rows deleted (the target itself plus everything after it,
+    /// queued rows included).
+    pub deleted: u64,
+    /// The session's NEW native id (the fork), or None when the next turn
+    /// starts a brand-new native session (rewound to before the first
+    /// message, or the session had no native id).
+    pub native_id: Option<String>,
+    /// True when the worktree was restored to the message's pre-turn
+    /// checkpoint (modes code/both; conversation-only leaves it false).
+    pub code_restored: bool,
+}
+
+/// Rewind a worker session's OR the lead console's conversation to just
+/// BEFORE `message_id`: fork the native session at the cut point (claude
+/// transcript surgery / codex `thread/fork` / opencode `session/fork`), drop
+/// the target row and everything after it, and hand the target's text back
+/// for the composer. The original native session stays untouched as the
+/// natural backup. The turn must be idle — rewind refuses a busy engine
+/// rather than auto-interrupting, and holds a reservation (`inner.rewinding`)
+/// from that check to the final truncate so no new turn can start in between.
+///
+/// `mode` adds the code half (worker sessions only — the lead has no
+/// worktree): Code restores the worktree to the message's pre-turn checkpoint
+/// and leaves the timeline/native session untouched; Both restores AND
+/// rewinds the conversation. A missing checkpoint fails the whole rewind
+/// before anything is forked/truncated.
+pub async fn rewind(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    message_id: i32,
+    mode: RewindMode,
+) -> anyhow::Result<RewindOutcome> {
+    {
+        let mut inner = eng.lock().await;
+        if inner.turn.busy {
+            return Err(anyhow::anyhow!("先中断当前 turn"));
+        }
+        if inner.rewinding {
+            return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
+        }
+        // Reserve the engine for the whole operation, under the same lock as
+        // the busy check: a send either lands first (busy → we refuse here) or
+        // loses to this reservation and errors out in `send` — no turn can
+        // start mid-rewind for the stop/truncate steps to silently consume.
+        inner.rewinding = true;
+    }
+    let result = rewind_reserved(app, db, eng, message_id, mode).await;
+    eng.lock().await.rewinding = false;
+    result
+}
+
+/// The body of [`rewind`], run with the engine's rewind reservation held.
+async fn rewind_reserved(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    message_id: i32,
+    mode: RewindMode,
+) -> anyhow::Result<RewindOutcome> {
+    let snap = {
+        let inner = eng.lock().await;
+        if inner.turn.busy {
+            return Err(anyhow::anyhow!("先中断当前 turn"));
+        }
+        RewindSnap {
+            thread_id: inner.thread_id,
+            session_id: inner.session_id,
+            tool: inner.tool.clone(),
+            command: inner.command.clone(),
+            extra_args: inner.extra_args.clone(),
+            cwd: inner.cwd.clone(),
+            native_id: inner.native_id.clone(),
+            ask_dir: inner.ask_dir.clone(),
+            codex_client: inner.codex_client.clone(),
+        }
+    };
+    // Lead engines (session_id None) can only rewind the conversation — they
+    // have no worktree to checkpoint or restore.
+    if snap.session_id.is_none() && mode != RewindMode::Conversation {
+        return Err(anyhow::anyhow!("lead 会话没有 worktree，不支持代码回退"));
+    }
+
+    // The target row must be a completed user message of THIS timeline.
+    let rows = repo::list_lead_messages(db, snap.thread_id).await?;
+    let session_rows: Vec<&crate::store::entities::lead_message::Model> = rows
+        .iter()
+        .filter(|m| m.session_id == snap.session_id)
+        .collect();
+    let Some(pos) = session_rows.iter().position(|m| m.id == message_id) else {
+        return Err(anyhow::anyhow!("消息不存在"));
+    };
+    let target = session_rows[pos];
+    if target.role != "user" {
+        return Err(anyhow::anyhow!("只能回退用户消息"));
+    }
+    if target.status != "complete" {
+        return Err(anyhow::anyhow!("只能回退已发送完成的消息"));
+    }
+    let target_turn = target.turn_id;
+    let rewound_text = serde_json::from_str::<serde_json::Value>(&target.content)
+        .ok()
+        .and_then(|v| v["text"].as_str().map(String::from))
+        .unwrap_or_default();
+
+    // The cut anchor lives on the nearest user row BEFORE the target (its
+    // turn's end = the native state right before the target was sent). Only
+    // DELIVERED rows count — queued/error user rows never reached the native
+    // history and would skew both the anchor and the ordinal (review P2).
+    let prev_user = session_rows[..pos]
+        .iter()
+        .rev()
+        .find(|m| super::rewind::native_delivered(&m.role, &m.status));
+    let anchor = prev_user.and_then(|m| m.native_anchor.clone());
+    // The text the native side actually stores: send() appends attachment
+    // instructions/spill paths, so the match must use the reconstructed
+    // DISPATCHED text (the raw content.text only ever matches bare messages).
+    // The composer prefill still uses the raw rewound_text.
+    let per_turn_tool = per_turn(&snap.tool);
+    let match_text = super::rewind::dispatched_text(per_turn_tool, target.id, &target.content);
+    // Fallback ordinal for claude's/opencode's text cut: the target's 1-based
+    // position among same-text user rows of this session, up to and including
+    // itself. Counted under the SAME whitespace-normalized identity the
+    // transcript cut uses (rewind::ordinal_of), or a `hello  world`/`hello
+    // world` pair would fork at a different point than the timeline truncates.
+    let user_texts: Vec<String> = session_rows[..=pos]
+        .iter()
+        .filter(|m| super::rewind::native_delivered(&m.role, &m.status))
+        .map(|m| super::rewind::dispatched_text(per_turn_tool, m.id, &m.content))
+        .collect();
+    let ordinal = super::rewind::ordinal_of(&user_texts, &match_text);
+
+    // Resolve the session's worktree ONCE: mandatory for the code half,
+    // best-effort for a conversation-only rewind (it only drives the
+    // checkpoint-row sweep below).
+    let wt = match snap.session_id {
+        Some(sid) => session_worktree(db, sid).await?,
+        None => None,
+    };
+    // Resolve the code half BEFORE mutating anything (fork/stop/truncate): a
+    // missing checkpoint must fail the whole rewind, not half of it.
+    let code_target = match mode {
+        RewindMode::Conversation => None,
+        _ => {
+            let Some(w) = &wt else {
+                return Err(anyhow::anyhow!("该消息没有代码检查点（旧会话或快照失败）"));
+            };
+            Some(resolve_code_target(db, w, snap.session_id, message_id).await?)
+        }
+    };
+
+    // The native id to cut: a worker's lives on the engine; the lead's lives
+    // in its per-thread meta row.
+    let old_native: Option<String> = match snap.session_id {
+        Some(_) => snap.native_id.clone(),
+        None => repo::lead_native_id(db, snap.thread_id).await?,
+    };
+
+    // Fork BEFORE mutating anything (stop/truncate), so a fork failure leaves
+    // the session fully intact.
+    let new_native: Option<String> = match mode {
+        // Restore only: the native session is untouched.
+        RewindMode::Code => None,
+        _ => match snap.tool.as_str() {
+            "claude" => match &old_native {
+                // No native session yet → nothing to cut; the next turn starts one.
+                None => None,
+                Some(old) => {
+                    let cut = match &anchor {
+                        Some(a) => super::rewind::ClaudeCut::AfterUuid(a.clone()),
+                        None => {
+                            if ordinal == 0 {
+                                return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
+                            }
+                            super::rewind::ClaudeCut::BeforeUserText {
+                                text: match_text.clone(),
+                                ordinal,
+                            }
+                        }
+                    };
+                    super::rewind::fork_claude_at(&snap.cwd, old, &cut)?
+                }
+            },
+            "codex" => {
+                if !codex_appserver_enabled() {
+                    return Err(anyhow::anyhow!("codex exec 模式暂不支持回退"));
+                }
+                match &old_native {
+                    None => None,
+                    Some(old) => match (prev_user.is_some(), anchor) {
+                        // Rewinding to before the FIRST user message: the next turn
+                        // starts a brand-new thread (no fork to make).
+                        (false, _) => None,
+                        (true, None) => {
+                            return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
+                        }
+                        (true, Some(turn_id)) => Some(fork_codex_thread(&snap, old, &turn_id).await?),
+                    },
+                }
+            }
+            "opencode" => match &old_native {
+                // No native session yet → nothing to cut; the next turn starts one.
+                None => None,
+                // Rewinding to before the FIRST user message: the next turn
+                // starts a brand-new session (no fork to make).
+                Some(_) if prev_user.is_none() => None,
+                Some(old) => {
+                    // opencode streams carry no rewind anchor — the cut is
+                    // always the text+ordinal match against the served history.
+                    if ordinal == 0 {
+                        return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
+                    }
+                    let program = crate::tool_command::effective(snap.command.as_deref(), &snap.tool);
+                    Some(
+                        super::rewind::fork_opencode_at(&program, &snap.cwd, old, &match_text, ordinal)
+                            .await?,
+                    )
+                }
+            },
+            _ => return Err(anyhow::anyhow!("该工具暂不支持回退")),
+        },
+    };
+
+    // The code restore runs after the fork and before the restart: both halves
+    // land (or fail) while the session is still fully intact. The worktree is
+    // RESERVED first, then siblings are re-checked — a sibling send admitted
+    // before the reservation shows up busy now; one after it is refused at
+    // admission, so no agent edits the worktree mid-restore. Shadow ops are
+    // serialized per worktree via the op lock.
+    let mut code_restored = false;
+    // Compensation context for a post-restore persistence failure (both mode):
+    // put the worktree back so a rewind can't end half-applied. The
+    // reservation AND the shadow op lock live to the end of the function,
+    // covering persistence and any compensation — a second rewind can't
+    // restore between our restore and our rollback.
+    let mut compensation: Option<(std::path::PathBuf, std::path::PathBuf, crate::checkpoint::RestoreReceipt)> = None;
+    let mut _reservation = None;
+    let mut _op_arc = None;
+    let mut _op_guard = None;
+    // Post-checkpoint nested repos to delete once the rewind is DURABLE (they
+    // can't be recreated by rollback, so deletion waits until it can't roll).
+    let mut nested_cleanup: Option<(std::path::PathBuf, Vec<String>)> = None;
+    if let Some(t) = code_target {
+        let reservation = crate::checkpoint::begin_worktree_op_reservation(t.worktree_id);
+        if sibling_turn_busy(app, db, t.direction_id, t.repo_id, t.session_id).await? {
+            return Err(anyhow::anyhow!("另一个会话正在使用该 worktree，请先中断它"));
+        }
+        _op_arc = Some(crate::checkpoint::op_lock(t.worktree_id));
+        if let Some(a) = _op_arc.as_ref() {
+            _op_guard = Some(a.lock().await);
+        }
+        let (wt_path, wt_shadow) = (t.path.clone(), t.shadow.clone());
+        nested_cleanup = Some((t.path.clone(), t.nested_repos.clone()));
+        let receipt = tokio::task::spawn_blocking(move || {
+            crate::checkpoint::restore(
+                &t.path,
+                &t.shadow,
+                t.session_id,
+                &t.shadow_sha,
+                &t.head_sha,
+                &t.base_commit,
+                &t.nested_repos,
+                &t.index_tree,
+                Some(&t.branch),
+            )
+        })
+        .await??;
+        compensation = Some((wt_path, wt_shadow, receipt));
+        code_restored = true;
+        _reservation = Some(reservation);
+    }
+    if mode == RewindMode::Code {
+        // Code-only has no persistence to roll back into it — deleting now is
+        // as durable as it gets; a deletion failure is surfaced, not hidden.
+        if let Some((p, recorded)) = nested_cleanup {
+            cleanup_unrecorded_nested(p, recorded)
+                .await
+                .map_err(|e| anyhow::anyhow!("代码已回退，但删除检查点之后新建的嵌套仓库失败：{e}"))?;
+        }
+        return Ok(RewindOutcome {
+            rewound_text: String::new(),
+            deleted: 0,
+            native_id: None,
+            code_restored,
+        });
+    }
+
+    // Fork (and any restore) succeeded: restart the engine and persist the
+    // truncation + forked native id — atomically (one transaction), so a DB
+    // failure can't leave a truncated timeline pointing at the old native
+    // history. A failure HERE, after a restore already happened, is still
+    // compensated by rolling the worktree back to its pre-restore state.
+    let persist = async {
+        stop_quiet(eng).await;
+        let deleted_ids = repo::rewind_persist(
+            db,
+            snap.thread_id,
+            snap.session_id,
+            message_id,
+            wt.as_ref().map(|w| w.id),
+            new_native.as_deref(),
+        )
+        .await?;
+        eng.lock().await.native_id = new_native.clone();
+        Ok::<Vec<i32>, anyhow::Error>(deleted_ids)
+    };
+    let deleted_ids = match persist.await {
+        Ok(ids) => ids,
+        Err(e) => {
+            if let Some((p, s, receipt)) = compensation {
+                // spawn_blocking gives Result<Result<()>, JoinError> — check
+                // BOTH layers: a normal rollback error is Ok(Err(..)) and
+                // must not be silently dropped (the whole point of
+                // compensating).
+                let rb = tokio::task::spawn_blocking(move || {
+                    crate::checkpoint::rollback_restore(&p, &s, &receipt)
+                })
+                .await;
+                match rb {
+                    Ok(Ok(())) => {}
+                    Ok(Err(rb_err)) => {
+                        return Err(anyhow::anyhow!(
+                            "回退持久化失败（{e}），且补偿回滚也失败（{rb_err}）——worktree 已回退，backup ref 仍在可手动恢复"
+                        ));
+                    }
+                    Err(join_err) => {
+                        return Err(anyhow::anyhow!(
+                            "回退持久化失败（{e}），且补偿回滚异常终止（{join_err}）——worktree 已回退，backup ref 仍在可手动恢复"
+                        ));
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
+    // Conversation + code are durably rewound — only NOW can post-checkpoint
+    // nested repos be deleted (rollback can no longer need them). A deletion
+    // failure is surfaced: a leftover repo contradicts the promised rewind.
+    if let Some((p, recorded)) = nested_cleanup {
+        cleanup_unrecorded_nested(p, recorded)
+            .await
+            .map_err(|e| anyhow::anyhow!("回退已完成，但删除检查点之后新建的嵌套仓库失败：{e}"))?;
+    }
+    let deleted = deleted_ids.len() as u64;
+    // The divider row every surface renders between the kept past and the
+    // rewound future. Best-effort: the rewind itself already happened.
+    insert_rewind_marker(
+        app,
+        db,
+        snap.thread_id,
+        snap.session_id,
+        target_turn,
+        message_id,
+        deleted,
+    )
+    .await;
+    // A dangling ask from the abandoned turns would sit unanswered forever.
+    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+        bus.cancel_open_asks_from(snap.thread_id, &snap.ask_dir);
+    }
+    let _ = app.emit(
+        EVENT,
+        Push::Rewound {
+            thread_id: snap.thread_id,
+            session_id: snap.session_id,
+            native_id: new_native.clone(),
+        },
+    );
+    Ok(RewindOutcome {
+        rewound_text,
+        deleted,
+        native_id: new_native,
+        code_restored,
+    })
+}
+
+/// Best-effort deletion of post-checkpoint nested repos, called ONLY once the
+/// rewind is durable (committed persistence or a code-only restore): the
+/// shadow backup records embedded repos as gitlinks, so a rollback can't
+/// recreate them and they must survive until rollback is off the table.
+/// Failures are PROPAGATED — a leftover nested repo contradicts the promised
+/// rewind and must be surfaced, not just logged.
+async fn cleanup_unrecorded_nested(path: std::path::PathBuf, recorded: Vec<String>) -> anyhow::Result<usize> {
+    let removed = tokio::task::spawn_blocking(move || {
+        crate::checkpoint::remove_unrecorded_nested_repos(&path, &recorded)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("nested cleanup task failed: {e}"))??;
+    Ok(removed)
+}
+
+/// The worktree a worker session runs in (via its direction + repo), or None
+/// when the session or its worktree row is gone.
+async fn session_worktree(
+    db: &Db,
+    session_id: i32,
+) -> anyhow::Result<Option<crate::store::entities::worktree::Model>> {
+    let Some(sess) = repo::get_session(db, session_id).await? else {
+        return Ok(None);
+    };
+    repo::worktree_for(db, sess.direction_id, sess.repo_id).await
+}
+
+/// Pre-turn code checkpoint (worker sessions only): snapshot the session's
+/// worktree into its shadow repo and record the row keyed by the user message
+/// opening this turn, so a later code rewind can restore exactly this point.
+/// Best-effort by contract — every failure is logged and swallowed, so a
+/// checkpoint hiccup can never block or break a turn. Callers await it BEFORE
+/// the turn's message is dispatched to the agent.
+async fn snapshot_turn_checkpoint(
+    app: &AppHandle,
+    db: &Db,
+    session_id: Option<i32>,
+    turn_id: i32,
+    user_row_id: i32,
+) {
+    let Some(sid) = session_id else {
+        return; // the lead has no worktree to checkpoint
+    };
+    if let Err(e) = snapshot_turn_checkpoint_impl(app, db, sid, turn_id, user_row_id).await {
+        eprintln!("[weft] code checkpoint skipped for session {sid} turn {turn_id}: {e}");
+    }
+}
+
+async fn snapshot_turn_checkpoint_impl(
+    app: &AppHandle,
+    db: &Db,
+    session_id: i32,
+    turn_id: i32,
+    user_row_id: i32,
+) -> anyhow::Result<()> {
+    let Some(wt) = session_worktree(db, session_id).await? else {
+        return Ok(());
+    };
+    // A reused/user-owned checkout is never snapshotted (nor restored): weft
+    // must not checkpoint someone else's live directory. A reclaimed worktree
+    // (row kept, dir gone) has nothing to snapshot either.
+    if !wt.created_checkout {
+        return Ok(());
+    }
+    // A sibling session mid-turn means the other agent is writing the shared
+    // worktree RIGHT NOW: a snapshot taken mid-write would capture a partial
+    // state a later code rewind would faithfully restore. The worktree op
+    // reservation is taken FIRST, then siblings re-checked — a sibling send
+    // admitted before it shows busy now; one after it is refused at
+    // admission. Skip this turn's checkpoint on contention (the turn itself
+    // is never blocked; the message just gets no code-rewind target, which
+    // resolve_code_target reports honestly).
+    let op_guard = crate::checkpoint::begin_worktree_op_reservation(wt.id);
+    if sibling_turn_busy(app, db, wt.direction_id, wt.repo_id, session_id).await? {
+        eprintln!("[weft] code checkpoint skipped for session {session_id} turn {turn_id}: sibling session busy on the worktree");
+        return Ok(());
+    }
+    let path = std::path::PathBuf::from(&wt.path);
+    if !path.is_dir() {
+        return Ok(());
+    }
+    // A worktree with an initialized submodule can never be restored
+    // completely (nested-repo edits are invisible to the parent's
+    // snapshot/restore) — record no checkpoints for it at all.
+    if crate::checkpoint::has_initialized_submodules(&path) {
+        return Ok(());
+    }
+    let shadow = crate::checkpoint::shadow_repo_for(wt.id)?;
+    // Serialized per worktree: sibling sessions share one shadow index.
+    let op_lock = crate::checkpoint::op_lock(wt.id);
+    let _op = op_lock.lock().await;
+    let snap = tokio::task::spawn_blocking(move || {
+        crate::checkpoint::snapshot(&path, &shadow, session_id, turn_id)
+    })
+    .await??;
+    drop(_op);
+    drop(op_guard);
+    repo::insert_code_checkpoint(
+        db,
+        wt.id,
+        session_id,
+        user_row_id,
+        turn_id,
+        &snap.shadow_sha,
+        &snap.head_sha,
+        &serde_json::json!(snap.nested_repos).to_string(),
+        &snap.index_tree,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Everything a code restore needs, resolved (and validated) before any
+/// mutation begins.
+struct CodeTarget {
+    session_id: i32,
+    worktree_id: i32,
+    direction_id: i32,
+    repo_id: i32,
+    path: std::path::PathBuf,
+    shadow: std::path::PathBuf,
+    base_commit: String,
+    shadow_sha: String,
+    head_sha: String,
+    /// Nested git repo dirs present at the checkpoint — the restore removes
+    /// exactly the nested repos NOT in this manifest (created after it).
+    nested_repos: Vec<String>,
+    /// Tree of the real index at the checkpoint ("" for pre-m0039 rows →
+    /// the restore falls back to HEAD).
+    index_tree: String,
+    /// The lane's recorded branch: a reset --hard must only ever move THIS
+    /// branch (the agent may have switched the checkout elsewhere).
+    branch: String,
+}
+
+/// The checkpoint a code rewind restores to. Errors honestly when the lane
+/// can't be restored: a reused checkout is never weft's to reset, and a
+/// message without a recorded checkpoint (old session, snapshot skipped or
+/// failed) has no state to return to.
+async fn resolve_code_target(
+    db: &Db,
+    wt: &crate::store::entities::worktree::Model,
+    session_id: Option<i32>,
+    message_id: i32,
+) -> anyhow::Result<CodeTarget> {
+    if !wt.created_checkout {
+        return Err(anyhow::anyhow!("该 worktree 是复用的检出，不支持代码回退"));
+    }
+    // An initialized submodule would be silently UNDER-restored (nested-repo
+    // edits are invisible to the parent's snapshot/restore) — refuse honestly.
+    if crate::checkpoint::has_initialized_submodules(std::path::Path::new(&wt.path)) {
+        return Err(anyhow::anyhow!("该 worktree 含 submodule，暂不支持代码回退"));
+    }
+    let Some(ckpt) = repo::code_checkpoint_for(db, wt.id, message_id).await? else {
+        return Err(anyhow::anyhow!("该消息没有代码检查点（旧会话或快照失败）"));
+    };
+    // A nested repo present AT the checkpoint was never content-tracked — a
+    // restore would keep its post-checkpoint edits silently. Refuse honestly
+    // (restore bails on the same condition as a backstop).
+    let nested_repos: Vec<String> = serde_json::from_str(&ckpt.nested_repos).unwrap_or_default();
+    if !nested_repos.is_empty() {
+        return Err(anyhow::anyhow!("该检查点包含嵌套 git 仓库，暂不支持代码回退"));
+    }
+    let Some(sid) = session_id else {
+        return Err(anyhow::anyhow!("lead 会话没有 worktree，不支持代码回退"));
+    };
+    Ok(CodeTarget {
+        session_id: sid,
+        worktree_id: wt.id,
+        direction_id: wt.direction_id,
+        repo_id: wt.repo_id,
+        path: std::path::PathBuf::from(&wt.path),
+        shadow: crate::checkpoint::shadow_repo_for(wt.id)?,
+        base_commit: wt.base_commit.clone(),
+        shadow_sha: ckpt.shadow_sha,
+        head_sha: ckpt.head_sha,
+        nested_repos,
+        index_tree: ckpt.index_tree,
+        branch: wt.branch.clone(),
+    })
+}
+
+/// True when a DIFFERENT session sharing this (direction, repo) worktree has
+/// a turn in flight — a code restore would wipe its edits mid-write. The
+/// rewind reservation only covers this session's own engine, so siblings are
+/// checked explicitly. Uses try_lock: a peer whose mutex is held (e.g. while
+/// IT is checkpointing or dispatching) counts as busy — conservative and
+/// deadlock-free (this check itself runs while our own lock may be held).
+/// (Best-effort after all: a false positive just skips/refuses one round.)
+async fn sibling_turn_busy(
+    app: &AppHandle,
+    db: &Db,
+    direction_id: i32,
+    repo_id: i32,
+    our_session_id: i32,
+) -> anyhow::Result<bool> {
+    let sessions = repo::sessions_for(db, direction_id, repo_id).await?;
+    let state = app.state::<LeadChatState>();
+    for s in sessions {
+        if s.id == our_session_id {
+            continue;
+        }
+        if let Some(e) = state.get(s.id as i64) {
+            match e.try_lock() {
+                Ok(g) => {
+                    if g.turn.busy {
+                        return Ok(true);
+                    }
+                }
+                // The peer's mutex is held right now — treat as busy rather
+                // than await it (two resident siblings could otherwise
+                // deadlock waiting on each other's lock).
+                Err(_) => return Ok(true),
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The rewind divider row: one system/rewind marker inserted where the
+/// truncation happened so every surface renders a divider between the kept
+/// past and the rewound future. Rides the normal insert + Push::Message path.
+async fn insert_rewind_marker(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn_id: i32,
+    from_message_id: i32,
+    deleted: u64,
+) {
+    let content = serde_json::json!({
+        "from_message_id": from_message_id,
+        "deleted": deleted,
+    })
+    .to_string();
+    match repo::insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        turn_id,
+        "system",
+        "rewind",
+        &content,
+        "complete",
+    )
+    .await
+    {
+        Ok(m) => {
+            let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+        }
+        Err(e) => eprintln!("[weft] rewind marker insert failed: {e}"),
+    }
+}
+
+/// Engine fields `rewind` snapshots under one lock (no lock held across the
+/// fork / stop / DB awaits).
+struct RewindSnap {
+    thread_id: i32,
+    session_id: Option<i32>,
+    tool: String,
+    command: Option<String>,
+    extra_args: Vec<String>,
+    cwd: std::path::PathBuf,
+    native_id: Option<String>,
+    ask_dir: String,
+    codex_client: Option<crate::codex_app_server::Client>,
+}
+
+/// `thread/fork` at `last_turn_id`: ride the session's live app-server
+/// connection when there is one, else open a temporary one (same connect as
+/// spawn_codex_turn) and shut it down right after.
+async fn fork_codex_thread(
+    snap: &RewindSnap,
+    thread_id: &str,
+    last_turn_id: &str,
+) -> anyhow::Result<String> {
+    if let Some(c) = &snap.codex_client {
+        if c.is_alive().await {
+            return c.fork_thread(thread_id, Some(last_turn_id)).await;
+        }
+    }
+    let program = crate::tool_command::effective(snap.command.as_deref(), &snap.tool);
+    // Same trust pre-accept as spawn_codex_turn, or thread/fork can block on
+    // codex's folder-trust prompt.
+    crate::codex::ensure_codex_trusted(&snap.cwd);
+    let c = crate::codex_app_server::Client::connect_session(&program, &snap.extra_args, &snap.cwd)
+        .await?;
+    let r = c.fork_thread(thread_id, Some(last_turn_id)).await;
+    c.shutdown_and_reap().await;
+    r
+}
+
 fn spawn_reader(
     app: AppHandle,
     db: Db,
@@ -3629,7 +4428,12 @@ fn spawn_reader(
                         },
                     );
                 }
-                super::proto::ChatEvent::Assistant { texts, tools } => {
+                super::proto::ChatEvent::Assistant { texts, tools, uuid } => {
+                    // claude assistant events carry the transcript uuid — the
+                    // rewind anchor candidate for this turn (last one wins).
+                    if uuid.is_some() {
+                        inner.last_assistant_uuid = uuid;
+                    }
                     // A finished text block: finalize the streaming row with the
                     // authoritative full text. Some turns have NO deltas at all —
                     // built-in slash commands reply via a synthetic assistant
@@ -3746,6 +4550,17 @@ fn spawn_reader(
                         "complete"
                     };
                     inner.interrupting = false;
+                    // A cleanly finished turn stamps its rewind anchor (claude:
+                    // the turn's last assistant-event uuid) on the user row that
+                    // opened it. Interrupted/error turns write nothing — the
+                    // previous completed turn's anchor stands.
+                    if status == "complete" {
+                        if let (Some(row), Some(anchor)) =
+                            (inner.turn_user_row, inner.last_assistant_uuid.clone())
+                        {
+                            let _ = repo::set_lead_message_anchor(&db, row, &anchor).await;
+                        }
+                    }
                     // Finalize any tool rows still awaiting a result — an
                     // interrupted or errored turn can leave a `tool_use` without
                     // its `tool_result`, which would otherwise spin forever.
@@ -3796,6 +4611,10 @@ fn spawn_reader(
                         );
                     }
                     let next = inner.turn.on_turn_end();
+                    // Rewind bookkeeping passes to the dequeued turn: its user row
+                    // is the queued row's id (None for plumbing turns/going idle).
+                    inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+                    inner.last_assistant_uuid = None;
                     // The next turn's tag becomes the in-flight tag (None when going
                     // idle), set BEFORE its input is dispatched so its frames carry it.
                     inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
@@ -3810,6 +4629,12 @@ fn spawn_reader(
                         if per_turn(&inner.tool) {
                             let (a, d, e) = (app.clone(), db.clone(), eng.clone());
                             tauri::async_runtime::spawn(async move {
+                                // Pre-turn checkpoint for the dequeued turn,
+                                // awaited before the spawn dispatches its message.
+                                if let Some(qid) = next.queue_id {
+                                    snapshot_turn_checkpoint(&a, &d, session_id, next_turn_id, qid)
+                                        .await;
+                                }
                                 if let Err(err) = spawn_turn(
                                     a.clone(),
                                     d.clone(),
@@ -3832,6 +4657,12 @@ fn spawn_reader(
                                 }
                             });
                         } else {
+                            // Pre-turn checkpoint for the dequeued turn, awaited
+                            // before the resident write dispatches its message
+                            // (both run under this lock).
+                            if let Some(qid) = next.queue_id {
+                                snapshot_turn_checkpoint(&app, &db, session_id, next_turn_id, qid).await;
+                            }
                             if let Err(e) = write_user(&mut inner, &next).await {
                                 eprintln!("[weft] queued resident delivery failed: {e}");
                                 drop(inner);
@@ -4573,6 +5404,10 @@ mod tests {
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
             codex_client: None,
+            turn_user_row: None,
+            last_assistant_uuid: None,
+            rewinding: false,
+            worktree_id: None,
         }
     }
 
@@ -4809,6 +5644,10 @@ mod tests {
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
             codex_client: None,
+            turn_user_row: None,
+            last_assistant_uuid: None,
+            rewinding: false,
+            worktree_id: None,
         };
         let fresh = build_args(&inner);
         assert!(fresh.contains(&"--append-system-prompt".to_string()));
@@ -4922,6 +5761,7 @@ mod tests {
             status: "complete".into(),
             created_at: "0".into(),
             seq: None,
+            native_anchor: None,
         };
         let plain = Outgoing { text: "edited".into(), queue_id: Some(1), ..Default::default() };
         // Plain text, no attachments → use the (edited) Outgoing text.

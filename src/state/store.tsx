@@ -1529,6 +1529,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         } else {
           setLeadMeta((m) => ({ ...m, [p.thread_id]: metaFromUsage(m[p.thread_id], p) }));
         }
+      } else if (p.type === "rewound") {
+        // The backend truncated this thread's rows (a conversation rewind):
+        // reload so every open surface drops the removed tail at once, and
+        // adopt the forked native id so Open App / Take Over can't resume the
+        // abandoned pre-rewind conversation.
+        void loadLeadChatRef.current(p.thread_id);
+        if (p.session_id != null) {
+          setSessions((m) => {
+            const s = m[p.session_id!];
+            return s ? { ...m, [p.session_id!]: { ...s, nativeId: p.native_id } } : m;
+          });
+        }
       }
     });
     return () => {
@@ -1597,6 +1609,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       console.error(e);
     }
   }, [discoverLeadSlash]);
+
+  // Ref escape hatch for the mount-once push listener above (same pattern as
+  // verifyDirectionRef): the "rewound" arm reloads without resubscribing.
+  const loadLeadChatRef = useRef(loadLeadChat);
+  loadLeadChatRef.current = loadLeadChat;
 
   // Pull a worker's slash commands on demand: opencode runs live GET /command,
   // claude returns its initialize list, codex mirrors TUI built-ins plus skills.

@@ -22,6 +22,8 @@ import type {
   RepoGraph,
   RepoRef,
   ResolvedProposal,
+  RewindMode,
+  RewindOutcome,
   SessionInfo,
   SessionMetaSnapshot,
   SkillSource,
@@ -191,6 +193,16 @@ export const api = {
     images?: ImageAttachment[],
     files?: string[],
   ) => invoke<void>("chat_send", { sessionId, text, images, files }),
+  /** Rewind to just before `messageId` (a completed user text row), scoped by
+   *  `mode`: "conversation" truncates the rows and forks the native session at
+   *  that point, "code" restores the worktree files, "both" does both. The
+   *  message's text comes back for composer prefill (conversation modes). */
+  chatRewind: (sessionId: number, messageId: number, mode: RewindMode) =>
+    invoke<RewindOutcome>("chat_rewind", { sessionId, messageId, mode }),
+  /** Lead-console rewind — conversation-only (code rewind never applies to the
+   *  lead), so it takes no mode. */
+  leadRewind: (threadId: number, messageId: number, lang?: string) =>
+    invoke<RewindOutcome>("lead_rewind", { threadId, messageId, lang }),
   chatInterrupt: (sessionId: number) =>
     invoke<void>("chat_interrupt", { sessionId }),
   chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),

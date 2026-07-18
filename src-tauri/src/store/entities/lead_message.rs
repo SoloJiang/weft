@@ -23,6 +23,10 @@ pub struct Model {
     /// Delivery-order key: set when a queued row is delivered so reordered
     /// messages appear in send (not creation) order. NULL = use id for ordering.
     pub seq: Option<i64>,
+    /// Native rewind anchor, recorded on the user row that opened a turn:
+    /// claude = uuid of the turn's last assistant event, codex app-server =
+    /// turn id. NULL for rows that predate anchoring or never completed a turn.
+    pub native_anchor: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

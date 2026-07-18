@@ -326,6 +326,29 @@ export const zh = {
     backToReadonly: "返回只读",
     promptOk: "确定",
     promptCancel: "取消",
+    rewindTip: "回退到这条消息之前",
+    rewindTitle: "回退对话？",
+    rewindBody: "这条消息之后的对话将被移除，agent 将不再记得它们；这条消息的文本会回填到输入框，可编辑后重发。",
+    rewindConfirm: "回退",
+    rewindModeConversation: "仅回退对话",
+    rewindModeConversationDesc:
+      "这条消息之后的对话将被移除，agent 不再记得它们；该消息的文本会回填到输入框。",
+    rewindModeCode: "仅回退代码",
+    rewindModeCodeDesc:
+      "工作区文件恢复到这条消息之前的状态，未提交的改动会被覆盖（会保留安全快照）。",
+    rewindModeBoth: "对话和代码",
+    rewindModeBothDesc: "同时回退对话并恢复工作区代码。",
+    rewindCodeTitle: "回退代码？",
+    rewindCodeBody:
+      "工作区文件将恢复到这条消息之前的状态，当前未提交的改动会被覆盖（会保留一份安全快照）。",
+    rewindCodeConfirm: "回退代码",
+    rewindBothTitle: "回退对话和代码？",
+    rewindBothBody:
+      "这条消息之后的对话将被移除，agent 不再记得它们（该消息文本回填到输入框）；工作区文件也将恢复到这条消息之前的状态，未提交的改动会被覆盖（会保留一份安全快照）。",
+    rewindBothConfirm: "全部回退",
+    rewoundMarker: "已从此处回退",
+    rewindPickerTitle: "回退到之前的消息",
+    rewindPickerEmpty: "没有可回退的消息。",
   },
   diff: {
     tab: "改动",

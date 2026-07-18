@@ -77,10 +77,12 @@ pub enum ChatEvent {
     },
     /// One complete assistant message event: its text blocks plus any tool calls
     /// it started. Codex builds pill-only calls (transient activity); claude and
-    /// opencode build full calls persisted as expandable tool rows.
+    /// opencode build full calls persisted as expandable tool rows. `uuid` is the
+    /// claude transcript uuid (rewind anchor); other dialects leave it None.
     Assistant {
         texts: Vec<String>,
         tools: Vec<ToolCall>,
+        uuid: Option<String>,
     },
     /// Tool results delivered out-of-band (claude `user` message), each
     /// correlated to its `Assistant` tool call by id.
@@ -150,6 +152,7 @@ fn parse_codex(line: &str) -> ChatEvent {
                         .map(|t| vec![t.to_string()])
                         .unwrap_or_default(),
                     tools: vec![],
+                    uuid: None,
                 },
                 Some("agent_message") => ChatEvent::Other,
                 Some("error") => ChatEvent::TextDelta {
@@ -172,6 +175,7 @@ fn parse_codex(line: &str) -> ChatEvent {
                         ChatEvent::Assistant {
                             texts: vec![],
                             tools: vec![codex_tool_call(item)],
+                            uuid: None,
                         }
                     }
                 }
@@ -179,7 +183,7 @@ fn parse_codex(line: &str) -> ChatEvent {
                 // completion (exec has no deltas) — surface it so it isn't dropped;
                 // the running half and payload-less items stay Other (no empty row).
                 _ if completed => match codex_content_item_text(item) {
-                    Some(text) => ChatEvent::Assistant { texts: vec![text], tools: vec![] },
+                    Some(text) => ChatEvent::Assistant { texts: vec![text], tools: vec![], uuid: None },
                     None => ChatEvent::Other,
                 },
                 _ => ChatEvent::Other,
@@ -341,6 +345,7 @@ fn parse_opencode(line: &str) -> ChatEvent {
                 .map(|t| vec![t.to_string()])
                 .unwrap_or_default(),
             tools: vec![],
+            uuid: None,
         },
         Some("tool_use") => {
             let state = &part["state"];
@@ -364,6 +369,7 @@ fn parse_opencode(line: &str) -> ChatEvent {
                     output: Some(opencode_output(state)),
                     is_error: status == "error",
                 }],
+                uuid: None,
             }
         }
         _ => ChatEvent::Other,
@@ -524,7 +530,11 @@ pub fn parse_line(line: &str) -> ChatEvent {
                     _ => {}
                 }
             }
-            ChatEvent::Assistant { texts, tools }
+            ChatEvent::Assistant {
+                texts,
+                tools,
+                uuid: v["uuid"].as_str().map(str::to_string),
+            }
         }
         // Tool results come back as a `user` turn whose content is one or more
         // `tool_result` blocks, each tied to its call by `tool_use_id`.
@@ -755,9 +765,9 @@ mod tests {
 
     #[test]
     fn parses_assistant_blocks() {
-        let l = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
+        let l = r#"{"type":"assistant","uuid":"u-1","message":{"content":[{"type":"text","text":"done"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
         match parse_line(l) {
-            ChatEvent::Assistant { texts, tools } => {
+            ChatEvent::Assistant { texts, tools, uuid } => {
                 assert_eq!(texts, vec!["done"]);
                 assert_eq!(tools[0].id, "toolu_1");
                 assert_eq!(tools[0].name, "Read");
@@ -765,6 +775,8 @@ mod tests {
                 // full input is kept for the expandable row, not just the summary
                 assert_eq!(tools[0].input["file_path"], "/a/b.rs");
                 assert!(tools[0].output.is_none());
+                // transcript uuid rides along as the rewind anchor
+                assert_eq!(uuid.as_deref(), Some("u-1"));
             }
             e => panic!("{e:?}"),
         }
@@ -833,7 +845,7 @@ mod tests {
     fn thinking_only_assistant_is_empty() {
         let l = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"...","signature":"s"}]}}"#;
         match parse_line(l) {
-            ChatEvent::Assistant { texts, tools } => {
+            ChatEvent::Assistant { texts, tools, .. } => {
                 assert!(texts.is_empty());
                 assert!(tools.is_empty());
             }
@@ -999,7 +1011,7 @@ mod tests {
             "codex",
             r#"{"type":"item.completed","item":{"id":"p","type":"plan","text":"1. do x\n2. do y","status":"completed"}}"#,
         ) {
-            ChatEvent::Assistant { texts, tools } => {
+            ChatEvent::Assistant { texts, tools, .. } => {
                 assert_eq!(texts, vec!["1. do x\n2. do y".to_string()]);
                 assert!(tools.is_empty());
             }
