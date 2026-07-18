@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, Check, Copy, Sparkles, Undo2 } from "lucide-react";
@@ -30,6 +30,7 @@ import { toast } from "../components/Toast";
 import { PermissionBar } from "./PermissionBar";
 import type { useRepoActions } from "./useRepoActions";
 import type { ChatHistoryStatus } from "../state/chatHistory";
+import { isInitialBottomSettled, isNearBottom } from "./chatBottom";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 
@@ -113,8 +114,11 @@ export function ChatTimeline({
   asks?: PermissionAsk[];
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
-  const atBottomRef = useRef(true);
+  const scrollerRef = useRef<HTMLElement | null>(null);
+  const scrollerCleanupRef = useRef<(() => void) | null>(null);
+  const stickToBottomRef = useRef(true);
   const rootRef = useRef<HTMLDivElement>(null);
+  const [positionedTimelineKey, setPositionedTimelineKey] = useState<string | null>(null);
 
   // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
   // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
@@ -124,8 +128,45 @@ export function ChatTimeline({
   const growthLen = visible
     .filter((m) => m.kind === "text" || m.kind === "tool")
     .reduce((n, m) => n + m.content.length, 0);
+  const initialBottomSettled = visible.length === 0 || positionedTimelineKey === timelineKey;
+  const markInitialBottomSettled = useCallback(() => {
+    if (visible.length === 0) {
+      setPositionedTimelineKey(timelineKey);
+      return;
+    }
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const lastItemRendered = scroller.querySelector(
+      `[data-item-index="${visible.length - 1}"]`,
+    ) != null;
+    const settled = isInitialBottomSettled({
+      lastItemRendered,
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight,
+    });
+    if (!settled) return;
+    setPositionedTimelineKey((current) => current === timelineKey ? current : timelineKey);
+  }, [timelineKey, visible.length]);
+  const setScrollerElement = useCallback((ref: HTMLElement | Window | null) => {
+    scrollerCleanupRef.current?.();
+    scrollerCleanupRef.current = null;
+    scrollerRef.current = ref instanceof HTMLElement ? ref : null;
+    if (!(ref instanceof HTMLElement)) return;
+    const updateBottomIntent = () => {
+      stickToBottomRef.current = isNearBottom({
+        scrollTop: ref.scrollTop,
+        scrollHeight: ref.scrollHeight,
+        clientHeight: ref.clientHeight,
+      });
+    };
+    ref.addEventListener("scroll", updateBottomIntent, { passive: true });
+    updateBottomIntent();
+    scrollerCleanupRef.current = () => ref.removeEventListener("scroll", updateBottomIntent);
+  }, []);
+  useEffect(() => () => scrollerCleanupRef.current?.(), []);
   useEffect(() => {
-    if (historyStatus !== "ready" || !atBottomRef.current || visible.length === 0) return;
+    if (historyStatus !== "ready" || !stickToBottomRef.current || visible.length === 0) return;
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
   }, [visible.length, growthLen, busy, activity, historyStatus]);
 
@@ -134,7 +175,7 @@ export function ChatTimeline({
   // whenever that identity changes, then pin once its complete history mounts.
   useEffect(() => {
     if (historyStatus !== "ready") return;
-    atBottomRef.current = true;
+    stickToBottomRef.current = true;
     requestAnimationFrame(() =>
       virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" }),
     );
@@ -174,7 +215,7 @@ export function ChatTimeline({
   }
 
   return (
-    <div ref={rootRef} className="flex min-h-0 flex-1 flex-col">
+    <div ref={rootRef} className="relative flex min-h-0 flex-1 flex-col">
       <Virtuoso<LeadMessage>
         key={timelineKey}
         ref={virtuosoRef}
@@ -182,16 +223,36 @@ export function ChatTimeline({
         // overflow-x to auto, so any over-wide row scrolls the WHOLE timeline
         // sideways. The timeline never pans — wide content (code, tables)
         // scrolls inside its own block (see .weft-md pre/table).
-        className="weft-chat-virtualizer min-h-0 flex-1 overflow-x-hidden"
+        className={cn(
+          "weft-chat-virtualizer min-h-0 flex-1 overflow-x-hidden",
+          !initialBottomSettled && "invisible",
+        )}
+        scrollerRef={setScrollerElement}
         data={visible}
+        // Chat rows have highly variable content, while the final row is often
+        // a short tool/status line. Using that row as Virtuoso's size probe
+        // underestimates the whole history and produces multiple visible
+        // height-correction passes before the first bottom position settles.
+        defaultItemHeight={72}
         computeItemKey={(_index, m) => m.id}
+        totalListHeightChanged={() => {
+          // During the hidden first layout, measured-height corrections keep
+          // targeting the real last row. Once revealed, normal at-bottom/user
+          // scroll semantics take over; never pull a reader back down.
+          if ((!stickToBottomRef.current && initialBottomSettled) || visible.length === 0) return;
+          virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
+          requestAnimationFrame(markInitialBottomSettled);
+        }}
         initialTopMostItemIndex={
           visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
         }
         atBottomThreshold={80}
         atBottomStateChange={(atBottom) => {
-          atBottomRef.current = atBottom;
+          if (!atBottom) return;
+          stickToBottomRef.current = true;
+          markInitialBottomSettled();
         }}
+        rangeChanged={markInitialBottomSettled}
         increaseViewportBy={{ top: 600, bottom: 600 }}
         components={{ Header, Footer }}
         itemContent={(_index, m) => (
@@ -215,6 +276,7 @@ export function ChatTimeline({
           </div>
         )}
       />
+      {!initialBottomSettled && <ChatPositioningState />}
       {/* The in-flight tool / working indicator sits OUTSIDE the virtualized
           scroller as a fixed bottom bar. Keeping it out of the list makes the
           last message the unambiguous list bottom and keeps the indicator
@@ -233,6 +295,18 @@ export function ChatTimeline({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ChatPositioningState() {
+  const { t } = useTranslation();
+  return (
+    <div
+      className="absolute inset-0 grid place-items-center bg-bg text-[12px] text-ink-faint"
+      role="status"
+    >
+      {t("lead.loading")}
     </div>
   );
 }
