@@ -655,8 +655,8 @@ function ContextGauge({ meta }: { meta?: SessionMeta }) {
   }
   const windowOnly = ct == null && win != null ? fmtK(win) : null;
   const detail = usage ?? windowOnly;
-  const gauge = (
-    <span className="flex min-w-0 items-center gap-1.5 text-[11px] tabular-nums text-ink-faint">
+  const usageGauge = ct != null ? (
+    <span className="flex shrink-0 items-center gap-1.5">
       {pct != null && (
         <span className="h-1 w-9 shrink-0 overflow-hidden rounded-full bg-border">
           <span className="block h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
@@ -664,6 +664,17 @@ function ContextGauge({ meta }: { meta?: SessionMeta }) {
       )}
       {pct != null && <span className="shrink-0">{pct}%</span>}
       {pct == null && ct != null && <span className="shrink-0">{fmtK(ct)}</span>}
+    </span>
+  ) : null;
+  const gauge = (
+    <span className="flex min-w-0 items-center gap-1.5 text-[11px] tabular-nums text-ink-faint">
+      {detail != null && usageGauge != null ? (
+        <Tooltip label={detail} className="shrink-0">
+          {usageGauge}
+        </Tooltip>
+      ) : (
+        usageGauge
+      )}
       {model && <span className="min-w-0 truncate font-mono text-[10.5px]">{model}</span>}
       {effort && (
         <span className="shrink-0 font-mono text-[10.5px]">
@@ -673,6 +684,7 @@ function ContextGauge({ meta }: { meta?: SessionMeta }) {
     </span>
   );
   if (!detail) return gauge;
+  if (usageGauge != null) return gauge;
   return (
     <Tooltip label={detail} className="min-w-0">
       {gauge}
