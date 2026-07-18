@@ -231,6 +231,8 @@ export const en = {
     repoGuideStepReturn: "The result lands back in chat so the lead can continue from the updated workspace.",
     working: "Working…",
     loading: "Loading",
+    historyLoadError: "Couldn’t load this conversation.",
+    retryHistory: "Try again",
     stop: "Stop",
     queuedN: "{{count}} queued",
     interrupted: "interrupted",

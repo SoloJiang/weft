@@ -29,6 +29,7 @@ import { currentLang } from "../i18n";
 import { toast } from "../components/Toast";
 import { PermissionBar } from "./PermissionBar";
 import type { useRepoActions } from "./useRepoActions";
+import type { ChatHistoryStatus } from "../state/chatHistory";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 
@@ -45,6 +46,9 @@ type RunAction = ReturnType<typeof useRepoActions>["run"];
  */
 export function ChatTimeline({
   messages,
+  historyStatus,
+  timelineKey,
+  onRetryHistory,
   busy,
   activity,
   onReviewProposal,
@@ -66,6 +70,11 @@ export function ChatTimeline({
   testCaseCount = 0,
 }: {
   messages: LeadMessage[];
+  /** Persisted history must be ready before the virtual list first mounts. */
+  historyStatus: ChatHistoryStatus;
+  /** Identity of the actual conversation, not merely its parent thread. */
+  timelineKey: string;
+  onRetryHistory?: () => void;
   busy: boolean;
   /** Pending (not-yet-sent) queued messages, shown in the bottom stack. */
   queue?: QueuedItem[];
@@ -116,22 +125,20 @@ export function ChatTimeline({
     .filter((m) => m.kind === "text" || m.kind === "tool")
     .reduce((n, m) => n + m.content.length, 0);
   useEffect(() => {
-    if (!atBottomRef.current || visible.length === 0) return;
+    if (historyStatus !== "ready" || !atBottomRef.current || visible.length === 0) return;
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
-  }, [visible.length, growthLen, busy, activity]);
+  }, [visible.length, growthLen, busy, activity, historyStatus]);
 
-  // Switching THREADS swaps this timeline's data without remounting it (e.g. the lead
-  // chat stays mounted as the active thread changes), so Virtuoso keeps the previous
-  // thread's scroll position. Reset the at-bottom intent and re-pin to the latest, so
-  // switching into a chat always lands at the bottom. (rAF lets the new data lay out;
-  // if it loads async the at-bottom reset makes the message-growth effect above scroll
-  // once it arrives.)
+  // Conversation identity is finer than thread identity: each worker session
+  // under a thread owns independent history and scroll state. Reset the intent
+  // whenever that identity changes, then pin once its complete history mounts.
   useEffect(() => {
+    if (historyStatus !== "ready") return;
     atBottomRef.current = true;
     requestAnimationFrame(() =>
       virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" }),
     );
-  }, [threadId]);
+  }, [timelineKey, historyStatus]);
 
   const showList = visible.length > 0 || busy || asks.length > 0;
 
@@ -141,6 +148,7 @@ export function ChatTimeline({
   // initial bottom-scroll is lost and switching in would land mid-history. rAF lets
   // Virtuoso lay out at the new size before we scroll.
   useEffect(() => {
+    if (historyStatus !== "ready") return;
     const el = rootRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
     let prevH = el.offsetHeight;
@@ -155,7 +163,11 @@ export function ChatTimeline({
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, [showList]);
+  }, [showList, historyStatus]);
+
+  if (historyStatus !== "ready") {
+    return <ChatHistoryState status={historyStatus} onRetry={onRetryHistory} />;
+  }
 
   if (!showList) {
     return <>{emptyState}</>;
@@ -164,12 +176,13 @@ export function ChatTimeline({
   return (
     <div ref={rootRef} className="flex min-h-0 flex-1 flex-col">
       <Virtuoso<LeadMessage>
+        key={timelineKey}
         ref={virtuosoRef}
         // overflow-x-hidden: the scroller's inline overflow-y:auto computes
         // overflow-x to auto, so any over-wide row scrolls the WHOLE timeline
         // sideways. The timeline never pans — wide content (code, tables)
         // scrolls inside its own block (see .weft-md pre/table).
-        className="min-h-0 flex-1 overflow-x-hidden"
+        className="weft-chat-virtualizer min-h-0 flex-1 overflow-x-hidden"
         data={visible}
         computeItemKey={(_index, m) => m.id}
         initialTopMostItemIndex={
@@ -219,6 +232,39 @@ export function ChatTimeline({
             />
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+function ChatHistoryState({
+  status,
+  onRetry,
+}: {
+  status: Exclude<ChatHistoryStatus, "ready">;
+  onRetry?: () => void;
+}) {
+  const { t } = useTranslation();
+  if (status === "loading") {
+    return (
+      <div className="grid min-h-0 flex-1 place-items-center text-[12px] text-ink-faint" role="status">
+        {t("lead.loading")}
+      </div>
+    );
+  }
+  return (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-4 text-center">
+      <p className="text-[12px] text-ink-muted" role="alert">
+        {t("lead.historyLoadError")}
+      </p>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="rounded-[var(--radius-md)] border border-border px-2.5 py-1 text-[12px] font-medium text-ink-muted transition-colors hover:border-border-strong hover:bg-hover hover:text-ink"
+        >
+          {t("lead.retryHistory")}
+        </button>
       )}
     </div>
   );
