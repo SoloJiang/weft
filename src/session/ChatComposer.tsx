@@ -673,8 +673,11 @@ function ContextGauge({ meta }: { meta?: SessionMeta }) {
     </span>
   );
   if (!detail) return gauge;
+  // `align="start"`: the wrapper spans bar + model + effort (~200px), so a
+  // centered bubble would float over the middle of the composer, detached from
+  // the bar it annotates. Left-anchored, it sits right above the gauge bar.
   return (
-    <Tooltip label={detail} className="min-w-0">
+    <Tooltip label={detail} className="min-w-0" align="start">
       {gauge}
     </Tooltip>
   );
