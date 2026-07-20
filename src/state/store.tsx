@@ -10,7 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { createDeltaCoalescer } from "./deltaCoalescer";
-import { mergeLeadSnapshot } from "./leadSnapshot";
+import { applyLeadFinalize, mergeLeadSnapshot } from "./leadSnapshot";
 import {
   beginChatHistoryLoad,
   failChatHistoryLoad,
@@ -1422,18 +1422,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } else if (p.type === "finalize") {
         setLeadMessages((m) => ({
           ...m,
-          [p.thread_id]: (m[p.thread_id] ?? []).map((x) =>
-            x.id === p.message_id
-              ? {
-                  ...x,
-                  status: p.status as LeadMessage["status"],
-                  // Replace the streamed body when the engine sends cleaned content
-                  // (sentinels stripped post-stream) so the raw tags vanish live.
-                  ...(p.content != null
-                    ? { content: JSON.stringify({ text: p.content }) }
-                    : {}),
-                }
-              : x,
+          [p.thread_id]: applyLeadFinalize(
+            m[p.thread_id] ?? [],
+            p.message_id,
+            p.status as LeadMessage["status"],
+            p.content,
+            p.seq,
           ),
         }));
       } else if (p.type === "tool_result") {

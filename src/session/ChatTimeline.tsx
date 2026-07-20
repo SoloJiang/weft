@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, Check, Copy, Sparkles, Undo2 } from "lucide-react";
@@ -32,6 +32,13 @@ import type { useRepoActions } from "./useRepoActions";
 import type { ChatHistoryStatus } from "../state/chatHistory";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
+
+const CHAT_BOTTOM_THRESHOLD = 80;
+
+function pinNativeScrollerToBottom(scroller: HTMLElement) {
+  const bottom = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  if (Math.abs(scroller.scrollTop - bottom) > 0.5) scroller.scrollTop = bottom;
+}
 
 /**
  * The chat-engine timeline: renders weft-owned LeadMessage rows (no polling,
@@ -113,8 +120,12 @@ export function ChatTimeline({
   asks?: PermissionAsk[];
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
-  const atBottomRef = useRef(true);
+  const followBottomRef = useRef(true);
+  const scrollerElementRef = useRef<HTMLElement | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const setScrollerElement = useCallback((element: HTMLElement | Window | null) => {
+    scrollerElementRef.current = element instanceof HTMLElement ? element : null;
+  }, []);
 
   // Tool calls render inline as expandable `kind:"tool"` rows for every dialect
   // (claude/opencode/codex alike); only `meta` bookkeeping rows are hidden.
@@ -125,7 +136,7 @@ export function ChatTimeline({
     .filter((m) => m.kind === "text" || m.kind === "tool")
     .reduce((n, m) => n + m.content.length, 0);
   useEffect(() => {
-    if (historyStatus !== "ready" || !atBottomRef.current || visible.length === 0) return;
+    if (historyStatus !== "ready" || !followBottomRef.current || visible.length === 0) return;
     virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" });
   }, [visible.length, growthLen, busy, activity, historyStatus]);
 
@@ -134,7 +145,7 @@ export function ChatTimeline({
   // whenever that identity changes, then pin once its complete history mounts.
   useEffect(() => {
     if (historyStatus !== "ready") return;
-    atBottomRef.current = true;
+    followBottomRef.current = true;
     requestAnimationFrame(() =>
       virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end", behavior: "auto" }),
     );
@@ -165,6 +176,59 @@ export function ChatTimeline({
     return () => ro.disconnect();
   }, [showList, historyStatus]);
 
+  // Bottom intent belongs to the reader, not to the current viewport geometry.
+  // Virtuoso's atBottomStateChange also fires when the viewport gets shorter;
+  // a queue/permission stack can therefore turn a reader who WAS at bottom into
+  // "not at bottom" without any scroll input. Track native scroll events instead:
+  // an external flex resize changes clientHeight but does not masquerade as a
+  // reader scroll, while wheel/trackpad/scrollbar movement still updates intent.
+  useEffect(() => {
+    if (historyStatus !== "ready") return;
+    const scroller = scrollerElementRef.current;
+    if (!scroller) return;
+    const recordReaderIntent = () => {
+      const bottomDistance = Math.max(
+        0,
+        scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight,
+      );
+      followBottomRef.current = bottomDistance <= CHAT_BOTTOM_THRESHOLD;
+    };
+    scroller.addEventListener("scroll", recordReaderIntent, { passive: true });
+    return () => scroller.removeEventListener("scroll", recordReaderIntent);
+  }, [timelineKey, historyStatus]);
+
+  // Queue, permission, and activity chrome sits outside Virtuoso and takes flex
+  // height from its viewport. Preserve the last row across that resize only when
+  // the reader was already following the bottom; an intentionally scrolled-up
+  // reader keeps the same scrollTop. The immediate write runs in ResizeObserver's
+  // pre-paint phase, and the rAF repeat covers Virtuoso's follow-up measurement.
+  useEffect(() => {
+    if (historyStatus !== "ready" || typeof ResizeObserver === "undefined") return;
+    const scroller = scrollerElementRef.current;
+    if (!scroller) return;
+    let previousHeight = scroller.clientHeight;
+    let frame = 0;
+    const pinIfFollowing = () => {
+      if (followBottomRef.current && scrollerElementRef.current === scroller) {
+        pinNativeScrollerToBottom(scroller);
+      }
+    };
+    const ro = new ResizeObserver(() => {
+      const nextHeight = scroller.clientHeight;
+      if (nextHeight === previousHeight) return;
+      previousHeight = nextHeight;
+      if (!followBottomRef.current) return;
+      pinIfFollowing();
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(pinIfFollowing);
+    });
+    ro.observe(scroller);
+    return () => {
+      cancelAnimationFrame(frame);
+      ro.disconnect();
+    };
+  }, [timelineKey, historyStatus]);
+
   if (historyStatus !== "ready") {
     return <ChatHistoryState status={historyStatus} onRetry={onRetryHistory} />;
   }
@@ -178,6 +242,7 @@ export function ChatTimeline({
       <Virtuoso<LeadMessage>
         key={timelineKey}
         ref={virtuosoRef}
+        scrollerRef={setScrollerElement}
         // overflow-x-hidden: the scroller's inline overflow-y:auto computes
         // overflow-x to auto, so any over-wide row scrolls the WHOLE timeline
         // sideways. The timeline never pans — wide content (code, tables)
@@ -188,14 +253,15 @@ export function ChatTimeline({
         initialTopMostItemIndex={
           visible.length > 0 ? { index: visible.length - 1, align: "end" } : undefined
         }
-        atBottomThreshold={80}
-        atBottomStateChange={(atBottom) => {
-          atBottomRef.current = atBottom;
-        }}
         increaseViewportBy={{ top: 600, bottom: 600 }}
-        components={{ Header, Footer }}
-        itemContent={(_index, m) => (
-          <div className="mx-auto w-full min-w-0 max-w-[820px] px-4 pb-2.5">
+        components={{ Header }}
+        itemContent={(index, m) => (
+          <div
+            className={cn(
+              "mx-auto w-full min-w-0 max-w-[820px] px-4",
+              index < visible.length - 1 && "pb-2.5",
+            )}
+          >
             <TimelineRow
               m={m}
               all={visible}
@@ -220,7 +286,10 @@ export function ChatTimeline({
           last message the unambiguous list bottom and keeps the indicator
           visible even while the user scrolls back through history. */}
       {(busy || queue.length > 0 || asks.length > 0) && (
-        <div className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3">
+        <div
+          data-testid="chat-bottom-stack"
+          className="mx-auto w-full max-w-[820px] shrink-0 px-4 pb-3"
+        >
           <div className="flex flex-col gap-1.5">
             <PermissionBar asks={asks} />
             {busy && <BusyIndicator activity={activity} cwd={cwd} />}
@@ -288,10 +357,6 @@ function BusyIndicator({
 }
 
 function Header() {
-  return <div className="h-4" />;
-}
-
-function Footer() {
   return <div className="h-4" />;
 }
 

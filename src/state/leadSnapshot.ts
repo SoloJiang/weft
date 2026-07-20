@@ -1,5 +1,36 @@
 import type { LeadMessage } from "../lib/types";
 
+function deliveryOrder(row: LeadMessage): number {
+  return row.seq ?? row.id;
+}
+
+export function orderLeadMessages(rows: LeadMessage[]): LeadMessage[] {
+  return [...rows].sort((a, b) => deliveryOrder(a) - deliveryOrder(b) || a.id - b.id);
+}
+
+/** Apply one engine finalize push atomically. A queued row receives its delivery
+ *  seq at the same moment it becomes visible, so it never flashes at the older
+ *  enqueue-time position before moving to the end of the completed turn. */
+export function applyLeadFinalize(
+  rows: LeadMessage[],
+  messageId: number,
+  status: LeadMessage["status"],
+  content?: string,
+  seq?: number,
+): LeadMessage[] {
+  const updated = rows.map((row) => {
+    if (row.id !== messageId) return row;
+    return {
+      ...row,
+      status,
+      ...(content != null ? { content: JSON.stringify({ text: content }) } : {}),
+      ...(seq != null ? { seq } : {}),
+    };
+  });
+  if (seq == null) return updated;
+  return orderLeadMessages(updated);
+}
+
 function textOf(row: LeadMessage): string | null {
   try {
     const parsed = JSON.parse(row.content) as { text?: unknown };

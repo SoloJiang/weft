@@ -107,6 +107,11 @@ pub enum Push {
         /// streamed raw) — the frontend replaces the row text so the tags vanish.
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Delivery-order key for a queued row that just became visible. The
+        /// frontend applies this in the same update as `status=complete`, so the
+        /// live timeline matches a freshly loaded DB snapshot immediately.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
     },
     Turn {
         thread_id: i32,
@@ -410,6 +415,7 @@ fn emit_finalize(app: &AppHandle, thread_id: i32, message_id: i32, status: &str)
             message_id,
             status: status.into(),
             content: None,
+            seq: None,
         },
     );
 }
@@ -431,10 +437,14 @@ async fn mark_queued_delivered(
     match res {
         Ok(Some(m)) => {
             // Stamp a delivery-order seq so reordered rows appear in send order
-            // (not creation order) in the transcript after restart.
-            if let Err(e) = repo::assign_delivery_seq(db, thread_id, m.id).await {
-                eprintln!("[weft] assign_delivery_seq failed: {e}");
-            }
+            // (not creation order) both live and after a transcript reload.
+            let seq = match repo::assign_delivery_seq(db, thread_id, m.id).await {
+                Ok(seq) => Some(seq),
+                Err(e) => {
+                    eprintln!("[weft] assign_delivery_seq failed: {e}");
+                    None
+                }
+            };
             // Carry the (possibly edited) text so the transcript shows what was
             // delivered, not the stale original Push::Message body.
             let content = finalize_text(&m, out);
@@ -445,6 +455,7 @@ async fn mark_queued_delivered(
                     message_id: m.id,
                     status: "complete".into(),
                     content,
+                    seq,
                 },
             );
         }
@@ -992,6 +1003,7 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
             message_id: id,
             status: status.into(),
             content: stripped.then(|| clean.clone()),
+            seq: None,
         },
     );
     if status == "complete" {
@@ -3143,6 +3155,7 @@ pub async fn queue_edit(app: &AppHandle, db: &Db, eng: &EngineRef, message_id: i
             message_id,
             status: "queued".into(),
             content: Some(text.to_string()),
+            seq: None,
         },
     );
     Ok(())
@@ -4468,6 +4481,7 @@ fn spawn_reader(
                                         message_id: id,
                                         status: "complete".into(),
                                         content: if stripped { Some(clean.clone()) } else { None },
+                                        seq: None,
                                     },
                                 );
                                 emit_lead_out(
@@ -4582,6 +4596,7 @@ fn spawn_reader(
                                 message_id: id,
                                 status: status.into(),
                                 content: None,
+                                seq: None,
                             },
                         );
                         if status == "complete" {
@@ -4753,6 +4768,7 @@ fn spawn_reader(
                         message_id: id,
                         status: status.into(),
                         content: None,
+                        seq: None,
                     },
                 );
                 // 仅 complete 才回流 IM——interrupted/error 的半截不应上桥。
@@ -4853,6 +4869,7 @@ fn spawn_reader(
                         message_id: id,
                         status: status.into(),
                         content: None,
+                        seq: None,
                     },
                 );
             }
@@ -5745,6 +5762,29 @@ mod tests {
         assert!(!t.reorder(&[2, 1]));
         let ids: Vec<i32> = t.queue.iter().filter_map(|o| o.queue_id).collect();
         assert_eq!(ids, vec![1, 2], "queue untouched on refusal");
+    }
+
+    #[test]
+    fn finalize_serializes_delivery_seq_when_present() {
+        let delivered = serde_json::to_value(Push::Finalize {
+            thread_id: 1,
+            message_id: 2,
+            status: "complete".into(),
+            content: None,
+            seq: Some(9),
+        })
+        .unwrap();
+        assert_eq!(delivered["seq"], serde_json::json!(9));
+
+        let ordinary = serde_json::to_value(Push::Finalize {
+            thread_id: 1,
+            message_id: 3,
+            status: "complete".into(),
+            content: None,
+            seq: None,
+        })
+        .unwrap();
+        assert!(ordinary.get("seq").is_none());
     }
 
     #[test]

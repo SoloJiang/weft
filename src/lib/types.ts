@@ -227,6 +227,9 @@ export interface LeadMessage {
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
+  /** Delivery-order key assigned when a queued row is actually handed to the
+   *  agent. Null/absent rows retain their insertion id as the order key. */
+  seq?: number | null;
   /** Engine-side rewind anchor (claude assistant uuid / codex turn id), recorded
    *  on the user row that opened a turn. Backend-owned; the UI never reads it. */
   native_anchor?: string | null;
@@ -257,6 +260,9 @@ export type LeadChatPush =
       /** Cleaned final text, present only when sentinels were stripped after they
        *  streamed raw — the row content is replaced so the tags vanish live. */
       content?: string;
+      /** Present when a queued row was delivered and must move from enqueue order
+       *  to its authoritative transcript position immediately. */
+      seq?: number;
     }
   | {
       type: "turn";
