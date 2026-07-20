@@ -634,7 +634,7 @@ function PathInput({
 }
 
 export function CreateThreadDialog({ open, onOpenChange }: DProps) {
-  const { createThread } = useStore();
+  const { createThread, selectThread } = useStore();
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
   const [kind, setKind] = useState("");
@@ -655,8 +655,11 @@ export function CreateThreadDialog({ open, onOpenChange }: DProps) {
     setBusy(true);
     setErr(null);
     try {
-      await createThread(title.trim(), kind);
+      const created = await createThread(title.trim(), kind);
       onOpenChange(false);
+      // Land in the new issue's chat right away: the next act is always
+      // "describe the requirement to the lead", not hunting the sidebar row.
+      await selectThread(created.id);
     } catch (e) {
       setErr(String(e));
     } finally {
