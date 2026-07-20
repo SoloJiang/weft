@@ -980,7 +980,7 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     let Some((id, text, _)) = inner.current.take() else {
         return;
     };
-    finalize_text_row(app, db, inner, id, text, status).await;
+    finalize_text_row(app, db, inner, id, text, status, false).await;
 }
 
 /// Finalize every item-keyed open text row (app-server parallel streams) with
@@ -992,13 +992,17 @@ async fn finalize_open_texts(app: &AppHandle, db: &Db, inner: &mut EngineInner, 
         .map(|(_, (id, text, _))| (id, text))
         .collect();
     for (id, text) in rows {
-        finalize_text_row(app, db, inner, id, text, status).await;
+        finalize_text_row(app, db, inner, id, text, status, false).await;
     }
 }
 
 /// Row-level text finalize: sentinel extraction on clean completion, DB write,
 /// `Push::Finalize`, IM out. Shared by the anonymous slot (`current`), the
 /// item-keyed rows (`open_texts`), and standalone one-shot texts (`TextDone`).
+/// `replaced` = the body already differs from what streamed to the frontend
+/// (authoritative TextDone override / standalone rows inserted empty) — the
+/// finalize push must then carry the content even when sentinels changed nothing,
+/// or the live React state keeps the stale streamed chunks until a reload.
 async fn finalize_text_row(
     app: &AppHandle,
     db: &Db,
@@ -1006,6 +1010,7 @@ async fn finalize_text_row(
     id: i32,
     text: String,
     status: &str,
+    replaced: bool,
 ) {
     let thread_id = inner.thread_id;
     let origin_tag = inner.current_origin_tag.clone();
@@ -1033,7 +1038,7 @@ async fn finalize_text_row(
             thread_id,
             message_id: id,
             status: status.into(),
-            content: stripped.then(|| clean.clone()),
+            content: (stripped || replaced).then(|| clean.clone()),
             seq: None,
         },
     );
@@ -1987,7 +1992,7 @@ pub async fn send(
         )
     };
     if skill_pending || cmd_now {
-        let (tid, _sid, _current, orphans) = stop_quiet(eng).await;
+        let (tid, _sid, _texts, orphans) = stop_quiet(eng).await;
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
@@ -2708,10 +2713,15 @@ async fn codex_consumer(
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
                 match streamed {
                     // The item streamed: finalize its row, preferring the
-                    // authoritative full body over the accumulated frames.
+                    // authoritative full body over the accumulated frames. When
+                    // that body differs (dropped/duped delta frames), the
+                    // finalize push must carry it so the live view heals too.
                     Some((row, buf, _)) => {
-                        let body = text.filter(|t| !t.is_empty()).unwrap_or(buf);
-                        finalize_text_row(&app, &db, &mut inner, row, body, "complete").await;
+                        let auth = text.filter(|t| !t.is_empty());
+                        let replaced = auth.as_deref().is_some_and(|t| t != buf);
+                        let body = auth.unwrap_or(buf);
+                        finalize_text_row(&app, &db, &mut inner, row, body, "complete", replaced)
+                            .await;
                     }
                     // No open row (content items never stream): land the text as
                     // a standalone completed row.
@@ -2742,7 +2752,9 @@ async fn codex_consumer(
                                 message: m.clone(),
                             },
                         );
-                        finalize_text_row(&app, &db, &mut inner, m.id, t, "complete").await;
+                        // Inserted empty + finalized at once: the push must carry
+                        // the body or the live view shows an empty bubble.
+                        finalize_text_row(&app, &db, &mut inner, m.id, t, "complete", true).await;
                     }
                 }
             }
@@ -3622,12 +3634,22 @@ pub async fn stop_quiet(
 ) -> (
     i32,
     Option<i32>,
-    Option<(i32, String)>,
+    Vec<(i32, String)>,
     Vec<(i32, serde_json::Value)>,
 ) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
-    let current = inner.current.take().map(|(id, text, _)| (id, text));
+    // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
+    // Hard stops also shut the codex client down, so the consumer's disconnect
+    // cleanup never runs for them — without this drain an item row would stay
+    // `streaming` forever and could be finalized under a later turn.
+    let mut texts: Vec<(i32, String)> = inner
+        .current
+        .take()
+        .map(|(id, text, _)| (id, text))
+        .into_iter()
+        .collect();
+    texts.extend(inner.open_texts.drain().map(|(_, (id, text, _))| (id, text)));
     // Drain tool rows still awaiting a result, but DON'T finalize here: the
     // caller makes the stop visible (sets `stopped`) first. Awaiting DB/event
     // work while the engine is reset-but-not-yet-stopped would let a concurrent
@@ -3652,7 +3674,7 @@ pub async fn stop_quiet(
     // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
     // past those flags). send_reservation_valid compares the captured reset_epoch.
     inner.reset_epoch += 1;
-    (target.0, target.1, current, orphan_tools)
+    (target.0, target.1, texts, orphan_tools)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -3662,7 +3684,7 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, current, orphans) = stop_quiet(eng).await;
+    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
@@ -3671,7 +3693,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
         // Stop is now visible to the engine, so finalizing here can't race a
         // concurrent send into a turn we'd wrongly kill.
         finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
-        if let Some((id, text)) = current {
+        for (id, text) in texts {
             let _ = repo::update_lead_message(
                 &db,
                 id,
