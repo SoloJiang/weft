@@ -74,6 +74,17 @@ pub enum ChatEvent {
     },
     TextDelta {
         text: String,
+        /// app-server 流式 item 的 id——并行 item(主叙述、collab 子 agent 各自的
+        /// agentMessage)靠它各自成行,不再交错拼进同一个气泡。exec/claude 方言是
+        /// 单串行流 → None(引擎的匿名单槽,行为与历史一致)。
+        item: Option<String>,
+    },
+    /// 一段文本的定稿(app-server):`item=Some` 收敛该 item 的流式行——`text` 是
+    /// 权威全文(修复丢帧/重帧);无开放行或 `item=None` 时,以一条独立的已完成行
+    /// 落一次性文本(/plan、/review 内容项等,它们不走 delta)。
+    TextDone {
+        item: Option<String>,
+        text: Option<String>,
     },
     /// One complete assistant message event: its text blocks plus any tool calls
     /// it started. Codex builds pill-only calls (transient activity); claude and
@@ -157,6 +168,7 @@ fn parse_codex(line: &str) -> ChatEvent {
                 Some("agent_message") => ChatEvent::Other,
                 Some("error") => ChatEvent::TextDelta {
                     text: error_text_from_item(item),
+                    item: None,
                 },
                 Some("reasoning") => ChatEvent::Other,
                 // Real tool items → rows (started: running; completed: result, merged
@@ -494,6 +506,7 @@ pub fn parse_line(line: &str) -> ChatEvent {
             if v["event"]["type"] == "content_block_delta" && d["type"] == "text_delta" {
                 ChatEvent::TextDelta {
                     text: d["text"].as_str().unwrap_or_default().to_string(),
+                    item: None,
                 }
             } else {
                 ChatEvent::Other
@@ -740,7 +753,7 @@ mod tests {
     #[test]
     fn parses_text_delta() {
         let l = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"He"}}}"#;
-        assert!(matches!(parse_line(l), ChatEvent::TextDelta { text } if text == "He"));
+        assert!(matches!(parse_line(l), ChatEvent::TextDelta { text, item: None } if text == "He"));
     }
 
     #[test]
@@ -885,7 +898,7 @@ mod tests {
             "codex",
             r#"{"type":"item.started","item":{"type":"error","message":"unknown slash command"}}"#,
         ) {
-            ChatEvent::TextDelta { text } => assert_eq!(text, "unknown slash command"),
+            ChatEvent::TextDelta { text, .. } => assert_eq!(text, "unknown slash command"),
             e => panic!("{e:?}"),
         }
         assert!(matches!(

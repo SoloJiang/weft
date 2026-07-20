@@ -245,11 +245,18 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                 .filter(|s| !s.is_empty())
                 .map(|s| ChatEvent::TextDelta {
                     text: s.to_string(),
+                    // Key the delta to its item: parallel streams (collab
+                    // sub-agents + the main narration) each get their own row
+                    // instead of char-interleaving into one shared bubble.
+                    item: params["itemId"].as_str().map(String::from),
                 })
         }
         "item/started" => match item["type"].as_str() {
+            // Transient error items (e.g. codex's own reconnect banners) go to
+            // the anonymous slot — never merged into an agentMessage row.
             Some("error") => Some(ChatEvent::TextDelta {
                 text: crate::lead_chat::proto::error_text_from_item(item),
+                item: None,
             }),
             // The tool-call item types (verified against the 0.139.0 ThreadItem
             // union): exec/edit/MCP plus subagent (collabAgentToolCall) and custom
@@ -274,25 +281,27 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
             ) => Some(ChatEvent::ToolResults {
                 items: vec![appserver_tool_result(item)],
             }),
-            // agentMessage already streamed via deltas; its *completion* is the
-            // finalize signal — surface it as an Assistant text event (no tools) so
-            // the engine closes the open row and its streaming caret clears at
-            // text-end, not at the next tool's item/started or turn/completed. The
-            // carried text is only the trigger; the body is the accumulated deltas.
-            Some("agentMessage") => Some(ChatEvent::Assistant {
-                texts: item["text"]
-                    .as_str()
-                    .map(|t| vec![t.to_string()])
-                    .unwrap_or_default(),
-                tools: vec![],
-                uuid: None,
+            // agentMessage already streamed via deltas; its *completion* finalizes
+            // THAT item's row — the carried text is the authoritative full body
+            // (heals any dropped/duped frames), keyed by item id so parallel
+            // streams close their own rows.
+            Some("agentMessage") => Some(ChatEvent::TextDone {
+                item: item["id"].as_str().map(String::from),
+                text: item["text"].as_str().map(String::from),
             }),
-            // userMessage / reasoning carry no display payload of their own.
-            Some("userMessage" | "reasoning") | None => None,
+            // userMessage / reasoning carry no display payload; an error item's
+            // text was already surfaced by its item/started.
+            Some("userMessage" | "reasoning" | "error") | None => None,
             // Other content items (/plan, /review …) don't stream via agentMessage
-            // deltas, so surface any text they carry instead of dropping it.
-            Some(_) => crate::lead_chat::proto::codex_content_item_text(item)
-                .map(|text| ChatEvent::TextDelta { text }),
+            // deltas — land their text as a standalone completed row.
+            Some(_) => {
+                crate::lead_chat::proto::codex_content_item_text(item).map(|text| {
+                    ChatEvent::TextDone {
+                        item: item["id"].as_str().map(String::from),
+                        text: Some(text),
+                    }
+                })
+            }
         },
         // Top-level failure (auth / usage-limit / context-window …): surface the
         // message so the turn doesn't end blank, then turn/completed marks it error.
@@ -304,7 +313,7 @@ pub fn notification_to_event(method: &str, params: &Value) -> Option<ChatEvent> 
                     .or_else(|| params["error"].as_str())
                     .unwrap_or("Codex reported an error."),
             );
-            (!text.is_empty()).then(|| ChatEvent::TextDelta { text })
+            (!text.is_empty()).then(|| ChatEvent::TextDelta { text, item: None })
         }
         "thread/tokenUsage/updated" => {
             let tu = &params["tokenUsage"];
@@ -727,7 +736,10 @@ impl Client {
                                 self.route_resolved(
                                     tid.as_deref(),
                                     ThreadMsg::Event(
-                                        crate::lead_chat::proto::ChatEvent::TextDelta { text },
+                                        crate::lead_chat::proto::ChatEvent::TextDelta {
+                                            text,
+                                            item: None,
+                                        },
                                     ),
                                 )
                                 .await;
@@ -1077,7 +1089,12 @@ mod tests {
             "item/agentMessage/delta",
             &json!({"threadId":"t","turnId":"u","itemId":"i","delta":"He"}),
         ) {
-            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "He"),
+            Some(ChatEvent::TextDelta { text, item }) => {
+                assert_eq!(text, "He");
+                // Deltas carry their item id: parallel streams (collab sub-agents)
+                // key their own rows instead of interleaving into one bubble.
+                assert_eq!(item.as_deref(), Some("i"));
+            }
             e => panic!("{e:?}"),
         }
         // commandExecution started → a running tool row with id + input (camelCase
@@ -1151,9 +1168,21 @@ mod tests {
             "item/started",
             &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
         ) {
-            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "unknown slash command"),
+            Some(ChatEvent::TextDelta { text, item }) => {
+                assert_eq!(text, "unknown slash command");
+                // Error items go to the anonymous slot — never merged into an
+                // agentMessage row (codex's own reconnect banners arrive here).
+                assert_eq!(item, None);
+            }
             e => panic!("{e:?}"),
         }
+        // An error item's completion must NOT resurface its text (its started
+        // already did) — that would duplicate the row.
+        assert!(notification_to_event(
+            "item/completed",
+            &json!({"item":{"id":"i","type":"error","message":"unknown slash command"}}),
+        )
+        .is_none());
         assert!(notification_to_event(
             "item/completed",
             &json!({"item":{"id":"i","type":"userMessage","text":"hi"}}),
@@ -1182,19 +1211,19 @@ mod tests {
 
     #[test]
     fn agent_message_completion_finalizes_streamed_text() {
-        // Regression (lingering streaming caret): the app-server transport must
-        // surface agentMessage's *completion* as an Assistant event (texts
-        // non-empty, no tools) so the engine finalizes the open streaming row at
-        // text-end. Dropping it (→ None) left the caret lit until the next tool's
-        // item/started or turn/completed. The carried text is only the finalize
-        // trigger; the persisted body comes from the accumulated deltas.
+        // Regression (lingering streaming caret / interleaved parallel streams):
+        // agentMessage's *completion* finalizes ITS OWN row — TextDone keyed by
+        // item id, carrying the authoritative full body. Dropping it (→ None)
+        // left the caret lit; mapping it without the item id (the old Assistant
+        // trigger) closed whichever row happened to be open, chopping parallel
+        // collab-agent streams into fragments.
         match notification_to_event(
             "item/completed",
             &json!({"item":{"id":"i","type":"agentMessage","text":"done"}}),
         ) {
-            Some(ChatEvent::Assistant { texts, tools, .. }) => {
-                assert_eq!(texts, vec!["done".to_string()]);
-                assert!(tools.is_empty());
+            Some(ChatEvent::TextDone { item, text }) => {
+                assert_eq!(item.as_deref(), Some("i"));
+                assert_eq!(text.as_deref(), Some("done"));
             }
             e => panic!("{e:?}"),
         }
@@ -1203,6 +1232,28 @@ mod tests {
             notification_to_event("item/started", &json!({"item":{"type":"agentMessage"}}))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parallel_item_deltas_keep_their_item_keys() {
+        // Two items streaming concurrently (main narration + a collab sub-agent)
+        // must map to deltas keyed by THEIR item ids — the engine turns each key
+        // into its own row, so the texts can never char-interleave in one bubble.
+        let d = |item: &str, s: &str| {
+            notification_to_event(
+                "item/agentMessage/delta",
+                &json!({"threadId":"t","turnId":"u","itemId":item,"delta":s}),
+            )
+        };
+        for (item, s) in [("a", "我先只读梳理"), ("b", "我会并行追踪"), ("a", " Cargo 结构")] {
+            match d(item, s) {
+                Some(ChatEvent::TextDelta { text, item: got }) => {
+                    assert_eq!(text, s);
+                    assert_eq!(got.as_deref(), Some(item));
+                }
+                e => panic!("{e:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1237,12 +1288,16 @@ mod tests {
             Some(ChatEvent::ToolResults { items }) => assert_eq!(items[0].output, "task #3"),
             e => panic!("{e:?}"),
         }
-        // /plan content item carries text only on completion → surface as text.
+        // /plan content item carries text only on completion → a standalone
+        // completed row (it never streamed, so nothing to finalize).
         match notification_to_event(
             "item/completed",
             &json!({"item":{"id":"p","type":"plan","text":"1. x","status":"completed"}}),
         ) {
-            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "1. x"),
+            Some(ChatEvent::TextDone { item, text }) => {
+                assert_eq!(item.as_deref(), Some("p"));
+                assert_eq!(text.as_deref(), Some("1. x"));
+            }
             e => panic!("{e:?}"),
         }
         // a payload-less plan item still opens no row and surfaces nothing.
@@ -1258,11 +1313,13 @@ mod tests {
         // A turn-level failure (auth / usage-limit / context-window) arrives as a
         // bare `error` notification — surface it so the turn doesn't end blank.
         match notification_to_event("error", &json!({"message":"usage limit reached"})) {
-            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "usage limit reached"),
+            Some(ChatEvent::TextDelta { text, item: None }) => {
+                assert_eq!(text, "usage limit reached")
+            }
             e => panic!("{e:?}"),
         }
         match notification_to_event("error", &json!({"error":{"message":"nested"}})) {
-            Some(ChatEvent::TextDelta { text }) => assert_eq!(text, "nested"),
+            Some(ChatEvent::TextDelta { text, item: None }) => assert_eq!(text, "nested"),
             e => panic!("{e:?}"),
         }
         // An empty error message yields nothing (turn/completed still flags error).
