@@ -1014,6 +1014,14 @@ async fn finalize_text_row(
 ) {
     let thread_id = inner.thread_id;
     let origin_tag = inner.current_origin_tag.clone();
+    // Single source for the "this turn produced visible text" invariant: ANY
+    // row completing mid-turn (streamed item, standalone TextDone, anonymous
+    // slot) marks the turn, so a later failure never appends *_before_output
+    // after real output. Turn boundaries (TurnEnd / disconnect / hard stop)
+    // reset it.
+    if status == "complete" {
+        inner.turn_saw_text = true;
+    }
     // `stripped` = the cleaned body differs from what streamed (sentinels removed),
     // so the live row still shows the raw tags and must be replaced, not just status.
     let (clean, stripped) = if status == "complete" {
@@ -2765,11 +2773,8 @@ async fn codex_consumer(
                             },
                         );
                         // Inserted empty + finalized at once: the push must carry
-                        // the body or the live view shows an empty bubble. Record
-                        // that this turn produced visible output — these rows live
-                        // in neither current nor open_texts, and a later turn
-                        // failure must not append a *_before_output bubble.
-                        inner.turn_saw_text = true;
+                        // the body or the live view shows an empty bubble.
+                        // (finalize_text_row records turn_saw_text.)
                         finalize_text_row(&app, &db, &mut inner, m.id, t, "complete", true).await;
                     }
                 }
@@ -3686,6 +3691,10 @@ pub async fn stop_quiet(
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    // A hard stop ends the turn: clear the per-turn text marker, or the NEXT
+    // turn inherits a stale true and a pre-output failure there would wrongly
+    // suppress its error_before_output row.
+    inner.turn_saw_text = false;
     // Invalidate any send that reserved against the turn we just cleared — even one
     // whose Phase 1 ran before this stop but whose Phase 3 runs after, and even a
     // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
