@@ -195,7 +195,7 @@ export function ChatTimeline({
     };
     scroller.addEventListener("scroll", recordReaderIntent, { passive: true });
     return () => scroller.removeEventListener("scroll", recordReaderIntent);
-  }, [timelineKey, historyStatus]);
+  }, [timelineKey, showList, historyStatus]);
 
   // Queue, permission, and activity chrome sits outside Virtuoso and takes flex
   // height from its viewport. Preserve the last row across that resize only when
@@ -227,7 +227,7 @@ export function ChatTimeline({
       cancelAnimationFrame(frame);
       ro.disconnect();
     };
-  }, [timelineKey, historyStatus]);
+  }, [timelineKey, showList, historyStatus]);
 
   if (historyStatus !== "ready") {
     return <ChatHistoryState status={historyStatus} onRetry={onRetryHistory} />;
