@@ -1112,6 +1112,10 @@ async fn cleanup_disconnected_turn(
         },
     );
     drop(inner);
+    // Real streamed output existed if item-keyed rows were open — suppress the
+    // `*_before_output` terminal insert below (same rule as the TurnEnd path),
+    // or the disconnect would append a spurious terminal bubble after it.
+    let had_orphan_texts = !orphan_texts.is_empty();
     for (id, text) in orphan_texts {
         let _ = repo::update_lead_message(
             db,
@@ -1128,7 +1132,7 @@ async fn cleanup_disconnected_turn(
         session_id,
         turn_id,
         status,
-        had_busy_turn,
+        had_busy_turn && !had_orphan_texts,
         current,
     )
     .await
