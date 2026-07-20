@@ -1079,6 +1079,8 @@ async fn cleanup_disconnected_turn(
         .drain()
         .map(|(_, (id, text, _))| (id, text))
         .collect();
+    let turn_saw_text = inner.turn_saw_text;
+    inner.turn_saw_text = false;
     let orphan_tools: Vec<(i32, serde_json::Value)> =
         inner.tool_rows.drain().map(|(_, v)| v).collect();
     // Capture EXACTLY the still-queued rows this cleanup drains (the
@@ -1112,10 +1114,11 @@ async fn cleanup_disconnected_turn(
         },
     );
     drop(inner);
-    // Real streamed output existed if item-keyed rows were open — suppress the
-    // `*_before_output` terminal insert below (same rule as the TurnEnd path),
-    // or the disconnect would append a spurious terminal bubble after it.
-    let had_orphan_texts = !orphan_texts.is_empty();
+    // Real streamed output existed if item-keyed rows were open OR a standalone
+    // TextDone row already landed — suppress the `*_before_output` terminal
+    // insert below (same rule as the TurnEnd path), or the disconnect would
+    // append a spurious terminal bubble after it.
+    let had_orphan_texts = !orphan_texts.is_empty() || turn_saw_text;
     for (id, text) in orphan_texts {
         let _ = repo::update_lead_message(
             db,
@@ -1270,6 +1273,11 @@ pub struct EngineInner {
     /// 镜像 `tool_rows` 的按 item 分键模式:主叙述与各 collab 子 agent 的
     /// agentMessage 各自成行,工具行不再切断文本,item/completed 以权威全文定稿。
     pub open_texts: std::collections::HashMap<String, (i32, String, std::time::Instant)>,
+    /// 本轮已落过「即插即定稿」的独立文本行(standalone TextDone:/plan 内容、
+    /// 未流式的 agentMessage)。这类行不经过 current/open_texts,turn 失败时
+    /// 终态插入要靠它抑制,否则真实输出之后还会追加 *_before_output 气泡。
+    /// TurnEnd/disconnect 清理后复位。
+    pub turn_saw_text: bool,
     /// Set while a protocol interrupt is in flight so the closing row/status
     /// reads `interrupted` instead of `error`.
     pub interrupting: bool,
@@ -2757,7 +2765,11 @@ async fn codex_consumer(
                             },
                         );
                         // Inserted empty + finalized at once: the push must carry
-                        // the body or the live view shows an empty bubble.
+                        // the body or the live view shows an empty bubble. Record
+                        // that this turn produced visible output — these rows live
+                        // in neither current nor open_texts, and a later turn
+                        // failure must not append a *_before_output bubble.
+                        inner.turn_saw_text = true;
                         finalize_text_row(&app, &db, &mut inner, m.id, t, "complete", true).await;
                     }
                 }
@@ -2874,7 +2886,7 @@ async fn codex_consumer(
                     // clean finish, closes its IM card) — same helper the tool
                     // boundary uses, so the final segment is handled identically.
                     finalize_current_text(&app, &db, &mut inner, status).await;
-                } else if !had_item_rows {
+                } else if !had_item_rows && !inner.turn_saw_text {
                     if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
                         &db,
                         thread_id,
@@ -2898,6 +2910,7 @@ async fn codex_consumer(
                 // the queued row's id (None for plumbing turns or going idle).
                 inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
                 inner.last_assistant_uuid = None;
+                inner.turn_saw_text = false;
                 // Next turn's tag becomes the in-flight tag (None when going idle),
                 // so the dequeued turn's output frames carry its own origin_tag.
                 inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
@@ -5558,6 +5571,7 @@ mod tests {
             stdin: None,
             current: None,
             open_texts: std::collections::HashMap::new(),
+            turn_saw_text: false,
             interrupting: false,
             generation: 0,
             reset_epoch: 0,
@@ -5799,6 +5813,7 @@ mod tests {
             stdin: None,
             current: None,
             open_texts: std::collections::HashMap::new(),
+            turn_saw_text: false,
             interrupting: false,
             generation: 0,
             reset_epoch: 0,
