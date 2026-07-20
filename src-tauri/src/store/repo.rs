@@ -2282,7 +2282,7 @@ pub async fn delete_message(db: &Db, message_id: i32) -> Result<()> {
 /// Stamp a delivered queued row with seq = max(COALESCE(seq, id)) + 1 over its
 /// thread so it sorts after all currently-ordered rows in list_lead_messages.
 /// Called for every tracked queued delivery to preserve reorder-then-deliver order.
-pub async fn assign_delivery_seq(db: &Db, thread_id: i32, message_id: i32) -> Result<()> {
+pub async fn assign_delivery_seq(db: &Db, thread_id: i32, message_id: i32) -> Result<i64> {
     use sea_orm::{ConnectionTrait, Order, QuerySelect};
     // Find the current max effective sort key for this thread.
     let rows = lead_message::Entity::find()
@@ -2297,13 +2297,18 @@ pub async fn assign_delivery_seq(db: &Db, thread_id: i32, message_id: i32) -> Re
         .unwrap_or(1);
     // Raw UPDATE: seq is not in the entity's ActiveModel update path in older
     // SeaORM versions; use a raw statement to avoid depending on the column ordering.
-    db.0.execute(sea_orm::Statement::from_sql_and_values(
-        db.0.get_database_backend(),
-        "UPDATE lead_message SET seq = ? WHERE id = ?",
-        [next_seq.into(), message_id.into()],
-    ))
-    .await?;
-    Ok(())
+    let updated = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            db.0.get_database_backend(),
+            "UPDATE lead_message SET seq = ? WHERE id = ?",
+            [next_seq.into(), message_id.into()],
+        ))
+        .await?;
+    if updated.rows_affected() == 0 {
+        anyhow::bail!("lead_message {message_id} not found while assigning delivery sequence");
+    }
+    Ok(next_seq)
 }
 
 /// 查一条消息行（用于读取原始 content 再局部改写）。
@@ -5316,7 +5321,8 @@ mod tests {
 
         // Assign a delivery seq to B as if it was delivered after C (reorder scenario).
         // max(COALESCE(seq,id)) over [a.id, b.id, c.id] = c.id, so B.seq = c.id + 1.
-        assign_delivery_seq(&db, t, b.id).await.unwrap();
+        let seq = assign_delivery_seq(&db, t, b.id).await.unwrap();
+        assert_eq!(seq, c.id as i64 + 1);
 
         let msgs = list_lead_messages(&db, t).await.unwrap();
         let ids: Vec<i32> = msgs.iter().map(|m| m.id).collect();
