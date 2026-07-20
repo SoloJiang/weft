@@ -135,66 +135,8 @@ fn consume_card<'a>(
     }
 }
 
-/// Heal model-side over-escaping in a card's JSON payload before it is
-/// persisted/rendered: leads sometimes write `\\n` inside the sentinel JSON
-/// (one escape level too many), so the decoded string carries a LITERAL
-/// backslash-n and the plan card renders "\n\n" as text. The signal is kept
-/// deliberately narrow — a DOUBLED `\n\n` (the paragraph-break artifact seen
-/// live) in a string with no real newline. Single literal `\n` sequences stay
-/// untouched: they are routinely legitimate (Windows paths like `C:\new\file`,
-/// prose explaining the escape), and a correctly-escaped payload has real
-/// newlines and is skipped entirely. Non-JSON payloads pass through unchanged.
-pub fn normalize_card_json(json: &str) -> String {
-    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return json.to_string();
-    };
-    fn heal(v: &mut serde_json::Value) {
-        match v {
-            serde_json::Value::String(s) => {
-                if !s.contains('\n') && s.contains("\\n\\n") {
-                    *s = s.replace("\\n\\n", "\n\n");
-                }
-            }
-            serde_json::Value::Array(a) => a.iter_mut().for_each(heal),
-            serde_json::Value::Object(o) => o.values_mut().for_each(heal),
-            _ => {}
-        }
-    }
-    heal(&mut v);
-    v.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_collapses_over_escaped_newlines() {
-        // The exact artifact seen live: `\\n\\n` between sections (decoded to a
-        // literal backslash-n pair) with no real newline anywhere in the string.
-        let raw = r#"{"approach":"**契约**：一段\\n\\n**交互**：另一段","tasks":[{"note":"a\\nb"}]}"#;
-        let healed = normalize_card_json(raw);
-        let v: serde_json::Value = serde_json::from_str(&healed).expect("valid json");
-        assert_eq!(v["approach"].as_str(), Some("**契约**：一段\n\n**交互**：另一段"));
-        // A SINGLE literal backslash-n is legitimate content (paths, escape
-        // docs) — never rewritten.
-        assert_eq!(v["tasks"][0]["note"].as_str(), Some("a\\nb"));
-    }
-
-    #[test]
-    fn normalize_keeps_correct_payloads_and_single_escapes() {
-        // A properly-escaped payload (real newline present) keeps its literal
-        // backslash-n untouched — e.g. code snippets explaining "\n".
-        let raw = "{\"approach\":\"first line\\nuses \\\\n as separator\"}";
-        let healed = normalize_card_json(raw);
-        let v: serde_json::Value = serde_json::from_str(&healed).expect("valid json");
-        assert_eq!(v["approach"].as_str(), Some("first line\nuses \\n as separator"));
-        // Windows-style single-line strings survive verbatim.
-        let path = r#"{"note":"C:\\new\\file"}"#;
-        let healed = normalize_card_json(path);
-        let v: serde_json::Value = serde_json::from_str(&healed).expect("valid json");
-        assert_eq!(v["note"].as_str(), Some("C:\\new\\file"));
-        // Non-JSON passes through verbatim.
-        assert_eq!(normalize_card_json("not json"), "not json");
-    }
-}
+// NOTE: card payloads are persisted VERBATIM — an earlier revision healed
+// model-side over-escaping (literal backslash-n paragraph breaks) here, but any
+// content-based rewrite of decoded strings can corrupt legitimate literals
+// (Windows paths, regex/escape-explaining prose). The fix lives at the source:
+// PLAN_CARD_DIRECTIVES mandates normally-escaped JSON strings.

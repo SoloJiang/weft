@@ -799,13 +799,14 @@ async fn apply_lead_sentinels(
     for s in sentinels {
         match s {
             super::sentinels::Sentinel::ActionCard(json) => {
-                let json = super::sentinels::normalize_card_json(&json);
                 persist_card_row(app, db, inner, thread_id, "action_card", &json).await;
             }
+            // Card payloads persist VERBATIM. Model-side over-escaping (literal
+            // backslash-n paragraph breaks) is corrected at the source — the
+            // plan-card directives mandate normally-escaped JSON — because any
+            // content-based healing of decoded strings can corrupt legitimate
+            // literals (Windows paths, escape-explaining prose).
             super::sentinels::Sentinel::PlanCard(json) => {
-                // Heal model-side over-escaping (`\\n` one level too deep) so the
-                // card renders paragraphs, not literal "\n\n" text.
-                let json = super::sentinels::normalize_card_json(&json);
                 persist_card_row(app, db, inner, thread_id, "plan_card", &json).await;
             }
             super::sentinels::Sentinel::TestCases(md) => {
