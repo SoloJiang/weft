@@ -28,18 +28,36 @@ const REVIVE_PROMPT: &str =
 const RESUME_STALLED_PROMPT: &str = "The app just restarted. One or more of your in-progress tasks has a worker that went idle without finishing — its in-flight instruction was likely lost on restart. Resume driving these tasks the way you normally would: check each one's current state and latest output, then re-dispatch its worker with the next concrete step, and keep driving the normal loop — read the worker's replies on the bus as they arrive and dispatch the next step — until the task is actually delivered, not just nudged once. Don't repeat work that's already done.";
 const MAX_CONCURRENT: usize = 4;
 
-/// The stalled-resume instruction for a lead, naming the exact worker bus ids
-/// (= direction ids) that went idle without delivering. Without these the lead —
-/// which has no worker message to read a `from` id off (the stall means the worker
-/// never posted) — cannot reliably address the idle workers to re-dispatch them
-/// (see the lead's bus instructions in commands.rs).
-fn resume_stalled_prompt(stalled_dirs: &[i32]) -> String {
+/// Names the exact worker bus ids (= direction ids) that went idle without
+/// delivering, so the lead can address them: without these it has no worker
+/// message to read a `from` id off (the stall means the worker never posted).
+/// Appended to BOTH the idle-stall prompt and the interrupted-lead prompt — an
+/// interrupted lead may be a stall-resume turn that was itself cut off, so the
+/// ids must survive that crash rather than only riding the idle-only path.
+fn stalled_ids_clause(stalled_dirs: &[i32]) -> String {
     let ids = stalled_dirs
         .iter()
         .map(|d| d.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{RESUME_STALLED_PROMPT} The workers that went idle are on the thread bus under these ids: {ids}. bus_post each id directly (a direct bus_post reaches an idle worker) to re-dispatch it.")
+    format!(" The workers that went idle are on the thread bus under these ids: {ids}. bus_post each id directly (a direct bus_post reaches an idle worker) to re-dispatch it.")
+}
+
+/// The idle-stall resume nudge: [`RESUME_STALLED_PROMPT`] + the stalled ids.
+fn resume_stalled_prompt(stalled_dirs: &[i32]) -> String {
+    format!("{RESUME_STALLED_PROMPT}{}", stalled_ids_clause(stalled_dirs))
+}
+
+/// The interrupted-lead nudge: the generic continue prompt, PLUS the stalled ids
+/// when this interrupted lead also owns undelivered stalled tasks (e.g. its cut-off
+/// turn was itself a stall-resume). Empty stalled set → unchanged `REVIVE_PROMPT`,
+/// so a normal interrupted lead is a pure regression.
+fn lead_revive_prompt(stalled_dirs: &[i32]) -> String {
+    if stalled_dirs.is_empty() {
+        REVIVE_PROMPT.to_string()
+    } else {
+        format!("{REVIVE_PROMPT}{}", stalled_ids_clause(stalled_dirs))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +297,13 @@ async fn try_revive_lead(app: &AppHandle, db: &Db, thread_id: i32) -> anyhow::Re
     if has_open_ask(app, "lead", thread_id) {
         return Ok(());
     }
-    nudge_eng_if_idle(app, db, &eng, REVIVE_PROMPT).await?;
+    // Fold in any stalled worker ids this interrupted lead still owns: its cut-off
+    // turn may itself have been a stall-resume, and the idle-only stall scan skips
+    // a lead persisted "running" — so without this the ids are lost across a crash
+    // mid-resume. Empty set → plain REVIVE_PROMPT (a normal interrupted lead is
+    // unchanged).
+    let stalled_dirs = stalled_direction_ids(db, thread_id).await?;
+    nudge_eng_if_idle(app, db, &eng, &lead_revive_prompt(&stalled_dirs)).await?;
     Ok(())
 }
 
@@ -306,6 +330,31 @@ async fn nudge_if_idle(app: &AppHandle, db: &Db, key: i64, prompt: &str) -> anyh
     Ok(())
 }
 
+/// Deliver `prompt`, resetting the engine to idle on failure. nudge can fail
+/// AFTER marking the turn busy + running (a per-turn CLI that fails to spawn), so
+/// resetting first stops later user sends queuing behind a turn that never emits
+/// TurnEnd; propagating the error lets the caller's report_failure surface it in
+/// Needs-you instead of a silent "revived". A busy engine QUEUES the prompt
+/// (single-writer: it runs AFTER the current turn, never in parallel) — never a
+/// second concurrent turn, so this cannot double-drive.
+async fn nudge_or_reset(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    if let Err(e) = engine::nudge(app, db, eng, prompt).await {
+        engine::stop(app, eng).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Running-revive nudge: deliver ONLY when the (freshly-resumed) engine is idle.
+/// A racing concurrent send that already made it busy is driving it — don't queue
+/// a redundant "continue where you left off" behind that. The stall path instead
+/// uses [`nudge_or_reset`] directly: its resume carries the re-dispatch ids and
+/// must QUEUE (not drop) if the lead is transiently busy.
 async fn nudge_eng_if_idle(
     app: &AppHandle,
     db: &Db,
@@ -314,16 +363,7 @@ async fn nudge_eng_if_idle(
 ) -> anyhow::Result<()> {
     let busy = { eng.lock().await.turn.busy };
     if !busy {
-        // Propagate failure (e.g. the CLI/app-server can't start at boot) so the
-        // caller's report_failure surfaces it in Needs-you instead of marking the
-        // session silently revived while its interrupted work stays stuck. nudge can
-        // fail AFTER already marking the turn busy + running (a per-turn CLI that
-        // fails to spawn), so reset the engine to idle first — otherwise later user
-        // sends queue behind a turn that never emits TurnEnd.
-        if let Err(e) = engine::nudge(app, db, eng, prompt).await {
-            engine::stop(app, eng).await;
-            return Err(e);
-        }
+        nudge_or_reset(app, db, eng, prompt).await?;
     }
     Ok(())
 }
@@ -366,7 +406,12 @@ async fn try_revive_stalled_lead(
     if has_open_ask(app, "lead", thread_id) {
         return Ok(());
     }
-    nudge_eng_if_idle(app, db, &eng, &resume_stalled_prompt(stalled_dirs)).await?;
+    // nudge_or_reset (NOT nudge_eng_if_idle): if a frontend/IM send made the lead
+    // busy between selection and here, the resume must QUEUE (single-writer → runs
+    // after that turn, no double-drive), never be DROPPED — it carries the stalled
+    // worker ids the lead has to re-dispatch, and dropping it re-strands the task
+    // until another restart.
+    nudge_or_reset(app, db, &eng, &resume_stalled_prompt(stalled_dirs)).await?;
     Ok(())
 }
 
@@ -796,6 +841,19 @@ mod tests {
         assert!(p.contains("5, 7"));
         assert!(p.contains("bus_post"));
         assert!(p.contains("not just nudged once"));
+    }
+
+    /// The interrupted-lead prompt is the plain continue prompt for a normal
+    /// interrupted lead, but folds in the stalled worker ids when the lead still
+    /// owns them — so a crash during a stall-resume turn (which lands on the
+    /// interrupted path next boot) doesn't strand those workers without their ids.
+    #[test]
+    fn lead_revive_prompt_folds_in_stalled_ids_only_when_present() {
+        assert_eq!(lead_revive_prompt(&[]), REVIVE_PROMPT); // regression: unchanged
+        let p = lead_revive_prompt(&[5, 7]);
+        assert!(p.starts_with(REVIVE_PROMPT));
+        assert!(p.contains("5, 7"));
+        assert!(p.contains("bus_post"));
     }
 
     /// Leftover queued user messages must surface as "error" (un-sent, resendable)
