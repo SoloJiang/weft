@@ -1,6 +1,8 @@
-//! Boot-time recovery: re-attach and continue the worker/lead turns that were
-//! interrupted by a hard app exit (orphaned `running` activity status). Idle work
-//! is left for lazy-attach on open. See the worker-restart-recovery spec.
+//! Boot-time recovery: re-attach and continue work interrupted by a hard app
+//! exit — both orphaned `running` turns (cut off mid-flight) and silently-stalled
+//! tasks (a lead that finished its turn cleanly yet still owns an in-progress task
+//! whose worker drained to idle without delivering). Cleanly-idle work with no
+//! in-progress task is left for lazy-attach on open. See the worker-restart spec.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,19 +16,31 @@ use crate::store::{repo, Db};
 
 const REVIVE_PROMPT: &str =
     "Your previous run was interrupted before it finished. Continue from where you left off.";
-/// Posted to an idle lead whose in-progress task stalled after a clean restart
-/// (its worker drained to idle without delivering). Unlike [`REVIVE_PROMPT`] the
-/// lead's OWN turn wasn't cut off — so this asks it to re-examine task state and
-/// RESUME DRIVING, not to "continue where it left off". The "keep driving … not
-/// just nudged once" framing matters: a single poke would only move the task one
-/// step before it stalls again; the lead must re-enter its normal orchestration
-/// loop (worker reports back on the bus → lead dispatches the next step) and run
-/// it to delivery.
-const RESUME_STALLED_PROMPT: &str = "The app just restarted. One or more of your in-progress tasks has a worker that went idle without finishing — its in-flight instruction was likely lost on restart. Resume driving these tasks the way you normally would. For each in-progress task whose worker has gone idle without delivering: check its current state and latest output, then re-dispatch that worker (a direct bus_post reaches it even when idle) with the next concrete step. Then keep driving the normal loop — read the worker's replies on the bus as they arrive and dispatch the next step — until the task is actually delivered, not just nudged once. Don't repeat work that's already done.";
-/// Bus `from` identity for the recovery post (display-only; wake routing keys on
-/// `to`, so this is never parsed as a route).
-const STALL_FROM: &str = "system";
+/// Base of the stalled-resume nudge for an idle lead whose in-progress task
+/// stalled after a clean restart (its worker drained to idle without delivering).
+/// Unlike [`REVIVE_PROMPT`] the lead's OWN turn wasn't cut off — so this asks it
+/// to re-examine task state and RESUME DRIVING, not "continue where it left off".
+/// The "keep driving … not just nudged once" framing matters: a single poke would
+/// move the task one step before it stalls again; the lead must re-enter its
+/// normal orchestration loop (worker reports back on the bus → lead dispatches the
+/// next step) and run it to delivery. [`resume_stalled_prompt`] appends the exact
+/// stalled worker bus ids the lead must re-dispatch.
+const RESUME_STALLED_PROMPT: &str = "The app just restarted. One or more of your in-progress tasks has a worker that went idle without finishing — its in-flight instruction was likely lost on restart. Resume driving these tasks the way you normally would: check each one's current state and latest output, then re-dispatch its worker with the next concrete step, and keep driving the normal loop — read the worker's replies on the bus as they arrive and dispatch the next step — until the task is actually delivered, not just nudged once. Don't repeat work that's already done.";
 const MAX_CONCURRENT: usize = 4;
+
+/// The stalled-resume instruction for a lead, naming the exact worker bus ids
+/// (= direction ids) that went idle without delivering. Without these the lead —
+/// which has no worker message to read a `from` id off (the stall means the worker
+/// never posted) — cannot reliably address the idle workers to re-dispatch them
+/// (see the lead's bus instructions in commands.rs).
+fn resume_stalled_prompt(stalled_dirs: &[i32]) -> String {
+    let ids = stalled_dirs
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{RESUME_STALLED_PROMPT} The workers that went idle are on the thread bus under these ids: {ids}. bus_post each id directly (a direct bus_post reaches an idle worker) to re-dispatch it.")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkerTarget {
@@ -89,10 +103,13 @@ async fn collect_targets(
 /// Silent-stall selection: threads whose lead finished its own turn cleanly
 /// (idle, so NOT caught by the `running`-only [`collect_targets`]) yet still own
 /// an in-progress task whose worker has gone idle without delivering. Nothing is
-/// driving such a thread forward, so on boot we wake its lead via a bus post to
-/// re-read persisted task state and re-dispatch. Pure over (DB, live-set) →
-/// unit-testable. Returns thread ids (the lead is woken per thread, not per
-/// stalled direction, so repeated stalled directions wake it once).
+/// driving such a thread forward, so on boot we re-drive its lead to re-dispatch.
+/// Returns `(thread_id, stalled direction ids)` per stalled thread — the ids are
+/// carried into the resume prompt so the lead can address the idle workers
+/// directly (it has no worker bus message to read a `from` id off). Pure over DB
+/// → unit-testable. Not filtered by a live-set: a resident-but-idle lead (e.g.
+/// the frontend opened it for slash discovery) still needs the prompt — idempotency
+/// is handled at drive time by [`nudge_eng_if_idle`]'s busy check, not by exclusion.
 ///
 /// Authorization guard ("don't restart a task waiting on a human"): a BLOCKING
 /// permission ask holds the tool call open, keeping the turn busy → persisted
@@ -101,38 +118,37 @@ async fn collect_targets(
 /// re-driven — intended, not a leak: that question lived only in the in-memory
 /// AskRegistry (cleared on restart), so re-driving the lead re-surfaces it
 /// instead of stalling forever on an answer that can no longer arrive.
-async fn collect_stalled_leads(db: &Db, live: &HashSet<i64>) -> anyhow::Result<Vec<i32>> {
+async fn collect_stalled_leads(db: &Db) -> anyhow::Result<Vec<(i32, Vec<i32>)>> {
     let mut stalled = Vec::new();
     for ws in repo::list_workspaces(db).await? {
         for th in repo::list_threads(db, ws.id).await? {
             // The lead must have orchestration context to resume from (a native
-            // id), be legitimately idle — NOT "running" (an interrupted turn,
+            // id) and be legitimately idle — NOT "running" (an interrupted turn,
             // already handled by collect_targets) and NOT "stopped" (taken over
-            // in the user's terminal) — and not already live (idempotent reboot).
-            if live.contains(&lead_key(th.id)) {
-                continue;
-            }
+            // in the user's terminal).
             if repo::lead_native_id(db, th.id).await?.is_none() {
                 continue;
             }
             if repo::lead_status(db, th.id).await?.as_deref() != Some("idle") {
                 continue;
             }
-            if thread_has_stalled_direction(db, th.id).await? {
-                stalled.push(th.id);
+            let dirs = stalled_direction_ids(db, th.id).await?;
+            if !dirs.is_empty() {
+                stalled.push((th.id, dirs));
             }
         }
     }
     Ok(stalled)
 }
 
-/// True iff the thread owns ≥1 in-progress task ("planning"/"working") whose
-/// latest session finished its turn cleanly — a captured native id and
-/// status=="idle" — yet the task never reached "review"/"done". "queued" (never
-/// started) and "review" (awaiting the human) are legitimate rest states, not
-/// stalls; a "running" session is an interrupted turn (collect_targets owns it)
-/// and "stopped" is a worker taken over in the user's terminal.
-async fn thread_has_stalled_direction(db: &Db, thread_id: i32) -> anyhow::Result<bool> {
+/// The in-progress ("planning"/"working") directions of a thread whose latest
+/// session finished its turn cleanly — a captured native id and status=="idle" —
+/// yet the task never reached "review"/"done". "queued" (never started) and
+/// "review" (awaiting the human) are legitimate rest states, not stalls; a
+/// "running" session is an interrupted turn (collect_targets owns it) and
+/// "stopped" is a worker taken over in the user's terminal.
+async fn stalled_direction_ids(db: &Db, thread_id: i32) -> anyhow::Result<Vec<i32>> {
+    let mut ids = Vec::new();
     for dir in repo::list_directions(db, thread_id).await? {
         if dir.status != "planning" && dir.status != "working" {
             continue;
@@ -141,10 +157,10 @@ async fn thread_has_stalled_direction(db: &Db, thread_id: i32) -> anyhow::Result
             continue;
         };
         if sess.native_session_id.is_some() && sess.status == "idle" {
-            return Ok(true);
+            ids.push(dir.id);
         }
     }
-    Ok(false)
+    Ok(ids)
 }
 
 async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
@@ -162,7 +178,7 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
     // BUSY under the boot storm of concurrent services) degrades to "no stall
     // recovery this boot" + a log, rather than propagating and skipping the
     // running-revive dispatch entirely.
-    let stalled = collect_stalled_leads(&db, &live).await.unwrap_or_else(|e| {
+    let stalled = collect_stalled_leads(&db).await.unwrap_or_else(|e| {
         eprintln!("[weft][revive] stalled scan failed: {e}");
         Vec::new()
     });
@@ -192,20 +208,20 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
             revive_worker(&app, w).await;
         }));
     }
+    // Silent-stall recovery: idle leads whose in-progress task's worker drained to
+    // idle without delivering. Re-drive the lead (get-or-create engine → resume →
+    // nudge with the stalled worker ids) exactly like the interrupted paths, so a
+    // failure surfaces in Needs-you instead of silently staying stalled. Shares the
+    // spawn budget; disjoint from the running-turn revive by status (idle vs running).
+    for (tid, dirs) in stalled {
+        let (app, sem) = (app.clone(), sem.clone());
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _permit = sem.acquire().await;
+            revive_stalled_lead(&app, tid, dirs).await;
+        }));
+    }
     for h in handles {
         let _ = h.await;
-    }
-    // Silent-stall recovery: idle leads whose in-progress task's worker drained
-    // to idle without delivering. One bus post per thread (not per stalled
-    // direction) enqueues the resume instruction and wakes the coordinator to
-    // drive the lead, which re-dispatches from persisted task state. Independent
-    // of the running-turn revive above — disjoint by status (idle vs running).
-    if !stalled.is_empty() {
-        if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-            for tid in stalled {
-                wake_stalled_lead(&bus, tid);
-            }
-        }
     }
     // A worker revived AFTER the frontend store mounted isn't caught by its
     // mount-time pull, and a nudge-driven turn emits no busy push the listener
@@ -239,7 +255,7 @@ async fn try_revive_worker(app: &AppHandle, db: &Db, w: WorkerTarget) -> anyhow:
     if has_open_ask(app, &w.direction_id.to_string(), w.thread_id) {
         return Ok(());
     }
-    nudge_if_idle(app, db, w.session_id as i64).await?;
+    nudge_if_idle(app, db, w.session_id as i64, REVIVE_PROMPT).await?;
     Ok(())
 }
 
@@ -263,7 +279,7 @@ async fn try_revive_lead(app: &AppHandle, db: &Db, thread_id: i32) -> anyhow::Re
     if has_open_ask(app, "lead", thread_id) {
         return Ok(());
     }
-    nudge_eng_if_idle(app, db, &eng).await?;
+    nudge_eng_if_idle(app, db, &eng, REVIVE_PROMPT).await?;
     Ok(())
 }
 
@@ -283,14 +299,19 @@ fn has_open_ask(app: &AppHandle, dir: &str, thread_id: i32) -> bool {
         .unwrap_or(false)
 }
 
-async fn nudge_if_idle(app: &AppHandle, db: &Db, key: i64) -> anyhow::Result<()> {
+async fn nudge_if_idle(app: &AppHandle, db: &Db, key: i64, prompt: &str) -> anyhow::Result<()> {
     if let Some(eng) = app.state::<LeadChatState>().get(key) {
-        nudge_eng_if_idle(app, db, &eng).await?;
+        nudge_eng_if_idle(app, db, &eng, prompt).await?;
     }
     Ok(())
 }
 
-async fn nudge_eng_if_idle(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
+async fn nudge_eng_if_idle(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    prompt: &str,
+) -> anyhow::Result<()> {
     let busy = { eng.lock().await.turn.busy };
     if !busy {
         // Propagate failure (e.g. the CLI/app-server can't start at boot) so the
@@ -299,7 +320,7 @@ async fn nudge_eng_if_idle(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow:
         // fail AFTER already marking the turn busy + running (a per-turn CLI that
         // fails to spawn), so reset the engine to idle first — otherwise later user
         // sends queue behind a turn that never emits TurnEnd.
-        if let Err(e) = engine::nudge(app, db, eng, REVIVE_PROMPT).await {
+        if let Err(e) = engine::nudge(app, db, eng, prompt).await {
             engine::stop(app, eng).await;
             return Err(e);
         }
@@ -314,23 +335,39 @@ fn report_failure(app: &AppHandle, thread_id: i32, dir: &str, e: &anyhow::Error)
     eprintln!("[weft][revive] {dir}@{thread_id} failed: {e}");
 }
 
-/// Wake an idle-but-stalled lead by posting a resume instruction to its bus
-/// inbox. The post both enqueues the instruction AND emits the wake the
-/// coordinator turns into an inbox-read (the coordinator is spawned before this
-/// sweep in lib.rs), so the lead resumes from persisted task state and
-/// re-dispatches its idle worker. Going through the bus — not a direct engine
-/// nudge — reuses the coordinator's single-writer safety (a taken-over lead is
-/// skipped). Reboots never stack parallel workers: we post once per thread, and
-/// once the lead re-dispatches, the worker flips idle→running so the NEXT reboot
-/// routes it through the interrupted path, not this one.
-fn wake_stalled_lead(bus: &crate::bus::BusRegistry, thread_id: i32) {
-    bus.post(
-        thread_id,
-        STALL_FROM,
-        crate::bus::LEAD,
-        RESUME_STALLED_PROMPT,
-        "message",
-    );
+async fn revive_stalled_lead(app: &AppHandle, thread_id: i32, stalled_dirs: Vec<i32>) {
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    let db = Db(db.0.clone(), db.1);
+    if let Err(e) = try_revive_stalled_lead(app, &db, thread_id, &stalled_dirs).await {
+        report_failure(app, thread_id, "lead", &e);
+    }
+}
+
+/// Re-drive an idle lead whose task stalled: get-or-create its engine, resume the
+/// native session, and nudge it with the stalled worker ids so it re-dispatches.
+/// Structurally a sibling of [`try_revive_lead`] — the difference is the trigger
+/// (a cleanly-idle lead with an undelivered in-progress task, not an interrupted
+/// turn) and the prompt. No `mark_incomplete`/`fail_queued`: a cleanly-idle lead
+/// has no half-streamed row and no orphaned queue (idle ⟺ empty queue). Failures
+/// (missing CLI, read-only workspace, native resume fails) propagate so the
+/// caller's `report_failure` surfaces them in Needs-you rather than leaving the
+/// task silently stalled. `lead_engine` get-or-create also covers a resident-but-
+/// idle lead (opened by the frontend for slash discovery) — never excluded.
+async fn try_revive_stalled_lead(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    stalled_dirs: &[i32],
+) -> anyhow::Result<()> {
+    let eng = lead_engine(app, db, thread_id, "en").await?;
+    engine::ensure_running(app, db, &eng).await?;
+    if has_open_ask(app, "lead", thread_id) {
+        return Ok(());
+    }
+    nudge_eng_if_idle(app, db, &eng, &resume_stalled_prompt(stalled_dirs)).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -566,10 +603,11 @@ mod tests {
         let db = mem().await;
         let (th, repo_id) = fixture(&db).await;
         idle_lead(&db, th).await;
-        stalled_direction(&db, th, repo_id, "working").await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
-        assert_eq!(stalled, vec![th]);
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        // Thread + its stalled worker id, so the resume prompt can address it.
+        assert_eq!(stalled, vec![(th, vec![dir])]);
     }
 
     /// "planning" is equally in-progress — the stall path spans both live states.
@@ -578,10 +616,10 @@ mod tests {
         let db = mem().await;
         let (th, repo_id) = fixture(&db).await;
         idle_lead(&db, th).await;
-        stalled_direction(&db, th, repo_id, "planning").await;
+        let dir = stalled_direction(&db, th, repo_id, "planning").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
-        assert_eq!(stalled, vec![th]);
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert_eq!(stalled, vec![(th, vec![dir])]);
     }
 
     /// Two stalled directions under one thread wake the lead EXACTLY once — the
@@ -592,15 +630,23 @@ mod tests {
         let db = mem().await;
         let (th, repo_id) = fixture(&db).await;
         idle_lead(&db, th).await;
+        let mut want: Vec<i32> = Vec::new();
         for (name, status) in [("alpha", "working"), ("beta", "planning")] {
             let dir = mk_direction(&db, th, repo_id, name).await;
             repo::set_direction_status(&db, dir, status).await.unwrap();
             let sess = running_session(&db, dir, repo_id).await;
             repo::set_session_status(&db, sess, "idle").await.unwrap();
+            want.push(dir);
         }
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
-        assert_eq!(stalled, vec![th]); // one entry despite two stalled directions
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        // ONE thread entry despite two stalled directions, carrying BOTH worker ids.
+        assert_eq!(stalled.len(), 1);
+        assert_eq!(stalled[0].0, th);
+        let mut got = stalled[0].1.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     /// A "running" lead is an interrupted turn owned by collect_targets; the stall
@@ -613,7 +659,7 @@ mod tests {
         repo::set_lead_status(&db, th, "running").await.unwrap();
         stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -627,7 +673,7 @@ mod tests {
         repo::set_lead_status(&db, th, "stopped").await.unwrap();
         stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -639,22 +685,7 @@ mod tests {
         repo::set_lead_status(&db, th, "idle").await.unwrap(); // idle, but no native id
         stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
-        assert!(stalled.is_empty());
-    }
-
-    /// A live lead (already resident) is excluded → idempotent reboot; weft
-    /// already owns the single-writer slot, so don't stack a second driver.
-    #[tokio::test]
-    async fn excludes_stalled_when_lead_live() {
-        let db = mem().await;
-        let (th, repo_id) = fixture(&db).await;
-        idle_lead(&db, th).await;
-        stalled_direction(&db, th, repo_id, "working").await;
-
-        let mut live = HashSet::new();
-        live.insert(lead_key(th));
-        let stalled = collect_stalled_leads(&db, &live).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -666,7 +697,7 @@ mod tests {
         idle_lead(&db, th).await;
         stalled_direction(&db, th, repo_id, "done").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -678,7 +709,7 @@ mod tests {
         idle_lead(&db, th).await;
         stalled_direction(&db, th, repo_id, "queued").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -690,7 +721,7 @@ mod tests {
         idle_lead(&db, th).await;
         stalled_direction(&db, th, repo_id, "review").await;
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -705,7 +736,7 @@ mod tests {
         repo::set_direction_status(&db, dir, "working").await.unwrap();
         running_session(&db, dir, repo_id).await; // native id + RUNNING (not drained)
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -720,7 +751,7 @@ mod tests {
         let sess = running_session(&db, dir, repo_id).await;
         repo::set_session_status(&db, sess, "stopped").await.unwrap();
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -737,7 +768,7 @@ mod tests {
             .unwrap();
         repo::set_session_status(&db, s.id, "idle").await.unwrap(); // idle, no native id
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
@@ -751,22 +782,20 @@ mod tests {
         let dir = mk_direction(&db, th, repo_id, "alpha").await;
         repo::set_direction_status(&db, dir, "working").await.unwrap();
 
-        let stalled = collect_stalled_leads(&db, &empty()).await.unwrap();
+        let stalled = collect_stalled_leads(&db).await.unwrap();
         assert!(stalled.is_empty());
     }
 
-    /// The wake posts the resume instruction to the LEAD's inbox (not a worker,
-    /// not a broadcast); the post's emitted wake is what the coordinator turns
-    /// into an inbox-read.
+    /// The resume prompt names the exact stalled worker bus ids so the lead can
+    /// bus_post each idle worker directly (the stall means no worker message it
+    /// could read a `from` id off), and keeps the "not just nudged once" framing.
     #[test]
-    fn wake_stalled_lead_posts_resume_to_lead_inbox() {
-        let bus = crate::bus::BusRegistry::new();
-        wake_stalled_lead(&bus, 7);
-        let inbox = bus.inbox(7, crate::bus::LEAD);
-        assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0].from, STALL_FROM);
-        assert_eq!(inbox[0].to, crate::bus::LEAD);
-        assert!(inbox[0].text.contains("restarted"));
+    fn resume_stalled_prompt_names_the_stalled_worker_ids() {
+        let p = resume_stalled_prompt(&[5, 7]);
+        assert!(p.contains("restarted"));
+        assert!(p.contains("5, 7"));
+        assert!(p.contains("bus_post"));
+        assert!(p.contains("not just nudged once"));
     }
 
     /// Leftover queued user messages must surface as "error" (un-sent, resendable)
