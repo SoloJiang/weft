@@ -186,7 +186,11 @@ export function PermissionConfirmationCard({
         className,
       )}
     >
-      <div className="flex min-w-0 items-center gap-2">
+      {/* `flex-1` matters in the in-session ROW layout: it stretches the title
+          block so the actions pin to the card's right edge — a short summary
+          ("/bin/echo hi") otherwise left the buttons floating mid-card. In the
+          default column layout it has no visible effect. */}
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         <ShieldQuestion size={14} className="shrink-0 text-waiting" />
         {showToolIcon && <ToolIcon tool={ask.tool} size={13} />}
         <ConfirmationTitle
@@ -195,7 +199,10 @@ export function PermissionConfirmationCard({
           <span className="text-ink">{toolFullName(ask.tool)}</span>{" "}
           {t("needs.wantsPermission")}
           {!isBlockSummary && ask.summary && (
-            <span className="ml-1.5 font-mono text-[11.5px] text-ink">
+            <span
+              className="ml-1.5 font-mono text-[11.5px] text-ink"
+              title={detailTitle}
+            >
               {ask.summary}
             </span>
           )}

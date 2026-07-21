@@ -82,7 +82,7 @@ The body is RAW markdown (a # title plus nested unordered lists; leaves are indi
 /// core flow, unlike the situational `SENTINEL_DIRECTIVES` below.
 const PLAN_CARD_DIRECTIVES: &str = r#"To present the plan for confirmation, render a plan card by outputting exactly:
 <weft:plan_card>{"title":"...","requirements":["..."],"approach":"...","split":[{"name":"...","repo":"...","reason":"..."}],"risks":["..."]}</weft:plan_card>
-`requirements` lists the agreed needs / acceptance criteria. `approach` is the issue-level technical plan (markdown: architecture, cross-repo contracts, data flow, sequencing). `split` is an optional coarse preview of the intended tasks. `risks` lists open risks that survived your blind-spot pass (omit when none). Use language matching the user's locale for all values. After the human acts on the card you will receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision> as a hidden message; a clear textual agreement in chat counts the same. Never call propose_directions while your latest plan_card is unanswered, unless the human explicitly told you to skip the plan discussion."#;
+`requirements` lists the agreed needs / acceptance criteria. `approach` is the issue-level technical plan (markdown: architecture, cross-repo contracts, data flow, sequencing). `split` is an optional coarse preview of the intended tasks. `risks` lists open risks that survived your blind-spot pass (omit when none). Use language matching the user's locale for all values. The payload must be VALID JSON with normally-escaped strings: paragraph breaks inside a value are the two characters \n\n (one backslash each) — never double-escape them into literal backslash-n text. After the human acts on the card you will receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision> as a hidden message; a clear textual agreement in chat counts the same. Never call propose_directions while your latest plan_card is unanswered, unless the human explicitly told you to skip the plan discussion."#;
 
 /// Sentinel usage directives appended to the lead prompt. Each subsequent task
 /// (Task 3-5) keeps growing this block, so it lives as its own const for easy
@@ -259,6 +259,8 @@ pub async fn lead_engine(
         child: None,
         stdin: None,
         current: None,
+        open_texts: std::collections::HashMap::new(),
+        turn_saw_text: false,
         interrupting: false,
         generation: 0,
         reset_epoch: 0,
@@ -1120,6 +1122,8 @@ pub(crate) async fn chat_open_worker_impl(
                 child: None,
                 stdin: None,
                 current: None,
+                open_texts: std::collections::HashMap::new(),
+                turn_saw_text: false,
                 interrupting: false,
                 generation: 0,
                 reset_epoch: 0,
@@ -1236,6 +1240,8 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         child: None,
         stdin: None,
         current: None,
+        open_texts: std::collections::HashMap::new(),
+        turn_saw_text: false,
         interrupting: false,
         generation: 0,
         reset_epoch: 0,

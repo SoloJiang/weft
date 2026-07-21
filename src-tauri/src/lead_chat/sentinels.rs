@@ -134,3 +134,9 @@ fn consume_card<'a>(
         false
     }
 }
+
+// NOTE: card payloads are persisted VERBATIM — an earlier revision healed
+// model-side over-escaping (literal backslash-n paragraph breaks) here, but any
+// content-based rewrite of decoded strings can corrupt legitimate literals
+// (Windows paths, regex/escape-explaining prose). The fix lives at the source:
+// PLAN_CARD_DIRECTIVES mandates normally-escaped JSON strings.

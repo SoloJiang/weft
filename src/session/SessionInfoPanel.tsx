@@ -15,6 +15,7 @@ export function SessionInfoPanel({
   meta,
   skills,
   subtasks,
+  onOpenSubtask,
   onClose,
   onReload,
   busy,
@@ -23,6 +24,8 @@ export function SessionInfoPanel({
   skills: EnabledSkill[];
   /** 该 thread 已创建的子任务(lead 专用;worker 不传 → 不渲染该段)。 */
   subtasks?: Direction[];
+  /** 点击子任务行 → 打开该 worker 会话面(lead 专用;不传 → 行保持静态)。 */
+  onOpenSubtask?: (directionId: number) => void;
   onClose: () => void;
   /** 重载会话:复用静默 re-spawn,拾取新加的 MCP / skill。 */
   onReload?: () => void;
@@ -100,7 +103,9 @@ export function SessionInfoPanel({
               items={sortedSubtasks}
               head={3}
               layout="rows"
-              renderItem={(d) => <SubtaskRow key={d.id} direction={d} />}
+              renderItem={(d) => (
+                <SubtaskRow key={d.id} direction={d} onOpen={onOpenSubtask} />
+              )}
             />
           </Section>
         )}
@@ -265,23 +270,46 @@ function mcpDot(status: string): string {
 
 // Display-only row (not interactive → no hover affordance): tool icon, name,
 // status dot.
-function SubtaskRow({ direction }: { direction: Direction }) {
-  return (
-    // -mx-1.5 mirrors McpRow: the tool icon lines up with the section title
-    // (and the show-more chevron) at the content edge.
-    <div className="-mx-1.5 flex items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1">
+function SubtaskRow({
+  direction,
+  onOpen,
+}: {
+  direction: Direction;
+  onOpen?: (directionId: number) => void;
+}) {
+  // -mx-1.5 mirrors McpRow: the tool icon lines up with the section title
+  // (and the show-more chevron) at the content edge.
+  const rowClass = "-mx-1.5 flex items-center gap-2 rounded-[var(--radius-sm)] px-1.5 py-1";
+  const body = (
+    <>
       <span
         title={toolFullName(direction.tool)}
         className="grid h-5 w-5 shrink-0 place-items-center rounded-[var(--radius-sm)] border border-border bg-bg text-ink-muted"
       >
         <ToolIcon tool={direction.tool} size={12} />
       </span>
-      <span className="min-w-0 flex-1 truncate text-[12.5px] text-ink">{direction.name}</span>
+      <span className="min-w-0 flex-1 truncate text-left text-[12.5px] text-ink">
+        {direction.name}
+      </span>
       <span
         title={direction.status}
         className={`h-1.5 w-1.5 shrink-0 rounded-full ${subtaskDot(direction.status)}`}
       />
-    </div>
+    </>
+  );
+  if (!onOpen) {
+    return <div className={rowClass}>{body}</div>;
+  }
+  // Interactive: click opens the direction's worker surface (McpRow's hover
+  // affordance) — the panel row used to be the one task entry that led nowhere.
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(direction.id)}
+      className={`${rowClass} w-[calc(100%+0.75rem)] transition-colors hover:bg-surface`}
+    >
+      {body}
+    </button>
   );
 }
 

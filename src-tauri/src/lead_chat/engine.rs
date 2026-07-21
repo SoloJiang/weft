@@ -801,6 +801,11 @@ async fn apply_lead_sentinels(
             super::sentinels::Sentinel::ActionCard(json) => {
                 persist_card_row(app, db, inner, thread_id, "action_card", &json).await;
             }
+            // Card payloads persist VERBATIM. Model-side over-escaping (literal
+            // backslash-n paragraph breaks) is corrected at the source — the
+            // plan-card directives mandate normally-escaped JSON — because any
+            // content-based healing of decoded strings can corrupt legitimate
+            // literals (Windows paths, escape-explaining prose).
             super::sentinels::Sentinel::PlanCard(json) => {
                 persist_card_row(app, db, inner, thread_id, "plan_card", &json).await;
             }
@@ -976,8 +981,48 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     let Some((id, text, _)) = inner.current.take() else {
         return;
     };
+    finalize_text_row(app, db, inner, id, text, status, false).await;
+}
+
+/// Finalize every item-keyed open text row (app-server parallel streams) with
+/// `status`. Row order is already fixed by insertion; drain order is irrelevant.
+async fn finalize_open_texts(app: &AppHandle, db: &Db, inner: &mut EngineInner, status: &str) {
+    let rows: Vec<(i32, String)> = inner
+        .open_texts
+        .drain()
+        .map(|(_, (id, text, _))| (id, text))
+        .collect();
+    for (id, text) in rows {
+        finalize_text_row(app, db, inner, id, text, status, false).await;
+    }
+}
+
+/// Row-level text finalize: sentinel extraction on clean completion, DB write,
+/// `Push::Finalize`, IM out. Shared by the anonymous slot (`current`), the
+/// item-keyed rows (`open_texts`), and standalone one-shot texts (`TextDone`).
+/// `replaced` = the body already differs from what streamed to the frontend
+/// (authoritative TextDone override / standalone rows inserted empty) — the
+/// finalize push must then carry the content even when sentinels changed nothing,
+/// or the live React state keeps the stale streamed chunks until a reload.
+async fn finalize_text_row(
+    app: &AppHandle,
+    db: &Db,
+    inner: &mut EngineInner,
+    id: i32,
+    text: String,
+    status: &str,
+    replaced: bool,
+) {
     let thread_id = inner.thread_id;
     let origin_tag = inner.current_origin_tag.clone();
+    // Single source for the "this turn produced visible text" invariant: ANY
+    // row completing mid-turn (streamed item, standalone TextDone, anonymous
+    // slot) marks the turn, so a later failure never appends *_before_output
+    // after real output. Turn boundaries (TurnEnd / disconnect / hard stop)
+    // reset it.
+    if status == "complete" {
+        inner.turn_saw_text = true;
+    }
     // `stripped` = the cleaned body differs from what streamed (sentinels removed),
     // so the live row still shows the raw tags and must be replaced, not just status.
     let (clean, stripped) = if status == "complete" {
@@ -1002,7 +1047,7 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
             thread_id,
             message_id: id,
             status: status.into(),
-            content: stripped.then(|| clean.clone()),
+            content: (stripped || replaced).then(|| clean.clone()),
             seq: None,
         },
     );
@@ -1020,6 +1065,7 @@ async fn cleanup_disconnected_turn(
     let mut inner = eng.lock().await;
     if !inner.turn.busy
         && inner.current.is_none()
+        && inner.open_texts.is_empty()
         && inner.turn.queue.is_empty()
         && inner.tool_rows.is_empty()
     {
@@ -1035,6 +1081,15 @@ async fn cleanup_disconnected_turn(
         fallback_status
     };
     let current = inner.current.take().map(|(id, text, _)| (id, text));
+    // Item-keyed open rows freeze like `current`: raw text + terminal status
+    // (no sentinel pass — mirrors the anonymous slot's disconnect handling).
+    let orphan_texts: Vec<(i32, String)> = inner
+        .open_texts
+        .drain()
+        .map(|(_, (id, text, _))| (id, text))
+        .collect();
+    let turn_saw_text = inner.turn_saw_text;
+    inner.turn_saw_text = false;
     let orphan_tools: Vec<(i32, serde_json::Value)> =
         inner.tool_rows.drain().map(|(_, v)| v).collect();
     // Capture EXACTLY the still-queued rows this cleanup drains (the
@@ -1068,13 +1123,28 @@ async fn cleanup_disconnected_turn(
         },
     );
     drop(inner);
+    // Real streamed output existed if item-keyed rows were open OR a standalone
+    // TextDone row already landed — suppress the `*_before_output` terminal
+    // insert below (same rule as the TurnEnd path), or the disconnect would
+    // append a spurious terminal bubble after it.
+    let had_orphan_texts = !orphan_texts.is_empty() || turn_saw_text;
+    for (id, text) in orphan_texts {
+        let _ = repo::update_lead_message(
+            db,
+            id,
+            &serde_json::json!({ "text": text }).to_string(),
+            status,
+        )
+        .await;
+        emit_finalize(app, thread_id, id, status);
+    }
     if let Ok(Some(row)) = persist_disconnected_turn_row(
         db,
         thread_id,
         session_id,
         turn_id,
         status,
-        had_busy_turn,
+        had_busy_turn && !had_orphan_texts,
         current,
     )
     .await
@@ -1206,7 +1276,17 @@ pub struct EngineInner {
     pub child: Option<Child>,
     pub stdin: Option<ChildStdin>,
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
+    /// exec/claude 的单串行匿名槽;app-server 的 item 键控行走 `open_texts`。
     pub current: Option<(i32, String, std::time::Instant)>,
+    /// app-server 并行流式 item → 其开放文本行 (row id, 累积文本, last DB flush)。
+    /// 镜像 `tool_rows` 的按 item 分键模式:主叙述与各 collab 子 agent 的
+    /// agentMessage 各自成行,工具行不再切断文本,item/completed 以权威全文定稿。
+    pub open_texts: std::collections::HashMap<String, (i32, String, std::time::Instant)>,
+    /// 本轮已落过「即插即定稿」的独立文本行(standalone TextDone:/plan 内容、
+    /// 未流式的 agentMessage)。这类行不经过 current/open_texts,turn 失败时
+    /// 终态插入要靠它抑制,否则真实输出之后还会追加 *_before_output 气泡。
+    /// TurnEnd/disconnect 清理后复位。
+    pub turn_saw_text: bool,
     /// Set while a protocol interrupt is in flight so the closing row/status
     /// reads `interrupted` instead of `error`.
     pub interrupting: bool,
@@ -1933,7 +2013,7 @@ pub async fn send(
         )
     };
     if skill_pending || cmd_now {
-        let (tid, _sid, _current, orphans) = stop_quiet(eng).await;
+        let (tid, _sid, _texts, orphans) = stop_quiet(eng).await;
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
@@ -2582,17 +2662,96 @@ async fn codex_consumer(
         Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
         match msg {
-            ThreadMsg::Event(ChatEvent::TextDelta { text }) => {
+            ThreadMsg::Event(ChatEvent::TextDelta { text, item }) => {
                 let mut inner = eng.lock().await;
                 inner.clock.last_activity = std::time::Instant::now();
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
-                let row = match &mut inner.current {
-                    Some(c) => {
-                        c.1.push_str(&text);
-                        c.0
+                // Ensure the target row exists: item-keyed rows in `open_texts`
+                // (parallel app-server streams), the anonymous slot in `current`
+                // (errors / turn-failure texts / non-item dialect paths).
+                let missing = match &item {
+                    Some(k) => !inner.open_texts.contains_key(k),
+                    None => inner.current.is_none(),
+                };
+                if missing {
+                    let Ok(m) = repo::insert_lead_message(
+                        &db,
+                        thread_id,
+                        sid,
+                        turn,
+                        "assistant",
+                        "text",
+                        r#"{"text":""}"#,
+                        "streaming",
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let fresh = (m.id, String::new(), std::time::Instant::now());
+                    match &item {
+                        Some(k) => {
+                            inner.open_texts.insert(k.clone(), fresh);
+                        }
+                        None => inner.current = Some(fresh),
                     }
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Message {
+                            thread_id,
+                            message: m,
+                        },
+                    );
+                }
+                // Read the in-flight turn's tag before borrowing the slot mutably.
+                let origin_tag = inner.current_origin_tag.clone();
+                let slot = match &item {
+                    Some(k) => inner.open_texts.get_mut(k),
+                    None => inner.current.as_mut(),
+                };
+                let Some(c) = slot else { continue };
+                c.1.push_str(&text);
+                let row = c.0;
+                if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
+                    c.2 = std::time::Instant::now();
+                    let content = serde_json::json!({ "text": c.1 }).to_string();
+                    let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
+                    emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
+                }
+                let _ = app.emit(
+                    EVENT,
+                    Push::Delta {
+                        thread_id,
+                        message_id: row,
+                        text,
+                    },
+                );
+            }
+            ThreadMsg::Event(ChatEvent::TextDone { item, text }) => {
+                let mut inner = eng.lock().await;
+                inner.clock.last_activity = std::time::Instant::now();
+                let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
+                match streamed {
+                    // The item streamed: finalize its row, preferring the
+                    // authoritative full body over the accumulated frames. When
+                    // that body differs (dropped/duped delta frames), the
+                    // finalize push must carry it so the live view heals too.
+                    Some((row, buf, _)) => {
+                        let auth = text.filter(|t| !t.is_empty());
+                        let replaced = auth.as_deref().is_some_and(|t| t != buf);
+                        let body = auth.unwrap_or(buf);
+                        finalize_text_row(&app, &db, &mut inner, row, body, "complete", replaced)
+                            .await;
+                    }
+                    // No open row (content items never stream): land the text as
+                    // a standalone completed row.
                     None => {
+                        let Some(t) = text.filter(|t| !t.trim().is_empty()) else {
+                            continue;
+                        };
+                        let thread_id = inner.thread_id;
+                        let (sid, turn) = (inner.session_id, inner.turn_id);
                         let Ok(m) = repo::insert_lead_message(
                             &db,
                             thread_id,
@@ -2607,49 +2766,31 @@ async fn codex_consumer(
                         else {
                             continue;
                         };
-                        let id = m.id;
-                        inner.current = Some((id, text.clone(), std::time::Instant::now()));
                         let _ = app.emit(
                             EVENT,
                             Push::Message {
                                 thread_id,
-                                message: m,
+                                message: m.clone(),
                             },
                         );
-                        id
-                    }
-                };
-                // Read the in-flight turn's tag before borrowing inner.current mutably.
-                let origin_tag = inner.current_origin_tag.clone();
-                if let Some(c) = &mut inner.current {
-                    if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
-                        c.2 = std::time::Instant::now();
-                        let content = serde_json::json!({ "text": c.1 }).to_string();
-                        let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
-                        emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
+                        // Inserted empty + finalized at once: the push must carry
+                        // the body or the live view shows an empty bubble.
+                        // (finalize_text_row records turn_saw_text.)
+                        finalize_text_row(&app, &db, &mut inner, m.id, t, "complete", true).await;
                     }
                 }
-                let _ = app.emit(
-                    EVENT,
-                    Push::Delta {
-                        thread_id,
-                        message_id: row,
-                        text,
-                    },
-                );
             }
             ThreadMsg::Event(ChatEvent::Assistant { texts, tools, .. }) => {
                 // Codex streams text via deltas; non-text items are tool calls →
                 // inline `kind:"tool"` rows, filled by their item.completed result.
+                // Text rows are NOT finalized here: each agentMessage closes via
+                // its own TextDone (item-keyed), so a tool item starting mid-flow
+                // — routinely another collab agent's — no longer chops an
+                // unrelated stream's sentence into fragment bubbles. Serial
+                // ordering still holds: an item's completion precedes its tools.
                 let mut inner = eng.lock().await;
                 inner.clock.last_activity = std::time::Instant::now();
-                // Finalize the open text row when the agent message *completes*
-                // (texts non-empty) so its streaming caret clears at text-end — and
-                // before any tool row, so later deltas open a fresh row BELOW it,
-                // keeping "I'll inspect…" → command → explanation flows in order
-                // instead of stacking post-tool prose above the tool. The accumulated
-                // deltas are the body; `texts` is only the finalize trigger.
-                if !texts.is_empty() || !tools.is_empty() {
+                if !texts.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
                 persist_tool_calls(&app, &db, &mut inner, tools).await;
@@ -2665,6 +2806,19 @@ async fn codex_consumer(
                 // app-server's current-context usage (last.inputTokens + window):
                 // the accurate Context-panel value codex exec couldn't give.
                 let mut inner = eng.lock().await;
+                // `last` is the thread's LAST model call — while collab sub-agents
+                // are in flight that flips between the main context and each
+                // sub-agent's much smaller one, making the gauge jump (26% ⇄ 10%).
+                // The payload carries no agent marker, so freeze the gauge for the
+                // duration: running collab calls are exactly the open tool rows
+                // named collabAgentToolCall (completed ones leave `tool_rows`).
+                let collab_active = inner
+                    .tool_rows
+                    .values()
+                    .any(|(_, v)| v["name"] == "collabAgentToolCall");
+                if collab_active {
+                    continue;
+                }
                 inner.last_context_tokens = Some(context_tokens);
                 if window.is_some() {
                     inner.last_window = window;
@@ -2729,33 +2883,40 @@ async fn codex_consumer(
                 let orphans: Vec<(i32, serde_json::Value)> =
                     inner.tool_rows.drain().map(|(_, v)| v).collect();
                 finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
+                // Item-keyed rows a lost item/completed left open (interrupt /
+                // failed turn) finalize with the turn's status, same as tools.
+                let had_item_rows = !inner.open_texts.is_empty();
+                finalize_open_texts(&app, &db, &mut inner, status).await;
                 if inner.current.is_some() {
                     // Finalize the open text row (forks <weft:*> sentinels out on a
                     // clean finish, closes its IM card) — same helper the tool
                     // boundary uses, so the final segment is handled identically.
                     finalize_current_text(&app, &db, &mut inner, status).await;
-                } else if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
-                    &db,
-                    thread_id,
-                    inner.session_id,
-                    inner.turn_id,
-                    status,
-                )
-                .await
-                {
-                    let _ = app.emit(
-                        EVENT,
-                        Push::Message {
-                            thread_id,
-                            message: m,
-                        },
-                    );
+                } else if !had_item_rows && !inner.turn_saw_text {
+                    if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
+                        &db,
+                        thread_id,
+                        inner.session_id,
+                        inner.turn_id,
+                        status,
+                    )
+                    .await
+                    {
+                        let _ = app.emit(
+                            EVENT,
+                            Push::Message {
+                                thread_id,
+                                message: m,
+                            },
+                        );
+                    }
                 }
                 let next = inner.turn.on_turn_end();
                 // Rewind bookkeeping passes to the dequeued turn: its user row is
                 // the queued row's id (None for plumbing turns or going idle).
                 inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
                 inner.last_assistant_uuid = None;
+                inner.turn_saw_text = false;
                 // Next turn's tag becomes the in-flight tag (None when going idle),
                 // so the dequeued turn's output frames carry its own origin_tag.
                 inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
@@ -3496,12 +3657,22 @@ pub async fn stop_quiet(
 ) -> (
     i32,
     Option<i32>,
-    Option<(i32, String)>,
+    Vec<(i32, String)>,
     Vec<(i32, serde_json::Value)>,
 ) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
-    let current = inner.current.take().map(|(id, text, _)| (id, text));
+    // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
+    // Hard stops also shut the codex client down, so the consumer's disconnect
+    // cleanup never runs for them — without this drain an item row would stay
+    // `streaming` forever and could be finalized under a later turn.
+    let mut texts: Vec<(i32, String)> = inner
+        .current
+        .take()
+        .map(|(id, text, _)| (id, text))
+        .into_iter()
+        .collect();
+    texts.extend(inner.open_texts.drain().map(|(_, (id, text, _))| (id, text)));
     // Drain tool rows still awaiting a result, but DON'T finalize here: the
     // caller makes the stop visible (sets `stopped`) first. Awaiting DB/event
     // work while the engine is reset-but-not-yet-stopped would let a concurrent
@@ -3521,12 +3692,16 @@ pub async fn stop_quiet(
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
+    // A hard stop ends the turn: clear the per-turn text marker, or the NEXT
+    // turn inherits a stale true and a pre-output failure there would wrongly
+    // suppress its error_before_output row.
+    inner.turn_saw_text = false;
     // Invalidate any send that reserved against the turn we just cleared — even one
     // whose Phase 1 ran before this stop but whose Phase 3 runs after, and even a
     // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
     // past those flags). send_reservation_valid compares the captured reset_epoch.
     inner.reset_epoch += 1;
-    (target.0, target.1, current, orphan_tools)
+    (target.0, target.1, texts, orphan_tools)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -3536,7 +3711,7 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, current, orphans) = stop_quiet(eng).await;
+    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
@@ -3545,7 +3720,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
         // Stop is now visible to the engine, so finalizing here can't race a
         // concurrent send into a turn we'd wrongly kill.
         finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
-        if let Some((id, text)) = current {
+        for (id, text) in texts {
             let _ = repo::update_lead_message(
                 &db,
                 id,
@@ -4385,7 +4560,7 @@ fn spawn_reader(
                         },
                     );
                 }
-                super::proto::ChatEvent::TextDelta { text } => {
+                super::proto::ChatEvent::TextDelta { text, .. } => {
                     let sid = inner.session_id;
                     let turn = inner.turn_id;
                     let row = match &mut inner.current {
@@ -5405,6 +5580,8 @@ mod tests {
             child: None,
             stdin: None,
             current: None,
+            open_texts: std::collections::HashMap::new(),
+            turn_saw_text: false,
             interrupting: false,
             generation: 0,
             reset_epoch: 0,
@@ -5645,6 +5822,8 @@ mod tests {
             child: None,
             stdin: None,
             current: None,
+            open_texts: std::collections::HashMap::new(),
+            turn_saw_text: false,
             interrupting: false,
             generation: 0,
             reset_epoch: 0,

@@ -872,10 +872,21 @@ impl TurnCollector {
     ) -> bool {
         use crate::lead_chat::proto::ChatEvent;
         match ev {
-            ChatEvent::TextDelta { text } => {
+            ChatEvent::TextDelta { text, .. } => {
                 sink(AnalysisEvent::Delta(&text));
                 self.deltas.push_str(&text);
                 self.saw_delta = true;
+                false
+            }
+            // app-server text finalize: the authoritative body. Mirror the
+            // Assistant dedupe — deltas already streamed it to the sink.
+            ChatEvent::TextDone { text, .. } => {
+                if let Some(t) = text.filter(|t| !t.is_empty()) {
+                    if !self.saw_delta {
+                        sink(AnalysisEvent::Delta(&t));
+                    }
+                    self.texts.push(t);
+                }
                 false
             }
             ChatEvent::Assistant { texts, .. } => {
@@ -2370,7 +2381,7 @@ mod tests {
     fn turn_collector_decides_outcome_and_streams() {
         use crate::lead_chat::proto::ChatEvent;
         let te = |is_error| ChatEvent::TurnEnd { is_error, context_tokens: None };
-        let delta = |s: &str| ChatEvent::TextDelta { text: s.to_string() };
+        let delta = |s: &str| ChatEvent::TextDelta { text: s.to_string(), item: None };
         let asst = |s: &str| ChatEvent::Assistant { texts: vec![s.to_string()], tools: vec![], uuid: None };
         let mut noop = |_: super::AnalysisEvent| {};
 

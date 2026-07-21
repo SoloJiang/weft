@@ -72,18 +72,26 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
   // cap, the body (min-h-0 + scroll) scrolls and the footer (shrink-0) stays
   // pinned — no reliance on a definite-height ancestor a max-h dialog can't give.
   return (
-    <div className="relative flex min-h-0 flex-col overflow-hidden bg-bg">
-      <button
-        onClick={onClose}
-        aria-label={t("scope.close")}
-        className="absolute right-3 top-3 z-20 grid h-7 w-7 place-items-center rounded-[var(--radius-md)] text-ink-faint transition-colors hover:bg-surface hover:text-ink"
-      >
-        <X size={15} />
-      </button>
+    <div className="flex min-h-0 flex-col overflow-hidden bg-bg">
+      {/* A real header band, not an absolute overlay: the close button owns its
+          space, so its hover box never sits flush on the first card's corner
+          and scrolled content can't slide beneath it. Ghost variant = the
+          shared icon-button hover vocabulary. */}
+      <div className="flex shrink-0 justify-end px-3 pt-3">
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          onClick={onClose}
+          aria-label={t("scope.close")}
+        >
+          <X size={15} />
+        </Button>
+      </div>
 
-      <div className="min-h-0 overflow-y-auto px-5 py-5">
+      <div className="min-h-0 overflow-y-auto px-5 pb-5 pt-2">
         <div className="mx-auto flex w-full max-w-[820px] flex-col gap-4">
-          <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-4 py-3 pr-12">
+          <div className="rounded-[var(--radius-lg)] border border-border bg-surface px-4 py-3">
             <div className="flex items-center gap-3">
               <span className="grid h-8 w-8 shrink-0 place-items-center rounded-[var(--radius-md)] bg-accent-ghost text-accent">
                 <Sparkles size={16} />

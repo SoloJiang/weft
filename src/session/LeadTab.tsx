@@ -86,6 +86,7 @@ export function LeadTab({
     mergeLeadMeta,
     leadRail,
     setLeadRail,
+    viewDirection,
   } = useStore();
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
@@ -398,6 +399,18 @@ export function LeadTab({
           meta={leadMeta[tid]}
           skills={skills}
           subtasks={directionsByThread[tid]}
+          onOpenSubtask={(directionId) => {
+            // Resolve the direction's live worktree → its worker surface. The
+            // panel row was previously inert — the only path to a worker was
+            // the board's lane menu.
+            void api
+              .listWorktrees(directionId)
+              .then((writes) => {
+                const first = writes.find((w) => w.exists);
+                if (first) viewDirection(directionId, first.repo_id);
+              })
+              .catch(() => {});
+          }}
           onClose={() => setLeadRail("none")}
           onReload={onReload}
           busy={turn.state === "busy"}

@@ -255,13 +255,12 @@ export function ChatTimeline({
         }
         increaseViewportBy={{ top: 600, bottom: 600 }}
         components={{ Header }}
-        itemContent={(index, m) => (
-          <div
-            className={cn(
-              "mx-auto w-full min-w-0 max-w-[820px] px-4",
-              index < visible.length - 1 && "pb-2.5",
-            )}
-          >
+        itemContent={(_index, m) => (
+          // Every row keeps its bottom padding — INCLUDING the last one, which
+          // is what separates the streaming tail from the composer / bottom
+          // stack. The old `index < length-1` gate left the final message flush
+          // against the input box.
+          <div className="mx-auto w-full min-w-0 max-w-[820px] px-4 pb-2.5">
             <TimelineRow
               m={m}
               all={visible}
