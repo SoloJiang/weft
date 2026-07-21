@@ -514,11 +514,13 @@ async fn mark_queued_status(
     }
 }
 
-fn emit_turn_state(
+/// Single construction point for the Push::Turn state event. `state` is the wire
+/// vocabulary the frontend maps to SessionStatus: "busy" | "idle" | "stalled".
+fn emit_turn_push(
     app: &AppHandle,
     thread_id: i32,
     session_id: Option<i32>,
-    busy: bool,
+    state: &str,
     queue: Vec<QueuedItem>,
 ) {
     let _ = app.emit(
@@ -526,9 +528,25 @@ fn emit_turn_state(
         Push::Turn {
             thread_id,
             session_id,
-            state: if busy { "busy" } else { "idle" }.into(),
+            state: state.into(),
             queue,
         },
+    );
+}
+
+fn emit_turn_state(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    busy: bool,
+    queue: Vec<QueuedItem>,
+) {
+    emit_turn_push(
+        app,
+        thread_id,
+        session_id,
+        if busy { "busy" } else { "idle" },
+        queue,
     );
 }
 
@@ -3592,57 +3610,227 @@ pub(crate) fn turn_verdict(
     None
 }
 
-/// Runaway guard (§7 跑飞护栏): every 30s, sweep all live engines and force-stop
-/// a turn that ran past the wall cap or went silent past the idle cap. The
-/// stopped engine surfaces via Needs-you (bus ask) and resumes losslessly on
-/// the next send (`--resume`). Caps come from GuardrailState (Settings / WEFT_*
-/// env); 0 disables a cap.
+/// Production default for the stall-visibility threshold: 8 min (480s). A human
+/// decision (issue #5 decision 2) — deliberately NOT a short value, so normal LLM
+/// quiet (a slow tool call / a thinking round / a slow build) isn't false-flagged
+/// as stalled, and it stays well under the runaway idle-kill cap (30 min): a hint,
+/// not a kill. Named + sentinel-tested so it can't be silently shortened; override
+/// per run with `WEFT_STALL_HINT_SECS` (e.g. a small value for dogfood/tests).
+const STALL_HINT_DEFAULT_SECS: u64 = 480;
+
+/// Visibility-only verdict (任务停滞可见): a busy turn that has gone silent past
+/// `stall_secs` is *shown* as `stalled` — distinct from `turn_verdict`, which
+/// force-STOPS a runaway. No side effects, no kill: purely "has this turn been
+/// quiet long enough that the user should see it?". Reuses the watchdog's
+/// `has_open_ask` gate — a turn legitimately blocked on a human (already in
+/// Needs-you) is paused, not stalled. `stall_secs == 0` disables the hint. Pure
+/// → unit-tested.
+pub(crate) fn stall_verdict(
+    busy: bool,
+    quiet_secs: u64,
+    stall_secs: u64,
+    has_open_ask: bool,
+) -> bool {
+    stall_secs > 0 && busy && !has_open_ask && quiet_secs >= stall_secs
+}
+
+/// Turn-state string to push for a stall-visibility flip, or `None` when nothing
+/// changed. `prev` is the previously-emitted stalled bit (`None` = never seen →
+/// treated as "was showing busy", since turn-start already pushed busy), `now` is
+/// the current `stall_verdict`. Transition-only: never re-pushes "busy" on the
+/// first observation, never repeats while stalled. Pure → unit-tested.
+fn stall_push(prev: Option<bool>, now: bool) -> Option<&'static str> {
+    if prev.unwrap_or(false) == now {
+        return None;
+    }
+    Some(if now { "stalled" } else { "busy" })
+}
+
+/// Per-engine result of one watchdog sweep, computed UNDER the engine lock and
+/// acted on after it drops (the bus notice + `stop()` each take their own lock).
+enum SweepOutcome {
+    /// Turn ended / idle: retract any open stall notice for this engine.
+    Idle,
+    /// Busy turn. `stall_flip`: Some(true) just crossed into stalled, Some(false)
+    /// just recovered, None unchanged. `kill`: the runaway verdict to enforce.
+    Busy {
+        stall_flip: Option<bool>,
+        thread: i32,
+        dir: String,
+        kill: Option<String>,
+    },
+}
+
+/// Post the soft, self-clearing "task stalled" notice to Needs-you (also wakes the
+/// human + IM bridge). Returns the ask id, or None if the bus isn't mounted.
+fn post_stall_notice(app: &AppHandle, thread: i32, dir: &str, stall_secs: u64) -> Option<u64> {
+    app.try_state::<crate::bus::BusRegistry>()
+        .map(|bus| bus.ask_human(thread, dir, &stall_notice_text(stall_secs)))
+}
+
+/// Retract a previously-posted stall notice. `ask_id == 0` means "no notice was
+/// posted" (bus absent at post time) — a no-op.
+fn cancel_stall_notice(app: &AppHandle, thread: i32, ask_id: u64) {
+    if ask_id == 0 {
+        return;
+    }
+    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+        // Unlike `ask_human`, the cancel path doesn't wake the human sentinel, so
+        // the coordinator won't nudge Needs-you. Emit the refresh ourselves so the
+        // retracted stall item disappears promptly (matches coordinator.rs).
+        if bus.cancel_open_asks_by_id(thread, ask_id) {
+            let _ = app.emit("needs-you://changed", thread);
+        }
+    }
+}
+
+fn stall_notice_text(stall_secs: u64) -> String {
+    format!(
+        "⏳ 停滞:已静默超过 {},可能卡住了。看一眼,或等它自行恢复(恢复后本提示自动撤除)。",
+        human_dur(stall_secs)
+    )
+}
+
+/// Runaway guard (§7 跑飞护栏) + stall visibility (任务停滞可见): every 15s, sweep
+/// all live engines. TWO independent concerns share the one clock read:
+///   1. Kill — force-stop a turn past the wall cap or silent past the idle cap;
+///      the stopped engine surfaces via Needs-you and resumes losslessly on the
+///      next send. Caps come from GuardrailState (Settings / WEFT_* env); 0 off.
+///   2. Show — flip a busy-but-silent turn to a visible `stalled` state (distinct
+///      from the healthy green pulse) long before the minutes-long kill cap, so a
+///      hung/stuck task is never invisible. Threshold `WEFT_STALL_HINT_SECS`
+///      (default 480s = 8 min, 0 disables); runs even when both kill caps are off.
 pub fn spawn_watchdog(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        // Env-only knob (like the cap env seeds); read once at start. 0 disables.
+        // Default = STALL_HINT_DEFAULT_SECS (8 min, human decision 2, sentinel-tested);
+        // override per run with the env var (e.g. a small value for dogfood).
+        let stall_secs =
+            crate::commands::env_secs("WEFT_STALL_HINT_SECS", STALL_HINT_DEFAULT_SECS);
+        // Watchdog-owned stall state per engine key: PRESENT iff currently in a
+        // stall episode; value = (thread, Needs-you notice ask id; 0 = no notice).
+        // The sweep is the SOLE owner, so there's no EngineInner field to reset
+        // across turn boundaries — a new turn's fresh clock self-heals it. Drives
+        // BOTH the visual flip (transition-only, never per tick) and the
+        // self-clearing Needs-you notice (posted on cross; retracted on
+        // recover / idle / kill / prune).
+        let mut stall_notices: std::collections::HashMap<i64, (i32, u64)> =
+            std::collections::HashMap::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let Some(guard) = app.try_state::<crate::commands::GuardrailState>() else {
                 continue;
             };
             let (idle_cap, wall_cap) = guard.get();
-            if idle_cap == 0 && wall_cap == 0 {
+            // Stall visibility runs even with both kill caps disabled; only skip the
+            // whole sweep when nothing at all is enabled.
+            if idle_cap == 0 && wall_cap == 0 && stall_secs == 0 {
                 continue;
             }
-            let engines: Vec<EngineRef> = {
+            let engines: Vec<(i64, EngineRef)> = {
                 let state = app.state::<LeadChatState>();
-                state.0.iter().map(|r| r.value().clone()).collect()
+                state
+                    .0
+                    .iter()
+                    .map(|r| (*r.key(), r.value().clone()))
+                    .collect()
             };
-            for eng in engines {
-                let (verdict, thread_id, ask_dir) = {
+            // Engines that vanished (dropped/stopped) while stalled: retract their
+            // notice and forget them.
+            let live: std::collections::HashSet<i64> = engines.iter().map(|(k, _)| *k).collect();
+            stall_notices.retain(|k, v| {
+                if live.contains(k) {
+                    return true;
+                }
+                cancel_stall_notice(&app, v.0, v.1);
+                false
+            });
+            for (key, eng) in engines {
+                // Compute UNDER the lock and emit the visual flip here (this file's
+                // ordering rule — a concurrent turn-start/turn-end takes this SAME
+                // lock to persist+emit, so releasing first could let our stale
+                // busy/stalled push land AFTER their idle and stick). The bus notice
+                // + stop() each take their OWN lock, so they run after this guard
+                // drops (below), mirroring the kill ask_human.
+                let outcome = {
                     let inner = eng.lock().await;
                     if !inner.turn.busy {
-                        continue;
-                    }
-                    let busy = inner.clock.started.map(|t| t.elapsed().as_secs());
-                    let quiet = inner.clock.last_activity.elapsed().as_secs();
-                    let has_open_ask = app
-                        .try_state::<crate::ask::AskRegistry>()
-                        .map(|a| {
-                            a.open().iter().any(|k| {
-                                k.dir == inner.ask_dir
-                                    || (inner.ask_dir == "lead" && k.dir.is_empty())
+                        SweepOutcome::Idle
+                    } else {
+                        let busy = inner.clock.started.map(|t| t.elapsed().as_secs());
+                        let quiet = inner.clock.last_activity.elapsed().as_secs();
+                        let has_open_ask = app
+                            .try_state::<crate::ask::AskRegistry>()
+                            .map(|a| {
+                                a.open().iter().any(|k| {
+                                    k.dir == inner.ask_dir
+                                        || (inner.ask_dir == "lead" && k.dir.is_empty())
+                                })
                             })
-                        })
-                        .unwrap_or(false);
-                    (
-                        turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
-                        inner.thread_id,
-                        inner.ask_dir.clone(),
-                    )
+                            .unwrap_or(false);
+                        let was_stalled = stall_notices.contains_key(&key);
+                        let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
+                        // (2) Stall visibility — emit only on a running↔stalled flip.
+                        if let Some(state) = stall_push(Some(was_stalled), now) {
+                            emit_turn_push(
+                                &app,
+                                inner.thread_id,
+                                inner.session_id,
+                                state,
+                                queue_items(&inner.turn),
+                            );
+                        }
+                        SweepOutcome::Busy {
+                            stall_flip: if now != was_stalled { Some(now) } else { None },
+                            thread: inner.thread_id,
+                            dir: inner.ask_dir.clone(),
+                            // (1) Runaway kill — gated on the caps, unchanged.
+                            kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
+                        }
+                    }
                 };
-                let Some(reason) = verdict else { continue };
-                stop(&app, &eng).await;
-                if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-                    bus.ask_human(
-                        thread_id,
-                        &ask_dir,
-                        &format!("⚠️ Agent auto-stopped by the runaway guard: {reason}. Review and resume if it was still needed."),
-                    );
+                // After the lock: reconcile the self-clearing Needs-you stall notice,
+                // then enforce a kill if the caps demand one.
+                match outcome {
+                    SweepOutcome::Idle => {
+                        if let Some((thread, id)) = stall_notices.remove(&key) {
+                            cancel_stall_notice(&app, thread, id);
+                        }
+                    }
+                    SweepOutcome::Busy {
+                        stall_flip,
+                        thread,
+                        dir,
+                        kill,
+                    } => {
+                        match stall_flip {
+                            Some(true) => {
+                                let id = post_stall_notice(&app, thread, &dir, stall_secs)
+                                    .unwrap_or(0);
+                                stall_notices.insert(key, (thread, id));
+                            }
+                            Some(false) => {
+                                if let Some((th, id)) = stall_notices.remove(&key) {
+                                    cancel_stall_notice(&app, th, id);
+                                }
+                            }
+                            None => {}
+                        }
+                        let Some(reason) = kill else { continue };
+                        // A kill supersedes the stall hint — retract it so the user
+                        // sees one notice (the auto-stop), not two.
+                        if let Some((th, id)) = stall_notices.remove(&key) {
+                            cancel_stall_notice(&app, th, id);
+                        }
+                        stop(&app, &eng).await;
+                        if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+                            bus.ask_human(
+                                thread,
+                                &dir,
+                                &format!("⚠️ Agent auto-stopped by the runaway guard: {reason}. Review and resume if it was still needed."),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -5405,6 +5593,56 @@ mod tests {
     #[test]
     fn zero_caps_disable_each_check() {
         assert_eq!(turn_verdict(Some(1_000_000), 1_000_000, 0, 0, false), None);
+    }
+
+    #[test]
+    fn stall_shows_when_busy_and_silent_past_threshold() {
+        assert!(stall_verdict(true, 90, 90, false)); // exactly at threshold
+        assert!(stall_verdict(true, 200, 90, false)); // well past
+    }
+
+    #[test]
+    fn stall_hidden_before_threshold() {
+        assert!(!stall_verdict(true, 89, 90, false)); // one short of the boundary
+        assert!(!stall_verdict(true, 0, 90, false));
+    }
+
+    #[test]
+    fn stall_suppressed_while_waiting_on_human() {
+        // A turn blocked on a human ask is legitimately paused, not stalled.
+        assert!(!stall_verdict(true, 9999, 90, true));
+    }
+
+    #[test]
+    fn stall_hidden_when_idle() {
+        // No in-flight turn → never stalled, however stale the clock reads.
+        assert!(!stall_verdict(false, 9999, 90, false));
+    }
+
+    #[test]
+    fn stall_disabled_when_threshold_zero() {
+        assert!(!stall_verdict(true, 1_000_000, 0, false));
+    }
+
+    #[test]
+    fn stall_push_emits_only_on_transition() {
+        // First sweep of a busy turn: never seen → treat as "was busy".
+        assert_eq!(stall_push(None, false), None); // still running → silent
+        assert_eq!(stall_push(None, true), Some("stalled")); // straight to stalled → show
+        // Real flips.
+        assert_eq!(stall_push(Some(false), true), Some("stalled")); // running → stalled
+        assert_eq!(stall_push(Some(true), false), Some("busy")); // recovered → running
+        // No-change ticks stay silent (no per-sweep spam).
+        assert_eq!(stall_push(Some(true), true), None);
+        assert_eq!(stall_push(Some(false), false), None);
+    }
+
+    #[test]
+    fn stall_hint_default_is_eight_minutes() {
+        // Regression sentinel: 480s (8 min) is a human decision (issue #5
+        // decision 2), NOT a test-fast value. This trips if the production
+        // default is silently shortened (e.g. back to the rejected 90s).
+        assert_eq!(STALL_HINT_DEFAULT_SECS, 480);
     }
 
     #[test]

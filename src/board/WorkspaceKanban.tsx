@@ -151,9 +151,13 @@ function EmptyBoard() {
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   const { sessions, needs, asks, checksByDirection, openNeeds } = useStore();
   const { t } = useTranslation();
-  const live = Object.values(sessions).filter(
-    (s) => s.status === "running" && o.direction_ids.includes(s.directionId),
-  ).length;
+  // Split the in-flight count so a stalled worker is visible on the card itself
+  // (not just the drill-in board): running = green pulse, stalled = amber still.
+  const inThread = Object.values(sessions).filter((s) =>
+    o.direction_ids.includes(s.directionId),
+  );
+  const running = inThread.filter((s) => s.status === "running").length;
+  const stalled = inThread.filter((s) => s.status === "stalled").length;
   const done = o.statuses.filter((s) => s === "done").length;
   const attention =
     needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +
@@ -222,13 +226,22 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
           <span className="font-mono text-[11px] tabular-nums text-ink-faint">
             {done}/{o.direction_ids.length}
           </span>
-          {live > 0 && (
+          {running > 0 && (
             <span
-              title={t("workspace.live", { count: live })}
+              title={t("workspace.live", { count: running })}
               className="flex items-center gap-1 text-[11px] tabular-nums text-running"
             >
               <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
-              {live}
+              {running}
+            </span>
+          )}
+          {stalled > 0 && (
+            <span
+              title={t("workspace.stalled", { count: stalled })}
+              className="flex items-center gap-1 text-[11px] tabular-nums text-waiting"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-waiting" />
+              {stalled}
             </span>
           )}
           {failing > 0 && (

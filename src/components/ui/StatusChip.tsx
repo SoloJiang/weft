@@ -6,12 +6,14 @@ import { cn } from "../../lib/cn";
 
 const STYLE_MAP: Record<SessionStatus, { color: string; ring: string }> = {
   running: { color: "text-running", ring: "ring-running/30" },
+  stalled: { color: "text-waiting", ring: "ring-waiting/30" },
   idle: { color: "text-idle", ring: "ring-idle/25" },
   exited: { color: "text-danger", ring: "ring-danger/30" },
 };
 
 const LABEL_KEYS: Record<SessionStatus, string> = {
   running: "status.running",
+  stalled: "status.stalled",
   idle: "status.idle",
   exited: "status.exited",
 };
@@ -19,6 +21,9 @@ const LABEL_KEYS: Record<SessionStatus, string> = {
 function Glyph({ status }: { status: SessionStatus }) {
   if (status === "running")
     return <Circle size={9} className="weft-pulse fill-current" />;
+  // Stalled: same disc as running but STILL (no pulse). Motion = healthy stream,
+  // stillness = gone quiet. Amber comes from the parent's text-waiting.
+  if (status === "stalled") return <Circle size={9} className="fill-current" />;
   if (status === "exited") return <X size={11} />;
   return <Square size={9} className="fill-current" />;
 }

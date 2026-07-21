@@ -379,6 +379,14 @@ impl BusRegistry {
     pub fn cancel_open_asks_from(&self, thread: i32, from: &str) -> usize {
         self.cancel_open_asks_matching(thread, |ask| ask.from.as_str() == from)
     }
+
+    /// Withdraw a single open human ask by id — for self-clearing notices (e.g.
+    /// the task-stall hint, retracted on recovery/turn-end) that must NOT touch a
+    /// worker's other open asks from the same direction. No message is delivered
+    /// back. Returns whether an open ask with that id was found and cancelled.
+    pub fn cancel_open_asks_by_id(&self, thread: i32, ask_id: u64) -> bool {
+        self.cancel_open_asks_matching(thread, |ask| ask.id == ask_id) > 0
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +407,22 @@ mod tests {
         assert_eq!(r.inbox(1, "20").len(), 0);
         // other dir unaffected
         assert_eq!(r.inbox(1, "10").len(), 0);
+    }
+
+    #[test]
+    fn cancel_open_asks_by_id_removes_only_that_ask() {
+        // Precision is the whole point: a stall notice must be retractable WITHOUT
+        // touching the worker's other real open asks from the same direction.
+        let r = BusRegistry::new();
+        let stall = r.ask_human(1, "10", "stall hint");
+        let question = r.ask_human(1, "10", "real question"); // same dir — must survive
+        assert!(r.cancel_open_asks_by_id(1, stall));
+        let open = r.open_asks(1);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, question);
+        // Unknown / already-cancelled id → no-op false.
+        assert!(!r.cancel_open_asks_by_id(1, stall));
+        assert!(!r.cancel_open_asks_by_id(1, 9999));
     }
 
     #[test]

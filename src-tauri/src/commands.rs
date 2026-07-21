@@ -1597,7 +1597,7 @@ impl GuardrailState {
     }
 }
 
-fn env_secs(key: &str, default: u64) -> u64 {
+pub(crate) fn env_secs(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse().ok())

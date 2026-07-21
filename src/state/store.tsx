@@ -45,6 +45,7 @@ import type {
   SlashCmd,
   Thread,
   ToolStatus,
+  TurnState,
   Workspace,
   Worktree,
   WriteTrigger,
@@ -64,12 +65,26 @@ export interface OpenSession {
   nativeId: string | null;
 }
 
-type LeadWorkerState = "busy" | "idle" | "stopped";
-const SESSION_STATUS: Record<LeadWorkerState, SessionStatus> = {
+const SESSION_STATUS: Record<TurnState, SessionStatus> = {
   busy: "running",
+  stalled: "stalled",
   idle: "idle",
   stopped: "exited",
 };
+
+/** A session with an in-flight turn — running OR stalled (still busy, just gone
+ * quiet). Single source of truth for "count this as live/working" so a stalled
+ * task stays in live counts instead of vanishing (which would read as finished). */
+export function isLiveStatus(s: SessionStatus): boolean {
+  return s === "running" || s === "stalled";
+}
+
+/** A turn still in flight — busy OR stalled (the backend turn is busy either way;
+ * stalled just means it went quiet). Single source of truth for "keep the Stop
+ * button and queue sends", so a stalled turn stays interruptible from the composer. */
+export function isInFlight(state: TurnState): boolean {
+  return state === "busy" || state === "stalled";
+}
 
 interface Store {
   workspaces: Workspace[];
@@ -89,7 +104,7 @@ interface Store {
   /** Persisted timeline hydration state per thread. Missing means not loaded. */
   leadHistoryStatus: Record<number, ChatHistoryStatus>;
   /** Lead engine turn state per thread: busy/idle/stopped + queued items. */
-  leadTurn: Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>;
+  leadTurn: Record<number, { state: TurnState; queue: QueuedItem[] }>;
   /** Slash commands the lead's CLI reports as available (init event). */
   leadSlash: Record<number, SlashCmd[]>;
   /** Hydrate a thread's timeline from DB + make sure the engine runs. */
@@ -106,7 +121,7 @@ interface Store {
   /** Interrupt the lead's current turn. */
   interruptLead: (threadId: number) => Promise<void>;
   /** Chat-mode worker engine state, keyed by session id. */
-  workerTurn: Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>;
+  workerTurn: Record<number, { state: TurnState; queue: QueuedItem[] }>;
   workerSlash: Record<number, SlashCmd[]>;
   discoverWorkerSlash: (sessionId: number) => void;
   /** The tool call running right now (transient): lead by thread, worker by session. */
@@ -367,8 +382,9 @@ const NAV_AUTOCOLLAPSE_BELOW = 1000;
  * raced turn push (the lead-chat listener may have recorded idle/stopped before
  * this adoption ran) with the slot's busy flag — per the discriminated-state
  * rule, instead of a mutable `let` reassigned across `if`/`else`. */
-function adoptionStatus(turnState: string | undefined, busy: boolean): SessionStatus {
+function adoptionStatus(turnState: TurnState | undefined, busy: boolean): SessionStatus {
   if (turnState === "stopped") return "exited";
+  if (turnState === "stalled") return "stalled";
   if (turnState !== "idle" && busy) return "running";
   return "idle";
 }
@@ -1307,11 +1323,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     Record<number, ChatHistoryStatus>
   >({});
   const [leadTurn, setLeadTurn] = useState<
-    Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>
+    Record<number, { state: TurnState; queue: QueuedItem[] }>
   >({});
   const [leadSlash, setLeadSlash] = useState<Record<number, SlashCmd[]>>({});
   const [workerTurn, setWorkerTurn] = useState<
-    Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>
+    Record<number, { state: TurnState; queue: QueuedItem[] }>
   >({});
   const workerTurnRef = useRef(workerTurn);
   workerTurnRef.current = workerTurn;
@@ -1457,7 +1473,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // a revived worker's first observed state IS the idle push (no busy push).
           const prevTurn = lastWorkerTurnRef.current[sid];
           lastWorkerTurnRef.current[sid] = p.state;
-          setWorkerActivity((a) => ({ ...a, [sid]: null }));
+          // Clear the running-tool label only at a real turn END (idle/stopped), so
+          // it survives BOTH a stall push and the stall→busy recovery — the amber dot
+          // keeps carrying "what it's stuck on". A turn-start busy is always preceded
+          // by an idle/stopped that already cleared, so not clearing on busy is safe.
+          if (p.state === "idle" || p.state === "stopped")
+            setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queue: p.queue } }));
           setSessions((m) =>
             m[sid]
@@ -1489,7 +1510,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
 
         } else {
-          setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
+          // Same as the worker path: clear only at a real turn end (idle/stopped),
+          // so the lead's tool label survives the stall push and the recovery.
+          if (p.state === "idle" || p.state === "stopped")
+            setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
             ...t,
             [p.thread_id]: { state: p.state, queue: p.queue },
@@ -2305,13 +2329,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Idle skill-refresh: when skills changed (dirty timestamp) and a session goes
   // busy→idle, flag its engine once so the next send picks up new skills.
-  const prevWorkerTurnRef = useRef<Record<number, string>>({});
+  const prevWorkerTurnRef = useRef<Record<number, TurnState>>({});
   useEffect(() => {
     for (const [sidStr, turn] of Object.entries(workerTurn)) {
       const sid = Number(sidStr);
       const prev = prevWorkerTurnRef.current[sid];
       prevWorkerTurnRef.current[sid] = turn.state;
-      if (prev === "busy" && turn.state === "idle" &&
+      if (isInFlight(prev ?? "stopped") && turn.state === "idle" &&
           skillsDirtyAt > (skillsRefreshedRef.current[sid] ?? 0)) {
         skillsRefreshedRef.current[sid] = Date.now();
         void api.flagSessionSkillRefresh(sid).catch(() => {});
@@ -2319,7 +2343,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [workerTurn, skillsDirtyAt]);
 
-  const prevLeadTurnRef = useRef<Record<number, string>>({});
+  const prevLeadTurnRef = useRef<Record<number, TurnState>>({});
   useEffect(() => {
     for (const [tidStr, turn] of Object.entries(leadTurn)) {
       const tid = Number(tidStr);
@@ -2328,7 +2352,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // lead engines refreshed in the same per-id ref space, negative-keyed to
       // avoid colliding with worker session ids.
       const key = -tid;
-      if (prev === "busy" && turn.state === "idle" &&
+      if (isInFlight(prev ?? "stopped") && turn.state === "idle" &&
           skillsDirtyAt > (skillsRefreshedRef.current[key] ?? 0)) {
         skillsRefreshedRef.current[key] = Date.now();
         void api.flagLeadSkillRefresh(tid).catch(() => {});
@@ -2395,7 +2419,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // turn, so it'd otherwise leave the Analyze control enabled mid-pass.
   const reanalyzing = activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId);
   const analyzing =
-    (curatorTid != null && leadTurn[curatorTid]?.state === "busy") || reanalyzing;
+    (curatorTid != null && isInFlight(leadTurn[curatorTid]?.state ?? "stopped")) ||
+    reanalyzing;
 
   const value: Store = {
     workspaces,

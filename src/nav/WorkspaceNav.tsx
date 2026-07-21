@@ -17,7 +17,7 @@ import {
   SquarePen,
   Trash2,
 } from "lucide-react";
-import { useStore } from "../state/store";
+import { isLiveStatus, useStore } from "../state/store";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
 import { openCommandPalette } from "../components/CommandPalette";
@@ -349,7 +349,7 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
   const dirCount = directionsByThread[thread.id]?.length;
   const liveCount = Object.values(sessions).filter(
     (s) =>
-      s.status === "running" &&
+      isLiveStatus(s.status) &&
       directionsByThread[thread.id]?.some((d) => d.id === s.directionId),
   ).length;
   const needsYou =
