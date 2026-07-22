@@ -455,6 +455,18 @@ impl AskRegistry {
         }
     }
 
+    /// Dispatch a revoke at the caller's granularity — the single entry the
+    /// `revoke_auth_grant` command funnels through, so the command stays a pure
+    /// wrapper and the dir-dispatch itself is under test:
+    /// - `dir == None`  → `revoke_thread` (clear the whole issue's grants).
+    /// - `dir == Some`  → `revoke_grant` (one task, or one always-rule via `summary`).
+    pub fn revoke(&self, thread: i32, dir: Option<&str>, summary: Option<&str>) {
+        match dir {
+            None => self.revoke_thread(thread),
+            Some(dir) => self.revoke_grant(thread, dir, summary),
+        }
+    }
+
     /// All Asks across threads (for the workspace-wide Needs-you surface).
     pub fn open(&self) -> Vec<Ask> {
         self.inner
@@ -892,5 +904,45 @@ mod tests {
         r.set_persist_notifier(tx);
         r.revoke_grant(1, "10", None);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn revoke_dispatch_routes_by_dir_granularity() {
+        let seeded = || {
+            let r = AskRegistry::new();
+            r.seed_grants(GrantSnapshot {
+                full: vec![FullGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                }],
+                always: vec![
+                    AlwaysGrant {
+                        thread: 1,
+                        dir: "10".into(),
+                        summary: "a".into(),
+                    },
+                    AlwaysGrant {
+                        thread: 1,
+                        dir: "11".into(),
+                        summary: "b".into(),
+                    },
+                ],
+            });
+            r
+        };
+        // dir=None → the whole issue (every dir under the thread) is cleared
+        let r = seeded();
+        r.revoke(1, None, None);
+        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert!(r.auto_decision(1, "11", "b").is_none());
+        // dir=Some, summary=None → only that one task; the sibling task survives
+        let r = seeded();
+        r.revoke(1, Some("10"), None);
+        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
+        // dir=Some, summary=Some → only that always-rule; the task's full access stays
+        let r = seeded();
+        r.revoke(1, Some("10"), Some("a"));
+        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
     }
 }

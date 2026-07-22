@@ -1975,10 +1975,9 @@ pub fn revoke_auth_grant(
     dir: Option<String>,
     summary: Option<String>,
 ) -> R<()> {
-    match dir {
-        None => asks.revoke_thread(thread),
-        Some(dir) => asks.revoke_grant(thread, &dir, summary.as_deref()),
-    }
+    // Dispatch lives in the registry (tested by revoke_dispatch_routes_by_dir_granularity);
+    // this command is a pure wrapper.
+    asks.revoke(thread, dir.as_deref(), summary.as_deref());
     Ok(())
 }
 

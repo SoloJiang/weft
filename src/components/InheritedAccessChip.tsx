@@ -19,17 +19,14 @@ export function InheritedAccessChip({ threadId }: { threadId: number }) {
   const { revokeAuthGrant } = useStore();
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
 
-  const revoke = async () => {
-    setBusy(true);
-    try {
-      // dir=null → clear the whole issue's grants in one call.
-      await revokeAuthGrant(threadId, null, null);
-      setOpen(false);
-    } finally {
-      setBusy(false);
-    }
+  const revoke = () => {
+    // Close the dialog first so it animates out; the optimistic store update then
+    // clears the grant and unmounts this chip. (Revoking first would flip the
+    // parent's `inherited` to false and close the dialog by unmounting it — abrupt.)
+    setOpen(false);
+    // dir=null → clear the whole issue's grants in one call.
+    void revokeAuthGrant(threadId, null, null);
   };
 
   return (
@@ -60,17 +57,16 @@ export function InheritedAccessChip({ threadId }: { threadId: number }) {
       >
         <div className="flex justify-end gap-2">
           <DialogClose asChild>
-            <Button variant="ghost" size="sm" disabled={busy}>
+            <Button variant="ghost" size="sm">
               {t("common.cancel")}
             </Button>
           </DialogClose>
           <Button
             variant="danger"
             size="sm"
-            disabled={busy}
             onClick={(e) => {
               e.stopPropagation();
-              void revoke();
+              revoke();
             }}
           >
             {t("grants.revokeConfirm")}

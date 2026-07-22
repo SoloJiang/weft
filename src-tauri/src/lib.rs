@@ -177,13 +177,16 @@ pub fn run() {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
             lead_chat::engine::spawn_watchdog(app.handle().clone());
+            // Install the grant-persist consumer BEFORE revive re-drives tasks, so
+            // the persist path is live for the whole run (grants were already
+            // seeded synchronously above, before the builder). Ordering hygiene.
+            auth_persist::spawn(app.handle().clone());
             lead_chat::revive::spawn_revive(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             im::spawn(app.handle().clone());
             trail::spawn(app.handle().clone());
-            auth_persist::spawn(app.handle().clone());
             backup::scheduler::spawn(backup_svc.clone());
             {
                 // APP_HANDLE is set above; access the managed Db via Manager.
