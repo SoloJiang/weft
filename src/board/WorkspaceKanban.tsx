@@ -220,17 +220,21 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
         )}
       </div>
 
-      {o.direction_ids.length > 0 && (
+      {(o.direction_ids.length > 0 || running > 0 || stalled > 0) && (
         <div className="flex items-center gap-2">
-          <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-bg">
-            <span
-              className={cn("block h-full rounded-full", progressColor)}
-              style={{ width: `${donePct}%` }}
-            />
-          </div>
-          <span className="font-mono text-[11px] tabular-nums text-ink-faint">
-            {done}/{o.direction_ids.length}
-          </span>
+          {o.direction_ids.length > 0 && (
+            <>
+              <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-bg">
+                <span
+                  className={cn("block h-full rounded-full", progressColor)}
+                  style={{ width: `${donePct}%` }}
+                />
+              </div>
+              <span className="font-mono text-[11px] tabular-nums text-ink-faint">
+                {done}/{o.direction_ids.length}
+              </span>
+            </>
+          )}
           {running > 0 && (
             <span
               title={t("workspace.live", { count: running })}

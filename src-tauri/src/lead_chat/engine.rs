@@ -3653,6 +3653,19 @@ fn ask_blocks(k_dir: &str, k_thread: i32, ask_dir: &str, thread_id: i32) -> bool
     }
 }
 
+/// Is there an open PERMISSION ask (AskRegistry) that legitimately blocks this
+/// engine's turn on the human — i.e. it's waiting, not stalled? Thread-scoped for
+/// lead asks via `ask_blocks`. Used by both the stall gate and the kill gate.
+fn has_blocking_perm_ask(app: &AppHandle, ask_dir: &str, thread_id: i32) -> bool {
+    app.try_state::<crate::ask::AskRegistry>()
+        .map(|a| {
+            a.open()
+                .iter()
+                .any(|k| ask_blocks(&k.dir, k.thread, ask_dir, thread_id))
+        })
+        .unwrap_or(false)
+}
+
 /// Per-engine result of one watchdog sweep, computed UNDER the engine lock and
 /// acted on after it drops (the bus notice + `stop()` each take their own lock).
 enum SweepOutcome {
@@ -3709,7 +3722,12 @@ fn stall_notice_still_open(app: &AppHandle, thread: i32, ask_id: u64) -> bool {
 /// caller still records the latch so a skip is cleared by the next recovery sweep.
 async fn post_stall_notice_confirmed(app: &AppHandle, eng: &EngineRef, stall_secs: u64) -> u64 {
     let inner = eng.lock().await;
-    if inner.turn.busy && inner.clock.last_activity.elapsed().as_secs() >= stall_secs {
+    let quiet = inner.clock.last_activity.elapsed().as_secs();
+    // Re-run the FULL verdict (busy + silent past threshold + no blocking permission
+    // ask) — a permission ask may have opened in the gap, making the turn
+    // legitimately blocked on the human rather than stalled.
+    let has_open_ask = has_blocking_perm_ask(app, &inner.ask_dir, inner.thread_id);
+    if stall_verdict(inner.turn.busy, quiet, stall_secs, has_open_ask) {
         post_stall_notice(app, inner.thread_id, &inner.ask_dir, stall_secs).unwrap_or(0)
     } else {
         0
@@ -3802,14 +3820,8 @@ pub fn spawn_watchdog(app: AppHandle) {
                         // real wait is idle, and a busy+silent turn with an open bus
                         // question is genuinely stuck → it SHOULD read stalled). Lead asks
                         // are thread-scoped (see ask_blocks).
-                        let has_open_ask = app
-                            .try_state::<crate::ask::AskRegistry>()
-                            .map(|a| {
-                                a.open().iter().any(|k| {
-                                    ask_blocks(&k.dir, k.thread, &inner.ask_dir, inner.thread_id)
-                                })
-                            })
-                            .unwrap_or(false);
+                        let has_open_ask =
+                            has_blocking_perm_ask(&app, &inner.ask_dir, inner.thread_id);
                         let was_stalled = stall_notices.contains_key(&key);
                         let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
                         // (2) Stall visibility. Re-assert `stalled` EVERY sweep while
