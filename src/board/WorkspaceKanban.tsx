@@ -149,15 +149,20 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection, openNeeds } = useStore();
+  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn } = useStore();
   const { t } = useTranslation();
   // Split the in-flight count so a stalled worker is visible on the card itself
   // (not just the drill-in board): running = green pulse, stalled = amber still.
+  // The thread lead lives in leadTurn (no session row), so fold its state in — a
+  // planning thread with only a stalled lead still shows the amber marker.
   const inThread = Object.values(sessions).filter((s) =>
     o.direction_ids.includes(s.directionId),
   );
-  const running = inThread.filter((s) => s.status === "running").length;
-  const stalled = inThread.filter((s) => s.status === "stalled").length;
+  const leadState = leadTurn[o.thread_id]?.state;
+  const running =
+    inThread.filter((s) => s.status === "running").length + (leadState === "busy" ? 1 : 0);
+  const stalled =
+    inThread.filter((s) => s.status === "stalled").length + (leadState === "stalled" ? 1 : 0);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention =
     needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +

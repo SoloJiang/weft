@@ -343,6 +343,7 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
     sessions,
     needs,
     asks,
+    leadTurn,
   } = useStore();
   const { t } = useTranslation();
   const isActive = activeThreadId === thread.id;
@@ -353,8 +354,13 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
   const inThread = Object.values(sessions).filter((s) =>
     directionsByThread[thread.id]?.some((d) => d.id === s.directionId),
   );
-  const running = inThread.filter((s) => s.status === "running").length;
-  const stalled = inThread.filter((s) => s.status === "stalled").length;
+  // A thread's lead lives in leadTurn (no session row), so fold its state in — a
+  // planning thread with only a stalled lead still gets the amber marker.
+  const leadState = leadTurn[thread.id]?.state;
+  const running =
+    inThread.filter((s) => s.status === "running").length + (leadState === "busy" ? 1 : 0);
+  const stalled =
+    inThread.filter((s) => s.status === "stalled").length + (leadState === "stalled" ? 1 : 0);
   const needsYou =
     needs.some((n) => n.thread_id === thread.id) ||
     asks.some((a) => a.thread === thread.id);

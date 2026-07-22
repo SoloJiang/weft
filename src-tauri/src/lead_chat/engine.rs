@@ -3700,6 +3700,22 @@ fn stall_notice_still_open(app: &AppHandle, thread: i32, ask_id: u64) -> bool {
         .unwrap_or(true)
 }
 
+/// Post the stall notice ONLY if the turn is STILL busy+silent past the threshold,
+/// re-checked under the engine lock and posted while holding it. The sweep's
+/// verdict was taken under a lock we've since released, so a turn that emitted
+/// output or finished in the gap must not get a stale notice — this closes that
+/// window by confirming and posting atomically. Returns the ask id, or 0 (skipped
+/// / no bus). The visual `stalled` was already emitted under the sweep lock; the
+/// caller still records the latch so a skip is cleared by the next recovery sweep.
+async fn post_stall_notice_confirmed(app: &AppHandle, eng: &EngineRef, stall_secs: u64) -> u64 {
+    let inner = eng.lock().await;
+    if inner.turn.busy && inner.clock.last_activity.elapsed().as_secs() >= stall_secs {
+        post_stall_notice(app, inner.thread_id, &inner.ask_dir, stall_secs).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 fn stall_notice_text(stall_secs: u64) -> String {
     // A self-healing NOTICE, not a question awaiting an answer — so the user isn't
     // confused when it auto-withdraws on recovery (same tone as the kill/revive
@@ -3844,8 +3860,12 @@ pub fn spawn_watchdog(app: AppHandle) {
                     } => {
                         match stall_flip {
                             Some(true) => {
-                                let id = post_stall_notice(&app, thread, &dir, stall_secs)
-                                    .unwrap_or(0);
+                                // Confirm still-stalled under the lock before posting (the
+                                // sweep verdict is from a lock we've released). Always record
+                                // the latch (even on a skipped post) so the visual we already
+                                // emitted is cleared by the next recovery sweep.
+                                let id =
+                                    post_stall_notice_confirmed(&app, &eng, stall_secs).await;
                                 stall_notices.insert(key, (thread, id));
                             }
                             Some(false) => {
@@ -3863,8 +3883,8 @@ pub fn spawn_watchdog(app: AppHandle) {
                                 if let Some((th, id)) = stall_notices.get(&key).copied() {
                                     if id != 0 && !stall_notice_still_open(&app, th, id) {
                                         let new_id =
-                                            post_stall_notice(&app, th, &dir, stall_secs)
-                                                .unwrap_or(0);
+                                            post_stall_notice_confirmed(&app, &eng, stall_secs)
+                                                .await;
                                         stall_notices.insert(key, (th, new_id));
                                     }
                                 }
