@@ -79,6 +79,27 @@ export function isInFlight(state: TurnState): boolean {
   return state === "busy" || state === "stalled";
 }
 
+/** Split a thread's in-flight engines into running vs stalled counts — its worker
+ * sessions (matched by directionIds) PLUS its lead (leadTurn has no session row).
+ * Single source of truth so the workspace card and the nav row can't drift. */
+export function threadLiveCounts(
+  sessions: Record<number, OpenSession>,
+  directionIds: number[],
+  leadState: TurnState | undefined,
+): { running: number; stalled: number } {
+  const inThread = Object.values(sessions).filter((s) =>
+    directionIds.includes(s.directionId),
+  );
+  return {
+    running:
+      inThread.filter((s) => s.status === "running").length +
+      (leadState === "busy" ? 1 : 0),
+    stalled:
+      inThread.filter((s) => s.status === "stalled").length +
+      (leadState === "stalled" ? 1 : 0),
+  };
+}
+
 interface Store {
   workspaces: Workspace[];
   activeWorkspaceId: number | null;
@@ -1358,7 +1379,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // Last worker turn state seen by the lead-chat listener, kept synchronously so
   // auto-verify fires once per real turn end (see the turn handler).
   const lastWorkerTurnRef = useRef<Record<number, string>>({});
-  const lastLeadTurnRef = useRef<Record<number, string>>({});
 
   // The engine forwards every raw token chunk as its own `delta` push;
   // applying each one directly re-renders the transcript (and re-parses the
@@ -1467,12 +1487,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // a revived worker's first observed state IS the idle push (no busy push).
           const prevTurn = lastWorkerTurnRef.current[sid];
           lastWorkerTurnRef.current[sid] = p.state;
-          // Clear the running-tool label on a real turn transition, but KEEP it on a
-          // stall push AND on the stall→busy recovery flip (prevTurn === "stalled",
-          // emitted by the watchdog mid-turn) so the tool context survives the whole
-          // stall. A promoted queued turn also emits "busy" but with prevTurn !==
-          // "stalled", so it still clears (no stale label from the previous turn).
-          if (p.state !== "stalled" && !(p.state === "busy" && prevTurn === "stalled"))
+          // Clear the running-tool label on a real turn transition, but keep it on a
+          // stall push AND on the watchdog's stall→busy recovery push (p.recovered) —
+          // so the tool context survives the whole stall. A promoted queued turn also
+          // arrives as "busy" but with recovered=false, so it still clears the stale
+          // label. The backend flag distinguishes recovery from a (promoted) new turn,
+          // which the observed state alone cannot.
+          if (p.state !== "stalled" && !p.recovered)
             setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queue: p.queue } }));
           setSessions((m) =>
@@ -1505,11 +1526,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
 
         } else {
-          const prevLead = lastLeadTurnRef.current[p.thread_id];
-          lastLeadTurnRef.current[p.thread_id] = p.state;
-          // Same as the worker path: clear on a real transition, but keep on a stall
-          // push AND on the stall→busy recovery flip (prevLead === "stalled").
-          if (p.state !== "stalled" && !(p.state === "busy" && prevLead === "stalled"))
+          // Same as the worker path: clear on a real transition, keep on a stall push
+          // AND on the watchdog's recovery push (p.recovered).
+          if (p.state !== "stalled" && !p.recovered)
             setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
             ...t,

@@ -17,7 +17,7 @@ import {
   SquarePen,
   Trash2,
 } from "lucide-react";
-import { useStore } from "../state/store";
+import { threadLiveCounts, useStore } from "../state/store";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
 import { openCommandPalette } from "../components/CommandPalette";
@@ -349,18 +349,13 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
   const isActive = activeThreadId === thread.id;
   const dirCount = directionsByThread[thread.id]?.length;
   // Split running vs stalled so an all-stalled thread doesn't advertise a healthy
-  // green pulse — the stalled count gets its own amber, still dot (matches the
-  // workspace card + status chip).
-  const inThread = Object.values(sessions).filter((s) =>
-    directionsByThread[thread.id]?.some((d) => d.id === s.directionId),
+  // green pulse. Shared derivation with the workspace card: worker sessions + the
+  // thread lead (which has no session row) → running vs stalled.
+  const { running, stalled } = threadLiveCounts(
+    sessions,
+    (directionsByThread[thread.id] ?? []).map((d) => d.id),
+    leadTurn[thread.id]?.state,
   );
-  // A thread's lead lives in leadTurn (no session row), so fold its state in — a
-  // planning thread with only a stalled lead still gets the amber marker.
-  const leadState = leadTurn[thread.id]?.state;
-  const running =
-    inThread.filter((s) => s.status === "running").length + (leadState === "busy" ? 1 : 0);
-  const stalled =
-    inThread.filter((s) => s.status === "stalled").length + (leadState === "stalled" ? 1 : 0);
   const needsYou =
     needs.some((n) => n.thread_id === thread.id) ||
     asks.some((a) => a.thread === thread.id);

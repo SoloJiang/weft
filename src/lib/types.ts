@@ -269,6 +269,9 @@ export type LeadChatPush =
       thread_id: number;
       session_id: number | null;
       state: TurnState;
+      /** True only for the watchdog's stall→busy recovery push — the UI keeps the
+       *  running-tool label on recovery but still clears it on a real/promoted turn. */
+      recovered?: boolean;
       queue: QueuedItem[];
     }
   | {

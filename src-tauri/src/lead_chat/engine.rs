@@ -118,6 +118,12 @@ pub enum Push {
         /// Some(session) for chat-mode workers; None for the lead.
         session_id: Option<i32>,
         state: String,
+        /// True ONLY for the watchdog's stalled→busy RECOVERY push. The frontend
+        /// keeps the running-tool label through recovery but still clears it on a
+        /// real/promoted new turn — which it cannot tell apart from the observed
+        /// state alone (a promoted-after-stall turn also arrives as `busy`).
+        #[serde(default)]
+        recovered: bool,
         queue: Vec<QueuedItem>,
     },
     Init {
@@ -521,6 +527,7 @@ fn emit_turn_push(
     thread_id: i32,
     session_id: Option<i32>,
     state: &str,
+    recovered: bool,
     queue: Vec<QueuedItem>,
 ) {
     let _ = app.emit(
@@ -529,6 +536,7 @@ fn emit_turn_push(
             thread_id,
             session_id,
             state: state.into(),
+            recovered,
             queue,
         },
     );
@@ -546,6 +554,7 @@ fn emit_turn_state(
         thread_id,
         session_id,
         if busy { "busy" } else { "idle" },
+        false,
         queue,
     );
 }
@@ -1137,6 +1146,7 @@ async fn cleanup_disconnected_turn(
             thread_id,
             session_id,
             state: "stopped".into(),
+            recovered: false,
             queue: Vec::new(),
         },
     );
@@ -2373,6 +2383,7 @@ pub async fn send(
                 thread_id: ctx.thread_id,
                 session_id: ctx.session_id,
                 state: if inner.turn.busy { "busy" } else { "idle" }.into(),
+                recovered: false,
                 queue: queue_items(&inner.turn),
             },
         );
@@ -2963,6 +2974,7 @@ async fn codex_consumer(
                         thread_id,
                         session_id: inner.session_id,
                         state: if still_busy { "busy" } else { "idle" }.into(),
+                        recovered: false,
                         queue: queue_items(&inner.turn),
                     },
                 );
@@ -3835,14 +3847,19 @@ pub fn spawn_watchdog(app: AppHandle) {
                                 inner.thread_id,
                                 inner.session_id,
                                 "stalled",
+                                false,
                                 queue_items(&inner.turn),
                             );
                         } else if was_stalled {
+                            // Recovery flip: `recovered = true` tells the frontend to
+                            // KEEP the running-tool label (it can't tell this mid-turn
+                            // recovery from a promoted new turn by state alone).
                             emit_turn_push(
                                 &app,
                                 inner.thread_id,
                                 inner.session_id,
                                 "busy",
+                                true,
                                 queue_items(&inner.turn),
                             );
                         }
@@ -4012,6 +4029,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
             thread_id,
             session_id,
             state: "stopped".into(),
+            recovered: false,
             queue: Vec::new(),
         },
     );
@@ -5159,6 +5177,7 @@ fn spawn_reader(
                             thread_id,
                             session_id: inner.session_id,
                             state: state.into(),
+                            recovered: false,
                             queue: queue_items(&inner.turn),
                         },
                     );
@@ -5282,6 +5301,7 @@ fn spawn_reader(
                     thread_id: inner.thread_id,
                     session_id: inner.session_id,
                     state: state.into(),
+                    recovered: false,
                     queue: queue_items(&inner.turn),
                 },
             );
@@ -5336,6 +5356,7 @@ fn spawn_reader(
                     thread_id,
                     session_id,
                     state: "stopped".into(),
+                    recovered: false,
                     queue: Vec::new(),
                 },
             );

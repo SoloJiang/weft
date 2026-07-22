@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Layers, Plus, SquarePen, X } from "lucide-react";
-import { useStore } from "../state/store";
+import { threadLiveCounts, useStore } from "../state/store";
 import type { ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
@@ -151,22 +151,23 @@ function EmptyBoard() {
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn } = useStore();
   const { t } = useTranslation();
-  // Split the in-flight count so a stalled worker is visible on the card itself
-  // (not just the drill-in board): running = green pulse, stalled = amber still.
-  // The thread lead lives in leadTurn (no session row), so fold its state in — a
-  // planning thread with only a stalled lead still shows the amber marker.
-  const inThread = Object.values(sessions).filter((s) =>
-    o.direction_ids.includes(s.directionId),
+  // Split the in-flight count so a stalled worker OR lead is visible on the card
+  // itself (not just the drill-in board): running = green pulse, stalled = amber.
+  const { running, stalled } = threadLiveCounts(
+    sessions,
+    o.direction_ids,
+    leadTurn[o.thread_id]?.state,
   );
-  const leadState = leadTurn[o.thread_id]?.state;
-  const running =
-    inThread.filter((s) => s.status === "running").length + (leadState === "busy" ? 1 : 0);
-  const stalled =
-    inThread.filter((s) => s.status === "stalled").length + (leadState === "stalled" ? 1 : 0);
   const done = o.statuses.filter((s) => s === "done").length;
+  // Attention includes THREAD-level needs/asks — a stalled or blocked lead posts
+  // with direction_id -1 / dir "lead", so match by thread_id, not only per-direction.
   const attention =
-    needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +
-    asks.filter((a) => o.direction_ids.includes(Number(a.dir))).length;
+    needs.filter(
+      (n) => o.direction_ids.includes(n.direction_id) || n.thread_id === o.thread_id,
+    ).length +
+    asks.filter(
+      (a) => o.direction_ids.includes(Number(a.dir)) || a.thread === o.thread_id,
+    ).length;
   const failing = o.direction_ids.filter((id) =>
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;
