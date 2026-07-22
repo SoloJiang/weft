@@ -3,12 +3,30 @@ import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Layers, Plus, SquarePen, X } from "lucide-react";
 import { threadLiveCounts, useStore } from "../state/store";
-import type { ThreadOverview } from "../lib/types";
+import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
+
+/** Needs/asks that want the human on this thread — per-direction PLUS thread-level
+ * ones (a stalled/blocked lead posts with direction_id -1 / dir "lead"), matched by
+ * thread_id. Single source so the card badge and the column sort agree. */
+function threadAttentionCount(
+  o: ThreadOverview,
+  needs: NeedItem[],
+  asks: PermissionAsk[],
+): number {
+  return (
+    needs.filter(
+      (n) => o.direction_ids.includes(n.direction_id) || n.thread_id === o.thread_id,
+    ).length +
+    asks.filter(
+      (a) => o.direction_ids.includes(Number(a.dir)) || a.thread === o.thread_id,
+    ).length
+  );
+}
 
 function progressBarColor(attention: number, failing: number): string {
   if (attention > 0) return "bg-waiting";
@@ -51,10 +69,11 @@ export function WorkspaceKanban() {
   };
 
   // Cards waiting on the human (or with a failing check) bubble to the top of
-  // their column — the attention signal without hijacking the stage.
+  // their column — the attention signal without hijacking the stage. Same
+  // thread-level accounting as the card badge, so a stalled lead (which posts
+  // under thread_id, not a direction) sorts up too.
   const urgent = (o: ThreadOverview): boolean =>
-    needs.some((n) => o.direction_ids.includes(n.direction_id)) ||
-    asks.some((a) => o.direction_ids.includes(Number(a.dir))) ||
+    threadAttentionCount(o, needs, asks) > 0 ||
     o.direction_ids.some((id) =>
       (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
     );
@@ -159,15 +178,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
     leadTurn[o.thread_id]?.state,
   );
   const done = o.statuses.filter((s) => s === "done").length;
-  // Attention includes THREAD-level needs/asks — a stalled or blocked lead posts
-  // with direction_id -1 / dir "lead", so match by thread_id, not only per-direction.
-  const attention =
-    needs.filter(
-      (n) => o.direction_ids.includes(n.direction_id) || n.thread_id === o.thread_id,
-    ).length +
-    asks.filter(
-      (a) => o.direction_ids.includes(Number(a.dir)) || a.thread === o.thread_id,
-    ).length;
+  const attention = threadAttentionCount(o, needs, asks);
   const failing = o.direction_ids.filter((id) =>
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;
