@@ -6,6 +6,7 @@ import { useStore } from "../state/store";
 import type { ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
+import { InheritedAccessChip } from "../components/InheritedAccessChip";
 import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
@@ -149,11 +150,17 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection, openNeeds } = useStore();
+  const { sessions, needs, asks, checksByDirection, openNeeds, authGrants } =
+    useStore();
   const { t } = useTranslation();
   const live = Object.values(sessions).filter(
     (s) => s.status === "running" && o.direction_ids.includes(s.directionId),
   ).length;
+  // Any of this issue's tasks (or its lead) carrying a persisted standing grant.
+  // Grants key on thread id, so every grant under this thread belongs to it.
+  const inherited =
+    authGrants.full.some((g) => g.thread === o.thread_id) ||
+    authGrants.always.some((g) => g.thread === o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention =
     needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +
@@ -209,6 +216,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
             +{o.write_repos.length - 3}
           </span>
         )}
+        {inherited && <InheritedAccessChip threadId={o.thread_id} />}
       </div>
 
       {o.direction_ids.length > 0 && (

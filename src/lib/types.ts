@@ -601,6 +601,26 @@ export interface PermissionAsk {
   dir_name: string;
 }
 
+/** A persisted "full access" grant: every ask from this (thread, dir) auto-allows. */
+export interface FullGrant {
+  thread: number;
+  dir: string;
+}
+
+/** A persisted "always allow" grant: this exact `summary` from (thread, dir). */
+export interface AlwaysGrant {
+  thread: number;
+  dir: string;
+  summary: string;
+}
+
+/** Standing authorization grants that persist across restarts (Ask Bridge). The
+ *  board marks issues whose access was inherited and offers a one-click revoke. */
+export interface GrantSnapshot {
+  full: FullGrant[];
+  always: AlwaysGrant[];
+}
+
 /** A lead-proposed write declaration awaiting human approve/deny (Needs you). */
 export interface WriteTrigger {
   thread_id: number;

@@ -191,6 +191,12 @@ async fn cancel_workspace_human_asks(
     Ok(())
 }
 
+/// Clear this workspace's entire footprint in the AskRegistry: cancel its open
+/// asks AND drop its threads' standing grants (full/always). The workspace delete
+/// cascade bypasses the per-issue `delete_thread` path, so — mirroring what that
+/// path does per issue — grants are revoked here too, or a deleted workspace would
+/// leave persisted authorization behind (and a later-reused thread id could inherit
+/// it).
 async fn cancel_workspace_asks(
     db: &Db,
     asks: &crate::ask::AskRegistry,
@@ -203,6 +209,9 @@ async fn cancel_workspace_asks(
         {
             asks.cancel(ask.id);
         }
+    }
+    for thread_id in &scope.thread_ids {
+        asks.revoke_thread(*thread_id);
     }
     Ok(())
 }
@@ -1220,6 +1229,9 @@ pub async fn delete_thread(
     let removed = repo::delete_thread_cascade(&db, thread_id)
         .await
         .map_err(e)?;
+    // Drop the issue's persisted authorization grants so a future thread id can't
+    // inherit stale "full access" (and the store doesn't accumulate tombstones).
+    app.state::<crate::ask::AskRegistry>().revoke_thread(thread_id);
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(key) {
@@ -1939,6 +1951,37 @@ pub fn answer_permission(
     }
 }
 
+/// The current standing authorization grants (full / always), so the board can
+/// mark tasks whose Full/Always access was inherited across a restart and offer
+/// a one-click revoke.
+#[tauri::command]
+pub fn list_auth_grants(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+) -> R<crate::ask::GrantSnapshot> {
+    Ok(asks.snapshot_grants())
+}
+
+/// Revoke a standing grant (the human's one-click undo), at the granularity the
+/// caller passes:
+/// - `dir == None`                → clear the whole issue's grants (every task's
+///   full/always under this thread) — the board card's one-click "revoke all".
+/// - `dir == Some`, `summary == None` → clear that one task's `(thread, dir)` grant
+///   (its full access + every always-rule).
+/// - `dir == Some`, `summary == Some` → drop only that one always-rule.
+#[tauri::command]
+pub fn revoke_auth_grant(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread: i32,
+    dir: Option<String>,
+    summary: Option<String>,
+) -> R<()> {
+    match dir {
+        None => asks.revoke_thread(thread),
+        Some(dir) => asks.revoke_grant(thread, &dir, summary.as_deref()),
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn bus_post_human(
     bus: tauri::State<'_, crate::bus::BusRegistry>,
@@ -2572,6 +2615,42 @@ mod tests {
         );
         assert!(!asks.open().iter().any(|ask| ask.id == remove_id));
         assert!(!asks.open().iter().any(|ask| ask.id == repo_scoped_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_asks_revokes_only_that_workspaces_standing_grants() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![
+                crate::ask::FullGrant {
+                    thread: thread.id,
+                    dir: "".into(),
+                },
+                crate::ask::FullGrant {
+                    thread: keep_thread.id,
+                    dir: "".into(),
+                },
+            ],
+            always: vec![],
+        });
+
+        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+
+        // the deleted workspace's grant is gone; the other workspace's survives
+        assert!(asks.auto_decision(thread.id, "", "anything").is_none());
+        assert_eq!(
+            asks.auto_decision(keep_thread.id, "", "anything"),
+            Some(crate::ask::Decision::Allow)
+        );
     }
 
     #[tokio::test]

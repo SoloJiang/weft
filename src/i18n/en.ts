@@ -803,6 +803,15 @@ export const en = {
     idle: "Idle",
     exited: "Exited",
   },
+  grants: {
+    inherited: "Inherited access",
+    inheritedTitle:
+      "This issue's Full access / Always-allow rules carried over from a previous run — click to revoke",
+    revokeTitle: "Revoke inherited access?",
+    revokeBody:
+      "The persisted Full access / Always-allow rules for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
+    revokeConfirm: "Revoke access",
+  },
   ai: {
     shellSnippet: "Shell snippet",
   },

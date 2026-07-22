@@ -6,7 +6,7 @@
 //! terminal. A spawned task that hits an approval no longer hangs silently in a
 //! PTY; it surfaces as a card you can answer from the board.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -96,6 +96,41 @@ pub struct Ask {
     pub dir_name: String,
 }
 
+/// A persisted "full access" grant: every ask from this (thread, dir) auto-allows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FullGrant {
+    pub thread: i32,
+    pub dir: String,
+}
+
+/// A persisted "always allow" grant: this exact `summary` from this (thread, dir)
+/// auto-allows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlwaysGrant {
+    pub thread: i32,
+    pub dir: String,
+    pub summary: String,
+}
+
+/// The durable shape of the registry's standing grants (`full` + `always`). This
+/// is what gets mirrored to the store and re-seeded at boot so a granted "Full
+/// access" survives an app restart instead of re-prompting every run. `dangerous`
+/// is deliberately NOT here — it is a global toggle the frontend already persists.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GrantSnapshot {
+    #[serde(default)]
+    pub full: Vec<FullGrant>,
+    #[serde(default)]
+    pub always: Vec<AlwaysGrant>,
+}
+
+impl GrantSnapshot {
+    /// True when there is nothing to persist (used to avoid writing an empty row).
+    pub fn is_empty(&self) -> bool {
+        self.full.is_empty() && self.always.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     next_id: u64,
@@ -112,6 +147,9 @@ struct Inner {
     notify: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
     /// transcript 结算痕迹消费者（与 IM 桥独立的第二订阅，始终在桌面端装上）。
     trail: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
+    /// 授权落盘订阅：`full`/`always` 每次真正变更后收到一份当前快照，消费方
+    /// 把它写进 store。装上后授权跨重启存活；未装时零开销。
+    persist: Option<tokio::sync::mpsc::UnboundedSender<GrantSnapshot>>,
 }
 
 impl Inner {
@@ -122,6 +160,38 @@ impl Inner {
         }
         if let Some(tx) = &self.notify {
             let _ = tx.send(ev);
+        }
+    }
+
+    /// Current standing grants as a durable snapshot (持锁内调用).
+    fn grant_snapshot(&self) -> GrantSnapshot {
+        let full = self
+            .full
+            .iter()
+            .map(|(thread, dir)| FullGrant {
+                thread: *thread,
+                dir: dir.clone(),
+            })
+            .collect();
+        let always = self
+            .always
+            .iter()
+            .flat_map(|((thread, dir), summaries)| {
+                summaries.iter().map(move |summary| AlwaysGrant {
+                    thread: *thread,
+                    dir: dir.clone(),
+                    summary: summary.clone(),
+                })
+            })
+            .collect();
+        GrantSnapshot { full, always }
+    }
+
+    /// Push the current grants to the persistence consumer (持锁内调用，仅在
+    /// grant 真正变更后调用). 未装消费者时零开销。
+    fn emit_persist(&self) {
+        if let Some(tx) = &self.persist {
+            let _ = tx.send(self.grant_snapshot());
         }
     }
 }
@@ -231,18 +301,18 @@ impl AskRegistry {
             return false;
         };
         let key = (ask.thread, ask.dir.clone());
-        match ans {
-            Answer::Always => {
-                g.always
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(ask.summary.clone());
-            }
-            Answer::Full => {
-                g.full.insert(key.clone());
-            }
-            _ => {}
-        }
+        // Whether this answer added a NEW standing grant (HashSet::insert is true
+        // only on first insertion). Drives a single persist write — an idempotent
+        // re-grant of an existing rule writes nothing.
+        let granted = match ans {
+            Answer::Always => g
+                .always
+                .entry(key.clone())
+                .or_default()
+                .insert(ask.summary.clone()),
+            Answer::Full => g.full.insert(key.clone()),
+            _ => false,
+        };
 
         // Every open ask this answer now covers (the target + any others the new
         // rule sweeps up) resolves to the same verdict.
@@ -282,6 +352,12 @@ impl AskRegistry {
                 answer: ans,
             });
         }
+        // Mirror the new grant to the store (single source: the only place a
+        // human-created full/always rule is persisted, so all answer() callers
+        // stay unaware of persistence).
+        if granted {
+            g.emit_persist();
+        }
         woke
     }
 
@@ -303,6 +379,80 @@ impl AskRegistry {
     /// only records future resolutions, never replays still-open asks.
     pub fn set_trail_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<AskEvent>) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).trail = Some(tx);
+    }
+
+    /// Install the durable-grants consumer's channel (called once at startup). It
+    /// receives a fresh `GrantSnapshot` every time a `full`/`always` grant is added
+    /// or a thread's grants are revoked; the consumer writes it to the store.
+    pub fn set_persist_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<GrantSnapshot>) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).persist = Some(tx);
+    }
+
+    /// Seed standing grants at boot from the persisted snapshot (before serving any
+    /// ask). Does NOT re-emit to `persist` — this loads FROM persistence.
+    pub fn seed_grants(&self, snap: GrantSnapshot) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for fg in snap.full {
+            g.full.insert((fg.thread, fg.dir));
+        }
+        for ag in snap.always {
+            g.always
+                .entry((ag.thread, ag.dir))
+                .or_default()
+                .insert(ag.summary);
+        }
+    }
+
+    /// Current standing grants, for persistence/inspection.
+    pub fn snapshot_grants(&self) -> GrantSnapshot {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .grant_snapshot()
+    }
+
+    /// Drop every standing grant belonging to `thread` (issue deletion cascade),
+    /// persisting the reduced snapshot when anything actually changed.
+    pub fn revoke_thread(&self, thread: i32) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = g.full.len() + g.always.len();
+        g.full.retain(|(t, _)| *t != thread);
+        g.always.retain(|(t, _), _| *t != thread);
+        if g.full.len() + g.always.len() != before {
+            g.emit_persist();
+        }
+    }
+
+    /// Revoke a specific standing grant (the human's one-click "undo"):
+    /// - `summary == None`  → clear this task's `(thread, dir)` grants entirely
+    ///   (its full access AND all its always-rules).
+    /// - `summary == Some(s)` → drop only that one always-rule, leaving full
+    ///   access (if any) and the task's other always-rules intact.
+    /// Persists the reduced snapshot when anything actually changed.
+    pub fn revoke_grant(&self, thread: i32, dir: &str, summary: Option<&str>) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (thread, dir.to_string());
+        let changed = match summary {
+            None => {
+                let had_full = g.full.remove(&key);
+                let had_always = g.always.remove(&key).is_some();
+                had_full || had_always
+            }
+            Some(summary) => {
+                let removed = g
+                    .always
+                    .get_mut(&key)
+                    .is_some_and(|rules| rules.remove(summary));
+                // drop a now-empty always-set so snapshots don't carry a hollow key
+                if removed && g.always.get(&key).is_some_and(|rules| rules.is_empty()) {
+                    g.always.remove(&key);
+                }
+                removed
+            }
+        };
+        if changed {
+            g.emit_persist();
+        }
     }
 
     /// All Asks across threads (for the workspace-wide Needs-you surface).
@@ -463,5 +613,284 @@ mod tests {
         assert_eq!(r.open_in(1).len(), 1);
         assert_eq!(r.open_in(2).len(), 1);
         assert_eq!(r.open_in(1)[0].thread, 1);
+    }
+
+    // ---- authorization persistence ------------------------------------------
+
+    #[test]
+    fn seeded_grants_are_honored_by_auto_decision() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![AlwaysGrant {
+                thread: 2,
+                dir: "20".into(),
+                summary: "Run: npm test".into(),
+            }],
+        });
+        // full → anything in (1,"10") auto-allows
+        assert_eq!(r.auto_decision(1, "10", "Run: anything"), Some(Decision::Allow));
+        // always → only the exact summary in (2,"20")
+        assert_eq!(
+            r.auto_decision(2, "20", "Run: npm test"),
+            Some(Decision::Allow)
+        );
+        assert!(r.auto_decision(2, "20", "Run: other").is_none());
+        // an unrelated key is unaffected
+        assert!(r.auto_decision(3, "30", "x").is_none());
+    }
+
+    #[test]
+    fn answering_full_persists_a_snapshot_with_that_grant() {
+        let r = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        assert!(r.answer(id, Answer::Full));
+        // the send is synchronous inside answer(), so try_recv sees it immediately
+        let snap = rx.try_recv().expect("full grant must be persisted");
+        assert_eq!(
+            snap.full,
+            vec![FullGrant {
+                thread: 1,
+                dir: "10".into()
+            }]
+        );
+        assert!(snap.always.is_empty());
+    }
+
+    #[test]
+    fn answering_always_persists_the_summary_grant() {
+        let r = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        let (id, _rx) = r.request(1, "10", "codex", "Run: npm test", "npm test");
+        assert!(r.answer(id, Answer::Always));
+        let snap = rx.try_recv().expect("always grant must be persisted");
+        assert_eq!(
+            snap.always,
+            vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                summary: "Run: npm test".into()
+            }]
+        );
+        assert!(snap.full.is_empty());
+    }
+
+    #[test]
+    fn plain_allow_creates_no_grant_and_does_not_persist() {
+        let r = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        assert!(r.answer(id, Answer::Allow));
+        assert!(
+            rx.try_recv().is_err(),
+            "a one-shot allow must not write a standing grant"
+        );
+    }
+
+    #[test]
+    fn re_granting_full_does_not_re_persist() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![],
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        // (1,"10") already has full access — answering Full again changes nothing.
+        assert!(r.answer(id, Answer::Full));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged grant set must not trigger a redundant write"
+        );
+    }
+
+    #[test]
+    fn revoke_thread_clears_that_threads_grants_and_persists() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![
+                FullGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                },
+                FullGrant {
+                    thread: 2,
+                    dir: "20".into(),
+                },
+            ],
+            always: vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                summary: "x".into(),
+            }],
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        r.revoke_thread(1);
+        // thread 1 grants gone, thread 2 intact
+        assert!(r.auto_decision(1, "10", "anything").is_none());
+        assert_eq!(
+            r.auto_decision(2, "20", "anything"),
+            Some(Decision::Allow)
+        );
+        let snap = rx.try_recv().expect("revocation must persist the reduced set");
+        assert_eq!(
+            snap.full,
+            vec![FullGrant {
+                thread: 2,
+                dir: "20".into()
+            }]
+        );
+        assert!(snap.always.is_empty());
+    }
+
+    #[test]
+    fn revoke_thread_with_nothing_to_remove_does_not_persist() {
+        let r = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        r.revoke_thread(99);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn grant_snapshot_round_trips_through_json_and_reseeds() {
+        let snap = GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![AlwaysGrant {
+                thread: 2,
+                dir: "".into(),
+                summary: "Run: x".into(),
+            }],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: GrantSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snap);
+        // and the round-tripped value seeds real behavior
+        let r = AskRegistry::new();
+        r.seed_grants(back);
+        assert_eq!(r.auto_decision(1, "10", "z"), Some(Decision::Allow));
+        assert_eq!(r.auto_decision(2, "", "Run: x"), Some(Decision::Allow));
+    }
+
+    #[test]
+    fn snapshot_grants_reflects_answered_grants() {
+        let r = AskRegistry::new();
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        r.answer(id, Answer::Full);
+        let snap = r.snapshot_grants();
+        assert_eq!(
+            snap.full,
+            vec![FullGrant {
+                thread: 1,
+                dir: "10".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn revoke_grant_none_clears_full_and_all_always_for_that_dir() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![
+                AlwaysGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                    summary: "a".into(),
+                },
+                AlwaysGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                    summary: "b".into(),
+                },
+            ],
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        r.revoke_grant(1, "10", None);
+        assert!(r.auto_decision(1, "10", "a").is_none());
+        assert!(r.auto_decision(1, "10", "anything").is_none()); // full gone too
+        let snap = rx.try_recv().expect("one-click revoke persists the cleared set");
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn revoke_grant_with_summary_drops_only_that_always_rule() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![],
+            always: vec![
+                AlwaysGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                    summary: "a".into(),
+                },
+                AlwaysGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                    summary: "b".into(),
+                },
+            ],
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        r.revoke_grant(1, "10", Some("a"));
+        assert!(r.auto_decision(1, "10", "a").is_none()); // dropped
+        assert_eq!(r.auto_decision(1, "10", "b"), Some(Decision::Allow)); // kept
+        let snap = rx.try_recv().expect("granular revoke persists");
+        assert_eq!(
+            snap.always,
+            vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                summary: "b".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn revoke_grant_with_summary_keeps_full_access() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                summary: "a".into(),
+            }],
+        });
+        r.revoke_grant(1, "10", Some("a"));
+        // full access is a separate rule — dropping one always must not touch it
+        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+    }
+
+    #[test]
+    fn revoke_grant_with_nothing_to_remove_does_not_persist() {
+        let r = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        r.revoke_grant(1, "10", None);
+        assert!(rx.try_recv().is_err());
     }
 }
