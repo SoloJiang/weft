@@ -147,8 +147,16 @@ struct Inner {
     next_id: u64,
     waiters: HashMap<u64, oneshot::Sender<Decision>>,
     open: Vec<Ask>,
-    /// (thread, dir) -> summaries the human has "always allow"-ed.
+    /// (thread, dir) -> summaries the human has "always allow"-ed. Holds ALL
+    /// always-rules (auto_decision consults this) whether or not they persist.
     always: HashMap<(i32, String), HashSet<String>>,
+    /// The subset of `always` (as (thread, dir, summary)) whose display summary
+    /// PRECISELY identifies the action, so it is safe to persist. An over-broad
+    /// summary (e.g. a Claude multi-line command truncated to its first line) is
+    /// left OUT of this set: it still auto-allows in memory this session but is not
+    /// written to disk, so persistence never turns a session-scoped over-broad match
+    /// into a permanent one. (PR #87 follow-up: a canonical action key per engine.)
+    persistent_always: HashSet<(i32, String, String)>,
     /// (thread, dir) granted full access — every ask auto-allows.
     full: HashSet<(i32, String)>,
     /// Dangerous mode: when on, EVERY ask from EVERY agent auto-allows (never
@@ -175,7 +183,9 @@ impl Inner {
         }
     }
 
-    /// Current standing grants as a durable snapshot (持锁内调用).
+    /// Current standing grants as a durable snapshot (持锁内调用). Only the
+    /// `persistent_always` subset of always-rules is written — over-broad ones are
+    /// in-memory only.
     fn grant_snapshot(&self) -> GrantSnapshot {
         let full = self
             .full
@@ -185,14 +195,19 @@ impl Inner {
                 dir: dir.clone(),
             })
             .collect();
+        let persistent = &self.persistent_always;
         let always = self
             .always
             .iter()
             .flat_map(|((thread, dir), summaries)| {
-                summaries.iter().map(move |summary| AlwaysGrant {
-                    thread: *thread,
-                    dir: dir.clone(),
-                    summary: summary.clone(),
+                summaries.iter().filter_map(move |summary| {
+                    persistent
+                        .contains(&(*thread, dir.clone(), summary.clone()))
+                        .then(|| AlwaysGrant {
+                            thread: *thread,
+                            dir: dir.clone(),
+                            summary: summary.clone(),
+                        })
                 })
             })
             .collect();
@@ -320,11 +335,24 @@ impl AskRegistry {
         // only on first insertion). Drives a single persist write — an idempotent
         // re-grant of an existing rule writes nothing.
         let granted = match ans {
-            Answer::Always => g
-                .always
-                .entry(key.clone())
-                .or_default()
-                .insert(ask.summary.clone()),
+            Answer::Always => {
+                // Record the always-rule in memory (auto_decision uses this) always.
+                g.always
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(ask.summary.clone());
+                // Only PERSIST it when the display summary precisely identifies the
+                // action — i.e. `detail` (the full action) is a single line, so the
+                // summary is the whole thing. A Claude multi-line command is truncated
+                // to its first line as the summary; persisting that would auto-allow a
+                // different command sharing that first line after restart. Over-broad
+                // ones stay in-memory only (pre-existing behavior; re-prompt next run).
+                // `granted` gates the persist emit, so only a NEW persistable rule writes.
+                let persistable = ask.detail.lines().count() <= 1;
+                persistable
+                    && g.persistent_always
+                        .insert((key.0, key.1.clone(), ask.summary.clone()))
+            }
             Answer::Full => g.full.insert(key.clone()),
             _ => false,
         };
@@ -429,9 +457,12 @@ impl AskRegistry {
         }
         for ag in snap.always {
             g.always
-                .entry((ag.thread, ag.dir))
+                .entry((ag.thread, ag.dir.clone()))
                 .or_default()
-                .insert(ag.summary);
+                .insert(ag.summary.clone());
+            // Anything on disk was persistable when written.
+            g.persistent_always
+                .insert((ag.thread, ag.dir, ag.summary));
         }
     }
 
@@ -443,16 +474,46 @@ impl AskRegistry {
             .grant_snapshot()
     }
 
-    /// Drop every standing grant belonging to `thread` (issue deletion cascade),
-    /// persisting the reduced snapshot when anything actually changed.
-    pub fn revoke_thread(&self, thread: i32) {
+    /// Drop every standing grant belonging to `thread` (issue deletion cascade) and
+    /// RETURN exactly what was removed — computed under the SAME lock as the removal,
+    /// so a concurrent revoke can't inflate it (that return is what makes an atomic
+    /// rollback possible). Persists the reduced snapshot when anything changed.
+    pub fn revoke_thread(&self, thread: i32) -> GrantSnapshot {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let before = g.full.len() + g.always.len();
-        g.full.retain(|(t, _)| *t != thread);
-        g.always.retain(|(t, _), _| *t != thread);
-        if g.full.len() + g.always.len() != before {
+        let mut removed = GrantSnapshot::default();
+        let full_keys: Vec<(i32, String)> =
+            g.full.iter().filter(|(t, _)| *t == thread).cloned().collect();
+        for key in full_keys {
+            g.full.remove(&key);
+            removed.full.push(FullGrant {
+                thread: key.0,
+                dir: key.1,
+            });
+        }
+        let always_keys: Vec<(i32, String)> =
+            g.always.keys().filter(|(t, _)| *t == thread).cloned().collect();
+        for key in always_keys {
+            if let Some(rules) = g.always.remove(&key) {
+                for summary in rules {
+                    // Only PERSISTABLE always-rules count as "removed" for the durable
+                    // rollback — an over-broad in-memory one was never on disk.
+                    if g
+                        .persistent_always
+                        .remove(&(key.0, key.1.clone(), summary.clone()))
+                    {
+                        removed.always.push(AlwaysGrant {
+                            thread: key.0,
+                            dir: key.1.clone(),
+                            summary,
+                        });
+                    }
+                }
+            }
+        }
+        if !removed.is_empty() {
             g.emit_persist();
         }
+        removed
     }
 
     /// Revoke a specific standing grant (the human's one-click "undo"):
@@ -460,39 +521,70 @@ impl AskRegistry {
     ///   (its full access AND all its always-rules).
     /// - `summary == Some(s)` → drop only that one always-rule, leaving full
     ///   access (if any) and the task's other always-rules intact.
+    /// Returns exactly what was removed (under one lock; see `revoke_thread`).
     /// Persists the reduced snapshot when anything actually changed.
-    pub fn revoke_grant(&self, thread: i32, dir: &str, summary: Option<&str>) {
+    pub fn revoke_grant(&self, thread: i32, dir: &str, summary: Option<&str>) -> GrantSnapshot {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let key = (thread, dir.to_string());
-        let changed = match summary {
+        let mut removed = GrantSnapshot::default();
+        match summary {
             None => {
-                let had_full = g.full.remove(&key);
-                let had_always = g.always.remove(&key).is_some();
-                had_full || had_always
+                if g.full.remove(&key) {
+                    removed.full.push(FullGrant {
+                        thread,
+                        dir: dir.to_string(),
+                    });
+                }
+                if let Some(rules) = g.always.remove(&key) {
+                    for summary in rules {
+                        if g
+                            .persistent_always
+                            .remove(&(thread, dir.to_string(), summary.clone()))
+                        {
+                            removed.always.push(AlwaysGrant {
+                                thread,
+                                dir: dir.to_string(),
+                                summary,
+                            });
+                        }
+                    }
+                }
             }
             Some(summary) => {
-                let removed = g
+                let dropped = g
                     .always
                     .get_mut(&key)
                     .is_some_and(|rules| rules.remove(summary));
-                // drop a now-empty always-set so snapshots don't carry a hollow key
-                if removed && g.always.get(&key).is_some_and(|rules| rules.is_empty()) {
-                    g.always.remove(&key);
+                if dropped {
+                    if g
+                        .persistent_always
+                        .remove(&(thread, dir.to_string(), summary.to_string()))
+                    {
+                        removed.always.push(AlwaysGrant {
+                            thread,
+                            dir: dir.to_string(),
+                            summary: summary.to_string(),
+                        });
+                    }
+                    // drop a now-empty always-set so snapshots don't carry a hollow key
+                    if g.always.get(&key).is_some_and(|rules| rules.is_empty()) {
+                        g.always.remove(&key);
+                    }
                 }
-                removed
             }
-        };
-        if changed {
+        }
+        if !removed.is_empty() {
             g.emit_persist();
         }
+        removed
     }
 
-    /// Dispatch a revoke at the caller's granularity — the single entry the
-    /// `revoke_auth_grant` command funnels through, so the command stays a pure
-    /// wrapper and the dir-dispatch itself is under test:
+    /// Dispatch a revoke at the caller's granularity and return exactly what was
+    /// removed — the single entry `revoke_auth_grant` funnels through (so the
+    /// command stays a pure wrapper AND gets an atomic removed-set for rollback):
     /// - `dir == None`  → `revoke_thread` (clear the whole issue's grants).
     /// - `dir == Some`  → `revoke_grant` (one task, or one always-rule via `summary`).
-    pub fn revoke(&self, thread: i32, dir: Option<&str>, summary: Option<&str>) {
+    pub fn revoke(&self, thread: i32, dir: Option<&str>, summary: Option<&str>) -> GrantSnapshot {
         match dir {
             None => self.revoke_thread(thread),
             Some(dir) => self.revoke_grant(thread, dir, summary),
@@ -1030,6 +1122,84 @@ mod tests {
         let r = seeded();
         r.revoke(1, Some("10"), Some("a"));
         assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+    }
+
+    #[test]
+    fn over_broad_multiline_always_is_in_memory_only_not_persisted() {
+        let r = AskRegistry::new();
+        // A Claude multi-line command: the summary is truncated to its first line, but
+        // `detail` holds the full (multi-line) command → over-broad Always key.
+        let (id, _rx) = r.request(1, "10", "claude", "Run: npm test", "npm test\n&& rm -rf /");
+        assert!(r.answer(id, Answer::Always));
+        // It still auto-allows this exact summary in memory (pre-existing behavior)...
+        assert_eq!(
+            r.auto_decision(1, "10", "Run: npm test"),
+            Some(Decision::Allow)
+        );
+        // ...but it is NOT durable — persisting it would auto-allow a different command
+        // sharing the same first line after restart.
+        assert!(
+            r.snapshot_grants().always.is_empty(),
+            "an over-broad multi-line always must not be persisted"
+        );
+    }
+
+    #[test]
+    fn single_line_always_is_persisted() {
+        let r = AskRegistry::new();
+        let (id, _rx) = r.request(1, "10", "claude", "Run: npm test", "npm test");
+        assert!(r.answer(id, Answer::Always));
+        assert_eq!(
+            r.snapshot_grants().always,
+            vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                summary: "Run: npm test".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn revoke_returns_exactly_what_it_removed() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![
+                AlwaysGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                    summary: "a".into(),
+                },
+                AlwaysGrant {
+                    thread: 1,
+                    dir: "11".into(),
+                    summary: "b".into(),
+                },
+            ],
+        });
+        // removes (1,"10")'s full + its always "a"; leaves the sibling (1,"11")
+        let removed = r.revoke(1, Some("10"), None);
+        assert_eq!(
+            removed.full,
+            vec![FullGrant {
+                thread: 1,
+                dir: "10".into()
+            }]
+        );
+        assert_eq!(
+            removed.always,
+            vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                summary: "a".into()
+            }]
+        );
+        assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
+        // revoking nothing returns an empty set
+        assert!(r.revoke(2, Some("99"), None).is_empty());
     }
 
     #[test]

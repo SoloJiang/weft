@@ -2226,9 +2226,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           setAuthGrants(await api.listAuthGrants());
         }
       } catch (e) {
-        /* already resolved/expired */
-      console.error(e);
-    }
+        /* already resolved/expired, or the durable write failed */
+        console.error(e);
+        // A broad grant still applies in memory this session even if persisting it
+        // failed; surface that so a re-prompt after restart isn't a silent surprise.
+        if (answer === "always" || answer === "full") {
+          toast(i18n.t("grants.grantNotSaved"));
+        }
+      }
     },
     [dangerousMode],
   );

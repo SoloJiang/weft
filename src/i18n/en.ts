@@ -812,6 +812,8 @@ export const en = {
       "The persisted Full access / Always-allow rules for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
     revokeConfirm: "Revoke access",
     revokeFailed: "Couldn't revoke access — it's still active. Please try again.",
+    grantNotSaved:
+      "Access granted for now, but couldn't be saved — you may be asked again after a restart.",
   },
   ai: {
     shellSnippet: "Shell snippet",

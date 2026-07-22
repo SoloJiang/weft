@@ -788,6 +788,7 @@ export const zh = {
       "该 issue 下各任务保留的完全访问 / 始终允许授权会被清除。下次有工具需要权限时会重新问你。",
     revokeConfirm: "撤销授权",
     revokeFailed: "撤销失败——该授权仍然有效，请重试。",
+    grantNotSaved: "已临时授权，但未能保存——重启后可能会再次询问。",
   },
   ai: {
     shellSnippet: "Shell 片段",
