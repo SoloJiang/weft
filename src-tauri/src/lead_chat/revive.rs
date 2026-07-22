@@ -297,13 +297,19 @@ async fn try_revive_lead(app: &AppHandle, db: &Db, thread_id: i32) -> anyhow::Re
     if has_open_ask(app, "lead", thread_id) {
         return Ok(());
     }
-    // Fold in any stalled worker ids this interrupted lead still owns: its cut-off
-    // turn may itself have been a stall-resume, and the idle-only stall scan skips
-    // a lead persisted "running" — so without this the ids are lost across a crash
-    // mid-resume. Empty set → plain REVIVE_PROMPT (a normal interrupted lead is
-    // unchanged).
+    // An interrupted lead that ALSO owns stalled tasks — its cut-off turn may have
+    // BEEN a stall-resume, and the idle-only stall scan skips a lead persisted
+    // "running" — must carry the worker ids too, delivered on the SAME reliable
+    // terms as the idle stall path: QUEUE if transiently busy (don't drop the ids)
+    // and stay retryable on failure. A normal interrupted lead (no stalled tasks)
+    // keeps the exact previous behavior: plain REVIVE_PROMPT, skip-if-busy,
+    // stop-on-fail — a pure regression.
     let stalled_dirs = stalled_direction_ids(db, thread_id).await?;
-    nudge_eng_if_idle(app, db, &eng, &lead_revive_prompt(&stalled_dirs)).await?;
+    if stalled_dirs.is_empty() {
+        nudge_eng_if_idle(app, db, &eng, REVIVE_PROMPT).await?;
+    } else {
+        deliver_stalled_resume(app, db, &eng, &lead_revive_prompt(&stalled_dirs)).await?;
+    }
     Ok(())
 }
 
@@ -352,9 +358,9 @@ async fn nudge_or_reset(
 
 /// Running-revive nudge: deliver ONLY when the (freshly-resumed) engine is idle.
 /// A racing concurrent send that already made it busy is driving it — don't queue
-/// a redundant "continue where you left off" behind that. The stall path instead
-/// uses [`nudge_or_reset`] directly: its resume carries the re-dispatch ids and
-/// must QUEUE (not drop) if the lead is transiently busy.
+/// a redundant "continue where you left off" behind that. The stall paths instead
+/// use [`deliver_stalled_resume`]: their prompt carries the re-dispatch ids and
+/// must QUEUE (not drop) if the lead is transiently busy, and stay retryable.
 async fn nudge_eng_if_idle(
     app: &AppHandle,
     db: &Db,
@@ -366,6 +372,28 @@ async fn nudge_eng_if_idle(
         nudge_or_reset(app, db, eng, prompt).await?;
     }
     Ok(())
+}
+
+/// Deliver a stalled-resume prompt (it names the worker ids the lead must
+/// re-dispatch). Differs from [`nudge_eng_if_idle`] on two axes that both matter
+/// for stall recovery:
+/// - QUEUES rather than skips when the lead is transiently busy (a frontend/IM
+///   send racing the sweep). `engine::nudge` → `hidden_delivery(busy) → Queue`
+///   runs the resume after the current turn (single-writer, never parallel), so
+///   the ids are delivered, not dropped until another restart.
+/// - Does NOT `engine::stop` on failure. `engine::nudge` already rolls a failed
+///   hidden turn back to idle (`rollback_failed_turn`), so a `stop` here would only
+///   ADD a `STATUS_STOPPED` persist — which excludes the thread from every future
+///   revive scan (`collect_stalled_leads` is idle-only), turning a TRANSIENT boot
+///   failure (CLI briefly missing) into a permanent stall. Staying idle keeps the
+///   next boot retryable; the caller's `report_failure` still surfaces the failure.
+async fn deliver_stalled_resume(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    engine::nudge(app, db, eng, prompt).await
 }
 
 fn report_failure(app: &AppHandle, thread_id: i32, dir: &str, e: &anyhow::Error) {
@@ -406,12 +434,7 @@ async fn try_revive_stalled_lead(
     if has_open_ask(app, "lead", thread_id) {
         return Ok(());
     }
-    // nudge_or_reset (NOT nudge_eng_if_idle): if a frontend/IM send made the lead
-    // busy between selection and here, the resume must QUEUE (single-writer → runs
-    // after that turn, no double-drive), never be DROPPED — it carries the stalled
-    // worker ids the lead has to re-dispatch, and dropping it re-strands the task
-    // until another restart.
-    nudge_or_reset(app, db, &eng, &resume_stalled_prompt(stalled_dirs)).await?;
+    deliver_stalled_resume(app, db, &eng, &resume_stalled_prompt(stalled_dirs)).await?;
     Ok(())
 }
 
