@@ -60,6 +60,16 @@ pub async fn seed(db: &Db, asks: &AskRegistry) {
     asks.seed_grants(load_snapshot(db).await);
 }
 
+/// Durably write the registry's CURRENT grants now and await it — for a
+/// grant-changing command that must not report success until the change is on
+/// disk. The `spawn` consumer's fire-and-forget emit could be lost on an
+/// immediate quit/crash, resurrecting a just-revoked grant; awaiting this closes
+/// that window. Idempotent with the consumer (both write the same snapshot); the
+/// consumer stays as the backstop for non-command paths (IM / remote bus answers).
+pub async fn flush(db: &Db, asks: &AskRegistry) {
+    persist_snapshot(db, &asks.snapshot_grants()).await;
+}
+
 /// Install the persist consumer: mirror every grant change to the store. Called
 /// once at startup (mirrors `trail::spawn`).
 pub fn spawn(app: AppHandle) {
@@ -192,5 +202,22 @@ mod tests {
         let revived = AskRegistry::new();
         seed(&db, &revived).await;
         assert!(revived.auto_decision(7, "42", "Run: x").is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_durably_writes_current_grants_without_the_consumer() {
+        let db = mem().await;
+        let asks = AskRegistry::new();
+        asks.seed_grants(sample());
+        // No persist consumer installed — flush must write on its own (this is the
+        // durability guarantee for grant-changing commands that await it).
+        flush(&db, &asks).await;
+        assert_eq!(load_snapshot(&db).await, sample());
+        // a revoke then flush leaves only the surviving grant on disk
+        asks.revoke_thread(1);
+        flush(&db, &asks).await;
+        let snap = load_snapshot(&db).await;
+        assert!(snap.full.is_empty());
+        assert_eq!(snap.always.len(), 1);
     }
 }

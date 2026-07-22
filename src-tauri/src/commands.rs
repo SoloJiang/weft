@@ -213,6 +213,16 @@ async fn cancel_workspace_asks(
     for thread_id in &scope.thread_ids {
         asks.revoke_thread(*thread_id);
     }
+    // Repo-routed directions live in OTHER workspaces' threads (this workspace owns
+    // the repo they use); the cascade deletes those directions, so revoke just their
+    // (thread, dir) grants — mirroring the open-ask cancellation scope above — else a
+    // later reused direction id inherits the deleted task's access.
+    for (thread_id, dir) in &scope.direction_routes {
+        if !scope.thread_ids.contains(thread_id) {
+            asks.revoke_grant(*thread_id, dir, None);
+        }
+    }
+    crate::auth_persist::flush(db, asks).await;
     Ok(())
 }
 
@@ -628,18 +638,42 @@ pub async fn get_repo_map_doc(db: State<'_, Db>, workspace_id: i32) -> R<Option<
     repo::get_repo_map_doc(&db, workspace_id).await.map_err(e)
 }
 
+/// Revoke the persisted authorization grants of every direction bound to `repo_id`,
+/// then flush durably. Used by `delete_repo`, whose cascade removes those directions
+/// without passing through `delete_thread` — closing the id-reuse-inheritance gap.
+async fn revoke_repo_direction_grants(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    repo_id: i32,
+) -> R<()> {
+    for d in repo::directions_for_repo(db, repo_id).await.map_err(e)? {
+        asks.revoke_grant(d.thread_id, &d.id.to_string(), None);
+    }
+    crate::auth_persist::flush(db, asks).await;
+    Ok(())
+}
+
 /// Remove a repo from its workspace: delete Weft's reference, the repo's
 /// profile, the directions bound to it (with their sessions), and its worktrees
 /// (physically removed from git). The user's actual repository at its local path
 /// is NEVER deleted — only Weft's tracking of it.
 #[tauri::command]
-pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
+pub async fn delete_repo(
+    db: State<'_, Db>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    repo_id: i32,
+) -> R<()> {
     // Capture the repo path before the cascade — the repo_ref row is gone after
     // delete_repo_cascade, so we must resolve the git path first.
     let repo = repo::get_repo(&db, repo_id)
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
+    // Revoke persisted grants for the directions this delete removes — the cascade
+    // bypasses delete_thread, so without this a later reused direction id could
+    // inherit the deleted task's Full/Always access. Do it while the rows still
+    // exist to enumerate, and flush durably.
+    revoke_repo_direction_grants(&db, &asks, repo_id).await?;
     // Forget before the cascade so any in-flight curator pass sees the deletion
     // as early as possible and does not publish stale running/done state.
     crate::curator::run_forget(repo_id);
@@ -1230,8 +1264,11 @@ pub async fn delete_thread(
         .await
         .map_err(e)?;
     // Drop the issue's persisted authorization grants so a future thread id can't
-    // inherit stale "full access" (and the store doesn't accumulate tombstones).
-    app.state::<crate::ask::AskRegistry>().revoke_thread(thread_id);
+    // inherit stale "full access" (and the store doesn't accumulate tombstones),
+    // durably before returning.
+    let asks = app.state::<crate::ask::AskRegistry>();
+    asks.revoke_thread(thread_id);
+    crate::auth_persist::flush(&db, &asks).await;
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(key) {
@@ -1938,17 +1975,23 @@ pub async fn workspace_needs_counts(
 /// Answer a pending permission Ask. `answer` is allow | deny | always | full —
 /// always remembers this action for the task, full grants it full access.
 #[tauri::command]
-pub fn answer_permission(
+pub async fn answer_permission(
+    db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     ask_id: u64,
     answer: String,
 ) -> R<()> {
     let a = crate::ask::Answer::parse(&answer).ok_or("unknown answer")?;
-    if asks.answer(ask_id, a) {
-        Ok(())
-    } else {
-        Err("that request was already answered or has expired".into())
+    if !asks.answer(ask_id, a) {
+        return Err("that request was already answered or has expired".into());
     }
+    // A broad grant (Always/Full) creates a standing rule — persist it durably
+    // before reporting success, so an immediate quit/crash can't drop it (the
+    // async consumer is only a backstop; awaiting closes that window).
+    if matches!(a, crate::ask::Answer::Always | crate::ask::Answer::Full) {
+        crate::auth_persist::flush(&db, &asks).await;
+    }
+    Ok(())
 }
 
 /// The current standing authorization grants (full / always), so the board can
@@ -1969,15 +2012,19 @@ pub fn list_auth_grants(
 ///   (its full access + every always-rule).
 /// - `dir == Some`, `summary == Some` → drop only that one always-rule.
 #[tauri::command]
-pub fn revoke_auth_grant(
+pub async fn revoke_auth_grant(
+    db: State<'_, Db>,
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread: i32,
     dir: Option<String>,
     summary: Option<String>,
 ) -> R<()> {
-    // Dispatch lives in the registry (tested by revoke_dispatch_routes_by_dir_granularity);
-    // this command is a pure wrapper.
+    // Dispatch lives in the registry (tested by revoke_dispatch_routes_by_dir_granularity).
     asks.revoke(thread, dir.as_deref(), summary.as_deref());
+    // Persist the revoke durably before reporting success — a lost revoke would
+    // resurrect the grant on next launch, and this revoke IS the safety net for
+    // persisted Full access, so it must not have a hole.
+    crate::auth_persist::flush(&db, &asks).await;
     Ok(())
 }
 
@@ -2649,6 +2696,122 @@ mod tests {
         assert_eq!(
             asks.auto_decision(keep_thread.id, "", "anything"),
             Some(crate::ask::Decision::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_asks_revokes_repo_routed_direction_grants() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        // ws owns a repo; a direction in keep_ws's thread has a SESSION using ws's
+        // repo → it is a repo-routed direction in ws's ask scope.
+        let ws_repo = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let routed = repo::create_direction(
+            &db,
+            keep_thread.id,
+            "routed",
+            "claude",
+            keep_repo.id,
+            "why",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        repo::create_session(&db, routed.id, ws_repo.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant {
+                thread: keep_thread.id,
+                dir: routed.id.to_string(),
+            }],
+            always: vec![],
+        });
+        // active before the delete
+        assert_eq!(
+            asks.auto_decision(keep_thread.id, &routed.id.to_string(), "x"),
+            Some(crate::ask::Decision::Allow)
+        );
+
+        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+
+        // deleting the workspace that owns the routed repo revokes the repo-routed
+        // direction's grant (in another workspace's thread) — and durably.
+        assert!(asks
+            .auto_decision(keep_thread.id, &routed.id.to_string(), "x")
+            .is_none());
+        assert!(crate::auth_persist::load_snapshot(&db).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_repo_direction_grants_clears_only_that_repos_directions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_a = repo::add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
+            .await
+            .unwrap();
+        let repo_b = repo::add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        let dir_a = repo::create_direction(
+            &db, thread.id, "a task", "claude", repo_a.id, "why", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        let dir_b = repo::create_direction(
+            &db, thread.id, "b task", "claude", repo_b.id, "why", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![
+                crate::ask::FullGrant {
+                    thread: thread.id,
+                    dir: dir_a.id.to_string(),
+                },
+                crate::ask::FullGrant {
+                    thread: thread.id,
+                    dir: dir_b.id.to_string(),
+                },
+            ],
+            always: vec![],
+        });
+
+        revoke_repo_direction_grants(&db, &asks, repo_a.id)
+            .await
+            .unwrap();
+
+        // repo_a's direction grant is gone; repo_b's survives
+        assert!(asks
+            .auto_decision(thread.id, &dir_a.id.to_string(), "x")
+            .is_none());
+        assert_eq!(
+            asks.auto_decision(thread.id, &dir_b.id.to_string(), "x"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // durable: the store reflects only repo_b's surviving grant
+        let snap = crate::auth_persist::load_snapshot(&db).await;
+        assert_eq!(
+            snap.full,
+            vec![crate::ask::FullGrant {
+                thread: thread.id,
+                dir: dir_b.id.to_string()
+            }]
         );
     }
 
