@@ -453,8 +453,6 @@ impl AskRegistry {
         for fg in snap.full {
             g.full.insert((fg.thread, fg.dir));
         }
-        // A persisted snapshot has no always-rules (Always isn't persisted in this PR),
-        // so this is a no-op in practice; kept so a prior-version disk row still loads.
         for ag in snap.always {
             g.always
                 .entry((ag.thread, ag.dir))

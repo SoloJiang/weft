@@ -54,9 +54,15 @@ pub async fn persist_snapshot(db: &Db, snap: &GrantSnapshot) -> Result<(), Strin
 }
 
 /// Seed the registry from the store at boot — call BEFORE anything serves asks
-/// or `spawn_revive` re-drives tasks.
+/// or `spawn_revive` re-drives tasks. Only Full access is inherited: any stale
+/// Always rows on disk (from an earlier build, or a restored backup) are dropped,
+/// since Always is in-memory only in this PR — re-seeding them would silently
+/// auto-allow across restarts while the Full-only board marker can't surface or
+/// revoke them.
 pub async fn seed(db: &Db, asks: &AskRegistry) {
-    asks.seed_grants(load_snapshot(db).await);
+    let mut snap = load_snapshot(db).await;
+    snap.always.clear();
+    asks.seed_grants(snap);
 }
 
 /// Durably persist the registry's current grants and await it — for a
@@ -163,17 +169,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_loads_persisted_grants_into_the_registry() {
+    async fn seed_loads_full_but_ignores_stale_always() {
         let db = mem().await;
+        // sample() has a Full grant AND a (stale, e.g. earlier-build) Always grant.
         persist_snapshot(&db, &sample()).await.unwrap();
         let asks = AskRegistry::new();
         seed(&db, &asks).await;
+        // Full is inherited...
         assert_eq!(asks.auto_decision(1, "10", "anything"), Some(Decision::Allow));
-        assert_eq!(
-            asks.auto_decision(2, "", "Run: npm test"),
-            Some(Decision::Allow)
-        );
-        assert!(asks.auto_decision(2, "", "Run: other").is_none());
+        // ...but a stale on-disk Always is NOT re-seeded (Always is in-memory only in
+        // this PR), so it does not silently auto-allow across restarts.
+        assert!(asks.auto_decision(2, "", "Run: npm test").is_none());
     }
 
     /// Drains one snapshot from the registry's persist channel into the store,
