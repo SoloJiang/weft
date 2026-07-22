@@ -131,6 +131,17 @@ impl GrantSnapshot {
     }
 }
 
+/// A persist request to the SINGLE ordered writer (the `auth_persist` consumer).
+/// `ack`, when present, is signalled with the store-write result once THIS message
+/// is written — so a grant-changing command can await durability and surface a
+/// write failure. A fire-and-forget emit uses `ack: None`. Routing every write
+/// through one channel (never a parallel direct write) is what keeps them ordered:
+/// the last-enqueued snapshot is the last written, so a stale one can't clobber it.
+pub struct PersistMsg {
+    pub snapshot: GrantSnapshot,
+    pub ack: Option<oneshot::Sender<Result<(), String>>>,
+}
+
 #[derive(Default)]
 struct Inner {
     next_id: u64,
@@ -147,9 +158,10 @@ struct Inner {
     notify: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
     /// transcript 结算痕迹消费者（与 IM 桥独立的第二订阅，始终在桌面端装上）。
     trail: Option<tokio::sync::mpsc::UnboundedSender<AskEvent>>,
-    /// 授权落盘订阅：`full`/`always` 每次真正变更后收到一份当前快照，消费方
-    /// 把它写进 store。装上后授权跨重启存活；未装时零开销。
-    persist: Option<tokio::sync::mpsc::UnboundedSender<GrantSnapshot>>,
+    /// 授权落盘订阅（单一有序写者）：`full`/`always` 每次真正变更后收到一条
+    /// `PersistMsg`（快照 + 可选 ack）。消费方按序写 store；命令路径经 ack 等其
+    /// 落盘完成后再返回。装上后授权跨重启存活；未装时零开销。
+    persist: Option<tokio::sync::mpsc::UnboundedSender<PersistMsg>>,
 }
 
 impl Inner {
@@ -187,11 +199,14 @@ impl Inner {
         GrantSnapshot { full, always }
     }
 
-    /// Push the current grants to the persistence consumer (持锁内调用，仅在
-    /// grant 真正变更后调用). 未装消费者时零开销。
+    /// Push the current grants to the persistence consumer as a fire-and-forget
+    /// (no-ack) message (持锁内调用，仅在 grant 真正变更后调用). 未装消费者时零开销。
     fn emit_persist(&self) {
         if let Some(tx) = &self.persist {
-            let _ = tx.send(self.grant_snapshot());
+            let _ = tx.send(PersistMsg {
+                snapshot: self.grant_snapshot(),
+                ack: None,
+            });
         }
     }
 }
@@ -382,10 +397,27 @@ impl AskRegistry {
     }
 
     /// Install the durable-grants consumer's channel (called once at startup). It
-    /// receives a fresh `GrantSnapshot` every time a `full`/`always` grant is added
-    /// or a thread's grants are revoked; the consumer writes it to the store.
-    pub fn set_persist_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<GrantSnapshot>) {
+    /// receives a `PersistMsg` every time a `full`/`always` grant is added, revoked,
+    /// or explicitly flushed; the consumer is the single writer to the store.
+    pub fn set_persist_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<PersistMsg>) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).persist = Some(tx);
+    }
+
+    /// Enqueue the CURRENT grants to the single writer WITH a completion ack and
+    /// return the receiver — the caller awaits it to know the write is durable (or
+    /// failed). Routing through the same channel (not a parallel direct write) keeps
+    /// writes ordered, so a stale queued snapshot can never land after this one.
+    /// `None` when no consumer is installed (e.g. a unit test without one).
+    pub fn request_persist_ack(&self) -> Option<oneshot::Receiver<Result<(), String>>> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = g.persist.as_ref()?;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(PersistMsg {
+            snapshot: g.grant_snapshot(),
+            ack: Some(ack_tx),
+        })
+        .ok()?;
+        Some(ack_rx)
     }
 
     /// Seed standing grants at boot from the persisted snapshot (before serving any
@@ -465,6 +497,44 @@ impl AskRegistry {
             None => self.revoke_thread(thread),
             Some(dir) => self.revoke_grant(thread, dir, summary),
         }
+    }
+
+    /// Delete-time cleanup of an issue's WHOLE footprint in this registry: cancel
+    /// its still-open asks AND revoke its standing grants. Cancelling the open asks
+    /// matters as much as revoking: after the thread rows are gone a lingering card,
+    /// if answered Full/Always, would `answer` a FRESH grant for the deleted id and
+    /// reopen the id-reuse hole. Used by delete_thread.
+    pub fn purge_thread(&self, thread: i32) {
+        let ids: Vec<u64> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.open
+                .iter()
+                .filter(|a| a.thread == thread)
+                .map(|a| a.id)
+                .collect()
+        };
+        for id in ids {
+            self.cancel(id);
+        }
+        self.revoke_thread(thread);
+    }
+
+    /// Delete-time cleanup of ONE task's `(thread, dir)` footprint: cancel its open
+    /// asks and revoke its standing grant (same rationale as `purge_thread`). Used by
+    /// delete_repo, per removed direction.
+    pub fn purge_dir(&self, thread: i32, dir: &str) {
+        let ids: Vec<u64> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.open
+                .iter()
+                .filter(|a| a.thread == thread && a.dir == dir)
+                .map(|a| a.id)
+                .collect()
+        };
+        for id in ids {
+            self.cancel(id);
+        }
+        self.revoke_grant(thread, dir, None);
     }
 
     /// All Asks across threads (for the workspace-wide Needs-you surface).
@@ -663,7 +733,7 @@ mod tests {
         let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
         assert!(r.answer(id, Answer::Full));
         // the send is synchronous inside answer(), so try_recv sees it immediately
-        let snap = rx.try_recv().expect("full grant must be persisted");
+        let snap = rx.try_recv().expect("full grant must be persisted").snapshot;
         assert_eq!(
             snap.full,
             vec![FullGrant {
@@ -681,7 +751,7 @@ mod tests {
         r.set_persist_notifier(tx);
         let (id, _rx) = r.request(1, "10", "codex", "Run: npm test", "npm test");
         assert!(r.answer(id, Answer::Always));
-        let snap = rx.try_recv().expect("always grant must be persisted");
+        let snap = rx.try_recv().expect("always grant must be persisted").snapshot;
         assert_eq!(
             snap.always,
             vec![AlwaysGrant {
@@ -756,7 +826,10 @@ mod tests {
             r.auto_decision(2, "20", "anything"),
             Some(Decision::Allow)
         );
-        let snap = rx.try_recv().expect("revocation must persist the reduced set");
+        let snap = rx
+            .try_recv()
+            .expect("revocation must persist the reduced set")
+            .snapshot;
         assert_eq!(
             snap.full,
             vec![FullGrant {
@@ -840,7 +913,10 @@ mod tests {
         r.revoke_grant(1, "10", None);
         assert!(r.auto_decision(1, "10", "a").is_none());
         assert!(r.auto_decision(1, "10", "anything").is_none()); // full gone too
-        let snap = rx.try_recv().expect("one-click revoke persists the cleared set");
+        let snap = rx
+            .try_recv()
+            .expect("one-click revoke persists the cleared set")
+            .snapshot;
         assert!(snap.is_empty());
     }
 
@@ -867,7 +943,7 @@ mod tests {
         r.revoke_grant(1, "10", Some("a"));
         assert!(r.auto_decision(1, "10", "a").is_none()); // dropped
         assert_eq!(r.auto_decision(1, "10", "b"), Some(Decision::Allow)); // kept
-        let snap = rx.try_recv().expect("granular revoke persists");
+        let snap = rx.try_recv().expect("granular revoke persists").snapshot;
         assert_eq!(
             snap.always,
             vec![AlwaysGrant {
@@ -944,5 +1020,58 @@ mod tests {
         let r = seeded();
         r.revoke(1, Some("10"), Some("a"));
         assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+    }
+
+    #[test]
+    fn purge_thread_cancels_open_asks_and_revokes_grants() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![],
+        });
+        let (id1, _rx1) = r.request(1, "10", "codex", "Run: a", "a");
+        let (id2, _rx2) = r.request(1, "11", "codex", "Run: b", "b");
+        let (keep, _rxk) = r.request(2, "20", "codex", "Run: c", "c");
+
+        r.purge_thread(1);
+
+        // thread 1's grant is revoked...
+        assert!(r.auto_decision(1, "10", "x").is_none());
+        // ...and its open asks cancelled, while another thread's ask survives.
+        let open: Vec<u64> = r.open().iter().map(|a| a.id).collect();
+        assert_eq!(open, vec![keep]);
+        assert!(!open.contains(&id1) && !open.contains(&id2));
+    }
+
+    #[test]
+    fn purge_dir_cancels_that_dirs_asks_and_revokes_its_grant() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![
+                FullGrant {
+                    thread: 1,
+                    dir: "10".into(),
+                },
+                FullGrant {
+                    thread: 1,
+                    dir: "11".into(),
+                },
+            ],
+            always: vec![],
+        });
+        let (drop_id, _r1) = r.request(1, "10", "codex", "Run: a", "a");
+        let (keep_id, _r2) = r.request(1, "11", "codex", "Run: b", "b");
+
+        r.purge_dir(1, "10");
+
+        // (1,"10") grant + ask gone; the sibling dir (1,"11") is untouched.
+        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert_eq!(r.auto_decision(1, "11", "x"), Some(Decision::Allow));
+        let open: Vec<u64> = r.open().iter().map(|a| a.id).collect();
+        assert_eq!(open, vec![keep_id]);
+        assert!(!open.contains(&drop_id));
     }
 }

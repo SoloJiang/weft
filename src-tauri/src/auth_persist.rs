@@ -6,12 +6,15 @@
 //! place BEFORE `spawn_revive` re-drives in-flight tasks, so a revived worker
 //! runs unattended under the access the human already granted.
 //!
-//! Single source: the registry emits a fresh `GrantSnapshot` on every real grant
-//! change; this consumer is the ONLY writer, and boot seeds the registry from the
-//! store. `dangerous` mode is intentionally not here — it is a global toggle the
-//! frontend already persists.
+//! Single ordered writer: the registry enqueues a `PersistMsg` on every real grant
+//! change; THIS consumer is the ONLY writer, draining the channel in FIFO order so
+//! the last-enqueued snapshot is the last on disk (never a parallel write that
+//! could let a stale snapshot land after a fresh one). A grant-changing command
+//! calls `flush` to enqueue an ack'd write and await its completion, so it reports
+//! success only after the change is durable. Boot seeds the registry from the store.
+//! `dangerous` mode is intentionally not here — a global toggle the frontend persists.
 
-use crate::ask::{AskRegistry, GrantSnapshot};
+use crate::ask::{AskRegistry, GrantSnapshot, PersistMsg};
 use crate::store::{repo, Db};
 use tauri::{AppHandle, Manager};
 
@@ -35,23 +38,19 @@ pub async fn load_snapshot(db: &Db) -> GrantSnapshot {
     })
 }
 
-/// Write the current grants, or clear the row entirely when empty. Best-effort:
-/// a failed write never breaks the (already applied) in-memory grant.
-pub async fn persist_snapshot(db: &Db, snap: &GrantSnapshot) {
+/// Write the current grants, or clear the row entirely when empty. Returns the
+/// error as a String so the single writer can propagate it to a command awaiting
+/// durability (rather than silently swallowing a failed write).
+pub async fn persist_snapshot(db: &Db, snap: &GrantSnapshot) -> Result<(), String> {
     let result = if snap.is_empty() {
         repo::delete_setting(db, K_AUTH_GRANTS).await
     } else {
         match serde_json::to_string(snap) {
             Ok(json) => repo::set_setting(db, K_AUTH_GRANTS, &json).await,
-            Err(err) => {
-                eprintln!("[weft] failed to serialize auth_grants: {err}");
-                return;
-            }
+            Err(err) => return Err(format!("serialize auth_grants: {err}")),
         }
     };
-    if let Err(err) = result {
-        eprintln!("[weft] failed to persist auth_grants: {err}");
-    }
+    result.map_err(|err| format!("persist auth_grants: {err}"))
 }
 
 /// Seed the registry from the store at boot — call BEFORE anything serves asks
@@ -60,27 +59,52 @@ pub async fn seed(db: &Db, asks: &AskRegistry) {
     asks.seed_grants(load_snapshot(db).await);
 }
 
-/// Durably write the registry's CURRENT grants now and await it — for a
+/// Durably persist the registry's current grants and await it — for a
 /// grant-changing command that must not report success until the change is on
-/// disk. The `spawn` consumer's fire-and-forget emit could be lost on an
-/// immediate quit/crash, resurrecting a just-revoked grant; awaiting this closes
-/// that window. Idempotent with the consumer (both write the same snapshot); the
-/// consumer stays as the backstop for non-command paths (IM / remote bus answers).
-pub async fn flush(db: &Db, asks: &AskRegistry) {
-    persist_snapshot(db, &asks.snapshot_grants()).await;
+/// disk. Routes through the SAME single writer as every other persist (never a
+/// parallel write), so writes stay ordered and a stale snapshot can't land after
+/// this one — the ordering guarantee round-1's parallel flush lacked. Returns the
+/// store error so the command can surface a failed write. A no-op `Ok` when no
+/// consumer is installed (only a unit test without one).
+pub async fn flush(asks: &AskRegistry) -> Result<(), String> {
+    match asks.request_persist_ack() {
+        Some(rx) => rx
+            .await
+            .unwrap_or_else(|_| Err("auth_grants writer dropped".into())),
+        None => Ok(()),
+    }
 }
 
-/// Install the persist consumer: mirror every grant change to the store. Called
-/// once at startup (mirrors `trail::spawn`).
+/// The single ordered writer: drain persist messages in FIFO order, write each to
+/// the store, and signal any ack with the result. Being the ONLY writer over an
+/// ordered channel is what guarantees the last-enqueued snapshot is the last on
+/// disk, so a revoke awaited via `flush` cannot be resurrected by a stale write.
+pub(crate) async fn run_consumer(
+    db: Db,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<PersistMsg>,
+) {
+    while let Some(msg) = rx.recv().await {
+        let result = persist_snapshot(&db, &msg.snapshot).await;
+        match msg.ack {
+            Some(ack) => {
+                let _ = ack.send(result);
+            }
+            None => {
+                if let Err(err) = result {
+                    eprintln!("[weft] auth_grants persist failed: {err}");
+                }
+            }
+        }
+    }
+}
+
+/// Install the single persist writer: mirror every grant change to the store.
+/// Called once at startup (mirrors `trail::spawn`).
 pub fn spawn(app: AppHandle) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GrantSnapshot>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PersistMsg>();
     app.state::<AskRegistry>().set_persist_notifier(tx);
     let db = app.state::<Db>().inner().clone();
-    tauri::async_runtime::spawn(async move {
-        while let Some(snap) = rx.recv().await {
-            persist_snapshot(&db, &snap).await;
-        }
-    });
+    tauri::async_runtime::spawn(run_consumer(db, rx));
 }
 
 #[cfg(test)]
@@ -115,15 +139,15 @@ mod tests {
     #[tokio::test]
     async fn persist_then_load_round_trips() {
         let db = mem().await;
-        persist_snapshot(&db, &sample()).await;
+        persist_snapshot(&db, &sample()).await.unwrap();
         assert_eq!(load_snapshot(&db).await, sample());
     }
 
     #[tokio::test]
     async fn persist_empty_clears_a_previous_value() {
         let db = mem().await;
-        persist_snapshot(&db, &sample()).await;
-        persist_snapshot(&db, &GrantSnapshot::default()).await;
+        persist_snapshot(&db, &sample()).await.unwrap();
+        persist_snapshot(&db, &GrantSnapshot::default()).await.unwrap();
         assert!(load_snapshot(&db).await.is_empty());
     }
 
@@ -137,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn seed_loads_persisted_grants_into_the_registry() {
         let db = mem().await;
-        persist_snapshot(&db, &sample()).await;
+        persist_snapshot(&db, &sample()).await.unwrap();
         let asks = AskRegistry::new();
         seed(&db, &asks).await;
         assert_eq!(asks.auto_decision(1, "10", "anything"), Some(Decision::Allow));
@@ -152,11 +176,11 @@ mod tests {
     /// exactly as `spawn`'s consumer loop does — so these end-to-end tests prove
     /// the real wiring, not a hand-built blob.
     async fn drain_once(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<GrantSnapshot>,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PersistMsg>,
         db: &Db,
     ) {
-        let snap = rx.recv().await.expect("a grant change was emitted");
-        persist_snapshot(db, &snap).await;
+        let msg = rx.recv().await.expect("a grant change was emitted");
+        persist_snapshot(db, &msg.snapshot).await.unwrap();
     }
 
     /// Acceptance #1: granted Full access survives an app restart — the revived
@@ -205,19 +229,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_durably_writes_current_grants_without_the_consumer() {
+    async fn flush_routes_through_the_writer_and_is_durable() {
         let db = mem().await;
         let asks = AskRegistry::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        asks.set_persist_notifier(tx);
+        tokio::spawn(run_consumer(db.clone(), rx));
         asks.seed_grants(sample());
-        // No persist consumer installed — flush must write on its own (this is the
-        // durability guarantee for grant-changing commands that await it).
-        flush(&db, &asks).await;
+        // flush enqueues to the single writer and awaits its store write
+        flush(&asks).await.unwrap();
         assert_eq!(load_snapshot(&db).await, sample());
         // a revoke then flush leaves only the surviving grant on disk
         asks.revoke_thread(1);
-        flush(&db, &asks).await;
+        flush(&asks).await.unwrap();
         let snap = load_snapshot(&db).await;
         assert!(snap.full.is_empty());
         assert_eq!(snap.always.len(), 1);
+    }
+
+    /// The ordering guarantee round-1 lacked: even with a stale Full-grant snapshot
+    /// still queued ahead of it, a revoke awaited via `flush` is the LAST write, so
+    /// an immediate crash/quit leaves the grant revoked on restart — it must not be
+    /// resurrected by the queued grant. (Fails under round-1's parallel flush.)
+    #[tokio::test]
+    async fn revoke_flushed_then_crash_does_not_resurrect_the_grant() {
+        let db = mem().await;
+        let asks = AskRegistry::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        asks.set_persist_notifier(tx);
+
+        // grant then revoke BEFORE the writer starts — a stale {full} snapshot is now
+        // queued ahead of the {} revoke, exactly the round-1 race window.
+        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x");
+        assert!(asks.answer(id, crate::ask::Answer::Full)); // queues {full}
+        asks.revoke_grant(7, "42", None); // queues {}
+
+        // start the single writer, await the revoke's durability, then "crash".
+        let writer = tokio::spawn(run_consumer(db.clone(), rx));
+        flush(&asks).await.unwrap();
+        writer.abort();
+
+        // restart: the store must reflect the revoke, not the earlier grant.
+        let revived = AskRegistry::new();
+        seed(&db, &revived).await;
+        assert!(
+            revived.auto_decision(7, "42", "x").is_none(),
+            "a flushed revoke must survive a crash; the queued grant must NOT resurrect"
+        );
     }
 }
