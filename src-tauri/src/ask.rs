@@ -504,6 +504,16 @@ impl AskRegistry {
     /// matters as much as revoking: after the thread rows are gone a lingering card,
     /// if answered Full/Always, would `answer` a FRESH grant for the deleted id and
     /// reopen the id-reuse hole. Used by delete_thread.
+    ///
+    /// SAFETY INVARIANT (applies to all delete-time cleanup here — `purge_dir`,
+    /// `revoke_thread`, `revoke_grant`, and the workspace/repo delete paths): this
+    /// cleanup is DEFENSE-IN-DEPTH. The real guard against a deleted issue's grant
+    /// being auto-approved for a DIFFERENT future issue is that `thread`/`direction`
+    /// ids are SQLite `AUTOINCREMENT` and are never reused — so a stale grant for a
+    /// deleted (thread, dir) is inert forever. If that schema invariant ever changes
+    /// (id reuse becomes possible), re-evaluate the deferred PR #87 Codex round-3
+    /// findings 1/2/4/5 (quiesce producers before purge, extra delete-path coverage,
+    /// propagate cleanup-write failures) — a stale grant could then be inherited.
     pub fn purge_thread(&self, thread: i32) {
         let ids: Vec<u64> = {
             let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
