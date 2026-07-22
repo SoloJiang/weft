@@ -72,13 +72,6 @@ const SESSION_STATUS: Record<TurnState, SessionStatus> = {
   stopped: "exited",
 };
 
-/** A session with an in-flight turn — running OR stalled (still busy, just gone
- * quiet). Single source of truth for "count this as live/working" so a stalled
- * task stays in live counts instead of vanishing (which would read as finished). */
-export function isLiveStatus(s: SessionStatus): boolean {
-  return s === "running" || s === "stalled";
-}
-
 /** A turn still in flight — busy OR stalled (the backend turn is busy either way;
  * stalled just means it went quiet). Single source of truth for "keep the Stop
  * button and queue sends", so a stalled turn stays interruptible from the composer. */

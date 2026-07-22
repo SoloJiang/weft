@@ -3634,15 +3634,16 @@ pub(crate) fn stall_verdict(
     stall_secs > 0 && busy && !has_open_ask && quiet_secs >= stall_secs
 }
 
-/// Whether the turn is awaiting a genuine human answer on the bus — an open
-/// `ask_human` from its OWN `dir` that is NOT our own stall notice
-/// (`own_notice_id`). Such a turn is legitimately blocked on the human, not
-/// stalled — so it must be excluded before `stall_verdict`, exactly like a
-/// pending permission ask. Excluding `own_notice_id` stops the stall notice we
-/// post from self-suppressing the very stall it reports. Pure → unit-tested.
-fn awaiting_human_bus_ask(open: &[crate::bus::Ask], dir: &str, own_notice_id: u64) -> bool {
-    open.iter()
-        .any(|a| a.from == dir && a.id != own_notice_id)
+/// Does open permission ask `(k_dir, k_thread)` block engine `ask_dir`@`thread_id`
+/// from the runaway/stall gates (i.e. it's legitimately waiting on the human)?
+/// Worker asks match by dir. A lead ask uses dir "" and "lead" repeats across
+/// threads, so it matches only WITHIN its own thread — otherwise one issue's lead
+/// permission ask would suppress the stall AND the kill for every other issue's
+/// lead. Bus `ask_human` questions are deliberately NOT consulted: that tool is
+/// non-blocking, so a turn awaiting a bus answer is idle (never stall-checked),
+/// and a busy+silent turn that left a bus question open is genuinely stuck. Pure.
+fn ask_blocks(k_dir: &str, k_thread: i32, ask_dir: &str, thread_id: i32) -> bool {
+    k_dir == ask_dir || (ask_dir == "lead" && k_dir.is_empty() && k_thread == thread_id)
 }
 
 /// Per-engine result of one watchdog sweep, computed UNDER the engine lock and
@@ -3681,6 +3682,15 @@ fn cancel_stall_notice(app: &AppHandle, thread: i32, ask_id: u64) {
             let _ = app.emit("needs-you://changed", thread);
         }
     }
+}
+
+/// Is our stall notice `ask_id` still an OPEN human ask? The notice is a normal
+/// `ask_human`, so the user can answer it — that drops it from `open_asks`, and
+/// the watchdog re-posts while the turn stays stalled. No bus → assume open.
+fn stall_notice_still_open(app: &AppHandle, thread: i32, ask_id: u64) -> bool {
+    app.try_state::<crate::bus::BusRegistry>()
+        .map(|b| b.open_asks(thread).iter().any(|a| a.id == ask_id))
+        .unwrap_or(true)
 }
 
 fn stall_notice_text(stall_secs: u64) -> String {
@@ -3763,35 +3773,22 @@ pub fn spawn_watchdog(app: AppHandle) {
                         let quiet = inner.clock.last_activity.elapsed().as_secs();
                         // Permission ask (AskRegistry) — feeds the runaway KILL gate,
                         // unchanged.
-                        let has_perm_ask = app
+                        // Legitimately waiting on the human (an open PERMISSION ask) isn't
+                        // stalled — the SAME gate feeds the stall check and the kill below.
+                        // Bus `ask_human` is deliberately NOT consulted (non-blocking: a
+                        // real wait is idle, and a busy+silent turn with an open bus
+                        // question is genuinely stuck → it SHOULD read stalled). Lead asks
+                        // are thread-scoped (see ask_blocks).
+                        let has_open_ask = app
                             .try_state::<crate::ask::AskRegistry>()
                             .map(|a| {
                                 a.open().iter().any(|k| {
-                                    k.dir == inner.ask_dir
-                                        || (inner.ask_dir == "lead" && k.dir.is_empty())
+                                    ask_blocks(&k.dir, k.thread, &inner.ask_dir, inner.thread_id)
                                 })
                             })
                             .unwrap_or(false);
                         let was_stalled = stall_notices.contains_key(&key);
-                        // A turn genuinely blocked ON THE HUMAN isn't stalled — and that
-                        // includes a bus `ask_human` question the agent is awaiting, not
-                        // just a permission ask. Exclude our OWN stall notice (same dir)
-                        // so it never self-suppresses. Stall gate only; the kill stays on
-                        // has_perm_ask so its behavior is unchanged.
-                        let my_notice_id =
-                            stall_notices.get(&key).map(|(_, id)| *id).unwrap_or(0);
-                        let has_human_ask = has_perm_ask
-                            || app
-                                .try_state::<crate::bus::BusRegistry>()
-                                .map(|b| {
-                                    awaiting_human_bus_ask(
-                                        &b.open_asks(inner.thread_id),
-                                        &inner.ask_dir,
-                                        my_notice_id,
-                                    )
-                                })
-                                .unwrap_or(false);
-                        let now = stall_verdict(true, quiet, stall_secs, has_human_ask);
+                        let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
                         // (2) Stall visibility. Re-assert `stalled` EVERY sweep while
                         // stalled (not only on the flip) so a clobbering push — a
                         // queue-change `busy`, or a post-reload hydration snapshot that
@@ -3818,9 +3815,9 @@ pub fn spawn_watchdog(app: AppHandle) {
                             stall_flip: if now != was_stalled { Some(now) } else { None },
                             thread: inner.thread_id,
                             dir: inner.ask_dir.clone(),
-                            // (1) Runaway kill — gated on the caps + permission ask only,
-                            // unchanged.
-                            kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_perm_ask),
+                            // (1) Runaway kill — same caps + permission-ask gate, now
+                            // correctly thread-scoped for lead asks (see ask_blocks).
+                            kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
                         }
                     }
                 };
@@ -3849,7 +3846,22 @@ pub fn spawn_watchdog(app: AppHandle) {
                                     cancel_stall_notice(&app, th, id);
                                 }
                             }
-                            None => {}
+                            None => {
+                                // Still stalled AND the user answered/dismissed our notice
+                                // (it's a normal ask_human, so answerable) → re-post so the
+                                // self-clearing item stays present for the rest of the
+                                // episode. Answering nudges the worker; if it recovers the
+                                // notice clears next sweep, if it stays stalled the re-post
+                                // is warranted. No-op while running (no tracked notice).
+                                if let Some((th, id)) = stall_notices.get(&key).copied() {
+                                    if id != 0 && !stall_notice_still_open(&app, th, id) {
+                                        let new_id =
+                                            post_stall_notice(&app, th, &dir, stall_secs)
+                                                .unwrap_or(0);
+                                        stall_notices.insert(key, (th, new_id));
+                                    }
+                                }
+                            }
                         }
                         let Some(reason) = kill else { continue };
                         // A kill supersedes the stall hint — retract it so the user
@@ -5668,16 +5680,16 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_human_bus_ask_excludes_own_stall_notice() {
-        // A turn whose agent posted a bus question to the human is blocked, not
-        // stalled → suppress. Our OWN stall notice must NOT suppress (else it
-        // self-cancels the very stall it reports).
-        let bus = crate::bus::BusRegistry::new();
-        let notice = bus.ask_human(1, "42", "⏳ stall notice"); // our stall notice, dir 42
-        assert!(!awaiting_human_bus_ask(&bus.open_asks(1), "42", notice)); // only ours → not blocked
-        let _q = bus.ask_human(1, "42", "am I on track?"); // agent's real question, same dir
-        assert!(awaiting_human_bus_ask(&bus.open_asks(1), "42", notice)); // real one → blocked
-        assert!(!awaiting_human_bus_ask(&bus.open_asks(1), "99", notice)); // other dir → not
+    fn ask_blocks_scopes_lead_by_thread() {
+        // Worker ask matches its own dir.
+        assert!(ask_blocks("42", 1, "42", 1));
+        assert!(!ask_blocks("42", 1, "43", 1));
+        // A lead ask (dir "") blocks its OWN thread's lead only — NOT a lead in
+        // another issue (the pre-existing cross-thread suppression bug this fixes).
+        assert!(ask_blocks("", 5, "lead", 5));
+        assert!(!ask_blocks("", 5, "lead", 6));
+        // A worker's empty-dir ask isn't a lead ask.
+        assert!(!ask_blocks("", 5, "42", 5));
     }
 
     #[test]
