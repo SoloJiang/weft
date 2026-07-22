@@ -273,6 +273,11 @@ impl Inner {
 #[derive(Default, Clone)]
 pub struct AskRegistry {
     inner: Arc<Mutex<Inner>>,
+    /// Serializes the durable-revoke command path (mutate → acked flush → rollback).
+    /// Without it, two overlapping revokes of the same grant can race: the earlier
+    /// one's rollback (on a failed write) re-seeds a grant a later, already-succeeded
+    /// revoke removed, so the session resumes auto-approving despite a "success".
+    revoke_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn now() -> u64 {
@@ -285,6 +290,13 @@ fn now() -> u64 {
 impl AskRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Acquire the durable-revoke serialization lock — a revoke command holds it across
+    /// its whole mutate → acked flush → rollback so overlapping revokes can't let an
+    /// earlier failed revoke's rollback resurrect what a later succeeded revoke removed.
+    pub async fn lock_revoke(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.revoke_lock.lock().await
     }
 
     /// 安装 IM 桥的通知器（重装时替换旧的；旧消费者随 sender drop 收尾）。
@@ -1174,6 +1186,17 @@ mod tests {
             rx.try_recv().is_err(),
             "revoke_no_emit must not emit a persist message"
         );
+    }
+
+    #[tokio::test]
+    async fn lock_revoke_is_exclusive() {
+        let r = AskRegistry::new();
+        let _held = r.lock_revoke().await;
+        // While one durable revoke holds the lock, a second must block (they serialize),
+        // so an earlier revoke's rollback can't race a later revoke.
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), r.lock_revoke()).await;
+        assert!(blocked.is_err(), "the durable-revoke lock must be exclusive");
     }
 
     #[test]

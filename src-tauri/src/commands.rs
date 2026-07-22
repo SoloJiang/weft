@@ -2043,6 +2043,10 @@ async fn revoke_grant_durable(
     dir: Option<&str>,
     summary: Option<&str>,
 ) -> Result<(), String> {
+    // Serialize the whole mutate → flush → rollback: two overlapping revokes of the
+    // same grant would otherwise race, an earlier failed revoke's rollback resurrecting
+    // a grant a later, already-succeeded revoke removed.
+    let _guard = asks.lock_revoke().await;
     let removed = asks.revoke_no_emit(thread, dir, summary);
     if let Err(err) = crate::auth_persist::flush(asks).await {
         asks.seed_grants(removed);
