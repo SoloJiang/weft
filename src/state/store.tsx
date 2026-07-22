@@ -1466,11 +1466,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // a revived worker's first observed state IS the idle push (no busy push).
           const prevTurn = lastWorkerTurnRef.current[sid];
           lastWorkerTurnRef.current[sid] = p.state;
-          // Clear the running-tool label only at a real turn END (idle/stopped), so
-          // it survives BOTH a stall push and the stall→busy recovery — the amber dot
-          // keeps carrying "what it's stuck on". A turn-start busy is always preceded
-          // by an idle/stopped that already cleared, so not clearing on busy is safe.
-          if (p.state === "idle" || p.state === "stopped")
+          // Clear the running-tool label on any real turn transition (busy / idle /
+          // stopped) — including a PROMOTED queued turn, which emits "busy" with no
+          // intervening idle. Keep it ONLY on a stall push, so the amber dot still
+          // carries "what it's stuck on" through the stall episode (the watchdog
+          // re-emits "stalled" each sweep, so the label persists across the stall).
+          if (p.state !== "stalled")
             setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queue: p.queue } }));
           setSessions((m) =>
@@ -1503,9 +1504,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
 
         } else {
-          // Same as the worker path: clear only at a real turn end (idle/stopped),
-          // so the lead's tool label survives the stall push and the recovery.
-          if (p.state === "idle" || p.state === "stopped")
+          // Same as the worker path: clear on any real turn transition, keep only on
+          // a stall push so the lead's tool label persists through the stall episode.
+          if (p.state !== "stalled")
             setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
             ...t,

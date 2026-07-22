@@ -3636,14 +3636,21 @@ pub(crate) fn stall_verdict(
 
 /// Does open permission ask `(k_dir, k_thread)` block engine `ask_dir`@`thread_id`
 /// from the runaway/stall gates (i.e. it's legitimately waiting on the human)?
-/// Worker asks match by dir. A lead ask uses dir "" and "lead" repeats across
-/// threads, so it matches only WITHIN its own thread — otherwise one issue's lead
-/// permission ask would suppress the stall AND the kill for every other issue's
-/// lead. Bus `ask_human` questions are deliberately NOT consulted: that tool is
-/// non-blocking, so a turn awaiting a bus answer is idle (never stall-checked),
-/// and a busy+silent turn that left a bus question open is genuinely stuck. Pure.
+/// A lead's asks all carry dir "lead" (the ask hook is injected with "lead" —
+/// commands.rs:195 — and the engine's `ask_dir` is "lead" too), which repeats
+/// across EVERY thread, so a lead ask blocks ONLY its own thread's lead —
+/// otherwise one issue's lead permission ask would suppress the stall AND the
+/// kill for every other issue's lead. A worker's dir is a globally-unique
+/// direction id, so it matches directly. Bus `ask_human` is deliberately NOT
+/// consulted: that tool is non-blocking, so a turn awaiting a bus answer is idle
+/// (never stall-checked), and a busy+silent turn that left a bus question open is
+/// genuinely stuck. Pure → unit-tested.
 fn ask_blocks(k_dir: &str, k_thread: i32, ask_dir: &str, thread_id: i32) -> bool {
-    k_dir == ask_dir || (ask_dir == "lead" && k_dir.is_empty() && k_thread == thread_id)
+    if ask_dir == "lead" {
+        (k_dir == "lead" || k_dir.is_empty()) && k_thread == thread_id
+    } else {
+        k_dir == ask_dir
+    }
 }
 
 /// Per-engine result of one watchdog sweep, computed UNDER the engine lock and
@@ -5681,15 +5688,20 @@ mod tests {
 
     #[test]
     fn ask_blocks_scopes_lead_by_thread() {
-        // Worker ask matches its own dir.
+        // Worker ask matches its own (globally-unique) direction id.
         assert!(ask_blocks("42", 1, "42", 1));
         assert!(!ask_blocks("42", 1, "43", 1));
-        // A lead ask (dir "") blocks its OWN thread's lead only — NOT a lead in
-        // another issue (the pre-existing cross-thread suppression bug this fixes).
+        // A lead's ask carries dir "lead" — it blocks its OWN thread's lead only,
+        // NOT a lead in another issue (both leads' asks are dir "lead"). This is the
+        // cross-thread suppression bug: `k_dir == ask_dir` alone would match across
+        // threads, so the thread scope is essential.
+        assert!(ask_blocks("lead", 5, "lead", 5));
+        assert!(!ask_blocks("lead", 5, "lead", 6));
+        // Defensive: an empty-dir lead ask is thread-scoped the same way.
         assert!(ask_blocks("", 5, "lead", 5));
         assert!(!ask_blocks("", 5, "lead", 6));
-        // A worker's empty-dir ask isn't a lead ask.
-        assert!(!ask_blocks("", 5, "42", 5));
+        // A worker ask isn't a lead ask (a worker never has dir "lead").
+        assert!(!ask_blocks("42", 5, "lead", 5));
     }
 
     #[test]
