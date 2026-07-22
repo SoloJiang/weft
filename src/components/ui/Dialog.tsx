@@ -1,10 +1,22 @@
 import * as RD from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { cn } from "../../lib/cn";
 
 export const Dialog = RD.Root;
 export const DialogTrigger = RD.Trigger;
+
+/**
+ * A modal layer must not leak synthetic clicks to background UI. React replays
+ * portal events through the OWNER tree (where `<Portal>` sits in JSX), not the
+ * DOM tree — so a dialog rendered inside a clickable ancestor (e.g. a kanban
+ * card `<button onClick>`) would otherwise fire that ancestor's onClick when the
+ * user clicks the overlay, the close button, or any control inside the dialog.
+ * Stopping propagation on the overlay + content (children bubble through it)
+ * seals the whole modal. This does not affect Radix's own dismiss, which runs on
+ * native pointer listeners, nor inner controls, whose handlers fire first.
+ */
+const sealModalClicks = (e: MouseEvent<HTMLElement>) => e.stopPropagation();
 
 export function DialogContent({
   title,
@@ -19,8 +31,12 @@ export function DialogContent({
 }) {
   return (
     <RD.Portal>
-      <RD.Overlay className="weft-overlay fixed inset-0 z-50 bg-black/55 backdrop-blur-[1px]" />
+      <RD.Overlay
+        onClick={sealModalClicks}
+        className="weft-overlay fixed inset-0 z-50 bg-black/55 backdrop-blur-[1px]"
+      />
       <RD.Content
+        onClick={sealModalClicks}
         className={cn(
           "weft-pop fixed left-1/2 top-1/2 z-50 w-[min(440px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2",
           "rounded-[var(--radius-lg)] border border-border bg-surface p-5 shadow-[0_8px_28px_-8px_rgba(0,0,0,0.6)]",
@@ -69,9 +85,13 @@ export function DialogPanel({
 }) {
   return (
     <RD.Portal>
-      <RD.Overlay className="weft-overlay fixed inset-0 z-50 bg-black/55 backdrop-blur-[1px]" />
+      <RD.Overlay
+        onClick={sealModalClicks}
+        className="weft-overlay fixed inset-0 z-50 bg-black/55 backdrop-blur-[1px]"
+      />
       <RD.Content
         aria-describedby={undefined}
+        onClick={sealModalClicks}
         className={cn(
           "weft-pop fixed left-1/2 top-1/2 z-50 flex max-h-[86vh] w-[min(900px,calc(100vw-3rem))]",
           "-translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-[var(--radius-lg)]",

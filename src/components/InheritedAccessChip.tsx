@@ -12,8 +12,11 @@ import { Button } from "./ui/Button";
  * it in one click, instead of it silently carrying over with no way to undo.
  *
  * Rendered inside the kanban card's `<button>`, so the trigger is a `<span
- * role="button">` (a nested `<button>` would be invalid DOM), and every handler
- * stops propagation so acting on the chip never opens the issue behind it.
+ * role="button">` (a nested `<button>` would be invalid DOM) whose own click
+ * stops propagation to avoid opening the card. The dialog's controls (overlay,
+ * close, Cancel) sit in a portal but still bubble synthetic clicks through the
+ * owner tree back to the card — `DialogContent` seals those so acting inside the
+ * dialog never opens the issue behind it.
  */
 export function InheritedAccessChip({ threadId }: { threadId: number }) {
   const { revokeAuthGrant } = useStore();
