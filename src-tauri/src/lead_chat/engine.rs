@@ -3634,16 +3634,15 @@ pub(crate) fn stall_verdict(
     stall_secs > 0 && busy && !has_open_ask && quiet_secs >= stall_secs
 }
 
-/// Turn-state string to push for a stall-visibility flip, or `None` when nothing
-/// changed. `prev` is the previously-emitted stalled bit (`None` = never seen →
-/// treated as "was showing busy", since turn-start already pushed busy), `now` is
-/// the current `stall_verdict`. Transition-only: never re-pushes "busy" on the
-/// first observation, never repeats while stalled. Pure → unit-tested.
-fn stall_push(prev: Option<bool>, now: bool) -> Option<&'static str> {
-    if prev.unwrap_or(false) == now {
-        return None;
-    }
-    Some(if now { "stalled" } else { "busy" })
+/// Whether the turn is awaiting a genuine human answer on the bus — an open
+/// `ask_human` from its OWN `dir` that is NOT our own stall notice
+/// (`own_notice_id`). Such a turn is legitimately blocked on the human, not
+/// stalled — so it must be excluded before `stall_verdict`, exactly like a
+/// pending permission ask. Excluding `own_notice_id` stops the stall notice we
+/// post from self-suppressing the very stall it reports. Pure → unit-tested.
+fn awaiting_human_bus_ask(open: &[crate::bus::Ask], dir: &str, own_notice_id: u64) -> bool {
+    open.iter()
+        .any(|a| a.from == dir && a.id != own_notice_id)
 }
 
 /// Per-engine result of one watchdog sweep, computed UNDER the engine lock and
@@ -3685,8 +3684,11 @@ fn cancel_stall_notice(app: &AppHandle, thread: i32, ask_id: u64) {
 }
 
 fn stall_notice_text(stall_secs: u64) -> String {
+    // A self-healing NOTICE, not a question awaiting an answer — so the user isn't
+    // confused when it auto-withdraws on recovery (same tone as the kill/revive
+    // human-notices). "无需回复" + "自动消失" make the self-clearing explicit.
     format!(
-        "⏳ 停滞:已静默超过 {},可能卡住了。看一眼,或等它自行恢复(恢复后本提示自动撤除)。",
+        "⏳ 任务停滞:已静默超过 {},可能卡住了。无需回复 —— 恢复输出后本提示会自动消失;想介入就直接查看这个任务。",
         human_dur(stall_secs)
     )
 }
@@ -3759,7 +3761,9 @@ pub fn spawn_watchdog(app: AppHandle) {
                     } else {
                         let busy = inner.clock.started.map(|t| t.elapsed().as_secs());
                         let quiet = inner.clock.last_activity.elapsed().as_secs();
-                        let has_open_ask = app
+                        // Permission ask (AskRegistry) — feeds the runaway KILL gate,
+                        // unchanged.
+                        let has_perm_ask = app
                             .try_state::<crate::ask::AskRegistry>()
                             .map(|a| {
                                 a.open().iter().any(|k| {
@@ -3769,14 +3773,44 @@ pub fn spawn_watchdog(app: AppHandle) {
                             })
                             .unwrap_or(false);
                         let was_stalled = stall_notices.contains_key(&key);
-                        let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
-                        // (2) Stall visibility — emit only on a running↔stalled flip.
-                        if let Some(state) = stall_push(Some(was_stalled), now) {
+                        // A turn genuinely blocked ON THE HUMAN isn't stalled — and that
+                        // includes a bus `ask_human` question the agent is awaiting, not
+                        // just a permission ask. Exclude our OWN stall notice (same dir)
+                        // so it never self-suppresses. Stall gate only; the kill stays on
+                        // has_perm_ask so its behavior is unchanged.
+                        let my_notice_id =
+                            stall_notices.get(&key).map(|(_, id)| *id).unwrap_or(0);
+                        let has_human_ask = has_perm_ask
+                            || app
+                                .try_state::<crate::bus::BusRegistry>()
+                                .map(|b| {
+                                    awaiting_human_bus_ask(
+                                        &b.open_asks(inner.thread_id),
+                                        &inner.ask_dir,
+                                        my_notice_id,
+                                    )
+                                })
+                                .unwrap_or(false);
+                        let now = stall_verdict(true, quiet, stall_secs, has_human_ask);
+                        // (2) Stall visibility. Re-assert `stalled` EVERY sweep while
+                        // stalled (not only on the flip) so a clobbering push — a
+                        // queue-change `busy`, or a post-reload hydration snapshot that
+                        // only knows busy — self-corrects within one interval; emit
+                        // `busy` once on the recovery flip.
+                        if now {
                             emit_turn_push(
                                 &app,
                                 inner.thread_id,
                                 inner.session_id,
-                                state,
+                                "stalled",
+                                queue_items(&inner.turn),
+                            );
+                        } else if was_stalled {
+                            emit_turn_push(
+                                &app,
+                                inner.thread_id,
+                                inner.session_id,
+                                "busy",
                                 queue_items(&inner.turn),
                             );
                         }
@@ -3784,8 +3818,9 @@ pub fn spawn_watchdog(app: AppHandle) {
                             stall_flip: if now != was_stalled { Some(now) } else { None },
                             thread: inner.thread_id,
                             dir: inner.ask_dir.clone(),
-                            // (1) Runaway kill — gated on the caps, unchanged.
-                            kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
+                            // (1) Runaway kill — gated on the caps + permission ask only,
+                            // unchanged.
+                            kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_perm_ask),
                         }
                     }
                 };
@@ -5625,24 +5660,24 @@ mod tests {
     }
 
     #[test]
-    fn stall_push_emits_only_on_transition() {
-        // First sweep of a busy turn: never seen → treat as "was busy".
-        assert_eq!(stall_push(None, false), None); // still running → silent
-        assert_eq!(stall_push(None, true), Some("stalled")); // straight to stalled → show
-        // Real flips.
-        assert_eq!(stall_push(Some(false), true), Some("stalled")); // running → stalled
-        assert_eq!(stall_push(Some(true), false), Some("busy")); // recovered → running
-        // No-change ticks stay silent (no per-sweep spam).
-        assert_eq!(stall_push(Some(true), true), None);
-        assert_eq!(stall_push(Some(false), false), None);
-    }
-
-    #[test]
     fn stall_hint_default_is_eight_minutes() {
         // Regression sentinel: 480s (8 min) is a human decision (issue #5
         // decision 2), NOT a test-fast value. This trips if the production
         // default is silently shortened (e.g. back to the rejected 90s).
         assert_eq!(STALL_HINT_DEFAULT_SECS, 480);
+    }
+
+    #[test]
+    fn awaiting_human_bus_ask_excludes_own_stall_notice() {
+        // A turn whose agent posted a bus question to the human is blocked, not
+        // stalled → suppress. Our OWN stall notice must NOT suppress (else it
+        // self-cancels the very stall it reports).
+        let bus = crate::bus::BusRegistry::new();
+        let notice = bus.ask_human(1, "42", "⏳ stall notice"); // our stall notice, dir 42
+        assert!(!awaiting_human_bus_ask(&bus.open_asks(1), "42", notice)); // only ours → not blocked
+        let _q = bus.ask_human(1, "42", "am I on track?"); // agent's real question, same dir
+        assert!(awaiting_human_bus_ask(&bus.open_asks(1), "42", notice)); // real one → blocked
+        assert!(!awaiting_human_bus_ask(&bus.open_asks(1), "99", notice)); // other dir → not
     }
 
     #[test]
