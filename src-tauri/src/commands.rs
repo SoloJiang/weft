@@ -2028,6 +2028,52 @@ pub fn list_auth_grants(
 /// - `dir == Some`, `summary == None` → clear that one task's `(thread, dir)` grant
 ///   (its full access + every always-rule).
 /// - `dir == Some`, `summary == Some` → drop only that one always-rule.
+/// The grants in `before` but not `after` — i.e. exactly what a revoke removed.
+fn removed_grants(
+    before: &crate::ask::GrantSnapshot,
+    after: &crate::ask::GrantSnapshot,
+) -> crate::ask::GrantSnapshot {
+    crate::ask::GrantSnapshot {
+        full: before
+            .full
+            .iter()
+            .filter(|g| !after.full.contains(g))
+            .cloned()
+            .collect(),
+        always: before
+            .always
+            .iter()
+            .filter(|g| !after.always.contains(g))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Revoke a standing grant and durably persist it, ATOMICALLY: the revoke is the
+/// safety net for persisted Full access, so it must never leave memory ahead of the
+/// store (chip gone in the UI but the grant still on disk, ready to resurrect on
+/// restart) or report success on a failed write. On a failed durable write we re-add
+/// ONLY the grants this call removed — computed synchronously right after the revoke,
+/// so a concurrent revoke landing during the flush await is NOT resurrected (which
+/// blindly re-seeding the whole prior set would do). Extracted from the command so
+/// the rollback is unit-testable.
+async fn revoke_grant_durable(
+    asks: &crate::ask::AskRegistry,
+    thread: i32,
+    dir: Option<&str>,
+    summary: Option<&str>,
+) -> Result<(), String> {
+    let before = asks.snapshot_grants();
+    // Dispatch lives in the registry (tested by revoke_dispatch_routes_by_dir_granularity).
+    asks.revoke(thread, dir, summary);
+    let removed = removed_grants(&before, &asks.snapshot_grants());
+    if let Err(err) = crate::auth_persist::flush(asks).await {
+        asks.seed_grants(removed);
+        return Err(err);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn revoke_auth_grant(
     asks: tauri::State<'_, crate::ask::AskRegistry>,
@@ -2035,13 +2081,7 @@ pub async fn revoke_auth_grant(
     dir: Option<String>,
     summary: Option<String>,
 ) -> R<()> {
-    // Dispatch lives in the registry (tested by revoke_dispatch_routes_by_dir_granularity).
-    asks.revoke(thread, dir.as_deref(), summary.as_deref());
-    // Persist the revoke durably (single ordered writer, awaited) before reporting
-    // success — a lost revoke would resurrect the grant on next launch, and this
-    // revoke IS the safety net for persisted Full access, so it must not have a hole.
-    crate::auth_persist::flush(&asks).await?;
-    Ok(())
+    revoke_grant_durable(&asks, thread, dir.as_deref(), summary.as_deref()).await
 }
 
 #[tauri::command]
@@ -2845,6 +2885,91 @@ mod tests {
         // their open asks are cancelled — a post-delete answer can't re-grant them.
         let open: Vec<u64> = asks.open().iter().map(|a| a.id).collect();
         assert!(!open.contains(&ask_a) && !open.contains(&ask_routed));
+    }
+
+    #[test]
+    fn removed_grants_is_the_set_difference() {
+        let before = crate::ask::GrantSnapshot {
+            full: vec![
+                crate::ask::FullGrant {
+                    thread: 1,
+                    dir: "a".into(),
+                },
+                crate::ask::FullGrant {
+                    thread: 2,
+                    dir: "b".into(),
+                },
+            ],
+            always: vec![crate::ask::AlwaysGrant {
+                thread: 3,
+                dir: "c".into(),
+                summary: "s".into(),
+            }],
+        };
+        let after = crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant {
+                thread: 2,
+                dir: "b".into(),
+            }],
+            always: vec![crate::ask::AlwaysGrant {
+                thread: 3,
+                dir: "c".into(),
+                summary: "s".into(),
+            }],
+        };
+        let removed = removed_grants(&before, &after);
+        assert_eq!(
+            removed.full,
+            vec![crate::ask::FullGrant {
+                thread: 1,
+                dir: "a".into()
+            }]
+        );
+        assert!(removed.always.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_grant_durable_rolls_back_only_this_calls_removal_on_write_failure() {
+        let asks = crate::ask::AskRegistry::new();
+        // a writer that FAILS every ack'd write
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ask::PersistMsg>();
+        asks.set_persist_notifier(tx);
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(ack) = msg.ack {
+                    let _ = ack.send(Err("boom".into()));
+                }
+            }
+        });
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![
+                crate::ask::FullGrant {
+                    thread: 7,
+                    dir: "42".into(),
+                },
+                // an UNRELATED grant that must be left exactly as-is by the rollback
+                crate::ask::FullGrant {
+                    thread: 8,
+                    dir: "99".into(),
+                },
+            ],
+            always: vec![],
+        });
+
+        let r = revoke_grant_durable(&asks, 7, Some("42"), None).await;
+
+        assert!(r.is_err(), "a failed durable write must surface as an error");
+        // the revoked grant is restored (memory matches the unchanged store)...
+        assert_eq!(
+            asks.auto_decision(7, "42", "x"),
+            Some(crate::ask::Decision::Allow),
+            "the grant must be restored on a failed write"
+        );
+        // ...and the unrelated grant is untouched (no blind whole-set re-seed).
+        assert_eq!(
+            asks.auto_decision(8, "99", "x"),
+            Some(crate::ask::Decision::Allow)
+        );
     }
 
     #[tokio::test]

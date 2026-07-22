@@ -811,6 +811,7 @@ export const en = {
     revokeBody:
       "The persisted Full access / Always-allow rules for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
     revokeConfirm: "Revoke access",
+    revokeFailed: "Couldn't revoke access — it's still active. Please try again.",
   },
   ai: {
     shellSnippet: "Shell snippet",

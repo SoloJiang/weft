@@ -2253,8 +2253,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         await api.revokeAuthGrant(thread, dir, summary);
       } catch (e) {
         console.error(e);
+        // The backend rolls back a failed durable write, so the reconcile below
+        // restores the chip; tell the user the revoke did NOT take — otherwise the
+        // safety-net revoke would appear to succeed while the grant persists.
+        toast(i18n.t("grants.revokeFailed"));
       }
-      // reconcile with backend truth (covers a concurrent grant/revoke)
+      // reconcile with backend truth (covers a concurrent grant/revoke, and a
+      // rolled-back failed revoke — the grant reappears rather than silently gone)
       try {
         setAuthGrants(await api.listAuthGrants());
       } catch (e) {
