@@ -14,7 +14,7 @@
 //! success only after the change is durable. Boot seeds the registry from the store.
 //! `dangerous` mode is intentionally not here — a global toggle the frontend persists.
 
-use crate::ask::{AskRegistry, GrantSnapshot, PersistMsg};
+use crate::ask::{AskRegistry, GrantSnapshot, PersistAck, PersistMsg};
 use crate::store::{repo, Db};
 use tauri::{AppHandle, Manager};
 
@@ -68,10 +68,14 @@ pub async fn seed(db: &Db, asks: &AskRegistry) {
 /// consumer is installed (only a unit test without one).
 pub async fn flush(asks: &AskRegistry) -> Result<(), String> {
     match asks.request_persist_ack() {
-        Some(rx) => rx
+        // No writer installed (a unit test without a consumer) → nothing to do.
+        PersistAck::NoConsumer => Ok(()),
+        // Writer configured but its channel is closed (consumer died) → the durable
+        // write did NOT happen; surface it rather than falsely reporting success.
+        PersistAck::WriterGone => Err("auth_grants writer unavailable".into()),
+        PersistAck::Pending(rx) => rx
             .await
             .unwrap_or_else(|_| Err("auth_grants writer dropped".into())),
-        None => Ok(()),
     }
 }
 
@@ -229,22 +233,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_routes_through_the_writer_and_is_durable() {
+    async fn flush_without_a_writer_is_a_noop() {
+        // No persist consumer installed (as in a unit test) → flush is a no-op Ok.
+        let asks = AskRegistry::new();
+        assert!(flush(&asks).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn flush_errors_when_the_writer_channel_is_closed() {
+        let asks = AskRegistry::new();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        asks.set_persist_notifier(tx);
+        // the single writer is gone → the channel is closed
+        drop(rx);
+        assert!(
+            flush(&asks).await.is_err(),
+            "a closed writer channel must surface as a flush error, not false success"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_persists_full_only_and_is_durable() {
         let db = mem().await;
         let asks = AskRegistry::new();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         asks.set_persist_notifier(tx);
         tokio::spawn(run_consumer(db.clone(), rx));
-        asks.seed_grants(sample());
+        asks.seed_grants(sample()); // sample has a Full grant AND an Always grant
         // flush enqueues to the single writer and awaits its store write
         flush(&asks).await.unwrap();
-        assert_eq!(load_snapshot(&db).await, sample());
-        // a revoke then flush leaves only the surviving grant on disk
+        let snap = load_snapshot(&db).await;
+        // Only Full persists in this PR — Always is in-memory only (#89).
+        assert_eq!(snap.full, sample().full);
+        assert!(snap.always.is_empty());
+        // revoke the Full grant then flush → nothing left on disk
         asks.revoke_thread(1);
         flush(&asks).await.unwrap();
-        let snap = load_snapshot(&db).await;
-        assert!(snap.full.is_empty());
-        assert_eq!(snap.always.len(), 1);
+        assert!(load_snapshot(&db).await.is_empty());
     }
 
     /// The ordering guarantee round-1 lacked: even with a stale Full-grant snapshot

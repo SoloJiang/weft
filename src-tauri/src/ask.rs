@@ -142,21 +142,28 @@ pub struct PersistMsg {
     pub ack: Option<oneshot::Sender<Result<(), String>>>,
 }
 
+/// The outcome of enqueuing a durable-write request (`request_persist_ack`), so a
+/// flush can tell "no writer configured" (a unit test — a no-op) apart from "writer
+/// configured but its channel is closed" (the consumer died — a real durability
+/// failure that must surface as an error, not a false success).
+pub enum PersistAck {
+    NoConsumer,
+    WriterGone,
+    Pending(oneshot::Receiver<Result<(), String>>),
+}
+
 #[derive(Default)]
 struct Inner {
     next_id: u64,
     waiters: HashMap<u64, oneshot::Sender<Decision>>,
     open: Vec<Ask>,
-    /// (thread, dir) -> summaries the human has "always allow"-ed. Holds ALL
-    /// always-rules (auto_decision consults this) whether or not they persist.
+    /// (thread, dir) -> summaries the human has "always allow"-ed. **In-memory only**:
+    /// Always grants are NOT persisted in this PR — an Always summary is a lossy
+    /// display label (a Claude multi-line command truncated to its first line, an MCP
+    /// tool name, a truncated path list), not a precise action key, so persisting it
+    /// risks a permanent over-broad grant. Only Full access is persisted here; precise
+    /// per-action Always-persistence lands with issue #89's canonical action key.
     always: HashMap<(i32, String), HashSet<String>>,
-    /// The subset of `always` (as (thread, dir, summary)) whose display summary
-    /// PRECISELY identifies the action, so it is safe to persist. An over-broad
-    /// summary (e.g. a Claude multi-line command truncated to its first line) is
-    /// left OUT of this set: it still auto-allows in memory this session but is not
-    /// written to disk, so persistence never turns a session-scoped over-broad match
-    /// into a permanent one. (PR #87 follow-up: a canonical action key per engine.)
-    persistent_always: HashSet<(i32, String, String)>,
     /// (thread, dir) granted full access — every ask auto-allows.
     full: HashSet<(i32, String)>,
     /// Dangerous mode: when on, EVERY ask from EVERY agent auto-allows (never
@@ -183,9 +190,9 @@ impl Inner {
         }
     }
 
-    /// Current standing grants as a durable snapshot (持锁内调用). Only the
-    /// `persistent_always` subset of always-rules is written — over-broad ones are
-    /// in-memory only.
+    /// Current DURABLE grants (持锁内调用). Only Full access is persisted in this PR
+    /// — Always grants are in-memory only (see #89), so the snapshot's `always` is
+    /// always empty.
     fn grant_snapshot(&self) -> GrantSnapshot {
         let full = self
             .full
@@ -195,23 +202,10 @@ impl Inner {
                 dir: dir.clone(),
             })
             .collect();
-        let persistent = &self.persistent_always;
-        let always = self
-            .always
-            .iter()
-            .flat_map(|((thread, dir), summaries)| {
-                summaries.iter().filter_map(move |summary| {
-                    persistent
-                        .contains(&(*thread, dir.clone(), summary.clone()))
-                        .then(|| AlwaysGrant {
-                            thread: *thread,
-                            dir: dir.clone(),
-                            summary: summary.clone(),
-                        })
-                })
-            })
-            .collect();
-        GrantSnapshot { full, always }
+        GrantSnapshot {
+            full,
+            always: Vec::new(),
+        }
     }
 
     /// Push the current grants to the persistence consumer as a fire-and-forget
@@ -336,22 +330,16 @@ impl AskRegistry {
         // re-grant of an existing rule writes nothing.
         let granted = match ans {
             Answer::Always => {
-                // Record the always-rule in memory (auto_decision uses this) always.
+                // Record the always-rule in memory (auto_decision uses this), but do
+                // NOT persist it: `granted` (which gates the persist emit) stays false,
+                // so Always is in-memory only — a lossy display summary must not become
+                // a permanent grant. Only Full persists here; #89 adds precise
+                // per-action Always-persistence.
                 g.always
                     .entry(key.clone())
                     .or_default()
                     .insert(ask.summary.clone());
-                // Only PERSIST it when the display summary precisely identifies the
-                // action — i.e. `detail` (the full action) is a single line, so the
-                // summary is the whole thing. A Claude multi-line command is truncated
-                // to its first line as the summary; persisting that would auto-allow a
-                // different command sharing that first line after restart. Over-broad
-                // ones stay in-memory only (pre-existing behavior; re-prompt next run).
-                // `granted` gates the persist emit, so only a NEW persistable rule writes.
-                let persistable = ask.detail.lines().count() <= 1;
-                persistable
-                    && g.persistent_always
-                        .insert((key.0, key.1.clone(), ask.summary.clone()))
+                false
             }
             Answer::Full => g.full.insert(key.clone()),
             _ => false,
@@ -385,10 +373,9 @@ impl AskRegistry {
 
         let covered_ids: HashSet<u64> = covered.iter().map(|a| a.id).collect();
         g.open.retain(|a| !covered_ids.contains(&a.id));
-        let mut woke = false;
         for c in covered {
             if let Some(tx) = g.waiters.remove(&c.id) {
-                woke = tx.send(decision).is_ok() || woke;
+                let _ = tx.send(decision);
             }
             g.emit(AskEvent::Resolved {
                 ask: c,
@@ -401,7 +388,12 @@ impl AskRegistry {
         if granted {
             g.emit_persist();
         }
-        woke
+        // Success = the ask was found AND answered (an unfound/already-answered ask
+        // returned false above). Whether a waiter was still around to wake is a
+        // separate race — a cancelled approval request drops its waiter, but the
+        // human's answer and any grant still took effect, so the caller must NOT see
+        // that as "expired" while the grant is persisted.
+        true
     }
 
     /// Drop a pending Ask without answering (e.g. on timeout) so it leaves the
@@ -431,21 +423,27 @@ impl AskRegistry {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).persist = Some(tx);
     }
 
-    /// Enqueue the CURRENT grants to the single writer WITH a completion ack and
-    /// return the receiver — the caller awaits it to know the write is durable (or
-    /// failed). Routing through the same channel (not a parallel direct write) keeps
-    /// writes ordered, so a stale queued snapshot can never land after this one.
-    /// `None` when no consumer is installed (e.g. a unit test without one).
-    pub fn request_persist_ack(&self) -> Option<oneshot::Receiver<Result<(), String>>> {
+    /// Enqueue the CURRENT grants to the single writer WITH a completion ack.
+    /// Routing through the same channel (not a parallel direct write) keeps writes
+    /// ordered, so a stale queued snapshot can never land after this one. Returns
+    /// `NoConsumer` (no writer installed — unit test), `WriterGone` (writer installed
+    /// but its channel closed — durability failure), or `Pending(rx)` to await.
+    pub fn request_persist_ack(&self) -> PersistAck {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = g.persist.as_ref()?;
+        let Some(tx) = g.persist.as_ref() else {
+            return PersistAck::NoConsumer;
+        };
         let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(PersistMsg {
-            snapshot: g.grant_snapshot(),
-            ack: Some(ack_tx),
-        })
-        .ok()?;
-        Some(ack_rx)
+        if tx
+            .send(PersistMsg {
+                snapshot: g.grant_snapshot(),
+                ack: Some(ack_tx),
+            })
+            .is_err()
+        {
+            return PersistAck::WriterGone;
+        }
+        PersistAck::Pending(ack_rx)
     }
 
     /// Seed standing grants at boot from the persisted snapshot (before serving any
@@ -455,14 +453,13 @@ impl AskRegistry {
         for fg in snap.full {
             g.full.insert((fg.thread, fg.dir));
         }
+        // A persisted snapshot has no always-rules (Always isn't persisted in this PR),
+        // so this is a no-op in practice; kept so a prior-version disk row still loads.
         for ag in snap.always {
             g.always
-                .entry((ag.thread, ag.dir.clone()))
+                .entry((ag.thread, ag.dir))
                 .or_default()
-                .insert(ag.summary.clone());
-            // Anything on disk was persistable when written.
-            g.persistent_always
-                .insert((ag.thread, ag.dir, ag.summary));
+                .insert(ag.summary);
         }
     }
 
@@ -490,26 +487,9 @@ impl AskRegistry {
                 dir: key.1,
             });
         }
-        let always_keys: Vec<(i32, String)> =
-            g.always.keys().filter(|(t, _)| *t == thread).cloned().collect();
-        for key in always_keys {
-            if let Some(rules) = g.always.remove(&key) {
-                for summary in rules {
-                    // Only PERSISTABLE always-rules count as "removed" for the durable
-                    // rollback — an over-broad in-memory one was never on disk.
-                    if g
-                        .persistent_always
-                        .remove(&(key.0, key.1.clone(), summary.clone()))
-                    {
-                        removed.always.push(AlwaysGrant {
-                            thread: key.0,
-                            dir: key.1.clone(),
-                            summary,
-                        });
-                    }
-                }
-            }
-        }
+        // Clear this thread's in-memory always-rules too (delete cleanup). Always is
+        // not persisted, so it never goes in `removed` (which drives durable rollback).
+        g.always.retain(|(t, _), _| *t != thread);
         if !removed.is_empty() {
             g.emit_persist();
         }
@@ -535,39 +515,14 @@ impl AskRegistry {
                         dir: dir.to_string(),
                     });
                 }
-                if let Some(rules) = g.always.remove(&key) {
-                    for summary in rules {
-                        if g
-                            .persistent_always
-                            .remove(&(thread, dir.to_string(), summary.clone()))
-                        {
-                            removed.always.push(AlwaysGrant {
-                                thread,
-                                dir: dir.to_string(),
-                                summary,
-                            });
-                        }
-                    }
-                }
+                // in-memory always cleared too (not persisted → not in `removed`)
+                g.always.remove(&key);
             }
             Some(summary) => {
-                let dropped = g
-                    .always
-                    .get_mut(&key)
-                    .is_some_and(|rules| rules.remove(summary));
-                if dropped {
-                    if g
-                        .persistent_always
-                        .remove(&(thread, dir.to_string(), summary.to_string()))
-                    {
-                        removed.always.push(AlwaysGrant {
-                            thread,
-                            dir: dir.to_string(),
-                            summary: summary.to_string(),
-                        });
-                    }
-                    // drop a now-empty always-set so snapshots don't carry a hollow key
-                    if g.always.get(&key).is_some_and(|rules| rules.is_empty()) {
+                // Drop just the in-memory always-rule (not persisted → not in `removed`).
+                if let Some(rules) = g.always.get_mut(&key) {
+                    rules.remove(summary);
+                    if rules.is_empty() {
                         g.always.remove(&key);
                     }
                 }
@@ -847,22 +802,24 @@ mod tests {
     }
 
     #[test]
-    fn answering_always_persists_the_summary_grant() {
+    fn answering_always_is_in_memory_only_not_persisted() {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
         let (id, _rx) = r.request(1, "10", "codex", "Run: npm test", "npm test");
         assert!(r.answer(id, Answer::Always));
-        let snap = rx.try_recv().expect("always grant must be persisted").snapshot;
+        // auto-allows this exact summary in memory...
         assert_eq!(
-            snap.always,
-            vec![AlwaysGrant {
-                thread: 1,
-                dir: "10".into(),
-                summary: "Run: npm test".into()
-            }]
+            r.auto_decision(1, "10", "Run: npm test"),
+            Some(Decision::Allow)
         );
-        assert!(snap.full.is_empty());
+        // ...but Always grants are in-memory only in this PR — nothing is persisted
+        // (only Full persists; precise per-action Always-persistence is #89).
+        assert!(
+            rx.try_recv().is_err(),
+            "an Always answer must not write a durable grant"
+        );
+        assert!(r.snapshot_grants().always.is_empty());
     }
 
     #[test]
@@ -1045,15 +1002,8 @@ mod tests {
         r.revoke_grant(1, "10", Some("a"));
         assert!(r.auto_decision(1, "10", "a").is_none()); // dropped
         assert_eq!(r.auto_decision(1, "10", "b"), Some(Decision::Allow)); // kept
-        let snap = rx.try_recv().expect("granular revoke persists").snapshot;
-        assert_eq!(
-            snap.always,
-            vec![AlwaysGrant {
-                thread: 1,
-                dir: "10".into(),
-                summary: "b".into()
-            }]
-        );
+        // Always is in-memory only, so a granular always-revoke persists nothing.
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1125,38 +1075,17 @@ mod tests {
     }
 
     #[test]
-    fn over_broad_multiline_always_is_in_memory_only_not_persisted() {
+    fn answering_a_found_ask_whose_waiter_is_gone_still_succeeds() {
         let r = AskRegistry::new();
-        // A Claude multi-line command: the summary is truncated to its first line, but
-        // `detail` holds the full (multi-line) command → over-broad Always key.
-        let (id, _rx) = r.request(1, "10", "claude", "Run: npm test", "npm test\n&& rm -rf /");
-        assert!(r.answer(id, Answer::Always));
-        // It still auto-allows this exact summary in memory (pre-existing behavior)...
-        assert_eq!(
-            r.auto_decision(1, "10", "Run: npm test"),
-            Some(Decision::Allow)
-        );
-        // ...but it is NOT durable — persisting it would auto-allow a different command
-        // sharing the same first line after restart.
-        assert!(
-            r.snapshot_grants().always.is_empty(),
-            "an over-broad multi-line always must not be persisted"
-        );
-    }
-
-    #[test]
-    fn single_line_always_is_persisted() {
-        let r = AskRegistry::new();
-        let (id, _rx) = r.request(1, "10", "claude", "Run: npm test", "npm test");
-        assert!(r.answer(id, Answer::Always));
-        assert_eq!(
-            r.snapshot_grants().always,
-            vec![AlwaysGrant {
-                thread: 1,
-                dir: "10".into(),
-                summary: "Run: npm test".into()
-            }]
-        );
+        let (id, rx) = r.request(1, "10", "codex", "Run: x", "x");
+        // the blocked tool's receiver is gone (e.g. its approval request was cancelled)
+        drop(rx);
+        // the ask is still open, so answering it Full is a SUCCESS (found + answered)
+        // — the command must not report "expired" while the grant is being created.
+        assert!(r.answer(id, Answer::Full));
+        assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
+        // a genuinely unknown / already-answered ask still returns false
+        assert!(!r.answer(id, Answer::Full));
     }
 
     #[test]
@@ -1180,7 +1109,7 @@ mod tests {
                 },
             ],
         });
-        // removes (1,"10")'s full + its always "a"; leaves the sibling (1,"11")
+        // removes (1,"10")'s full + its (in-memory) always "a"; leaves (1,"11")
         let removed = r.revoke(1, Some("10"), None);
         assert_eq!(
             removed.full,
@@ -1189,14 +1118,10 @@ mod tests {
                 dir: "10".into()
             }]
         );
-        assert_eq!(
-            removed.always,
-            vec![AlwaysGrant {
-                thread: 1,
-                dir: "10".into(),
-                summary: "a".into()
-            }]
-        );
+        // Always is in-memory only, so it never appears in the durable removed set...
+        assert!(removed.always.is_empty());
+        // ...but it IS cleared from memory (auto_decision no longer allows it).
+        assert!(r.auto_decision(1, "10", "a").is_none());
         assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
         // revoking nothing returns an empty set
         assert!(r.revoke(2, Some("99"), None).is_empty());

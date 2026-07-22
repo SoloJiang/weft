@@ -156,11 +156,10 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
   const live = Object.values(sessions).filter(
     (s) => s.status === "running" && o.direction_ids.includes(s.directionId),
   ).length;
-  // Any of this issue's tasks (or its lead) carrying a persisted standing grant.
-  // Grants key on thread id, so every grant under this thread belongs to it.
-  const inherited =
-    authGrants.full.some((g) => g.thread === o.thread_id) ||
-    authGrants.always.some((g) => g.thread === o.thread_id);
+  // Only Full access is persisted (Always grants are in-memory only, see #89), so
+  // the "inherited access" marker is Full-only. Grants key on thread id, so every
+  // persisted grant under this thread belongs to it.
+  const inherited = authGrants.full.some((g) => g.thread === o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention =
     needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +
