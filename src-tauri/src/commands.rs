@@ -2031,18 +2031,19 @@ pub fn list_auth_grants(
 /// Revoke a standing grant and durably persist it, ATOMICALLY: the revoke is the
 /// safety net for persisted Full access, so it must never leave memory ahead of the
 /// store (chip gone in the UI but the grant still on disk, ready to resurrect on
-/// restart) or report success on a failed write. `revoke` returns EXACTLY what it
-/// removed, computed under a single registry lock, so on a failed durable write the
-/// rollback re-adds only this call's removals — a concurrent revoke landing during
-/// the flush await is not resurrected (a before/after diff here would race). Extracted
-/// from the command so the rollback is unit-testable.
+/// restart) or report success on a failed write. Uses `revoke_no_emit` so the ONLY
+/// store write is the acked `flush` — a fire-and-forget emit here plus the acked flush
+/// could diverge if one landed and the other failed (memory rolled back while disk is
+/// already revoked → the session keeps auto-approving). `revoke_no_emit` returns
+/// EXACTLY what it removed under one lock, so on a failed write the rollback re-adds
+/// only this call's removals. Extracted from the command so the rollback is testable.
 async fn revoke_grant_durable(
     asks: &crate::ask::AskRegistry,
     thread: i32,
     dir: Option<&str>,
     summary: Option<&str>,
 ) -> Result<(), String> {
-    let removed = asks.revoke(thread, dir, summary);
+    let removed = asks.revoke_no_emit(thread, dir, summary);
     if let Err(err) = crate::auth_persist::flush(asks).await {
         asks.seed_grants(removed);
         return Err(err);

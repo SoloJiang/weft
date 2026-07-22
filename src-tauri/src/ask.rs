@@ -218,6 +218,55 @@ impl Inner {
             });
         }
     }
+
+    /// Remove the standing grants matching (thread, dir, summary) and RETURN what was
+    /// removed (Full only — Always is in-memory, not durable, so it's cleared but not
+    /// returned). Does NOT emit; the caller decides how to persist. 持锁内调用.
+    fn remove_grants(
+        &mut self,
+        thread: i32,
+        dir: Option<&str>,
+        summary: Option<&str>,
+    ) -> GrantSnapshot {
+        let mut removed = GrantSnapshot::default();
+        match (dir, summary) {
+            // whole issue
+            (None, _) => {
+                let full_keys: Vec<(i32, String)> =
+                    self.full.iter().filter(|(t, _)| *t == thread).cloned().collect();
+                for key in full_keys {
+                    self.full.remove(&key);
+                    removed.full.push(FullGrant {
+                        thread: key.0,
+                        dir: key.1,
+                    });
+                }
+                self.always.retain(|(t, _), _| *t != thread);
+            }
+            // one task's whole grant
+            (Some(dir), None) => {
+                let key = (thread, dir.to_string());
+                if self.full.remove(&key) {
+                    removed.full.push(FullGrant {
+                        thread,
+                        dir: dir.to_string(),
+                    });
+                }
+                self.always.remove(&key);
+            }
+            // one always-rule
+            (Some(dir), Some(summary)) => {
+                let key = (thread, dir.to_string());
+                if let Some(rules) = self.always.get_mut(&key) {
+                    rules.remove(summary);
+                    if rules.is_empty() {
+                        self.always.remove(&key);
+                    }
+                }
+            }
+        }
+        removed
+    }
 }
 
 /// Cloneable handle to all pending Asks.
@@ -469,79 +518,51 @@ impl AskRegistry {
             .grant_snapshot()
     }
 
-    /// Drop every standing grant belonging to `thread` (issue deletion cascade) and
-    /// RETURN exactly what was removed — computed under the SAME lock as the removal,
-    /// so a concurrent revoke can't inflate it (that return is what makes an atomic
-    /// rollback possible). Persists the reduced snapshot when anything changed.
-    pub fn revoke_thread(&self, thread: i32) -> GrantSnapshot {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut removed = GrantSnapshot::default();
-        let full_keys: Vec<(i32, String)> =
-            g.full.iter().filter(|(t, _)| *t == thread).cloned().collect();
-        for key in full_keys {
-            g.full.remove(&key);
-            removed.full.push(FullGrant {
-                thread: key.0,
-                dir: key.1,
-            });
-        }
-        // Clear this thread's in-memory always-rules too (delete cleanup). Always is
-        // not persisted, so it never goes in `removed` (which drives durable rollback).
-        g.always.retain(|(t, _), _| *t != thread);
-        if !removed.is_empty() {
-            g.emit_persist();
-        }
-        removed
-    }
-
-    /// Revoke a specific standing grant (the human's one-click "undo"):
-    /// - `summary == None`  → clear this task's `(thread, dir)` grants entirely
-    ///   (its full access AND all its always-rules).
-    /// - `summary == Some(s)` → drop only that one always-rule, leaving full
-    ///   access (if any) and the task's other always-rules intact.
-    /// Returns exactly what was removed (under one lock; see `revoke_thread`).
-    /// Persists the reduced snapshot when anything actually changed.
-    pub fn revoke_grant(&self, thread: i32, dir: &str, summary: Option<&str>) -> GrantSnapshot {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (thread, dir.to_string());
-        let mut removed = GrantSnapshot::default();
-        match summary {
-            None => {
-                if g.full.remove(&key) {
-                    removed.full.push(FullGrant {
-                        thread,
-                        dir: dir.to_string(),
-                    });
-                }
-                // in-memory always cleared too (not persisted → not in `removed`)
-                g.always.remove(&key);
-            }
-            Some(summary) => {
-                // Drop just the in-memory always-rule (not persisted → not in `removed`).
-                if let Some(rules) = g.always.get_mut(&key) {
-                    rules.remove(summary);
-                    if rules.is_empty() {
-                        g.always.remove(&key);
-                    }
-                }
-            }
-        }
-        if !removed.is_empty() {
-            g.emit_persist();
-        }
-        removed
-    }
-
-    /// Dispatch a revoke at the caller's granularity and return exactly what was
-    /// removed — the single entry `revoke_auth_grant` funnels through (so the
-    /// command stays a pure wrapper AND gets an atomic removed-set for rollback):
-    /// - `dir == None`  → `revoke_thread` (clear the whole issue's grants).
-    /// - `dir == Some`  → `revoke_grant` (one task, or one always-rule via `summary`).
+    /// Remove the standing grants matching (thread, dir, summary), emit the reduced
+    /// snapshot fire-and-forget, and RETURN exactly what was removed (Full only — the
+    /// removed-set, computed under one lock, drives an atomic rollback). Delete cleanup
+    /// and the general one-shot revoke use this; the DURABLE revoke command uses
+    /// `revoke_no_emit` + a single acked flush instead.
+    /// - `dir == None`  → the whole issue's grants.
+    /// - `dir == Some`  → one task (`summary == None`) or one always-rule.
     pub fn revoke(&self, thread: i32, dir: Option<&str>, summary: Option<&str>) -> GrantSnapshot {
-        match dir {
-            None => self.revoke_thread(thread),
-            Some(dir) => self.revoke_grant(thread, dir, summary),
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = g.remove_grants(thread, dir, summary);
+        if !removed.is_empty() {
+            g.emit_persist();
         }
+        removed
+    }
+
+    /// Like `revoke` but WITHOUT the fire-and-forget persist emit — for the durable
+    /// revoke command, which follows with a SINGLE acked flush. If a revoke emitted a
+    /// no-ack write AND the command's acked flush then failed (a transient error on the
+    /// second write, or writer death after the first), memory would roll the grant back
+    /// while disk is already revoked, so the session keeps auto-approving. One acked
+    /// write keeps memory and disk consistent.
+    pub fn revoke_no_emit(
+        &self,
+        thread: i32,
+        dir: Option<&str>,
+        summary: Option<&str>,
+    ) -> GrantSnapshot {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_grants(thread, dir, summary)
+    }
+
+    /// Drop every standing grant belonging to `thread` (issue deletion cascade),
+    /// emitting best-effort. Returns exactly what was removed.
+    pub fn revoke_thread(&self, thread: i32) -> GrantSnapshot {
+        self.revoke(thread, None, None)
+    }
+
+    /// Revoke a specific standing grant (`summary == None` → the whole `(thread, dir)`
+    /// grant; `summary == Some` → one always-rule), emitting best-effort. Returns what
+    /// was removed.
+    pub fn revoke_grant(&self, thread: i32, dir: &str, summary: Option<&str>) -> GrantSnapshot {
+        self.revoke(thread, Some(dir), summary)
     }
 
     /// Delete-time cleanup of an issue's WHOLE footprint in this registry: cancel
@@ -1123,6 +1144,36 @@ mod tests {
         assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
         // revoking nothing returns an empty set
         assert!(r.revoke(2, Some("99"), None).is_empty());
+    }
+
+    #[test]
+    fn revoke_no_emit_removes_and_returns_without_a_persist_write() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![FullGrant {
+                thread: 1,
+                dir: "10".into(),
+            }],
+            always: vec![],
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        // removes + returns the grant, but does NOT emit a fire-and-forget write — the
+        // durable command follows with a single acked flush, so a second (diverging)
+        // write can't leave memory and disk inconsistent.
+        let removed = r.revoke_no_emit(1, Some("10"), None);
+        assert_eq!(
+            removed.full,
+            vec![FullGrant {
+                thread: 1,
+                dir: "10".into()
+            }]
+        );
+        assert!(r.auto_decision(1, "10", "x").is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "revoke_no_emit must not emit a persist message"
+        );
     }
 
     #[test]
