@@ -6,6 +6,7 @@ import { threadLiveCounts, useStore } from "../state/store";
 import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
+import { InheritedAccessChip } from "../components/InheritedAccessChip";
 import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
@@ -168,7 +169,8 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn } = useStore();
+  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn, authGrants } =
+    useStore();
   const { t } = useTranslation();
   // Split the in-flight count so a stalled worker OR lead is visible on the card
   // itself (not just the drill-in board): running = green pulse, stalled = amber.
@@ -177,6 +179,10 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
     o.direction_ids,
     leadTurn[o.thread_id]?.state,
   );
+  // Only Full access is persisted (Always grants are in-memory only, see #89), so
+  // the "inherited access" marker is Full-only. Grants key on thread id, so every
+  // persisted grant under this thread belongs to it.
+  const inherited = authGrants.full.some((g) => g.thread === o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention = threadAttentionCount(o, needs, asks);
   const failing = o.direction_ids.filter((id) =>
@@ -230,6 +236,7 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
             +{o.write_repos.length - 3}
           </span>
         )}
+        {inherited && <InheritedAccessChip threadId={o.thread_id} />}
       </div>
 
       {(o.direction_ids.length > 0 || running > 0 || stalled > 0) && (
