@@ -2002,10 +2002,12 @@ pub async fn answer_permission(
     if !asks.answer(ask_id, a) {
         return Err("that request was already answered or has expired".into());
     }
-    // A broad grant (Always/Full) creates a standing rule — persist it durably
-    // (routed through the single ordered writer, awaited) before reporting
-    // success, so an immediate quit/crash can't drop it and a write failure surfaces.
-    if matches!(a, crate::ask::Answer::Always | crate::ask::Answer::Full) {
+    // Only Full access persists (approach B: Always is in-memory only, never on
+    // disk). Persist it durably — routed through the single ordered writer, awaited
+    // — before reporting success, so an immediate quit/crash can't drop it and a
+    // write failure surfaces. Flushing on Always would be a no-op write whose rare
+    // failure would misleadingly report "not saved" for a grant never meant to be.
+    if matches!(a, crate::ask::Answer::Full) {
         crate::auth_persist::flush(&asks).await?;
     }
     Ok(())
@@ -2048,6 +2050,12 @@ async fn revoke_grant_durable(
     // a grant a later, already-succeeded revoke removed.
     let _guard = asks.lock_revoke().await;
     let removed = asks.revoke_no_emit(thread, dir, summary);
+    // Nothing matched → memory is unchanged, so disk is already consistent. Skip the
+    // write entirely (mirrors the emit path's guard) so a "revoke nothing" can't
+    // surface a spurious failure on an unrelated write error.
+    if removed.is_empty() {
+        return Ok(());
+    }
     if let Err(err) = crate::auth_persist::flush(asks).await {
         asks.seed_grants(removed);
         return Err(err);
@@ -2909,6 +2917,30 @@ mod tests {
         assert_eq!(
             asks.auto_decision(8, "99", "x"),
             Some(crate::ask::Decision::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_grant_durable_with_nothing_to_remove_skips_the_write() {
+        let asks = crate::ask::AskRegistry::new();
+        // a writer that FAILS every ack'd write — so if the revoke tried to flush,
+        // it would surface an error. It must not, because nothing was removed.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ask::PersistMsg>();
+        asks.set_persist_notifier(tx);
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(ack) = msg.ack {
+                    let _ = ack.send(Err("boom".into()));
+                }
+            }
+        });
+
+        // No grant for (7, "42") exists, so nothing is removed.
+        let r = revoke_grant_durable(&asks, 7, Some("42"), None).await;
+
+        assert!(
+            r.is_ok(),
+            "revoking a grant that isn't there must skip the write, not surface a spurious failure"
         );
     }
 

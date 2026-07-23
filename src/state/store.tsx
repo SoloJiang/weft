@@ -2228,9 +2228,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch (e) {
         /* already resolved/expired, or the durable write failed */
         console.error(e);
-        // A broad grant still applies in memory this session even if persisting it
-        // failed; surface that so a re-prompt after restart isn't a silent surprise.
-        if (answer === "always" || answer === "full") {
+        // Only Full persists (approach B: Always is in-memory only). Full still
+        // applies this session even if persisting it failed; surface that so a
+        // re-prompt after restart isn't a silent surprise. Always is never saved
+        // by design, so its re-prompt is expected — no "not saved" warning.
+        if (answer === "full") {
           toast(i18n.t("grants.grantNotSaved"));
         }
       }
