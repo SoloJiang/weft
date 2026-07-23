@@ -1212,6 +1212,14 @@ async fn consume_human_event(
     let Some(owner) = owner else { return };
     match ev {
         crate::bus::state::HumanAskEvent::Asked { thread, ask } => {
+            // A display-only NOTICE (the self-clearing stall hint) stays on the
+            // desktop board: IM's cards are answer-oriented (reply-to-answer, then
+            // a resolved/cancelled patch), which fits a question, not a notice that
+            // carries no answer and retracts itself. Forwarding it would show a
+            // reply prompt that no-ops and a wrong "cancelled" patch on recovery.
+            if !ask.answerable {
+                return;
+            }
             let title = crate::store::repo::get_thread(db, thread)
                 .await
                 .ok()
@@ -1980,6 +1988,94 @@ mod tests {
             .unwrap();
         assert_eq!(thread.kind, "concierge");
         assert_eq!(thread.lead_tool, expected);
+    }
+
+    #[derive(Default)]
+    struct CountingChannel {
+        cards: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for CountingChannel {
+        async fn send_card(&self, _o: &str, _c: serde_json::Value) -> anyhow::Result<String> {
+            self.cards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok("om_card".into())
+        }
+        async fn patch_card(&self, _m: &str, _c: serde_json::Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text(&self, _o: &str, _t: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_chat_text(&self, _c: &str, _t: &str) -> anyhow::Result<String> {
+            Ok("om_msg".into())
+        }
+        async fn create_chat_topic(
+            &self,
+            _c: &str,
+            _s: &str,
+            _t: &str,
+        ) -> anyhow::Result<String> {
+            Ok("omt".into())
+        }
+        async fn reply_text(&self, _r: &str, _t: &str) -> anyhow::Result<String> {
+            Ok("om_reply".into())
+        }
+    }
+
+    /// A display-only stall NOTICE surfaces on the desktop board but must NOT be
+    /// pushed through IM's answer-oriented card pipeline (an answerable question
+    /// still is). Guards against a notice showing a dead reply prompt on IM.
+    #[tokio::test]
+    async fn stall_notice_is_not_forwarded_to_im() {
+        use crate::bus::state::{Ask, HumanAskEvent};
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let w = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let th = crate::store::repo::create_thread(&db, w.id, "stalled task", "bugfix", "claude")
+            .await
+            .unwrap();
+        // An owner must be bound, else the handler returns before the notice check
+        // and the test would pass for the wrong reason.
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner_open_id")
+            .await
+            .unwrap();
+        let ch = CountingChannel::default();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        let count = || ch.cards.load(std::sync::atomic::Ordering::Relaxed);
+        let mk = |id: u64, answerable: bool| Ask {
+            id,
+            from: "10".to_string(),
+            text: "x".to_string(),
+            ts: 0,
+            answered: false,
+            answerable,
+        };
+        // An answerable question IS forwarded as an IM card.
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: mk(1, true),
+            },
+            &db,
+            &ch,
+            &cards,
+        )
+        .await;
+        assert_eq!(count(), 1);
+        // A non-answerable NOTICE is NOT — it stays on the desktop board only.
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: mk(2, false),
+            },
+            &db,
+            &ch,
+            &cards,
+        )
+        .await;
+        assert_eq!(count(), 1);
     }
 
     #[derive(Default)]

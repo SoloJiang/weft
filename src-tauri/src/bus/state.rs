@@ -74,6 +74,10 @@ pub struct Ask {
     pub text: String,
     pub ts: u64,
     pub answered: bool,
+    /// `false` for a display-only NOTICE (e.g. the self-clearing stall hint):
+    /// it surfaces in Needs-you/IM but carries no answer — `answer_ask` refuses
+    /// it, so a reply can never inject a stray bus message. See `notify_human`.
+    pub answerable: bool,
 }
 
 #[derive(Default)]
@@ -267,6 +271,18 @@ impl BusRegistry {
     /// Also lands in the timeline (kind = "ask") and wakes the human sentinel
     /// so the UI knows attention is needed without polling.
     pub fn ask_human(&self, thread: i32, from: &str, text: &str) -> u64 {
+        self.push_ask(thread, from, text, true)
+    }
+
+    /// Post a display-only NOTICE to the human — same Needs-you/IM surfacing and
+    /// wake as `ask_human`, but `answerable = false`, so `answer_ask` refuses it
+    /// and a reply can't inject a stray bus message. For self-clearing hints
+    /// (the stall notice) that a later cancel retracts; there is no answer to give.
+    pub fn notify_human(&self, thread: i32, from: &str, text: &str) -> u64 {
+        self.push_ask(thread, from, text, false)
+    }
+
+    fn push_ask(&self, thread: i32, from: &str, text: &str, answerable: bool) -> u64 {
         let id = self.next_ask_id.fetch_add(1, Ordering::Relaxed) + 1;
         let ts = now();
         let ask = Ask {
@@ -275,6 +291,7 @@ impl BusRegistry {
             text: text.to_string(),
             ts,
             answered: false,
+            answerable,
         };
         {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -306,12 +323,18 @@ impl BusRegistry {
     }
 
     /// Answer an open ask: mark it answered and deliver `text` to the asking
-    /// direction's inbox (as if from the human). Returns false if not found.
+    /// direction's inbox (as if from the human). Returns false if not found —
+    /// including a display-only NOTICE (`answerable == false`), which has no
+    /// answer to give, so a stray reply never reaches the asker's inbox.
     pub fn answer_ask(&self, thread: i32, ask_id: u64, text: &str) -> bool {
         let target = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let bus = g.entry(thread).or_default();
-            let hit = match bus.asks.iter_mut().find(|a| a.id == ask_id && !a.answered) {
+            let hit = match bus
+                .asks
+                .iter_mut()
+                .find(|a| a.id == ask_id && !a.answered && a.answerable)
+            {
                 Some(a) => {
                     a.answered = true;
                     Some((a.from.clone(), a.text.clone()))
@@ -519,6 +542,27 @@ mod tests {
     fn answering_unknown_ask_is_a_noop() {
         let r = BusRegistry::new();
         assert!(!r.answer_ask(1, 999, "hi"));
+    }
+
+    #[test]
+    fn notify_human_is_a_non_answerable_notice() {
+        // A notice surfaces in Needs-you like an ask, but answering it must be a
+        // no-op: no reply reaches the asker's inbox (a stale stall notice answered
+        // in the sweep gap can't inject a stray bus message), and it stays open
+        // until it's explicitly retracted.
+        let r = BusRegistry::new();
+        r.join(1, "10");
+        let id = r.notify_human(1, "10", "⏳ task stalled");
+        let open = r.open_asks(1);
+        assert_eq!(open.len(), 1);
+        assert!(!open[0].answerable);
+        // Answering is refused — no delivery, and the notice remains open.
+        assert!(!r.answer_ask(1, id, "hurry up"));
+        assert!(r.inbox(1, "10").is_empty());
+        assert_eq!(r.open_asks(1).len(), 1);
+        // An explicit retract (what the watchdog does on recover/idle) clears it.
+        assert!(r.cancel_open_asks_by_id(1, id));
+        assert!(r.open_asks(1).is_empty());
     }
 
     #[test]

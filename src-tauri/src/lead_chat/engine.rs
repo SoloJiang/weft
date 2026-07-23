@@ -3695,9 +3695,13 @@ enum SweepOutcome {
 
 /// Post the soft, self-clearing "task stalled" notice to Needs-you (also wakes the
 /// human + IM bridge). Returns the ask id, or None if the bus isn't mounted.
+/// A display-only NOTICE (`notify_human`), never an answerable question: it says
+/// "无需回复" and retracts itself, so it must not accept a reply — otherwise a
+/// user answering a card that goes stale in the sweep gap (turn ended / recovered)
+/// would inject a stray bus message into the task's inbox.
 fn post_stall_notice(app: &AppHandle, thread: i32, dir: &str, stall_secs: u64) -> Option<u64> {
     app.try_state::<crate::bus::BusRegistry>()
-        .map(|bus| bus.ask_human(thread, dir, &stall_notice_text(stall_secs)))
+        .map(|bus| bus.notify_human(thread, dir, &stall_notice_text(stall_secs)))
 }
 
 /// Retract a previously-posted stall notice. `ask_id == 0` means "no notice was
@@ -3714,15 +3718,6 @@ fn cancel_stall_notice(app: &AppHandle, thread: i32, ask_id: u64) {
             let _ = app.emit("needs-you://changed", thread);
         }
     }
-}
-
-/// Is our stall notice `ask_id` still an OPEN human ask? The notice is a normal
-/// `ask_human`, so the user can answer it — that drops it from `open_asks`, and
-/// the watchdog re-posts while the turn stays stalled. No bus → assume open.
-fn stall_notice_still_open(app: &AppHandle, thread: i32, ask_id: u64) -> bool {
-    app.try_state::<crate::bus::BusRegistry>()
-        .map(|b| b.open_asks(thread).iter().any(|a| a.id == ask_id))
-        .unwrap_or(true)
 }
 
 /// Post the stall notice ONLY if the turn is STILL busy+silent past the threshold,
@@ -3903,20 +3898,11 @@ pub fn spawn_watchdog(app: AppHandle) {
                                 }
                             }
                             None => {
-                                // Still stalled AND the user answered/dismissed our notice
-                                // (it's a normal ask_human, so answerable) → re-post so the
-                                // self-clearing item stays present for the rest of the
-                                // episode. Answering nudges the worker; if it recovers the
-                                // notice clears next sweep, if it stays stalled the re-post
-                                // is warranted. No-op while running (no tracked notice).
-                                if let Some((th, id)) = stall_notices.get(&key).copied() {
-                                    if id != 0 && !stall_notice_still_open(&app, th, id) {
-                                        let new_id =
-                                            post_stall_notice_confirmed(&app, &eng, stall_secs)
-                                                .await;
-                                        stall_notices.insert(key, (th, new_id));
-                                    }
-                                }
+                                // Still stalled, notice unchanged. The notice is a
+                                // non-answerable NOTICE (notify_human), so the user can't
+                                // drop it from `open_asks` — it stays put for the whole
+                                // episode until we retract it on recover / idle / kill.
+                                // Nothing to re-post.
                             }
                         }
                         let Some(reason) = kill else { continue };

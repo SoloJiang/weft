@@ -630,6 +630,9 @@ export interface NeedItem {
   direction_name: string;
   text: string;
   ts: number;
+  /** `false` for a display-only NOTICE (the self-clearing stall hint) — rendered
+   * without an answer box; answering is refused backend-side. */
+  answerable: boolean;
 }
 
 /** IM 话题绑定行：issue ↔ 飞书话题 1:1 映射（M2-5）。 */
