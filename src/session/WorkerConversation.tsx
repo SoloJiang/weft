@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FolderTree, GitCompare, Info } from "lucide-react";
-import { useStore } from "../state/store";
+import { isInFlight, useStore } from "../state/store";
 import { api } from "../lib/api";
 import type { EnabledSkill, ObserveRef, RewindMode } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
@@ -216,7 +216,7 @@ export function WorkerConversation() {
     ? `worker-slot:${directionId}:${repoId}`
     : `worker:${sid}`;
   const turn = sid != null ? workerTurn[sid] : undefined;
-  const busy = (turn?.state ?? "stopped") === "busy";
+  const busy = isInFlight(turn?.state ?? "stopped");
   const msgs =
     threadId != null && sid != null
       ? (leadMessages[threadId] ?? []).filter((m) => m.session_id === sid)

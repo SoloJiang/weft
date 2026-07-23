@@ -2,14 +2,32 @@ import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Layers, Plus, SquarePen, X } from "lucide-react";
-import { useStore } from "../state/store";
-import type { ThreadOverview } from "../lib/types";
+import { threadLiveCounts, useStore } from "../state/store";
+import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { InheritedAccessChip } from "../components/InheritedAccessChip";
 import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
+
+/** Needs/asks that want the human on this thread — per-direction PLUS thread-level
+ * ones (a stalled/blocked lead posts with direction_id -1 / dir "lead"), matched by
+ * thread_id. Single source so the card badge and the column sort agree. */
+function threadAttentionCount(
+  o: ThreadOverview,
+  needs: NeedItem[],
+  asks: PermissionAsk[],
+): number {
+  return (
+    needs.filter(
+      (n) => o.direction_ids.includes(n.direction_id) || n.thread_id === o.thread_id,
+    ).length +
+    asks.filter(
+      (a) => o.direction_ids.includes(Number(a.dir)) || a.thread === o.thread_id,
+    ).length
+  );
+}
 
 function progressBarColor(attention: number, failing: number): string {
   if (attention > 0) return "bg-waiting";
@@ -52,10 +70,11 @@ export function WorkspaceKanban() {
   };
 
   // Cards waiting on the human (or with a failing check) bubble to the top of
-  // their column — the attention signal without hijacking the stage.
+  // their column — the attention signal without hijacking the stage. Same
+  // thread-level accounting as the card badge, so a stalled lead (which posts
+  // under thread_id, not a direction) sorts up too.
   const urgent = (o: ThreadOverview): boolean =>
-    needs.some((n) => o.direction_ids.includes(n.direction_id)) ||
-    asks.some((a) => o.direction_ids.includes(Number(a.dir))) ||
+    threadAttentionCount(o, needs, asks) > 0 ||
     o.direction_ids.some((id) =>
       (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
     );
@@ -150,20 +169,22 @@ function EmptyBoard() {
 }
 
 function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
-  const { sessions, needs, asks, checksByDirection, openNeeds, authGrants } =
+  const { sessions, needs, asks, checksByDirection, openNeeds, leadTurn, authGrants } =
     useStore();
   const { t } = useTranslation();
-  const live = Object.values(sessions).filter(
-    (s) => s.status === "running" && o.direction_ids.includes(s.directionId),
-  ).length;
+  // Split the in-flight count so a stalled worker OR lead is visible on the card
+  // itself (not just the drill-in board): running = green pulse, stalled = amber.
+  const { running, stalled } = threadLiveCounts(
+    sessions,
+    o.direction_ids,
+    leadTurn[o.thread_id]?.state,
+  );
   // Only Full access is persisted (Always grants are in-memory only, see #89), so
   // the "inherited access" marker is Full-only. Grants key on thread id, so every
   // persisted grant under this thread belongs to it.
   const inherited = authGrants.full.some((g) => g.thread === o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
-  const attention =
-    needs.filter((n) => o.direction_ids.includes(n.direction_id)).length +
-    asks.filter((a) => o.direction_ids.includes(Number(a.dir))).length;
+  const attention = threadAttentionCount(o, needs, asks);
   const failing = o.direction_ids.filter((id) =>
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;
@@ -218,24 +239,37 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
         {inherited && <InheritedAccessChip threadId={o.thread_id} />}
       </div>
 
-      {o.direction_ids.length > 0 && (
+      {(o.direction_ids.length > 0 || running > 0 || stalled > 0) && (
         <div className="flex items-center gap-2">
-          <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-bg">
+          {o.direction_ids.length > 0 && (
+            <>
+              <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-bg">
+                <span
+                  className={cn("block h-full rounded-full", progressColor)}
+                  style={{ width: `${donePct}%` }}
+                />
+              </div>
+              <span className="font-mono text-[11px] tabular-nums text-ink-faint">
+                {done}/{o.direction_ids.length}
+              </span>
+            </>
+          )}
+          {running > 0 && (
             <span
-              className={cn("block h-full rounded-full", progressColor)}
-              style={{ width: `${donePct}%` }}
-            />
-          </div>
-          <span className="font-mono text-[11px] tabular-nums text-ink-faint">
-            {done}/{o.direction_ids.length}
-          </span>
-          {live > 0 && (
-            <span
-              title={t("workspace.live", { count: live })}
+              title={t("workspace.live", { count: running })}
               className="flex items-center gap-1 text-[11px] tabular-nums text-running"
             >
               <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
-              {live}
+              {running}
+            </span>
+          )}
+          {stalled > 0 && (
+            <span
+              title={t("workspace.stalled", { count: stalled })}
+              className="flex items-center gap-1 text-[11px] tabular-nums text-waiting"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-waiting" />
+              {stalled}
             </span>
           )}
           {failing > 0 && (

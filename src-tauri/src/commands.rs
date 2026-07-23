@@ -1316,6 +1316,9 @@ pub struct NeedItem {
     pub direction_name: String,
     pub text: String,
     pub ts: u64,
+    /// `false` for a display-only NOTICE (the self-clearing stall hint): the UI
+    /// shows it without an answer box, and answering is refused backend-side.
+    pub answerable: bool,
 }
 
 /// Aggregate every open agent→human question across the workspace's threads.
@@ -1355,6 +1358,7 @@ pub async fn needs_you(
                 direction_name: dir_name,
                 text: a.text,
                 ts: a.ts,
+                answerable: a.answerable,
             });
         }
     }
@@ -1664,7 +1668,7 @@ impl GuardrailState {
     }
 }
 
-fn env_secs(key: &str, default: u64) -> u64 {
+pub(crate) fn env_secs(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse().ok())

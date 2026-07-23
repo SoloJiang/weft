@@ -268,7 +268,10 @@ export type LeadChatPush =
       type: "turn";
       thread_id: number;
       session_id: number | null;
-      state: "busy" | "idle" | "stopped";
+      state: TurnState;
+      /** True only for the watchdog's stall→busy recovery push — the UI keeps the
+       *  running-tool label on recovery but still clears it on a real/promoted turn. */
+      recovered?: boolean;
       queue: QueuedItem[];
     }
   | {
@@ -357,7 +360,7 @@ export interface ImageAttachment {
 
 /** Snapshot of the lead engine, for mount-time hydration. */
 export interface LeadStateInfo {
-  state: "busy" | "idle" | "stopped";
+  state: TurnState;
   queue: QueuedItem[];
   native_id: string | null;
   slash_commands: SlashCmd[];
@@ -373,8 +376,13 @@ export interface LeadStateInfo {
   tools: string[];
 }
 
-/** UI-side runtime status for a live session panel. */
-export type SessionStatus = "running" | "idle" | "exited";
+/** UI-side runtime status for a live session panel. `stalled` = a busy turn gone
+ * silent past the stall-hint threshold (still in-flight, just not progressing). */
+export type SessionStatus = "running" | "stalled" | "idle" | "exited";
+
+/** Engine turn state as pushed by the backend / held per session. `stalled` =
+ * busy but silent past the stall hint; `stopped` = no live engine (UI default). */
+export type TurnState = "busy" | "stalled" | "idle" | "stopped";
 
 export interface FileDiff {
   path: string;
@@ -642,6 +650,9 @@ export interface NeedItem {
   direction_name: string;
   text: string;
   ts: number;
+  /** `false` for a display-only NOTICE (the self-clearing stall hint) — rendered
+   * without an answer box; answering is refused backend-side. */
+  answerable: boolean;
 }
 
 /** IM 话题绑定行：issue ↔ 飞书话题 1:1 映射（M2-5）。 */

@@ -74,6 +74,7 @@ export const zh = {
     threadsCount: "{{count}} 个 issue",
     noScope: "尚未划定范围",
     live: "{{count}} 个运行中",
+    stalled: "{{count}} 个停滞",
     failing: "{{count}} 个失败",
     writtenByAnother: "其他 issue 也在写这个仓库",
     emptyTitleHas: "还没有 issue",
@@ -287,6 +288,7 @@ export const zh = {
     emptyBody:
       "当 agent 遇到只有你能拍板的决定时，会在这里发问。你回答一次，答复会直接回到它的收件箱，你无需去翻找会话。",
     answerPlaceholder: "回复 {{name}}…",
+    selfClearing: "无需回复 —— 任务恢复输出后自动消失。",
     openDirection: "打开这个任务",
     wantsToWrite: "想修改",
     approveRun: "批准并运行",
@@ -777,6 +779,7 @@ export const zh = {
   },
   status: {
     running: "运行中",
+    stalled: "停滞",
     idle: "空闲",
     exited: "已退出",
   },

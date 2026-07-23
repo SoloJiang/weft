@@ -75,6 +75,7 @@ export const en = {
     threadsCount: "{{count}} issues",
     noScope: "no scope yet",
     live: "{{count}} live",
+    stalled: "{{count}} stalled",
     failing: "{{count}} failing",
     writtenByAnother: "Written by another issue too",
     emptyTitleHas: "No issues yet",
@@ -295,6 +296,7 @@ export const en = {
     emptyBody:
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",
     answerPlaceholder: "Answer {{name}}…",
+    selfClearing: "No reply needed — clears itself when the task resumes.",
     openDirection: "Open this task",
     wantsToWrite: "wants to modify",
     approveRun: "Approve & run",
@@ -800,6 +802,7 @@ export const en = {
   },
   status: {
     running: "Running",
+    stalled: "Stalled",
     idle: "Idle",
     exited: "Exited",
   },
