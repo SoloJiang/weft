@@ -1212,14 +1212,6 @@ async fn consume_human_event(
     let Some(owner) = owner else { return };
     match ev {
         crate::bus::state::HumanAskEvent::Asked { thread, ask } => {
-            // A display-only NOTICE (the self-clearing stall hint) stays on the
-            // desktop board: IM's cards are answer-oriented (reply-to-answer, then
-            // a resolved/cancelled patch), which fits a question, not a notice that
-            // carries no answer and retracts itself. Forwarding it would show a
-            // reply prompt that no-ops and a wrong "cancelled" patch on recovery.
-            if !ask.answerable {
-                return;
-            }
             let title = crate::store::repo::get_thread(db, thread)
                 .await
                 .ok()
@@ -1235,6 +1227,22 @@ async fn consume_human_event(
                     .unwrap_or_else(|| ask.from.clone()),
                 Err(_) => ask.from.clone(),
             };
+            // A display-only NOTICE (the self-clearing stall hint) can't be
+            // answered and retracts itself, so it must NOT go through IM's
+            // answer-card pipeline (reply-to-answer, then a resolved/cancelled
+            // patch) — that would show a dead reply prompt and a wrong
+            // "cancelled" patch on recovery. But a remote human still needs to
+            // learn a task froze, so send it as plain TEXT. Crucially, do NOT
+            // record it in CardIndex: a later Answered/Cancelled then finds
+            // nothing to patch (take_human → None), which is exactly right for
+            // a notice that never carries an answer.
+            if !ask.answerable {
+                let notice = format!("{title} · {from}\n{}", ask.text);
+                if let Err(e) = ch.send_text(&owner, &notice).await {
+                    eprintln!("[weft][im] send stall notice: {e}");
+                }
+                return;
+            }
             match ch
                 .send_card(
                     &owner,
@@ -1993,6 +2001,7 @@ mod tests {
     #[derive(Default)]
     struct CountingChannel {
         cards: std::sync::atomic::AtomicUsize,
+        texts: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -2005,6 +2014,7 @@ mod tests {
             Ok(())
         }
         async fn send_text(&self, _o: &str, _t: &str) -> anyhow::Result<()> {
+            self.texts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
         async fn send_chat_text(&self, _c: &str, _t: &str) -> anyhow::Result<String> {
@@ -2023,11 +2033,12 @@ mod tests {
         }
     }
 
-    /// A display-only stall NOTICE surfaces on the desktop board but must NOT be
-    /// pushed through IM's answer-oriented card pipeline (an answerable question
-    /// still is). Guards against a notice showing a dead reply prompt on IM.
+    /// An answerable question goes through IM's answer-card pipeline; a
+    /// display-only stall NOTICE reaches the remote human as plain TEXT instead
+    /// (never an answer card, so no dead reply prompt or wrong "cancelled" patch),
+    /// and — verified below — is NOT recorded in CardIndex.
     #[tokio::test]
-    async fn stall_notice_is_not_forwarded_to_im() {
+    async fn stall_notice_forwarded_as_text_to_im() {
         use crate::bus::state::{Ask, HumanAskEvent};
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let w = crate::store::repo::create_workspace(&db, "ws")
@@ -2043,7 +2054,8 @@ mod tests {
             .unwrap();
         let ch = CountingChannel::default();
         let cards = tokio::sync::Mutex::new(CardIndex::default());
-        let count = || ch.cards.load(std::sync::atomic::Ordering::Relaxed);
+        let cards_sent = || ch.cards.load(std::sync::atomic::Ordering::Relaxed);
+        let texts_sent = || ch.texts.load(std::sync::atomic::Ordering::Relaxed);
         let mk = |id: u64, answerable: bool| Ask {
             id,
             from: "10".to_string(),
@@ -2052,7 +2064,7 @@ mod tests {
             answered: false,
             answerable,
         };
-        // An answerable question IS forwarded as an IM card.
+        // An answerable question IS forwarded as an IM answer card.
         consume_human_event(
             HumanAskEvent::Asked {
                 thread: th.id,
@@ -2063,8 +2075,9 @@ mod tests {
             &cards,
         )
         .await;
-        assert_eq!(count(), 1);
-        // A non-answerable NOTICE is NOT — it stays on the desktop board only.
+        assert_eq!(cards_sent(), 1, "answerable → one answer card");
+        assert_eq!(texts_sent(), 0, "answerable → not a plain-text notice");
+        // A non-answerable NOTICE still reaches IM — as plain text, not a card.
         consume_human_event(
             HumanAskEvent::Asked {
                 thread: th.id,
@@ -2075,7 +2088,13 @@ mod tests {
             &cards,
         )
         .await;
-        assert_eq!(count(), 1);
+        assert_eq!(cards_sent(), 1, "notice must not open an answer card");
+        assert_eq!(texts_sent(), 1, "notice is delivered as plain text");
+        // And it is NOT recorded, so a later Answered/Cancelled patches nothing.
+        assert!(
+            cards.lock().await.take_human(th.id, 2).is_none(),
+            "notice must not be recorded in CardIndex",
+        );
     }
 
     #[derive(Default)]
