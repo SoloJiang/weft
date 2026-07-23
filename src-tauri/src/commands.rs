@@ -191,6 +191,12 @@ async fn cancel_workspace_human_asks(
     Ok(())
 }
 
+/// Clear this workspace's entire footprint in the AskRegistry: cancel its open
+/// asks AND drop its threads' standing grants (full/always). The workspace delete
+/// cascade bypasses the per-issue `delete_thread` path, so — mirroring what that
+/// path does per issue — grants are revoked here too, or a deleted workspace would
+/// leave persisted authorization behind (and a later-reused thread id could inherit
+/// it).
 async fn cancel_workspace_asks(
     db: &Db,
     asks: &crate::ask::AskRegistry,
@@ -204,6 +210,20 @@ async fn cancel_workspace_asks(
             asks.cancel(ask.id);
         }
     }
+    for thread_id in &scope.thread_ids {
+        asks.revoke_thread(*thread_id);
+    }
+    // Repo-routed directions live in OTHER workspaces' threads (this workspace owns
+    // the repo they use); the cascade deletes those directions, so revoke just their
+    // (thread, dir) grants — mirroring the open-ask cancellation scope above — else a
+    // later reused direction id inherits the deleted task's access.
+    for (thread_id, dir) in &scope.direction_routes {
+        if !scope.thread_ids.contains(thread_id) {
+            asks.revoke_grant(*thread_id, dir, None);
+        }
+    }
+    // best-effort durable clear (revokes already reached the writer via emit)
+    let _ = crate::auth_persist::flush(asks).await;
     Ok(())
 }
 
@@ -619,18 +639,57 @@ pub async fn get_repo_map_doc(db: State<'_, Db>, workspace_id: i32) -> R<Option<
     repo::get_repo_map_doc(&db, workspace_id).await.map_err(e)
 }
 
+/// Purge the AskRegistry footprint of every direction a repo delete removes: cancel
+/// their still-open asks (else a card answered Full/Always after the cascade would
+/// persist a FRESH grant for a removed id) AND revoke their standing grants. Covers
+/// BOTH directions bound to the repo (`directions_for_repo`) and directions with a
+/// session using it (`sessions_for_repo` — the repo-routed case `workspace_ask_scope`
+/// also handles), since `delete_repo_cascade` deletes both. delete_repo's cascade
+/// bypasses `delete_thread`, so this closes the id-reuse-inheritance gap.
+async fn purge_repo_ask_footprint(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    repo_id: i32,
+) -> R<()> {
+    use std::collections::BTreeSet;
+    let mut targets: BTreeSet<(i32, i32)> = BTreeSet::new(); // (thread_id, direction_id)
+    for d in repo::directions_for_repo(db, repo_id).await.map_err(e)? {
+        targets.insert((d.thread_id, d.id));
+    }
+    for s in repo::sessions_for_repo(db, repo_id).await.map_err(e)? {
+        if let Some(d) = repo::get_direction(db, s.direction_id).await.map_err(e)? {
+            targets.insert((d.thread_id, d.id));
+        }
+    }
+    for (thread, dir) in targets {
+        asks.purge_dir(thread, &dir.to_string());
+    }
+    // best-effort durable clear (revokes already reached the writer via emit)
+    let _ = crate::auth_persist::flush(asks).await;
+    Ok(())
+}
+
 /// Remove a repo from its workspace: delete Weft's reference, the repo's
 /// profile, the directions bound to it (with their sessions), and its worktrees
 /// (physically removed from git). The user's actual repository at its local path
 /// is NEVER deleted — only Weft's tracking of it.
 #[tauri::command]
-pub async fn delete_repo(db: State<'_, Db>, repo_id: i32) -> R<()> {
+pub async fn delete_repo(
+    db: State<'_, Db>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    repo_id: i32,
+) -> R<()> {
     // Capture the repo path before the cascade — the repo_ref row is gone after
     // delete_repo_cascade, so we must resolve the git path first.
     let repo = repo::get_repo(&db, repo_id)
         .await
         .map_err(e)?
         .ok_or("repo not found")?;
+    // Purge the AskRegistry footprint (open asks + standing grants) of the directions
+    // this delete removes — the cascade bypasses delete_thread, so without this a
+    // stale card or a later reused direction id could inherit the deleted task's
+    // Full/Always access. Do it while the rows still exist to enumerate.
+    purge_repo_ask_footprint(&db, &asks, repo_id).await?;
     // Forget before the cascade so any in-flight curator pass sees the deletion
     // as early as possible and does not publish stale running/done state.
     crate::curator::run_forget(repo_id);
@@ -1220,6 +1279,14 @@ pub async fn delete_thread(
     let removed = repo::delete_thread_cascade(&db, thread_id)
         .await
         .map_err(e)?;
+    // Purge the issue's WHOLE AskRegistry footprint: cancel its still-open asks
+    // (else a lingering card, answered Full/Always after the rows are gone, would
+    // persist a fresh grant for the deleted id) AND revoke its standing grants, so
+    // a future reused thread id can't inherit access. The revoke's emit reaches the
+    // writer; a best-effort awaited flush makes it durable without gating delete.
+    let asks = app.state::<crate::ask::AskRegistry>();
+    asks.purge_thread(thread_id);
+    let _ = crate::auth_persist::flush(&asks).await;
     let state = app.state::<crate::lead_chat::engine::LeadChatState>();
     for key in keys {
         if let Some(eng) = state.remove(key) {
@@ -1926,17 +1993,84 @@ pub async fn workspace_needs_counts(
 /// Answer a pending permission Ask. `answer` is allow | deny | always | full —
 /// always remembers this action for the task, full grants it full access.
 #[tauri::command]
-pub fn answer_permission(
+pub async fn answer_permission(
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     ask_id: u64,
     answer: String,
 ) -> R<()> {
     let a = crate::ask::Answer::parse(&answer).ok_or("unknown answer")?;
-    if asks.answer(ask_id, a) {
-        Ok(())
-    } else {
-        Err("that request was already answered or has expired".into())
+    if !asks.answer(ask_id, a) {
+        return Err("that request was already answered or has expired".into());
     }
+    // Only Full access persists (approach B: Always is in-memory only, never on
+    // disk). Persist it durably — routed through the single ordered writer, awaited
+    // — before reporting success, so an immediate quit/crash can't drop it and a
+    // write failure surfaces. Flushing on Always would be a no-op write whose rare
+    // failure would misleadingly report "not saved" for a grant never meant to be.
+    if matches!(a, crate::ask::Answer::Full) {
+        crate::auth_persist::flush(&asks).await?;
+    }
+    Ok(())
+}
+
+/// The current standing authorization grants (full / always), so the board can
+/// mark tasks whose Full/Always access was inherited across a restart and offer
+/// a one-click revoke.
+#[tauri::command]
+pub fn list_auth_grants(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+) -> R<crate::ask::GrantSnapshot> {
+    Ok(asks.snapshot_grants())
+}
+
+/// Revoke a standing grant (the human's one-click undo), at the granularity the
+/// caller passes:
+/// - `dir == None`                → clear the whole issue's grants (every task's
+///   full/always under this thread) — the board card's one-click "revoke all".
+/// - `dir == Some`, `summary == None` → clear that one task's `(thread, dir)` grant
+///   (its full access + every always-rule).
+/// - `dir == Some`, `summary == Some` → drop only that one always-rule.
+/// Revoke a standing grant and durably persist it, ATOMICALLY: the revoke is the
+/// safety net for persisted Full access, so it must never leave memory ahead of the
+/// store (chip gone in the UI but the grant still on disk, ready to resurrect on
+/// restart) or report success on a failed write. Uses `revoke_no_emit` so the ONLY
+/// store write is the acked `flush` — a fire-and-forget emit here plus the acked flush
+/// could diverge if one landed and the other failed (memory rolled back while disk is
+/// already revoked → the session keeps auto-approving). `revoke_no_emit` returns
+/// EXACTLY what it removed under one lock, so on a failed write the rollback re-adds
+/// only this call's removals. Extracted from the command so the rollback is testable.
+async fn revoke_grant_durable(
+    asks: &crate::ask::AskRegistry,
+    thread: i32,
+    dir: Option<&str>,
+    summary: Option<&str>,
+) -> Result<(), String> {
+    // Serialize the whole mutate → flush → rollback: two overlapping revokes of the
+    // same grant would otherwise race, an earlier failed revoke's rollback resurrecting
+    // a grant a later, already-succeeded revoke removed.
+    let _guard = asks.lock_revoke().await;
+    let removed = asks.revoke_no_emit(thread, dir, summary);
+    // Nothing matched → memory is unchanged, so disk is already consistent. Skip the
+    // write entirely (mirrors the emit path's guard) so a "revoke nothing" can't
+    // surface a spurious failure on an unrelated write error.
+    if removed.is_empty() {
+        return Ok(());
+    }
+    if let Err(err) = crate::auth_persist::flush(asks).await {
+        asks.seed_grants(removed);
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn revoke_auth_grant(
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread: i32,
+    dir: Option<String>,
+    summary: Option<String>,
+) -> R<()> {
+    revoke_grant_durable(&asks, thread, dir.as_deref(), summary.as_deref()).await
 }
 
 #[tauri::command]
@@ -2572,6 +2706,242 @@ mod tests {
         );
         assert!(!asks.open().iter().any(|ask| ask.id == remove_id));
         assert!(!asks.open().iter().any(|ask| ask.id == repo_scoped_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_asks_revokes_only_that_workspaces_standing_grants() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        let thread = repo::create_thread(&db, ws.id, "remove", "feature", "claude")
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![
+                crate::ask::FullGrant {
+                    thread: thread.id,
+                    dir: "".into(),
+                },
+                crate::ask::FullGrant {
+                    thread: keep_thread.id,
+                    dir: "".into(),
+                },
+            ],
+            always: vec![],
+        });
+
+        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+
+        // the deleted workspace's grant is gone; the other workspace's survives
+        assert!(asks.auto_decision(thread.id, "", "anything").is_none());
+        assert_eq!(
+            asks.auto_decision(keep_thread.id, "", "anything"),
+            Some(crate::ask::Decision::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_workspace_asks_revokes_repo_routed_direction_grants() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "delete me").await.unwrap();
+        let keep_ws = repo::create_workspace(&db, "keep me").await.unwrap();
+        // ws owns a repo; a direction in keep_ws's thread has a SESSION using ws's
+        // repo → it is a repo-routed direction in ws's ask scope.
+        let ws_repo = repo::add_repo_ref(&db, ws.id, "web", "/tmp/web", "main", "", true)
+            .await
+            .unwrap();
+        let keep_repo = repo::add_repo_ref(&db, keep_ws.id, "api", "/tmp/api", "main", "", true)
+            .await
+            .unwrap();
+        let keep_thread = repo::create_thread(&db, keep_ws.id, "keep", "feature", "claude")
+            .await
+            .unwrap();
+        let routed = repo::create_direction(
+            &db,
+            keep_thread.id,
+            "routed",
+            "claude",
+            keep_repo.id,
+            "why",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        repo::create_session(&db, routed.id, ws_repo.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![crate::ask::FullGrant {
+                thread: keep_thread.id,
+                dir: routed.id.to_string(),
+            }],
+            always: vec![],
+        });
+        // active before the delete
+        assert_eq!(
+            asks.auto_decision(keep_thread.id, &routed.id.to_string(), "x"),
+            Some(crate::ask::Decision::Allow)
+        );
+
+        cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
+
+        // deleting the workspace that owns the routed repo revokes the repo-routed
+        // direction's grant (which lives in another workspace's thread).
+        assert!(asks
+            .auto_decision(keep_thread.id, &routed.id.to_string(), "x")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_repo_ask_footprint_covers_bound_and_routed_and_cancels_asks() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_a = repo::add_repo_ref(&db, ws.id, "a", "/tmp/a", "main", "", true)
+            .await
+            .unwrap();
+        let repo_b = repo::add_repo_ref(&db, ws.id, "b", "/tmp/b", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        // dir_a is BOUND to repo_a (the deleted repo).
+        let dir_a = repo::create_direction(
+            &db, thread.id, "a", "claude", repo_a.id, "why", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        // dir_routed is bound to repo_b but has a SESSION using repo_a → repo-routed.
+        let dir_routed = repo::create_direction(
+            &db, thread.id, "routed", "claude", repo_b.id, "why", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        repo::create_session(&db, dir_routed.id, repo_a.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        // dir_b is bound to repo_b with no repo_a session → survives.
+        let dir_b = repo::create_direction(
+            &db, thread.id, "b", "claude", repo_b.id, "why", "plan+impl", "",
+        )
+        .await
+        .unwrap();
+        let asks = crate::ask::AskRegistry::new();
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![
+                crate::ask::FullGrant {
+                    thread: thread.id,
+                    dir: dir_a.id.to_string(),
+                },
+                crate::ask::FullGrant {
+                    thread: thread.id,
+                    dir: dir_routed.id.to_string(),
+                },
+                crate::ask::FullGrant {
+                    thread: thread.id,
+                    dir: dir_b.id.to_string(),
+                },
+            ],
+            always: vec![],
+        });
+        // open asks for the two directions the repo delete removes
+        let (ask_a, _r1) =
+            asks.request(thread.id, &dir_a.id.to_string(), "codex", "Run: x", "x");
+        let (ask_routed, _r2) =
+            asks.request(thread.id, &dir_routed.id.to_string(), "codex", "Run: y", "y");
+
+        purge_repo_ask_footprint(&db, &asks, repo_a.id)
+            .await
+            .unwrap();
+
+        // BOUND (dir_a) and REPO-ROUTED (dir_routed) grants revoked; dir_b survives.
+        assert!(asks
+            .auto_decision(thread.id, &dir_a.id.to_string(), "x")
+            .is_none());
+        assert!(asks
+            .auto_decision(thread.id, &dir_routed.id.to_string(), "x")
+            .is_none());
+        assert_eq!(
+            asks.auto_decision(thread.id, &dir_b.id.to_string(), "x"),
+            Some(crate::ask::Decision::Allow)
+        );
+        // their open asks are cancelled — a post-delete answer can't re-grant them.
+        let open: Vec<u64> = asks.open().iter().map(|a| a.id).collect();
+        assert!(!open.contains(&ask_a) && !open.contains(&ask_routed));
+    }
+
+    #[tokio::test]
+    async fn revoke_grant_durable_rolls_back_only_this_calls_removal_on_write_failure() {
+        let asks = crate::ask::AskRegistry::new();
+        // a writer that FAILS every ack'd write
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ask::PersistMsg>();
+        asks.set_persist_notifier(tx);
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(ack) = msg.ack {
+                    let _ = ack.send(Err("boom".into()));
+                }
+            }
+        });
+        asks.seed_grants(crate::ask::GrantSnapshot {
+            full: vec![
+                crate::ask::FullGrant {
+                    thread: 7,
+                    dir: "42".into(),
+                },
+                // an UNRELATED grant that must be left exactly as-is by the rollback
+                crate::ask::FullGrant {
+                    thread: 8,
+                    dir: "99".into(),
+                },
+            ],
+            always: vec![],
+        });
+
+        let r = revoke_grant_durable(&asks, 7, Some("42"), None).await;
+
+        assert!(r.is_err(), "a failed durable write must surface as an error");
+        // the revoked grant is restored (memory matches the unchanged store)...
+        assert_eq!(
+            asks.auto_decision(7, "42", "x"),
+            Some(crate::ask::Decision::Allow),
+            "the grant must be restored on a failed write"
+        );
+        // ...and the unrelated grant is untouched (no blind whole-set re-seed).
+        assert_eq!(
+            asks.auto_decision(8, "99", "x"),
+            Some(crate::ask::Decision::Allow)
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_grant_durable_with_nothing_to_remove_skips_the_write() {
+        let asks = crate::ask::AskRegistry::new();
+        // a writer that FAILS every ack'd write — so if the revoke tried to flush,
+        // it would surface an error. It must not, because nothing was removed.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ask::PersistMsg>();
+        asks.set_persist_notifier(tx);
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(ack) = msg.ack {
+                    let _ = ack.send(Err("boom".into()));
+                }
+            }
+        });
+
+        // No grant for (7, "42") exists, so nothing is removed.
+        let r = revoke_grant_durable(&asks, 7, Some("42"), None).await;
+
+        assert!(
+            r.is_ok(),
+            "revoking a grant that isn't there must skip the write, not surface a spurious failure"
+        );
     }
 
     #[tokio::test]

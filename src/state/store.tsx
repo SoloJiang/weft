@@ -23,6 +23,7 @@ import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromU
 import type {
   BusMsg,
   Direction,
+  GrantSnapshot,
   ImageAttachment,
   LeadChatPush,
   LeadMessage,
@@ -171,6 +172,16 @@ interface Store {
   needs: NeedItem[];
   /** Pending tool permission requests (the Ask Bridge). */
   asks: PermissionAsk[];
+  /** Standing authorization grants (full / always) that persist across restarts,
+   *  so the board can mark issues whose access was inherited and offer a revoke. */
+  authGrants: GrantSnapshot;
+  /** Revoke a standing grant. dir=null clears the whole issue's grants (one-click
+   *  "revoke all"); dir set clears one task; +summary drops a single always-rule. */
+  revokeAuthGrant: (
+    thread: number,
+    dir: string | null,
+    summary: string | null,
+  ) => Promise<void>;
   /** Lead-proposed write declarations awaiting human approve/deny. */
   writeTriggers: WriteTrigger[];
   approveWriteTrigger: (item: WriteTrigger, tool?: string) => Promise<void>;
@@ -405,6 +416,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<BusMsg[]>([]);
   const [needs, setNeeds] = useState<NeedItem[]>([]);
   const [asks, setAsks] = useState<PermissionAsk[]>([]);
+  const [authGrants, setAuthGrants] = useState<GrantSnapshot>({
+    full: [],
+    always: [],
+  });
   const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
   const [showNeeds, setShowNeeds] = useState(false);
@@ -1794,6 +1809,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       /* server may not be ready */
       console.error(e);
     }
+    // Standing grants are global too; refresh so "inherited access" markers stay
+    // in sync (e.g. seeded from disk at boot, or granted in another view).
+    try {
+      setAuthGrants(await api.listAuthGrants());
+    } catch (e) {
+      console.error(e);
+    }
     if (activeWorkspaceId == null) {
       setNeeds([]);
       setWriteTriggers([]);
@@ -2198,12 +2220,60 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       try {
         await api.answerPermission(askId, answer);
+        // A broad grant (always / full) creates a standing rule — refresh so the
+        // board's "inherited access" marker appears without waiting for a poll.
+        if (answer === "always" || answer === "full") {
+          setAuthGrants(await api.listAuthGrants());
+        }
       } catch (e) {
-        /* already resolved/expired */
-      console.error(e);
-    }
+        /* already resolved/expired, or the durable write failed */
+        console.error(e);
+        // Only Full persists (approach B: Always is in-memory only). Full still
+        // applies this session even if persisting it failed; surface that so a
+        // re-prompt after restart isn't a silent surprise. Always is never saved
+        // by design, so its re-prompt is expected — no "not saved" warning.
+        if (answer === "full") {
+          toast(i18n.t("grants.grantNotSaved"));
+        }
+      }
     },
     [dangerousMode],
+  );
+
+  const revokeAuthGrant = useCallback(
+    async (thread: number, dir: string | null, summary: string | null) => {
+      // optimistic: drop the matching grants locally so the marker clears at once
+      setAuthGrants((cur) => ({
+        full: cur.full.filter(
+          (g) => !(g.thread === thread && (dir === null || g.dir === dir)),
+        ),
+        always: cur.always.filter(
+          (g) =>
+            !(
+              g.thread === thread &&
+              (dir === null || g.dir === dir) &&
+              (summary === null || g.summary === summary)
+            ),
+        ),
+      }));
+      try {
+        await api.revokeAuthGrant(thread, dir, summary);
+      } catch (e) {
+        console.error(e);
+        // The backend rolls back a failed durable write, so the reconcile below
+        // restores the chip; tell the user the revoke did NOT take — otherwise the
+        // safety-net revoke would appear to succeed while the grant persists.
+        toast(i18n.t("grants.revokeFailed"));
+      }
+      // reconcile with backend truth (covers a concurrent grant/revoke, and a
+      // rolled-back failed revoke — the grant reappears rather than silently gone)
+      try {
+        setAuthGrants(await api.listAuthGrants());
+      } catch (e) {
+        console.error(e);
+      }
+    },
+    [],
   );
 
   const goToAsk = useCallback(
@@ -2457,6 +2527,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setGuardrails,
     needs,
     asks,
+    authGrants,
+    revokeAuthGrant,
     writeTriggers,
     approveWriteTrigger,
     denyWriteTrigger,
