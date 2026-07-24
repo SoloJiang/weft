@@ -108,6 +108,30 @@ export function threadLiveCounts(
   };
 }
 
+/** A NeedItem the human must actually act on — excludes a display-only NOTICE
+ *  (the self-clearing stall hint, `answerable: false`): it surfaces in the
+ *  Needs-you queue as an FYI row but has no answer to give and clears itself
+ *  automatically once the task recovers. Single source of truth for every
+ *  "needs you" badge/count/urgent-flag so a stall notice can't inflate a number
+ *  that promises "N things need your action" (issue #105). */
+export function isPendingNeed(item: NeedItem): boolean {
+  return item.answerable;
+}
+
+/** Workspace-wide "needs you" count: real agent questions (excludes
+ *  self-clearing NOTICEs via `isPendingNeed`) + tool-permission asks + pending
+ *  write triggers — everything actually waiting on the human. Single source for
+ *  every numeric badge (dock strip, nav item) so they can't drift apart; the
+ *  Needs-you queue itself still RENDERS a notice row (so a stall hint stays
+ *  reachable) — it just doesn't count toward this number. */
+export function pendingNeedsCount(
+  needs: NeedItem[],
+  asks: PermissionAsk[],
+  writeTriggers: WriteTrigger[],
+): number {
+  return needs.filter(isPendingNeed).length + asks.length + writeTriggers.length;
+}
+
 const PROCESS_QUOTA_NOTICE_VIEW: Record<
   ProcessQuotaNotice,
   { key: string; tone: ToastTone }

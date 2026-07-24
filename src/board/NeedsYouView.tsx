@@ -17,6 +17,10 @@ import { needsRowMotion } from "../lib/motion";
 export function NeedsYouView() {
   const { needs, asks, writeTriggers } = useStore();
   const reduce = useReducedMotion();
+  // Row count, not the "needs your action" count (see pendingNeedsCount in
+  // state/store.tsx): this only gates empty-vs-list, so it deliberately still
+  // counts a self-clearing stall notice — AskRow renders it as a no-action FYI
+  // row, and it must stay reachable here even when it's the only item.
   const total = needs.length + asks.length + writeTriggers.length;
 
   return (

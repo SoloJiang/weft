@@ -1958,8 +1958,10 @@ pub async fn workspace_skills(
         .map_err(e)
 }
 
-/// Pending "needs you" count per workspace (agent questions + tool asks), so the
-/// workspace switcher can flag OTHER workspaces that want attention.
+/// Pending "needs you" count per workspace (answerable agent questions + tool
+/// asks + pending write triggers — self-clearing NOTICEs excluded, see
+/// `open_answerable_ask_count`), so the workspace switcher can flag OTHER
+/// workspaces that want attention.
 #[tauri::command]
 pub async fn workspace_needs_counts(
     db: State<'_, Db>,
@@ -1979,7 +1981,10 @@ pub async fn workspace_needs_counts(
         let tids: HashSet<i32> = threads.iter().map(|t| t.id).collect();
         let mut count: u32 = 0;
         for t in &threads {
-            count += bus.open_asks(t.id).len() as u32;
+            // Excludes self-clearing NOTICEs (e.g. the stall hint) — they carry
+            // no action, so they must not inflate the "needs you" count that
+            // flags other workspaces (issue #105).
+            count += bus.open_answerable_ask_count(t.id) as u32;
             count += crate::planner::pending_writes(&db, t.id)
                 .await
                 .map_err(e)?
