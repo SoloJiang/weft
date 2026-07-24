@@ -322,6 +322,16 @@ impl BusRegistry {
             .collect()
     }
 
+    /// Count of open asks the human must actually act on — excludes a
+    /// display-only NOTICE (`answerable == false`, e.g. the self-clearing stall
+    /// hint), which surfaces in Needs-you but has no answer to give. Single
+    /// source so every "needs you" count (the workspace switcher, badges)
+    /// agrees on what's pending: a stall notice must not inflate a number that
+    /// promises "N things need your action" (issue #105).
+    pub fn open_answerable_ask_count(&self, thread: i32) -> usize {
+        self.open_asks(thread).iter().filter(|a| a.answerable).count()
+    }
+
     /// Answer an open ask: mark it answered and deliver `text` to the asking
     /// direction's inbox (as if from the human). Returns false if not found —
     /// including a display-only NOTICE (`answerable == false`), which has no
@@ -446,6 +456,25 @@ mod tests {
         // Unknown / already-cancelled id → no-op false.
         assert!(!r.cancel_open_asks_by_id(1, stall));
         assert!(!r.cancel_open_asks_by_id(1, 9999));
+    }
+
+    #[test]
+    fn open_answerable_ask_count_excludes_notices() {
+        // A self-clearing NOTICE (`notify_human`, e.g. the stall hint) still
+        // surfaces via `open_asks` — the queue must render it — but must NOT
+        // inflate the "needs you" count, which promises real pending items
+        // (issue #105: badge showed 4, only 1 was actually awaiting an answer).
+        let r = BusRegistry::new();
+        r.notify_human(1, "10", "stall hint");
+        assert_eq!(r.open_asks(1).len(), 1, "the notice still surfaces in the queue");
+        assert_eq!(r.open_answerable_ask_count(1), 0, "but doesn't count as pending");
+
+        let q = r.ask_human(1, "10", "real question");
+        assert_eq!(r.open_asks(1).len(), 2);
+        assert_eq!(r.open_answerable_ask_count(1), 1, "a real question does count");
+
+        assert!(r.answer_ask(1, q, "ok"));
+        assert_eq!(r.open_answerable_ask_count(1), 0, "answered questions drop out");
     }
 
     #[test]

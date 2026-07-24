@@ -19,7 +19,7 @@ import { useTranslation } from "react-i18next";
 import { currentLang, setLang } from "../i18n";
 import { Button } from "../components/ui/Button";
 import { cn } from "../lib/cn";
-import { useStore } from "../state/store";
+import { pendingNeedsCount, useStore } from "../state/store";
 import { useTheme, type ThemePref } from "../state/theme";
 import { AddRepoDialog } from "./dialogs";
 
@@ -89,7 +89,9 @@ export function AppTopBar() {
     viewing == null &&
     !showNeeds &&
     homeTab === "repos";
-  const needsCount = needs.length + asks.length + writeTriggers.length;
+  // Header count for the open Needs-you page — excludes self-clearing stall
+  // notices so it can't outnumber the rows actually awaiting a reply (issue #105).
+  const needsCount = pendingNeedsCount(needs, asks, writeTriggers);
   const proposalPending =
     proposal?.status === "proposed" && proposal.directions.length > 0 && !reviewingProposal;
   const issueTabs = [

@@ -2,18 +2,21 @@ import { useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { Layers, Plus, SquarePen, X } from "lucide-react";
-import { threadLiveCounts, useStore } from "../state/store";
+import { isPendingNeed, threadLiveCounts, useStore } from "../state/store";
 import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { InheritedAccessChip } from "../components/InheritedAccessChip";
+import { inheritedAccessOf } from "../lib/grants";
 import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
 
 /** Needs/asks that want the human on this thread — per-direction PLUS thread-level
  * ones (a stalled/blocked lead posts with direction_id -1 / dir "lead"), matched by
- * thread_id. Single source so the card badge and the column sort agree. */
+ * thread_id. Single source so the card badge and the column sort agree. Excludes
+ * self-clearing stall notices (isPendingNeed) — they carry no action, so they
+ * don't inflate the card's "N need you" badge (issue #105). */
 function threadAttentionCount(
   o: ThreadOverview,
   needs: NeedItem[],
@@ -21,7 +24,9 @@ function threadAttentionCount(
 ): number {
   return (
     needs.filter(
-      (n) => o.direction_ids.includes(n.direction_id) || n.thread_id === o.thread_id,
+      (n) =>
+        isPendingNeed(n) &&
+        (o.direction_ids.includes(n.direction_id) || n.thread_id === o.thread_id),
     ).length +
     asks.filter(
       (a) => o.direction_ids.includes(Number(a.dir)) || a.thread === o.thread_id,
@@ -179,10 +184,11 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
     o.direction_ids,
     leadTurn[o.thread_id]?.state,
   );
-  // Only Full access is persisted (Always grants are in-memory only, see #89), so
-  // the "inherited access" marker is Full-only. Grants key on thread id, so every
-  // persisted grant under this thread belongs to it.
-  const inherited = authGrants.full.some((g) => g.thread === o.thread_id);
+  // Full access and always-allow rules both count: either is a standing grant
+  // that carries over (#89 makes Always persist across restarts too), so the
+  // marker and its one-click revoke must cover both. The chip re-derives the
+  // kind-accurate copy from this same helper.
+  const inherited = inheritedAccessOf(authGrants, o.thread_id) !== null;
   const done = o.statuses.filter((s) => s === "done").length;
   const attention = threadAttentionCount(o, needs, asks);
   const failing = o.direction_ids.filter((id) =>

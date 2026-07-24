@@ -444,11 +444,18 @@ async fn register_repo(
     // gets a deep per-repo classification and cross-repo relations refresh.
     // Read-only, coalesced (a batch add runs one pass), and best-effort — it
     // never blocks the add. Not forced: an add shouldn't retry OTHER repos' failures.
-    let db_bg = db.clone();
-    let ws = r.workspace_id;
-    tauri::async_runtime::spawn(async move {
-        crate::curator::analyze_workspace_coalesced(&db_bg, ws, false).await;
-    });
+    // No-op outside a running app (`maybe_schedule_backfill`'s gate): with no App
+    // built, `tauri::async_runtime::spawn` still runs this on a fallback runtime,
+    // so a unit test calling `register_repo` would leak a live pass that outlives
+    // the test body, mutates the process-global pass-gate/run-state registries
+    // (shared across tests via small fresh-DB ids), and can launch a real agent.
+    if crate::APP_HANDLE.get().is_some() {
+        let db_bg = db.clone();
+        let ws = r.workspace_id;
+        tauri::async_runtime::spawn(async move {
+            crate::curator::analyze_workspace_coalesced(&db_bg, ws, false).await;
+        });
+    }
     Ok(r)
 }
 
@@ -1958,8 +1965,10 @@ pub async fn workspace_skills(
         .map_err(e)
 }
 
-/// Pending "needs you" count per workspace (agent questions + tool asks), so the
-/// workspace switcher can flag OTHER workspaces that want attention.
+/// Pending "needs you" count per workspace (answerable agent questions + tool
+/// asks + pending write triggers — self-clearing NOTICEs excluded, see
+/// `open_answerable_ask_count`), so the workspace switcher can flag OTHER
+/// workspaces that want attention.
 #[tauri::command]
 pub async fn workspace_needs_counts(
     db: State<'_, Db>,
@@ -1979,7 +1988,10 @@ pub async fn workspace_needs_counts(
         let tids: HashSet<i32> = threads.iter().map(|t| t.id).collect();
         let mut count: u32 = 0;
         for t in &threads {
-            count += bus.open_asks(t.id).len() as u32;
+            // Excludes self-clearing NOTICEs (e.g. the stall hint) — they carry
+            // no action, so they must not inflate the "needs you" count that
+            // flags other workspaces (issue #105).
+            count += bus.open_answerable_ask_count(t.id) as u32;
             count += crate::planner::pending_writes(&db, t.id)
                 .await
                 .map_err(e)?
@@ -2462,6 +2474,65 @@ mod tests {
             "R47-2: a nonstandard fallback base (trunk; no main/master/origin-HEAD) must NOT be \
              captured as a vetted default"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `register_repo` must NOT fire background curator analysis outside a
+    /// running app (`maybe_schedule_backfill`'s rule): `tauri::async_runtime::spawn`
+    /// falls back to its own runtime even when no App was built, so in unit
+    /// tests the leaked pass outlives the test body and mutates the
+    /// process-global pass-gate/run-state registries — keyed by the tiny ids
+    /// every fresh in-memory DB restarts at, i.e. shared across concurrent
+    /// tests — and can even launch a real curator agent on the repo.
+    #[tokio::test]
+    async fn register_repo_without_app_fires_no_background_analysis() {
+        const WS: i32 = 2_000_000_777;
+        let tag = format!("weft-regrepo-noapp-{}", std::process::id());
+        let root = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        // A real workspace row at a SENTINEL id (`add_repo_ref` checks the
+        // workspace exists): the pass-gate registry is process-global and keyed
+        // by workspace id, so asserting quiescence on a small fresh-DB id would
+        // race any concurrent test legitimately driving that workspace's gate.
+        {
+            use sea_orm::{ActiveModelTrait, Set};
+            entities::workspace::ActiveModel {
+                id: Set(WS),
+                name: Set("noapp".into()),
+                slug: Set("noapp".into()),
+                created_at: Set(String::new()),
+            }
+            .insert(&db.0)
+            .await
+            .unwrap();
+        }
+
+        // Freeze the gate FIRST — and leak the hold on purpose: a leaked spawn
+        // marks the gate dirty before blocking on the lock, so the leak shows up
+        // as a stuck flag, and a regression's parked task stays parked even
+        // after this test's assert unwinds (it must never reach run-state/DB
+        // writes or a real agent launch). Sentinel gate, so nothing else in the
+        // process ever wants this lock.
+        std::mem::forget(crate::curator::test_hold_pass_gate(WS).await);
+
+        let repo_dir = init_main_repo(&root, "svc");
+        let r = register_repo(&db, WS, "svc", repo_dir.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.workspace_id, WS, "precondition: row landed on the sentinel workspace");
+
+        // Absence assert over a generous window — the buggy spawn reaches the
+        // gate within milliseconds of register_repo returning.
+        for _ in 0..20 {
+            assert!(
+                !crate::curator::test_pass_gate_dirty(WS),
+                "register_repo queued a background analysis pass with no app running"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

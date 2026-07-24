@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type { PermissionAsk, WriteTrigger, NeedItem } from "../lib/types";
 import { cn } from "../lib/cn";
-import { useStore } from "../state/store";
+import { isPendingNeed, pendingNeedsCount, useStore } from "../state/store";
 import { needsBarMotion } from "../lib/motion";
 
 type DockItem =
@@ -22,8 +22,11 @@ export function NeedsDock() {
   const { needs, asks, writeTriggers, openNeeds } = useStore();
   const { t } = useTranslation();
   const reduce = useReducedMotion();
-  const total = needs.length + asks.length + writeTriggers.length;
-  const top = topDockItem(writeTriggers, asks, needs);
+  // Self-clearing stall notices don't count — this strip promises "N things
+  // need your action" (issue #105), and a notice has none. It still shows up
+  // once you open the queue via the persistent "Needs you" nav entry.
+  const total = pendingNeedsCount(needs, asks, writeTriggers);
+  const top = topDockItem(writeTriggers, asks, needs.filter(isPendingNeed));
 
   return (
     <AnimatePresence initial={false}>
