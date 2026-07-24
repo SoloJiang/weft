@@ -12,12 +12,14 @@ type NamedSkill = { name: string; description: string };
  * Sub-tasks/MCP 是 <Section> 静态头 + <OverflowList>(head+show-more):头常驻只读,
  * 长列表用同一个 head + "Show N more" 控件折叠尾部。Skills 是两个独立口径的
  * <SkillGroup>(各自的头 + OverflowList)——workspace 静态注入 vs 引擎运行时探测,
- * 见该段内注释与 #108。纯展示——数据由 store 的 leadMeta/workerMeta +
- * workspaceSkills + directionsByThread 喂。
+ * 见该段内注释与 #108;运行时探测那组按 `tool` 门控(opencode 无此探测能力,
+ * 见 {@link skillDiscoverySupported} 与 #114 review)。纯展示——数据由 store 的
+ * leadMeta/workerMeta + workspaceSkills + directionsByThread 喂。
  */
 export function SessionInfoPanel({
   meta,
   skills,
+  tool,
   subtasks,
   onOpenSubtask,
   onClose,
@@ -26,6 +28,10 @@ export function SessionInfoPanel({
 }: {
   meta: SessionMeta | undefined;
   skills: EnabledSkill[];
+  /** lead_tool / ObserveRef.tool — gates the "Discovered" Skills group to
+   *  engines that can actually report it (see {@link skillDiscoverySupported}).
+   *  Omitted/undefined (tool identity not resolved yet) still renders. */
+  tool?: string;
   /** 该 thread 已创建的子任务(lead 专用;worker 不传 → 不渲染该段)。 */
   subtasks?: Direction[];
   /** 点击子任务行 → 打开该 worker 会话面(lead 专用;不传 → 行保持静态)。 */
@@ -120,15 +126,23 @@ export function SessionInfoPanel({
               skills={skills}
               emptyText={t("sessionInfo.noSkills")}
             />
-            <div className="mt-3">
-              <SkillGroup
-                label={t("sessionInfo.skillsDiscovered")}
-                hint={t("sessionInfo.skillsDiscoveredHint")}
-                skills={meta?.engineSkills}
-                emptyText={t("sessionInfo.noEngineSkills")}
-                pendingText={t("sessionInfo.pending")}
-              />
-            </div>
+            {/* opencode has no discovery probe at all (session_meta.rs's
+                gather_opencode never sets `skills`) — engineSkills would stay
+                `undefined` forever, so the group would be stuck reading
+                "pending" turn after turn instead of ever resolving. That's not
+                the same as "not probed yet"; hide the reading entirely rather
+                than show a promise that can't be kept (PR #114 review). */}
+            {skillDiscoverySupported(tool) && (
+              <div className="mt-3">
+                <SkillGroup
+                  label={t("sessionInfo.skillsDiscovered")}
+                  hint={t("sessionInfo.skillsDiscoveredHint")}
+                  skills={meta?.engineSkills}
+                  emptyText={t("sessionInfo.noEngineSkills")}
+                  pendingText={t("sessionInfo.pending")}
+                />
+              </div>
+            )}
           </div>
         </Section>
 
@@ -236,6 +250,22 @@ function OverflowList<T>({
       )}
     </>
   );
+}
+
+/** Whether this session's engine has ANY mechanism to report which skills it
+ *  actually loaded — mirrors `session_meta::gather`'s dispatch in
+ *  `src-tauri/src/session_meta.rs`: claude scans the session cwd's
+ *  `.claude/skills`, codex has its own skill discovery; opencode has no
+ *  equivalent probe, so `gather_opencode` never sets `skills` and
+ *  `meta.engineSkills` would stay `undefined` for the life of the session —
+ *  not "pending", just permanently unavailable. `tool` unresolved
+ *  (`undefined`, e.g. the worker surface before its session lookup lands)
+ *  still counts as supported: the session_meta effects that would populate
+ *  `engineSkills` already gate on the tool being known first (see
+ *  LeadTab/WorkerConversation), so there's no real window where this default
+ *  would show a reading that never arrives. */
+function skillDiscoverySupported(tool: string | undefined): boolean {
+  return tool !== "opencode";
 }
 
 /** One Skills reading's tri-state: `undefined` means no authoritative result

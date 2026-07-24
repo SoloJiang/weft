@@ -373,6 +373,7 @@ export function WorkerConversation() {
         <SessionInfoPanel
           meta={sid != null ? workerMeta[sid] : undefined}
           skills={skills}
+          tool={ref?.tool}
           onClose={() => setRail("none")}
           onReload={onReload}
           busy={busy}
