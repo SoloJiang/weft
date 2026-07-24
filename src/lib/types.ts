@@ -251,6 +251,11 @@ export interface LeadMessage {
   /** Engine-side rewind anchor (claude assistant uuid / codex turn id), recorded
    *  on the user row that opened a turn. Backend-owned; the UI never reads it. */
   native_anchor?: string | null;
+  /** Unix-millis when the agent produced its first observed activity for the
+   *  turn this ("user") row opened — the delivery receipt's third tier
+   *  ("已被 agent 消费", issue #94). Null/absent = not yet observed (still just
+   *  "delivered"). Only ever set on a "user" row whose status is "complete". */
+  consumed_at?: number | null;
   created_at: string;
 }
 
@@ -340,6 +345,15 @@ export type LeadChatPush =
       thread_id: number;
       session_id: number | null;
       native_id: string | null;
+    }
+  | {
+      /** The delivery receipt's third tier (issue #94): the agent produced its
+       *  first observed activity for the turn `message_id` (a "user" row)
+       *  opened. Fired at most once per turn. */
+      type: "consumed";
+      thread_id: number;
+      message_id: number;
+      consumed_at: number;
     };
 
 /** Rewind scope for `chat_rewind`: the conversation rows, the worktree code

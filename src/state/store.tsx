@@ -10,7 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { createDeltaCoalescer } from "./deltaCoalescer";
-import { applyLeadFinalize, mergeLeadSnapshot } from "./leadSnapshot";
+import { applyLeadConsumed, applyLeadFinalize, mergeLeadSnapshot } from "./leadSnapshot";
 import {
   beginChatHistoryLoad,
   failChatHistoryLoad,
@@ -119,6 +119,29 @@ const PROCESS_QUOTA_NOTICE_VIEW: Record<
 
 function notifyProcessQuotaBlocked() {
   toast(i18n.t("processQuota.blockedToast"), "danger");
+}
+
+/** The raw rejection from a Tauri command: `Result<T, String>` commands reject
+ *  with the bare string; a handful of paths (network layer, JS runtime) reject
+ *  with a real `Error` instead — cover both, no nested ternary. */
+function rawErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  return "";
+}
+
+/** A send that never created a message row (queue-full race, worktree/session
+ *  mid-rewind, "turn ended while persisting", a missing agent binary before any
+ *  row lands, …) has no row to carry a delivery receipt — the composer
+ *  restoring the draft would otherwise be the ONLY visible effect, which reads
+ *  as a silent drop (issue #94). Surface the reason explicitly instead. */
+function notifySendFailed(error: unknown) {
+  const raw = rawErrorMessage(error);
+  const msg =
+    raw === "queue_full"
+      ? i18n.t("lead.queueFull")
+      : i18n.t("lead.sendFailedGeneric", { reason: raw || i18n.t("lead.sendFailedUnknown") });
+  toast(msg, "danger");
 }
 
 interface Store {
@@ -1346,7 +1369,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         if (sessionId == null) return;
         await api.chatSend(sessionId, text, images, files);
       } catch (error) {
-        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        if (isProcessQuotaDegradedError(error)) {
+          notifyProcessQuotaBlocked();
+        } else {
+          notifySendFailed(error);
+        }
         // ChatComposer restores the draft when the send promise rejects.
         throw error;
       }
@@ -1553,6 +1580,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               ? { ...x, content: p.content, status: p.status as LeadMessage["status"] }
               : x,
           ),
+        }));
+      } else if (p.type === "consumed") {
+        // Delivery receipt, third tier (issue #94): the agent produced its
+        // first activity for the turn this user row opened.
+        setLeadMessages((m) => ({
+          ...m,
+          [p.thread_id]: applyLeadConsumed(m[p.thread_id] ?? [], p.message_id, p.consumed_at),
         }));
       } else if (p.type === "activity") {
         const act = { name: p.name, summary: p.summary };
@@ -1781,7 +1815,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         await api.leadSend(threadId, text, currentLang(), images, files);
       } catch (error) {
-        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        if (isProcessQuotaDegradedError(error)) {
+          notifyProcessQuotaBlocked();
+        } else {
+          notifySendFailed(error);
+        }
         // ChatComposer restores the draft when the send promise rejects.
         throw error;
       }

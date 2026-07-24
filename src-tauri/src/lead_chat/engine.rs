@@ -173,6 +173,14 @@ pub enum Push {
         session_id: Option<i32>,
         native_id: Option<String>,
     },
+    /// The delivery receipt's third tier (issue #94): the agent produced its
+    /// first observed activity for the turn `message_id` (a "user" row)
+    /// opened. Fired at most once per turn — see [`note_turn_activity`].
+    Consumed {
+        thread_id: i32,
+        message_id: i32,
+        consumed_at: i64,
+    },
 }
 
 /// 进行中 turn 最多排队多少条人类消息（满后 send 拒绝入队）。
@@ -389,6 +397,12 @@ fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
     inner.clock.begin_turn();
     // Plumbing starts a turn directly (not via send): keep the invariant.
     inner.current_origin_tag = None;
+    // No user row opens a hidden turn (it carries no `queue_id`/tracked row) —
+    // clear the pointer rather than leave it stale on whatever real turn ran
+    // last. Left stale, it would misattribute this turn's outcome to that old
+    // row: the rewind anchor (`set_lead_message_anchor` on TurnEnd) and the
+    // "consumed" receipt (`note_turn_activity`) both key off `turn_user_row`.
+    inner.turn_user_row = None;
     inner.turn_id
 }
 
@@ -518,6 +532,47 @@ async fn mark_queued_status(
         }
         Err(e) => eprintln!("[weft] queued message {status} finalize failed: {e}"),
     }
+}
+
+/// Record that the child produced SOME event for the in-flight turn — proof the
+/// agent is actively working, not merely that bytes reached its stdin. This is
+/// the ONE choke point every dialect's reader (resident/per-turn stdout in
+/// `spawn_reader`, codex app-server's `codex_consumer`) already calls to bump
+/// `clock.last_activity` for the idle watchdog; it now also carries the
+/// delivery receipt's third tier (issue #94 — "已被 agent 消费").
+///
+/// The first time this fires since the turn began, best-effort mark the
+/// turn's opening user row (`turn_user_row`) consumed and push the receipt.
+/// Fire-and-forget, off the engine lock: `mark_message_consumed` is a single
+/// idempotent UPDATE keyed by message id, so a dropped/delayed mark only
+/// delays the UI receipt — it can never block, retry into, or corrupt turn
+/// delivery (no OCC state is read or written here).
+fn note_turn_activity(app: &AppHandle, db: &Db, inner: &mut EngineInner) {
+    inner.clock.last_activity = std::time::Instant::now();
+    if !inner.clock.mark_consumed_once() {
+        return;
+    }
+    let Some(message_id) = inner.turn_user_row else {
+        return;
+    };
+    let app = app.clone();
+    let db = db.clone();
+    tauri::async_runtime::spawn(async move {
+        match repo::mark_message_consumed(&db, message_id).await {
+            Ok(Some(m)) => {
+                let _ = app.emit(
+                    EVENT,
+                    Push::Consumed {
+                        thread_id: m.thread_id,
+                        message_id: m.id,
+                        consumed_at: m.consumed_at.unwrap_or_default(),
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[weft] mark_message_consumed failed: {e}"),
+        }
+    });
 }
 
 /// Single construction point for the Push::Turn state event. `state` is the wire
@@ -1246,6 +1301,12 @@ pub struct TurnClock {
     /// idle-save immediately followed by the feedback turn (same second)
     /// from being misread as a mid-turn save.
     pub started_millis: u64,
+    /// True once SOME activity has been observed for the in-flight turn.
+    /// Gates the one-time "consumed" receipt (issue #94, [`note_turn_activity`])
+    /// so repeated stdout lines / delta events within one turn don't re-query
+    /// the DB after the first — `mark_message_consumed` is idempotent on its
+    /// own, this just avoids the redundant round-trips.
+    consumed_marked: bool,
 }
 
 impl Default for TurnClock {
@@ -1254,6 +1315,7 @@ impl Default for TurnClock {
             started: None,
             last_activity: std::time::Instant::now(),
             started_millis: 0,
+            consumed_marked: false,
         }
     }
 }
@@ -1266,6 +1328,7 @@ impl TurnClock {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
+        self.consumed_marked = false;
     }
     /// Re-sync with the queue state after a turn ends (queued pop = new turn).
     fn on_turn_end(&mut self, still_busy: bool) {
@@ -1273,6 +1336,17 @@ impl TurnClock {
             self.begin_turn();
         } else {
             self.started = None;
+        }
+    }
+    /// True only the FIRST call since the turn began (`begin_turn`) — the
+    /// caller uses this to fire the one-time "consumed" mark. Pure state flip,
+    /// no I/O: [`note_turn_activity`] is what actually persists/pushes it.
+    fn mark_consumed_once(&mut self) -> bool {
+        if self.consumed_marked {
+            false
+        } else {
+            self.consumed_marked = true;
+            true
         }
     }
 }
@@ -2735,7 +2809,7 @@ async fn codex_consumer(
         match msg {
             ThreadMsg::Event(ChatEvent::TextDelta { text, item }) => {
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &mut inner);
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 // Ensure the target row exists: item-keyed rows in `open_texts`
@@ -2801,7 +2875,7 @@ async fn codex_consumer(
             }
             ThreadMsg::Event(ChatEvent::TextDone { item, text }) => {
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &mut inner);
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
                 match streamed {
                     // The item streamed: finalize its row, preferring the
@@ -2860,7 +2934,7 @@ async fn codex_consumer(
                 // unrelated stream's sentence into fragment bubbles. Serial
                 // ordering still holds: an item's completion precedes its tools.
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &mut inner);
                 if !texts.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
@@ -3122,7 +3196,8 @@ async fn codex_consumer(
             ThreadMsg::Heartbeat => {
                 // outputDelta from a long-running command: no row change, just keep
                 // the turn alive so the idle watchdog doesn't reap it mid-output.
-                eng.lock().await.clock.last_activity = std::time::Instant::now();
+                let mut inner = eng.lock().await;
+                note_turn_activity(&app, &db, &mut inner);
             }
             ThreadMsg::Approval { id, method, params } => {
                 // An approval (command / file-change / permissions) — route to Weft's
@@ -4803,7 +4878,7 @@ fn spawn_reader(
             if inner.generation != generation {
                 return; // superseded by a respawn/stop
             }
-            inner.clock.last_activity = std::time::Instant::now();
+            note_turn_activity(&app, &db, &mut inner);
             let thread_id = inner.thread_id;
             // Per-turn dialects carry the native session id on their events.
             if inner.native_id.is_none() {
@@ -6211,6 +6286,39 @@ mod tests {
         assert!(c.started.is_none());
     }
 
+    /// [`TurnClock::mark_consumed_once`] fires exactly once per turn — the gate
+    /// `note_turn_activity` uses so a chatty turn's later stdout lines / delta
+    /// events don't re-query the DB after the first "consumed" mark landed.
+    #[test]
+    fn mark_consumed_once_fires_once_then_resets_on_new_turn() {
+        let mut c = TurnClock::default();
+        // Fresh clock, no turn begun yet: still gates true→false like any other
+        // "first observation" — begin_turn is what a real send always calls
+        // first, but the gate itself doesn't depend on it.
+        assert!(c.mark_consumed_once(), "first observation fires");
+        assert!(!c.mark_consumed_once(), "second observation in the same turn no-ops");
+        assert!(!c.mark_consumed_once(), "third+ stays a no-op");
+        // A new turn resets the gate — begin_turn is called at EVERY turn-start
+        // site (direct send, promoted queue, dequeue via on_turn_end(true)).
+        c.begin_turn();
+        assert!(c.mark_consumed_once(), "a new turn re-arms the gate");
+        assert!(!c.mark_consumed_once(), "and gates again within that turn");
+    }
+
+    /// `on_turn_end(true)` (a queued message popped into a fresh turn) goes
+    /// through `begin_turn` internally, so it must re-arm the gate exactly like
+    /// a direct/promoted send does — a dequeued turn's activity must still be
+    /// attributable to ITS OWN opening row, not silently skipped because the
+    /// previous turn already consumed the gate.
+    #[test]
+    fn mark_consumed_once_rearms_across_queue_dequeue() {
+        let mut c = TurnClock::default();
+        c.begin_turn();
+        assert!(c.mark_consumed_once());
+        c.on_turn_end(true); // dequeue: still busy → begin_turn() again
+        assert!(c.mark_consumed_once(), "the dequeued turn gets its own first mark");
+    }
+
     #[test]
     fn build_args_fresh_vs_resume() {
         let mut inner = EngineInner {
@@ -6391,6 +6499,7 @@ mod tests {
             created_at: "0".into(),
             seq: None,
             native_anchor: None,
+            consumed_at: None,
         };
         let plain = Outgoing { text: "edited".into(), queue_id: Some(1), ..Default::default() };
         // Plain text, no attachments → use the (edited) Outgoing text.
