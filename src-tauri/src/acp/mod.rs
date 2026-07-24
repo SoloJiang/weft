@@ -12,9 +12,7 @@ pub mod map;
 pub mod permission;
 
 pub mod backends;
-
-// runtime lands in the next task.
-// pub mod runtime;
+pub mod runtime;
 
 #[allow(unused_imports)]
 pub use backends::{backend_for, registered_ids, AcpBackend, McpServerSpec};
