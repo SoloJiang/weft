@@ -7,6 +7,7 @@ import type { NeedItem, PermissionAsk, ThreadOverview } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { CreateThreadDialog, CreateWorkspaceDialog } from "../nav/dialogs";
 import { InheritedAccessChip } from "../components/InheritedAccessChip";
+import { inheritedAccessOf } from "../lib/grants";
 import { cn } from "../lib/cn";
 
 type Phase = "planning" | "working" | "review" | "done";
@@ -179,10 +180,11 @@ function ThreadCard({ o, onOpen }: { o: ThreadOverview; onOpen: () => void }) {
     o.direction_ids,
     leadTurn[o.thread_id]?.state,
   );
-  // Only Full access is persisted (Always grants are in-memory only, see #89), so
-  // the "inherited access" marker is Full-only. Grants key on thread id, so every
-  // persisted grant under this thread belongs to it.
-  const inherited = authGrants.full.some((g) => g.thread === o.thread_id);
+  // Full access and always-allow rules both count: either is a standing grant
+  // that carries over (#89 makes Always persist across restarts too), so the
+  // marker and its one-click revoke must cover both. The chip re-derives the
+  // kind-accurate copy from this same helper.
+  const inherited = inheritedAccessOf(authGrants, o.thread_id) !== null;
   const done = o.statuses.filter((s) => s === "done").length;
   const attention = threadAttentionCount(o, needs, asks);
   const failing = o.direction_ids.filter((id) =>

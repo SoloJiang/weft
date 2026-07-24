@@ -798,10 +798,18 @@ export const zh = {
   },
   grants: {
     inherited: "已继承授权",
-    inheritedTitle: "这个 issue 的完全访问授权从上次运行保留了下来——点击撤销",
+    inheritedTitleFull: "这个 issue 的完全访问授权从上次运行保留了下来——点击撤销",
+    inheritedTitleAlways_other:
+      "这个 issue 的 {{count}} 条「始终允许」规则从上次运行保留了下来——点击撤销",
+    inheritedTitleBoth:
+      "这个 issue 的完全访问授权和「始终允许」规则从上次运行保留了下来——点击撤销",
     revokeTitle: "撤销继承的授权？",
-    revokeBody:
+    revokeBodyFull:
       "该 issue 下各任务保留的完全访问授权会被清除。下次有工具需要权限时会重新问你。",
+    revokeBodyAlways_other:
+      "该 issue 下各任务保留的 {{count}} 条「始终允许」规则会被清除。下次有工具需要权限时会重新问你。",
+    revokeBodyBoth:
+      "该 issue 下各任务保留的完全访问授权和「始终允许」规则会被清除。下次有工具需要权限时会重新问你。",
     revokeConfirm: "撤销授权",
     revokeFailed: "撤销失败——该授权仍然有效，请重试。",
     grantNotSaved: "已临时授权，但未能保存——重启后可能会再次询问。",
