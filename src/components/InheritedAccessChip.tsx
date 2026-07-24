@@ -2,8 +2,18 @@ import { useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useStore } from "../state/store";
+import { inheritedAccessOf, type InheritedKind } from "../lib/grants";
 import { Dialog, DialogContent, DialogClose } from "./ui/Dialog";
 import { Button } from "./ui/Button";
+
+/** Tooltip + revoke-dialog copy per inherited kind, so the chip never claims
+ *  "Full access" for an Always-only issue. Exhaustive by construction: a new
+ *  kind fails to compile until it gets copy here (and in en.ts + zh.ts). */
+const COPY: Record<InheritedKind, { title: string; body: string }> = {
+  full: { title: "grants.inheritedTitleFull", body: "grants.revokeBodyFull" },
+  always: { title: "grants.inheritedTitleAlways", body: "grants.revokeBodyAlways" },
+  both: { title: "grants.inheritedTitleBoth", body: "grants.revokeBodyBoth" },
+};
 
 /**
  * Board marker for an issue whose Full-access / Always-allow rules persisted
@@ -19,16 +29,22 @@ import { Button } from "./ui/Button";
  * dialog never opens the issue behind it.
  */
 export function InheritedAccessChip({ threadId }: { threadId: number }) {
-  const { revokeAuthGrant } = useStore();
+  const { authGrants, revokeAuthGrant } = useStore();
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
+  // Same derivation as the kanban card's render gate; if a concurrent reconcile
+  // empties the grants while the dialog is up, render nothing.
+  const info = inheritedAccessOf(authGrants, threadId);
+
+  if (!info) return null;
+  const copy = COPY[info.kind];
 
   const revoke = () => {
     // Close the dialog first so it animates out; the optimistic store update then
     // clears the grant and unmounts this chip. (Revoking first would flip the
     // parent's `inherited` to false and close the dialog by unmounting it — abrupt.)
     setOpen(false);
-    // dir=null → clear the whole issue's grants in one call.
+    // dir=null → clear the whole issue's grants (Full AND Always) in one call.
     void revokeAuthGrant(threadId, null, null);
   };
 
@@ -37,7 +53,7 @@ export function InheritedAccessChip({ threadId }: { threadId: number }) {
       <span
         role="button"
         tabIndex={0}
-        title={t("grants.inheritedTitle")}
+        title={t(copy.title, { count: info.alwaysCount })}
         onClick={(e) => {
           e.stopPropagation();
           setOpen(true);
@@ -56,7 +72,7 @@ export function InheritedAccessChip({ threadId }: { threadId: number }) {
       </span>
       <DialogContent
         title={t("grants.revokeTitle")}
-        description={t("grants.revokeBody")}
+        description={t(copy.body, { count: info.alwaysCount })}
       >
         <div className="flex justify-end gap-2">
           <DialogClose asChild>

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FolderTree, GitCompare, Info } from "lucide-react";
-import { isInFlight, useStore } from "../state/store";
+import { isInFlight, isPendingNeed, useStore } from "../state/store";
 import { api } from "../lib/api";
 import type { EnabledSkill, ObserveRef, RewindMode } from "../lib/types";
 import { ChatTimeline } from "./ChatTimeline";
@@ -221,7 +221,11 @@ export function WorkerConversation() {
     threadId != null && sid != null
       ? (leadMessages[threadId] ?? []).filter((m) => m.session_id === sid)
       : [];
-  const openAsks = needs.filter((n) => n.direction_id === directionId);
+  // Only real questions get an inline reply box — a self-clearing NOTICE
+  // (isPendingNeed = false) has no answer to give, and the backend refuses it
+  // (answer_ask), so including it here would let the user type into a box that
+  // silently errors on submit.
+  const openAsks = needs.filter((n) => n.direction_id === directionId && isPendingNeed(n));
   const nativeId = live?.nativeId ?? ref?.native_id ?? null;
   // Prefer the live engine's worktree — available synchronously on slot switch,
   // unlike the async `ref` — so relative file refs resolve against this worker.
@@ -373,6 +377,7 @@ export function WorkerConversation() {
         <SessionInfoPanel
           meta={sid != null ? workerMeta[sid] : undefined}
           skills={skills}
+          tool={ref?.tool}
           onClose={() => setRail("none")}
           onReload={onReload}
           busy={busy}

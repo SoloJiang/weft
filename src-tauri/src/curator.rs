@@ -2308,6 +2308,27 @@ fn pass_gate(workspace_id: i32) -> PassGate {
         .clone()
 }
 
+/// Test-only pass-gate observation for tests OUTSIDE this module (commands.rs):
+/// hold the gate lock so that if a background pass leaks, it parks at the gate
+/// — after marking `dirty` but BEFORE touching run-states or the caller's DB —
+/// turning the leak into a stuck, readable flag instead of a transient race.
+/// Callers use a sentinel workspace id: the gate registry is process-global, so
+/// a real (small) id would collide with concurrent tests' gates.
+#[cfg(test)]
+pub(crate) async fn test_hold_pass_gate(workspace_id: i32) -> tokio::sync::OwnedMutexGuard<()> {
+    pass_gate(workspace_id).lock.clone().lock_owned().await
+}
+
+/// Test-only: whether an analysis request is queued (dirty) on this workspace's
+/// pass-gate. Pairs with `test_hold_pass_gate` to prove a request was — or was
+/// never — fired.
+#[cfg(test)]
+pub(crate) fn test_pass_gate_dirty(workspace_id: i32) -> bool {
+    pass_gate(workspace_id)
+        .dirty
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Run an analysis pass for a workspace, SERIALIZED (two never overlap, so a
 /// background pass and a manual reprofile/analyze can't clobber each other's
 /// relations) and AWAITABLE (returns only once this request's work has actually
