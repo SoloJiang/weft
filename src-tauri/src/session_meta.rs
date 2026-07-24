@@ -206,6 +206,8 @@ async fn gather_codex(cwd: &str, command: &str) -> SessionMetaSnapshot {
     // `codex mcp list` 成功且输出是数组 → 权威(Some,可空);进程失败 / 输出畸形 / 超时 →
     // None(前端保留旧行,不把"没读懂"当成"没有")。10s 上限 + kill_on_drop:codex 探测
     // 若卡住(网络型 MCP 发现 / stdin 提示)不会无限挂起本次取数,与 opencode 探测的超时对齐。
+    // 进程树治理:`mcp list` **只读配置枚举、不拉起 MCP server**(实测:0 后代、MCP 进程数
+    // 不变),且 `.output()` 会收尸其直接子进程,故无孤儿泄漏、无需 proc_registry 登记。
     let probe = tokio::process::Command::new(command)
         .args(["mcp", "list", "--json"])
         .current_dir(cwd)

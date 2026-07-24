@@ -373,8 +373,8 @@ pub async fn fork_opencode_at(
     if ordinal == 0 {
         return Err(anyhow!("ordinal is 1-based"));
     }
-    let child = tokio::process::Command::new(command)
-        .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
         .current_dir(cwd)
         // Same PATH augmentation as the engine's `opencode run` spawn, and the
         // same password removal as the discovery serve (we never set one).
@@ -382,9 +382,15 @@ pub async fn fork_opencode_at(
         .env_remove("OPENCODE_SERVER_PASSWORD")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // T1: own process group + marker before spawn; register alongside the serve
+    // guard (reg lives until fork_opencode_at returns). Reclaim is T2's.
+    let configured =
+        crate::proc_registry::configure(&mut cmd, crate::proc_registry::Owner::preview(session_id));
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawn {command} serve"))?;
+    let _reg = configured.register(&child);
     let mut guard = KillOnDrop(child);
     let base = serve_listen_url(&mut guard.0).await?;
 

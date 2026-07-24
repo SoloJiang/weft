@@ -992,7 +992,9 @@ async fn run_codex_appserver<F: FnMut(AnalysisEvent)>(
         "-c".to_string(),
         "approval_policy=\"never\"".to_string(),
     ];
-    let client = Client::connect_session(&program, &read_only, cwd).await?;
+    let client =
+        Client::connect_session(&program, &read_only, cwd, crate::proc_registry::Owner::curator())
+            .await?;
     let cwd_s = cwd.to_string_lossy().into_owned();
     // codex has no thread/start system-prompt field, so prepend it to the turn
     // (exactly as the exec adapter and the engine's first-turn text do).
@@ -1087,14 +1089,19 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
     };
     let (program, argv) = adapter.build_argv(&ctx)?;
     let command = crate::tool_command::effective(None, &program);
-    let mut child = tokio::process::Command::new(&command)
-        .args(&argv)
+    let mut cmd = tokio::process::Command::new(&command);
+    cmd.args(&argv)
         .current_dir(cwd)
         .env("PATH", crate::detect::tool_path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // T1: own process group + marker before spawn; register the exec child locally
+    // (reg lives until run_exec returns). Reclaim (tree-aware) is T2's teardown wiring.
+    let configured =
+        crate::proc_registry::configure(&mut cmd, crate::proc_registry::Owner::curator());
+    let mut child = cmd
         .spawn()
         // A missing CLI surfaces as the stable `agent-not-found:<tool>` code so the
         // failed-analysis notice localizes it, not raw "os error 2". But a `cwd`
@@ -1108,6 +1115,7 @@ async fn run_exec<F: FnMut(AnalysisEvent)>(
                 anyhow::anyhow!("{}", crate::tool_command::spawn_error_message(tool, &command, &e))
             }
         })?;
+    let _reg = configured.register(&child);
     if let Some(mut stdin) = child.stdin.take() {
         // claude reads the message from stdin as a stream-json user envelope
         // (matches engine::write_user); per-turn tools already have it on argv.
