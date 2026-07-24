@@ -27,6 +27,11 @@ pub struct Model {
     /// claude = uuid of the turn's last assistant event, codex app-server =
     /// turn id. NULL for rows that predate anchoring or never completed a turn.
     pub native_anchor: Option<String>,
+    /// Unix-milliseconds when the agent produced its first observed activity
+    /// (any stdout line / app-server event) for the turn this row opened — the
+    /// "已被 agent 消费" receipt (issue #94). Set at most once, on a "user" row
+    /// with status "complete"; NULL until then and for every other row.
+    pub consumed_at: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -2288,6 +2288,34 @@ pub async fn complete_queued_by_id(
     Ok(Some(a.update(&db.0).await?))
 }
 
+/// Stamp the delivery receipt's third tier: the agent produced its first
+/// observed activity for the turn this "user" row opened (issue #94 — "已被
+/// agent 消费"). Idempotent and narrowly guarded so a stray/late caller can't
+/// misuse it as a general status-setter: no-ops (`Ok(None)`) unless the row is
+/// role `"user"`, already `status == "complete"` (delivered — a queued row
+/// hasn't reached the agent yet, so it cannot be "consumed"), and not already
+/// marked. `consumed_at` is otherwise independent of `status`: it never
+/// overwrites it, so the existing queued/complete/error/interrupted lifecycle
+/// (and everything that reads it, e.g. rewind's anchor matching) is untouched.
+pub async fn mark_message_consumed(
+    db: &Db,
+    message_id: i32,
+) -> Result<Option<lead_message::Model>> {
+    let Some(m) = lead_message::Entity::find_by_id(message_id).one(&db.0).await? else {
+        return Ok(None);
+    };
+    if m.role != "user" || m.status != "complete" || m.consumed_at.is_some() {
+        return Ok(None);
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    let mut a: lead_message::ActiveModel = m.into();
+    a.consumed_at = Set(Some(millis));
+    Ok(Some(a.update(&db.0).await?))
+}
+
 /// 删除一条消息行（仅用于取消未交付的 queued 行）。
 pub async fn delete_message(db: &Db, message_id: i32) -> Result<()> {
     lead_message::Entity::delete_by_id(message_id).exec(&db.0).await?;
@@ -4903,6 +4931,75 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(still.status, "queued");
+    }
+
+    /// A delivered ("complete") user row flips NULL -> Some(millis) exactly once.
+    #[tokio::test]
+    async fn mark_message_consumed_flips_null_to_some() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        assert_eq!(m.consumed_at, None, "fresh delivered row starts unconsumed");
+        let consumed = mark_message_consumed(&db, m.id).await.unwrap().unwrap();
+        assert_eq!(consumed.id, m.id);
+        assert!(consumed.consumed_at.is_some(), "must stamp a millis timestamp");
+        // status is untouched — consumed_at is an orthogonal signal.
+        assert_eq!(consumed.status, "complete");
+    }
+
+    /// A second mark is a no-op (Ok(None)): the DB timestamp never gets
+    /// overwritten by a later "first activity" observation racing in.
+    #[tokio::test]
+    async fn mark_message_consumed_idempotent_second_call_noops() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "complete")
+            .await
+            .unwrap();
+        let first = mark_message_consumed(&db, m.id).await.unwrap().unwrap();
+        let second = mark_message_consumed(&db, m.id).await.unwrap();
+        assert!(second.is_none(), "an already-consumed row must not re-fire");
+        let still = lead_message::Entity::find_by_id(m.id).one(&db.0).await.unwrap().unwrap();
+        assert_eq!(still.consumed_at, first.consumed_at, "timestamp must not change");
+    }
+
+    /// A still-queued row hasn't reached the agent yet — it cannot be marked
+    /// "consumed" ahead of "delivered" (queued -> complete -> consumed only).
+    #[tokio::test]
+    async fn mark_message_consumed_ignores_queued_row() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        let m = insert_lead_message(&db, t, None, 1, "user", "text", "{}", "queued")
+            .await
+            .unwrap();
+        let res = mark_message_consumed(&db, m.id).await.unwrap();
+        assert!(res.is_none(), "a queued row must not be markable as consumed");
+        let still = lead_message::Entity::find_by_id(m.id).one(&db.0).await.unwrap().unwrap();
+        assert_eq!(still.consumed_at, None);
+    }
+
+    /// Only the human's own row carries the receipt — an assistant/system row
+    /// (even if somehow passed in) is never a valid target.
+    #[tokio::test]
+    async fn mark_message_consumed_ignores_non_user_role() {
+        let db = mem().await;
+        let t = live_thread(&db).await;
+        let m = insert_lead_message(&db, t, None, 1, "assistant", "text", "{}", "complete")
+            .await
+            .unwrap();
+        let res = mark_message_consumed(&db, m.id).await.unwrap();
+        assert!(res.is_none(), "a non-user row must not be markable as consumed");
+    }
+
+    /// A missing row (e.g. deleted between the activity event and the mark)
+    /// fails soft — Ok(None), not an error the caller must handle specially.
+    #[tokio::test]
+    async fn mark_message_consumed_missing_row_returns_none() {
+        let db = mem().await;
+        let res = mark_message_consumed(&db, 999_999).await.unwrap();
+        assert!(res.is_none());
     }
 
     /// M0030: analysis_state/error round-trip and upsert_repo_profile preserves them.

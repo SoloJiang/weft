@@ -250,6 +250,10 @@ export const zh = {
     queueDrag: "拖动重排",
     queueAttachmentOnly: "{{count}} 张图片",
     autoReviewDirective: "review 结束后，直接修复发现的问题并重新跑检查自验，然后简要汇报。",
+    receiptDelivered: "已送达",
+    receiptConsumed: "Agent 已开始处理",
+    sendFailedGeneric: "发送失败：{{reason}}",
+    sendFailedUnknown: "未知错误",
   },
   scope: {
     addReposFirst: "请先往这个工作区添加仓库。",
