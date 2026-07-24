@@ -235,7 +235,6 @@ export const en = {
     historyLoadError: "Couldn’t load this conversation.",
     retryHistory: "Try again",
     stop: "Stop",
-    queuedN: "{{count}} queued",
     interrupted: "interrupted",
     errored: "This turn errored",
     terminalErrorBeforeOutput: "The agent turn ended with an error before producing output.",
