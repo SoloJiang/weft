@@ -228,11 +228,12 @@ interface Store {
    *  so the board can mark issues whose access was inherited and offer a revoke. */
   authGrants: GrantSnapshot;
   /** Revoke a standing grant. dir=null clears the whole issue's grants (one-click
-   *  "revoke all"); dir set clears one task; +summary drops a single always-rule. */
+   *  "revoke all"); dir set clears one task; +actionKey drops a single
+   *  always-rule (the canonical action identity, not the display summary). */
   revokeAuthGrant: (
     thread: number,
     dir: string | null,
-    summary: string | null,
+    actionKey: string | null,
   ) => Promise<void>;
   /** Lead-proposed write declarations awaiting human approve/deny. */
   writeTriggers: WriteTrigger[];
@@ -2343,11 +2344,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch (e) {
         /* already resolved/expired, or the durable write failed */
         console.error(e);
-        // Only Full persists (approach B: Always is in-memory only). Full still
-        // applies this session even if persisting it failed; surface that so a
-        // re-prompt after restart isn't a silent surprise. Always is never saved
-        // by design, so its re-prompt is expected — no "not saved" warning.
-        if (answer === "full") {
+        // Both Full and Always now create a durable standing grant (Always is
+        // keyed by the exact action_key, not the lossy display summary, so it's
+        // safe to persist too — issue #89). Either still applies this session
+        // even if persisting it failed; surface that so a re-prompt after
+        // restart isn't a silent surprise.
+        if (answer === "full" || answer === "always") {
           toast(i18n.t("grants.grantNotSaved"));
         }
       }
@@ -2356,7 +2358,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   );
 
   const revokeAuthGrant = useCallback(
-    async (thread: number, dir: string | null, summary: string | null) => {
+    async (thread: number, dir: string | null, actionKey: string | null) => {
       // optimistic: drop the matching grants locally so the marker clears at once
       setAuthGrants((cur) => ({
         full: cur.full.filter(
@@ -2367,12 +2369,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             !(
               g.thread === thread &&
               (dir === null || g.dir === dir) &&
-              (summary === null || g.summary === summary)
+              (actionKey === null || g.action_key === actionKey)
             ),
         ),
       }));
       try {
-        await api.revokeAuthGrant(thread, dir, summary);
+        await api.revokeAuthGrant(thread, dir, actionKey);
       } catch (e) {
         console.error(e);
         // The backend rolls back a failed durable write, so the reconcile below

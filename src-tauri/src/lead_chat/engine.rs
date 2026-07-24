@@ -3135,20 +3135,6 @@ async fn codex_consumer(
                     let i = eng.lock().await;
                     (i.thread_id, i.ask_dir.clone())
                 };
-                // command/cwd may sit at the top level (commandExecution ask) or
-                // nested under `item` (the generic permissions ask) — read both.
-                let cmd = params["command"]
-                    .as_str()
-                    .or_else(|| params["item"]["command"].as_str());
-                let is_cmd = method.contains("commandExecution") || cmd.is_some();
-                let net = params
-                    .get("networkApprovalContext")
-                    .or_else(|| params["item"].get("networkApprovalContext"))
-                    .filter(|v| !v.is_null());
-                let has_changes = params["changes"]
-                    .as_array()
-                    .or_else(|| params["item"]["changes"].as_array())
-                    .is_some_and(|c| !c.is_empty());
                 // Requested permission profile (also echoed back as the grant on allow).
                 let requested = params
                     .get("permissions")
@@ -3156,39 +3142,16 @@ async fn codex_consumer(
                     .or_else(|| params["params"].get("permissions"))
                     .filter(|v| !v.is_null())
                     .cloned();
-                // Network FIRST: a network-only ask arrives as a commandExecution
-                // approval (so is_cmd is true) with the command omitted, so the cmd
-                // branch would otherwise mislabel + Always-key it as Bash.
-                let (tool, summary) = if let Some(net) = net {
-                    let host = net["host"]
-                        .as_str()
-                        .or_else(|| net["url"].as_str())
-                        .or_else(|| net["domain"].as_str())
-                        .unwrap_or("network");
-                    ("Network", format!("network access: {host}"))
-                } else if is_cmd {
-                    ("Bash", cmd.unwrap_or("(command)").to_string())
-                } else if has_changes {
-                    // Include the changed path(s): the AskRegistry keys Always rules
-                    // by (thread, dir, summary), so a constant "apply file changes"
-                    // would let one Always blanket-allow every later edit.
-                    ("Edit", codex_change_approval_summary(&params))
-                } else {
-                    // A permission escalation — key it by the REQUESTED scope, else an
-                    // Always for one profile silently grants a later, different one.
-                    let scope = requested
-                        .as_ref()
-                        .map(|v| v.to_string().chars().take(120).collect::<String>())
-                        .unwrap_or_else(|| "(unspecified)".to_string());
-                    ("Permission", format!("permission: {scope}"))
-                };
-                let detail = params["cwd"]
-                    .as_str()
-                    .or_else(|| params["item"]["cwd"].as_str())
-                    .unwrap_or_default()
-                    .to_string();
+                // `summary` is a compact DISPLAY label (may truncate — a >3-path
+                // edit, a 120-char permission scope); `detail` is the FULL raw
+                // content (untruncated, shown in the detail tooltip / IM
+                // plain-text card); `action_key` is the EXACT action identity
+                // used ONLY for Always-grant matching (never displayed) — see
+                // #89. Mirrors `bus::server::summarize`'s claude/opencode shape
+                // so both engines share the same canonical action-key semantics.
+                let (tool, summary, detail, action_key) = codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
-                match registry.auto_decision(thread_id, &dir, &summary) {
+                match registry.auto_decision(thread_id, &dir, &action_key) {
                     // dangerous mode / full access / always-allow: reply inline (fast).
                     Some(d) => {
                         let allow = matches!(d, crate::ask::Decision::Allow);
@@ -3205,7 +3168,14 @@ async fn codex_consumer(
                     // stale card is answered. A late reply to an already-resolved turn
                     // is harmless (codex ignores it).
                     None => {
-                        let (aid, rx) = registry.request(thread_id, &dir, tool, &summary, &detail);
+                        let (aid, rx) = registry.request(
+                            thread_id,
+                            &dir,
+                            tool,
+                            &summary,
+                            &detail,
+                            &action_key,
+                        );
                         // Remember this card by server-request id so a later
                         // serverRequest/resolved can cancel it; clear on answer.
                         let key = id.to_string();
@@ -3248,10 +3218,95 @@ async fn codex_consumer(
 }
 
 
-/// Specific Needs-you summary for an app-server file-change approval: the
-/// changed path(s) (top-level or nested under `item`), so each distinct edit
-/// gets its own Always-rule key instead of one blanket "apply file changes".
-fn codex_change_approval_summary(params: &serde_json::Value) -> String {
+/// The (tool, summary, detail, action_key) quadruple for a codex app-server
+/// approval — computed ONCE so the Needs-you card, the IM card, and Always
+/// matching all agree. `summary` is a compact DISPLAY label that may truncate
+/// (a >3-path edit, a 120-char permission scope); `detail` is the FULL raw
+/// content (untruncated); `action_key` is the EXACT action identity used ONLY
+/// for Always-grant matching (never displayed). Mirrors `bus::server::summarize`'s
+/// claude/opencode shape so both engines share the same canonical semantics —
+/// see issue #89.
+fn codex_approval_fields(
+    method: &str,
+    params: &serde_json::Value,
+) -> (&'static str, String, String, String) {
+    // command/cwd may sit at the top level (commandExecution ask) or nested
+    // under `item` (the generic permissions ask) — read both.
+    let cmd = params["command"]
+        .as_str()
+        .or_else(|| params["item"]["command"].as_str());
+    let is_cmd = method.contains("commandExecution") || cmd.is_some();
+    let net = params
+        .get("networkApprovalContext")
+        .or_else(|| params["item"].get("networkApprovalContext"))
+        .filter(|v| !v.is_null());
+    let has_changes = params["changes"]
+        .as_array()
+        .or_else(|| params["item"]["changes"].as_array())
+        .is_some_and(|c| !c.is_empty());
+
+    // Network FIRST: a network-only ask arrives as a commandExecution approval
+    // (so is_cmd is true) with the command omitted, so the cmd branch would
+    // otherwise mislabel + Always-key it as Bash.
+    if let Some(net) = net {
+        let host = net["host"]
+            .as_str()
+            .or_else(|| net["url"].as_str())
+            .or_else(|| net["domain"].as_str())
+            .unwrap_or("network");
+        let action_key = format!("Network:{host}");
+        return (
+            "Network",
+            format!("network access: {host}"),
+            host.to_string(),
+            action_key,
+        );
+    }
+    if is_cmd {
+        let full = cmd.unwrap_or("(command)").to_string();
+        let first = full.lines().next().unwrap_or("").to_string();
+        // action_key = the full, untruncated command — a later line or arg
+        // change is a different action even if the first line (and thus
+        // `summary`) matches.
+        let action_key = format!("Bash:{full}");
+        return ("Bash", format!("Run: {first}"), full.clone(), action_key);
+    }
+    if has_changes {
+        // `full_paths` is the UNTRUNCATED changed-path list: the AskRegistry
+        // keys Always rules by action_key, so a >3-path edit whose display
+        // summary caps at "first 3 + N" must still disambiguate from a
+        // DIFFERENT >3-path edit sharing that same capped label.
+        let (summary, full_paths) = codex_change_approval_summary(params);
+        let action_key = format!("Edit:{full_paths}");
+        return ("Edit", summary, full_paths, action_key);
+    }
+    // A permission escalation — key it by the REQUESTED scope, else an Always
+    // for one profile silently grants a later, different one.
+    let requested = params
+        .get("permissions")
+        .or_else(|| params["item"].get("permissions"))
+        .or_else(|| params["params"].get("permissions"))
+        .filter(|v| !v.is_null());
+    let scope_json = requested
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "(unspecified)".to_string());
+    let scope_label: String = scope_json.chars().take(120).collect();
+    let action_key = format!("Permission:{scope_json}");
+    (
+        "Permission",
+        format!("permission: {scope_label}"),
+        scope_json,
+        action_key,
+    )
+}
+
+/// Specific Needs-you summary for an app-server file-change approval: a compact
+/// DISPLAY label capped at 3 paths (`take(3) + "+N"`), plus the FULL
+/// (untruncated) changed-path list (top-level or nested under `item`) for the
+/// detail panel / action key — so a >3-path edit still gets its own exact
+/// Always-rule key instead of colliding with a different >3-path edit that
+/// happens to share its first 3 paths + count (issue #89).
+fn codex_change_approval_summary(params: &serde_json::Value) -> (String, String) {
     let changes = params["changes"]
         .as_array()
         .or_else(|| params["item"]["changes"].as_array());
@@ -3259,17 +3314,20 @@ fn codex_change_approval_summary(params: &serde_json::Value) -> String {
         .map(|cs| cs.iter().filter_map(|c| c["path"].as_str()).collect())
         .unwrap_or_default();
     if paths.is_empty() {
-        return "apply file changes".to_string();
+        return ("apply file changes".to_string(), String::new());
     }
-    let mut s = format!(
+    let mut summary = format!(
         "apply file changes: {}",
         paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
     );
     let more = paths.len().saturating_sub(3);
     if more > 0 {
-        s.push_str(&format!(" +{more}"));
+        summary.push_str(&format!(" +{more}"));
     }
-    s
+    // JSON-array encoding: unambiguous (each path quoted/escaped) even if a
+    // path itself contains ", ".
+    let full = serde_json::to_string(&paths).unwrap_or_default();
+    (summary, full)
 }
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
@@ -5923,19 +5981,91 @@ mod tests {
         let b = codex_change_approval_summary(&serde_json::json!({
             "item": {"changes": [{"path": "src/b.rs"}]}
         }));
-        assert_eq!(a, "apply file changes: src/a.rs");
-        assert_eq!(b, "apply file changes: src/b.rs");
-        assert_ne!(a, b);
-        // >3 paths are capped with a +N suffix.
+        assert_eq!(a.0, "apply file changes: src/a.rs");
+        assert_eq!(b.0, "apply file changes: src/b.rs");
+        assert_ne!(a.0, b.0);
+        assert_eq!(a.1, r#"["src/a.rs"]"#);
+        // >3 paths are capped with a +N suffix in the DISPLAY summary...
         let many = codex_change_approval_summary(&serde_json::json!({
             "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"4"},{"path":"5"}]
         }));
-        assert_eq!(many, "apply file changes: 1, 2, 3 +2");
+        assert_eq!(many.0, "apply file changes: 1, 2, 3 +2");
+        // ...but the FULL path list (used for the action key) keeps every path.
+        assert_eq!(many.1, r#"["1","2","3","4","5"]"#);
         // no paths → the generic label (still answerable, just not Always-specific).
         assert_eq!(
             codex_change_approval_summary(&serde_json::json!({})),
-            "apply file changes"
+            ("apply file changes".to_string(), String::new())
         );
+    }
+
+    /// Issue #89's Codex ">3-path edit" acceptance case: two DIFFERENT >3-path
+    /// edits can share the SAME capped display summary (first 3 + count), so the
+    /// action_key must be built from the full path list, not the summary.
+    #[test]
+    fn codex_change_approval_full_paths_disambiguate_beyond_the_take3_cap() {
+        let a = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"4"}]
+        }));
+        let b = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"5"}]
+        }));
+        assert_eq!(a.0, b.0, "both display as \"apply file changes: 1, 2, 3 +1\"");
+        // ...but the full (untruncated) list disambiguates them.
+        assert_ne!(a.1, b.1);
+    }
+
+    /// Issue #89: `codex_approval_fields` produces the (tool, summary, detail,
+    /// action_key) quadruple for every approval kind, with `action_key` always
+    /// exact even where `summary` truncates for display.
+    #[test]
+    fn codex_approval_fields_action_key_is_exact_and_summary_may_truncate() {
+        // Bash: summary truncates to the first line; action_key carries the full
+        // multi-line command (mirrors bus::server::summarize's claude shape).
+        let (tool, summary, detail, key) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"command": "npm test\nrm -rf /", "cwd": "/repo"}),
+        );
+        assert_eq!(tool, "Bash");
+        assert_eq!(summary, "Run: npm test");
+        assert_eq!(detail, "npm test\nrm -rf /");
+        assert!(key.contains("rm -rf /"));
+        // A different multi-line command sharing the same first line differs in key.
+        let (_, summary2, _, key2) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"command": "npm test\necho safe"}),
+        );
+        assert_eq!(summary2, summary);
+        assert_ne!(key2, key);
+
+        // Network: keyed by host — network FIRST beats the commandExecution method.
+        let (tool, summary, _detail, key) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"networkApprovalContext": {"host": "example.com"}}),
+        );
+        assert_eq!(tool, "Network");
+        assert_eq!(summary, "network access: example.com");
+        assert_eq!(key, "Network:example.com");
+
+        // Edit: action_key carries the FULL path list even beyond the 3-path cap.
+        let (tool, summary, _detail, key) = codex_approval_fields(
+            "applyPatchApproval",
+            &serde_json::json!({"changes": [{"path":"a"},{"path":"b"},{"path":"c"},{"path":"d"}]}),
+        );
+        assert_eq!(tool, "Edit");
+        assert_eq!(summary, "apply file changes: a, b, c +1");
+        assert!(key.contains('d'));
+
+        // Permission: summary truncates the scope at 120 chars; action_key (and
+        // detail) keep it whole.
+        let long_scope = "x".repeat(200);
+        let (tool, summary, detail, key) = codex_approval_fields(
+            "elicitation/permissions",
+            &serde_json::json!({"permissions": {"note": long_scope}}),
+        );
+        assert_eq!(tool, "Permission");
+        assert!(summary.len() < detail.len());
+        assert_eq!(key, format!("Permission:{detail}"));
     }
 
     #[test]

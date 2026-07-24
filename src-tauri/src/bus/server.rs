@@ -104,14 +104,15 @@ async fn handle_ask(
         }
     }
 
-    let (summary, detail) = summarize(tool_name, req.get("tool_input"));
+    let (summary, detail, action_key) = summarize(tool_name, req.get("tool_input"));
 
     // A standing rule (full access / always-allow) decides without surfacing.
-    if asks.auto_decision(thread, &dir, &summary) == Some(Decision::Allow) {
+    // Matches on the canonical action_key, NOT the (possibly lossy) summary.
+    if asks.auto_decision(thread, &dir, &action_key) == Some(Decision::Allow) {
         return hook_decision("allow", "Auto-approved by a weft rule");
     }
 
-    let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail);
+    let (id, rx) = asks.request(thread, &dir, tool, &summary, &detail, &action_key);
 
     match tokio::time::timeout(ASK_WAIT, rx).await {
         Ok(Ok(decision)) => {
@@ -256,10 +257,17 @@ fn hook_decision(decision: &str, reason: &str) -> Response {
     .into_response()
 }
 
-/// A short human label + raw detail for a tool action. Tool-agnostic across
-/// claude (Bash / file_path) and opencode (bash / filePath, lowercase names):
-/// a command reads as "Run: …", a file op as "<tool> <file>".
-fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String) {
+/// A short human label + raw detail + canonical action key for a tool action.
+/// Tool-agnostic across claude (Bash / file_path) and opencode (bash / filePath,
+/// lowercase names): a command reads as "Run: …", a file op as "<tool> <file>".
+///
+/// Returns `(summary, detail, action_key)`: `summary` is a compact DISPLAY label
+/// that MAY truncate (a multi-line command's first line, a bare MCP tool name);
+/// `detail` is the FULL raw content (untruncated — shown in the detail tooltip /
+/// IM plain-text card); `action_key` is the EXACT action identity used ONLY for
+/// Always-grant matching (`auto_decision`), never shown to the human — a later
+/// ask sharing `summary` but not `action_key` must NOT auto-allow (issue #89).
+fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String, String) {
     let s = |k: &str| {
         input
             .and_then(|v| v.get(k))
@@ -268,13 +276,26 @@ fn summarize(tool_name: &str, input: Option<&Value>) -> (String, String) {
     };
     if let Some(cmd) = s("command") {
         let first = cmd.lines().next().unwrap_or("").to_string();
-        return (format!("Run: {first}"), cmd);
+        // action_key = the full, untruncated command — a later line differing
+        // (e.g. a multi-line command sharing only its first line) is a DIFFERENT
+        // action even though `summary` collides.
+        let action_key = format!("{tool_name}:{cmd}");
+        return (format!("Run: {first}"), cmd, action_key);
     }
     if let Some(f) = s("file_path").or_else(|| s("filePath")) {
-        return (format!("{tool_name} {f}"), f);
+        // action_key folds in the tool name too: `Read` and `Write` on the same
+        // path are different actions, even though both already show the full
+        // (untruncated) path in `summary` today.
+        let action_key = format!("{tool_name}:{f}");
+        return (format!("{tool_name} {f}"), f.clone(), action_key);
     }
     let detail = input.map(|v| v.to_string()).unwrap_or_default();
-    (tool_name.to_string(), detail)
+    // MCP/fallback ask: `summary` is just the bare tool name (lossy for
+    // display — e.g. "WebFetch"), but `action_key` folds in the full args so two
+    // calls to the same tool with different args are different actions (issue
+    // #89's MCP tool-name-fallback case).
+    let action_key = format!("{tool_name}:{detail}");
+    (tool_name.to_string(), detail, action_key)
 }
 
 async fn get_not_allowed() -> StatusCode {
@@ -996,7 +1017,51 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_weft_internal_tool, session_servers_for_kind};
+    use super::{is_weft_internal_tool, session_servers_for_kind, summarize};
+    use serde_json::json;
+
+    /// Issue #89: a Claude/opencode multi-line command truncates `summary` to
+    /// its first line for display, but `action_key` must carry the FULL command
+    /// — two commands sharing a first line are different actions.
+    #[test]
+    fn summarize_command_action_key_is_full_command_not_first_line() {
+        let input = json!({"command": "npm test\nrm -rf /"});
+        let (summary, detail, action_key) = summarize("Bash", Some(&input));
+        assert_eq!(summary, "Run: npm test"); // display: first line only
+        assert_eq!(detail, "npm test\nrm -rf /"); // full command, untruncated
+        assert!(action_key.contains("rm -rf /")); // match key carries the WHOLE command
+
+        // A different multi-line command sharing the same first line must yield a
+        // DIFFERENT action_key even though `summary` collides.
+        let other = json!({"command": "npm test\necho safe"});
+        let (summary2, _detail2, action_key2) = summarize("Bash", Some(&other));
+        assert_eq!(summary2, summary, "both display as \"Run: npm test\"");
+        assert_ne!(action_key2, action_key);
+    }
+
+    /// Issue #89: an MCP/fallback ask (no `command`/`file_path` field) shows only
+    /// the bare tool name as `summary`, but `action_key` must fold in the full
+    /// args so two calls with different args don't collide.
+    #[test]
+    fn summarize_mcp_fallback_action_key_includes_full_args() {
+        let a = json!({"url": "https://safe.example"});
+        let b = json!({"url": "https://evil.example"});
+        let (summary_a, _da, key_a) = summarize("WebFetch", Some(&a));
+        let (summary_b, _db, key_b) = summarize("WebFetch", Some(&b));
+        assert_eq!(summary_a, "WebFetch"); // lossy tool-name-only display
+        assert_eq!(summary_a, summary_b, "both display as just the tool name");
+        assert_ne!(key_a, key_b, "different args must yield different action keys");
+    }
+
+    /// A file-op action_key folds in the tool name: reading and writing the same
+    /// path are different actions.
+    #[test]
+    fn summarize_file_op_action_key_distinguishes_tool() {
+        let input = json!({"file_path": "/tmp/x"});
+        let (_s_read, _d_read, key_read) = summarize("Read", Some(&input));
+        let (_s_write, _d_write, key_write) = summarize("Write", Some(&input));
+        assert_ne!(key_read, key_write);
+    }
 
     #[test]
     fn session_servers_mirror_injection_policy() {
