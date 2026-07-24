@@ -2114,6 +2114,28 @@ fn promote_queued_reservation(inner: &mut EngineInner, origin_tag: Option<String
     inner.turn_id
 }
 
+/// Retarget the two pieces of bookkeeping every EOF/TurnEnd handler must sync
+/// to whatever `TurnState::on_turn_end` just returned: `turn_user_row` (the
+/// rewind anchor AND the "consumed" receipt, issue #94, both key off it — see
+/// `note_turn_activity`) and `current_origin_tag` (rides the next turn's
+/// output frames). `None` (queue drained, engine goes idle) clears both.
+///
+/// Every dialect's turn-end site MUST route through this rather than
+/// hand-rolling the same two lines: a hand-rolled copy is exactly how PR
+/// #117's review found a P1 bug — the per-turn EOF branch in `spawn_reader`
+/// dequeued the next turn via `on_turn_end` but left `turn_user_row` pointing
+/// at the turn that just ended, so the dequeued turn's first activity
+/// mis-marked the WRONG (already-finished, or already-failed) row
+/// "consumed" and the row that actually ran was never marked at all —
+/// precisely the delivered/consumed truth-inversion issue #94 exists to
+/// prevent. Pure state transition, no I/O — callers still own their own
+/// EXTRA dialect-specific resets (e.g. claude's `last_assistant_uuid`, codex
+/// app-server's `turn_saw_text`) alongside this call.
+fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
+    inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+    inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+}
+
 /// Send a human message: optimistic-persist + either write through or queue.
 /// `images` ride the outbound message as base64 blocks; `files` are appended
 /// as plain paths (the agent reads them with its own tools).
@@ -3057,14 +3079,9 @@ async fn codex_consumer(
                     }
                 }
                 let next = inner.turn.on_turn_end();
-                // Rewind bookkeeping passes to the dequeued turn: its user row is
-                // the queued row's id (None for plumbing turns or going idle).
-                inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+                advance_dequeued_turn(&mut inner, &next);
                 inner.last_assistant_uuid = None;
                 inner.turn_saw_text = false;
-                // Next turn's tag becomes the in-flight tag (None when going idle),
-                // so the dequeued turn's output frames carry its own origin_tag.
-                inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
                 let next_turn_id = if next.is_some() {
                     inner.turn_id += 1;
                     Some(inner.turn_id)
@@ -5224,13 +5241,10 @@ fn spawn_reader(
                         );
                     }
                     let next = inner.turn.on_turn_end();
-                    // Rewind bookkeeping passes to the dequeued turn: its user row
-                    // is the queued row's id (None for plumbing turns/going idle).
-                    inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+                    // Set BEFORE `next`'s input is dispatched below so its output
+                    // frames carry the retargeted origin tag.
+                    advance_dequeued_turn(&mut inner, &next);
                     inner.last_assistant_uuid = None;
-                    // The next turn's tag becomes the in-flight tag (None when going
-                    // idle), set BEFORE its input is dispatched so its frames carry it.
-                    inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
                     if let Some(next) = next {
                         inner.turn_id += 1;
                         let next_turn_id = inner.turn_id;
@@ -5383,8 +5397,13 @@ fn spawn_reader(
             }
             inner.child = None;
             let next = inner.turn.on_turn_end();
-            // Carry the dequeued turn's tag (None when going idle) onto its frames.
-            inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+            // A kill-only interrupt (see interrupt()) leaves `generation`/the
+            // queue untouched, so THIS EOF branch — not a reset — is what runs
+            // for a per-turn dialect's interrupted turn; it must retarget
+            // turn_user_row/current_origin_tag to `next` like every other
+            // dequeue site (see advance_dequeued_turn's own doc for why this
+            // one previously didn't, and what broke).
+            advance_dequeued_turn(&mut inner, &next);
             if let Some(next) = next {
                 inner.turn_id += 1;
                 let next_turn_id = inner.turn_id;
@@ -6272,6 +6291,64 @@ mod tests {
         assert!(inner.turn.busy, "promotion reserves the turn (busy)");
         assert_eq!(inner.current_origin_tag.as_deref(), Some("tag"));
         assert!(inner.clock.started.is_some(), "promotion starts the turn clock");
+    }
+
+    fn queued_outgoing(queue_id: i32, origin_tag: &str) -> Outgoing {
+        Outgoing {
+            text: "text".into(),
+            origin_tag: Some(origin_tag.into()),
+            queue_id: Some(queue_id),
+            ..Default::default()
+        }
+    }
+
+    /// PR #117 review, P1: reproduces the exact scenario from a real per-turn
+    /// dialect's kill-only interrupt (opencode always; codex without the
+    /// app-server) — turn A is interrupted, B sits queued behind it, A's
+    /// stdout then EOFs and `on_turn_end` dequeues B. Without
+    /// `advance_dequeued_turn` retargeting `turn_user_row`, the pointer would
+    /// still read A: B's first activity would then mis-mark A "consumed" (A
+    /// never ran again) while B's own row — the one the agent actually
+    /// processed — stayed "delivered" forever. That is the exact
+    /// delivered/consumed truth-inversion issue #94 exists to prevent.
+    #[test]
+    fn advance_dequeued_turn_retargets_from_the_finished_turn_to_the_dequeued_one() {
+        let mut inner = test_inner("opencode");
+        // Turn A just finished (interrupted): its bookkeeping is still live
+        // until on_turn_end + advance_dequeued_turn catch up.
+        inner.turn_user_row = Some(1); // A's message id
+        inner.current_origin_tag = Some("a-tag".into());
+        inner.turn.busy = true;
+        inner.turn.queue.push_back(queued_outgoing(2, "b-tag")); // B's message id
+
+        let next = inner.turn.on_turn_end(); // pops B
+        advance_dequeued_turn(&mut inner, &next);
+
+        assert_eq!(
+            inner.turn_user_row,
+            Some(2),
+            "must retarget to B's row, not linger on A's finished turn"
+        );
+        assert_eq!(inner.current_origin_tag.as_deref(), Some("b-tag"));
+    }
+
+    /// The other half of the same bookkeeping: a drained queue must clear
+    /// `turn_user_row`/`current_origin_tag` rather than leave them pointing at
+    /// the turn that just ended — an idle engine must not attribute a LATER,
+    /// unrelated turn's activity (e.g. a hidden bus-wake read) to an old row.
+    #[test]
+    fn advance_dequeued_turn_clears_pointers_when_the_queue_drains_to_idle() {
+        let mut inner = test_inner("opencode");
+        inner.turn_user_row = Some(1);
+        inner.current_origin_tag = Some("a-tag".into());
+        inner.turn.busy = true; // empty queue: on_turn_end goes idle
+
+        let next = inner.turn.on_turn_end();
+        assert!(next.is_none(), "precondition: nothing queued behind A");
+        advance_dequeued_turn(&mut inner, &next);
+
+        assert_eq!(inner.turn_user_row, None);
+        assert_eq!(inner.current_origin_tag, None);
     }
 
     #[test]
