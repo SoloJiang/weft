@@ -279,6 +279,7 @@ pub async fn lead_engine(
         tool_rows: std::collections::HashMap::new(),
         stopped,
         codex_client: None,
+        acp_client: None,
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,
@@ -413,8 +414,8 @@ fn lead_state_label(alive: bool, busy: bool, stopped: bool) -> &'static str {
 /// resident child; a codex app-server lead has NO per-turn child when idle but
 /// stays alive while its client handle is present (a send reconnects if needed) —
 /// without this a remount's `loadLeadChat` mislabels the idle lead as "stopped".
-fn lead_alive(child_alive: bool, has_codex_client: bool) -> bool {
-    child_alive || has_codex_client
+fn lead_alive(child_alive: bool, has_connection_client: bool) -> bool {
+    child_alive || has_connection_client
 }
 
 #[cfg(test)]
@@ -632,7 +633,7 @@ pub async fn lead_state(
                 .map(|c| c.try_wait().ok().flatten().is_none())
                 .unwrap_or(false);
             // codex app-server leads are childless when idle but alive via the client.
-            let alive = lead_alive(child_alive, i.codex_client.is_some());
+            let alive = lead_alive(child_alive, i.codex_client.is_some() || i.acp_client.is_some());
             let command = crate::tool_command::effective(i.command.as_deref(), &i.tool);
             Ok(LeadStateInfo {
                 state: lead_state_label(alive, i.turn.busy, i.stopped).into(),
@@ -1144,6 +1145,7 @@ pub(crate) async fn chat_open_worker_impl(
                 tool_rows: std::collections::HashMap::new(),
                 stopped: sess.status == "stopped",
                 codex_client: None,
+        acp_client: None,
                 turn_user_row: None,
                 last_assistant_uuid: None,
                 rewinding: false,
@@ -1264,6 +1266,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         tool_rows: std::collections::HashMap::new(),
         stopped: sess.status == "stopped",
         codex_client: None,
+        acp_client: None,
         turn_user_row: None,
         last_assistant_uuid: None,
         rewinding: false,

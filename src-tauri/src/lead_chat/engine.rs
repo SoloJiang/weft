@@ -1379,6 +1379,10 @@ pub struct EngineInner {
     /// Per-session `codex app-server` connection (app-server transport only),
     /// spawned lazily on the first turn with this session's `-c mcp_servers` args.
     pub codex_client: Option<crate::codex_app_server::Client>,
+    /// Per-session ACP runtime handle (omp and future ACP backends). The
+    /// underlying child is process-global per backend; this Option means "this
+    /// engine has subscribed at least one session on that client".
+    pub acp_client: Option<crate::acp::runtime::ClientHandle>,
     /// Rewind anchor bookkeeping for the in-flight turn: the user row that
     /// opened it. Written with the turn's native anchor at a clean TurnEnd
     /// (claude: `last_assistant_uuid`; codex app-server: the turn id).
@@ -2311,7 +2315,9 @@ pub async fn send(
     // snapshot (which only decided the row's optimistic status). The lock drops
     // before any turn-spawning awaits.
     let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
-    let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_codex_appserver;
+    let is_acp = is_acp_tool(&ctx.tool);
+    let is_connection = is_codex_appserver || is_acp;
+    let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_connection;
     // Set when a queued send found the engine idle and claimed a fresh turn.
     let mut promoted: Option<i32> = None;
     {
@@ -2334,7 +2340,7 @@ pub async fn send(
                 "send could not be delivered: the turn ended or the engine stopped while it was persisting"
             ));
         }
-        if ctx.direct && !spawn_now && !is_codex_appserver {
+        if ctx.direct && !spawn_now && !is_connection {
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
                 rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, "error").await;
@@ -2376,7 +2382,7 @@ pub async fn send(
                 // Under the lock for the same ordering reason as Phase 1's direct
                 // write: a concurrent stop's "stopped" write must not be overtaken.
                 persist_activity(db, inner.session_id, inner.thread_id, "running").await;
-                if !per_turn(&ctx.tool) && !is_codex_appserver {
+                if !per_turn(&ctx.tool) && !is_connection {
                     // Resident tool: deliver through the live stdin under this
                     // lock, exactly like a direct resident send.
                     if let Err(e) = write_user(&mut inner, &out).await {
@@ -2451,6 +2457,20 @@ pub async fn send(
             rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
             return Err(e);
         }
+    } else if ctx.direct && is_acp {
+        if let Err(e) = spawn_acp_turn(
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            out,
+            Some(ctx.reset_epoch),
+        )
+        .await
+        {
+            let status = spawn_failure_status(eng, &ctx).await;
+            rollback_failed_visible_turn(app, db, eng, ctx.turn, row_id, &content, status).await;
+            return Err(e);
+        }
     } else if let Some(pturn) = promoted {
         // The promoted send owns a fresh turn now. Flip its row to delivered
         // (complete + delivery seq + finalize emit, same as a drained queue item),
@@ -2468,7 +2488,7 @@ pub async fn send(
             turn: pturn,
             ..ctx.clone()
         };
-        if per_turn(&ctx.tool) && !is_codex_appserver {
+        if per_turn(&ctx.tool) && !is_connection {
             if let Err(e) = spawn_turn(
                 app.clone(),
                 db.clone(),
@@ -2484,6 +2504,20 @@ pub async fn send(
             }
         } else if is_codex_appserver {
             if let Err(e) = spawn_codex_turn_or_exec(
+                app.clone(),
+                db.clone(),
+                eng.clone(),
+                dispatched,
+                Some(ctx.reset_epoch),
+            )
+            .await
+            {
+                let status = spawn_failure_status(eng, &promoted_ctx).await;
+                rollback_failed_visible_turn(app, db, eng, pturn, row_id, &content, status).await;
+                return Err(e);
+            }
+        } else if is_acp {
+            if let Err(e) = spawn_acp_turn(
                 app.clone(),
                 db.clone(),
                 eng.clone(),
@@ -2711,6 +2745,470 @@ fn codex_first_turn_text(system_prompt: &str, message: &str, had_native: bool) -
     } else {
         message.to_string()
     }
+}
+
+
+fn is_acp_tool(tool: &str) -> bool {
+    crate::acp::backend_for(tool).is_some()
+}
+
+/// Drive a turn over the generic ACP runtime (omp today). Mirrors the
+/// connection-shaped codex app-server path: ensure session, subscribe a
+/// long-lived consumer once, then `session/prompt`.
+async fn spawn_acp_turn(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    out: Outgoing,
+    expected_epoch: Option<u64>,
+) -> anyhow::Result<()> {
+    let (native, cwd, sid, thread_id_i, system_prompt, tool, ask_dir, had_client) = {
+        let i = eng.lock().await;
+        if i.stopped || i.interrupting || expected_epoch.is_some_and(|e| e != i.reset_epoch) {
+            return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
+        }
+        (
+            i.native_id.clone(),
+            i.cwd.clone(),
+            i.session_id,
+            i.thread_id,
+            i.system_prompt.clone(),
+            i.tool.clone(),
+            i.ask_dir.clone(),
+            i.acp_client.is_some(),
+        )
+    };
+    let backend = crate::acp::backend_for(&tool)
+        .ok_or_else(|| anyhow::anyhow!("not an ACP tool: {tool}"))?;
+    let client = crate::acp::runtime::client(backend.id()).await?;
+
+    // MCP list from the live bus base.
+    let base = app
+        .try_state::<crate::BusBase>()
+        .map(|b| b.0.clone())
+        .unwrap_or_default();
+    let include_planner = sid.is_none() && ask_dir == "lead";
+    let include_global = ask_dir == "concierge" || ask_dir.contains("concierge");
+    let include_curator = ask_dir == "curator";
+    let mcp = if base.is_empty() {
+        vec![]
+    } else {
+        crate::bus::inject::acp_mcp_servers(
+            &base,
+            thread_id_i,
+            &ask_dir,
+            include_planner,
+            include_global,
+            include_curator,
+        )
+    };
+
+    let had_native = native.is_some();
+    let session_id = match native {
+        Some(id) => {
+            // Prefer resume; fall back to load (hand-cut rewind files).
+            match client.resume_session(&id, &cwd, mcp.clone()).await {
+                Ok(s) => s,
+                Err(_) => client.load_session(&id, &cwd, mcp.clone()).await.unwrap_or(id),
+            }
+        }
+        None => client.new_session(&cwd, mcp).await?,
+    };
+
+    // Subscribe consumer once per native session.
+    let need_sub = {
+        let g = eng.lock().await;
+        g.acp_client.is_none()
+            || g.native_id.as_deref() != Some(session_id.as_str())
+            || !had_client
+    };
+    if need_sub {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        client.subscribe(&session_id, tx).await?;
+        let (a, d, e, c, s) = (
+            app.clone(),
+            db.clone(),
+            eng.clone(),
+            client.clone(),
+            session_id.clone(),
+        );
+        tauri::async_runtime::spawn(async move { acp_consumer(a, d, e, c, s, rx).await });
+    }
+
+    let stop_won = {
+        let mut g = eng.lock().await;
+        let won = g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        if !won {
+            g.acp_client = Some(client.clone());
+            if g.native_id.as_deref() != Some(session_id.as_str()) {
+                g.native_id = Some(session_id.clone());
+            }
+        }
+        won
+    };
+    if stop_won {
+        return Err(anyhow::anyhow!("engine stopped during ACP connect"));
+    }
+
+    if !had_native {
+        if let Some(sid) = sid {
+            let _ = repo::set_session_native_id(&db, sid, &session_id).await;
+        } else {
+            let _ = repo::set_lead_native_id(&db, thread_id_i, &session_id).await;
+        }
+    }
+
+    let text = if !had_native && !system_prompt.is_empty() {
+        format!("{system_prompt}\n\n{}", out.text)
+    } else {
+        out.text.clone()
+    };
+
+    // Non-blocking: codex-style. Launch prompt on a background task so send()
+    // returns while the consumer streams; finalize when prompt resolves.
+    let (a, d, e, c, s, txt) = (
+        app.clone(),
+        db.clone(),
+        eng.clone(),
+        client.clone(),
+        session_id.clone(),
+        text,
+    );
+    tauri::async_runtime::spawn(async move {
+        match c.prompt(&s, &txt).await {
+            Ok(outcome) => {
+                let cancelled = outcome.cancelled || e.lock().await.interrupting;
+                acp_emit_turn_end(
+                    a.clone(),
+                    d.clone(),
+                    e.clone(),
+                    outcome.is_error,
+                    cancelled,
+                    outcome.usage.clone(),
+                )
+                .await;
+            }
+            Err(err) => {
+                eprintln!("[weft][acp] prompt failed: {err}");
+                let interrupting = e.lock().await.interrupting;
+                acp_emit_turn_end(a.clone(), d.clone(), e.clone(), true, interrupting, None).await;
+            }
+        }
+    });
+    // Stop pressed while we were connecting? Best-effort cancel.
+    if eng.lock().await.interrupting {
+        let _ = client.cancel(&session_id).await;
+    }
+    Ok(())
+}
+
+async fn acp_emit_turn_end(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    is_error: bool,
+    cancelled: bool,
+    usage: Option<crate::acp::runtime::UsageBits>,
+) {
+    let mut pending_usage = usage;
+    let mut pending_error = is_error;
+    let mut pending_cancel = cancelled;
+    // Optional follow-up prompt after finalize (queue drain) — loop, not recurse.
+    let mut follow_up: Option<(crate::acp::runtime::ClientHandle, String, Outgoing, u64, i32)> =
+        None;
+    loop {
+        if let Some((client, sid, msg, dequeue_epoch, turn_id)) = follow_up.take() {
+            if eng.lock().await.reset_epoch != dequeue_epoch {
+                rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
+                finalize_dequeued_row(&app, &db, eng.lock().await.thread_id, &msg, "interrupted")
+                    .await;
+                break;
+            }
+            let thread_id = eng.lock().await.thread_id;
+            let session_id = eng.lock().await.session_id;
+            mark_queued_delivered(&app, &db, thread_id, session_id, &msg).await;
+            match client.prompt(&sid, &msg.text).await {
+                Ok(outcome) => {
+                    pending_usage = outcome.usage.clone();
+                    pending_error = outcome.is_error;
+                    pending_cancel = outcome.cancelled || eng.lock().await.interrupting;
+                }
+                Err(err) => {
+                    eprintln!("[weft][acp] flush prompt failed: {err}");
+                    let status = drain_failure_status(&eng, dequeue_epoch).await;
+                    rollback_failed_turn(&app, &db, &eng, turn_id, status).await;
+                    finalize_dequeued_row(&app, &db, thread_id, &msg, status).await;
+                    break;
+                }
+            }
+        }
+
+        let mut inner = eng.lock().await;
+        let thread_id = inner.thread_id;
+        let session_id = inner.session_id;
+        if let Some(u) = pending_usage.as_ref() {
+            if let Some(ct) = u.total_tokens.or(u.input_tokens) {
+                inner.last_context_tokens = Some(ct);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Usage {
+                        thread_id,
+                        session_id,
+                        context_tokens: ct,
+                        window: inner.last_window,
+                        model: inner.last_model.clone(),
+                    },
+                );
+            }
+        }
+        persist_engine_meta(&db, &inner).await;
+        let status = if inner.interrupting || pending_cancel {
+            "interrupted"
+        } else if pending_error {
+            "error"
+        } else {
+            "complete"
+        };
+        inner.interrupting = false;
+        let orphans: Vec<(i32, serde_json::Value)> =
+            inner.tool_rows.drain().map(|(_, v)| v).collect();
+        finalize_orphan_tool_rows(&app, &db, thread_id, orphans, status).await;
+        let had_item_rows = !inner.open_texts.is_empty();
+        finalize_open_texts(&app, &db, &mut inner, status).await;
+        if inner.current.is_some() {
+            finalize_current_text(&app, &db, &mut inner, status).await;
+        } else if !had_item_rows && !inner.turn_saw_text {
+            if let Ok(Some(m)) = insert_terminal_assistant_if_missing(
+                &db,
+                thread_id,
+                inner.session_id,
+                inner.turn_id,
+                status,
+            )
+            .await
+            {
+                let _ = app.emit(
+                    EVENT,
+                    Push::Message {
+                        thread_id,
+                        message: m,
+                    },
+                );
+            }
+        }
+        let next = inner.turn.on_turn_end();
+        inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+        inner.last_assistant_uuid = None;
+        inner.turn_saw_text = false;
+        inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+        let next_turn_id = if next.is_some() {
+            inner.turn_id += 1;
+            Some(inner.turn_id)
+        } else {
+            None
+        };
+        let dequeue_epoch = inner.reset_epoch;
+        let still_busy = inner.turn.busy;
+        let client = inner.acp_client.clone();
+        let native = inner.native_id.clone();
+        persist_activity(
+            &db,
+            inner.session_id,
+            thread_id,
+            if still_busy { "running" } else { "idle" },
+        )
+        .await;
+        inner.clock.on_turn_end(still_busy);
+        let _ = app.emit(
+            EVENT,
+            Push::Turn {
+                thread_id,
+                session_id: inner.session_id,
+                state: if still_busy { "busy" } else { "idle" }.into(),
+                recovered: false,
+                queue: queue_items(&inner.turn),
+            },
+        );
+        drop(inner);
+
+        let flush_stop_won = {
+            let g = eng.lock().await;
+            g.stopped || g.reset_epoch != dequeue_epoch
+        };
+        if flush_stop_won {
+            if let Some(turn_id) = next_turn_id {
+                rollback_failed_turn(&app, &db, &eng, turn_id, "interrupted").await;
+            }
+            if let Some(n) = next.as_ref() {
+                finalize_dequeued_row(&app, &db, thread_id, n, "interrupted").await;
+            }
+            break;
+        }
+        match (next, next_turn_id, client, native) {
+            (Some(n), Some(turn_id), Some(client), Some(sid)) => {
+                if let Some(qid) = n.queue_id {
+                    snapshot_turn_checkpoint(&app, &db, session_id, turn_id, qid).await;
+                }
+                follow_up = Some((client, sid, n, dequeue_epoch, turn_id));
+                pending_usage = None;
+                pending_error = false;
+                pending_cancel = false;
+                continue;
+            }
+            _ => break,
+        }
+    }
+}
+
+async fn acp_consumer(
+    app: AppHandle,
+    db: Db,
+    eng: EngineRef,
+    client: crate::acp::runtime::ClientHandle,
+    _session_id: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::acp::runtime::SessionEvent>,
+) {
+    use crate::acp::runtime::SessionEvent;
+    use super::proto::ChatEvent;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            SessionEvent::Chat(ChatEvent::TextDelta { text, item: _ }) => {
+                let mut inner = eng.lock().await;
+                inner.clock.last_activity = std::time::Instant::now();
+                let thread_id = inner.thread_id;
+                let (sid, turn) = (inner.session_id, inner.turn_id);
+                if inner.current.is_none() {
+                    let Ok(m) = repo::insert_lead_message(
+                        &db,
+                        thread_id,
+                        sid,
+                        turn,
+                        "assistant",
+                        "text",
+                        r#"{"text":""}"#,
+                        "streaming",
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    inner.current = Some((m.id, String::new(), std::time::Instant::now()));
+                    let _ = app.emit(EVENT, Push::Message { thread_id, message: m });
+                }
+                let origin_tag = inner.current_origin_tag.clone();
+                let Some(c) = inner.current.as_mut() else { continue };
+                c.1.push_str(&text);
+                let row = c.0;
+                if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
+                    c.2 = std::time::Instant::now();
+                    let content = serde_json::json!({ "text": c.1 }).to_string();
+                    let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
+                    emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
+                }
+                let _ = app.emit(
+                    EVENT,
+                    Push::Delta {
+                        thread_id,
+                        message_id: row,
+                        text,
+                    },
+                );
+            }
+            SessionEvent::Chat(ChatEvent::Assistant { tools, .. }) => {
+                let mut inner = eng.lock().await;
+                inner.clock.last_activity = std::time::Instant::now();
+                persist_tool_calls(&app, &db, &mut inner, tools).await;
+            }
+            SessionEvent::Chat(ChatEvent::ToolResults { items }) => {
+                let mut inner = eng.lock().await;
+                merge_tool_results(&app, &db, &mut inner, items).await;
+            }
+            SessionEvent::Chat(ChatEvent::Commands { commands }) => {
+                let mut inner = eng.lock().await;
+                if !commands.is_empty() {
+                    inner.slash_commands = commands;
+                }
+            }
+            SessionEvent::Commands(commands) => {
+                let mut inner = eng.lock().await;
+                if !commands.is_empty() {
+                    inner.slash_commands = commands;
+                }
+            }
+            SessionEvent::Usage {
+                context_tokens,
+                window,
+            } => {
+                let mut inner = eng.lock().await;
+                inner.last_context_tokens = Some(context_tokens);
+                if window.is_some() {
+                    inner.last_window = window;
+                }
+                let (thread_id, session_id) = (inner.thread_id, inner.session_id);
+                let _ = app.emit(
+                    EVENT,
+                    Push::Usage {
+                        thread_id,
+                        session_id,
+                        context_tokens,
+                        window: inner.last_window,
+                        model: inner.last_model.clone(),
+                    },
+                );
+            }
+            SessionEvent::Meta { model, thinking: _ } => {
+                let mut inner = eng.lock().await;
+                if model.is_some() {
+                    inner.last_model = model;
+                }
+            }
+            SessionEvent::Permission {
+                request_id,
+                summary,
+                detail,
+                intent_key,
+                options,
+            } => {
+                let (thread_id, tool, dir) = {
+                    let i = eng.lock().await;
+                    (i.thread_id, i.tool.clone(), i.ask_dir.clone())
+                };
+                // Clone the registry BEFORE any await — State guards are !Send.
+                let asks = app
+                    .try_state::<crate::ask::AskRegistry>()
+                    .map(|s| s.inner().clone());
+                let want = if let Some(asks) = asks {
+                    match asks.auto_decision(thread_id, &dir, &summary) {
+                        Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
+                        Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
+                        None => {
+                            let (id, rx) =
+                                asks.request(thread_id, &dir, &tool, &summary, &detail);
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(3600),
+                                rx,
+                            )
+                            .await
+                            {
+                                Ok(Ok(crate::ask::Decision::Allow)) => crate::acp::Want::AllowOnce,
+                                Ok(Ok(crate::ask::Decision::Deny)) => crate::acp::Want::RejectOnce,
+                                _ => {
+                                    asks.cancel(id);
+                                    crate::acp::Want::RejectOnce
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    crate::acp::Want::RejectOnce
+                };
+                let _ = intent_key;
+                client.reply_permission(&request_id, &options, want).await;
+            }
+            SessionEvent::Chat(_) => {}
+        }
+    }
+    let _ = client; // keep handle for permission replies while loop runs
 }
 
 /// One long-lived task per codex session: consume the thread's app-server
@@ -3454,6 +3952,15 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if is_acp_tool(&inner.tool) {
+        let sid = inner.native_id.clone();
+        let client = inner.acp_client.clone();
+        drop(inner);
+        if let (Some(sid), Some(client)) = (sid, client) {
+            let _ = client.cancel(&sid).await;
+        }
+        return Ok(());
+    }
     // Process-tool interrupt by transport (via the adapter): per-turn dialects
     // (codex exec / opencode) kill the per-turn child; the claude resident gets a
     // protocol interrupt payload + the delayed kill below.
@@ -4026,6 +4533,11 @@ pub async fn stop_quiet(
     if let Some(c) = inner.codex_client.take() {
         c.shutdown().await;
     }
+    if let Some(c) = inner.acp_client.take() {
+        // Drop engine's handle; global child stays for other sessions. Unsubscribe
+        // is best-effort via drop of consumer when channel closes.
+        let _ = c;
+    }
     inner.child = None;
     inner.stdin = None;
     inner.turn = TurnState::default();
@@ -4185,6 +4697,7 @@ async fn rewind_reserved(
             native_id: inner.native_id.clone(),
             ask_dir: inner.ask_dir.clone(),
             codex_client: inner.codex_client.clone(),
+            acp_client: inner.acp_client.clone(),
         }
     };
     // Lead engines (session_id None) can only rewind the conversation — they
@@ -4753,6 +5266,7 @@ struct RewindSnap {
     native_id: Option<String>,
     ask_dir: String,
     codex_client: Option<crate::codex_app_server::Client>,
+    acp_client: Option<crate::acp::runtime::ClientHandle>,
 }
 
 /// `thread/fork` at `last_turn_id`: ride the session's live app-server
@@ -6006,6 +6520,7 @@ mod tests {
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
             codex_client: None,
+            acp_client: None,
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
@@ -6250,6 +6765,7 @@ mod tests {
             tool_rows: std::collections::HashMap::new(),
             stopped: false,
             codex_client: None,
+            acp_client: None,
             turn_user_row: None,
             last_assistant_uuid: None,
             rewinding: false,
