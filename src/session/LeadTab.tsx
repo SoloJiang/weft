@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { currentLang } from "../i18n";
-import { useStore } from "../state/store";
+import { isInFlight, useStore } from "../state/store";
 import { ChatTimeline } from "./ChatTimeline";
 import { LeadEmptyState } from "./LeadEmptyState";
 import { ChatComposer, type LocalSlashSpec } from "./ChatComposer";
@@ -272,7 +272,7 @@ export function LeadTab({
           timelineKey={`lead:${tid}`}
           onRetryHistory={() => void loadLeadChat(tid)}
           asks={asks.filter((a) => a.thread === tid && (a.dir === "lead" || a.dir === ""))}
-          busy={turn.state === "busy"}
+          busy={isInFlight(turn.state)}
           activity={leadActivity[tid]}
           onReviewProposal={() => setReviewingProposal(true)}
           proposal={proposal}
@@ -311,7 +311,7 @@ export function LeadTab({
           placeholder={composePlaceholder}
           tool={leadTool}
           contextMeta={leadMeta[tid]}
-          busy={turn.state === "busy"}
+          busy={isInFlight(turn.state)}
           queued={turn.queue.length}
           onSend={(text, images, files) =>
             sendLeadChat(tid, text, images, files)
@@ -413,7 +413,7 @@ export function LeadTab({
           }}
           onClose={() => setLeadRail("none")}
           onReload={onReload}
-          busy={turn.state === "busy"}
+          busy={isInFlight(turn.state)}
         />
       )}
       {rail === "tests" && (

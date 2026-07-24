@@ -1723,6 +1723,15 @@ pub async fn sessions_for_repo(db: &Db, repo_id: i32) -> Result<Vec<session::Mod
         .await?)
 }
 
+/// Directions whose write repo is `repo_id`. Used to revoke their persisted
+/// authorization grants before a repo delete cascades the direction rows away.
+pub async fn directions_for_repo(db: &Db, repo_id: i32) -> Result<Vec<direction::Model>> {
+    Ok(direction::Entity::find()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?)
+}
+
 /// Every session ever opened for one (direction, repo) slot — normally one,
 /// but racing opens can create more; rewind's sibling-busy guard needs them.
 pub async fn sessions_for(db: &Db, direction_id: i32, repo_id: i32) -> Result<Vec<session::Model>> {

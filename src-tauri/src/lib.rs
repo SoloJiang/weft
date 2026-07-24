@@ -8,6 +8,7 @@
 
 mod adapters;
 pub mod ask;
+mod auth_persist;
 pub mod backup;
 mod brief;
 pub mod bus;
@@ -107,6 +108,15 @@ pub fn run() {
     // Start the local HTTP server (thread bus MCP + planner MCP + Ask Bridge).
     let bus = bus::BusRegistry::new();
     let asks = ask::AskRegistry::new();
+    // Re-hydrate standing authorization grants (full / always) from the store
+    // BEFORE the bus server serves any ask and BEFORE revive re-drives in-flight
+    // tasks — so a granted "Full access" survives a restart and a revived worker
+    // runs under the access already granted instead of triggering a fresh prompt.
+    {
+        let db = db.clone();
+        let asks = asks.clone();
+        tauri::async_runtime::block_on(async move { auth_persist::seed(&db, &asks).await });
+    }
     let bus_base: String = {
         let bus = bus.clone();
         let db = db.clone();
@@ -169,6 +179,10 @@ pub fn run() {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
             lead_chat::engine::spawn_watchdog(app.handle().clone());
+            // Install the grant-persist consumer BEFORE revive re-drives tasks, so
+            // the persist path is live for the whole run (grants were already
+            // seeded synchronously above, before the builder). Ordering hygiene.
+            auth_persist::spawn(app.handle().clone());
             lead_chat::revive::spawn_revive(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             process_quota::spawn_monitor(app.handle().clone());
@@ -233,6 +247,8 @@ pub fn run() {
             commands::pending_asks,
             commands::workspace_needs_counts,
             commands::answer_permission,
+            commands::list_auth_grants,
+            commands::revoke_auth_grant,
             commands::resolve_action_card,
             commands::set_dangerous_mode,
             commands::set_keep_awake,

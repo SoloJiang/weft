@@ -17,7 +17,7 @@ import {
   SquarePen,
   Trash2,
 } from "lucide-react";
-import { useStore } from "../state/store";
+import { threadLiveCounts, useStore } from "../state/store";
 import type { Thread } from "../lib/types";
 import { cn } from "../lib/cn";
 import { openCommandPalette } from "../components/CommandPalette";
@@ -343,15 +343,19 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
     sessions,
     needs,
     asks,
+    leadTurn,
   } = useStore();
   const { t } = useTranslation();
   const isActive = activeThreadId === thread.id;
   const dirCount = directionsByThread[thread.id]?.length;
-  const liveCount = Object.values(sessions).filter(
-    (s) =>
-      s.status === "running" &&
-      directionsByThread[thread.id]?.some((d) => d.id === s.directionId),
-  ).length;
+  // Split running vs stalled so an all-stalled thread doesn't advertise a healthy
+  // green pulse. Shared derivation with the workspace card: worker sessions + the
+  // thread lead (which has no session row) → running vs stalled.
+  const { running, stalled } = threadLiveCounts(
+    sessions,
+    (directionsByThread[thread.id] ?? []).map((d) => d.id),
+    leadTurn[thread.id]?.state,
+  );
   const needsYou =
     needs.some((n) => n.thread_id === thread.id) ||
     asks.some((a) => a.thread === thread.id);
@@ -378,10 +382,16 @@ function ThreadRow({ thread, onRename }: { thread: Thread; onRename: (id: number
           #{thread.id}
         </span>
         <span className="truncate text-[13px]">{thread.title}</span>
-        {liveCount > 0 && (
+        {running > 0 && (
           <span className="flex items-center gap-1 text-[10px] text-running">
             <span className="weft-pulse h-1.5 w-1.5 rounded-full bg-running" />
-            {liveCount}
+            {running}
+          </span>
+        )}
+        {stalled > 0 && (
+          <span className="flex items-center gap-1 text-[10px] text-waiting">
+            <span className="h-1.5 w-1.5 rounded-full bg-waiting" />
+            {stalled}
           </span>
         )}
         <span className="ml-auto flex items-center gap-1.5 transition-opacity group-hover:opacity-0">
