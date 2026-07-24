@@ -230,7 +230,6 @@ export const zh = {
     historyLoadError: "对话加载失败。",
     retryHistory: "重试",
     stop: "停止",
-    queuedN: "已排队 {{count}}",
     interrupted: "已中断",
     errored: "本回合出错",
     terminalErrorBeforeOutput: "Agent 在产出内容前出错，本回合已结束。",
