@@ -103,27 +103,42 @@ pub async fn client(backend_id: &str) -> anyhow::Result<ClientHandle> {
     let backend = backend_for(backend_id)
         .ok_or_else(|| anyhow::anyhow!("no ACP backend registered for {backend_id}"))?;
     let id = backend.id();
-    {
+    let existing = {
         let g = POOL.clients.lock().await;
-        if let Some(c) = g.get(id) {
-            // Ensure connected
-            c.ensure_connected(backend.clone()).await?;
-            return Ok(c.clone());
-        }
+        g.get(id).cloned()
+    };
+    if let Some(c) = existing {
+        // Must not hold POOL.clients across ensure_connected (it awaits).
+        c.ensure_connected(backend).await?;
+        return Ok(c);
     }
     let handle = ClientHandle {
         backend_id: id,
         inner: Arc::new(Mutex::new(None)),
     };
     handle.ensure_connected(backend).await?;
-    POOL.clients.lock().await.insert(id, handle.clone());
+    // Insert only after connect succeeds. Race: two first callers may both connect;
+    // keep the first inserted and drop the second's child on insert loss.
+    {
+        let mut g = POOL.clients.lock().await;
+        if let Some(c) = g.get(id) {
+            let kept = c.clone();
+            drop(g);
+            handle.shutdown_and_reap().await;
+            return Ok(kept);
+        }
+        g.insert(id, handle.clone());
+    }
     Ok(handle)
 }
 
 /// Tear down one backend connection (tool command bounce / tests).
 pub async fn shutdown(backend_id: &str) {
-    let mut g = POOL.clients.lock().await;
-    if let Some(c) = g.remove(backend_id) {
+    let c = {
+        let mut g = POOL.clients.lock().await;
+        g.remove(backend_id)
+    };
+    if let Some(c) = c {
         c.shutdown_and_reap().await;
     }
 }
@@ -204,6 +219,8 @@ impl ClientHandle {
             _child: child,
             _reg: reg,
         });
+        drop(g); // request() needs this mutex — never hold across initialize.
+
         let me = self.clone();
         tauri::async_runtime::spawn(async move { me.read_loop(stdout).await });
 
