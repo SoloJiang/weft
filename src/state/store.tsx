@@ -302,6 +302,12 @@ interface Store {
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: () => Promise<void>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
+  /** Approve a plan_card: post `plan_decision` to the lead, then persist the settled
+   *  state. Shared by the chat plan_card's own Approve button and the merged
+   *  ScopeReview confirm (issue #104, confirmation-chain compression) — one
+   *  submission path, two entry points. Resolves false (and toasts) when the lead
+   *  never received it, so a chained caller can stop before touching the proposal. */
+  approvePlanCard: (threadId: number, messageId: number, title: string) => Promise<boolean>;
 
   /** Workspace board: per-thread roll-ups for the portfolio view. */
   overview: ThreadOverview[];
@@ -2178,13 +2184,47 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       await refreshProposal(activeThreadId);
       return;
     }
-    const ids = await api.confirmProposal(activeThreadId);
+    // Surface a failure instead of leaving the caller silently stuck (issue #104: this is
+    // now reachable right after a merged plan-approve in the same click, so a failure here
+    // must land visibly/recoverably, not half-silently — mirrors the base-save-failed
+    // branch above: toast, refresh to the real state, and return so a retry acts on it).
+    let ids: number[];
+    try {
+      ids = await api.confirmProposal(activeThreadId);
+    } catch (err) {
+      console.error(err);
+      toast(i18n.t("scope.confirmFailed"), "danger");
+      await refreshProposal(activeThreadId);
+      return;
+    }
     setProposal(null);
     setReviewingProposal(false);
     await loadThreadChildren(activeThreadId);
     // Automation-first: dispatch every new task's worker immediately.
     for (const id of ids) void dispatchDirection(id);
   }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
+
+  const approvePlanCard = useCallback(
+    async (threadId: number, messageId: number, title: string): Promise<boolean> => {
+      // Feedback first, and only persist the settled state once the lead actually
+      // accepted the delivery — a stopped lead silently drops hidden input, and a
+      // card stamped "approved" with no split coming would mislead. Verbatim the chat
+      // plan_card's own submission (ChatTimeline's inline onApprove) so approving from
+      // the merged ScopeReview screen (issue #104) is the SAME action, not a new one.
+      const delivered = await api.postLeadToolResult(
+        threadId,
+        { tool: "plan_decision", status: "approved", title },
+        currentLang(),
+      );
+      if (!delivered) {
+        toast(i18n.t("planCard.deliverFailed"), "danger");
+        return false;
+      }
+      await api.resolveActionCard(messageId, title || i18n.t("planCard.label"));
+      return true;
+    },
+    [],
+  );
 
   const setProposalDirectionBase = useCallback(
     (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string): Promise<void> => {
@@ -2687,6 +2727,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     saveProposal,
     confirmProposal,
     setProposalDirectionBase,
+    approvePlanCard,
     overview,
     refreshOverview,
     selectWorkspace,
