@@ -1,21 +1,34 @@
 //! Boot-time recovery: re-attach and continue work interrupted by a hard app
-//! exit — both orphaned `running` turns (cut off mid-flight) and silently-stalled
-//! tasks (a lead that finished its turn cleanly yet still owns an in-progress task
-//! whose worker drained to idle without delivering). Cleanly-idle work with no
-//! in-progress task is left for lazy-attach on open. See the worker-restart spec.
+//! exit — orphaned `running` turns (cut off mid-flight). Cleanly-idle work with
+//! no in-progress task is left for lazy-attach on open. See the worker-restart
+//! spec.
 //!
-//! Runtime companion (issue #95): the same silent-stall shape can also develop
-//! while the app keeps running — a coordination deadlock isn't only a boot-time
-//! artifact. [`spawn_stall_watch`] re-runs [`collect_stalled_leads`] on a timer
-//! and auto-redrives through the exact same path, cooldown-gated per thread so a
-//! stall that doesn't actually resolve can't turn into a redrive storm (see
-//! `cooldown_elapsed`). It also covers the shape boot revive — and the bus wake
-//! path (`coordinator::deliver`) — can NEVER reach: a worker session left
-//! `stopped` (see `engine::stop`). Silently auto-driving that would risk
-//! spawning a second writer over a human's terminal takeover, so it is
-//! deliberately never auto-redriven; instead it gets a visible, honest
-//! Needs-you notice (`collect_stopped_worker_stalls`) so a lead that bus_post'd
-//! it is never left believing the wake landed.
+//! Silent-stall redrive + stopped-worker coverage (issue #95) live entirely in
+//! [`spawn_stall_watch`], NOT here — deliberately, after a review caught a real
+//! bug in an earlier split. A lead that finished its own turn cleanly yet still
+//! owns an in-progress task whose worker drained to idle without delivering
+//! ([`collect_stalled_leads`]) is auto-redriven through the same path as this
+//! file's other revives, cooldown-gated per thread so a stall that doesn't
+//! actually resolve can't turn into a redrive storm. A worker session left
+//! `stopped` ([`collect_stopped_worker_stalls`]) — a shape the bus wake path
+//! (`coordinator::deliver`) can NEVER reach, since it deliberately skips
+//! `STATUS_STOPPED` to avoid spawning a second writer over a human's terminal
+//! takeover (see `engine::stop`) — is never auto-redriven for that same
+//! reason; it gets a visible, honest Needs-you notice instead, so a lead that
+//! bus_post'd it is never left believing the wake landed.
+//!
+//! [`spawn_stall_watch`] runs an immediate first pass before its timer loop, so
+//! it covers "at boot" too — that first pass IS what used to be a separate
+//! boot-only scan in [`sweep`] below, with its OWN independent, boot-scoped
+//! cooldown/notice state. Splitting it that way meant the exact same thread or
+//! direction could get double-redriven or double-notified within the first
+//! tick after boot (the runtime side had no idea what the boot side already
+//! did, and vice versa), and a boot-posted notice — never tracked, because a
+//! one-shot boot pass has no "later" to retract it in — could never be
+//! retracted at all, becoming a permanent false alarm for the rest of the
+//! process's life. Consolidating both scans into `spawn_stall_watch`'s single,
+//! continuously-updated `last_redrive`/`stopped_notices` maps (one owner, from
+//! the first pass through every later tick) closes both gaps.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -106,17 +119,19 @@ pub fn spawn_revive(app: AppHandle) {
     });
 }
 
-/// Runtime companion to the boot-only sweep above (issue #95): a silent-stall
-/// coordination deadlock isn't only a boot-time artifact — it can develop while
-/// the app keeps running (e.g. a bus post to a worker races its lead going
-/// idle), and nothing else re-checks for that once boot has passed. Re-runs
-/// [`collect_stalled_leads`] on a timer and auto-redrives through the exact same
-/// path as boot (`revive_stalled_lead`), cooldown-gated per thread so a stall
-/// that doesn't actually resolve can't turn into a redrive storm. Also runs
-/// [`collect_stopped_worker_stalls`] on the same timer — never auto-driven (see
-/// that function's docs), but latched so its Needs-you notice is posted once per
+/// Runtime + boot owner of silent-stall redrive and stopped-worker coverage
+/// (issue #95) — see the module doc for why this single function owns BOTH,
+/// instead of splitting an immediate boot pass into the old `sweep`. Re-runs
+/// [`collect_stalled_leads`] and auto-redrives through the exact same path as
+/// this file's other revives (`revive_stalled_lead`), cooldown-gated per thread
+/// so a stall that doesn't actually resolve can't turn into a redrive storm.
+/// Also runs [`collect_stopped_worker_stalls`] — never auto-driven (see that
+/// function's docs), but latched so its Needs-you notice is posted once per
 /// episode and retracted on recovery, mirroring the engine watchdog's stall
-/// notice.
+/// notice. Runs an IMMEDIATE first pass (covering "at boot") before settling
+/// into its timer loop, so `last_redrive`/`stopped_notices` are seeded from the
+/// very first check onward — there is no earlier, differently-scoped pass that
+/// could redrive or notify the same thread/direction again a tick later.
 pub fn spawn_stall_watch(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let sweep_secs =
@@ -128,71 +143,98 @@ pub fn spawn_stall_watch(app: AppHandle) {
             "WEFT_STALL_REDRIVE_COOLDOWN_SECS",
             STALL_REDRIVE_COOLDOWN_DEFAULT_SECS,
         );
-        // Loop-owned state, mirroring the engine watchdog's `stall_notices`: no
-        // DB/EngineInner field exists for either (stall markers never persist —
-        // see the module doc), so the sweep itself is the sole owner for its
-        // whole lifetime.
+        // Owned by this async task for its whole lifetime, mirroring the engine
+        // watchdog's `stall_notices`: no DB/EngineInner field exists for either
+        // (stall markers never persist — see the module doc). Passed by
+        // `&mut` into every pass (the immediate one below, then each loop
+        // tick) so there is exactly ONE cooldown clock and ONE notice latch
+        // for the process's whole life, not a fresh one per call site.
         let mut last_redrive: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
         let mut stopped_notices: std::collections::HashMap<i32, (i32, u64)> =
             std::collections::HashMap::new();
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        run_stall_pass(&app, &sem, cooldown_secs, &mut last_redrive, &mut stopped_notices).await;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(sweep_secs)).await;
-            let Some(db) = app.try_state::<Db>() else {
-                continue;
-            };
-            let db = Db(db.0.clone(), db.1);
-
-            match collect_stalled_leads(&db).await {
-                Ok(stalled) => {
-                    let now = now_secs();
-                    // Prune threads that recovered on their own so a stale
-                    // cooldown from long ago can't shadow a genuinely fresh
-                    // stall episode much later.
-                    let live: HashSet<i32> = stalled.iter().map(|(t, _)| *t).collect();
-                    last_redrive.retain(|t, _| live.contains(t));
-                    for (tid, dirs) in stalled {
-                        if !cooldown_elapsed(last_redrive.get(&tid).copied(), now, cooldown_secs) {
-                            continue;
-                        }
-                        last_redrive.insert(tid, now);
-                        let (app, sem) = (app.clone(), sem.clone());
-                        tauri::async_runtime::spawn(async move {
-                            let _permit = sem.acquire().await;
-                            revive_stalled_lead(&app, tid, dirs).await;
-                        });
-                    }
-                }
-                Err(e) => eprintln!("[weft][revive] runtime stall sweep failed: {e}"),
-            }
-
-            match collect_stopped_worker_stalls(&db).await {
-                Ok(current) => {
-                    let known: Vec<i32> = stopped_notices.keys().copied().collect();
-                    let (to_notify, to_retract) = diff_stopped_notices(&current, &known);
-                    let Some(bus) = app.try_state::<crate::bus::BusRegistry>() else {
-                        continue;
-                    };
-                    for dir_id in to_retract {
-                        if let Some((thread_id, ask_id)) = stopped_notices.remove(&dir_id) {
-                            if bus.cancel_open_asks_by_id(thread_id, ask_id) {
-                                let _ = app.emit("needs-you://changed", thread_id);
-                            }
-                        }
-                    }
-                    for (thread_id, dir_id) in to_notify {
-                        let id = bus.notify_human(
-                            thread_id,
-                            &dir_id.to_string(),
-                            &stopped_worker_notice_text(dir_id),
-                        );
-                        stopped_notices.insert(dir_id, (thread_id, id));
-                    }
-                }
-                Err(e) => eprintln!("[weft][revive] runtime stopped-worker sweep failed: {e}"),
-            }
+            run_stall_pass(&app, &sem, cooldown_secs, &mut last_redrive, &mut stopped_notices).await;
         }
     });
+}
+
+/// One sweep pass: redrive silent-stall coordination deadlocks (cooldown-gated
+/// per thread) and reconcile the stopped-worker notice latch (post on a fresh
+/// hit, retract on recovery). Factored out of [`spawn_stall_watch`]'s loop so
+/// the SAME state (`last_redrive`, `stopped_notices`) backs both its immediate
+/// first call and every later tick — see that function's docs and the module
+/// doc for why a boot-scoped duplicate of this logic was a real bug (P0/P1 in
+/// the issue #95 review): a fresh, unshared cooldown/latch on either side of
+/// the boot→runtime boundary let the exact same thread or direction be
+/// redriven again a tick after boot instead of respecting the cooldown, and
+/// let a boot-posted notice — never tracked, so never retractable — outlive
+/// its own recovery as a permanent false alarm.
+async fn run_stall_pass(
+    app: &AppHandle,
+    sem: &Arc<Semaphore>,
+    cooldown_secs: u64,
+    last_redrive: &mut std::collections::HashMap<i32, u64>,
+    stopped_notices: &mut std::collections::HashMap<i32, (i32, u64)>,
+) {
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    let db = Db(db.0.clone(), db.1);
+
+    match collect_stalled_leads(&db).await {
+        Ok(stalled) => {
+            let now = now_secs();
+            // Prune threads that recovered on their own so a stale cooldown
+            // from long ago can't shadow a genuinely fresh stall episode much
+            // later.
+            let live: HashSet<i32> = stalled.iter().map(|(t, _)| *t).collect();
+            last_redrive.retain(|t, _| live.contains(t));
+            if !stalled.is_empty() {
+                eprintln!("[weft][revive] stall pass: {} stalled thread(s) found", stalled.len());
+            }
+            for (tid, dirs) in stalled {
+                if !cooldown_elapsed(last_redrive.get(&tid).copied(), now, cooldown_secs) {
+                    continue;
+                }
+                last_redrive.insert(tid, now);
+                let (app, sem) = (app.clone(), sem.clone());
+                tauri::async_runtime::spawn(async move {
+                    let _permit = sem.acquire().await;
+                    revive_stalled_lead(&app, tid, dirs).await;
+                });
+            }
+        }
+        Err(e) => eprintln!("[weft][revive] stall pass failed: {e}"),
+    }
+
+    match collect_stopped_worker_stalls(&db).await {
+        Ok(current) => {
+            let known: Vec<i32> = stopped_notices.keys().copied().collect();
+            let (to_notify, to_retract) = diff_stopped_notices(&current, &known);
+            let Some(bus) = app.try_state::<crate::bus::BusRegistry>() else {
+                return;
+            };
+            for dir_id in to_retract {
+                if let Some((thread_id, ask_id)) = stopped_notices.remove(&dir_id) {
+                    if bus.cancel_open_asks_by_id(thread_id, ask_id) {
+                        let _ = app.emit("needs-you://changed", thread_id);
+                    }
+                }
+            }
+            for (thread_id, dir_id) in to_notify {
+                let id = bus.notify_human(
+                    thread_id,
+                    &dir_id.to_string(),
+                    &stopped_worker_notice_text(dir_id),
+                );
+                stopped_notices.insert(dir_id, (thread_id, id));
+            }
+        }
+        Err(e) => eprintln!("[weft][revive] stopped-worker pass failed: {e}"),
+    }
 }
 
 /// DB-driven selection of interrupted sessions (orphaned `running`), excluding any
@@ -300,13 +342,12 @@ async fn stalled_direction_ids(db: &Db, thread_id: i32) -> anyhow::Result<Vec<i3
 }
 
 /// Threads' in-progress directions whose latest worker session is `stopped` —
-/// the shape neither the boot revive above nor `coordinator::deliver` will EVER
-/// wake: both explicitly skip `STATUS_STOPPED` so a bus post / restart can't
-/// spawn a second writer over what might be a human's live terminal takeover
-/// (see `engine::stop`). That safety rule means this can never be auto-driven
-/// the way [`collect_stalled_leads`] is — so unlike that function, this one is
-/// surfaced as an explicit, honest notice instead (see [`spawn_stall_watch`] and
-/// the boot `sweep`), not redriven.
+/// a shape `coordinator::deliver` will NEVER wake: it explicitly skips
+/// `STATUS_STOPPED` so a bus post can't spawn a second writer over what might
+/// be a human's live terminal takeover (see `engine::stop`). That safety rule
+/// means this can never be auto-driven the way [`collect_stalled_leads`] is —
+/// so unlike that function, this one is surfaced as an explicit, honest notice
+/// instead (see [`spawn_stall_watch`]), not redriven.
 ///
 /// Deliberately independent of lead status (unlike [`collect_stalled_leads`]):
 /// the stall lives in the WORKER, so it blocks progress whether the lead is
@@ -340,9 +381,21 @@ async fn collect_stopped_worker_stalls(db: &Db) -> anyhow::Result<Vec<(i32, i32)
 /// arrived" (so a lead that bus_post'd this direction is never left believing
 /// the wake landed). Points at the concrete fix (open it — sending resumes it,
 /// same as the `chatStopped` composer hint) rather than just naming the problem.
+///
+/// Deliberately does NOT claim a single cause. `STATUS_STOPPED` is set by
+/// `engine::stop` for more than a terminal takeover: the runaway guard
+/// (`spawn_watchdog`'s `turn_verdict` kill, on by default) calls the exact same
+/// `stop()`, and so can a revive attempt that itself fails to nudge
+/// (`nudge_or_reset`). An earlier version of this text asserted "probably a
+/// terminal takeover" unconditionally — for a runaway-guard kill (which already
+/// posts its own "auto-stopped by the runaway guard" notice) that claim is
+/// simply false, and a human reading two notices with one of them lying about
+/// why isn't "honest feedback" (issue #95 review). Naming both possibilities
+/// without picking one stays true regardless of which `stop()` caller fired —
+/// including ones added later.
 fn stopped_worker_notice_text(direction_id: i32) -> String {
     format!(
-        "⚠️ 任务 #{direction_id} 的 worker 处于 stopped 状态,总线唤醒无法触达它——不是「已唤醒但没反应」,而是消息根本没送到,可能已在终端被接管。请手动打开这个任务查看:如果没人在终端里,发送一条消息即可恢复;如果确实在终端接管中,忽略此提示即可。"
+        "⚠️ 任务 #{direction_id} 的 worker 处于 stopped 状态,总线唤醒无法触达它——不是「已唤醒但没反应」,而是消息根本没送到。停止原因可能是已在终端被接管,也可能是被系统自动停止(比如跑飞护栏),这里无法区分。请手动打开这个任务查看:如果没人在终端里,发送一条消息即可恢复;如果确实在终端接管中,忽略此提示即可。"
     )
 }
 
@@ -395,6 +448,18 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Interrupted-turn-only: `running` leads/workers cut off mid-flight.
+///
+/// Silent-stall redrive and stopped-worker coverage used to also run here as
+/// two more best-effort phases, each with its own boot-scoped cooldown/notice
+/// state — a review on issue #95 found that split let the exact same
+/// thread/direction be double-redriven or double-notified across the
+/// boot→runtime boundary (the runtime side's state started empty and had no
+/// way to know what boot had just done), and a boot-posted stopped-worker
+/// notice could never be retracted at all (a one-shot boot pass has no
+/// "later" to retract it in), becoming a permanent false alarm. Both phases
+/// now live solely in [`spawn_stall_watch`], whose immediate first pass covers
+/// "at boot" with the SAME state its later ticks use — see the module doc.
 async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
     let Some(db) = app.try_state::<Db>() else {
         return Ok(());
@@ -405,39 +470,14 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
         st.0.iter().map(|r| *r.key()).collect()
     };
     let (leads, workers) = collect_targets(&db, &live).await?;
-    // The silent-stall scan is a best-effort ENHANCEMENT — it must never gate the
-    // primary interrupted-turn revive below. A transient failure here (e.g. a WAL
-    // BUSY under the boot storm of concurrent services) degrades to "no stall
-    // recovery this boot" + a log, rather than propagating and skipping the
-    // running-revive dispatch entirely.
-    let stalled = collect_stalled_leads(&db).await.unwrap_or_else(|e| {
-        eprintln!("[weft][revive] stalled scan failed: {e}");
-        Vec::new()
-    });
-    // Stopped-worker coverage (issue #95) is the same best-effort ENHANCEMENT
-    // shape as the stall scan above: never gates the primary revive.
-    let stopped = collect_stopped_worker_stalls(&db).await.unwrap_or_else(|e| {
-        eprintln!("[weft][revive] stopped-worker scan failed: {e}");
-        Vec::new()
-    });
-    if leads.is_empty() && workers.is_empty() && stalled.is_empty() && stopped.is_empty() {
+    if leads.is_empty() && workers.is_empty() {
         return Ok(());
     }
     eprintln!(
-        "[weft][revive] reviving {} worker(s), {} lead(s), {} stalled thread(s), {} stopped-worker notice(s)",
+        "[weft][revive] reviving {} worker(s), {} lead(s)",
         workers.len(),
         leads.len(),
-        stalled.len(),
-        stopped.len(),
     );
-    // Never auto-driven (see `collect_stopped_worker_stalls`): a fresh, honest
-    // notice per boot is enough — no latch to manage, unlike the runtime loop's
-    // retraction dance, since a one-shot boot sweep has no "later" to retract in.
-    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-        for (thread_id, dir_id) in &stopped {
-            bus.notify_human(*thread_id, &dir_id.to_string(), &stopped_worker_notice_text(*dir_id));
-        }
-    }
     let revived_workers = workers.len();
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
@@ -453,18 +493,6 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
         handles.push(tauri::async_runtime::spawn(async move {
             let _permit = sem.acquire().await;
             revive_worker(&app, w).await;
-        }));
-    }
-    // Silent-stall recovery: idle leads whose in-progress task's worker drained to
-    // idle without delivering. Re-drive the lead (get-or-create engine → resume →
-    // nudge with the stalled worker ids) exactly like the interrupted paths, so a
-    // failure surfaces in Needs-you instead of silently staying stalled. Shares the
-    // spawn budget; disjoint from the running-turn revive by status (idle vs running).
-    for (tid, dirs) in stalled {
-        let (app, sem) = (app.clone(), sem.clone());
-        handles.push(tauri::async_runtime::spawn(async move {
-            let _permit = sem.acquire().await;
-            revive_stalled_lead(&app, tid, dirs).await;
         }));
     }
     for h in handles {
@@ -1241,6 +1269,23 @@ mod tests {
         assert!(text.contains("42"));
         assert!(text.contains("stopped"));
         assert!(text.contains("没送到"));
+    }
+
+    /// Regression (issue #95 review, P2): `STATUS_STOPPED` isn't only a
+    /// terminal takeover — the runaway guard's auto-kill sets the exact same
+    /// status, and that direction's worker would ALSO show up here. The notice
+    /// must name both possibilities rather than asserting the takeover as fact
+    /// — a false attribution next to the runaway guard's own (true) "auto-
+    /// stopped" notice would be dishonest, the opposite of what this notice
+    /// exists for.
+    #[test]
+    fn stopped_worker_notice_text_does_not_assert_a_single_cause() {
+        let text = stopped_worker_notice_text(42);
+        assert!(text.contains("终端"), "must still name the takeover case");
+        assert!(
+            text.contains("自动停止") || text.contains("跑飞护栏"),
+            "must also name the non-takeover (e.g. runaway-guard) case: {text}"
+        );
     }
 
     // ---- Runtime redrive cooldown (cooldown_elapsed) ----
