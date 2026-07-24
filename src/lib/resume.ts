@@ -27,6 +27,8 @@ export function resumeCommand(
       return `${at}${bin} resume ${nativeId}`;
     case "opencode":
       return `${at}${bin} . --session ${nativeId}`;
+    case "omp":
+      return `${at}${bin} --resume ${nativeId}`;
     default:
       return at + bin;
   }

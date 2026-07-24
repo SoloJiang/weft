@@ -1,0 +1,16 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "error": {
+    "code": -32602,
+    "message": "Invalid params",
+    "data": {
+      "_errors": [],
+      "cwd": {
+        "_errors": [
+          "Invalid input: expected string, received undefined"
+        ]
+      }
+    }
+  }
+}

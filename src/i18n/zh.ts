@@ -634,7 +634,7 @@ export const zh = {
     automationHint: "全自动的前提是异常循环有边界；常规流程不插入 Weft 自己的审批关。",
     defaultTool: "默认编程工具",
     defaultToolHint: "issue 的 lead 与新任务的默认工具；批准时可在卡片上逐条覆盖。",
-    noTools: "未检测到编程 CLI，请先安装 codex / claude / opencode。",
+    noTools: "未检测到编程 CLI，请先安装 codex / claude / opencode / omp。",
     toolFallback: "{{configured}} 未安装，当前生效 {{tool}}。",
     agentCommands: "Agent 命令",
     agentCommandsHint:

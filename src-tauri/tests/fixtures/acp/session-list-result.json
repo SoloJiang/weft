@@ -1,0 +1,189 @@
+{
+  "jsonrpc": "2.0",
+  "id": 12,
+  "result": {
+    "sessions": [
+      {
+        "sessionId": "019f9475-9196-7000-a561-014fbb0afad2",
+        "cwd": "/Users/solojiang/workspace/weft/.worktrees/feat/omp-acp-runtime",
+        "updatedAt": "2026-07-24T14:09:20.805Z",
+        "_meta": {
+          "messageCount": 5,
+          "size": 7562
+        }
+      },
+      {
+        "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+        "cwd": "/Users/solojiang/workspace/weft/.worktrees/feat/omp-acp-runtime",
+        "updatedAt": "2026-07-24T14:09:20.343Z",
+        "_meta": {
+          "messageCount": 5,
+          "size": 7443
+        }
+      },
+      {
+        "sessionId": "019f9475-66b5-7000-b7cc-42599dab7d40",
+        "cwd": "/Users/solojiang/workspace/weft/.worktrees/feat/omp-acp-runtime",
+        "updatedAt": "2026-07-24T14:09:10.009Z",
+        "_meta": {
+          "messageCount": 0,
+          "size": 718
+        }
+      },
+      {
+        "sessionId": "019f9465-92bd-7000-aa39-365e8c4ce053",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "updatedAt": "2026-07-24T14:09:05.682Z",
+        "_meta": {
+          "messageCount": 0,
+          "size": 1272621
+        }
+      },
+      {
+        "sessionId": "019f9467-9215-7000-ba0f-fbdd416888ca",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "updatedAt": "2026-07-24T13:54:12.947Z",
+        "_meta": {
+          "messageCount": 4,
+          "size": 4688
+        }
+      },
+      {
+        "sessionId": "019f9466-d4a1-7000-b6fa-e9aad1168f5c",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "updatedAt": "2026-07-24T13:53:20.785Z",
+        "_meta": {
+          "messageCount": 3,
+          "size": 2382
+        }
+      },
+      {
+        "sessionId": "019f9421-74e4-7000-80bb-a96fa70ab291",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "updatedAt": "2026-07-24T12:48:05.064Z",
+        "_meta": {
+          "messageCount": 0,
+          "size": 216456
+        }
+      },
+      {
+        "sessionId": "019f376c-ea5e-7000-bbbb-949d4a1e69de",
+        "cwd": "/Users/solojiang/workspace/find",
+        "title": "Complete producer context capsule implementation",
+        "updatedAt": "2026-07-08T15:24:55.337Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 10082509
+        }
+      },
+      {
+        "sessionId": "019ee50c-905d-7000-ac48-0c2e27447c3e",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "title": "Review Installation Guide",
+        "updatedAt": "2026-06-20T12:47:14.030Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 72275
+        }
+      },
+      {
+        "sessionId": "019ee094-15fc-7000-8047-0f66ce49c257",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "title": "Integrate AI SDK File Tree Component",
+        "updatedAt": "2026-06-20T11:14:59.288Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 3043844
+        }
+      },
+      {
+        "sessionId": "019ed63e-78fc-7000-8c90-102855367a9b",
+        "cwd": "/Users/solojiang/workspace/redditfind",
+        "updatedAt": "2026-06-17T15:41:52.767Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 36254
+        }
+      },
+      {
+        "sessionId": "019ebea3-ec84-7000-a146-34da24c03581",
+        "cwd": "/Users/solojiang/workspace/weft/.worktrees",
+        "title": "Configure Tauri package signing",
+        "updatedAt": "2026-06-13T01:46:25.856Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 173262
+        }
+      },
+      {
+        "sessionId": "019ebe91-bc09-7000-9479-601a7712345c",
+        "cwd": "/Users/solojiang/workspace/weft/.worktrees",
+        "title": "Improve README skills management",
+        "updatedAt": "2026-06-13T01:24:23.228Z",
+        "_meta": {
+          "messageCount": 6,
+          "size": 5340667
+        }
+      },
+      {
+        "sessionId": "019ebc16-6a24-7000-98cd-dc952ab6804a",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "title": "Improve README skills management",
+        "updatedAt": "2026-06-13T01:13:44.289Z",
+        "_meta": {
+          "messageCount": 6,
+          "size": 5548906
+        }
+      },
+      {
+        "sessionId": "019eb93a-9419-7000-aee4-c50a44f7995e",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "title": "Review open-design CLI integration",
+        "updatedAt": "2026-06-12T00:54:02.117Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 1099011
+        }
+      },
+      {
+        "sessionId": "019eb791-272a-7000-b3fe-35f30dc9f99e",
+        "cwd": "/Users/solojiang/workspace/weft",
+        "title": "Check oh my pi updates",
+        "updatedAt": "2026-06-11T17:28:45.928Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 941256
+        }
+      },
+      {
+        "sessionId": "019e7718-f91f-7000-a629-d343998aab20",
+        "cwd": "/Users/solojiang/workspace/find",
+        "updatedAt": "2026-05-30T09:54:13.925Z",
+        "_meta": {
+          "messageCount": 4,
+          "size": 3895607
+        }
+      },
+      {
+        "sessionId": "019e7742-ce3c-7000-892e-63fee16b1b32",
+        "cwd": "/Users/solojiang/workspace/find",
+        "title": "Google Workspace CLI \u8ba4\u8bc1\u51ed\u8bc1",
+        "updatedAt": "2026-05-30T05:45:40.153Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 1519086
+        }
+      },
+      {
+        "sessionId": "019e772c-6651-7000-9be8-9d99aae96fe2",
+        "cwd": "/Users/solojiang/Downloads",
+        "title": "Alist Global Command Design",
+        "updatedAt": "2026-05-30T04:55:24.804Z",
+        "_meta": {
+          "messageCount": 2,
+          "size": 876520
+        }
+      }
+    ]
+  }
+}

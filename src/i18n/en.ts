@@ -650,7 +650,7 @@ export const en = {
     automationHint: "Automation only works when runaway behavior has a boundary; Weft does not add its own routine approval gate.",
     defaultTool: "Default coding tool",
     defaultToolHint: "Default tool for issue leads and new tasks. Each approval card can still override it.",
-    noTools: "No coding CLI detected — install codex, claude, or opencode.",
+    noTools: "No coding CLI detected — install codex, claude, opencode, or omp.",
     toolFallback: "{{configured}} is not installed — using {{tool}}.",
     agentCommands: "Agent commands",
     agentCommandsHint:
