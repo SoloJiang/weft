@@ -230,7 +230,6 @@ export const zh = {
     historyLoadError: "对话加载失败。",
     retryHistory: "重试",
     stop: "停止",
-    queuedN: "已排队 {{count}}",
     interrupted: "已中断",
     errored: "本回合出错",
     terminalErrorBeforeOutput: "Agent 在产出内容前出错，本回合已结束。",
@@ -408,6 +407,11 @@ export const zh = {
     used: "已用 {{pct}}%",
     pending: "首条消息后可见",
     noSkills: "未启用 skill",
+    skillsInjected: "注入",
+    skillsInjectedHint: "Weft 为该工作区启用的 skill",
+    skillsDiscovered: "运行时发现",
+    skillsDiscoveredHint: "引擎在本次会话目录里实际发现的 skill",
+    noEngineSkills: "本次会话未发现 skill",
     reload: "重载会话",
     reloadHint: "重新扫描本会话的 skill / MCP",
     context: "Context",
@@ -802,10 +806,18 @@ export const zh = {
   },
   grants: {
     inherited: "已继承授权",
-    inheritedTitle: "这个 issue 的完全访问授权从上次运行保留了下来——点击撤销",
+    inheritedTitleFull: "这个 issue 的完全访问授权从上次运行保留了下来——点击撤销",
+    inheritedTitleAlways_other:
+      "这个 issue 的 {{count}} 条「始终允许」规则从上次运行保留了下来——点击撤销",
+    inheritedTitleBoth:
+      "这个 issue 的完全访问授权和「始终允许」规则从上次运行保留了下来——点击撤销",
     revokeTitle: "撤销继承的授权？",
-    revokeBody:
+    revokeBodyFull:
       "该 issue 下各任务保留的完全访问授权会被清除。下次有工具需要权限时会重新问你。",
+    revokeBodyAlways_other:
+      "该 issue 下各任务保留的 {{count}} 条「始终允许」规则会被清除。下次有工具需要权限时会重新问你。",
+    revokeBodyBoth:
+      "该 issue 下各任务保留的完全访问授权和「始终允许」规则会被清除。下次有工具需要权限时会重新问你。",
     revokeConfirm: "撤销授权",
     revokeFailed: "撤销失败——该授权仍然有效，请重试。",
     grantNotSaved: "已临时授权，但未能保存——重启后可能会再次询问。",

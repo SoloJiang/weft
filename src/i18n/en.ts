@@ -235,7 +235,6 @@ export const en = {
     historyLoadError: "Couldn’t load this conversation.",
     retryHistory: "Try again",
     stop: "Stop",
-    queuedN: "{{count}} queued",
     interrupted: "interrupted",
     errored: "This turn errored",
     terminalErrorBeforeOutput: "The agent turn ended with an error before producing output.",
@@ -418,6 +417,11 @@ export const en = {
     used: "{{pct}}% used",
     pending: "Available after first message",
     noSkills: "No skills enabled",
+    skillsInjected: "Injected",
+    skillsInjectedHint: "Skills Weft enabled for this workspace",
+    skillsDiscovered: "Discovered",
+    skillsDiscoveredHint: "Skills the engine actually found in this session's working directory",
+    noEngineSkills: "None found in this session",
     reload: "Reload session",
     reloadHint: "Re-scan this session's skills / MCP",
     context: "Context",
@@ -825,11 +829,23 @@ export const en = {
   },
   grants: {
     inherited: "Inherited access",
-    inheritedTitle:
+    inheritedTitleFull:
       "This issue's Full access carried over from a previous run — click to revoke",
+    inheritedTitleAlways_one:
+      "{{count}} always-allow rule for this issue carried over from a previous run — click to revoke",
+    inheritedTitleAlways_other:
+      "{{count}} always-allow rules for this issue carried over from a previous run — click to revoke",
+    inheritedTitleBoth:
+      "This issue's Full access and always-allow rules carried over from a previous run — click to revoke",
     revokeTitle: "Revoke inherited access?",
-    revokeBody:
+    revokeBodyFull:
       "The persisted Full access for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
+    revokeBodyAlways_one:
+      "The persisted always-allow rule for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
+    revokeBodyAlways_other:
+      "All {{count}} persisted always-allow rules for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
+    revokeBodyBoth:
+      "The persisted Full access and all always-allow rules for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
     revokeConfirm: "Revoke access",
     revokeFailed: "Couldn't revoke access — it's still active. Please try again.",
     grantNotSaved:
