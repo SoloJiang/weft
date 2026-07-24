@@ -23,6 +23,10 @@ use crate::session_meta::{find_model_context, parse_opencode_mcp};
 struct Serve {
     base: Option<String>,
     child: Option<tokio::process::Child>,
+    /// Registration kept ALONGSIDE `child` (registry entry lives as long as the
+    /// serve process). T1 registers only; reclaim (`proc_registry::reap`) is wired
+    /// into teardown by T2. Dropping it just deregisters.
+    child_reg: Option<crate::proc_registry::Registration>,
     /// The command this serve was spawned from. A serve started from a different
     /// command (a pinned session's binary vs. the global alias) must be restarted
     /// so discovery reflects the binary actually driving the session.
@@ -45,6 +49,9 @@ pub async fn shutdown() {
     if let Some(mut c) = g.child.take() {
         let _ = c.kill().await;
     }
+    // Drop the paired registration (deregisters). Reclaim of any subtree is T2's
+    // teardown wiring; here we only keep the registry honest.
+    g.child_reg = None;
     g.base = None;
     g.command.clear();
 }
@@ -170,10 +177,11 @@ async fn ensure_base(command: &str) -> anyhow::Result<String> {
     if let Some(mut c) = g.child.take() {
         let _ = c.kill().await;
     }
+    g.child_reg = None;
     g.base = None;
 
-    let mut child = Command::new(command)
-        .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+    let mut cmd = Command::new(command);
+    cmd.args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
         // Resolve nvm/fnm/volta CLIs from a GUI launch's minimal PATH without
         // mutating the global env (see detect::tool_path).
         .env("PATH", crate::detect::tool_path())
@@ -183,8 +191,12 @@ async fn ensure_base(command: &str) -> anyhow::Result<String> {
         .env_remove("OPENCODE_SERVER_PASSWORD")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    // T1: own process group + marker before spawn, then register alongside the child.
+    let configured =
+        crate::proc_registry::configure(&mut cmd, crate::proc_registry::Owner::opencode(command));
+    let mut child = cmd.spawn()?;
+    let reg = configured.register(&child);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2);
     drain_for_url(child.stdout.take(), tx.clone());
@@ -196,6 +208,7 @@ async fn ensure_base(command: &str) -> anyhow::Result<String> {
 
     g.base = Some(base.clone());
     g.child = Some(child);
+    g.child_reg = Some(reg);
     g.command = command.to_string();
     Ok(base)
 }

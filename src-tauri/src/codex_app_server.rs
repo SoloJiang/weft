@@ -504,6 +504,11 @@ struct Inner {
     /// thread_id → the in-flight turn id (needed by turn/interrupt).
     active_turn: HashMap<String, String>,
     _child: tokio::process::Child,
+    /// Registration for the spawned codex app-server child, kept ALONGSIDE `_child`
+    /// so the registry entry lives exactly as long as the process. T1 only registers
+    /// here; the tree-aware reclaim (`proc_registry::reap`) is wired into the teardown
+    /// paths (shutdown_and_reap / stop_quiet …) by T2. Dropping it just deregisters.
+    _reg: crate::proc_registry::Registration,
 }
 
 /// Handle to the single global `codex app-server` connection.
@@ -544,9 +549,12 @@ impl Client {
         program: &str,
         extra_args: &[String],
         cwd: &std::path::Path,
+        owner: crate::proc_registry::Owner,
     ) -> anyhow::Result<Client> {
         let client = Client(Arc::new(Mutex::new(None)));
-        client.spawn_inner(program, extra_args, Some(cwd)).await?;
+        client
+            .spawn_inner(program, extra_args, Some(cwd), owner)
+            .await?;
         Ok(client)
     }
 
@@ -615,8 +623,13 @@ impl Client {
     async fn connect(&self) -> anyhow::Result<()> {
         // The app-scoped global client has no per-session pin; use the global codex
         // override (alias).
-        self.spawn_inner(&crate::tool_command::command_for("codex"), &[], None)
-            .await
+        self.spawn_inner(
+            &crate::tool_command::command_for("codex"),
+            &[],
+            None,
+            crate::proc_registry::Owner::global_app_server(),
+        )
+        .await
     }
 
     async fn spawn_inner(
@@ -624,6 +637,7 @@ impl Client {
         program: &str,
         extra_args: &[String],
         cwd: Option<&std::path::Path>,
+        owner: crate::proc_registry::Owner,
     ) -> anyhow::Result<()> {
         let mut g = self.0.lock().await;
         if g.is_some() {
@@ -639,12 +653,17 @@ impl Client {
         // Resolve nvm/fnm/volta CLIs from a GUI launch's minimal PATH without
         // mutating the global env (see detect::tool_path).
         command.env("PATH", crate::detect::tool_path());
-        let mut child = command
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        // T1: own process group + instance/owner marker BEFORE spawn, then register
+        // the child ALONGSIDE it (Inner._reg). Reclaim stays in the teardown paths
+        // (T2), not here.
+        let configured = crate::proc_registry::configure(&mut command, owner);
+        let mut child = command.spawn()?;
+        let reg = configured.register(&child);
         let stdin = child
             .stdin
             .take()
@@ -688,6 +707,7 @@ impl Client {
             threads: HashMap::new(),
             active_turn: HashMap::new(),
             _child: child,
+            _reg: reg,
         });
         drop(g);
 

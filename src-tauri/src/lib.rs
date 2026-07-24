@@ -35,6 +35,10 @@ mod opencode;
 pub mod paths;
 mod planner;
 mod power;
+/// 派生进程身份与登记底座:进程组 + 登记表(pid/pgid/owner/instance)+
+/// count_instance_processes() + wait 收尸原语。会话子进程 reap / MCP 池化 /
+/// 派生并发上限都挂靠此接口(单一口径 `is_ours`,计数==孤儿判定)。
+pub mod proc_registry;
 mod process_quota;
 pub mod profile;
 mod session_meta;

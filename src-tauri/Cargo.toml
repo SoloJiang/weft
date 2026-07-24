@@ -36,6 +36,9 @@ futures = "0.3"
 # Mutex<HashMap> for the serverRequest/resolved → cancel-card mapping.
 crossbeam-skiplist = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
+# proc_registry 用 libc 做 fork-free 的进程组治理(killpg / 进程枚举):逼近 fork 上限时
+# shell 外化 ps/kill 本身也要 fork 会失败,故必须走 syscall。已是传递依赖,提为直接依赖零成本。
+libc = "0.2"
 axum = "0.7"
 tower = "0.5"
 # opencode slash-command discovery hits http://127.0.0.1（无需 TLS）；飞书 CardKit
@@ -61,7 +64,6 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 rand = "0.8"
 sha1 = "0.10"
 hex = "0.4"
-libc = "0.2"
 # Pulled in solely to call `CryptoProvider::install_default` at boot. Several
 # of our transitive deps enable both `ring` and `aws-lc-rs`, which makes
 # rustls refuse to auto-pick and panics at the first TLS handshake. Pin the

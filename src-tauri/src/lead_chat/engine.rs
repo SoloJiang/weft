@@ -1302,6 +1302,17 @@ pub struct EngineInner {
     /// Runaway-guard clocks for the in-flight turn.
     pub clock: TurnClock,
     pub child: Option<Child>,
+    /// Registration for `child`. T1 sets this Some at every spawn
+    /// (`ensure_running_locked` / per-turn). **T2 precondition:** T2 must mirror it at
+    /// every teardown/clear site (invalidate_resident / stop_quiet / the `child = None`
+    /// resets) — take BOTH `child` and `child_reg` and route through
+    /// `proc_registry::reap(&mut child, &reg)` for tree-aware reclaim — so the pair
+    /// stays both-Some/both-None. Until T2 does, a cleared `child` leaves this Some
+    /// (a stale dead-pid entry) only until the next spawn overwrites it; that is
+    /// harmless today (nothing consumes `is_ours`/`count` yet), and the registry's
+    /// id-keyed deregister makes even a pid-reuse across that window safe. Dropping it
+    /// only deregisters (never reclaims).
+    pub child_reg: Option<crate::proc_registry::Registration>,
     pub stdin: Option<ChildStdin>,
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
     /// exec/claude 的单串行匿名槽;app-server 的 item 键控行走 `open_texts`。
@@ -1734,15 +1745,23 @@ async fn ensure_running_locked(
     // Resolve the actual binary: a per-session pin, else the global override for
     // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
-    let mut child = Command::new(&program)
+    let owner = match inner.session_id {
+        Some(s) => crate::proc_registry::Owner::session(s.to_string()),
+        None => crate::proc_registry::Owner::lead_thread(inner.thread_id.to_string()),
+    };
+    let mut command = Command::new(&program);
+    command
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    // T1: own process group + marker before spawn, register PAIRED with the child.
+    let configured = crate::proc_registry::configure(&mut command, owner);
+    let mut child = command.spawn()?;
+    let reg = configured.register(&child);
     inner.stdin = child.stdin.take();
     // Ask for the command list NOW: the init system message only ships with the
     // first user turn, so the palette would stay empty until the human speaks.
@@ -1760,6 +1779,7 @@ async fn ensure_running_locked(
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
     inner.child = Some(child);
+    inner.child_reg = Some(reg);
     inner.generation += 1;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -2523,9 +2543,17 @@ async fn spawn_codex_turn(
             // Pre-accept folder trust (like the exec adapter's prepare) so the
             // app-server's first thread/start doesn't block on codex's trust prompt.
             crate::codex::ensure_codex_trusted(&cwd);
-            let c =
-                crate::codex_app_server::Client::connect_session(&program, &extra_args, &cwd)
-                    .await?;
+            let owner = match sid {
+                Some(s) => crate::proc_registry::Owner::session(s.to_string()),
+                None => crate::proc_registry::Owner::lead_thread(thread_id_i.to_string()),
+            };
+            let c = crate::codex_app_server::Client::connect_session(
+                &program,
+                &extra_args,
+                &cwd,
+                owner,
+            )
+            .await?;
             // NOT published to the engine yet: the stop check below must pass
             // first. Publishing early would let this task's stop-cleanup tear a
             // RESTARTED send's client out of the registry (a restart may reuse
@@ -3274,7 +3302,12 @@ async fn spawn_turn(
     // The adapter's program is the tool identity; resolve it through the
     // per-session pin / global override map so an aliased binary is spawned.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
-    let mut child = Command::new(&program)
+    let owner = match inner.session_id {
+        Some(s) => crate::proc_registry::Owner::session(s.to_string()),
+        None => crate::proc_registry::Owner::lead_thread(inner.thread_id.to_string()),
+    };
+    let mut command = Command::new(&program);
+    command
         .args(&args)
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
@@ -3282,14 +3315,18 @@ async fn spawn_turn(
         .stdout(std::process::Stdio::piped())
         // stderr → app log: a per-turn CLI that dies prints its reason there.
         .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    // T1: own process group + marker before spawn, register PAIRED with the child.
+    let configured = crate::proc_registry::configure(&mut command, owner);
+    let mut child = command.spawn()?;
+    let reg = configured.register(&child);
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
     inner.stdin = None;
     inner.child = Some(child);
+    inner.child_reg = Some(reg);
     inner.generation += 1;
     inner.current = None;
     let generation = inner.generation;
@@ -4720,8 +4757,17 @@ async fn fork_codex_thread(
     // Same trust pre-accept as spawn_codex_turn, or thread/fork can block on
     // codex's folder-trust prompt.
     crate::codex::ensure_codex_trusted(&snap.cwd);
-    let c = crate::codex_app_server::Client::connect_session(&program, &snap.extra_args, &snap.cwd)
-        .await?;
+    let owner = match snap.session_id {
+        Some(s) => crate::proc_registry::Owner::session(s.to_string()),
+        None => crate::proc_registry::Owner::lead_thread(snap.thread_id.to_string()),
+    };
+    let c = crate::codex_app_server::Client::connect_session(
+        &program,
+        &snap.extra_args,
+        &snap.cwd,
+        owner,
+    )
+    .await?;
     let r = c.fork_thread(thread_id, Some(last_turn_id)).await;
     c.shutdown_and_reap().await;
     r
@@ -5923,6 +5969,7 @@ mod tests {
             ask_dir: "lead".into(),
             clock: TurnClock::default(),
             child: None,
+            child_reg: None,
             stdin: None,
             current: None,
             open_texts: std::collections::HashMap::new(),
@@ -6165,6 +6212,7 @@ mod tests {
             ask_dir: "lead".into(),
             clock: TurnClock::default(),
             child: None,
+            child_reg: None,
             stdin: None,
             current: None,
             open_texts: std::collections::HashMap::new(),
