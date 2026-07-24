@@ -1,87 +1,58 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## What you're working on
 
-Weft is a Tauri v2 desktop app with a React frontend and Rust backend.
+Weft is a Tauri v2 desktop app: React/TypeScript UI in `src/`, Rust backend in `src-tauri/`. It orchestrates local coding agents across issues, lead/worker sessions, a thread bus, and git worktrees.
 
-- `src/`: React + TypeScript UI. Key areas: `board/` for workspace/issue boards, `session/` for chat/observe/diff surfaces, `components/` for shared UI, `i18n/` for English/Chinese strings.
-- `src-tauri/src/`: Rust backend. Key modules: `lead_chat/` for headless agent sessions, `store/` for SQLite/SeaORM entities and migrations, `bus/` for local MCP/thread bus, `git.rs` and `materialize.rs` for worktree handling.
-- `src-tauri/tests/`: Rust integration tests.
-- `assets/`, `public/`: screenshots, icons, and generated diagrams.
+## Layout gotchas
 
-## Build, Test, and Development Commands
+- `src/board/`, `src/session/`, `src/components/`, `src/i18n/` — main UI surfaces.
+- `src-tauri/src/lead_chat/`, `store/`, `bus/`, `git.rs`, `materialize.rs` — core backend.
+- `src-tauri/tests/` — Rust integration tests.
+- `docs/` is gitignored planning material; never commit it. If it is tracked by mistake, untrack with `git rm --cached`.
 
-- `pnpm install`: install frontend dependencies.
-- `pnpm dev`: run Vite for frontend-only iteration.
-- `pnpm build`: run TypeScript checking and create the production frontend bundle.
-- `pnpm tauri dev`: run the full desktop app in development mode.
-- `pnpm tauri build`: build a release app bundle.
-- `cd src-tauri && cargo test`: run Rust unit and integration tests.
-- `git diff --check`: check patches for whitespace errors before committing.
+## Hard constraints
 
-## Coding Style & Naming Conventions
+- User-facing strings go only through `src/i18n/en.ts` and `src/i18n/zh.ts`.
+- Rust production paths return `Result`; no `unwrap` / `expect` / `panic`.
+- No nested ternaries in TypeScript or Rust. Prefer early returns, `if` / `else if`, lookup maps, or `match`.
+- Multi-way UI/state: derive ONE discriminated value, then map it exhaustively (`Record`, `switch`, or a small status view). See `src/components/ui/StatusChip.tsx`. Do not re-derive the same booleans at every call site.
+- Command/handler registry edits are high-risk; diff neighboring entries so nothing adjacent is dropped.
+- Recursive filesystem work needs tests for symlink containment, large-directory truncation, and skipped artifact directories.
+- UI path tokens may be relative or carry line/column suffixes; absolute filesystem openers are a separate path.
+- Do not write cross-repo wiring into canonical repositories. Use launch flags, worktree-local ignored files, or Weft-managed state.
+- Prefer isolated worktrees for feature work so unrelated dirty state stays out of the main checkout.
+- Avoid adding embedded terminal/TUI dependencies; Weft owns the chat UI and uses terminal takeover only as an escape hatch.
 
-Use TypeScript for frontend code and Rust 2021 for backend code. Keep modules focused and follow the existing directory boundaries. Component files use `PascalCase.tsx`; helpers and state modules use lower camel or kebab style already present in the folder. User-facing strings must go through `src/i18n/en.ts` and `src/i18n/zh.ts`.
+## Verify before you claim done
 
-Rust production paths deny `unwrap`, `expect`, and `panic`; return `Result` and surface errors clearly. Avoid adding embedded terminal/TUI dependencies; Weft renders its own chat UI and uses terminal takeover only as an escape hatch.
+- Frontend/TS: `pnpm build`
+- Rust: `cd src-tauri && cargo test` (scoped is fine when the change is local)
+- Patch hygiene: `git diff --check`
+- Visible UI: reproduce on the running Tauri/WebView surface when behavior matters
 
-Never nest ternary expressions — a `?:` inside another `?:`'s branch is banned in both TypeScript and Rust. A single, non-nested ternary is fine; for three or more branches use early returns, `if` / `else if`, a lookup map, or `match` (Rust). For multi-way JSX rendering, extract a small helper function or sub-component that returns the right element via `if`/`else` rather than chaining `cond1 ? a : cond2 ? b : c`.
+Add or extend tests when changing store migrations, worktree/materialize behavior, chat protocol parsing, planner scope, bus behavior, or verification logic.
 
-**Discriminated state, exhaustive map.** When the same multi-way state drives rendering or logic — especially in more than one place — model it as ONE discriminated value derived by a pure function (`type Status = "a" | "b" | "c"`; `function statusOf(...): Status`) instead of multiple booleans, then map that value to output via a `Record<Status, …>` lookup, an exhaustive `switch`, or a small `status → view` component (see `src/components/ui/StatusChip.tsx`). Don't re-derive the same booleans (`isFailed`, `isDone`, …) at each call site, and don't reach for mutable `let x; if (…) x = …; else if (…) x = …` to pick a value — that's a pure mapping wearing imperative clothes. Prefer a `Record<Status, …>` literal: it's exhaustive by construction, so adding a new state is a compile error until every map handles it. This generalizes the no-nested-ternary rule: the goal is a single source of truth for the state plus one obvious place per surface that turns it into output.
+## Git / PR baseline
 
-- When porting external UI components, install their underlying primitives and re-skin with the project's design tokens; remove unused exports after porting.
-- Edits to command/handler registries are high-risk; diff the surrounding lines to ensure adjacent entries were not dropped.
-## Testing Guidelines
+- Conventional commits: `feat|fix|polish|chore(scope): ...`
+- Stage explicit paths only. Never scoop unrelated dirty files with `git add -A` / `git add .`.
+- Ready-for-review PRs by default. Include a concise summary, verification commands/results, linked issue when applicable, and UI evidence for visible changes.
+- Prefer the GitHub app/connector; fall back to `gh pr create`. Never `--no-verify`.
+- After opening a PR, record URL, number, base, head branch, head commit, and verification results. That head commit is the monitoring baseline.
 
-Backend logic is covered with Rust unit tests next to modules and integration tests under `src-tauri/tests/`. Add tests for store migrations, worktree behavior, chat protocol parsing, planner scope, bus behavior, and verification logic when those areas change. Frontend changes should at minimum pass `npm run build`.
+## PR closure bar
 
-- Recursive filesystem commands need tests for symlink containment, large-directory truncation, and skipped artifact directories.
+Opening or pushing a PR is not done. Keep watching until the review is stable.
 
-## Commit & Pull Request Guidelines
+A PR is truly mergeable only when **all three** hold:
 
-History uses short conventional prefixes such as `feat(plan): ...`, `fix(store): ...`, `polish(needs): ...`, and `chore: ...`. Keep commits scoped and descriptive.
+1. CI is green on every platform check.
+2. Codex has all-cleared the PR itself — a 👍 on the PR body, or an approving review.
+3. `mergeable == MERGEABLE` (no base conflict). If the base advances into conflict, merge the latest base (prefer a merge commit over force-push), then re-check.
 
-Respect `.gitignore` strictly. Never `git add` ignored or out-of-scope paths, and prefer staging explicit files over `git add -A`/`git add .`. Review `git status` / `git diff --cached` before every commit and confirm each staged path belongs to this change. Internal planning and spec artifacts (e.g. anything under `docs/`, which is ignored) must never be committed; if you find such a path already tracked, untrack it with `git rm --cached` rather than leaving it in the repo.
+Also required: unresolved review threads are handled. Fix real bugs with tests; explicitly push back on speculative, out-of-scope, or duplicate notes. Zero open threads alone is not enough.
 
-PRs should include a concise summary, verification commands and results, linked issue/task when applicable, and screenshots or short recordings for visible UI changes.
+Monitoring must be continuous (event subscription or timed polling, default about every 5 minutes), tracking PR URL, number, head branch, last-seen head commit, and last-checked time. Prefer GraphQL `reviewThreads` (`isResolved` / `isOutdated` / path / line) over flat comments. On a new review, head-commit change, or approval signal: fix or reply, push, resolve, and keep watching until the three-way bar holds.
 
-When opening a PR, prefer the GitHub app/connector and fall back to `gh pr create`. Confirm the working tree is clean or contains only this PR's scope before pushing, and never bypass hooks with `--no-verify` (fix the real failure instead). After creating a PR, record and report: PR URL, PR number, base branch, head branch, head commit, and verification results — the head commit is the last-seen baseline for review monitoring.
-
-## GitHub Remote Review Workflow
-
-Opening a PR or pushing new commits to one triggers an automated review (the Codex review bot) on the GitHub remote. Pushing is not the end of the task: keep watching the PR until its review reaches a stable state — do not report "pushed" and stop.
-
-A PR is **"truly mergeable"** — the bar for closing the loop — only when **ALL THREE** hold:
-
-1. **CI is green** on every platform check,
-2. **the Codex bot has signalled the all-clear on the PR itself** — a 👍 ("Good") reaction on the PR (its body/description), or an approving review, AND
-3. **the branch has no merge conflict with its target/base branch** — the PR's mergeable state is clean (GitHub `mergeable == MERGEABLE`, not `CONFLICTING`). If the base advances and a conflict appears, merge the latest base in and resolve it (prefer a merge commit over a force-push), then re-run CI and re-check.
-
-A clean re-review reacts 👍 *instead of* commenting, so that reaction is the signal — watch the PR's reactions (`gh api repos/<owner>/<repo>/issues/<n>/reactions` for `content == "+1"`), not just its threads. Also poll the PR's `mergeable` state so a base-advance conflict is caught proactively, not just at merge time. **Zero unresolved threads is necessary but NOT sufficient**: keep handling rounds and re-monitoring until the 👍 lands with CI green and no conflict (or CI fails / a conflict appears, which you fix first). Do not report "mergeable" and stop just because threads are resolved.
-
-Stop short of that bar only when:
-
-- The remaining threads are out-of-scope, speculative, or duplicate gates, and you have replied on the PR with an explicit push-back.
-- The user tells you to stop.
-
-Monitoring:
-
-- Continuous watching must run as an independent monitor (event/notification subscription or timed polling). A one-off `gh pr view`, a manual refresh, or a blocking wait in the main task does not count as monitoring.
-- Prefer subscribing to the PR's comments / reviews / reviewThreads / check-run events. If subscription is unavailable, poll on a timer — default every 5 minutes, or the cadence the user specifies.
-- The monitor records PR URL, number, head branch, last-seen head commit, last-checked time, and the closure conditions. It only reads GitHub state and reports back to the working thread; it does not edit files, commit, push, resolve threads, or comment. On a head-commit change, a new review, an unresolved actionable thread, or an approval signal, it returns to the main thread to trigger handling.
-- Read reviewThreads thread-aware (isResolved / isOutdated / inline path / line), not just flat comments. Each check reads reviewThreads / reviews / issue comments at minimum; with nothing new, report "no new actionable review" briefly — do not mistake that for final approval unless a closure condition is met.
-
-Handling:
-
-- A monitor/heartbeat report is standing authorization to continue handling the review: analyze each new comment, fix real problems with implementation + tests, push back explicitly on out-of-scope / speculative / duplicate threads, then commit, push, reply, and resolve the thread. Do not wait for the user to say "continue". Pause and ask only when a comment needs a product trade-off, exceeds the PR scope, or touches destructive operations, production access, or credentials.
-- For every comment, judge real bug vs speculative first. Fix real issues with tests; for out-of-scope or duplicate gates, state why you are not changing it — the output of a review pass is "what you are not fixing and why", not turning every ⚠ into ✅. If the same spot is bounced repeatedly, the design is wrong — rewrite from first principles instead of patching.
-- After handling, push the new commit, renew the monitor's last-seen head commit, and watch the next round.
-
-Flag a thread as blocking when it touches behavior correctness, store migrations, chat-protocol/parsing, worktree/materialize behavior, planner scope, permission boundaries, data safety, secret leakage, or stability; mark style-only notes as non-blocking. Necessary tests must cover real user paths; user-facing strings stay in `src/i18n/en.ts` + `src/i18n/zh.ts`; Rust production paths return `Result`, never `unwrap`/`expect`/`panic`.
-
-## Architecture & Configuration Notes
-
-Do not write cross-repo wiring into canonical repositories. Use temporary launch flags, worktree-local ignored files, or Weft-managed state. Current delivery reaches reviewable worktree diffs with pre-PR checks; PR creation, CI/CD observation, and deployment orchestration are roadmap work.
-
-- Use isolated workspaces for feature work to keep unrelated changes out of the main checkout.
-- Distinguish user-facing path tokens (which may carry line/column suffixes or be relative) from verbatim filesystem paths; provide dedicated openers when the UI already holds resolved absolute paths.
+Treat threads as blocking when they touch behavior correctness, store migrations, chat protocol/parsing, worktree/materialize, planner scope, permission boundaries, data safety, secret leakage, or stability. Style-only notes are non-blocking. Pause for product trade-offs, scope breaks, destructive ops, production access, or credentials; otherwise a monitor signal is standing authorization to continue.
