@@ -254,6 +254,13 @@ interface Store {
   /** The curator's repo map: profiles + dependency edges. */
   repoProfiles: RepoProfile[];
   repoEdges: RepoEdge[];
+  /** Whether an analysis pass (auto or forced) is currently queued or running for
+   *  the active workspace, straight from the backend's coalesced gate. Distinct
+   *  from `analyzing` (which also counts an unrelated curator-chat turn as busy):
+   *  this is precisely "a pass will reach an un-started repo soon" — the signal
+   *  repo cards use to render "queued" instead of "pending" (nothing scheduled,
+   *  needs a manual "Analyze deps" click). Refreshed alongside repoProfiles. */
+  repoAnalysisActive: boolean;
   /** Which workspace-home tab is active (Board · Repos). */
   homeTab: HomeTab;
   setHomeTab: (t: HomeTab) => void;
@@ -478,6 +485,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [showNeeds, setShowNeeds] = useState(false);
   const [repoProfiles, setRepoProfiles] = useState<RepoProfile[]>([]);
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
+  const [repoAnalysisActive, setRepoAnalysisActive] = useState(false);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
@@ -1982,6 +1990,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (ws == null) {
       setRepoProfiles([]);
       setRepoEdges([]);
+      setRepoAnalysisActive(false);
       return;
     }
     try {
@@ -1992,6 +2001,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (activeWorkspaceIdRef.current !== ws) return;
       setRepoProfiles(g.nodes);
       setRepoEdges(g.edges);
+      setRepoAnalysisActive(g.analysis_active);
     } catch (e) {
       /* workspace may be empty */
       console.error(e);
@@ -2598,9 +2608,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // forced pass (button) is in flight for the active workspace — the latter has no lead
   // turn, so it'd otherwise leave the Analyze control enabled mid-pass.
   const reanalyzing = activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId);
+  // Also busy while the backend's coalesced gate reports a pass in flight for this
+  // workspace (`repoAnalysisActive`, refreshed alongside repoProfiles) — covers the
+  // auto pass spawned right after adding a repo, which has no lead turn AND isn't
+  // the direct button, so without this the toolbar sat idle while analysis was
+  // actually running in the background (the bug this state exists to fix).
   const analyzing =
     (curatorTid != null && isInFlight(leadTurn[curatorTid]?.state ?? "stopped")) ||
-    reanalyzing;
+    reanalyzing ||
+    repoAnalysisActive;
 
   const value: Store = {
     workspaces,
@@ -2678,6 +2694,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     answerPermission,
     repoProfiles,
     repoEdges,
+    repoAnalysisActive,
     homeTab,
     setHomeTab,
     openSettings,

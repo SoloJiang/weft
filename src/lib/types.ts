@@ -498,6 +498,11 @@ export interface RepoEdge {
 export interface RepoGraph {
   nodes: RepoProfile[];
   edges: RepoEdge[];
+  /** Whether an analysis pass (auto or forced) is currently queued or running for
+   *  this workspace, from the backend's coalesced per-workspace gate. Lets the UI
+   *  render a not-yet-analyzed repo as "queued" (a pass will reach it) rather than
+   *  indistinguishable from "pending" (nothing scheduled — needs a manual click). */
+  analysis_active: boolean;
 }
 
 /** One item waiting in the engine's send queue (mirrors Rust QueuedItem). */
