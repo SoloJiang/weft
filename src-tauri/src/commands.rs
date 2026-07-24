@@ -1490,6 +1490,9 @@ pub async fn set_tool_command(
         match tool.as_str() {
             "opencode" => crate::opencode::shutdown().await,
             "codex" => crate::codex_app_server::shutdown_global().await,
+            t if crate::acp::backend_for(t).is_some() => {
+                crate::acp::runtime::shutdown(t).await;
+            }
             _ => {}
         }
     }

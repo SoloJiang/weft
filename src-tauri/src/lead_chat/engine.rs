@@ -4842,6 +4842,16 @@ async fn rewind_reserved(
                     )
                 }
             },
+            t if crate::acp::backend_for(t).is_some() => match &old_native {
+                None => None,
+                Some(_) if prev_user.is_none() => None,
+                Some(old) => {
+                    if ordinal == 0 {
+                        return Err(anyhow::anyhow!("该会话历史缺少回退锚点（旧会话）"));
+                    }
+                    super::rewind::fork_omp_at(&snap.cwd, old, &match_text, ordinal)?
+                }
+            },
             _ => return Err(anyhow::anyhow!("该工具暂不支持回退")),
         },
     };
@@ -5266,6 +5276,7 @@ struct RewindSnap {
     native_id: Option<String>,
     ask_dir: String,
     codex_client: Option<crate::codex_app_server::Client>,
+    #[allow(dead_code)]
     acp_client: Option<crate::acp::runtime::ClientHandle>,
 }
 

@@ -735,6 +735,17 @@ pub async fn discover_slash(
             "codex" => {
                 crate::codex_slash::discover_commands_for_cwd(std::path::Path::new(&sess.cwd)).await
             }
+            t if crate::acp::backend_for(t).is_some() => {
+                // ACP tools populate slash_commands via available_commands_update.
+                let eng = match state.get(sid as i64) {
+                    Some(eng) => eng,
+                    None => worker_engine(&app, &db, sid)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                };
+                let cmds = eng.lock().await.slash_commands.clone();
+                cmds
+            }
             _ => vec![],
         });
     }
@@ -774,6 +785,7 @@ pub async fn discover_slash(
                         cmds
                     }
                 }
+                t if crate::acp::backend_for(t).is_some() => live,
                 _ => live,
             };
             if !discovered.is_empty() {

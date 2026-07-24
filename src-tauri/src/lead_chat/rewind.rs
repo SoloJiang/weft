@@ -8,7 +8,7 @@
 //! holding every message strictly before the matched user message.
 //! Spike-verified against opencode 1.17.9.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -513,6 +513,198 @@ fn strip_outer_quotes(s: &str) -> &str {
     } else {
         s
     }
+}
+
+
+
+/// Cut-before rewind for omp ACP sessions.
+///
+/// ACP `session/fork` only does full-history copy. We rewrite the on-disk
+/// `~/.omp/agent/sessions/<encoded-cwd>/*_<id>.jsonl` to keep entries strictly
+/// before the Nth matching user message, mint a new session id, and return it
+/// so the engine can `session/load` next turn. Spike-verified: hand-cut files
+/// load and only see the kept prefix (omp 17.1.1).
+pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> Result<Option<String>> {
+    if ordinal == 0 {
+        return Err(anyhow!("ordinal is 1-based"));
+    }
+    let Some(src) = find_omp_session_file(cwd, session_id)? else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(&src)
+        .with_context(|| format!("read omp session {}", src.display()))?;
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    let want = normalize_ws(text);
+    let mut user_hits = 0usize;
+    let mut cut_at = None;
+    for (i, line) in lines.iter().enumerate() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let role = v
+            .pointer("/message/role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if role != "user" {
+            continue;
+        }
+        let body = v
+            .pointer("/message/content")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        // First-turn system-prompt prepend stores `{system}\n\n{user}`; match
+        // exact or suffix so ordinal-1 still hits.
+        let got = normalize_ws(&body);
+        if got != want && !got.ends_with(&want) {
+            continue;
+        }
+        user_hits += 1;
+        if user_hits == ordinal {
+            cut_at = Some(i);
+            break;
+        }
+    }
+    let Some(cut) = cut_at else {
+        return Err(anyhow!("omp rewind: user message not found in session file"));
+    };
+    if cut == 0 {
+        // Nothing to keep before first line — fresh session.
+        return Ok(None);
+    }
+    let kept = &lines[..cut];
+    if kept.iter().all(|l| {
+        serde_json::from_str::<Value>(l)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()))
+            .map(|t| t != "message")
+            .unwrap_or(true)
+    }) {
+        // Only headers — equivalent to before-first-message.
+        return Ok(None);
+    }
+    let new_id = uuid_v4_simple();
+    let mut out = String::new();
+    for line in kept {
+        let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("id".into(), Value::String(new_id.clone()));
+                obj.remove("parentSession");
+            }
+        }
+        out.push_str(&v.to_string());
+        out.push('\n');
+    }
+    let parent = src.parent().unwrap_or(Path::new("."));
+    let dst = parent.join(format!("weft-rewind_{new_id}.jsonl"));
+    std::fs::write(&dst, out).with_context(|| format!("write omp fork {}", dst.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod omp fork {}", dst.display()))?;
+    }
+    Ok(Some(new_id))
+}
+
+fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
+    let root = home.join(".omp/agent/sessions");
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    // Prefer encoded-cwd bucket; fall back to any match.
+    let encoded = omp_encode_cwd(cwd);
+    let mut candidates = Vec::new();
+    let preferred = root.join(&encoded);
+    if preferred.is_dir() {
+        for e in std::fs::read_dir(&preferred)? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.contains(session_id) && name.ends_with(".jsonl") {
+                candidates.push(e.path());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        for e in walkdir_jsonl(&root, session_id)? {
+            candidates.push(e);
+        }
+    }
+    // Newest mtime wins if several.
+    candidates.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+            .unwrap_or(0)
+    });
+    Ok(candidates.pop())
+}
+
+fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.contains(session_id) && name.ends_with(".jsonl") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// omp session bucket: non-alnum path chars → `-` (observed
+/// `~/.omp/agent/sessions/-workspace-weft-...`).
+fn omp_encode_cwd(cwd: &Path) -> String {
+    let s = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn uuid_v4_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
+        (nanos & 0xffff_ffff) as u32,
+        ((nanos >> 32) & 0xffff) as u16,
+        ((nanos >> 48) & 0x0fff) as u16,
+        ((nanos >> 60) & 0x0fff) as u16,
+        (nanos.reverse_bits() & 0xffff_ffff_ffff) as u64
+    )
 }
 
 #[cfg(test)]
