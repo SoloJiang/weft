@@ -1742,7 +1742,9 @@ async fn ensure_running_locked(
     if inner.stopped {
         return Ok(None);
     }
-    if per_turn(&inner.tool) {
+    if per_turn(&inner.tool) || is_acp_tool(&inner.tool) {
+        // Per-turn and ACP connection tools have no resident child to keep
+        // alive here — turns are driven by spawn_turn / spawn_acp_turn.
         return Ok(None);
     }
     if inner.tool != "claude" {
