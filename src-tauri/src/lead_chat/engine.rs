@@ -8,7 +8,7 @@
 
 use crate::store::{repo, Db};
 use dashmap::DashMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -3421,6 +3421,14 @@ pub async fn queue_reorder(app: &AppHandle, _db: &Db, eng: &EngineRef, order: Ve
     Ok(())
 }
 
+/// Bound on the interrupt control-payload's stdin write (claude resident only,
+/// issue #93). A wedged pipe must not hang the interrupt path itself — the
+/// whole point of a turn-freeze watchdog is a bounded, reliable way OUT of a
+/// frozen turn. Short: this is a handful of bytes to an OS pipe: a healthy
+/// child drains it instantly, so this only trips when the pipe itself is dead —
+/// and the 3s kill-fallback below still fires on schedule either way.
+const INTERRUPT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Interrupt the current turn: protocol control_request first (verified live:
 /// control_response + result{terminal_reason:aborted_streaming}); kill after 3s
 /// as the hard fallback. Either way `--resume` recovers the session next send.
@@ -3468,8 +3476,15 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
         .map(|a| a.interrupt_payload(inner.generation))
         .unwrap_or_default();
     if let Some(stdin) = inner.stdin.as_mut() {
-        let _ = stdin.write_all(payload.as_bytes()).await;
-        let _ = stdin.flush().await;
+        // Bounded (issue #93): a dead pipe must not block the interrupt path —
+        // the 3s kill-fallback spawned below still runs even when this never
+        // lands (a timed-out write is indistinguishable from a lost one; both
+        // fall through to it).
+        let _ = tokio::time::timeout(INTERRUPT_WRITE_TIMEOUT, async {
+            stdin.write_all(payload.as_bytes()).await?;
+            stdin.flush().await
+        })
+        .await;
     }
     let gen = inner.generation;
     drop(inner);
@@ -3707,6 +3722,34 @@ pub(crate) fn stall_verdict(
     stall_secs > 0 && busy && !has_open_ask && quiet_secs >= stall_secs
 }
 
+/// Production default for the turn-freeze auto-recovery threshold (issue #93):
+/// 10 min (600s). After the stall-visibility hint (8 min, above) so the user
+/// always SEES the visual warning before anything acts on it, and well before
+/// the runaway idle-kill cap (default 30 min — a human-tunable §7 cost/expense
+/// guard, not a "is the transport dead" detector). Dogfooding hit an agent
+/// frozen mid-tool-call for 15+ minutes with no recourse but a full app restart
+/// (#93) — this closes that gap with an automatic action instead of requiring a
+/// human to notice and intervene. Override with `WEFT_TURN_FREEZE_SECS` (0
+/// disables). Named + sentinel-tested so it can't be silently shortened.
+const TURN_FREEZE_DEFAULT_SECS: u64 = 600;
+
+/// Action verdict for the turn-freeze auto-recovery (issue #93): the same
+/// silence shape as `stall_verdict` (busy, not legitimately blocked on a human,
+/// quiet past a threshold) but answers a different question — not "should the
+/// user be shown a hint" but "should we cut this turn loose now". Kept as its
+/// own named predicate (not a reuse of `stall_verdict`) because the two answer
+/// independent questions on independent thresholds, and `stall_verdict`'s own
+/// contract is purely visual ("No side effects, no kill" — see its doc). Pure →
+/// unit-tested.
+pub(crate) fn freeze_verdict(
+    busy: bool,
+    quiet_secs: u64,
+    freeze_secs: u64,
+    has_open_ask: bool,
+) -> bool {
+    freeze_secs > 0 && busy && !has_open_ask && quiet_secs >= freeze_secs
+}
+
 /// Does open permission ask `(k_dir, k_thread)` block engine `ask_dir`@`thread_id`
 /// from the runaway/stall gates (i.e. it's legitimately waiting on the human)?
 /// A lead's asks all carry dir "lead" (the ask hook is injected with "lead" —
@@ -3746,11 +3789,15 @@ enum SweepOutcome {
     Idle,
     /// Busy turn. `stall_flip`: Some(true) just crossed into stalled, Some(false)
     /// just recovered, None unchanged. `kill`: the runaway verdict to enforce.
+    /// `freeze_fire`: true on the rising edge into turn-freeze territory (issue
+    /// #93) — set only once per silent episode (the caller tracks that), never
+    /// re-asserted every tick like `stall_flip`'s `None`-while-still-stalled case.
     Busy {
         stall_flip: Option<bool>,
         thread: i32,
         dir: String,
         kill: Option<String>,
+        freeze_fire: bool,
     },
 }
 
@@ -3812,8 +3859,77 @@ fn stall_notice_text(stall_secs: u64) -> String {
     )
 }
 
-/// Runaway guard (§7 跑飞护栏) + stall visibility (任务停滞可见): every 15s, sweep
-/// all live engines. TWO independent concerns share the one clock read:
+/// Clear the native session id for whichever surface this engine drives — the
+/// DB half of the turn-freeze auto-recovery (issue #93). Mirrors
+/// `persist_activity`'s session/lead dispatch, but routes to the `_opt`
+/// setters (already shipped for `rewind`'s "back to before the first message"
+/// case) so the id can be cleared rather than merely overwritten: a cleared id
+/// means the next send starts a brand-new native session instead of resuming
+/// one whose transport may still be wedged.
+async fn clear_native_id(db: &Db, session_id: Option<i32>, thread_id: i32) -> anyhow::Result<()> {
+    match session_id {
+        Some(sid) => repo::set_session_native_id_opt(db, sid, None).await,
+        None => repo::set_lead_native_id_opt(db, thread_id, None).await,
+    }
+}
+
+/// Explains the auto-recovery on the Needs-you feed (issue #93). Unlike the
+/// self-clearing stall hint, there is nothing left to "recover" from by the
+/// time this posts — the turn is already over and its native context WAS
+/// reset — so this is a persistent `ask_human` notice (same choice as the
+/// runaway-guard kill below), not a self-retracting `notify_human`.
+fn freeze_recovery_text(freeze_secs: u64) -> String {
+    format!(
+        "🔌 该 turn 已静默 {} 无任何输出，疑似传输层冻结——已自动中断并重置为全新会话继续。历史对话仍保留在时间线里，但新会话不带原生上下文；如果后续回复像「忘记」了之前的内容，请重新提示一下关键信息。",
+        human_dur(freeze_secs)
+    )
+}
+
+/// Re-confirm and execute the turn-freeze auto-recovery (issue #93). The
+/// sweep's verdict was computed under a lock already dropped, so this re-runs
+/// the FULL check (busy + silent past `freeze_secs` + not legitimately blocked
+/// on a human) under a FRESH lock before acting — mirrors
+/// `post_stall_notice_confirmed`'s race-closing re-check. When it still holds:
+///   1. `interrupt()` — the existing soft-protocol-interrupt-then-kill-fallback
+///      path (same one a user's own Stop button rides), so the frozen turn
+///      lands in the SAME honest, resumable `idle` state a normal interrupt
+///      does (never the harder `STATUS_STOPPED` the kill gate below uses).
+///   2. Clear the native session id, so the NEXT send opens a brand-new native
+///      session instead of resuming one whose transport may still be wedged
+///      (mirrors the "no native id ⇒ fresh session next send" contract
+///      `rewind` already ships).
+///   3. Post a Needs-you notice — this is a self-heal, but the user should
+///      still know their native context was reset.
+/// Returns false when the turn already ended in the gap (nothing to do).
+async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64) -> bool {
+    let (thread_id, session_id, dir, act) = {
+        let inner = eng.lock().await;
+        let quiet = inner.clock.last_activity.elapsed().as_secs();
+        let has_open_ask = has_blocking_perm_ask(app, &inner.ask_dir, inner.thread_id);
+        let act = freeze_verdict(inner.turn.busy, quiet, freeze_secs, has_open_ask);
+        (inner.thread_id, inner.session_id, inner.ask_dir.clone(), act)
+    };
+    if !act {
+        return false;
+    }
+    let _ = interrupt(app, eng).await;
+    if let Some(db) = app.try_state::<Db>() {
+        if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
+            );
+        }
+    }
+    eng.lock().await.native_id = None;
+    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+        bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
+    }
+    true
+}
+
+/// Runaway guard (§7 跑飞护栏) + stall visibility (任务停滞可见) + turn-freeze
+/// auto-recovery (issue #93): every 15s, sweep all live engines. THREE
+/// independent concerns share the one clock read:
 ///   1. Kill — force-stop a turn past the wall cap or silent past the idle cap;
 ///      the stopped engine surfaces via Needs-you and resumes losslessly on the
 ///      next send. Caps come from GuardrailState (Settings / WEFT_* env); 0 off.
@@ -3821,6 +3937,13 @@ fn stall_notice_text(stall_secs: u64) -> String {
 ///      from the healthy green pulse) long before the minutes-long kill cap, so a
 ///      hung/stuck task is never invisible. Threshold `WEFT_STALL_HINT_SECS`
 ///      (default 480s = 8 min, 0 disables); runs even when both kill caps are off.
+///   3. Recover — a busy turn whose transport has gone silent past
+///      `WEFT_TURN_FREEZE_SECS` (default 600s = 10 min, 0 disables) is cut
+///      loose with a soft interrupt and its native session id cleared, so the
+///      NEXT send self-heals onto a fresh session instead of sitting frozen
+///      until a human notices and restarts the app (issue #93). Fires once per
+///      silent episode; superseded by a kill in the same tick (one notice, the
+///      stronger action, not two).
 pub fn spawn_watchdog(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // Env-only knob (like the cap env seeds); read once at start. 0 disables.
@@ -3828,6 +3951,9 @@ pub fn spawn_watchdog(app: AppHandle) {
         // override per run with the env var (e.g. a small value for dogfood).
         let stall_secs =
             crate::commands::env_secs("WEFT_STALL_HINT_SECS", STALL_HINT_DEFAULT_SECS);
+        // Turn-freeze auto-recovery threshold (issue #93) — see TURN_FREEZE_DEFAULT_SECS.
+        let freeze_secs =
+            crate::commands::env_secs("WEFT_TURN_FREEZE_SECS", TURN_FREEZE_DEFAULT_SECS);
         // Watchdog-owned stall state per engine key: PRESENT iff currently in a
         // stall episode; value = (thread, Needs-you notice ask id; 0 = no notice).
         // The sweep is the SOLE owner, so there's no EngineInner field to reset
@@ -3837,15 +3963,20 @@ pub fn spawn_watchdog(app: AppHandle) {
         // recover / idle / kill / prune).
         let mut stall_notices: std::collections::HashMap<i64, (i32, u64)> =
             std::collections::HashMap::new();
+        // Watchdog-owned turn-freeze state per engine key (issue #93): PRESENT
+        // iff the auto-recovery already fired for the CURRENT silent episode, so
+        // a still-wedged transport doesn't get re-interrupted / re-notified every
+        // tick. Cleared on idle (episode over) or superseded by a kill.
+        let mut freeze_handled: HashSet<i64> = HashSet::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let Some(guard) = app.try_state::<crate::commands::GuardrailState>() else {
                 continue;
             };
             let (idle_cap, wall_cap) = guard.get();
-            // Stall visibility runs even with both kill caps disabled; only skip the
-            // whole sweep when nothing at all is enabled.
-            if idle_cap == 0 && wall_cap == 0 && stall_secs == 0 {
+            // Stall visibility / turn-freeze recovery run even with both kill caps
+            // disabled; only skip the whole sweep when nothing at all is enabled.
+            if idle_cap == 0 && wall_cap == 0 && stall_secs == 0 && freeze_secs == 0 {
                 continue;
             }
             let engines: Vec<(i64, EngineRef)> = {
@@ -3866,6 +3997,7 @@ pub fn spawn_watchdog(app: AppHandle) {
                 cancel_stall_notice(&app, v.0, v.1);
                 false
             });
+            freeze_handled.retain(|k| live.contains(k));
             for (key, eng) in engines {
                 // Compute UNDER the lock and emit the visual flip here (this file's
                 // ordering rule — a concurrent turn-start/turn-end takes this SAME
@@ -3892,6 +4024,11 @@ pub fn spawn_watchdog(app: AppHandle) {
                             has_blocking_perm_ask(&app, &inner.ask_dir, inner.thread_id);
                         let was_stalled = stall_notices.contains_key(&key);
                         let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
+                        // (3) Turn-freeze auto-recovery gate (issue #93) — rising edge
+                        // only: don't re-fire every 15s while an already-handled
+                        // episode is still (or again) past the threshold.
+                        let freeze_fire = !freeze_handled.contains(&key)
+                            && freeze_verdict(true, quiet, freeze_secs, has_open_ask);
                         // (2) Stall visibility. Re-assert `stalled` EVERY sweep while
                         // stalled (not only on the flip) so a clobbering push — a
                         // queue-change `busy`, or a post-reload hydration snapshot that
@@ -3926,6 +4063,7 @@ pub fn spawn_watchdog(app: AppHandle) {
                             // (1) Runaway kill — same caps + permission-ask gate, now
                             // correctly thread-scoped for lead asks (see ask_blocks).
                             kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
+                            freeze_fire,
                         }
                     }
                 };
@@ -3936,12 +4074,15 @@ pub fn spawn_watchdog(app: AppHandle) {
                         if let Some((thread, id)) = stall_notices.remove(&key) {
                             cancel_stall_notice(&app, thread, id);
                         }
+                        // Episode over (however it ended) — a future freeze starts fresh.
+                        freeze_handled.remove(&key);
                     }
                     SweepOutcome::Busy {
                         stall_flip,
                         thread,
                         dir,
                         kill,
+                        freeze_fire,
                     } => {
                         match stall_flip {
                             Some(true) => {
@@ -3966,12 +4107,23 @@ pub fn spawn_watchdog(app: AppHandle) {
                                 // Nothing to re-post.
                             }
                         }
-                        let Some(reason) = kill else { continue };
-                        // A kill supersedes the stall hint — retract it so the user
-                        // sees one notice (the auto-stop), not two.
+                        let Some(reason) = kill else {
+                            // (3) No kill this tick — consider the turn-freeze recovery.
+                            // Runs AFTER the stall bookkeeping above so a fresh stall
+                            // notice and the freeze recovery notice can coexist this one
+                            // tick (the stall hint isn't retracted here — only a KILL
+                            // supersedes it, same as before).
+                            if freeze_fire && recover_from_freeze(&app, &eng, freeze_secs).await {
+                                freeze_handled.insert(key);
+                            }
+                            continue;
+                        };
+                        // A kill supersedes the stall hint AND any turn-freeze tracking —
+                        // retract them so the user sees one notice (the auto-stop), not two.
                         if let Some((th, id)) = stall_notices.remove(&key) {
                             cancel_stall_notice(&app, th, id);
                         }
+                        freeze_handled.remove(&key);
                         stop(&app, &eng).await;
                         if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
                             bus.ask_human(
@@ -5793,6 +5945,77 @@ mod tests {
         // decision 2), NOT a test-fast value. This trips if the production
         // default is silently shortened (e.g. back to the rejected 90s).
         assert_eq!(STALL_HINT_DEFAULT_SECS, 480);
+    }
+
+    // ── turn-freeze auto-recovery (issue #93) ──
+
+    #[test]
+    fn freeze_fires_when_busy_and_silent_past_threshold() {
+        assert!(freeze_verdict(true, 600, 600, false)); // exactly at threshold
+        assert!(freeze_verdict(true, 1200, 600, false)); // well past
+    }
+
+    #[test]
+    fn freeze_hidden_before_threshold() {
+        assert!(!freeze_verdict(true, 599, 600, false)); // one short of the boundary
+        assert!(!freeze_verdict(true, 0, 600, false));
+    }
+
+    #[test]
+    fn freeze_suppressed_while_waiting_on_human() {
+        // A turn blocked on a human ask is legitimately paused, not frozen — the
+        // watchdog must never auto-interrupt a turn that's waiting on a
+        // permission decision.
+        assert!(!freeze_verdict(true, 9999, 600, true));
+    }
+
+    #[test]
+    fn freeze_hidden_when_idle() {
+        // No in-flight turn → never auto-recovered, however stale the clock reads.
+        assert!(!freeze_verdict(false, 9999, 600, false));
+    }
+
+    #[test]
+    fn freeze_disabled_when_threshold_zero() {
+        assert!(!freeze_verdict(true, 1_000_000, 0, false));
+    }
+
+    #[test]
+    fn turn_freeze_default_is_ten_minutes() {
+        // Regression sentinel: 600s (10 min) is a deliberate choice (issue #93),
+        // NOT a test-fast value. Trips if the production default is silently
+        // shortened (which would auto-interrupt turns that are merely slow, e.g.
+        // a multi-minute build/test tool call with no interim stdout).
+        assert_eq!(TURN_FREEZE_DEFAULT_SECS, 600);
+    }
+
+    #[test]
+    fn turn_freeze_threshold_fires_after_the_stall_hint() {
+        // Ordering invariant the watchdog sweep relies on: the visual "stalled"
+        // flag must always appear BEFORE the auto-recovery acts, so the user is
+        // never surprised by an action they had no warning of.
+        assert!(TURN_FREEZE_DEFAULT_SECS > STALL_HINT_DEFAULT_SECS);
+    }
+
+    #[tokio::test]
+    async fn clear_native_id_clears_the_lead_meta_row() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        repo::set_lead_native_id(&db, t.id, "old-native").await.unwrap();
+        assert_eq!(
+            repo::lead_native_id(&db, t.id).await.unwrap().as_deref(),
+            Some("old-native")
+        );
+
+        clear_native_id(&db, None, t.id).await.unwrap();
+
+        assert_eq!(repo::lead_native_id(&db, t.id).await.unwrap(), None);
+        // Clearing again (no meta row left) is a harmless no-op, not an error —
+        // the watchdog sweep must never fail loudly on a repeat/late tick.
+        clear_native_id(&db, None, t.id).await.unwrap();
     }
 
     #[test]
