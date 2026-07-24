@@ -3,6 +3,24 @@
 export type Tool = "claude" | "codex" | "opencode" | "none";
 export type ThreadKind = "feature" | "bugfix" | "refactor" | "spike";
 
+/** Process-pressure state reported by the backend governor. The frontend renders
+ *  this discriminant as-is; threshold and hysteresis decisions stay in Rust. */
+export type ProcessQuotaLevel = "normal" | "warning" | "degraded";
+
+/** App-wide process quota snapshot. Mirrors the governor's camelCase DTO and is
+ *  also the payload of `process-quota://changed`. */
+export interface ProcessQuotaStatus {
+  status: ProcessQuotaLevel;
+  processCount: number;
+  processLimit: number | null;
+  usagePercent: number | null;
+  warningPercent: number;
+  degradedPercent: number;
+  recoveryPercent: number;
+  /** Monotonic state-transition sequence used to reject stale fetch/event races. */
+  transitionSeq: number;
+}
+
 export interface Workspace {
   id: number;
   name: string;

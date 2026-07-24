@@ -7653,6 +7653,7 @@ dependencies = [
  "hex",
  "keepawake",
  "keyring",
+ "libc",
  "libsqlite3-sys",
  "openlark",
  "qrcode",

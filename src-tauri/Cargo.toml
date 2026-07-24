@@ -61,6 +61,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 rand = "0.8"
 sha1 = "0.10"
 hex = "0.4"
+libc = "0.2"
 # Pulled in solely to call `CryptoProvider::install_default` at boot. Several
 # of our transitive deps enable both `ring` and `aws-lc-rs`, which makes
 # rustls refuse to auto-pick and panics at the first TLS handshake. Pin the

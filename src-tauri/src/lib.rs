@@ -35,6 +35,7 @@ mod opencode;
 pub mod paths;
 mod planner;
 mod power;
+mod process_quota;
 pub mod profile;
 mod session_meta;
 mod sidecar;
@@ -153,6 +154,7 @@ pub fn run() {
         .manage(lead_chat::delta_hub::LeadDeltaHub::default())
         .manage(commands::GuardrailState::default())
         .manage(power::PowerGuard::default())
+        .manage(process_quota::ProcessQuotaGovernor::default())
         .manage(bus)
         .manage(asks)
         .manage(BusBase(bus_base))
@@ -183,6 +185,7 @@ pub fn run() {
             auth_persist::spawn(app.handle().clone());
             lead_chat::revive::spawn_revive(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
+            process_quota::spawn_monitor(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             im::spawn(app.handle().clone());
@@ -254,6 +257,7 @@ pub fn run() {
             commands::db_disable_encryption,
             commands::db_change_password,
             commands::set_guardrails,
+            process_quota::process_quota_status,
             commands::session_for,
             commands::session_meta,
             commands::effective_config,
