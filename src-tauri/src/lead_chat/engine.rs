@@ -118,6 +118,12 @@ pub enum Push {
         /// Some(session) for chat-mode workers; None for the lead.
         session_id: Option<i32>,
         state: String,
+        /// True ONLY for the watchdog's stalled→busy RECOVERY push. The frontend
+        /// keeps the running-tool label through recovery but still clears it on a
+        /// real/promoted new turn — which it cannot tell apart from the observed
+        /// state alone (a promoted-after-stall turn also arrives as `busy`).
+        #[serde(default)]
+        recovered: bool,
         queue: Vec<QueuedItem>,
     },
     Init {
@@ -514,11 +520,14 @@ async fn mark_queued_status(
     }
 }
 
-fn emit_turn_state(
+/// Single construction point for the Push::Turn state event. `state` is the wire
+/// vocabulary the frontend maps to SessionStatus: "busy" | "idle" | "stalled".
+fn emit_turn_push(
     app: &AppHandle,
     thread_id: i32,
     session_id: Option<i32>,
-    busy: bool,
+    state: &str,
+    recovered: bool,
     queue: Vec<QueuedItem>,
 ) {
     let _ = app.emit(
@@ -526,9 +535,27 @@ fn emit_turn_state(
         Push::Turn {
             thread_id,
             session_id,
-            state: if busy { "busy" } else { "idle" }.into(),
+            state: state.into(),
+            recovered,
             queue,
         },
+    );
+}
+
+fn emit_turn_state(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    busy: bool,
+    queue: Vec<QueuedItem>,
+) {
+    emit_turn_push(
+        app,
+        thread_id,
+        session_id,
+        if busy { "busy" } else { "idle" },
+        false,
+        queue,
     );
 }
 
@@ -1119,6 +1146,7 @@ async fn cleanup_disconnected_turn(
             thread_id,
             session_id,
             state: "stopped".into(),
+            recovered: false,
             queue: Vec::new(),
         },
     );
@@ -1695,6 +1723,7 @@ fn merge_init_slash_commands(
 /// under one continuous lock lets a caller reserve a turn slot atomically with
 /// ensuring the process — no window for a racing send to slip a turn in.
 async fn ensure_running_locked(
+    app: &AppHandle,
     inner: &mut EngineInner,
 ) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64)>> {
     if inner.stopped {
@@ -1711,6 +1740,7 @@ async fn ensure_running_locked(
             return Ok(None); // alive
         }
     }
+    crate::process_quota::admit_new_work(app)?;
     crate::claude::ensure_trusted(&inner.cwd);
     // Resolve the actual binary: a per-session pin, else the global override for
     // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
@@ -1762,7 +1792,7 @@ async fn ensure_running_locked(
 /// Per-turn dialects have no resident process — sending spawns one per turn.
 pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
-    let reader = ensure_running_locked(&mut inner).await?;
+    let reader = ensure_running_locked(app, &mut inner).await?;
     drop(inner);
     if let Some((stdout, generation)) = reader {
         spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
@@ -2011,6 +2041,7 @@ pub async fn send(
     files: Vec<String>,
     origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
+    crate::process_quota::admit_new_work(app)?;
     // A rewind holds its reservation from the busy check to the final
     // truncate; sends error out for that window rather than racing the
     // rewind's stop/truncate steps.
@@ -2375,6 +2406,7 @@ pub async fn send(
                 thread_id: ctx.thread_id,
                 session_id: ctx.session_id,
                 state: if inner.turn.busy { "busy" } else { "idle" }.into(),
+                recovered: false,
                 queue: queue_items(&inner.turn),
             },
         );
@@ -2973,6 +3005,7 @@ async fn codex_consumer(
                         thread_id,
                         session_id: inner.session_id,
                         state: if still_busy { "busy" } else { "idle" }.into(),
+                        recovered: false,
                         queue: queue_items(&inner.turn),
                     },
                 );
@@ -3487,12 +3520,18 @@ async fn send_hidden_inner(
     bus_read: bool,
     ensure: bool,
 ) -> anyhow::Result<()> {
+    if let Err(err) = crate::process_quota::admit_new_work(app) {
+        if bus_read {
+            return Ok(());
+        }
+        return Err(err);
+    }
     let mut inner = eng.lock().await;
     if ensure {
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
         // proceeds once we drop it on return.
-        if let Some((stdout, generation)) = ensure_running_locked(&mut inner).await? {
+        if let Some((stdout, generation)) = ensure_running_locked(app, &mut inner).await? {
             spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
         }
     }
@@ -3629,57 +3668,304 @@ pub(crate) fn turn_verdict(
     None
 }
 
-/// Runaway guard (§7 跑飞护栏): every 30s, sweep all live engines and force-stop
-/// a turn that ran past the wall cap or went silent past the idle cap. The
-/// stopped engine surfaces via Needs-you (bus ask) and resumes losslessly on
-/// the next send (`--resume`). Caps come from GuardrailState (Settings / WEFT_*
-/// env); 0 disables a cap.
+/// Production default for the stall-visibility threshold: 8 min (480s). A human
+/// decision (issue #5 decision 2) — deliberately NOT a short value, so normal LLM
+/// quiet (a slow tool call / a thinking round / a slow build) isn't false-flagged
+/// as stalled, and it stays well under the runaway idle-kill cap (30 min): a hint,
+/// not a kill. Named + sentinel-tested so it can't be silently shortened; override
+/// per run with `WEFT_STALL_HINT_SECS` (e.g. a small value for dogfood/tests).
+const STALL_HINT_DEFAULT_SECS: u64 = 480;
+
+/// Visibility-only verdict (任务停滞可见): a busy turn that has gone silent past
+/// `stall_secs` is *shown* as `stalled` — distinct from `turn_verdict`, which
+/// force-STOPS a runaway. No side effects, no kill: purely "has this turn been
+/// quiet long enough that the user should see it?". Reuses the watchdog's
+/// `has_open_ask` gate — a turn legitimately blocked on a human (already in
+/// Needs-you) is paused, not stalled. `stall_secs == 0` disables the hint. Pure
+/// → unit-tested.
+pub(crate) fn stall_verdict(
+    busy: bool,
+    quiet_secs: u64,
+    stall_secs: u64,
+    has_open_ask: bool,
+) -> bool {
+    stall_secs > 0 && busy && !has_open_ask && quiet_secs >= stall_secs
+}
+
+/// Does open permission ask `(k_dir, k_thread)` block engine `ask_dir`@`thread_id`
+/// from the runaway/stall gates (i.e. it's legitimately waiting on the human)?
+/// A lead's asks all carry dir "lead" (the ask hook is injected with "lead" —
+/// commands.rs:195 — and the engine's `ask_dir` is "lead" too), which repeats
+/// across EVERY thread, so a lead ask blocks ONLY its own thread's lead —
+/// otherwise one issue's lead permission ask would suppress the stall AND the
+/// kill for every other issue's lead. A worker's dir is a globally-unique
+/// direction id, so it matches directly. Bus `ask_human` is deliberately NOT
+/// consulted: that tool is non-blocking, so a turn awaiting a bus answer is idle
+/// (never stall-checked), and a busy+silent turn that left a bus question open is
+/// genuinely stuck. Pure → unit-tested.
+fn ask_blocks(k_dir: &str, k_thread: i32, ask_dir: &str, thread_id: i32) -> bool {
+    if ask_dir == "lead" {
+        (k_dir == "lead" || k_dir.is_empty()) && k_thread == thread_id
+    } else {
+        k_dir == ask_dir
+    }
+}
+
+/// Is there an open PERMISSION ask (AskRegistry) that legitimately blocks this
+/// engine's turn on the human — i.e. it's waiting, not stalled? Thread-scoped for
+/// lead asks via `ask_blocks`. Used by both the stall gate and the kill gate.
+fn has_blocking_perm_ask(app: &AppHandle, ask_dir: &str, thread_id: i32) -> bool {
+    app.try_state::<crate::ask::AskRegistry>()
+        .map(|a| {
+            a.open()
+                .iter()
+                .any(|k| ask_blocks(&k.dir, k.thread, ask_dir, thread_id))
+        })
+        .unwrap_or(false)
+}
+
+/// Per-engine result of one watchdog sweep, computed UNDER the engine lock and
+/// acted on after it drops (the bus notice + `stop()` each take their own lock).
+enum SweepOutcome {
+    /// Turn ended / idle: retract any open stall notice for this engine.
+    Idle,
+    /// Busy turn. `stall_flip`: Some(true) just crossed into stalled, Some(false)
+    /// just recovered, None unchanged. `kill`: the runaway verdict to enforce.
+    Busy {
+        stall_flip: Option<bool>,
+        thread: i32,
+        dir: String,
+        kill: Option<String>,
+    },
+}
+
+/// Post the soft, self-clearing "task stalled" notice to Needs-you (also wakes the
+/// human + IM bridge). Returns the ask id, or None if the bus isn't mounted.
+/// A display-only NOTICE (`notify_human`), never an answerable question: it says
+/// "无需回复" and retracts itself, so it must not accept a reply — otherwise a
+/// user answering a card that goes stale in the sweep gap (turn ended / recovered)
+/// would inject a stray bus message into the task's inbox.
+fn post_stall_notice(app: &AppHandle, thread: i32, dir: &str, stall_secs: u64) -> Option<u64> {
+    app.try_state::<crate::bus::BusRegistry>()
+        .map(|bus| bus.notify_human(thread, dir, &stall_notice_text(stall_secs)))
+}
+
+/// Retract a previously-posted stall notice. `ask_id == 0` means "no notice was
+/// posted" (bus absent at post time) — a no-op.
+fn cancel_stall_notice(app: &AppHandle, thread: i32, ask_id: u64) {
+    if ask_id == 0 {
+        return;
+    }
+    if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+        // Unlike `ask_human`, the cancel path doesn't wake the human sentinel, so
+        // the coordinator won't nudge Needs-you. Emit the refresh ourselves so the
+        // retracted stall item disappears promptly (matches coordinator.rs).
+        if bus.cancel_open_asks_by_id(thread, ask_id) {
+            let _ = app.emit("needs-you://changed", thread);
+        }
+    }
+}
+
+/// Post the stall notice ONLY if the turn is STILL busy+silent past the threshold,
+/// re-checked under the engine lock and posted while holding it. The sweep's
+/// verdict was taken under a lock we've since released, so a turn that emitted
+/// output or finished in the gap must not get a stale notice — this closes that
+/// window by confirming and posting atomically. Returns the ask id, or 0 (skipped
+/// / no bus). The visual `stalled` was already emitted under the sweep lock; the
+/// caller still records the latch so a skip is cleared by the next recovery sweep.
+async fn post_stall_notice_confirmed(app: &AppHandle, eng: &EngineRef, stall_secs: u64) -> u64 {
+    let inner = eng.lock().await;
+    let quiet = inner.clock.last_activity.elapsed().as_secs();
+    // Re-run the FULL verdict (busy + silent past threshold + no blocking permission
+    // ask) — a permission ask may have opened in the gap, making the turn
+    // legitimately blocked on the human rather than stalled.
+    let has_open_ask = has_blocking_perm_ask(app, &inner.ask_dir, inner.thread_id);
+    if stall_verdict(inner.turn.busy, quiet, stall_secs, has_open_ask) {
+        post_stall_notice(app, inner.thread_id, &inner.ask_dir, stall_secs).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+fn stall_notice_text(stall_secs: u64) -> String {
+    // A self-healing NOTICE, not a question awaiting an answer — so the user isn't
+    // confused when it auto-withdraws on recovery (same tone as the kill/revive
+    // human-notices). "无需回复" + "自动消失" make the self-clearing explicit.
+    format!(
+        "⏳ 任务停滞:已静默超过 {},可能卡住了。无需回复 —— 恢复输出后本提示会自动消失;想介入就直接查看这个任务。",
+        human_dur(stall_secs)
+    )
+}
+
+/// Runaway guard (§7 跑飞护栏) + stall visibility (任务停滞可见): every 15s, sweep
+/// all live engines. TWO independent concerns share the one clock read:
+///   1. Kill — force-stop a turn past the wall cap or silent past the idle cap;
+///      the stopped engine surfaces via Needs-you and resumes losslessly on the
+///      next send. Caps come from GuardrailState (Settings / WEFT_* env); 0 off.
+///   2. Show — flip a busy-but-silent turn to a visible `stalled` state (distinct
+///      from the healthy green pulse) long before the minutes-long kill cap, so a
+///      hung/stuck task is never invisible. Threshold `WEFT_STALL_HINT_SECS`
+///      (default 480s = 8 min, 0 disables); runs even when both kill caps are off.
 pub fn spawn_watchdog(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        // Env-only knob (like the cap env seeds); read once at start. 0 disables.
+        // Default = STALL_HINT_DEFAULT_SECS (8 min, human decision 2, sentinel-tested);
+        // override per run with the env var (e.g. a small value for dogfood).
+        let stall_secs =
+            crate::commands::env_secs("WEFT_STALL_HINT_SECS", STALL_HINT_DEFAULT_SECS);
+        // Watchdog-owned stall state per engine key: PRESENT iff currently in a
+        // stall episode; value = (thread, Needs-you notice ask id; 0 = no notice).
+        // The sweep is the SOLE owner, so there's no EngineInner field to reset
+        // across turn boundaries — a new turn's fresh clock self-heals it. Drives
+        // BOTH the visual flip (transition-only, never per tick) and the
+        // self-clearing Needs-you notice (posted on cross; retracted on
+        // recover / idle / kill / prune).
+        let mut stall_notices: std::collections::HashMap<i64, (i32, u64)> =
+            std::collections::HashMap::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             let Some(guard) = app.try_state::<crate::commands::GuardrailState>() else {
                 continue;
             };
             let (idle_cap, wall_cap) = guard.get();
-            if idle_cap == 0 && wall_cap == 0 {
+            // Stall visibility runs even with both kill caps disabled; only skip the
+            // whole sweep when nothing at all is enabled.
+            if idle_cap == 0 && wall_cap == 0 && stall_secs == 0 {
                 continue;
             }
-            let engines: Vec<EngineRef> = {
+            let engines: Vec<(i64, EngineRef)> = {
                 let state = app.state::<LeadChatState>();
-                state.0.iter().map(|r| r.value().clone()).collect()
+                state
+                    .0
+                    .iter()
+                    .map(|r| (*r.key(), r.value().clone()))
+                    .collect()
             };
-            for eng in engines {
-                let (verdict, thread_id, ask_dir) = {
+            // Engines that vanished (dropped/stopped) while stalled: retract their
+            // notice and forget them.
+            let live: std::collections::HashSet<i64> = engines.iter().map(|(k, _)| *k).collect();
+            stall_notices.retain(|k, v| {
+                if live.contains(k) {
+                    return true;
+                }
+                cancel_stall_notice(&app, v.0, v.1);
+                false
+            });
+            for (key, eng) in engines {
+                // Compute UNDER the lock and emit the visual flip here (this file's
+                // ordering rule — a concurrent turn-start/turn-end takes this SAME
+                // lock to persist+emit, so releasing first could let our stale
+                // busy/stalled push land AFTER their idle and stick). The bus notice
+                // + stop() each take their OWN lock, so they run after this guard
+                // drops (below), mirroring the kill ask_human.
+                let outcome = {
                     let inner = eng.lock().await;
                     if !inner.turn.busy {
-                        continue;
+                        SweepOutcome::Idle
+                    } else {
+                        let busy = inner.clock.started.map(|t| t.elapsed().as_secs());
+                        let quiet = inner.clock.last_activity.elapsed().as_secs();
+                        // Permission ask (AskRegistry) — feeds the runaway KILL gate,
+                        // unchanged.
+                        // Legitimately waiting on the human (an open PERMISSION ask) isn't
+                        // stalled — the SAME gate feeds the stall check and the kill below.
+                        // Bus `ask_human` is deliberately NOT consulted (non-blocking: a
+                        // real wait is idle, and a busy+silent turn with an open bus
+                        // question is genuinely stuck → it SHOULD read stalled). Lead asks
+                        // are thread-scoped (see ask_blocks).
+                        let has_open_ask =
+                            has_blocking_perm_ask(&app, &inner.ask_dir, inner.thread_id);
+                        let was_stalled = stall_notices.contains_key(&key);
+                        let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
+                        // (2) Stall visibility. Re-assert `stalled` EVERY sweep while
+                        // stalled (not only on the flip) so a clobbering push — a
+                        // queue-change `busy`, or a post-reload hydration snapshot that
+                        // only knows busy — self-corrects within one interval; emit
+                        // `busy` once on the recovery flip.
+                        if now {
+                            emit_turn_push(
+                                &app,
+                                inner.thread_id,
+                                inner.session_id,
+                                "stalled",
+                                false,
+                                queue_items(&inner.turn),
+                            );
+                        } else if was_stalled {
+                            // Recovery flip: `recovered = true` tells the frontend to
+                            // KEEP the running-tool label (it can't tell this mid-turn
+                            // recovery from a promoted new turn by state alone).
+                            emit_turn_push(
+                                &app,
+                                inner.thread_id,
+                                inner.session_id,
+                                "busy",
+                                true,
+                                queue_items(&inner.turn),
+                            );
+                        }
+                        SweepOutcome::Busy {
+                            stall_flip: if now != was_stalled { Some(now) } else { None },
+                            thread: inner.thread_id,
+                            dir: inner.ask_dir.clone(),
+                            // (1) Runaway kill — same caps + permission-ask gate, now
+                            // correctly thread-scoped for lead asks (see ask_blocks).
+                            kill: turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
+                        }
                     }
-                    let busy = inner.clock.started.map(|t| t.elapsed().as_secs());
-                    let quiet = inner.clock.last_activity.elapsed().as_secs();
-                    let has_open_ask = app
-                        .try_state::<crate::ask::AskRegistry>()
-                        .map(|a| {
-                            a.open().iter().any(|k| {
-                                k.dir == inner.ask_dir
-                                    || (inner.ask_dir == "lead" && k.dir.is_empty())
-                            })
-                        })
-                        .unwrap_or(false);
-                    (
-                        turn_verdict(busy, quiet, wall_cap, idle_cap, has_open_ask),
-                        inner.thread_id,
-                        inner.ask_dir.clone(),
-                    )
                 };
-                let Some(reason) = verdict else { continue };
-                stop(&app, &eng).await;
-                if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
-                    bus.ask_human(
-                        thread_id,
-                        &ask_dir,
-                        &format!("⚠️ Agent auto-stopped by the runaway guard: {reason}. Review and resume if it was still needed."),
-                    );
+                // After the lock: reconcile the self-clearing Needs-you stall notice,
+                // then enforce a kill if the caps demand one.
+                match outcome {
+                    SweepOutcome::Idle => {
+                        if let Some((thread, id)) = stall_notices.remove(&key) {
+                            cancel_stall_notice(&app, thread, id);
+                        }
+                    }
+                    SweepOutcome::Busy {
+                        stall_flip,
+                        thread,
+                        dir,
+                        kill,
+                    } => {
+                        match stall_flip {
+                            Some(true) => {
+                                // Confirm still-stalled under the lock before posting (the
+                                // sweep verdict is from a lock we've released). Always record
+                                // the latch (even on a skipped post) so the visual we already
+                                // emitted is cleared by the next recovery sweep.
+                                let id =
+                                    post_stall_notice_confirmed(&app, &eng, stall_secs).await;
+                                stall_notices.insert(key, (thread, id));
+                            }
+                            Some(false) => {
+                                if let Some((th, id)) = stall_notices.remove(&key) {
+                                    cancel_stall_notice(&app, th, id);
+                                }
+                            }
+                            None => {
+                                // Still stalled, notice unchanged. The notice is a
+                                // non-answerable NOTICE (notify_human), so the user can't
+                                // drop it from `open_asks` — it stays put for the whole
+                                // episode until we retract it on recover / idle / kill.
+                                // Nothing to re-post.
+                            }
+                        }
+                        let Some(reason) = kill else { continue };
+                        // A kill supersedes the stall hint — retract it so the user
+                        // sees one notice (the auto-stop), not two.
+                        if let Some((th, id)) = stall_notices.remove(&key) {
+                            cancel_stall_notice(&app, th, id);
+                        }
+                        stop(&app, &eng).await;
+                        if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
+                            bus.ask_human(
+                                thread,
+                                &dir,
+                                &format!("⚠️ Agent auto-stopped by the runaway guard: {reason}. Review and resume if it was still needed."),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3775,6 +4061,7 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
             thread_id,
             session_id,
             state: "stopped".into(),
+            recovered: false,
             queue: Vec::new(),
         },
     );
@@ -4931,6 +5218,7 @@ fn spawn_reader(
                             thread_id,
                             session_id: inner.session_id,
                             state: state.into(),
+                            recovered: false,
                             queue: queue_items(&inner.turn),
                         },
                     );
@@ -5054,6 +5342,7 @@ fn spawn_reader(
                     thread_id: inner.thread_id,
                     session_id: inner.session_id,
                     state: state.into(),
+                    recovered: false,
                     queue: queue_items(&inner.turn),
                 },
             );
@@ -5108,6 +5397,7 @@ fn spawn_reader(
                     thread_id,
                     session_id,
                     state: "stopped".into(),
+                    recovered: false,
                     queue: Vec::new(),
                 },
             );
@@ -5451,6 +5741,61 @@ mod tests {
     #[test]
     fn zero_caps_disable_each_check() {
         assert_eq!(turn_verdict(Some(1_000_000), 1_000_000, 0, 0, false), None);
+    }
+
+    #[test]
+    fn stall_shows_when_busy_and_silent_past_threshold() {
+        assert!(stall_verdict(true, 90, 90, false)); // exactly at threshold
+        assert!(stall_verdict(true, 200, 90, false)); // well past
+    }
+
+    #[test]
+    fn stall_hidden_before_threshold() {
+        assert!(!stall_verdict(true, 89, 90, false)); // one short of the boundary
+        assert!(!stall_verdict(true, 0, 90, false));
+    }
+
+    #[test]
+    fn stall_suppressed_while_waiting_on_human() {
+        // A turn blocked on a human ask is legitimately paused, not stalled.
+        assert!(!stall_verdict(true, 9999, 90, true));
+    }
+
+    #[test]
+    fn stall_hidden_when_idle() {
+        // No in-flight turn → never stalled, however stale the clock reads.
+        assert!(!stall_verdict(false, 9999, 90, false));
+    }
+
+    #[test]
+    fn stall_disabled_when_threshold_zero() {
+        assert!(!stall_verdict(true, 1_000_000, 0, false));
+    }
+
+    #[test]
+    fn stall_hint_default_is_eight_minutes() {
+        // Regression sentinel: 480s (8 min) is a human decision (issue #5
+        // decision 2), NOT a test-fast value. This trips if the production
+        // default is silently shortened (e.g. back to the rejected 90s).
+        assert_eq!(STALL_HINT_DEFAULT_SECS, 480);
+    }
+
+    #[test]
+    fn ask_blocks_scopes_lead_by_thread() {
+        // Worker ask matches its own (globally-unique) direction id.
+        assert!(ask_blocks("42", 1, "42", 1));
+        assert!(!ask_blocks("42", 1, "43", 1));
+        // A lead's ask carries dir "lead" — it blocks its OWN thread's lead only,
+        // NOT a lead in another issue (both leads' asks are dir "lead"). This is the
+        // cross-thread suppression bug: `k_dir == ask_dir` alone would match across
+        // threads, so the thread scope is essential.
+        assert!(ask_blocks("lead", 5, "lead", 5));
+        assert!(!ask_blocks("lead", 5, "lead", 6));
+        // Defensive: an empty-dir lead ask is thread-scoped the same way.
+        assert!(ask_blocks("", 5, "lead", 5));
+        assert!(!ask_blocks("", 5, "lead", 6));
+        // A worker ask isn't a lead ask (a worker never has dir "lead").
+        assert!(!ask_blocks("42", 5, "lead", 5));
     }
 
     #[test]

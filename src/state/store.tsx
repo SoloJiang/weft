@@ -17,18 +17,26 @@ import {
   type ChatHistoryStatus,
 } from "./chatHistory";
 import i18n, { currentLang } from "../i18n";
-import { toast } from "../components/Toast";
+import { toast, type ToastTone } from "../components/Toast";
+import {
+  isProcessQuotaDegradedError,
+  processQuotaNotice,
+  shouldApplyProcessQuotaStatus,
+  type ProcessQuotaNotice,
+} from "../lib/processQuota";
 import { STORAGE_KEYS } from "../lib/storageKeys";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
   BusMsg,
   Direction,
+  GrantSnapshot,
   ImageAttachment,
   LeadChatPush,
   LeadMessage,
   LiveWorkerSlot,
   NeedItem,
   PermissionAsk,
+  ProcessQuotaStatus,
   Proposal,
   QueuedItem,
   RepoChecks,
@@ -45,6 +53,7 @@ import type {
   SlashCmd,
   Thread,
   ToolStatus,
+  TurnState,
   Workspace,
   Worktree,
   WriteTrigger,
@@ -64,12 +73,53 @@ export interface OpenSession {
   nativeId: string | null;
 }
 
-type LeadWorkerState = "busy" | "idle" | "stopped";
-const SESSION_STATUS: Record<LeadWorkerState, SessionStatus> = {
+const SESSION_STATUS: Record<TurnState, SessionStatus> = {
   busy: "running",
+  stalled: "stalled",
   idle: "idle",
   stopped: "exited",
 };
+
+/** A turn still in flight — busy OR stalled (the backend turn is busy either way;
+ * stalled just means it went quiet). Single source of truth for "keep the Stop
+ * button and queue sends", so a stalled turn stays interruptible from the composer. */
+export function isInFlight(state: TurnState): boolean {
+  return state === "busy" || state === "stalled";
+}
+
+/** Split a thread's in-flight engines into running vs stalled counts — its worker
+ * sessions (matched by directionIds) PLUS its lead (leadTurn has no session row).
+ * Single source of truth so the workspace card and the nav row can't drift. */
+export function threadLiveCounts(
+  sessions: Record<number, OpenSession>,
+  directionIds: number[],
+  leadState: TurnState | undefined,
+): { running: number; stalled: number } {
+  const inThread = Object.values(sessions).filter((s) =>
+    directionIds.includes(s.directionId),
+  );
+  return {
+    running:
+      inThread.filter((s) => s.status === "running").length +
+      (leadState === "busy" ? 1 : 0),
+    stalled:
+      inThread.filter((s) => s.status === "stalled").length +
+      (leadState === "stalled" ? 1 : 0),
+  };
+}
+
+const PROCESS_QUOTA_NOTICE_VIEW: Record<
+  ProcessQuotaNotice,
+  { key: string; tone: ToastTone }
+> = {
+  warning: { key: "processQuota.warningToast", tone: "warning" },
+  degraded: { key: "processQuota.degradedToast", tone: "danger" },
+  recovered: { key: "processQuota.recoveredToast", tone: "success" },
+};
+
+function notifyProcessQuotaBlocked() {
+  toast(i18n.t("processQuota.blockedToast"), "danger");
+}
 
 interface Store {
   workspaces: Workspace[];
@@ -89,7 +139,7 @@ interface Store {
   /** Persisted timeline hydration state per thread. Missing means not loaded. */
   leadHistoryStatus: Record<number, ChatHistoryStatus>;
   /** Lead engine turn state per thread: busy/idle/stopped + queued items. */
-  leadTurn: Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>;
+  leadTurn: Record<number, { state: TurnState; queue: QueuedItem[] }>;
   /** Slash commands the lead's CLI reports as available (init event). */
   leadSlash: Record<number, SlashCmd[]>;
   /** Hydrate a thread's timeline from DB + make sure the engine runs. */
@@ -106,7 +156,7 @@ interface Store {
   /** Interrupt the lead's current turn. */
   interruptLead: (threadId: number) => Promise<void>;
   /** Chat-mode worker engine state, keyed by session id. */
-  workerTurn: Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>;
+  workerTurn: Record<number, { state: TurnState; queue: QueuedItem[] }>;
   workerSlash: Record<number, SlashCmd[]>;
   discoverWorkerSlash: (sessionId: number) => void;
   /** The tool call running right now (transient): lead by thread, worker by session. */
@@ -156,6 +206,9 @@ interface Store {
   idleCapMins: number;
   wallCapMins: number;
   setGuardrails: (idleMins: number, wallMins: number) => void;
+  /** App-wide process quota state; null until the governor's first snapshot. */
+  processQuota: ProcessQuotaStatus | null;
+  refreshProcessQuota: () => Promise<void>;
   /** Whether the board canvas is showing the proposal's scope-confirm. */
   reviewingProposal: boolean;
   setReviewingProposal: (v: boolean) => void;
@@ -171,6 +224,16 @@ interface Store {
   needs: NeedItem[];
   /** Pending tool permission requests (the Ask Bridge). */
   asks: PermissionAsk[];
+  /** Standing authorization grants (full / always) that persist across restarts,
+   *  so the board can mark issues whose access was inherited and offer a revoke. */
+  authGrants: GrantSnapshot;
+  /** Revoke a standing grant. dir=null clears the whole issue's grants (one-click
+   *  "revoke all"); dir set clears one task; +summary drops a single always-rule. */
+  revokeAuthGrant: (
+    thread: number,
+    dir: string | null,
+    summary: string | null,
+  ) => Promise<void>;
   /** Lead-proposed write declarations awaiting human approve/deny. */
   writeTriggers: WriteTrigger[];
   approveWriteTrigger: (item: WriteTrigger, tool?: string) => Promise<void>;
@@ -367,8 +430,9 @@ const NAV_AUTOCOLLAPSE_BELOW = 1000;
  * raced turn push (the lead-chat listener may have recorded idle/stopped before
  * this adoption ran) with the slot's busy flag — per the discriminated-state
  * rule, instead of a mutable `let` reassigned across `if`/`else`. */
-function adoptionStatus(turnState: string | undefined, busy: boolean): SessionStatus {
+function adoptionStatus(turnState: TurnState | undefined, busy: boolean): SessionStatus {
   if (turnState === "stopped") return "exited";
+  if (turnState === "stalled") return "stalled";
   if (turnState !== "idle" && busy) return "running";
   return "idle";
 }
@@ -405,6 +469,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<BusMsg[]>([]);
   const [needs, setNeeds] = useState<NeedItem[]>([]);
   const [asks, setAsks] = useState<PermissionAsk[]>([]);
+  const [authGrants, setAuthGrants] = useState<GrantSnapshot>({
+    full: [],
+    always: [],
+  });
   const [writeTriggers, setWriteTriggers] = useState<WriteTrigger[]>([]);
   const [needsByWorkspace, setNeedsByWorkspace] = useState<Record<number, number>>({});
   const [showNeeds, setShowNeeds] = useState(false);
@@ -495,6 +563,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     void initTools();
   }, []);
+
+  const [processQuota, setProcessQuota] = useState<ProcessQuotaStatus | null>(null);
+  const processQuotaRef = useRef<ProcessQuotaStatus | null>(null);
+  const applyProcessQuota = useCallback((next: ProcessQuotaStatus) => {
+    const previous = processQuotaRef.current;
+    if (!shouldApplyProcessQuotaStatus(previous, next)) return;
+
+    const notice = processQuotaNotice(previous, next);
+    processQuotaRef.current = next;
+    setProcessQuota(next);
+    if (notice !== null) {
+      const view = PROCESS_QUOTA_NOTICE_VIEW[notice];
+      toast(i18n.t(view.key), view.tone);
+    }
+  }, []);
+  const refreshProcessQuota = useCallback(async () => {
+    try {
+      applyProcessQuota(await api.processQuotaStatus());
+    } catch (error) {
+      // Pure Vite dev and an older backend do not expose the governor command.
+      if (import.meta.env.DEV) console.error(error);
+    }
+  }, [applyProcessQuota]);
+  useEffect(() => {
+    const unlisten = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
+      applyProcessQuota(event.payload);
+    });
+    void refreshProcessQuota();
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [applyProcessQuota, refreshProcessQuota]);
+
   const setDefaultTool = useCallback((tl: string) => {
     setDefaultToolState(tl);
     setConfiguredTool(tl);
@@ -1232,17 +1333,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       images?: ImageAttachment[],
       files?: string[],
     ) => {
-      const live = Object.values(sessionsRef.current).find(
-        (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
-      );
-      // driveDirection returns the (possibly freshly-resumed) session id directly.
-      // sessionsRef won't reflect a new session until React re-renders, so re-scanning
-      // it here would drop the first message to an idle/recovered worker (the send
-      // would no-op after ChatComposer already cleared the input).
-      const sessionId =
-        live?.info.session_id ?? (await driveDirection(directionId, repoId, false));
-      if (sessionId == null) return;
-      await api.chatSend(sessionId, text, images, files);
+      try {
+        const live = Object.values(sessionsRef.current).find(
+          (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
+        );
+        // driveDirection returns the (possibly freshly-resumed) session id directly.
+        // sessionsRef won't reflect a new session until React re-renders, so re-scanning
+        // it here would drop the first message to an idle/recovered worker (the send
+        // would no-op after ChatComposer already cleared the input).
+        const sessionId =
+          live?.info.session_id ?? (await driveDirection(directionId, repoId, false));
+        if (sessionId == null) return;
+        await api.chatSend(sessionId, text, images, files);
+      } catch (error) {
+        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        // ChatComposer restores the draft when the send promise rejects.
+        throw error;
+      }
     },
     [driveDirection],
   );
@@ -1260,7 +1367,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Skip reclaimed worktrees (exists=false): the directory is gone, so
       // spawning a worker in it would fail.
       for (const w of wts.filter((w) => w.exists)) {
-        await spawnWorker(directionId, w.repo_id, false);
+        try {
+          await spawnWorker(directionId, w.repo_id, false);
+        } catch (error) {
+          // The persistent quota bar already explains the pause. Background
+          // auto-dispatch must not leak a rejected promise while degraded.
+          if (isProcessQuotaDegradedError(error)) continue;
+          throw error;
+        }
       }
     },
     [spawnWorker],
@@ -1307,11 +1421,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     Record<number, ChatHistoryStatus>
   >({});
   const [leadTurn, setLeadTurn] = useState<
-    Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>
+    Record<number, { state: TurnState; queue: QueuedItem[] }>
   >({});
   const [leadSlash, setLeadSlash] = useState<Record<number, SlashCmd[]>>({});
   const [workerTurn, setWorkerTurn] = useState<
-    Record<number, { state: "busy" | "idle" | "stopped"; queue: QueuedItem[] }>
+    Record<number, { state: TurnState; queue: QueuedItem[] }>
   >({});
   const workerTurnRef = useRef(workerTurn);
   workerTurnRef.current = workerTurn;
@@ -1457,7 +1571,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // a revived worker's first observed state IS the idle push (no busy push).
           const prevTurn = lastWorkerTurnRef.current[sid];
           lastWorkerTurnRef.current[sid] = p.state;
-          setWorkerActivity((a) => ({ ...a, [sid]: null }));
+          // Clear the running-tool label on a real turn transition, but keep it on a
+          // stall push AND on the watchdog's stall→busy recovery push (p.recovered) —
+          // so the tool context survives the whole stall. A promoted queued turn also
+          // arrives as "busy" but with recovered=false, so it still clears the stale
+          // label. The backend flag distinguishes recovery from a (promoted) new turn,
+          // which the observed state alone cannot.
+          if (p.state !== "stalled" && !p.recovered)
+            setWorkerActivity((a) => ({ ...a, [sid]: null }));
           setWorkerTurn((t) => ({ ...t, [sid]: { state: p.state, queue: p.queue } }));
           setSessions((m) =>
             m[sid]
@@ -1489,7 +1610,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
 
         } else {
-          setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
+          // Same as the worker path: clear on a real transition, keep on a stall push
+          // AND on the watchdog's recovery push (p.recovered).
+          if (p.state !== "stalled" && !p.recovered)
+            setLeadActivity((a) => ({ ...a, [p.thread_id]: null }));
           setLeadTurn((t) => ({
             ...t,
             [p.thread_id]: { state: p.state, queue: p.queue },
@@ -1654,7 +1778,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const sendLeadChat = useCallback(
     async (threadId: number, text: string, images?: ImageAttachment[], files?: string[]) => {
-      await api.leadSend(threadId, text, currentLang(), images, files);
+      try {
+        await api.leadSend(threadId, text, currentLang(), images, files);
+      } catch (error) {
+        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        // ChatComposer restores the draft when the send promise rejects.
+        throw error;
+      }
     },
     [],
   );
@@ -1792,6 +1922,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       setAsks(await api.pendingAsks());
     } catch (e) {
       /* server may not be ready */
+      console.error(e);
+    }
+    // Standing grants are global too; refresh so "inherited access" markers stay
+    // in sync (e.g. seeded from disk at boot, or granted in another view).
+    try {
+      setAuthGrants(await api.listAuthGrants());
+    } catch (e) {
       console.error(e);
     }
     if (activeWorkspaceId == null) {
@@ -2198,12 +2335,60 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       try {
         await api.answerPermission(askId, answer);
+        // A broad grant (always / full) creates a standing rule — refresh so the
+        // board's "inherited access" marker appears without waiting for a poll.
+        if (answer === "always" || answer === "full") {
+          setAuthGrants(await api.listAuthGrants());
+        }
       } catch (e) {
-        /* already resolved/expired */
-      console.error(e);
-    }
+        /* already resolved/expired, or the durable write failed */
+        console.error(e);
+        // Only Full persists (approach B: Always is in-memory only). Full still
+        // applies this session even if persisting it failed; surface that so a
+        // re-prompt after restart isn't a silent surprise. Always is never saved
+        // by design, so its re-prompt is expected — no "not saved" warning.
+        if (answer === "full") {
+          toast(i18n.t("grants.grantNotSaved"));
+        }
+      }
     },
     [dangerousMode],
+  );
+
+  const revokeAuthGrant = useCallback(
+    async (thread: number, dir: string | null, summary: string | null) => {
+      // optimistic: drop the matching grants locally so the marker clears at once
+      setAuthGrants((cur) => ({
+        full: cur.full.filter(
+          (g) => !(g.thread === thread && (dir === null || g.dir === dir)),
+        ),
+        always: cur.always.filter(
+          (g) =>
+            !(
+              g.thread === thread &&
+              (dir === null || g.dir === dir) &&
+              (summary === null || g.summary === summary)
+            ),
+        ),
+      }));
+      try {
+        await api.revokeAuthGrant(thread, dir, summary);
+      } catch (e) {
+        console.error(e);
+        // The backend rolls back a failed durable write, so the reconcile below
+        // restores the chip; tell the user the revoke did NOT take — otherwise the
+        // safety-net revoke would appear to succeed while the grant persists.
+        toast(i18n.t("grants.revokeFailed"));
+      }
+      // reconcile with backend truth (covers a concurrent grant/revoke, and a
+      // rolled-back failed revoke — the grant reappears rather than silently gone)
+      try {
+        setAuthGrants(await api.listAuthGrants());
+      } catch (e) {
+        console.error(e);
+      }
+    },
+    [],
   );
 
   const goToAsk = useCallback(
@@ -2305,13 +2490,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Idle skill-refresh: when skills changed (dirty timestamp) and a session goes
   // busy→idle, flag its engine once so the next send picks up new skills.
-  const prevWorkerTurnRef = useRef<Record<number, string>>({});
+  const prevWorkerTurnRef = useRef<Record<number, TurnState>>({});
   useEffect(() => {
     for (const [sidStr, turn] of Object.entries(workerTurn)) {
       const sid = Number(sidStr);
       const prev = prevWorkerTurnRef.current[sid];
       prevWorkerTurnRef.current[sid] = turn.state;
-      if (prev === "busy" && turn.state === "idle" &&
+      if (isInFlight(prev ?? "stopped") && turn.state === "idle" &&
           skillsDirtyAt > (skillsRefreshedRef.current[sid] ?? 0)) {
         skillsRefreshedRef.current[sid] = Date.now();
         void api.flagSessionSkillRefresh(sid).catch(() => {});
@@ -2319,7 +2504,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, [workerTurn, skillsDirtyAt]);
 
-  const prevLeadTurnRef = useRef<Record<number, string>>({});
+  const prevLeadTurnRef = useRef<Record<number, TurnState>>({});
   useEffect(() => {
     for (const [tidStr, turn] of Object.entries(leadTurn)) {
       const tid = Number(tidStr);
@@ -2328,7 +2513,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // lead engines refreshed in the same per-id ref space, negative-keyed to
       // avoid colliding with worker session ids.
       const key = -tid;
-      if (prev === "busy" && turn.state === "idle" &&
+      if (isInFlight(prev ?? "stopped") && turn.state === "idle" &&
           skillsDirtyAt > (skillsRefreshedRef.current[key] ?? 0)) {
         skillsRefreshedRef.current[key] = Date.now();
         void api.flagLeadSkillRefresh(tid).catch(() => {});
@@ -2395,7 +2580,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // turn, so it'd otherwise leave the Analyze control enabled mid-pass.
   const reanalyzing = activeWorkspaceId != null && reanalyzingWs.has(activeWorkspaceId);
   const analyzing =
-    (curatorTid != null && leadTurn[curatorTid]?.state === "busy") || reanalyzing;
+    (curatorTid != null && isInFlight(leadTurn[curatorTid]?.state ?? "stopped")) ||
+    reanalyzing;
 
   const value: Store = {
     workspaces,
@@ -2455,8 +2641,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     idleCapMins,
     wallCapMins,
     setGuardrails,
+    processQuota,
+    refreshProcessQuota,
     needs,
     asks,
+    authGrants,
+    revokeAuthGrant,
     writeTriggers,
     approveWriteTrigger,
     denyWriteTrigger,

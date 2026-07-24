@@ -7,6 +7,7 @@ import { WorkspaceHome } from "./board/WorkspaceHome";
 import { NeedsYouView } from "./board/NeedsYouView";
 import { WorkerConversation } from "./session/WorkerConversation";
 import { DangerToast } from "./components/DangerToast";
+import { ProcessQuotaBar } from "./components/ProcessQuotaBar";
 import { Toasts } from "./components/Toast";
 import { FileMenu, useCmdAffordance } from "./components/FileMenu";
 import { CommandPalette } from "./components/CommandPalette";
@@ -65,8 +66,11 @@ function Shell() {
     activeThreadId == null
   ) {
     return (
-      <div className="h-screen w-screen overflow-hidden bg-bg text-ink">
-        <SettingsScreen />
+      <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg text-ink">
+        <ProcessQuotaBar inSettings />
+        <div className="min-h-0 flex-1 overflow-hidden [&>section]:h-full">
+          <SettingsScreen />
+        </div>
         <Toasts />
         <CommandPalette />
       </div>
@@ -85,6 +89,7 @@ function Shell() {
       <NavRailGate />
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <AppTopBar />
+        <ProcessQuotaBar />
         {showDock && <NeedsDock />}
         <ErrorBoundary key={routeKey}>
           <div className="flex min-h-0 min-w-0 flex-1 flex-col weft-screen-in">

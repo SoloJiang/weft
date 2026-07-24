@@ -193,23 +193,31 @@ export function AskRow({ item }: { item: NeedItem }) {
         {item.text}
       </p>
 
-      <form
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submit();
-        }}
-        className="flex gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5"
-      >
-        <Input
-          autoFocus
-          placeholder={t("needs.answerPlaceholder", { name: item.direction_name })}
-          value={text}
-          onChange={(event) => setText(event.currentTarget.value)}
-        />
-        <Button type="submit" variant="primary" size="icon" disabled={!text.trim() || busy}>
-          <Send size={14} />
-        </Button>
-      </form>
+      {item.answerable ? (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+          className="flex gap-2 border-t border-border bg-bg/40 px-3.5 py-2.5"
+        >
+          <Input
+            autoFocus
+            placeholder={t("needs.answerPlaceholder", { name: item.direction_name })}
+            value={text}
+            onChange={(event) => setText(event.currentTarget.value)}
+          />
+          <Button type="submit" variant="primary" size="icon" disabled={!text.trim() || busy}>
+            <Send size={14} />
+          </Button>
+        </form>
+      ) : (
+        // Display-only NOTICE (self-clearing stall hint): no answer box — it
+        // retracts itself, and answering is refused backend-side.
+        <p className="border-t border-border bg-bg/40 px-3.5 py-2.5 text-[12px] text-ink-faint">
+          {t("needs.selfClearing")}
+        </p>
+      )}
     </div>
   );
 }

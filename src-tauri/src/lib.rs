@@ -8,6 +8,7 @@
 
 mod adapters;
 pub mod ask;
+mod auth_persist;
 pub mod backup;
 mod brief;
 pub mod bus;
@@ -38,6 +39,7 @@ mod power;
 /// count_instance_processes() + wait 收尸原语。会话子进程 reap / MCP 池化 /
 /// 派生并发上限都挂靠此接口(单一口径 `is_ours`,计数==孤儿判定)。
 pub mod proc_registry;
+mod process_quota;
 pub mod profile;
 mod session_meta;
 mod sidecar;
@@ -110,6 +112,15 @@ pub fn run() {
     // Start the local HTTP server (thread bus MCP + planner MCP + Ask Bridge).
     let bus = bus::BusRegistry::new();
     let asks = ask::AskRegistry::new();
+    // Re-hydrate standing authorization grants (full / always) from the store
+    // BEFORE the bus server serves any ask and BEFORE revive re-drives in-flight
+    // tasks — so a granted "Full access" survives a restart and a revived worker
+    // runs under the access already granted instead of triggering a fresh prompt.
+    {
+        let db = db.clone();
+        let asks = asks.clone();
+        tauri::async_runtime::block_on(async move { auth_persist::seed(&db, &asks).await });
+    }
     let bus_base: String = {
         let bus = bus.clone();
         let db = db.clone();
@@ -147,6 +158,7 @@ pub fn run() {
         .manage(lead_chat::delta_hub::LeadDeltaHub::default())
         .manage(commands::GuardrailState::default())
         .manage(power::PowerGuard::default())
+        .manage(process_quota::ProcessQuotaGovernor::default())
         .manage(bus)
         .manage(asks)
         .manage(BusBase(bus_base))
@@ -171,8 +183,13 @@ pub fn run() {
             let _ = APP_HANDLE.set(app.handle().clone());
             coordinator::run(app.handle().clone(), wake_rx);
             lead_chat::engine::spawn_watchdog(app.handle().clone());
+            // Install the grant-persist consumer BEFORE revive re-drives tasks, so
+            // the persist path is live for the whole run (grants were already
+            // seeded synchronously above, before the builder). Ordering hygiene.
+            auth_persist::spawn(app.handle().clone());
             lead_chat::revive::spawn_revive(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
+            process_quota::spawn_monitor(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
             skills::spawn_periodic(app.handle().clone());
             im::spawn(app.handle().clone());
@@ -234,6 +251,8 @@ pub fn run() {
             commands::pending_asks,
             commands::workspace_needs_counts,
             commands::answer_permission,
+            commands::list_auth_grants,
+            commands::revoke_auth_grant,
             commands::resolve_action_card,
             commands::set_dangerous_mode,
             commands::set_keep_awake,
@@ -242,6 +261,7 @@ pub fn run() {
             commands::db_disable_encryption,
             commands::db_change_password,
             commands::set_guardrails,
+            process_quota::process_quota_status,
             commands::session_for,
             commands::session_meta,
             commands::effective_config,

@@ -1227,6 +1227,22 @@ async fn consume_human_event(
                     .unwrap_or_else(|| ask.from.clone()),
                 Err(_) => ask.from.clone(),
             };
+            // A display-only NOTICE (the self-clearing stall hint) can't be
+            // answered and retracts itself, so it must NOT go through IM's
+            // answer-card pipeline (reply-to-answer, then a resolved/cancelled
+            // patch) — that would show a dead reply prompt and a wrong
+            // "cancelled" patch on recovery. But a remote human still needs to
+            // learn a task froze, so send it as plain TEXT. Crucially, do NOT
+            // record it in CardIndex: a later Answered/Cancelled then finds
+            // nothing to patch (take_human → None), which is exactly right for
+            // a notice that never carries an answer.
+            if !ask.answerable {
+                let notice = format!("{title} · {from}\n{}", ask.text);
+                if let Err(e) = ch.send_text(&owner, &notice).await {
+                    eprintln!("[weft][im] send stall notice: {e}");
+                }
+                return;
+            }
             match ch
                 .send_card(
                     &owner,
@@ -1980,6 +1996,105 @@ mod tests {
             .unwrap();
         assert_eq!(thread.kind, "concierge");
         assert_eq!(thread.lead_tool, expected);
+    }
+
+    #[derive(Default)]
+    struct CountingChannel {
+        cards: std::sync::atomic::AtomicUsize,
+        texts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for CountingChannel {
+        async fn send_card(&self, _o: &str, _c: serde_json::Value) -> anyhow::Result<String> {
+            self.cards.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok("om_card".into())
+        }
+        async fn patch_card(&self, _m: &str, _c: serde_json::Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text(&self, _o: &str, _t: &str) -> anyhow::Result<()> {
+            self.texts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        async fn send_chat_text(&self, _c: &str, _t: &str) -> anyhow::Result<String> {
+            Ok("om_msg".into())
+        }
+        async fn create_chat_topic(
+            &self,
+            _c: &str,
+            _s: &str,
+            _t: &str,
+        ) -> anyhow::Result<String> {
+            Ok("omt".into())
+        }
+        async fn reply_text(&self, _r: &str, _t: &str) -> anyhow::Result<String> {
+            Ok("om_reply".into())
+        }
+    }
+
+    /// An answerable question goes through IM's answer-card pipeline; a
+    /// display-only stall NOTICE reaches the remote human as plain TEXT instead
+    /// (never an answer card, so no dead reply prompt or wrong "cancelled" patch),
+    /// and — verified below — is NOT recorded in CardIndex.
+    #[tokio::test]
+    async fn stall_notice_forwarded_as_text_to_im() {
+        use crate::bus::state::{Ask, HumanAskEvent};
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let w = crate::store::repo::create_workspace(&db, "ws")
+            .await
+            .unwrap();
+        let th = crate::store::repo::create_thread(&db, w.id, "stalled task", "bugfix", "claude")
+            .await
+            .unwrap();
+        // An owner must be bound, else the handler returns before the notice check
+        // and the test would pass for the wrong reason.
+        crate::store::repo::set_setting(&db, K_ALLOW, "owner_open_id")
+            .await
+            .unwrap();
+        let ch = CountingChannel::default();
+        let cards = tokio::sync::Mutex::new(CardIndex::default());
+        let cards_sent = || ch.cards.load(std::sync::atomic::Ordering::Relaxed);
+        let texts_sent = || ch.texts.load(std::sync::atomic::Ordering::Relaxed);
+        let mk = |id: u64, answerable: bool| Ask {
+            id,
+            from: "10".to_string(),
+            text: "x".to_string(),
+            ts: 0,
+            answered: false,
+            answerable,
+        };
+        // An answerable question IS forwarded as an IM answer card.
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: mk(1, true),
+            },
+            &db,
+            &ch,
+            &cards,
+        )
+        .await;
+        assert_eq!(cards_sent(), 1, "answerable → one answer card");
+        assert_eq!(texts_sent(), 0, "answerable → not a plain-text notice");
+        // A non-answerable NOTICE still reaches IM — as plain text, not a card.
+        consume_human_event(
+            HumanAskEvent::Asked {
+                thread: th.id,
+                ask: mk(2, false),
+            },
+            &db,
+            &ch,
+            &cards,
+        )
+        .await;
+        assert_eq!(cards_sent(), 1, "notice must not open an answer card");
+        assert_eq!(texts_sent(), 1, "notice is delivered as plain text");
+        // And it is NOT recorded, so a later Answered/Cancelled patches nothing.
+        assert!(
+            cards.lock().await.take_human(th.id, 2).is_none(),
+            "notice must not be recorded in CardIndex",
+        );
     }
 
     #[derive(Default)]

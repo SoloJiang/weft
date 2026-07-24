@@ -1,6 +1,8 @@
-//! Boot-time recovery: re-attach and continue the worker/lead turns that were
-//! interrupted by a hard app exit (orphaned `running` activity status). Idle work
-//! is left for lazy-attach on open. See the worker-restart-recovery spec.
+//! Boot-time recovery: re-attach and continue work interrupted by a hard app
+//! exit — both orphaned `running` turns (cut off mid-flight) and silently-stalled
+//! tasks (a lead that finished its turn cleanly yet still owns an in-progress task
+//! whose worker drained to idle without delivering). Cleanly-idle work with no
+//! in-progress task is left for lazy-attach on open. See the worker-restart spec.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,7 +16,49 @@ use crate::store::{repo, Db};
 
 const REVIVE_PROMPT: &str =
     "Your previous run was interrupted before it finished. Continue from where you left off.";
+/// Base of the stalled-resume nudge for an idle lead whose in-progress task
+/// stalled after a clean restart (its worker drained to idle without delivering).
+/// Unlike [`REVIVE_PROMPT`] the lead's OWN turn wasn't cut off — so this asks it
+/// to re-examine task state and RESUME DRIVING, not "continue where it left off".
+/// The "keep driving … not just nudged once" framing matters: a single poke would
+/// move the task one step before it stalls again; the lead must re-enter its
+/// normal orchestration loop (worker reports back on the bus → lead dispatches the
+/// next step) and run it to delivery. [`resume_stalled_prompt`] appends the exact
+/// stalled worker bus ids the lead must re-dispatch.
+const RESUME_STALLED_PROMPT: &str = "The app just restarted. One or more of your in-progress tasks has a worker that went idle without finishing — its in-flight instruction was likely lost on restart. Resume driving these tasks the way you normally would: check each one's current state and latest output, then re-dispatch its worker with the next concrete step, and keep driving the normal loop — read the worker's replies on the bus as they arrive and dispatch the next step — until the task is actually delivered, not just nudged once. Don't repeat work that's already done.";
 const MAX_CONCURRENT: usize = 4;
+
+/// Names the exact worker bus ids (= direction ids) that went idle without
+/// delivering, so the lead can address them: without these it has no worker
+/// message to read a `from` id off (the stall means the worker never posted).
+/// Appended to BOTH the idle-stall prompt and the interrupted-lead prompt — an
+/// interrupted lead may be a stall-resume turn that was itself cut off, so the
+/// ids must survive that crash rather than only riding the idle-only path.
+fn stalled_ids_clause(stalled_dirs: &[i32]) -> String {
+    let ids = stalled_dirs
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" The workers that went idle are on the thread bus under these ids: {ids}. bus_post each id directly (a direct bus_post reaches an idle worker) to re-dispatch it.")
+}
+
+/// The idle-stall resume nudge: [`RESUME_STALLED_PROMPT`] + the stalled ids.
+fn resume_stalled_prompt(stalled_dirs: &[i32]) -> String {
+    format!("{RESUME_STALLED_PROMPT}{}", stalled_ids_clause(stalled_dirs))
+}
+
+/// The interrupted-lead nudge: the generic continue prompt, PLUS the stalled ids
+/// when this interrupted lead also owns undelivered stalled tasks (e.g. its cut-off
+/// turn was itself a stall-resume). Empty stalled set → unchanged `REVIVE_PROMPT`,
+/// so a normal interrupted lead is a pure regression.
+fn lead_revive_prompt(stalled_dirs: &[i32]) -> String {
+    if stalled_dirs.is_empty() {
+        REVIVE_PROMPT.to_string()
+    } else {
+        format!("{REVIVE_PROMPT}{}", stalled_ids_clause(stalled_dirs))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkerTarget {
@@ -74,6 +118,69 @@ async fn collect_targets(
     Ok((leads, workers))
 }
 
+/// Silent-stall selection: threads whose lead finished its own turn cleanly
+/// (idle, so NOT caught by the `running`-only [`collect_targets`]) yet still own
+/// an in-progress task whose worker has gone idle without delivering. Nothing is
+/// driving such a thread forward, so on boot we re-drive its lead to re-dispatch.
+/// Returns `(thread_id, stalled direction ids)` per stalled thread — the ids are
+/// carried into the resume prompt so the lead can address the idle workers
+/// directly (it has no worker bus message to read a `from` id off). Pure over DB
+/// → unit-testable. Not filtered by a live-set: a resident-but-idle lead (e.g.
+/// the frontend opened it for slash discovery) still needs the prompt — idempotency
+/// is handled at drive time by [`nudge_eng_if_idle`]'s busy check, not by exclusion.
+///
+/// Authorization guard ("don't restart a task waiting on a human"): a BLOCKING
+/// permission ask holds the tool call open, keeping the turn busy → persisted
+/// "running", so the idle predicate excludes it by construction (the interrupted
+/// path owns it). A NON-blocking `ask_human` that already ended its turn idle IS
+/// re-driven — intended, not a leak: that question lived only in the in-memory
+/// AskRegistry (cleared on restart), so re-driving the lead re-surfaces it
+/// instead of stalling forever on an answer that can no longer arrive.
+async fn collect_stalled_leads(db: &Db) -> anyhow::Result<Vec<(i32, Vec<i32>)>> {
+    let mut stalled = Vec::new();
+    for ws in repo::list_workspaces(db).await? {
+        for th in repo::list_threads(db, ws.id).await? {
+            // The lead must have orchestration context to resume from (a native
+            // id) and be legitimately idle — NOT "running" (an interrupted turn,
+            // already handled by collect_targets) and NOT "stopped" (taken over
+            // in the user's terminal).
+            if repo::lead_native_id(db, th.id).await?.is_none() {
+                continue;
+            }
+            if repo::lead_status(db, th.id).await?.as_deref() != Some("idle") {
+                continue;
+            }
+            let dirs = stalled_direction_ids(db, th.id).await?;
+            if !dirs.is_empty() {
+                stalled.push((th.id, dirs));
+            }
+        }
+    }
+    Ok(stalled)
+}
+
+/// The in-progress ("planning"/"working") directions of a thread whose latest
+/// session finished its turn cleanly — a captured native id and status=="idle" —
+/// yet the task never reached "review"/"done". "queued" (never started) and
+/// "review" (awaiting the human) are legitimate rest states, not stalls; a
+/// "running" session is an interrupted turn (collect_targets owns it) and
+/// "stopped" is a worker taken over in the user's terminal.
+async fn stalled_direction_ids(db: &Db, thread_id: i32) -> anyhow::Result<Vec<i32>> {
+    let mut ids = Vec::new();
+    for dir in repo::list_directions(db, thread_id).await? {
+        if dir.status != "planning" && dir.status != "working" {
+            continue;
+        }
+        let Some(sess) = repo::latest_session_for_direction(db, dir.id).await? else {
+            continue;
+        };
+        if sess.native_session_id.is_some() && sess.status == "idle" {
+            ids.push(dir.id);
+        }
+    }
+    Ok(ids)
+}
+
 async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
     let Some(db) = app.try_state::<Db>() else {
         return Ok(());
@@ -84,13 +191,23 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
         st.0.iter().map(|r| *r.key()).collect()
     };
     let (leads, workers) = collect_targets(&db, &live).await?;
-    if leads.is_empty() && workers.is_empty() {
+    // The silent-stall scan is a best-effort ENHANCEMENT — it must never gate the
+    // primary interrupted-turn revive below. A transient failure here (e.g. a WAL
+    // BUSY under the boot storm of concurrent services) degrades to "no stall
+    // recovery this boot" + a log, rather than propagating and skipping the
+    // running-revive dispatch entirely.
+    let stalled = collect_stalled_leads(&db).await.unwrap_or_else(|e| {
+        eprintln!("[weft][revive] stalled scan failed: {e}");
+        Vec::new()
+    });
+    if leads.is_empty() && workers.is_empty() && stalled.is_empty() {
         return Ok(());
     }
     eprintln!(
-        "[weft][revive] reviving {} worker(s), {} lead(s)",
+        "[weft][revive] reviving {} worker(s), {} lead(s), {} stalled thread(s)",
         workers.len(),
-        leads.len()
+        leads.len(),
+        stalled.len(),
     );
     let revived_workers = workers.len();
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
@@ -107,6 +224,18 @@ async fn sweep(app: &AppHandle) -> anyhow::Result<()> {
         handles.push(tauri::async_runtime::spawn(async move {
             let _permit = sem.acquire().await;
             revive_worker(&app, w).await;
+        }));
+    }
+    // Silent-stall recovery: idle leads whose in-progress task's worker drained to
+    // idle without delivering. Re-drive the lead (get-or-create engine → resume →
+    // nudge with the stalled worker ids) exactly like the interrupted paths, so a
+    // failure surfaces in Needs-you instead of silently staying stalled. Shares the
+    // spawn budget; disjoint from the running-turn revive by status (idle vs running).
+    for (tid, dirs) in stalled {
+        let (app, sem) = (app.clone(), sem.clone());
+        handles.push(tauri::async_runtime::spawn(async move {
+            let _permit = sem.acquire().await;
+            revive_stalled_lead(&app, tid, dirs).await;
         }));
     }
     for h in handles {
@@ -144,7 +273,7 @@ async fn try_revive_worker(app: &AppHandle, db: &Db, w: WorkerTarget) -> anyhow:
     if has_open_ask(app, &w.direction_id.to_string(), w.thread_id) {
         return Ok(());
     }
-    nudge_if_idle(app, db, w.session_id as i64).await?;
+    nudge_if_idle(app, db, w.session_id as i64, REVIVE_PROMPT).await?;
     Ok(())
 }
 
@@ -168,7 +297,19 @@ async fn try_revive_lead(app: &AppHandle, db: &Db, thread_id: i32) -> anyhow::Re
     if has_open_ask(app, "lead", thread_id) {
         return Ok(());
     }
-    nudge_eng_if_idle(app, db, &eng).await?;
+    // An interrupted lead that ALSO owns stalled tasks — its cut-off turn may have
+    // BEEN a stall-resume, and the idle-only stall scan skips a lead persisted
+    // "running" — must carry the worker ids too, delivered on the SAME reliable
+    // terms as the idle stall path: QUEUE if transiently busy (don't drop the ids)
+    // and stay retryable on failure. A normal interrupted lead (no stalled tasks)
+    // keeps the exact previous behavior: plain REVIVE_PROMPT, skip-if-busy,
+    // stop-on-fail — a pure regression.
+    let stalled_dirs = stalled_direction_ids(db, thread_id).await?;
+    if stalled_dirs.is_empty() {
+        nudge_eng_if_idle(app, db, &eng, REVIVE_PROMPT).await?;
+    } else {
+        deliver_stalled_resume(app, db, &eng, &lead_revive_prompt(&stalled_dirs)).await?;
+    }
     Ok(())
 }
 
@@ -188,28 +329,71 @@ fn has_open_ask(app: &AppHandle, dir: &str, thread_id: i32) -> bool {
         .unwrap_or(false)
 }
 
-async fn nudge_if_idle(app: &AppHandle, db: &Db, key: i64) -> anyhow::Result<()> {
+async fn nudge_if_idle(app: &AppHandle, db: &Db, key: i64, prompt: &str) -> anyhow::Result<()> {
     if let Some(eng) = app.state::<LeadChatState>().get(key) {
-        nudge_eng_if_idle(app, db, &eng).await?;
+        nudge_eng_if_idle(app, db, &eng, prompt).await?;
     }
     Ok(())
 }
 
-async fn nudge_eng_if_idle(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
-    let busy = { eng.lock().await.turn.busy };
-    if !busy {
-        // Propagate failure (e.g. the CLI/app-server can't start at boot) so the
-        // caller's report_failure surfaces it in Needs-you instead of marking the
-        // session silently revived while its interrupted work stays stuck. nudge can
-        // fail AFTER already marking the turn busy + running (a per-turn CLI that
-        // fails to spawn), so reset the engine to idle first — otherwise later user
-        // sends queue behind a turn that never emits TurnEnd.
-        if let Err(e) = engine::nudge(app, db, eng, REVIVE_PROMPT).await {
-            engine::stop(app, eng).await;
-            return Err(e);
-        }
+/// Deliver `prompt`, resetting the engine to idle on failure. nudge can fail
+/// AFTER marking the turn busy + running (a per-turn CLI that fails to spawn), so
+/// resetting first stops later user sends queuing behind a turn that never emits
+/// TurnEnd; propagating the error lets the caller's report_failure surface it in
+/// Needs-you instead of a silent "revived". A busy engine QUEUES the prompt
+/// (single-writer: it runs AFTER the current turn, never in parallel) — never a
+/// second concurrent turn, so this cannot double-drive.
+async fn nudge_or_reset(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    if let Err(e) = engine::nudge(app, db, eng, prompt).await {
+        engine::stop(app, eng).await;
+        return Err(e);
     }
     Ok(())
+}
+
+/// Running-revive nudge: deliver ONLY when the (freshly-resumed) engine is idle.
+/// A racing concurrent send that already made it busy is driving it — don't queue
+/// a redundant "continue where you left off" behind that. The stall paths instead
+/// use [`deliver_stalled_resume`]: their prompt carries the re-dispatch ids and
+/// must QUEUE (not drop) if the lead is transiently busy, and stay retryable.
+async fn nudge_eng_if_idle(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    let busy = { eng.lock().await.turn.busy };
+    if !busy {
+        nudge_or_reset(app, db, eng, prompt).await?;
+    }
+    Ok(())
+}
+
+/// Deliver a stalled-resume prompt (it names the worker ids the lead must
+/// re-dispatch). Differs from [`nudge_eng_if_idle`] on two axes that both matter
+/// for stall recovery:
+/// - QUEUES rather than skips when the lead is transiently busy (a frontend/IM
+///   send racing the sweep). `engine::nudge` → `hidden_delivery(busy) → Queue`
+///   runs the resume after the current turn (single-writer, never parallel), so
+///   the ids are delivered, not dropped until another restart.
+/// - Does NOT `engine::stop` on failure. `engine::nudge` already rolls a failed
+///   hidden turn back to idle (`rollback_failed_turn`), so a `stop` here would only
+///   ADD a `STATUS_STOPPED` persist — which excludes the thread from every future
+///   revive scan (`collect_stalled_leads` is idle-only), turning a TRANSIENT boot
+///   failure (CLI briefly missing) into a permanent stall. Staying idle keeps the
+///   next boot retryable; the caller's `report_failure` still surfaces the failure.
+async fn deliver_stalled_resume(
+    app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    engine::nudge(app, db, eng, prompt).await
 }
 
 fn report_failure(app: &AppHandle, thread_id: i32, dir: &str, e: &anyhow::Error) {
@@ -217,6 +401,41 @@ fn report_failure(app: &AppHandle, thread_id: i32, dir: &str, e: &anyhow::Error)
         bus.ask_human(thread_id, dir, &format!("未能恢复：{e}"));
     }
     eprintln!("[weft][revive] {dir}@{thread_id} failed: {e}");
+}
+
+async fn revive_stalled_lead(app: &AppHandle, thread_id: i32, stalled_dirs: Vec<i32>) {
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    let db = Db(db.0.clone(), db.1);
+    if let Err(e) = try_revive_stalled_lead(app, &db, thread_id, &stalled_dirs).await {
+        report_failure(app, thread_id, "lead", &e);
+    }
+}
+
+/// Re-drive an idle lead whose task stalled: get-or-create its engine, resume the
+/// native session, and nudge it with the stalled worker ids so it re-dispatches.
+/// Structurally a sibling of [`try_revive_lead`] — the difference is the trigger
+/// (a cleanly-idle lead with an undelivered in-progress task, not an interrupted
+/// turn) and the prompt. No `mark_incomplete`/`fail_queued`: a cleanly-idle lead
+/// has no half-streamed row and no orphaned queue (idle ⟺ empty queue). Failures
+/// (missing CLI, read-only workspace, native resume fails) propagate so the
+/// caller's `report_failure` surfaces them in Needs-you rather than leaving the
+/// task silently stalled. `lead_engine` get-or-create also covers a resident-but-
+/// idle lead (opened by the frontend for slash discovery) — never excluded.
+async fn try_revive_stalled_lead(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    stalled_dirs: &[i32],
+) -> anyhow::Result<()> {
+    let eng = lead_engine(app, db, thread_id, "en").await?;
+    engine::ensure_running(app, db, &eng).await?;
+    if has_open_ask(app, "lead", thread_id) {
+        return Ok(());
+    }
+    deliver_stalled_resume(app, db, &eng, &resume_stalled_prompt(stalled_dirs)).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -420,6 +639,244 @@ mod tests {
         live.insert(lead_key(th));
         let (leads, _) = collect_targets(&db, &live).await.unwrap();
         assert!(leads.is_empty());
+    }
+
+    // ---- Silent-stall selection (collect_stalled_leads) ----
+
+    /// A direction whose worker drained cleanly to idle: an in-progress ("working"
+    /// / "planning") task with a latest session that has a native id and
+    /// status=="idle". This is the shape the running-only collect_targets misses.
+    async fn stalled_direction(db: &Db, thread_id: i32, repo_id: i32, status: &str) -> i32 {
+        let dir = mk_direction(db, thread_id, repo_id, "alpha").await;
+        repo::set_direction_status(db, dir, status).await.unwrap();
+        let sess = running_session(db, dir, repo_id).await; // native id + running
+        repo::set_session_status(db, sess, "idle").await.unwrap(); // drained to idle
+        dir
+    }
+
+    /// An idle lead with orchestration context (native id) that finished its turn.
+    async fn idle_lead(db: &Db, thread_id: i32) {
+        repo::set_lead_native_id(db, thread_id, "lead-nat")
+            .await
+            .unwrap();
+        repo::set_lead_status(db, thread_id, "idle").await.unwrap();
+    }
+
+    /// THE silent-stall shape: an idle lead whose in-progress task has a worker
+    /// that drained to idle without delivering. Nothing drives it → select the
+    /// lead's thread to wake. Proves selection spans the all-idle shape that the
+    /// running-only path misses.
+    #[tokio::test]
+    async fn selects_stalled_lead_with_idle_worker_on_working_direction() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        // Thread + its stalled worker id, so the resume prompt can address it.
+        assert_eq!(stalled, vec![(th, vec![dir])]);
+    }
+
+    /// "planning" is equally in-progress — the stall path spans both live states.
+    #[tokio::test]
+    async fn selects_stalled_lead_on_planning_direction() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "planning").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert_eq!(stalled, vec![(th, vec![dir])]);
+    }
+
+    /// Two stalled directions under one thread wake the lead EXACTLY once — the
+    /// per-thread (not per-direction) idempotency the plan requires, so a
+    /// multi-task thread can't post duplicate resume wakes.
+    #[tokio::test]
+    async fn selects_stalled_lead_once_for_multiple_stalled_directions() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let mut want: Vec<i32> = Vec::new();
+        for (name, status) in [("alpha", "working"), ("beta", "planning")] {
+            let dir = mk_direction(&db, th, repo_id, name).await;
+            repo::set_direction_status(&db, dir, status).await.unwrap();
+            let sess = running_session(&db, dir, repo_id).await;
+            repo::set_session_status(&db, sess, "idle").await.unwrap();
+            want.push(dir);
+        }
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        // ONE thread entry despite two stalled directions, carrying BOTH worker ids.
+        assert_eq!(stalled.len(), 1);
+        assert_eq!(stalled[0].0, th);
+        let mut got = stalled[0].1.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// A "running" lead is an interrupted turn owned by collect_targets; the stall
+    /// path must not double-drive it.
+    #[tokio::test]
+    async fn excludes_stalled_when_lead_running() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        repo::set_lead_native_id(&db, th, "lead-nat").await.unwrap();
+        repo::set_lead_status(&db, th, "running").await.unwrap();
+        stalled_direction(&db, th, repo_id, "working").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// A "stopped" lead was taken over in the user's terminal — never wake a
+    /// competing headless process for it.
+    #[tokio::test]
+    async fn excludes_stalled_when_lead_stopped() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        repo::set_lead_native_id(&db, th, "lead-nat").await.unwrap();
+        repo::set_lead_status(&db, th, "stopped").await.unwrap();
+        stalled_direction(&db, th, repo_id, "working").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// A lead with no native id has no orchestration context to resume from.
+    #[tokio::test]
+    async fn excludes_stalled_lead_without_native_id() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        repo::set_lead_status(&db, th, "idle").await.unwrap(); // idle, but no native id
+        stalled_direction(&db, th, repo_id, "working").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// A "done" task is delivered — not a stall.
+    #[tokio::test]
+    async fn excludes_stalled_when_direction_done() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        stalled_direction(&db, th, repo_id, "done").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// A "queued" task never started — nothing has stalled.
+    #[tokio::test]
+    async fn excludes_stalled_when_direction_queued() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        stalled_direction(&db, th, repo_id, "queued").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// A "review" task is legitimately awaiting the human — not a stall to drive.
+    #[tokio::test]
+    async fn excludes_stalled_when_direction_review() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        stalled_direction(&db, th, repo_id, "review").await;
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// A "running" worker session is an interrupted turn (collect_targets owns
+    /// it), not a silent stall — the stall shape is a worker DRAINED to idle.
+    #[tokio::test]
+    async fn excludes_stalled_when_worker_running() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = mk_direction(&db, th, repo_id, "alpha").await;
+        repo::set_direction_status(&db, dir, "working").await.unwrap();
+        running_session(&db, dir, repo_id).await; // native id + RUNNING (not drained)
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// A "stopped" worker session was taken over in the user's terminal.
+    #[tokio::test]
+    async fn excludes_stalled_when_worker_stopped() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = mk_direction(&db, th, repo_id, "alpha").await;
+        repo::set_direction_status(&db, dir, "working").await.unwrap();
+        let sess = running_session(&db, dir, repo_id).await;
+        repo::set_session_status(&db, sess, "stopped").await.unwrap();
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// An idle worker session that never captured a native id can't be resumed.
+    #[tokio::test]
+    async fn excludes_stalled_when_worker_without_native_id() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = mk_direction(&db, th, repo_id, "alpha").await;
+        repo::set_direction_status(&db, dir, "working").await.unwrap();
+        let s = repo::create_session(&db, dir, repo_id, "codex", "/tmp/wt")
+            .await
+            .unwrap();
+        repo::set_session_status(&db, s.id, "idle").await.unwrap(); // idle, no native id
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// An in-progress task with no session at all hasn't reached a worker → not
+    /// the "worker drained to idle" stall this path recovers.
+    #[tokio::test]
+    async fn excludes_stalled_when_no_session() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = mk_direction(&db, th, repo_id, "alpha").await;
+        repo::set_direction_status(&db, dir, "working").await.unwrap();
+
+        let stalled = collect_stalled_leads(&db).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// The resume prompt names the exact stalled worker bus ids so the lead can
+    /// bus_post each idle worker directly (the stall means no worker message it
+    /// could read a `from` id off), and keeps the "not just nudged once" framing.
+    #[test]
+    fn resume_stalled_prompt_names_the_stalled_worker_ids() {
+        let p = resume_stalled_prompt(&[5, 7]);
+        assert!(p.contains("restarted"));
+        assert!(p.contains("5, 7"));
+        assert!(p.contains("bus_post"));
+        assert!(p.contains("not just nudged once"));
+    }
+
+    /// The interrupted-lead prompt is the plain continue prompt for a normal
+    /// interrupted lead, but folds in the stalled worker ids when the lead still
+    /// owns them — so a crash during a stall-resume turn (which lands on the
+    /// interrupted path next boot) doesn't strand those workers without their ids.
+    #[test]
+    fn lead_revive_prompt_folds_in_stalled_ids_only_when_present() {
+        assert_eq!(lead_revive_prompt(&[]), REVIVE_PROMPT); // regression: unchanged
+        let p = lead_revive_prompt(&[5, 7]);
+        assert!(p.starts_with(REVIVE_PROMPT));
+        assert!(p.contains("5, 7"));
+        assert!(p.contains("bus_post"));
     }
 
     /// Leftover queued user messages must surface as "error" (un-sent, resendable)

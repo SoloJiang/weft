@@ -75,6 +75,7 @@ export const en = {
     threadsCount: "{{count}} issues",
     noScope: "no scope yet",
     live: "{{count}} live",
+    stalled: "{{count}} stalled",
     failing: "{{count}} failing",
     writtenByAnother: "Written by another issue too",
     emptyTitleHas: "No issues yet",
@@ -278,6 +279,19 @@ export const en = {
     reviewBody_one: "{{count}} task reached review",
     reviewBody_other: "{{count}} tasks reached review",
   },
+  processQuota: {
+    warningTitle: "Process capacity is running low",
+    warningBody: "New work can still start. It pauses automatically at {{degraded}}%.",
+    degradedTitle: "New sessions and turns are paused",
+    degradedBody: "Running work continues. New work resumes automatically at {{recovery}}%.",
+    usage: "{{count}} / {{limit}} · {{percent}}%",
+    countOnly: "{{count}} processes",
+    openDetails: "View details",
+    warningToast: "Weft is approaching the system process limit.",
+    degradedToast: "New sessions and turns are paused until process capacity recovers.",
+    recoveredToast: "Process capacity recovered. New sessions and turns can start again.",
+    blockedToast: "Process capacity is still constrained. Your message was kept; try again after recovery.",
+  },
   needs: {
     title: "Needs you",
     subtitle: "approvals and questions only you can answer",
@@ -295,6 +309,7 @@ export const en = {
     emptyBody:
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",
     answerPlaceholder: "Answer {{name}}…",
+    selfClearing: "No reply needed — clears itself when the task resumes.",
     openDirection: "Open this task",
     wantsToWrite: "wants to modify",
     approveRun: "Approve & run",
@@ -800,8 +815,21 @@ export const en = {
   },
   status: {
     running: "Running",
+    stalled: "Stalled",
     idle: "Idle",
     exited: "Exited",
+  },
+  grants: {
+    inherited: "Inherited access",
+    inheritedTitle:
+      "This issue's Full access carried over from a previous run — click to revoke",
+    revokeTitle: "Revoke inherited access?",
+    revokeBody:
+      "The persisted Full access for this issue's tasks will be cleared. The next tool that needs permission will ask you again.",
+    revokeConfirm: "Revoke access",
+    revokeFailed: "Couldn't revoke access — it's still active. Please try again.",
+    grantNotSaved:
+      "Access granted for now, but couldn't be saved — you may be asked again after a restart.",
   },
   ai: {
     shellSnippet: "Shell snippet",

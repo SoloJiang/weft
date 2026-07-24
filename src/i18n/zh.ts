@@ -74,6 +74,7 @@ export const zh = {
     threadsCount: "{{count}} 个 issue",
     noScope: "尚未划定范围",
     live: "{{count}} 个运行中",
+    stalled: "{{count}} 个停滞",
     failing: "{{count}} 个失败",
     writtenByAnother: "其他 issue 也在写这个仓库",
     emptyTitleHas: "还没有 issue",
@@ -270,6 +271,19 @@ export const zh = {
     reviewTitle: "可以 review 了",
     reviewBody_other: "{{count}} 个任务进入 review",
   },
+  processQuota: {
+    warningTitle: "进程额度接近上限",
+    warningBody: "当前仍可启动新工作；达到 {{degraded}}% 后会自动暂停。",
+    degradedTitle: "已暂停新会话和新回合",
+    degradedBody: "正在运行的任务继续；回落到 {{recovery}}% 后自动恢复。",
+    usage: "{{count}} / {{limit}} · {{percent}}%",
+    countOnly: "{{count}} 个进程",
+    openDetails: "查看详情",
+    warningToast: "Weft 使用的进程额度即将达到系统上限。",
+    degradedToast: "进程额度不足，已暂停新会话和新回合。",
+    recoveredToast: "进程额度已恢复，新会话和新回合可以继续。",
+    blockedToast: "进程额度仍处于降级状态。消息已保留，请在恢复后重试。",
+  },
   needs: {
     title: "待你处理",
     subtitle: "只有你能回答的审批与提问",
@@ -287,6 +301,7 @@ export const zh = {
     emptyBody:
       "当 agent 遇到只有你能拍板的决定时，会在这里发问。你回答一次，答复会直接回到它的收件箱，你无需去翻找会话。",
     answerPlaceholder: "回复 {{name}}…",
+    selfClearing: "无需回复 —— 任务恢复输出后自动消失。",
     openDirection: "打开这个任务",
     wantsToWrite: "想修改",
     approveRun: "批准并运行",
@@ -777,8 +792,19 @@ export const zh = {
   },
   status: {
     running: "运行中",
+    stalled: "停滞",
     idle: "空闲",
     exited: "已退出",
+  },
+  grants: {
+    inherited: "已继承授权",
+    inheritedTitle: "这个 issue 的完全访问授权从上次运行保留了下来——点击撤销",
+    revokeTitle: "撤销继承的授权？",
+    revokeBody:
+      "该 issue 下各任务保留的完全访问授权会被清除。下次有工具需要权限时会重新问你。",
+    revokeConfirm: "撤销授权",
+    revokeFailed: "撤销失败——该授权仍然有效，请重试。",
+    grantNotSaved: "已临时授权，但未能保存——重启后可能会再次询问。",
   },
   ai: {
     shellSnippet: "Shell 片段",

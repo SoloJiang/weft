@@ -8,6 +8,7 @@ import type {
   Direction,
   EnabledSkill,
   FileTree,
+  GrantSnapshot,
   ImageAttachment,
   ImRoute,
   LeadMessage,
@@ -17,6 +18,7 @@ import type {
   ObserveRef,
   ParsedSkill,
   PermissionAsk,
+  ProcessQuotaStatus,
   Proposal,
   RepoChecks,
   RepoGraph,
@@ -246,6 +248,13 @@ export const api = {
     invoke<[number, number][]>("workspace_needs_counts"),
   answerPermission: (askId: number, answer: "allow" | "deny" | "always" | "full") =>
     invoke<void>("answer_permission", { askId, answer }),
+  // Standing authorization grants (full / always) that persist across restarts —
+  // the board's "inherited access" markers.
+  listAuthGrants: () => invoke<GrantSnapshot>("list_auth_grants"),
+  // Revoke a standing grant. dir=null clears the whole issue's grants (one-click
+  // "revoke all"); dir set + summary=null clears one task; both set drops one rule.
+  revokeAuthGrant: (thread: number, dir: string | null, summary: string | null) =>
+    invoke<void>("revoke_auth_grant", { thread, dir, summary }),
 
   // Needs-you: open agent→human questions, aggregated across the workspace.
   needsYou: (workspaceId: number) =>
@@ -296,6 +305,7 @@ export const api = {
   // force-stopping a stuck/runaway agent (enforcement pending on the engine).
   setGuardrails: (idleSecs: number, wallSecs: number) =>
     invoke<void>("set_guardrails", { idleSecs, wallSecs }),
+  processQuotaStatus: () => invoke<ProcessQuotaStatus>("process_quota_status"),
   // Effective config (skills + rules) for a repo, tagged by layer + override.
   effectiveConfig: (repoPath: string, wsId?: number) =>
     invoke<ConfigItem[]>("effective_config", { repoPath, wsId }),
