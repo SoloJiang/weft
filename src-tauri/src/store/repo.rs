@@ -663,12 +663,18 @@ pub async fn update_plan_proposal_cas(
     Ok(res.rows_affected > 0)
 }
 
-/// Mark a thread's plan "confirmed" ONLY if its proposal AND status are still what `confirm`
+/// Mark a thread's plan "confirmed" ONLY if its proposal AND status are still what the caller
 /// read at the start — i.e. no re-propose and no concurrent confirm landed in between. Unlike
 /// `update_plan_proposal_cas` (which pins expected==new status), this flips a NON-confirmed
 /// status to "confirmed", so it takes a SEPARATE `expected_status`. Returns true when applied,
 /// false when the proposal OR status drifted (or the plan is gone). Leaves proposal +
 /// created_at untouched.
+///
+/// Called by `planner::auto_settle_if_fully_decided` (issue #104) to close a proposal that got
+/// resolved entirely lane-by-lane (approve_direction / deny_direction) without an explicit batch
+/// `confirm()`, so its card doesn't linger "proposed" forever waiting on a confirm click that
+/// would create nothing new. (`confirm` itself uses the sibling `commit_confirmed_plan_cas`,
+/// which also rewrites the proposal in the same atomic update.)
 pub async fn mark_plan_confirmed_cas(
     db: &Db,
     thread_id: i32,

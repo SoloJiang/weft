@@ -903,6 +903,35 @@ async fn rollback_attempt(db: &Db, created_now: &[i32], recreated_reused: &[i32]
     }
 }
 
+/// True once every lane in the proposal carries a human decision (approved or denied) —
+/// i.e. nothing is left for `pending_writes` to surface. An empty-directions proposal is
+/// NOT "fully decided" (that's `withdraw_proposal`'s domain, a distinct terminal state).
+fn fully_decided(p: &Proposal) -> bool {
+    !p.directions.is_empty() && p.directions.iter().all(|d| !d.decision.is_empty())
+}
+
+/// Close the loop when the LAST lane of a proposal is decided one-by-one (via
+/// `approve_direction` / `deny_direction`) instead of the batch `confirm()` button.
+/// Without this, a proposal fully resolved lane-by-lane (e.g. entirely from the Needs-you
+/// write-trigger cards) never leaves status "proposed" — `confirm()` is the only thing that
+/// writes "confirmed" — so the chat's proposal card / ScopeReview stays open forever,
+/// baiting a redundant "confirm" click that would create nothing new (issue #104,
+/// confirmation-chain compression: plan approve → per-lane approve → batch confirm is the
+/// same decision and should not cost a 3rd click once every lane already has one).
+///
+/// Best-effort: `proposal` is the exact value the caller just persisted (same json, same
+/// thread_gate hold), so this CAS is expected to always apply in production — kept
+/// defensive (like `confirm`'s final commit) rather than propagated as an error, because the
+/// caller's OWN action (the approve/deny that got us here) already succeeded regardless.
+async fn auto_settle_if_fully_decided(db: &Db, thread_id: i32, proposal: &Proposal) {
+    if !fully_decided(proposal) {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(proposal) {
+        let _ = repo::mark_plan_confirmed_cas(db, thread_id, &json, "proposed").await;
+    }
+}
+
 /// Approve one proposed direction (by index): mark it approved in the stored
 /// proposal, create the real direction bound to its repo + reason using the
 /// human-selected `tool`, and materialize its worktree. Returns the new
@@ -1100,6 +1129,7 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
             }
             return Err(err);
         }
+        auto_settle_if_fully_decided(db, thread_id, &proposal).await;
         return Ok(id);
     }
     let dir = repo::create_direction(
@@ -1135,6 +1165,7 @@ pub async fn approve_direction(db: &Db, thread_id: i32, index: usize, tool: &str
         let _ = materialize::rollback_direction(db, dir.id).await;
         return Err(err);
     }
+    auto_settle_if_fully_decided(db, thread_id, &proposal).await;
     Ok(dir.id)
 }
 
@@ -1156,6 +1187,7 @@ pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(St
     pd.decision = "denied".to_string();
     let info = (pd.name.clone(), pd.repo.clone());
     persist_decision(db, thread_id, &proposal, &plan).await?;
+    auto_settle_if_fully_decided(db, thread_id, &proposal).await;
     Ok(info)
 }
 
@@ -1651,6 +1683,153 @@ mod tests {
         let p = repo::get_plan(&db, t.id).await.unwrap().unwrap();
         let stored: Proposal = serde_json::from_str(&p.proposal).unwrap();
         assert_eq!(stored.directions[1].decision, "denied");
+        // Both lanes now carry a decision (index 0 approved above, index 1 just denied) —
+        // #104 auto-settle flips the plan to "confirmed" so its card doesn't linger
+        // "proposed" forever waiting on a redundant batch-confirm click.
+        assert_eq!(
+            p.status, "confirmed",
+            "deciding the LAST pending lane auto-settles the plan"
+        );
+
+        // Cleanup.
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    // ---- DB-backed: #104 auto-settle (approve/deny every lane closes the proposal) ----
+
+    #[tokio::test]
+    async fn auto_settle_waits_for_every_lane_then_confirms() {
+        let _env = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-planner-autosettle-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![
+                ProposedDirection {
+                    name: "A".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                },
+                ProposedDirection {
+                    name: "B".into(),
+                    repo: "api".into(),
+                    reason: "r".into(),
+                    mandate: "".into(),
+                    base_branch: "".into(),
+                    decision: "".into(),
+                    direction_id: 0,
+                },
+            ],
+        };
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+
+        // Approve ONLY lane 0 — lane 1 is still pending, so the plan must NOT auto-settle
+        // yet (a partial decision is not "nothing left to review").
+        approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        let mid = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(
+            mid.status, "proposed",
+            "one pending lane left => plan stays open for review"
+        );
+        assert_eq!(pending_writes(&db, t.id).await.unwrap().len(), 1);
+
+        // Deny the LAST pending lane -> every lane now has a decision -> auto-settle
+        // flips the plan straight to "confirmed" (mirrors what a batch confirm() would
+        // have done, without requiring that separate click).
+        deny_direction(&db, t.id, 1).await.unwrap();
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "confirmed");
+        assert!(
+            pending_writes(&db, t.id).await.unwrap().is_empty(),
+            "no Needs-you card survives full resolution"
+        );
+
+        // A stray extra confirm() (e.g. a stale click that raced the auto-settle) is a
+        // harmless no-op: the "confirmed" fast-path skips both decided lanes and
+        // dispatches nothing new.
+        let ids = confirm(&db, t.id).await.unwrap();
+        assert!(ids.is_empty(), "nothing left to dispatch");
+        let still = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(still.status, "confirmed");
+
+        // Cleanup.
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn auto_settle_via_approve_alone_when_it_is_the_last_lane() {
+        let _env = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-planner-autosettle-solo-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let repo_path = make_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(&db, ws.id, "api", repo_path.to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+
+        // A single-lane proposal (the common single-repo issue): approving its only
+        // direction decides EVERY lane in one shot, so the plan settles immediately —
+        // the chat's proposal card / ScopeReview never needs a follow-up confirm.
+        let proposal = Proposal {
+            rationale: "r".into(),
+            directions: vec![ProposedDirection {
+                name: "Solo".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        save_proposal(&db, t.id, &proposal).await.unwrap();
+
+        approve_direction(&db, t.id, 0, "codex").await.unwrap();
+        let after = repo::get_plan(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status, "confirmed",
+            "the only lane getting approved settles the whole plan"
+        );
 
         // Cleanup.
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();

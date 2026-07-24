@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, GitBranch, Sparkles, X } from "lucide-react";
+import { AlertTriangle, Check, GitBranch, Sparkles, X } from "lucide-react";
 import { useStore } from "../state/store";
 import type { ResolvedDirection } from "../lib/types";
 import { Button } from "../components/ui/Button";
+import { PlanSummary } from "../session/blocks/PlanSummary";
+import { latestPlanCard, type ParsedPlanCard } from "../session/planCard";
 
 // One sub-task lane: exactly one write repo per direction (scope rework). The
 // old read/write/none taxonomy is gone from this gate — every lane here is a
@@ -30,8 +32,23 @@ function defaultBranchLabel(baseRef: string): string {
   return b;
 }
 
+/** Whether confirming here must ALSO approve a still-open plan_card first (issue #104:
+ *  confirmation-chain compression). A single discriminated value, mapped exhaustively below
+ *  to the button copy — no re-derived booleans at each usage site. */
+type ConfirmMode = "planAndScope" | "scopeOnly";
+
+function confirmModeOf(planCard: ParsedPlanCard | null): ConfirmMode {
+  return planCard && !planCard.resolved ? "planAndScope" : "scopeOnly";
+}
+
+const CONFIRM_LABEL_KEY: Record<ConfirmMode, string> = {
+  planAndScope: "scope.confirmWithPlan",
+  scopeOnly: "scope.confirm",
+};
+
 export function ScopeReview({ onClose }: { onClose: () => void }) {
-  const { proposal, confirmProposal, threads, activeThreadId, repos } = useStore();
+  const { proposal, confirmProposal, approvePlanCard, threads, activeThreadId, repos, leadMessages } =
+    useStore();
   const { t } = useTranslation();
   const [confirming, setConfirming] = useState(false);
   const dirs = proposal?.directions ?? [];
@@ -56,11 +73,32 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
     [dirs, repos],
   );
 
+  // The thread's plan_card, if the lead emitted one — folded into this SAME screen so
+  // "approach + split + worktree" reads in one place (issue #104) instead of requiring a
+  // trip back into chat. `null` for scope that skipped the plan step entirely (unaffected:
+  // the confirm button behaves exactly as it did before this change).
+  const planCard = useMemo(
+    () => latestPlanCard(activeThreadId != null ? leadMessages[activeThreadId] ?? [] : []),
+    [leadMessages, activeThreadId],
+  );
+  const confirmMode = confirmModeOf(planCard);
+
   if (!proposal) return null;
 
   async function confirm() {
+    const tid = activeThreadId;
+    if (tid == null) return;
     setConfirming(true);
     try {
+      // Auto-flow: the plan approve (if it's still the open decision) happens first, in
+      // the SAME click, via the exact submission `approvePlanCard` shares with the chat
+      // plan_card's own Approve button — then the existing confirmProposal path runs
+      // exactly as it always has. A failed plan-approve stops here (already toasted by
+      // approvePlanCard) instead of silently continuing into confirmProposal.
+      if (confirmMode === "planAndScope" && planCard) {
+        const delivered = await approvePlanCard(tid, planCard.message.id, planCard.title);
+        if (!delivered) return;
+      }
       await confirmProposal();
     } finally {
       setConfirming(false);
@@ -110,6 +148,29 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
             </div>
           </div>
 
+          {/* Plan summary folded in (issue #104): approach + open risks read on this SAME
+              screen as the split/worktree preview below, instead of requiring a trip back
+              into chat. Omitted entirely when the thread never got a plan_card (trivial
+              scope) — the rest of the dialog is byte-identical to before this change. */}
+          {planCard &&
+          (planCard.requirements.length > 0 || planCard.approach || planCard.risks.length > 0) ? (
+            <div className="rounded-[var(--radius-lg)] border border-border bg-surface/60 px-4 py-3">
+              <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] font-semibold uppercase tracking-wide text-ink-faint">
+                <span>{t("scope.planSummary")}</span>
+                {confirmMode === "scopeOnly" && planCard.resolved ? (
+                  <span className="inline-flex items-center gap-1 normal-case text-running">
+                    <Check size={11} />
+                    {t("planCard.approved", { name: planCard.resolved })}
+                  </span>
+                ) : null}
+              </div>
+              {/* cwd omitted: the merged dialog isn't bound to the lead's live session cwd, so
+                  approach markdown falls back to plain (non-file-opening) links here — the
+                  chat plan_card still resolves them once approved. */}
+              <PlanSummary requirements={planCard.requirements} approach={planCard.approach} risks={planCard.risks} />
+            </div>
+          ) : null}
+
           {proposal.rationale && (
             <div className="rounded-[var(--radius-lg)] border border-border bg-surface/60 px-4 py-3">
               <div className="mb-1 text-[10.5px] font-semibold uppercase tracking-wide text-ink-faint">
@@ -145,7 +206,7 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
             disabled={confirming || dirs.length === 0}
           >
             <GitBranch size={14} />
-            {confirming ? t("scope.confirming") : t("scope.confirm", { count: dirs.length })}
+            {confirming ? t("scope.confirming") : t(CONFIRM_LABEL_KEY[confirmMode], { count: dirs.length })}
           </Button>
         </div>
       </div>
