@@ -41,6 +41,7 @@ mod power;
 pub mod proc_registry;
 mod process_quota;
 pub mod profile;
+mod session_gate;
 mod session_meta;
 mod sidecar;
 pub mod skills;
