@@ -2006,12 +2006,12 @@ pub async fn answer_permission(
     if !asks.answer(ask_id, a) {
         return Err("that request was already answered or has expired".into());
     }
-    // Only Full access persists (approach B: Always is in-memory only, never on
-    // disk). Persist it durably — routed through the single ordered writer, awaited
-    // — before reporting success, so an immediate quit/crash can't drop it and a
-    // write failure surfaces. Flushing on Always would be a no-op write whose rare
-    // failure would misleadingly report "not saved" for a grant never meant to be.
-    if matches!(a, crate::ask::Answer::Full) {
+    // Both Full and Always now create a durable standing grant (issue #89: Always
+    // is keyed by the exact action_key, not the lossy display summary, so it's
+    // safe to persist too). Persist it durably — routed through the single
+    // ordered writer, awaited — before reporting success, so an immediate
+    // quit/crash can't drop it and a write failure surfaces.
+    if matches!(a, crate::ask::Answer::Full | crate::ask::Answer::Always) {
         crate::auth_persist::flush(&asks).await?;
     }
     Ok(())
@@ -2029,31 +2029,33 @@ pub fn list_auth_grants(
 
 /// Revoke a standing grant (the human's one-click undo), at the granularity the
 /// caller passes:
-/// - `dir == None`                → clear the whole issue's grants (every task's
-///   full/always under this thread) — the board card's one-click "revoke all".
-/// - `dir == Some`, `summary == None` → clear that one task's `(thread, dir)` grant
-///   (its full access + every always-rule).
-/// - `dir == Some`, `summary == Some` → drop only that one always-rule.
+/// - `dir == None`                    → clear the whole issue's grants (every
+///   task's full/always under this thread) — the board card's one-click "revoke
+///   all".
+/// - `dir == Some`, `action_key == None` → clear that one task's `(thread, dir)`
+///   grant (its full access + every always-rule).
+/// - `dir == Some`, `action_key == Some` → drop only that one always-rule.
 /// Revoke a standing grant and durably persist it, ATOMICALLY: the revoke is the
-/// safety net for persisted Full access, so it must never leave memory ahead of the
-/// store (chip gone in the UI but the grant still on disk, ready to resurrect on
-/// restart) or report success on a failed write. Uses `revoke_no_emit` so the ONLY
-/// store write is the acked `flush` — a fire-and-forget emit here plus the acked flush
-/// could diverge if one landed and the other failed (memory rolled back while disk is
-/// already revoked → the session keeps auto-approving). `revoke_no_emit` returns
-/// EXACTLY what it removed under one lock, so on a failed write the rollback re-adds
-/// only this call's removals. Extracted from the command so the rollback is testable.
+/// safety net for persisted Full/Always access, so it must never leave memory
+/// ahead of the store (chip gone in the UI but the grant still on disk, ready to
+/// resurrect on restart) or report success on a failed write. Uses
+/// `revoke_no_emit` so the ONLY store write is the acked `flush` — a
+/// fire-and-forget emit here plus the acked flush could diverge if one landed
+/// and the other failed (memory rolled back while disk is already revoked → the
+/// session keeps auto-approving). `revoke_no_emit` returns EXACTLY what it
+/// removed under one lock, so on a failed write the rollback re-adds only this
+/// call's removals. Extracted from the command so the rollback is testable.
 async fn revoke_grant_durable(
     asks: &crate::ask::AskRegistry,
     thread: i32,
     dir: Option<&str>,
-    summary: Option<&str>,
+    action_key: Option<&str>,
 ) -> Result<(), String> {
     // Serialize the whole mutate → flush → rollback: two overlapping revokes of the
     // same grant would otherwise race, an earlier failed revoke's rollback resurrecting
     // a grant a later, already-succeeded revoke removed.
     let _guard = asks.lock_revoke().await;
-    let removed = asks.revoke_no_emit(thread, dir, summary);
+    let removed = asks.revoke_no_emit(thread, dir, action_key);
     // Nothing matched → memory is unchanged, so disk is already consistent. Skip the
     // write entirely (mirrors the emit path's guard) so a "revoke nothing" can't
     // surface a spurious failure on an unrelated write error.
@@ -2072,9 +2074,9 @@ pub async fn revoke_auth_grant(
     asks: tauri::State<'_, crate::ask::AskRegistry>,
     thread: i32,
     dir: Option<String>,
-    summary: Option<String>,
+    action_key: Option<String>,
 ) -> R<()> {
-    revoke_grant_durable(&asks, thread, dir.as_deref(), summary.as_deref()).await
+    revoke_grant_durable(&asks, thread, dir.as_deref(), action_key.as_deref()).await
 }
 
 #[tauri::command]
@@ -2689,16 +2691,17 @@ mod tests {
         .unwrap();
         let asks = crate::ask::AskRegistry::new();
         let (remove_id, remove_rx) =
-            asks.request(thread.id, "", "claude", "Run: rm", "rm -rf tmp");
+            asks.request(thread.id, "", "claude", "Run: rm", "rm -rf tmp", "rm -rf tmp");
         let (repo_scoped_id, repo_scoped_rx) = asks.request(
             keep_thread.id,
             &keep_direction.id.to_string(),
             "claude",
             "Run: clean",
             "rm -rf tmp",
+            "rm -rf tmp",
         );
         let (keep_id, _keep_rx) =
-            asks.request(keep_thread.id, "20", "claude", "Run: test", "pnpm test");
+            asks.request(keep_thread.id, "20", "claude", "Run: test", "pnpm test", "pnpm test");
 
         cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
 
@@ -2856,9 +2859,9 @@ mod tests {
         });
         // open asks for the two directions the repo delete removes
         let (ask_a, _r1) =
-            asks.request(thread.id, &dir_a.id.to_string(), "codex", "Run: x", "x");
+            asks.request(thread.id, &dir_a.id.to_string(), "codex", "Run: x", "x", "x");
         let (ask_routed, _r2) =
-            asks.request(thread.id, &dir_routed.id.to_string(), "codex", "Run: y", "y");
+            asks.request(thread.id, &dir_routed.id.to_string(), "codex", "Run: y", "y", "y");
 
         purge_repo_ask_footprint(&db, &asks, repo_a.id)
             .await

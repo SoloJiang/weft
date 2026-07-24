@@ -1,10 +1,11 @@
 //! Durable persistence for standing authorization grants (`full` / `always`).
 //!
 //! The `AskRegistry` keeps grants in memory (fast, DB-agnostic, unit-testable).
-//! This module mirrors them to the store so a granted "Full access" survives an
-//! app restart instead of re-prompting every run — and, crucially, is back in
-//! place BEFORE `spawn_revive` re-drives in-flight tasks, so a revived worker
-//! runs unattended under the access the human already granted.
+//! This module mirrors them to the store so a granted "Full access" or a precise
+//! "Always allow" (keyed by the exact `action_key` — issue #89) survives an app
+//! restart instead of re-prompting every run — and, crucially, is back in place
+//! BEFORE `spawn_revive` re-drives in-flight tasks, so a revived worker runs
+//! unattended under the access the human already granted.
 //!
 //! Single ordered writer: the registry enqueues a `PersistMsg` on every real grant
 //! change; THIS consumer is the ONLY writer, draining the channel in FIFO order so
@@ -54,14 +55,12 @@ pub async fn persist_snapshot(db: &Db, snap: &GrantSnapshot) -> Result<(), Strin
 }
 
 /// Seed the registry from the store at boot — call BEFORE anything serves asks
-/// or `spawn_revive` re-drives tasks. Only Full access is inherited: any stale
-/// Always rows on disk (from an earlier build, or a restored backup) are dropped,
-/// since Always is in-memory only in this PR — re-seeding them would silently
-/// auto-allow across restarts while the Full-only board marker can't surface or
-/// revoke them.
+/// or `spawn_revive` re-drives tasks. Both Full and Always are inherited: Always
+/// is keyed by the exact `action_key` (issue #89), not the lossy display
+/// summary, so a restored Always grant re-applies to the SAME action only — it
+/// cannot silently widen across a restart the way a summary-keyed grant could.
 pub async fn seed(db: &Db, asks: &AskRegistry) {
-    let mut snap = load_snapshot(db).await;
-    snap.always.clear();
+    let snap = load_snapshot(db).await;
     asks.seed_grants(snap);
 }
 
@@ -135,7 +134,7 @@ mod tests {
             always: vec![AlwaysGrant {
                 thread: 2,
                 dir: "".into(),
-                summary: "Run: npm test".into(),
+                action_key: "Run: npm test".into(),
             }],
         }
     }
@@ -169,17 +168,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_loads_full_but_ignores_stale_always() {
+    async fn seed_loads_full_and_precise_always_grants() {
         let db = mem().await;
-        // sample() has a Full grant AND a (stale, e.g. earlier-build) Always grant.
+        // sample() has a Full grant AND a precise (action-key-keyed) Always grant.
         persist_snapshot(&db, &sample()).await.unwrap();
         let asks = AskRegistry::new();
         seed(&db, &asks).await;
         // Full is inherited...
         assert_eq!(asks.auto_decision(1, "10", "anything"), Some(Decision::Allow));
-        // ...but a stale on-disk Always is NOT re-seeded (Always is in-memory only in
-        // this PR), so it does not silently auto-allow across restarts.
-        assert!(asks.auto_decision(2, "", "Run: npm test").is_none());
+        // ...and so is the precise Always grant — issue #89: it's safe to restore
+        // because it's keyed by the exact action, not a lossy display summary.
+        assert_eq!(
+            asks.auto_decision(2, "", "Run: npm test"),
+            Some(Decision::Allow)
+        );
     }
 
     /// Drains one snapshot from the registry's persist channel into the store,
@@ -203,7 +205,14 @@ mod tests {
         let asks = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         asks.set_persist_notifier(tx);
-        let (id, _rx) = asks.request(7, "42", "codex", "Run: cargo build", "cargo build");
+        let (id, _rx) = asks.request(
+            7,
+            "42",
+            "codex",
+            "Run: cargo build",
+            "cargo build",
+            "Run: cargo build",
+        );
         assert!(asks.answer(id, crate::ask::Answer::Full));
         drain_once(&mut rx, &db).await;
 
@@ -217,6 +226,40 @@ mod tests {
         );
     }
 
+    /// Issue #89's core persisted-path acceptance case: a precise Always grant
+    /// ALSO survives a restart (unlike PR #87's approach-B, where any on-disk
+    /// Always was dropped at boot) — AND stays exact: a different action sharing
+    /// the granted action's old lossy display summary still re-prompts.
+    #[tokio::test]
+    async fn always_grant_survives_a_simulated_restart_and_stays_precise() {
+        let db = mem().await;
+        let asks = AskRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        asks.set_persist_notifier(tx);
+        let (id, _rx) = asks.request(
+            7,
+            "42",
+            "codex",
+            "Run: npm test",
+            "npm test\necho a",
+            "npm test\necho a",
+        );
+        assert!(asks.answer(id, crate::ask::Answer::Always));
+        drain_once(&mut rx, &db).await;
+
+        let revived = AskRegistry::new();
+        seed(&db, &revived).await;
+        // the exact action_key is restored...
+        assert_eq!(
+            revived.auto_decision(7, "42", "npm test\necho a"),
+            Some(Decision::Allow),
+            "a persisted Always grant must survive restart when it's the exact action"
+        );
+        // ...but a different action sharing the old ask's display summary ("Run:
+        // npm test") must still re-prompt — precision, not the label, persisted.
+        assert!(revived.auto_decision(7, "42", "npm test\nrm -rf /").is_none());
+    }
+
     /// Acceptance #3: revoking a thread's grants (issue deletion) clears them from
     /// the store, so a later reuse of that thread id starts un-granted.
     #[tokio::test]
@@ -225,7 +268,7 @@ mod tests {
         let asks = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         asks.set_persist_notifier(tx);
-        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x");
+        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x", "Run: x");
         assert!(asks.answer(id, crate::ask::Answer::Full));
         drain_once(&mut rx, &db).await;
 
@@ -259,21 +302,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_persists_full_only_and_is_durable() {
+    async fn flush_persists_full_and_always_and_is_durable() {
         let db = mem().await;
         let asks = AskRegistry::new();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         asks.set_persist_notifier(tx);
         tokio::spawn(run_consumer(db.clone(), rx));
-        asks.seed_grants(sample()); // sample has a Full grant AND an Always grant
+        // sample() has a Full grant (thread 1) AND a precise Always grant (thread 2)
+        asks.seed_grants(sample());
         // flush enqueues to the single writer and awaits its store write
         flush(&asks).await.unwrap();
         let snap = load_snapshot(&db).await;
-        // Only Full persists in this PR — Always is in-memory only (#89).
+        // Both persist now — Always is precise (action-key-keyed), so it's safe (#89).
         assert_eq!(snap.full, sample().full);
-        assert!(snap.always.is_empty());
-        // revoke the Full grant then flush → nothing left on disk
+        assert_eq!(snap.always, sample().always);
+        // revoke both threads' grants then flush → nothing left on disk
         asks.revoke_thread(1);
+        asks.revoke_thread(2);
         flush(&asks).await.unwrap();
         assert!(load_snapshot(&db).await.is_empty());
     }
@@ -291,7 +336,7 @@ mod tests {
 
         // grant then revoke BEFORE the writer starts — a stale {full} snapshot is now
         // queued ahead of the {} revoke, exactly the round-1 race window.
-        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x");
+        let (id, _rx) = asks.request(7, "42", "codex", "Run: x", "x", "Run: x");
         assert!(asks.answer(id, crate::ask::Answer::Full)); // queues {full}
         asks.revoke_grant(7, "42", None); // queues {}
 

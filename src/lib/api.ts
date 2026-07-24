@@ -252,9 +252,10 @@ export const api = {
   // the board's "inherited access" markers.
   listAuthGrants: () => invoke<GrantSnapshot>("list_auth_grants"),
   // Revoke a standing grant. dir=null clears the whole issue's grants (one-click
-  // "revoke all"); dir set + summary=null clears one task; both set drops one rule.
-  revokeAuthGrant: (thread: number, dir: string | null, summary: string | null) =>
-    invoke<void>("revoke_auth_grant", { thread, dir, summary }),
+  // "revoke all"); dir set + actionKey=null clears one task; both set drops one
+  // rule (actionKey is the canonical action identity, not the display summary).
+  revokeAuthGrant: (thread: number, dir: string | null, actionKey: string | null) =>
+    invoke<void>("revoke_auth_grant", { thread, dir, actionKey }),
 
   // Needs-you: open agent→human questions, aggregated across the workspace.
   needsYou: (workspaceId: number) =>

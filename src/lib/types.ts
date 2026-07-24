@@ -633,11 +633,13 @@ export interface FullGrant {
   dir: string;
 }
 
-/** A persisted "always allow" grant: this exact `summary` from (thread, dir). */
+/** A persisted "always allow" grant: this exact `action_key` (the canonical,
+ *  precise action identity — distinct from the ask's display `summary`) from
+ *  (thread, dir) auto-allows. See ask.rs::Ask::action_key. */
 export interface AlwaysGrant {
   thread: number;
   dir: string;
-  summary: string;
+  action_key: string;
 }
 
 /** Standing authorization grants that persist across restarts (Ask Bridge). The

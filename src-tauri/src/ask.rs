@@ -83,7 +83,9 @@ pub struct Ask {
     /// asking direction id (as string); "" for a lead/planning session.
     pub dir: String,
     pub tool: String,
-    /// short human label, e.g. "Run: npm test" or "Edit src/main.rs".
+    /// short human label, e.g. "Run: npm test" or "Edit src/main.rs". MAY be a
+    /// lossy truncation (a multi-line command's first line, a bare MCP tool
+    /// name) — display only, never used for Always-matching. See `action_key`.
     pub summary: String,
     /// the raw action detail (command / file path / full input).
     pub detail: String,
@@ -94,6 +96,14 @@ pub struct Ask {
     pub thread_title: String,
     #[serde(default)]
     pub dir_name: String,
+    /// The canonical, EXACT action identity (full command / full path set /
+    /// full args) set by the engine's ask-creation call — distinct from
+    /// `summary`, which may truncate for display. Used ONLY for Always-grant
+    /// matching (`auto_decision`, the `always` standing-grant set); never
+    /// shown to the human. Not serialized to the frontend: it's an internal
+    /// matching key, not display data (see issue #89).
+    #[serde(skip_serializing)]
+    pub action_key: String,
 }
 
 /// A persisted "full access" grant: every ask from this (thread, dir) auto-allows.
@@ -103,13 +113,16 @@ pub struct FullGrant {
     pub dir: String,
 }
 
-/// A persisted "always allow" grant: this exact `summary` from this (thread, dir)
-/// auto-allows.
+/// A persisted "always allow" grant: this exact `action_key` (the canonical,
+/// precise action identity — see `Ask::action_key`) from this (thread, dir)
+/// auto-allows. Precise by construction, so persisting it is safe (issue #89):
+/// a restored grant re-applies to the SAME action only, never a different one
+/// that merely shared the old grant's display summary.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AlwaysGrant {
     pub thread: i32,
     pub dir: String,
-    pub summary: String,
+    pub action_key: String,
 }
 
 /// The durable shape of the registry's standing grants (`full` + `always`). This
@@ -157,12 +170,12 @@ struct Inner {
     next_id: u64,
     waiters: HashMap<u64, oneshot::Sender<Decision>>,
     open: Vec<Ask>,
-    /// (thread, dir) -> summaries the human has "always allow"-ed. **In-memory only**:
-    /// Always grants are NOT persisted in this PR — an Always summary is a lossy
-    /// display label (a Claude multi-line command truncated to its first line, an MCP
-    /// tool name, a truncated path list), not a precise action key, so persisting it
-    /// risks a permanent over-broad grant. Only Full access is persisted here; precise
-    /// per-action Always-persistence lands with issue #89's canonical action key.
+    /// (thread, dir) -> action_keys the human has "always allow"-ed. Persisted
+    /// (mirrored to the store via `emit_persist`, exactly like `full`): an Always
+    /// grant is keyed by the exact action (`Ask::action_key`; issue #89), never
+    /// the lossy display `summary` — a Claude multi-line command truncated to its
+    /// first line, an MCP tool name, a truncated path list — so persisting it is
+    /// safe: a restored grant re-applies to the SAME action only.
     always: HashMap<(i32, String), HashSet<String>>,
     /// (thread, dir) granted full access — every ask auto-allows.
     full: HashSet<(i32, String)>,
@@ -190,9 +203,9 @@ impl Inner {
         }
     }
 
-    /// Current DURABLE grants (持锁内调用). Only Full access is persisted in this PR
-    /// — Always grants are in-memory only (see #89), so the snapshot's `always` is
-    /// always empty.
+    /// Current DURABLE grants (持锁内调用): both `full` and `always` mirror the
+    /// in-memory state 1:1 — Always is precise (action-key-keyed, see #89), so
+    /// it's safe to persist exactly like Full.
     fn grant_snapshot(&self) -> GrantSnapshot {
         let full = self
             .full
@@ -202,10 +215,18 @@ impl Inner {
                 dir: dir.clone(),
             })
             .collect();
-        GrantSnapshot {
-            full,
-            always: Vec::new(),
-        }
+        let always = self
+            .always
+            .iter()
+            .flat_map(|((thread, dir), keys)| {
+                keys.iter().map(move |k| AlwaysGrant {
+                    thread: *thread,
+                    dir: dir.clone(),
+                    action_key: k.clone(),
+                })
+            })
+            .collect();
+        GrantSnapshot { full, always }
     }
 
     /// Push the current grants to the persistence consumer as a fire-and-forget
@@ -219,17 +240,19 @@ impl Inner {
         }
     }
 
-    /// Remove the standing grants matching (thread, dir, summary) and RETURN what was
-    /// removed (Full only — Always is in-memory, not durable, so it's cleared but not
-    /// returned). Does NOT emit; the caller decides how to persist. 持锁内调用.
+    /// Remove the standing grants matching (thread, dir, action_key) and RETURN
+    /// exactly what was removed — both `full` and `always` (Always is durable
+    /// now, see #89, so a caller doing a rollback-on-failed-write needs its
+    /// removals too, not just Full's). Does NOT emit; the caller decides how to
+    /// persist. 持锁内调用.
     fn remove_grants(
         &mut self,
         thread: i32,
         dir: Option<&str>,
-        summary: Option<&str>,
+        action_key: Option<&str>,
     ) -> GrantSnapshot {
         let mut removed = GrantSnapshot::default();
-        match (dir, summary) {
+        match (dir, action_key) {
             // whole issue
             (None, _) => {
                 let full_keys: Vec<(i32, String)> =
@@ -241,7 +264,23 @@ impl Inner {
                         dir: key.1,
                     });
                 }
-                self.always.retain(|(t, _), _| *t != thread);
+                let always_keys: Vec<(i32, String)> = self
+                    .always
+                    .keys()
+                    .filter(|(t, _)| *t == thread)
+                    .cloned()
+                    .collect();
+                for key in always_keys {
+                    if let Some(rules) = self.always.remove(&key) {
+                        for ak in rules {
+                            removed.always.push(AlwaysGrant {
+                                thread: key.0,
+                                dir: key.1.clone(),
+                                action_key: ak,
+                            });
+                        }
+                    }
+                }
             }
             // one task's whole grant
             (Some(dir), None) => {
@@ -252,13 +291,27 @@ impl Inner {
                         dir: dir.to_string(),
                     });
                 }
-                self.always.remove(&key);
+                if let Some(rules) = self.always.remove(&key) {
+                    for ak in rules {
+                        removed.always.push(AlwaysGrant {
+                            thread,
+                            dir: dir.to_string(),
+                            action_key: ak,
+                        });
+                    }
+                }
             }
             // one always-rule
-            (Some(dir), Some(summary)) => {
+            (Some(dir), Some(action_key)) => {
                 let key = (thread, dir.to_string());
                 if let Some(rules) = self.always.get_mut(&key) {
-                    rules.remove(summary);
+                    if rules.remove(action_key) {
+                        removed.always.push(AlwaysGrant {
+                            thread,
+                            dir: dir.to_string(),
+                            action_key: action_key.to_string(),
+                        });
+                    }
                     if rules.is_empty() {
                         self.always.remove(&key);
                     }
@@ -310,6 +363,8 @@ impl AskRegistry {
 
     /// Register a permission request; returns its id and a receiver that resolves
     /// when the human (or a timeout) answers. The caller awaits the receiver.
+    /// `action_key` is the canonical EXACT action identity (see `Ask::action_key`)
+    /// — distinct from `summary`, used only for Always-matching (issue #89).
     pub fn request(
         &self,
         thread: i32,
@@ -317,6 +372,7 @@ impl AskRegistry {
         tool: &str,
         summary: &str,
         detail: &str,
+        action_key: &str,
     ) -> (u64, oneshot::Receiver<Decision>) {
         let (tx, rx) = oneshot::channel();
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -333,6 +389,7 @@ impl AskRegistry {
             ts: now(),
             thread_title: String::new(),
             dir_name: String::new(),
+            action_key: action_key.to_string(),
         };
         g.open.push(ask.clone());
         g.emit(AskEvent::Opened(ask));
@@ -361,8 +418,10 @@ impl AskRegistry {
     }
 
     /// A standing rule's verdict for an incoming ask, checked BEFORE surfacing:
-    /// full access or a matching always-allow → auto-allow (never shown).
-    pub fn auto_decision(&self, thread: i32, dir: &str, summary: &str) -> Option<Decision> {
+    /// full access or a matching always-allow → auto-allow (never shown). Matches
+    /// on the canonical `action_key` (see `Ask::action_key`), NOT the lossy
+    /// display summary — issue #89.
+    pub fn auto_decision(&self, thread: i32, dir: &str, action_key: &str) -> Option<Decision> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.dangerous {
             return Some(Decision::Allow);
@@ -371,7 +430,7 @@ impl AskRegistry {
         if g.full.contains(&k) {
             return Some(Decision::Allow);
         }
-        if g.always.get(&k).is_some_and(|s| s.contains(summary)) {
+        if g.always.get(&k).is_some_and(|s| s.contains(action_key)) {
             return Some(Decision::Allow);
         }
         None
@@ -390,18 +449,14 @@ impl AskRegistry {
         // only on first insertion). Drives a single persist write — an idempotent
         // re-grant of an existing rule writes nothing.
         let granted = match ans {
-            Answer::Always => {
-                // Record the always-rule in memory (auto_decision uses this), but do
-                // NOT persist it: `granted` (which gates the persist emit) stays false,
-                // so Always is in-memory only — a lossy display summary must not become
-                // a permanent grant. Only Full persists here; #89 adds precise
-                // per-action Always-persistence.
-                g.always
-                    .entry(key.clone())
-                    .or_default()
-                    .insert(ask.summary.clone());
-                false
-            }
+            // Record the always-rule keyed by the EXACT action (not the lossy
+            // display summary) — precise, so it's safe to persist (issue #89):
+            // `granted` gates the persist emit below, symmetric with Full.
+            Answer::Always => g
+                .always
+                .entry(key.clone())
+                .or_default()
+                .insert(ask.action_key.clone()),
             Answer::Full => g.full.insert(key.clone()),
             _ => false,
         };
@@ -425,7 +480,7 @@ impl AskRegistry {
                 }
                 match ans {
                     Answer::Full => true,
-                    Answer::Always => a.summary == ask.summary,
+                    Answer::Always => a.action_key == ask.action_key,
                     _ => false,
                 }
             })
@@ -518,7 +573,7 @@ impl AskRegistry {
             g.always
                 .entry((ag.thread, ag.dir))
                 .or_default()
-                .insert(ag.summary);
+                .insert(ag.action_key);
         }
     }
 
@@ -530,16 +585,22 @@ impl AskRegistry {
             .grant_snapshot()
     }
 
-    /// Remove the standing grants matching (thread, dir, summary), emit the reduced
-    /// snapshot fire-and-forget, and RETURN exactly what was removed (Full only — the
-    /// removed-set, computed under one lock, drives an atomic rollback). Delete cleanup
-    /// and the general one-shot revoke use this; the DURABLE revoke command uses
-    /// `revoke_no_emit` + a single acked flush instead.
+    /// Remove the standing grants matching (thread, dir, action_key), emit the
+    /// reduced snapshot fire-and-forget, and RETURN exactly what was removed
+    /// (both `full` and `always` — the removed-set, computed under one lock,
+    /// drives an atomic rollback). Delete cleanup and the general one-shot
+    /// revoke use this; the DURABLE revoke command uses `revoke_no_emit` + a
+    /// single acked flush instead.
     /// - `dir == None`  → the whole issue's grants.
-    /// - `dir == Some`  → one task (`summary == None`) or one always-rule.
-    pub fn revoke(&self, thread: i32, dir: Option<&str>, summary: Option<&str>) -> GrantSnapshot {
+    /// - `dir == Some`  → one task (`action_key == None`) or one always-rule.
+    pub fn revoke(
+        &self,
+        thread: i32,
+        dir: Option<&str>,
+        action_key: Option<&str>,
+    ) -> GrantSnapshot {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let removed = g.remove_grants(thread, dir, summary);
+        let removed = g.remove_grants(thread, dir, action_key);
         if !removed.is_empty() {
             g.emit_persist();
         }
@@ -556,12 +617,12 @@ impl AskRegistry {
         &self,
         thread: i32,
         dir: Option<&str>,
-        summary: Option<&str>,
+        action_key: Option<&str>,
     ) -> GrantSnapshot {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove_grants(thread, dir, summary)
+            .remove_grants(thread, dir, action_key)
     }
 
     /// Drop every standing grant belonging to `thread` (issue deletion cascade),
@@ -570,11 +631,11 @@ impl AskRegistry {
         self.revoke(thread, None, None)
     }
 
-    /// Revoke a specific standing grant (`summary == None` → the whole `(thread, dir)`
-    /// grant; `summary == Some` → one always-rule), emitting best-effort. Returns what
-    /// was removed.
-    pub fn revoke_grant(&self, thread: i32, dir: &str, summary: Option<&str>) -> GrantSnapshot {
-        self.revoke(thread, Some(dir), summary)
+    /// Revoke a specific standing grant (`action_key == None` → the whole
+    /// `(thread, dir)` grant; `action_key == Some` → one always-rule), emitting
+    /// best-effort. Returns what was removed.
+    pub fn revoke_grant(&self, thread: i32, dir: &str, action_key: Option<&str>) -> GrantSnapshot {
+        self.revoke(thread, Some(dir), action_key)
     }
 
     /// Delete-time cleanup of an issue's WHOLE footprint in this registry: cancel
@@ -661,7 +722,7 @@ mod tests {
     #[tokio::test]
     async fn request_then_answer_delivers_decision() {
         let r = AskRegistry::new();
-        let (id, rx) = r.request(1, "10", "claude", "Run: npm test", "npm test");
+        let (id, rx) = r.request(1, "10", "claude", "Run: npm test", "npm test", "npm test");
         assert_eq!(r.open().len(), 1);
         assert!(r.answer(id, Answer::Allow));
         assert_eq!(rx.await.unwrap(), Decision::Allow);
@@ -673,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn always_allow_remembers_and_auto_decides() {
         let r = AskRegistry::new();
-        let (id, _rx) = r.request(1, "10", "claude", "Run: npm test", "npm test");
+        let (id, _rx) = r.request(1, "10", "claude", "Run: npm test", "npm test", "Run: npm test");
         // no rule yet
         assert!(r.auto_decision(1, "10", "Run: npm test").is_none());
         assert!(r.answer(id, Answer::Always));
@@ -688,11 +749,46 @@ mod tests {
         assert!(r.auto_decision(2, "10", "Run: npm test").is_none());
     }
 
+    /// Issue #89's core in-memory acceptance case: two asks share the SAME lossy
+    /// display `summary` (e.g. a Claude multi-line command truncated to its first
+    /// line) but are DIFFERENT exact actions. An Always on one must not auto-allow
+    /// the other, and must not sweep it into the "covered" resolution either.
+    #[tokio::test]
+    async fn always_matches_action_key_not_the_shared_display_summary() {
+        let r = AskRegistry::new();
+        let (id_a, _rxa) = r.request(
+            1,
+            "10",
+            "claude",
+            "Run: npm test",
+            "npm test\necho safe",
+            "npm test\necho safe",
+        );
+        let (id_b, _rxb) = r.request(
+            1,
+            "10",
+            "claude",
+            "Run: npm test",
+            "npm test\nrm -rf /",
+            "npm test\nrm -rf /",
+        );
+        assert!(r.answer(id_a, Answer::Always));
+        // the exact action just granted auto-allows...
+        assert_eq!(
+            r.auto_decision(1, "10", "npm test\necho safe"),
+            Some(Decision::Allow)
+        );
+        // ...but a different action that merely shares the display summary does not.
+        assert!(r.auto_decision(1, "10", "npm test\nrm -rf /").is_none());
+        // B was NOT swept up by A's Always answer — it's still open, unresolved.
+        assert_eq!(r.open().iter().map(|a| a.id).collect::<Vec<_>>(), vec![id_b]);
+    }
+
     #[tokio::test]
     async fn full_access_auto_allows_anything_and_clears_queue() {
         let r = AskRegistry::new();
-        let (id1, rx1) = r.request(1, "10", "claude", "Run: a", "a");
-        let (_id2, rx2) = r.request(1, "10", "claude", "Edit b", "b");
+        let (id1, rx1) = r.request(1, "10", "claude", "Run: a", "a", "Run: a");
+        let (_id2, rx2) = r.request(1, "10", "claude", "Edit b", "b", "Edit b");
         // full access on the first clears BOTH open asks for that task
         assert!(r.answer(id1, Answer::Full));
         assert_eq!(rx1.await.unwrap(), Decision::Allow);
@@ -708,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_drops_without_answer() {
         let r = AskRegistry::new();
-        let (id, rx) = r.request(2, "", "codex", "Edit x", "x");
+        let (id, rx) = r.request(2, "", "codex", "Edit x", "x", "Edit x");
         r.cancel(id);
         assert!(r.open().is_empty());
         assert!(rx.await.is_err()); // sender dropped
@@ -719,14 +815,14 @@ mod tests {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(r.set_notifier(tx).is_empty()); // 空 registry 挂接 → 空快照
-        let (id, _drx) = r.request(1, "10", "claude", "Run: x", "x");
+        let (id, _drx) = r.request(1, "10", "claude", "Run: x", "x", "Run: x");
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id));
         r.answer(id, Answer::Allow);
         assert!(matches!(
             rx.recv().await.unwrap(),
             AskEvent::Resolved { ask, answer: Answer::Allow } if ask.id == id
         ));
-        let (id2, _drx2) = r.request(1, "10", "claude", "Run: y", "y");
+        let (id2, _drx2) = r.request(1, "10", "claude", "Run: y", "y", "Run: y");
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id2));
         r.cancel(id2);
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Cancelled { id: c } if c == id2));
@@ -737,8 +833,8 @@ mod tests {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(r.set_notifier(tx).is_empty());
-        let (id1, _a) = r.request(1, "10", "claude", "Run: a", "a");
-        let (id2, _b) = r.request(1, "10", "claude", "Run: b", "b");
+        let (id1, _a) = r.request(1, "10", "claude", "Run: a", "a", "Run: a");
+        let (id2, _b) = r.request(1, "10", "claude", "Run: b", "b", "Run: b");
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id1));
         assert!(matches!(rx.recv().await.unwrap(), AskEvent::Opened(a) if a.id == id2));
         r.answer(id1, Answer::Full); // 覆盖 id2
@@ -756,8 +852,8 @@ mod tests {
     #[tokio::test]
     async fn dangerous_release_resolves_backlog_via_notifier() {
         let r = AskRegistry::new();
-        let (id1, _a) = r.request(1, "10", "claude", "Run: a", "a");
-        let (id2, _b) = r.request(2, "", "codex", "Edit b", "b");
+        let (id1, _a) = r.request(1, "10", "claude", "Run: a", "a", "Run: a");
+        let (id2, _b) = r.request(2, "", "codex", "Edit b", "b", "Edit b");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         // 挂接晚于 request：快照补齐已 open 的 ask，且不会再收到它们的 Opened
         let snap: Vec<u64> = r.set_notifier(tx).iter().map(|a| a.id).collect();
@@ -778,8 +874,8 @@ mod tests {
     #[test]
     fn open_in_filters_by_thread() {
         let r = AskRegistry::new();
-        let _ = r.request(1, "10", "claude", "a", "a");
-        let _ = r.request(2, "20", "codex", "b", "b");
+        let _ = r.request(1, "10", "claude", "a", "a", "a");
+        let _ = r.request(2, "20", "codex", "b", "b", "b");
         assert_eq!(r.open_in(1).len(), 1);
         assert_eq!(r.open_in(2).len(), 1);
         assert_eq!(r.open_in(1)[0].thread, 1);
@@ -798,12 +894,12 @@ mod tests {
             always: vec![AlwaysGrant {
                 thread: 2,
                 dir: "20".into(),
-                summary: "Run: npm test".into(),
+                action_key: "Run: npm test".into(),
             }],
         });
         // full → anything in (1,"10") auto-allows
         assert_eq!(r.auto_decision(1, "10", "Run: anything"), Some(Decision::Allow));
-        // always → only the exact summary in (2,"20")
+        // always → only the exact action_key in (2,"20")
         assert_eq!(
             r.auto_decision(2, "20", "Run: npm test"),
             Some(Decision::Allow)
@@ -818,7 +914,7 @@ mod tests {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
-        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a", "Run: a");
         assert!(r.answer(id, Answer::Full));
         // the send is synchronous inside answer(), so try_recv sees it immediately
         let snap = rx.try_recv().expect("full grant must be persisted").snapshot;
@@ -832,25 +928,36 @@ mod tests {
         assert!(snap.always.is_empty());
     }
 
+    /// Issue #89's core persisted-path acceptance case (approach-B's successor):
+    /// Always is now keyed by the exact action_key — not the lossy display
+    /// summary — so it's safe to persist, symmetric with Full.
     #[test]
-    fn answering_always_is_in_memory_only_not_persisted() {
+    fn answering_always_persists_a_snapshot_with_that_grant() {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
-        let (id, _rx) = r.request(1, "10", "codex", "Run: npm test", "npm test");
+        let (id, _rx) = r.request(1, "10", "codex", "Run: npm test", "npm test", "npm test");
         assert!(r.answer(id, Answer::Always));
-        // auto-allows this exact summary in memory...
+        // auto-allows this exact action in memory...
         assert_eq!(
-            r.auto_decision(1, "10", "Run: npm test"),
+            r.auto_decision(1, "10", "npm test"),
             Some(Decision::Allow)
         );
-        // ...but Always grants are in-memory only in this PR — nothing is persisted
-        // (only Full persists; precise per-action Always-persistence is #89).
-        assert!(
-            rx.try_recv().is_err(),
-            "an Always answer must not write a durable grant"
+        // ...and IS durably persisted — the send is synchronous inside answer(),
+        // so try_recv sees it immediately.
+        let snap = rx
+            .try_recv()
+            .expect("a precise Always grant must be persisted")
+            .snapshot;
+        assert_eq!(
+            snap.always,
+            vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                action_key: "npm test".into(),
+            }]
         );
-        assert!(r.snapshot_grants().always.is_empty());
+        assert!(snap.full.is_empty());
     }
 
     #[test]
@@ -858,7 +965,7 @@ mod tests {
         let r = AskRegistry::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
-        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a", "Run: a");
         assert!(r.answer(id, Answer::Allow));
         assert!(
             rx.try_recv().is_err(),
@@ -878,9 +985,31 @@ mod tests {
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         r.set_persist_notifier(tx);
-        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a", "Run: a");
         // (1,"10") already has full access — answering Full again changes nothing.
         assert!(r.answer(id, Answer::Full));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged grant set must not trigger a redundant write"
+        );
+    }
+
+    #[test]
+    fn re_granting_always_does_not_re_persist() {
+        let r = AskRegistry::new();
+        r.seed_grants(GrantSnapshot {
+            full: vec![],
+            always: vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                action_key: "a".into(),
+            }],
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        r.set_persist_notifier(tx);
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a", "a");
+        // (1,"10") already has this exact action_key always-allowed.
+        assert!(r.answer(id, Answer::Always));
         assert!(
             rx.try_recv().is_err(),
             "an unchanged grant set must not trigger a redundant write"
@@ -904,7 +1033,7 @@ mod tests {
             always: vec![AlwaysGrant {
                 thread: 1,
                 dir: "10".into(),
-                summary: "x".into(),
+                action_key: "x".into(),
             }],
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -949,7 +1078,7 @@ mod tests {
             always: vec![AlwaysGrant {
                 thread: 2,
                 dir: "".into(),
-                summary: "Run: x".into(),
+                action_key: "Run: x".into(),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -965,7 +1094,7 @@ mod tests {
     #[test]
     fn snapshot_grants_reflects_answered_grants() {
         let r = AskRegistry::new();
-        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a");
+        let (id, _rx) = r.request(1, "10", "codex", "Run: a", "a", "Run: a");
         r.answer(id, Answer::Full);
         let snap = r.snapshot_grants();
         assert_eq!(
@@ -989,12 +1118,12 @@ mod tests {
                 AlwaysGrant {
                     thread: 1,
                     dir: "10".into(),
-                    summary: "a".into(),
+                    action_key: "a".into(),
                 },
                 AlwaysGrant {
                     thread: 1,
                     dir: "10".into(),
-                    summary: "b".into(),
+                    action_key: "b".into(),
                 },
             ],
         });
@@ -1010,8 +1139,11 @@ mod tests {
         assert!(snap.is_empty());
     }
 
+    /// Issue #89: Always is durable now, so a granular always-revoke (dropping
+    /// ONE action_key rule while keeping a sibling) must persist the reduced set
+    /// — previously (approach-B) this was a guaranteed no-op write.
     #[test]
-    fn revoke_grant_with_summary_drops_only_that_always_rule() {
+    fn revoke_grant_with_action_key_drops_only_that_always_rule() {
         let r = AskRegistry::new();
         r.seed_grants(GrantSnapshot {
             full: vec![],
@@ -1019,12 +1151,12 @@ mod tests {
                 AlwaysGrant {
                     thread: 1,
                     dir: "10".into(),
-                    summary: "a".into(),
+                    action_key: "a".into(),
                 },
                 AlwaysGrant {
                     thread: 1,
                     dir: "10".into(),
-                    summary: "b".into(),
+                    action_key: "b".into(),
                 },
             ],
         });
@@ -1033,12 +1165,22 @@ mod tests {
         r.revoke_grant(1, "10", Some("a"));
         assert!(r.auto_decision(1, "10", "a").is_none()); // dropped
         assert_eq!(r.auto_decision(1, "10", "b"), Some(Decision::Allow)); // kept
-        // Always is in-memory only, so a granular always-revoke persists nothing.
-        assert!(rx.try_recv().is_err());
+        let snap = rx
+            .try_recv()
+            .expect("a granular always-revoke must persist the reduced set")
+            .snapshot;
+        assert_eq!(
+            snap.always,
+            vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                action_key: "b".into(),
+            }]
+        );
     }
 
     #[test]
-    fn revoke_grant_with_summary_keeps_full_access() {
+    fn revoke_grant_with_action_key_keeps_full_access() {
         let r = AskRegistry::new();
         r.seed_grants(GrantSnapshot {
             full: vec![FullGrant {
@@ -1048,7 +1190,7 @@ mod tests {
             always: vec![AlwaysGrant {
                 thread: 1,
                 dir: "10".into(),
-                summary: "a".into(),
+                action_key: "a".into(),
             }],
         });
         r.revoke_grant(1, "10", Some("a"));
@@ -1078,12 +1220,12 @@ mod tests {
                     AlwaysGrant {
                         thread: 1,
                         dir: "10".into(),
-                        summary: "a".into(),
+                        action_key: "a".into(),
                     },
                     AlwaysGrant {
                         thread: 1,
                         dir: "11".into(),
-                        summary: "b".into(),
+                        action_key: "b".into(),
                     },
                 ],
             });
@@ -1094,12 +1236,12 @@ mod tests {
         r.revoke(1, None, None);
         assert!(r.auto_decision(1, "10", "x").is_none());
         assert!(r.auto_decision(1, "11", "b").is_none());
-        // dir=Some, summary=None → only that one task; the sibling task survives
+        // dir=Some, action_key=None → only that one task; the sibling task survives
         let r = seeded();
         r.revoke(1, Some("10"), None);
         assert!(r.auto_decision(1, "10", "x").is_none());
         assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
-        // dir=Some, summary=Some → only that always-rule; the task's full access stays
+        // dir=Some, action_key=Some → only that always-rule; full access stays
         let r = seeded();
         r.revoke(1, Some("10"), Some("a"));
         assert_eq!(r.auto_decision(1, "10", "anything"), Some(Decision::Allow));
@@ -1108,7 +1250,7 @@ mod tests {
     #[test]
     fn answering_a_found_ask_whose_waiter_is_gone_still_succeeds() {
         let r = AskRegistry::new();
-        let (id, rx) = r.request(1, "10", "codex", "Run: x", "x");
+        let (id, rx) = r.request(1, "10", "codex", "Run: x", "x", "Run: x");
         // the blocked tool's receiver is gone (e.g. its approval request was cancelled)
         drop(rx);
         // the ask is still open, so answering it Full is a SUCCESS (found + answered)
@@ -1131,16 +1273,16 @@ mod tests {
                 AlwaysGrant {
                     thread: 1,
                     dir: "10".into(),
-                    summary: "a".into(),
+                    action_key: "a".into(),
                 },
                 AlwaysGrant {
                     thread: 1,
                     dir: "11".into(),
-                    summary: "b".into(),
+                    action_key: "b".into(),
                 },
             ],
         });
-        // removes (1,"10")'s full + its (in-memory) always "a"; leaves (1,"11")
+        // removes (1,"10")'s full + its always "a"; leaves (1,"11")'s "b" untouched
         let removed = r.revoke(1, Some("10"), None);
         assert_eq!(
             removed.full,
@@ -1149,9 +1291,17 @@ mod tests {
                 dir: "10".into()
             }]
         );
-        // Always is in-memory only, so it never appears in the durable removed set...
-        assert!(removed.always.is_empty());
-        // ...but it IS cleared from memory (auto_decision no longer allows it).
+        // Always is durable now (#89) — a revoke's removed-set reports it too, so
+        // the durable-revoke command's rollback-on-failed-write can restore it.
+        assert_eq!(
+            removed.always,
+            vec![AlwaysGrant {
+                thread: 1,
+                dir: "10".into(),
+                action_key: "a".into(),
+            }]
+        );
+        // ...and it IS cleared from memory (auto_decision no longer allows it).
         assert!(r.auto_decision(1, "10", "a").is_none());
         assert_eq!(r.auto_decision(1, "11", "b"), Some(Decision::Allow));
         // revoking nothing returns an empty set
@@ -1209,9 +1359,9 @@ mod tests {
             }],
             always: vec![],
         });
-        let (id1, _rx1) = r.request(1, "10", "codex", "Run: a", "a");
-        let (id2, _rx2) = r.request(1, "11", "codex", "Run: b", "b");
-        let (keep, _rxk) = r.request(2, "20", "codex", "Run: c", "c");
+        let (id1, _rx1) = r.request(1, "10", "codex", "Run: a", "a", "Run: a");
+        let (id2, _rx2) = r.request(1, "11", "codex", "Run: b", "b", "Run: b");
+        let (keep, _rxk) = r.request(2, "20", "codex", "Run: c", "c", "Run: c");
 
         r.purge_thread(1);
 
@@ -1239,8 +1389,8 @@ mod tests {
             ],
             always: vec![],
         });
-        let (drop_id, _r1) = r.request(1, "10", "codex", "Run: a", "a");
-        let (keep_id, _r2) = r.request(1, "11", "codex", "Run: b", "b");
+        let (drop_id, _r1) = r.request(1, "10", "codex", "Run: a", "a", "Run: a");
+        let (keep_id, _r2) = r.request(1, "11", "codex", "Run: b", "b", "Run: b");
 
         r.purge_dir(1, "10");
 
