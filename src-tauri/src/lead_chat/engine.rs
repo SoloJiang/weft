@@ -374,7 +374,10 @@ fn hidden_delivery(tool: &str, busy: bool, has_stdin: bool, stopped: bool) -> Hi
         HiddenDelivery::Noop
     } else if busy {
         HiddenDelivery::Queue
-    } else if per_turn(tool) {
+    } else if per_turn(tool) || is_acp_tool(tool) {
+        // Per-turn tools and ACP connection tools have no resident stdin when
+        // idle — both need a turn spawn (ACP → spawn_acp_turn; per-turn →
+        // spawn_turn / codex appserver redirect in send_hidden_inner).
         HiddenDelivery::SpawnTurn
     } else if has_stdin {
         HiddenDelivery::WriteResident
@@ -4101,8 +4104,9 @@ async fn send_hidden_inner(
         HiddenDelivery::SpawnTurn => {
             // codex on app-server must stay on app-server even for hidden turns
             // (bus wakes), else an exec turn and the app-server connection diverge
-            // on the same thread.
+            // on the same thread. ACP tools similarly stay on the ACP runtime.
             let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
+            let acp = is_acp_tool(&inner.tool);
             let turn_id = begin_hidden_turn(app, db, &mut inner).await;
             // Captured under the lock: a stop-then-restart before the spawn task
             // runs clears `stopped` but bumps the epoch — a canceled hidden turn
@@ -4112,6 +4116,15 @@ async fn send_hidden_inner(
             drop(inner);
             let res = if codex_appserver {
                 spawn_codex_turn_or_exec(
+                    app.clone(),
+                    db.clone(),
+                    eng.clone(),
+                    out,
+                    Some(hidden_epoch),
+                )
+                .await
+            } else if acp {
+                spawn_acp_turn(
                     app.clone(),
                     db.clone(),
                     eng.clone(),
@@ -6614,6 +6627,11 @@ mod tests {
             hidden_delivery("opencode", false, false, false),
             HiddenDelivery::SpawnTurn
         );
+        // ACP connection tools also have no resident stdin when idle.
+        assert_eq!(
+            hidden_delivery("omp", false, false, false),
+            HiddenDelivery::SpawnTurn
+        );
     }
 
     #[test]
@@ -6630,12 +6648,20 @@ mod tests {
             hidden_delivery("codex", true, false, false),
             HiddenDelivery::Queue
         );
+        assert_eq!(
+            hidden_delivery("omp", true, false, false),
+            HiddenDelivery::Queue
+        );
     }
 
     #[test]
     fn hidden_delivery_rejects_stopped_per_turn_engines() {
         assert_eq!(
             hidden_delivery("codex", false, false, true),
+            HiddenDelivery::Noop
+        );
+        assert_eq!(
+            hidden_delivery("omp", false, false, true),
             HiddenDelivery::Noop
         );
     }
