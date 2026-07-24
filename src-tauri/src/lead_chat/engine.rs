@@ -1313,6 +1313,12 @@ pub struct EngineInner {
     /// id-keyed deregister makes even a pid-reuse across that window safe. Dropping it
     /// only deregisters (never reclaims).
     pub child_reg: Option<crate::proc_registry::Registration>,
+    /// Active-session slot permit for `child` (paired with `child_reg`). Set at
+    /// every spawn right after registration; dropped exactly when `child` is
+    /// cleared (respawn overwrite / invalidate_resident / stop_quiet), which
+    /// releases the slot so a queued session can proceed. `None` = ungated
+    /// (session_gate degraded / no permit was available). See [`crate::session_gate`].
+    pub child_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pub stdin: Option<ChildStdin>,
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
     /// exec/claude 的单串行匿名槽;app-server 的 item 键控行走 `open_texts`。
@@ -1758,6 +1764,9 @@ async fn ensure_running_locked(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
+    // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
+    let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
     let mut child = command.spawn()?;
@@ -1780,6 +1789,8 @@ async fn ensure_running_locked(
         .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
     inner.child = Some(child);
     inner.child_reg = Some(reg);
+    // permit 与 child_reg 同寿:child 被 take/overwrite/stop 清掉时一并 drop=释放槽。
+    inner.child_permit = session_permit;
     inner.generation += 1;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -3316,6 +3327,8 @@ async fn spawn_turn(
         // stderr → app log: a per-turn CLI that dies prints its reason there.
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
+    // 活跃会话软上限:拿一个会话槽,已满则排队(与 admit_new_work 硬闸互补)。
+    let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
     let mut child = command.spawn()?;
@@ -3327,6 +3340,8 @@ async fn spawn_turn(
     inner.stdin = None;
     inner.child = Some(child);
     inner.child_reg = Some(reg);
+    // permit 与 child_reg 同寿:per-turn 进程结束(下一轮 overwrite / stop)时 drop=释放槽。
+    inner.child_permit = session_permit;
     inner.generation += 1;
     inner.current = None;
     let generation = inner.generation;
@@ -5970,6 +5985,7 @@ mod tests {
             clock: TurnClock::default(),
             child: None,
             child_reg: None,
+            child_permit: None,
             stdin: None,
             current: None,
             open_texts: std::collections::HashMap::new(),
@@ -6213,6 +6229,7 @@ mod tests {
             clock: TurnClock::default(),
             child: None,
             child_reg: None,
+            child_permit: None,
             stdin: None,
             current: None,
             open_texts: std::collections::HashMap::new(),
