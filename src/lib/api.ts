@@ -17,6 +17,7 @@ import type {
   ObserveRef,
   ParsedSkill,
   PermissionAsk,
+  ProcessQuotaStatus,
   Proposal,
   RepoChecks,
   RepoGraph,
@@ -296,6 +297,7 @@ export const api = {
   // force-stopping a stuck/runaway agent (enforcement pending on the engine).
   setGuardrails: (idleSecs: number, wallSecs: number) =>
     invoke<void>("set_guardrails", { idleSecs, wallSecs }),
+  processQuotaStatus: () => invoke<ProcessQuotaStatus>("process_quota_status"),
   // Effective config (skills + rules) for a repo, tagged by layer + override.
   effectiveConfig: (repoPath: string, wsId?: number) =>
     invoke<ConfigItem[]>("effective_config", { repoPath, wsId }),

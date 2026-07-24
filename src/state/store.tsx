@@ -17,7 +17,13 @@ import {
   type ChatHistoryStatus,
 } from "./chatHistory";
 import i18n, { currentLang } from "../i18n";
-import { toast } from "../components/Toast";
+import { toast, type ToastTone } from "../components/Toast";
+import {
+  isProcessQuotaDegradedError,
+  processQuotaNotice,
+  shouldApplyProcessQuotaStatus,
+  type ProcessQuotaNotice,
+} from "../lib/processQuota";
 import { STORAGE_KEYS } from "../lib/storageKeys";
 import { fillMetaHoles, mergeSnapshot, metaFromInit, metaFromSnapshot, metaFromUsage } from "../session/sessionMeta";
 import type {
@@ -29,6 +35,7 @@ import type {
   LiveWorkerSlot,
   NeedItem,
   PermissionAsk,
+  ProcessQuotaStatus,
   Proposal,
   QueuedItem,
   RepoChecks,
@@ -70,6 +77,19 @@ const SESSION_STATUS: Record<LeadWorkerState, SessionStatus> = {
   idle: "idle",
   stopped: "exited",
 };
+
+const PROCESS_QUOTA_NOTICE_VIEW: Record<
+  ProcessQuotaNotice,
+  { key: string; tone: ToastTone }
+> = {
+  warning: { key: "processQuota.warningToast", tone: "warning" },
+  degraded: { key: "processQuota.degradedToast", tone: "danger" },
+  recovered: { key: "processQuota.recoveredToast", tone: "success" },
+};
+
+function notifyProcessQuotaBlocked() {
+  toast(i18n.t("processQuota.blockedToast"), "danger");
+}
 
 interface Store {
   workspaces: Workspace[];
@@ -156,6 +176,9 @@ interface Store {
   idleCapMins: number;
   wallCapMins: number;
   setGuardrails: (idleMins: number, wallMins: number) => void;
+  /** App-wide process quota state; null until the governor's first snapshot. */
+  processQuota: ProcessQuotaStatus | null;
+  refreshProcessQuota: () => Promise<void>;
   /** Whether the board canvas is showing the proposal's scope-confirm. */
   reviewingProposal: boolean;
   setReviewingProposal: (v: boolean) => void;
@@ -495,6 +518,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
     void initTools();
   }, []);
+
+  const [processQuota, setProcessQuota] = useState<ProcessQuotaStatus | null>(null);
+  const processQuotaRef = useRef<ProcessQuotaStatus | null>(null);
+  const applyProcessQuota = useCallback((next: ProcessQuotaStatus) => {
+    const previous = processQuotaRef.current;
+    if (!shouldApplyProcessQuotaStatus(previous, next)) return;
+
+    const notice = processQuotaNotice(previous, next);
+    processQuotaRef.current = next;
+    setProcessQuota(next);
+    if (notice !== null) {
+      const view = PROCESS_QUOTA_NOTICE_VIEW[notice];
+      toast(i18n.t(view.key), view.tone);
+    }
+  }, []);
+  const refreshProcessQuota = useCallback(async () => {
+    try {
+      applyProcessQuota(await api.processQuotaStatus());
+    } catch (error) {
+      // Pure Vite dev and an older backend do not expose the governor command.
+      if (import.meta.env.DEV) console.error(error);
+    }
+  }, [applyProcessQuota]);
+  useEffect(() => {
+    const unlisten = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
+      applyProcessQuota(event.payload);
+    });
+    void refreshProcessQuota();
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [applyProcessQuota, refreshProcessQuota]);
+
   const setDefaultTool = useCallback((tl: string) => {
     setDefaultToolState(tl);
     setConfiguredTool(tl);
@@ -1232,17 +1288,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       images?: ImageAttachment[],
       files?: string[],
     ) => {
-      const live = Object.values(sessionsRef.current).find(
-        (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
-      );
-      // driveDirection returns the (possibly freshly-resumed) session id directly.
-      // sessionsRef won't reflect a new session until React re-renders, so re-scanning
-      // it here would drop the first message to an idle/recovered worker (the send
-      // would no-op after ChatComposer already cleared the input).
-      const sessionId =
-        live?.info.session_id ?? (await driveDirection(directionId, repoId, false));
-      if (sessionId == null) return;
-      await api.chatSend(sessionId, text, images, files);
+      try {
+        const live = Object.values(sessionsRef.current).find(
+          (s) => s.directionId === directionId && s.repoId === repoId && s.status !== "exited",
+        );
+        // driveDirection returns the (possibly freshly-resumed) session id directly.
+        // sessionsRef won't reflect a new session until React re-renders, so re-scanning
+        // it here would drop the first message to an idle/recovered worker (the send
+        // would no-op after ChatComposer already cleared the input).
+        const sessionId =
+          live?.info.session_id ?? (await driveDirection(directionId, repoId, false));
+        if (sessionId == null) return;
+        await api.chatSend(sessionId, text, images, files);
+      } catch (error) {
+        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        // ChatComposer restores the draft when the send promise rejects.
+        throw error;
+      }
     },
     [driveDirection],
   );
@@ -1260,7 +1322,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // Skip reclaimed worktrees (exists=false): the directory is gone, so
       // spawning a worker in it would fail.
       for (const w of wts.filter((w) => w.exists)) {
-        await spawnWorker(directionId, w.repo_id, false);
+        try {
+          await spawnWorker(directionId, w.repo_id, false);
+        } catch (error) {
+          // The persistent quota bar already explains the pause. Background
+          // auto-dispatch must not leak a rejected promise while degraded.
+          if (isProcessQuotaDegradedError(error)) continue;
+          throw error;
+        }
       }
     },
     [spawnWorker],
@@ -1654,7 +1723,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const sendLeadChat = useCallback(
     async (threadId: number, text: string, images?: ImageAttachment[], files?: string[]) => {
-      await api.leadSend(threadId, text, currentLang(), images, files);
+      try {
+        await api.leadSend(threadId, text, currentLang(), images, files);
+      } catch (error) {
+        if (isProcessQuotaDegradedError(error)) notifyProcessQuotaBlocked();
+        // ChatComposer restores the draft when the send promise rejects.
+        throw error;
+      }
     },
     [],
   );
@@ -2455,6 +2530,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     idleCapMins,
     wallCapMins,
     setGuardrails,
+    processQuota,
+    refreshProcessQuota,
     needs,
     asks,
     writeTriggers,

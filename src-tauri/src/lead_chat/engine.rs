@@ -1684,6 +1684,7 @@ fn merge_init_slash_commands(
 /// under one continuous lock lets a caller reserve a turn slot atomically with
 /// ensuring the process — no window for a racing send to slip a turn in.
 async fn ensure_running_locked(
+    app: &AppHandle,
     inner: &mut EngineInner,
 ) -> anyhow::Result<Option<(tokio::process::ChildStdout, u64)>> {
     if inner.stopped {
@@ -1700,6 +1701,7 @@ async fn ensure_running_locked(
             return Ok(None); // alive
         }
     }
+    crate::process_quota::admit_new_work(app)?;
     crate::claude::ensure_trusted(&inner.cwd);
     // Resolve the actual binary: a per-session pin, else the global override for
     // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
@@ -1742,7 +1744,7 @@ async fn ensure_running_locked(
 /// Per-turn dialects have no resident process — sending spawns one per turn.
 pub async fn ensure_running(app: &AppHandle, db: &Db, eng: &EngineRef) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
-    let reader = ensure_running_locked(&mut inner).await?;
+    let reader = ensure_running_locked(app, &mut inner).await?;
     drop(inner);
     if let Some((stdout, generation)) = reader {
         spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
@@ -1991,6 +1993,7 @@ pub async fn send(
     files: Vec<String>,
     origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
+    crate::process_quota::admit_new_work(app)?;
     // A rewind holds its reservation from the busy check to the final
     // truncate; sends error out for that window rather than racing the
     // rewind's stop/truncate steps.
@@ -3450,12 +3453,18 @@ async fn send_hidden_inner(
     bus_read: bool,
     ensure: bool,
 ) -> anyhow::Result<()> {
+    if let Err(err) = crate::process_quota::admit_new_work(app) {
+        if bus_read {
+            return Ok(());
+        }
+        return Err(err);
+    }
     let mut inner = eng.lock().await;
     if ensure {
         // Spawn the resident process under THIS lock, never releasing it before
         // the slot is reserved below. The reader task blocks on this lock and
         // proceeds once we drop it on return.
-        if let Some((stdout, generation)) = ensure_running_locked(&mut inner).await? {
+        if let Some((stdout, generation)) = ensure_running_locked(app, &mut inner).await? {
             spawn_reader(app.clone(), db.clone(), eng.clone(), stdout, generation);
         }
     }
