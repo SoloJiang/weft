@@ -218,6 +218,49 @@ impl AgentAdapter for CodexAppServerAdapter {
     }
 }
 
+// ───────────────────────────── ACP (generic) ─────────────────────────────
+
+/// Connection adapter for any tool registered with `acp::backend_for`.
+/// Spawn/parse go through `acp::runtime` (later task), not argv.
+pub struct AcpAdapter {
+    id: &'static str,
+}
+
+impl AcpAdapter {
+    pub fn new(id: &'static str) -> Self {
+        Self { id }
+    }
+}
+
+impl AgentAdapter for AcpAdapter {
+    fn tool(&self) -> &'static str {
+        self.id
+    }
+    fn per_turn(&self) -> bool {
+        false
+    }
+    fn is_connection(&self) -> bool {
+        true
+    }
+
+    fn build_argv(&self, _ctx: &AdapterContext) -> anyhow::Result<(String, Vec<String>)> {
+        anyhow::bail!(
+            "{} is an ACP connection adapter — drive it via acp::runtime",
+            self.id
+        )
+    }
+
+    fn parse_line(&self, _line: &str) -> ChatEvent {
+        ChatEvent::Other
+    }
+    fn extract_native_id(&self, _line: &str) -> Option<String> {
+        None
+    }
+    fn interrupt(&self) -> Interrupt {
+        Interrupt::Connection
+    }
+}
+
 // ───────────────────────────── opencode ─────────────────────────────
 
 pub struct OpenCodeAdapter;
@@ -297,7 +340,8 @@ pub fn adapter_for(tool: &str) -> Option<Arc<dyn AgentAdapter>> {
         "claude" => Some(Arc::new(ClaudeAdapter)),
         "codex" => Some(Arc::new(CodexExecAdapter)),
         "opencode" => Some(Arc::new(OpenCodeAdapter)),
-        _ => None,
+        t => crate::acp::backend_for(t)
+            .map(|b| Arc::new(AcpAdapter::new(b.id())) as Arc<dyn AgentAdapter>),
     }
 }
 
@@ -396,6 +440,10 @@ mod tests {
         let codex = adapter_for("codex").unwrap();
         assert_eq!(codex.tool(), "codex");
         assert!(codex.per_turn() && !codex.is_connection());
+        let omp = adapter_for("omp").unwrap();
+        assert_eq!(omp.tool(), "omp");
+        assert!(!omp.per_turn() && omp.is_connection());
+        assert_eq!(omp.interrupt(), Interrupt::Connection);
         assert!(adapter_for("mystery").is_none());
     }
 

@@ -11,9 +11,13 @@ pub mod jsonrpc;
 pub mod map;
 pub mod permission;
 
-// backends + runtime land in subsequent tasks.
-// pub mod backends;
+pub mod backends;
+
+// runtime lands in the next task.
 // pub mod runtime;
+
+#[allow(unused_imports)]
+pub use backends::{backend_for, registered_ids, AcpBackend, McpServerSpec};
 
 #[allow(unused_imports)]
 pub use jsonrpc::{

@@ -248,6 +248,7 @@ pub(crate) fn min_version(tool: &str) -> Option<(u32, u32, u32)> {
         "claude" => Some((1, 0, 0)),
         "codex" => Some((0, 20, 0)),
         "opencode" => Some((0, 1, 0)),
+        "omp" => Some((17, 1, 0)),
         _ => None,
     }
 }
@@ -341,7 +342,7 @@ impl ToolDiagnostic {
 }
 
 /// Preference order when the user hasn't chosen a tool explicitly.
-pub(crate) const TOOL_PRIORITY: [&str; 3] = ["codex", "claude", "opencode"];
+pub(crate) const TOOL_PRIORITY: [&str; 4] = ["codex", "claude", "opencode", "omp"];
 
 /// Pure default-tool decision: an explicit user choice wins when that CLI is
 /// installed; otherwise the first installed tool by priority; otherwise codex
@@ -478,6 +479,12 @@ mod tests {
         assert_eq!(pick_default_tool(None, installed), "codex");
         let only_oc = |t: &str| t == "opencode";
         assert_eq!(pick_default_tool(None, only_oc), "opencode");
+    }
+
+    #[test]
+    fn default_tool_omp_when_only_omp_installed() {
+        let only_omp = |t: &str| t == "omp";
+        assert_eq!(pick_default_tool(None, only_omp), "omp");
     }
 
     #[test]

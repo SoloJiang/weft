@@ -1,6 +1,6 @@
 // Mirrors the SeaORM models (serde serializes Rust field names as-is: snake_case).
 
-export type Tool = "claude" | "codex" | "opencode" | "none";
+export type Tool = "claude" | "codex" | "opencode" | "omp" | "none";
 export type ThreadKind = "feature" | "bugfix" | "refactor" | "spike";
 
 /** Process-pressure state reported by the backend governor. The frontend renders

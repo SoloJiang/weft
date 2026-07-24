@@ -18,8 +18,8 @@ pub struct ToolStatus {
 }
 
 // Display order for Settings (default-tool picker + diagnostics): mirrors the
-// default-tool priority (codex > claude > opencode).
-const TOOLS: [&str; 3] = ["codex", "claude", "opencode"];
+// default-tool priority (codex > claude > opencode > omp).
+const TOOLS: [&str; 4] = ["codex", "claude", "opencode", "omp"];
 
 fn probe(tool: &str) -> ToolStatus {
     use crate::detect::ToolDiagnostic as Diag;
