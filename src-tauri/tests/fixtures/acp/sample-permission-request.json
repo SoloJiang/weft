@@ -1,0 +1,49 @@
+{
+  "jsonrpc": "2.0",
+  "id": 0,
+  "method": "session/request_permission",
+  "params": {
+    "sessionId": "019f9475-63bb-7000-bff7-58073a1d26e9",
+    "toolCall": {
+      "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+      "title": "echo TOOL_OK",
+      "kind": "execute",
+      "status": "pending",
+      "rawInput": {
+        "command": "echo TOOL_OK"
+      },
+      "content": [
+        {
+          "type": "content",
+          "content": {
+            "type": "text",
+            "text": "$ echo TOOL_OK"
+          }
+        }
+      ],
+      "locations": []
+    },
+    "options": [
+      {
+        "optionId": "allow_once",
+        "name": "Allow once",
+        "kind": "allow_once"
+      },
+      {
+        "optionId": "allow_always",
+        "name": "Always allow",
+        "kind": "allow_always"
+      },
+      {
+        "optionId": "reject_once",
+        "name": "Reject",
+        "kind": "reject_once"
+      },
+      {
+        "optionId": "reject_always",
+        "name": "Always reject",
+        "kind": "reject_always"
+      }
+    ]
+  }
+}

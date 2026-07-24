@@ -1,0 +1,33 @@
+{
+  "sessionUpdate": "tool_call_update",
+  "toolCallId": "call-fb75add5-d66b-4754-8596-2092291de102-0|fc_8dd84108-a3e5-9b2a-910c-fb23fbfc059f_0",
+  "status": "completed",
+  "rawOutput": {
+    "content": [
+      {
+        "type": "text",
+        "text": "TOOL_OK\n\n\nWall time: 0.15 seconds"
+      }
+    ],
+    "details": {
+      "timeoutSeconds": 300,
+      "wallTimeMs": 151.16908300000068
+    }
+  },
+  "content": [
+    {
+      "type": "content",
+      "content": {
+        "type": "text",
+        "text": "$ echo TOOL_OK"
+      }
+    },
+    {
+      "type": "content",
+      "content": {
+        "type": "text",
+        "text": "TOOL_OK\n\n\nWall time: 0.15 seconds"
+      }
+    }
+  ]
+}
