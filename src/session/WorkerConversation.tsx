@@ -234,7 +234,7 @@ export function WorkerConversation() {
   // Conversation rewind (Phase 1) is scoped to claude/codex/opencode workers —
   // the tools with native fork support; others get no rewind affordance at all.
   const canRewind =
-    sid != null && (ref?.tool === "claude" || ref?.tool === "codex" || ref?.tool === "opencode");
+    sid != null && (ref?.tool === "claude" || ref?.tool === "codex" || ref?.tool === "opencode" || ref?.tool === "omp");
 
   // Dialog confirm: the backend truncates from the picked message on (and, for
   // the code modes, restores the worktree), then returns the message's text —

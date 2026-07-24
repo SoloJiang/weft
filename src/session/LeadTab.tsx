@@ -227,7 +227,7 @@ export function LeadTab({
   const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
   // Rewind is scoped to claude/codex/opencode leads — the tools with native
   // fork support (same gate as the worker); the lead rewinds conversation-only.
-  const canRewind = leadTool === "claude" || leadTool === "codex" || leadTool === "opencode";
+  const canRewind = leadTool === "claude" || leadTool === "codex" || leadTool === "opencode" || leadTool === "omp";
 
   // Dialog confirm: the backend truncates from the picked message on and
   // returns its text — prefill the composer with it. The "rewound" push
