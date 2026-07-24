@@ -4,12 +4,16 @@ import { X, ChevronRight, ChevronDown, RefreshCw } from "lucide-react";
 import type { SessionMeta, EnabledSkill, Direction } from "../lib/types";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 
+type NamedSkill = { name: string; description: string };
+
 /**
  * 常驻右栏「会话信息」:Sub-tasks、Skills、MCP。Context(token/%/model)不在这里——
  * 它常驻 composer 工具条的 ContextGauge(ChatComposer),面板只管列表型信息。
- * Sub-tasks/Skills/MCP 共享 <Section> 静态头 + <OverflowList>(head+show-more):
- * 头常驻只读,长列表用同一个 head + "Show N more" 控件折叠尾部。纯展示——数据由
- * store 的 leadMeta/workerMeta + workspaceSkills + directionsByThread 喂。
+ * Sub-tasks/MCP 是 <Section> 静态头 + <OverflowList>(head+show-more):头常驻只读,
+ * 长列表用同一个 head + "Show N more" 控件折叠尾部。Skills 是两个独立口径的
+ * <SkillGroup>(各自的头 + OverflowList)——workspace 静态注入 vs 引擎运行时探测,
+ * 见该段内注释与 #108。纯展示——数据由 store 的 leadMeta/workerMeta +
+ * workspaceSkills + directionsByThread 喂。
  */
 export function SessionInfoPanel({
   meta,
@@ -33,17 +37,6 @@ export function SessionInfoPanel({
   busy?: boolean;
 }) {
   const { t } = useTranslation();
-
-  // Workspace skills (`skills`) ∪ engine skills (`meta.engineSkills`), deduped by
-  // name (workspace wins).
-  const allSkills = useMemo(() => {
-    const byName = new Map<string, { name: string; description: string }>();
-    for (const s of skills) byName.set(s.name, { name: s.name, description: s.description });
-    for (const s of meta?.engineSkills ?? []) {
-      if (!byName.has(s.name)) byName.set(s.name, s);
-    }
-    return [...byName.values()];
-  }, [skills, meta?.engineSkills]);
 
   // Newest-first; the overflow list shows the head and folds the rest.
   // created_at is a Unix-seconds string (store `now()`), not RFC3339 — new
@@ -110,26 +103,33 @@ export function SessionInfoPanel({
           </Section>
         )}
 
-        {/* Skills — chips cap at 10 (chips are dense). */}
-        <Section key="skills" title={t("sessionInfo.skills")} count={allSkills.length}>
-          {allSkills.length === 0 ? (
-            <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.noSkills")}</div>
-          ) : (
-            <OverflowList
-              items={allSkills}
-              head={10}
-              layout="wrap"
-              renderItem={(s) => (
-                <span
-                  key={s.name}
-                  title={s.description}
-                  className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
-                >
-                  {s.name}
-                </span>
-              )}
+        {/* Skills — two independently-sourced readings, kept apart rather than
+            merged into one count (issue #108). `skills` is Weft's injected
+            catalog for this workspace (policy, static — from workspace_skills).
+            `meta.engineSkills` is what the engine actually found on disk in the
+            session cwd at the last probe (ground truth, often a superset — e.g.
+            pre-existing/plugin skills outside Weft's catalog). A dedup-merge of
+            the two used to back the section's single count, which visibly
+            jumped (e.g. 41→79) the moment the turn-triggered engine probe
+            resolved after the workspace fetch. Each group now owns its count. */}
+        <Section key="skills" title={t("sessionInfo.skills")}>
+          <div className="mt-1.5">
+            <SkillGroup
+              label={t("sessionInfo.skillsInjected")}
+              hint={t("sessionInfo.skillsInjectedHint")}
+              skills={skills}
+              emptyText={t("sessionInfo.noSkills")}
             />
-          )}
+            <div className="mt-3">
+              <SkillGroup
+                label={t("sessionInfo.skillsDiscovered")}
+                hint={t("sessionInfo.skillsDiscoveredHint")}
+                skills={meta?.engineSkills}
+                emptyText={t("sessionInfo.noEngineSkills")}
+                pendingText={t("sessionInfo.pending")}
+              />
+            </div>
+          </div>
         </Section>
 
         {/* MCP — servers cap at 3, each row expands its tools. */}
@@ -236,6 +236,90 @@ function OverflowList<T>({
       )}
     </>
   );
+}
+
+/** One Skills reading's tri-state: `undefined` means no authoritative result
+ *  has landed yet (the initial value, or every probe so far has failed —
+ *  `sessionMeta.ts`'s merges keep this as `undefined`/prev rather than ever
+ *  synthesizing a `[]`), `[]` means a probe DID land and confirmed zero, and a
+ *  non-empty array is the actual list. Modeled as one discriminated value
+ *  (instead of re-deriving `isPending`/`isEmpty` booleans at each call site)
+ *  so "no signal yet" can never be silently displayed as "confirmed zero". */
+type SkillReadingState = "pending" | "empty" | "list";
+
+function skillReadingState(skills: unknown[] | undefined): SkillReadingState {
+  if (skills == null) return "pending";
+  return skills.length === 0 ? "empty" : "list";
+}
+
+/** Skills section body for one reading: an eyebrow label + its own count, over
+ *  chips (head 10, dense) or an empty/pending hint. Exhaustive over
+ *  `SkillReadingState` via {@link SkillGroupBody} rather than a nested ternary. */
+function SkillGroup<T extends NamedSkill>({
+  label,
+  hint,
+  skills,
+  emptyText,
+  pendingText = emptyText,
+}: {
+  label: string;
+  hint: string;
+  skills: T[] | undefined;
+  /** Shown when the reading is authoritative and empty. */
+  emptyText: string;
+  /** Shown when the reading hasn't landed yet. Defaults to `emptyText` for
+   *  readings that have no pending state (e.g. the injected list, always a
+   *  concrete — if possibly not-yet-fetched-once — array). */
+  pendingText?: string;
+}) {
+  const state = skillReadingState(skills);
+  const list = skills ?? [];
+  return (
+    <div>
+      <div className="flex items-center" title={hint}>
+        <span className="text-[10.5px] font-medium uppercase tracking-wide text-ink-faint">
+          {label}
+        </span>
+        {state !== "pending" && (
+          <span className="ml-auto text-[10.5px] text-ink-faint">{list.length}</span>
+        )}
+      </div>
+      <SkillGroupBody state={state} list={list} pendingText={pendingText} emptyText={emptyText} />
+    </div>
+  );
+}
+
+function SkillGroupBody<T extends NamedSkill>({
+  state,
+  list,
+  pendingText,
+  emptyText,
+}: {
+  state: SkillReadingState;
+  list: T[];
+  pendingText: string;
+  emptyText: string;
+}) {
+  if (state === "list") {
+    return (
+      <OverflowList
+        items={list}
+        head={10}
+        layout="wrap"
+        renderItem={(s) => (
+          <span
+            key={s.name}
+            title={s.description}
+            className="rounded-[var(--radius-sm)] border border-border bg-surface px-2 py-0.5 text-[11.5px] text-ink"
+          >
+            {s.name}
+          </span>
+        )}
+      />
+    );
+  }
+  const text: Record<Exclude<SkillReadingState, "list">, string> = { pending: pendingText, empty: emptyText };
+  return <div className="mt-1.5 text-[11px] text-ink-faint">{text[state]}</div>;
 }
 
 /** created_at → epoch for ordering. Store writes Unix seconds as a string;
