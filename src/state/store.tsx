@@ -108,6 +108,30 @@ export function threadLiveCounts(
   };
 }
 
+/** A NeedItem the human must actually act on — excludes a display-only NOTICE
+ *  (the self-clearing stall hint, `answerable: false`): it surfaces in the
+ *  Needs-you queue as an FYI row but has no answer to give and clears itself
+ *  automatically once the task recovers. Single source of truth for every
+ *  "needs you" badge/count/urgent-flag so a stall notice can't inflate a number
+ *  that promises "N things need your action" (issue #105). */
+export function isPendingNeed(item: NeedItem): boolean {
+  return item.answerable;
+}
+
+/** Workspace-wide "needs you" count: real agent questions (excludes
+ *  self-clearing NOTICEs via `isPendingNeed`) + tool-permission asks + pending
+ *  write triggers — everything actually waiting on the human. Single source for
+ *  every numeric badge (dock strip, nav item) so they can't drift apart; the
+ *  Needs-you queue itself still RENDERS a notice row (so a stall hint stays
+ *  reachable) — it just doesn't count toward this number. */
+export function pendingNeedsCount(
+  needs: NeedItem[],
+  asks: PermissionAsk[],
+  writeTriggers: WriteTrigger[],
+): number {
+  return needs.filter(isPendingNeed).length + asks.length + writeTriggers.length;
+}
+
 const PROCESS_QUOTA_NOTICE_VIEW: Record<
   ProcessQuotaNotice,
   { key: string; tone: ToastTone }
@@ -501,6 +525,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   } | null>(null);
   const [proposal, setProposal] = useState<ResolvedProposal | null>(null);
   const [overview, setOverview] = useState<ThreadOverview[]>([]);
+  // Monotonic request token so an older, slower-resolving workspace_overview
+  // fetch (e.g. the WorkspaceKanban mount fetch racing a just-issued
+  // post-create refresh) can never clobber a fresher one that already landed —
+  // last REQUEST issued wins, not last response to arrive.
+  const overviewReqRef = useRef(0);
   // Thread-bus drawer + proposal-review state.
   const [showBus, setShowBus] = useState(false);
   const [reviewingProposal, setReviewingProposal] = useState(false);
@@ -814,11 +843,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const refreshOverview = useCallback(async () => {
     if (activeWorkspaceId == null) {
+      overviewReqRef.current += 1;
       setOverview([]);
       return;
     }
+    const reqId = ++overviewReqRef.current;
     try {
-      setOverview(await api.workspaceOverview(activeWorkspaceId));
+      const data = await api.workspaceOverview(activeWorkspaceId);
+      // A newer refreshOverview() was issued while this one was in flight —
+      // drop this stale response instead of overwriting the fresher state.
+      if (reqId !== overviewReqRef.current) return;
+      setOverview(data);
     } catch (e) {
       /* ignore */
       console.error(e);
@@ -1063,11 +1098,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     async (title: string, kind: string) => {
       if (activeWorkspaceId == null) throw new Error("no workspace");
       const t = await api.createThread(activeWorkspaceId, title, kind);
-      setThreads(await api.listThreads(activeWorkspaceId));
-      void refreshOverview();
+      // Await BOTH the sidebar list and the board overview before returning —
+      // the dialog navigates into the new issue right after this resolves, so a
+      // fire-and-forget overview refresh could still be in flight (or, worse,
+      // race a slower-resolving earlier fetch) when the caller assumes both
+      // views are already consistent. See issue #106.
+      const [threadList] = await Promise.all([
+        api.listThreads(activeWorkspaceId),
+        refreshOverview(),
+      ]);
+      setThreads(threadList);
       return t;
     },
-    [activeWorkspaceId],
+    [activeWorkspaceId, refreshOverview],
   );
 
   const deleteThread = useCallback(

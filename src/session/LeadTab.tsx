@@ -398,6 +398,7 @@ export function LeadTab({
         <SessionInfoPanel
           meta={leadMeta[tid]}
           skills={skills}
+          tool={leadTool}
           subtasks={directionsByThread[tid]}
           onOpenSubtask={(directionId) => {
             // Resolve the direction's live worktree → its worker surface. The

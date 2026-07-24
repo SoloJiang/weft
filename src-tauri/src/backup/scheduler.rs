@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant};
 
 use crate::backup::{config, BackupService};
@@ -22,19 +23,35 @@ use crate::backup::{config, BackupService};
 /// runtime in scope — bare `tokio::spawn` there panics with
 /// "there is no reactor running".
 pub fn spawn(svc: BackupService) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            let next_in = match next_delay(&svc).await {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("[weft][backup] scheduler tick read config failed: {e:#}");
-                    Duration::from_secs(60)
-                }
-            };
-            sleep_until(Instant::now() + next_in).await;
-            let _ = svc.run_now().await;
-        }
-    });
+    // The app never listens for tick completions, so the receiver is dropped
+    // right here; `run_loop` publishes via `send_replace`, which is fine with
+    // zero receivers. One loop implementation serves app and tests alike.
+    let (ticks, _) = watch::channel(0u64);
+    tauri::async_runtime::spawn(run_loop(svc, ticks));
+}
+
+/// The scheduler loop itself, factored out of `spawn` as a test seam.
+///
+/// After every completed tick — `run_now` returned and its outcome is already
+/// recorded in `backup_config` — the completed-tick count is published on
+/// `ticks`. Tests run this future on their own runtime so they can await tick
+/// completion instead of guessing wall-clock durations, and abort it on
+/// teardown instead of leaking an eternal loop.
+pub async fn run_loop(svc: BackupService, ticks: watch::Sender<u64>) {
+    let mut completed: u64 = 0;
+    loop {
+        let next_in = match next_delay(&svc).await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[weft][backup] scheduler tick read config failed: {e:#}");
+                Duration::from_secs(60)
+            }
+        };
+        sleep_until(Instant::now() + next_in).await;
+        let _ = svc.run_now().await;
+        completed += 1;
+        ticks.send_replace(completed);
+    }
 }
 
 /// Pick when to fire next.

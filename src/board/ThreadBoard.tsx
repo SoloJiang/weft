@@ -19,7 +19,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useStore } from "../state/store";
+import { isPendingNeed, useStore } from "../state/store";
 import type { Direction, RepoChecks, SessionStatus, Worktree } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { Dialog, DialogPanel } from "../components/ui/Dialog";
@@ -96,7 +96,7 @@ export function ThreadBoard() {
   };
 
   const urgent = (d: Direction): boolean =>
-    needs.some((n) => n.direction_id === d.id) ||
+    needs.some((n) => n.direction_id === d.id && isPendingNeed(n)) ||
     asks.some((a) => a.dir === String(d.id)) ||
     (checksByDirection[d.id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail"));
 
@@ -224,7 +224,7 @@ function DirectionCard({
   const failed = allChecks.filter((c) => c.status === "fail").length;
   const passed = allChecks.filter((c) => c.status === "pass").length;
   const hasNeed =
-    needs.some((n) => n.direction_id === direction.id) ||
+    needs.some((n) => n.direction_id === direction.id && isPendingNeed(n)) ||
     asks.some((a) => a.dir === String(direction.id));
   const firstWrite = liveWrites[0];
 
