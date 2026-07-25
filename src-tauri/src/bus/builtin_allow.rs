@@ -213,11 +213,13 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
 ///    `Grep`/`Glob` then default to the engine's own cwd, which weft set to a
 ///    root when it spawned the session — a fact that only holds once the
 ///    session RESOLVED, hence the empty-`roots` refusal below.
-/// 2. Recursively, ANY string value that looks like an absolute path must be
-///    contained. This is the one that doesn't depend on knowing the tool's
-///    schema: an argument key that isn't in `TARGET_KEYS` — one added by a
-///    later CLI release, or a nested option object — still can't point out of
-///    the session's directories.
+/// 2. Recursively, EVERY string value must stay inside the roots — absolute
+///    ones by containment, relative ones by carrying no `..` component (see
+///    `string_stays_in_root`). This is the rule that doesn't depend on knowing
+///    the tool's schema: an argument key that isn't in `TARGET_KEYS` — one
+///    added by a later CLI release, a nested option object, or a glob pattern
+///    that is a path in all but name — still can't reach out of the session's
+///    directories.
 ///
 /// KNOWN, ACCEPTED over-refusals from rule 2, both of which cost a click and
 /// never an unwanted approval:
@@ -265,21 +267,47 @@ pub fn paths_contained(input: Option<&Value>, roots: &[PathBuf]) -> bool {
             }
         }
     }
-    every_absolute_path_contained(v, roots)
+    every_string_stays_in_root(v, roots)
 }
 
 /// Rule 2 of `paths_contained`, walked over the whole argument value.
-fn every_absolute_path_contained(v: &Value, roots: &[PathBuf]) -> bool {
+fn every_string_stays_in_root(v: &Value, roots: &[PathBuf]) -> bool {
     match v {
-        Value::String(s) => !Path::new(s).is_absolute() || contained(s, roots),
-        Value::Array(items) => items
-            .iter()
-            .all(|i| every_absolute_path_contained(i, roots)),
-        Value::Object(map) => map
-            .values()
-            .all(|i| every_absolute_path_contained(i, roots)),
+        Value::String(s) => string_stays_in_root(s, roots),
+        Value::Array(items) => items.iter().all(|i| every_string_stays_in_root(i, roots)),
+        Value::Object(map) => map.values().all(|i| every_string_stays_in_root(i, roots)),
         _ => true,
     }
+}
+
+/// One string argument can't reach outside `roots`.
+///
+/// The two halves are judged differently because they escape differently:
+///
+/// - ABSOLUTE: canonicalized and checked against the roots (`contained`). That
+///   collapses any `..` along the way, so `/wt/src/../lib.rs` is correctly
+///   judged by where it actually lands, not by how it's spelled.
+/// - RELATIVE: safe only because it resolves under the ENGINE'S CWD, which weft
+///   set to a root. A `..` component breaks exactly that premise — it climbs
+///   above the directory the value is relative TO, whatever that is, so no
+///   amount of checking the rest of the string helps. Refused outright.
+///
+/// The relative half is what catches `Glob {"pattern": "../outside/*"}`: the
+/// pattern isn't absolute, so the containment check never looked at it, yet
+/// glob resolution walks straight up out of the root and `classify_risk` still
+/// (correctly) calls the call read-only. Caught in review by Codex on PR #146.
+///
+/// Checking COMPONENTS rather than substrings keeps a regex like `a..b` — one
+/// component, not a parent reference — out of it. A relative value that
+/// harmlessly doubles back inside the root (`src/../lib.rs`) is refused too:
+/// over-refusal, the accepted direction, and not a shape the engines emit.
+fn string_stays_in_root(s: &str, roots: &[PathBuf]) -> bool {
+    let p = Path::new(s);
+    if p.is_absolute() {
+        return contained(s, roots);
+    }
+    !p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 #[cfg(test)]
@@ -574,6 +602,54 @@ mod tests {
             );
         }
         assert!(!paths_contained(None, &[]));
+    }
+
+    /// A RELATIVE argument climbs out with `..` — the absolute-path rule never
+    /// looks at it, but glob/path resolution follows it right out of the root.
+    ///
+    /// `Glob {"pattern": "../outside/*"}` is the shape that matters: no
+    /// absolute string anywhere, an optional `path` that is itself perfectly
+    /// contained, and `classify_risk` correctly calling the whole thing
+    /// read-only — so every other guard says yes. Codex caught it on PR #146.
+    #[test]
+    fn parent_traversing_relative_args_are_refused() {
+        let t = TempTree::new("dotdot-rel");
+        let wt = t.0.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = vec![wt.clone()];
+        for escaping in [
+            json!({ "pattern": "../outside/*" }),
+            // ...even alongside a `path` that IS contained: the pattern
+            // resolves relative to it and climbs out anyway.
+            json!({ "pattern": "../*", "path": wt.to_string_lossy() }),
+            json!({ "pattern": "**/../../etc/*" }),
+            json!({ "opts": { "globs": ["ok/*", "../escape/*"] } }),
+        ] {
+            assert!(
+                !paths_contained(Some(&escaping), &roots),
+                "a parent-traversing relative arg must not be auto-approved: {escaping}"
+            );
+        }
+    }
+
+    /// The mirror: ordinary relative arguments — the overwhelmingly common
+    /// case — must keep working, so the `..` refusal can't be "fixed" by
+    /// something that refuses every relative value.
+    #[test]
+    fn ordinary_relative_args_still_pass() {
+        let t = TempTree::new("rel-ok");
+        for fine in [
+            json!({ "pattern": "**/*.rs" }),
+            json!({ "pattern": "src/**/*.ts", "output_mode": "content" }),
+            // `..` as regex syntax, not a path component: one component named
+            // `a..b`, which is not a parent reference.
+            json!({ "pattern": "a..b" }),
+        ] {
+            assert!(
+                paths_contained(Some(&fine), &t.roots()),
+                "an ordinary relative arg must stay auto-approved: {fine}"
+            );
+        }
     }
 
     /// The mirror of the above, so the empty-roots refusal can't be "fixed" by

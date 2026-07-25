@@ -407,6 +407,56 @@ async fn direction_from_another_thread_fails_closed() {
     assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
 }
 
+/// A `Glob` whose PATTERN climbs out of the worktree with `..` must still stop
+/// for the human — the second hole Codex found on PR #146.
+///
+/// Nothing else catches this shape: the pattern isn't absolute so containment
+/// never inspects it, the session resolves fine, and `classify_risk` correctly
+/// rates a Glob read-only. Only the relative-`..` rule refuses it.
+#[tokio::test]
+async fn glob_pattern_climbing_out_of_the_worktree_surfaces_the_card() {
+    let tree = TempTree::new("globescape");
+    let wt = tree.dir("wt");
+    file_in(&wt, "src/main.rs");
+    tree.file("elsewhere/notes.rs");
+    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+
+    // Sanity: the ordinary relative pattern on the same session is still
+    // auto-approved, so the assertion below is about `..`, not about relative
+    // patterns being refused wholesale.
+    let ok = ask_unattended(
+        &base,
+        thread,
+        &dir.to_string(),
+        "claude",
+        "Glob",
+        serde_json::json!({ "pattern": "**/*.rs" }),
+    )
+    .await;
+    assert!(
+        ok.contains("\"permissionDecision\":\"allow\""),
+        "an ordinary relative glob must stay auto-approved, got {ok}"
+    );
+
+    let base2 = base.clone();
+    let dir_s = dir.to_string();
+    let call = tokio::spawn(async move {
+        ask(
+            &base2,
+            thread,
+            &dir_s,
+            "claude",
+            "Glob",
+            serde_json::json!({ "pattern": "../elsewhere/*" }),
+        )
+        .await
+    });
+
+    let id = wait_for_card(&asks, "a glob pattern climbing out of the worktree").await;
+    assert!(asks.answer(id, Answer::Deny));
+    assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
+}
+
 /// The same fail-closed identity check, exercised through the form that names
 /// NO path — the hole Codex found on PR #146.
 ///
