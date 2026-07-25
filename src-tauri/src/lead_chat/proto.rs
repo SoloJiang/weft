@@ -51,6 +51,15 @@ pub struct ToolCall {
     pub summary: String,
     pub output: Option<String>,
     pub is_error: bool,
+    /// app-server `collabAgentToolCall` items only: the spawned/target sub-agent
+    /// thread id(s) this call knows about (`receiverThreadIds`) — empty until the
+    /// call resolves enough to know them (e.g. a spawn's `item/started` has none
+    /// yet). Lets the frontend deterministically group that sub-agent's own rows
+    /// (tagged by `ChatEvent`'s `agent_thread`, issue #99) under this row instead
+    /// of guessing from arrival order. Always empty for every other dialect/tool —
+    /// exec's transport has no per-event thread id for a child's rows to ever
+    /// carry, so capturing it there would be dead data (see codex_app_server.rs).
+    pub collab_threads: Vec<String>,
 }
 
 /// One tool result block (claude `user` message), correlated to its `Assistant`
@@ -60,6 +69,15 @@ pub struct ToolResultItem {
     pub id: String,
     pub output: String,
     pub is_error: bool,
+    /// Mirrors `ToolCall::collab_threads` — load-bearing here specifically for
+    /// a `spawnAgent` collab call: `receiverThreadIds` is EMPTY on its
+    /// `item/started` (the child doesn't exist yet) and only becomes known on
+    /// `item/completed`, which maps to a `ToolResults` event, not `Assistant`
+    /// — so this is the ONLY place that case's thread id is ever captured.
+    /// `merge_tool_results` (engine.rs) merges it into the row alongside
+    /// output/is_error. Empty for every dialect but app-server (see
+    /// `ToolCall::collab_threads`).
+    pub collab_threads: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -78,6 +96,14 @@ pub enum ChatEvent {
         /// agentMessage)靠它各自成行,不再交错拼进同一个气泡。exec/claude 方言是
         /// 单串行流 → None(引擎的匿名单槽,行为与历史一致)。
         item: Option<String>,
+        /// RAW app-server `threadId` this event arrived on (issue #99) — the
+        /// conversation/agent that produced it, main narration and every collab
+        /// sub-agent alike. NOT yet "is this a branch": the engine (which alone
+        /// knows the session's OWN thread id) compares this against it to decide
+        /// mainline vs sub-agent. Always None for exec/claude/opencode — their
+        /// transports carry no per-event thread id to read (see codex_app_server.rs
+        /// doc on `notification_to_event`).
+        agent_thread: Option<String>,
     },
     /// 一段文本的定稿(app-server):`item=Some` 收敛该 item 的流式行——`text` 是
     /// 权威全文(修复丢帧/重帧);无开放行或 `item=None` 时,以一条独立的已完成行
@@ -85,6 +111,10 @@ pub enum ChatEvent {
     TextDone {
         item: Option<String>,
         text: Option<String>,
+        /// See `TextDelta::agent_thread` — only load-bearing for the standalone
+        /// (no prior open row) case; an item that already streamed carries its tag
+        /// via the `open_texts` row created by its first delta.
+        agent_thread: Option<String>,
     },
     /// One complete assistant message event: its text blocks plus any tool calls
     /// it started. Codex builds pill-only calls (transient activity); claude and
@@ -94,6 +124,10 @@ pub enum ChatEvent {
         texts: Vec<String>,
         tools: Vec<ToolCall>,
         uuid: Option<String>,
+        /// See `TextDelta::agent_thread`. Stamped onto every tool this event
+        /// carries — app-server only ever sends one per event, so a single tag
+        /// is unambiguous.
+        agent_thread: Option<String>,
     },
     /// Tool results delivered out-of-band (claude `user` message), each
     /// correlated to its `Assistant` tool call by id.
@@ -164,11 +198,15 @@ fn parse_codex(line: &str) -> ChatEvent {
                         .unwrap_or_default(),
                     tools: vec![],
                     uuid: None,
+                    // exec's own envelope carries no per-event thread id (see the
+                    // module doc + codex_app_server.rs) — always mainline.
+                    agent_thread: None,
                 },
                 Some("agent_message") => ChatEvent::Other,
                 Some("error") => ChatEvent::TextDelta {
                     text: error_text_from_item(item),
                     item: None,
+                    agent_thread: None,
                 },
                 Some("reasoning") => ChatEvent::Other,
                 // Real tool items → rows (started: running; completed: result, merged
@@ -188,6 +226,7 @@ fn parse_codex(line: &str) -> ChatEvent {
                             texts: vec![],
                             tools: vec![codex_tool_call(item)],
                             uuid: None,
+                            agent_thread: None,
                         }
                     }
                 }
@@ -195,7 +234,12 @@ fn parse_codex(line: &str) -> ChatEvent {
                 // completion (exec has no deltas) — surface it so it isn't dropped;
                 // the running half and payload-less items stay Other (no empty row).
                 _ if completed => match codex_content_item_text(item) {
-                    Some(text) => ChatEvent::Assistant { texts: vec![text], tools: vec![], uuid: None },
+                    Some(text) => ChatEvent::Assistant {
+                        texts: vec![text],
+                        tools: vec![],
+                        uuid: None,
+                        agent_thread: None,
+                    },
                     None => ChatEvent::Other,
                 },
                 _ => ChatEvent::Other,
@@ -235,6 +279,13 @@ fn codex_tool_call(item: &Value) -> ToolCall {
         summary: codex_tool_summary(item),
         output: None,
         is_error: false,
+        // exec's `collab_agent_tool_call` item DOES carry `receiver_thread_ids`
+        // (same underlying ThreadItem as app-server), but exec's own per-event
+        // envelope has no thread id on any OTHER item for a child's rows to ever
+        // be tagged with (see codex_app_server.rs's notification_to_event doc) —
+        // capturing it here would be dead data nothing could ever match. Left
+        // empty; only the app-server dialect populates this (issue #99).
+        collab_threads: Vec::new(),
     }
 }
 
@@ -245,6 +296,9 @@ fn codex_tool_result(item: &Value) -> ToolResultItem {
         id: item["id"].as_str().unwrap_or_default().to_string(),
         output: cap_output(codex_item_output(item)),
         is_error: codex_item_is_error(item),
+        // exec has no per-event thread id for a child's rows to ever carry —
+        // see ToolCall::collab_threads.
+        collab_threads: Vec::new(),
     }
 }
 
@@ -358,6 +412,7 @@ fn parse_opencode(line: &str) -> ChatEvent {
                 .unwrap_or_default(),
             tools: vec![],
             uuid: None,
+            agent_thread: None,
         },
         Some("tool_use") => {
             let state = &part["state"];
@@ -380,8 +435,11 @@ fn parse_opencode(line: &str) -> ChatEvent {
                     summary,
                     output: Some(opencode_output(state)),
                     is_error: status == "error",
+                    // opencode has no collab/sub-agent concept at all.
+                    collab_threads: Vec::new(),
                 }],
                 uuid: None,
+                agent_thread: None,
             }
         }
         _ => ChatEvent::Other,
@@ -507,6 +565,7 @@ pub fn parse_line(line: &str) -> ChatEvent {
                 ChatEvent::TextDelta {
                     text: d["text"].as_str().unwrap_or_default().to_string(),
                     item: None,
+                    agent_thread: None,
                 }
             } else {
                 ChatEvent::Other
@@ -538,6 +597,10 @@ pub fn parse_line(line: &str) -> ChatEvent {
                             summary,
                             output: None,
                             is_error: false,
+                            // claude's Task/sub-agent tool never streams its own
+                            // transcript back to the parent's JSON stream — no
+                            // collab/sub-agent concept here at all.
+                            collab_threads: Vec::new(),
                         });
                     }
                     _ => {}
@@ -547,6 +610,7 @@ pub fn parse_line(line: &str) -> ChatEvent {
                 texts,
                 tools,
                 uuid: v["uuid"].as_str().map(str::to_string),
+                agent_thread: None,
             }
         }
         // Tool results come back as a `user` turn whose content is one or more
@@ -563,6 +627,8 @@ pub fn parse_line(line: &str) -> ChatEvent {
                         id: b["tool_use_id"].as_str().unwrap_or_default().to_string(),
                         output: tool_result_text(&b["content"]),
                         is_error: b["is_error"].as_bool().unwrap_or(false),
+                        // claude has no collab/sub-agent concept at all.
+                        collab_threads: Vec::new(),
                     });
                 }
             }
@@ -753,7 +819,10 @@ mod tests {
     #[test]
     fn parses_text_delta() {
         let l = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"He"}}}"#;
-        assert!(matches!(parse_line(l), ChatEvent::TextDelta { text, item: None } if text == "He"));
+        assert!(matches!(
+            parse_line(l),
+            ChatEvent::TextDelta { text, item: None, agent_thread: None } if text == "He"
+        ));
     }
 
     #[test]
@@ -780,7 +849,7 @@ mod tests {
     fn parses_assistant_blocks() {
         let l = r#"{"type":"assistant","uuid":"u-1","message":{"content":[{"type":"text","text":"done"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/a/b.rs"}}]}}"#;
         match parse_line(l) {
-            ChatEvent::Assistant { texts, tools, uuid } => {
+            ChatEvent::Assistant { texts, tools, uuid, agent_thread } => {
                 assert_eq!(texts, vec!["done"]);
                 assert_eq!(tools[0].id, "toolu_1");
                 assert_eq!(tools[0].name, "Read");
@@ -790,6 +859,8 @@ mod tests {
                 assert!(tools[0].output.is_none());
                 // transcript uuid rides along as the rewind anchor
                 assert_eq!(uuid.as_deref(), Some("u-1"));
+                // claude has no collab/sub-agent concept — always mainline.
+                assert_eq!(agent_thread, None);
             }
             e => panic!("{e:?}"),
         }

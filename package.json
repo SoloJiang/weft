@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node --test --experimental-strip-types tests/frontend/*.test.ts"
   },
   "dependencies": {
     "@radix-ui/react-collapsible": "^1.1.14",
