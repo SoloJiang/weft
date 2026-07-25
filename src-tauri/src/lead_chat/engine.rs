@@ -3519,7 +3519,9 @@ async fn codex_consumer(
                 let (tool, summary, detail, risk, action_key) =
                     codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
-                match registry.auto_decision(thread_id, &dir, &action_key) {
+                // `risk` gates issue #103's read-only batch/issue grants inside
+                // auto_decision; it never widens Full/Always, which ignore it.
+                match registry.auto_decision(thread_id, &dir, risk, &action_key) {
                     // dangerous mode / full access / always-allow: reply inline (fast).
                     Some(d) => {
                         let allow = matches!(d, crate::ask::Decision::Allow);

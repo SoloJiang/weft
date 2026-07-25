@@ -14,6 +14,7 @@ import { RewindDialog, RewindPickerDialog } from "./RewindDialog";
 import { EngineSwitchDialog } from "./EngineSwitchDialog";
 import { useRepoActions } from "./useRepoActions";
 import { api } from "../lib/api";
+import { readOnlyRevokeDir, readOnlyScopeOf } from "../lib/grants";
 import type { EnabledSkill, LeadStateInfo } from "../lib/types";
 import { nativeSessionResumeTarget } from "../lib/resume";
 import { toolFullName } from "../components/ToolIcon";
@@ -97,6 +98,8 @@ export function LeadTab({
     leadRail,
     setLeadRail,
     viewDirection,
+    readOnlyGrants,
+    revokeReadOnlyGrant,
   } = useStore();
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
@@ -264,6 +267,10 @@ export function LeadTab({
   }, [tid, testPlanRefreshKey, testPlanEditNonce]);
 
   if (tid == null) return null;
+  // Issue #103: the lead session's read-only auto-allow scope. A lead/planning
+  // session's ask carries dir="" (see ask.rs's Ask.dir doc), the same identity
+  // the asks filter above (line ~359) and releaseSessionReadOnly already key on.
+  const readOnlyScope = readOnlyScopeOf(readOnlyGrants, tid, "");
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
   const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
@@ -493,6 +500,12 @@ export function LeadTab({
           onReload={onReload}
           onSwitchEngine={() => setSwitchOpen(true)}
           busy={isInFlight(turn.state)}
+          readOnlyScope={readOnlyScope}
+          onRevokeReadOnlyTrust={
+            readOnlyScope === "none"
+              ? undefined
+              : () => void revokeReadOnlyGrant(tid, readOnlyRevokeDir(readOnlyScope, ""))
+          }
         />
       )}
       {rail === "tests" && (

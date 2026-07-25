@@ -27,6 +27,10 @@ mod deps_bootstrap;
 mod detect;
 mod gc;
 pub mod git;
+/// Test-only: shared driver for the generated ask-hook scripts (see the module
+/// docs — one copy so claude's and codex's hook tests can't drift apart).
+#[cfg(test)]
+mod hook_test_support;
 pub mod im;
 mod inspect;
 pub mod lead_chat;
@@ -263,6 +267,9 @@ pub fn run() {
             commands::answer_permission,
             commands::list_auth_grants,
             commands::revoke_auth_grant,
+            commands::read_only_grants,
+            commands::release_session_read_only,
+            commands::revoke_read_only_grant,
             commands::resolve_action_card,
             commands::set_dangerous_mode,
             commands::set_keep_awake,

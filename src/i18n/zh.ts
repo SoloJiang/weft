@@ -266,6 +266,7 @@ export const zh = {
     baseBranch: "基线分支",
     baseBranchHint: "从该分支拉出工作分支（留空 = 仓库默认分支）",
     planSummary: "方案摘要",
+    readOnlyPropagationNote: "批准后，这些 worker 的只读检查（如 git status）也会自动放行，无需再问——随时可在看板上撤销。",
   },
   notify: {
     needsTitle: "待你处理",
@@ -299,6 +300,8 @@ export const zh = {
     denyTitle: "拒绝这次请求，交回 agent 自行决定",
     fullAccess: "完全访问",
     fullAccessTitle: "自动批准该任务的所有请求",
+    releaseReadOnly: "放行本会话只读",
+    releaseReadOnlyTitle: "以后自动放行本会话内的全部只读请求（写入、网络/凭证类请求仍会询问）",
     emptyTitle: "暂无待办",
     emptyBody:
       "当 agent 遇到只有你能拍板的决定时，会在这里发问。你回答一次，答复会直接回到它的收件箱，你无需去翻找会话。",
@@ -457,6 +460,12 @@ export const zh = {
     engine: "引擎",
     engineUnknown: "未知",
     switchEngine: "切换…",
+    // issue #103:本会话的只读自动放行状态（只存内存，重启即失效；恒不覆盖写入
+    // 或网络/凭证类请求）。
+    access: "授权",
+    readOnlyIssueTrusted: "只读已放行（整个 issue）",
+    readOnlySessionTrusted: "只读已放行（本会话）",
+    revokeReadOnlyTrust: "撤销",
   },
   observe: {
     answerPlaceholder: "输入回复，回车发送",
@@ -886,6 +895,14 @@ export const zh = {
     revokeConfirm: "撤销授权",
     revokeFailed: "撤销失败——该授权仍然有效，请重试。",
     grantNotSaved: "已临时授权，但未能保存——重启后可能会再次询问。",
+    // issue #103:只读自动放行——与上面完全访问/始终允许是两套独立授权，只存内
+    // 存、不落盘（重启即失效），且恒不覆盖写入或网络/凭证类请求。
+    readOnlyIssue: "只读已放行",
+    readOnlyIssueTitle: "批准派发时，已把只读请求的信任下放给该 issue 的每个 worker——点击撤销",
+    revokeReadOnlyTitle: "撤销只读放行？",
+    revokeReadOnlyIssueBody:
+      "该 issue 下的每个 worker 都会停止自动放行只读请求——下一次会重新询问你。不影响完全访问或始终允许规则。",
+    readOnlyReleased_other: "已放行 {{count}} 个只读请求。",
   },
   ai: {
     shellSnippet: "Shell 片段",
