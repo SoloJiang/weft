@@ -1435,6 +1435,32 @@ pub async fn set_default_tool(db: State<'_, Db>, tool: String) -> R<()> {
         .map_err(e)
 }
 
+/// issue #97: whether Weft should auto-switch a thread/session to its
+/// fallback engine when the current one reports its usage limit as exceeded
+/// (`crate::lead_chat::commands::maybe_failover_on_quota`). Opt-in, default
+/// off — see `K_QUOTA_FAILOVER_ENABLED`'s doc for why.
+#[tauri::command]
+pub async fn get_quota_failover_enabled(db: State<'_, Db>) -> R<bool> {
+    Ok(matches!(
+        repo::get_setting(&db, crate::lead_chat::commands::K_QUOTA_FAILOVER_ENABLED)
+            .await
+            .map_err(e)?
+            .as_deref(),
+        Some("1") | Some("true")
+    ))
+}
+
+#[tauri::command]
+pub async fn set_quota_failover_enabled(db: State<'_, Db>, enabled: bool) -> R<()> {
+    repo::set_setting(
+        &db,
+        crate::lead_chat::commands::K_QUOTA_FAILOVER_ENABLED,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(e)
+}
+
 /// The user-configured coding-agent command overrides ("aliases"): identity →
 /// command (e.g. `claude` → `cc-claude`). Empty map when none are set.
 #[tauri::command]

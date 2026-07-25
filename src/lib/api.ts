@@ -322,6 +322,12 @@ export const api = {
   detectTools: () => invoke<ToolStatus[]>("detect_tools"),
   getDefaultTool: () => invoke<DefaultToolInfo>("get_default_tool"),
   setDefaultTool: (tool: string) => invoke<void>("set_default_tool", { tool }),
+  // issue #97: auto fail-over to the fallback engine on a quota-exceeded turn.
+  // Opt-in — off by default, since switching engines mid-task ships that
+  // engine's own history digest to a DIFFERENT provider.
+  getQuotaFailoverEnabled: () => invoke<boolean>("get_quota_failover_enabled"),
+  setQuotaFailoverEnabled: (enabled: boolean) =>
+    invoke<void>("set_quota_failover_enabled", { enabled }),
   // Per-tool command overrides ("aliases", e.g. claude → cc-claude): identity →
   // command. Empty map when none configured.
   getToolCommands: () => invoke<Record<string, string>>("get_tool_commands"),

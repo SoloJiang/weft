@@ -29,6 +29,24 @@ export interface ResourceOwnerCount {
   count: number;
 }
 
+/** An engine's usage-limit standing (issue #97) — mirrors the Rust
+ *  `engine_quota::QuotaStatus` discriminant as-is; the warn/exceeded cutoffs
+ *  live in Rust (`engine_quota::status_for`), not re-derived here. */
+export type EngineQuotaLevel = "ok" | "warning" | "exceeded";
+
+/** One engine's most recently observed quota signal (`engine_quota::QuotaSnapshot`).
+ *  `tool` crosses the IPC boundary as a plain string (not narrowed to `Tool`) —
+ *  same defensive-typing reason `ResourceOwnerCount.kind` is a plain string. */
+export interface EngineQuotaSnapshot {
+  tool: string;
+  status: EngineQuotaLevel;
+  usedPercent: number | null;
+  /** Unix seconds the window resets, when the source reported one. */
+  resetsAt: number | null;
+  windowLabel: string | null;
+  observedAt: number;
+}
+
 /** Read-only local-runtime dashboard snapshot (issue #112). Combines the three
  *  process-tree safety-net axes — no sampling happens here, this only aggregates
  *  what `process_quota` / `proc_registry` / `session_gate` already track. */
@@ -41,6 +59,9 @@ export interface ResourceDashboardSnapshot {
   byOwner: ResourceOwnerCount[];
   activeSessions: number;
   maxSessions: number;
+  /** Per-engine usage-limit snapshots (issue #97). An engine never observed
+   *  this run is simply absent — not a fabricated "ok" reading. */
+  engineQuota: EngineQuotaSnapshot[];
 }
 
 export interface Workspace {
@@ -283,8 +304,14 @@ export interface LeadMessage {
      *  timeline; content is {"from_message_id": number, "deleted": number}. */
     | "rewind"
     /** Marker row for an engine/model switch (issue #96/#98); content is
-     *  {"old_tool","new_tool","old_model","new_model"} (models nullable). */
-    | "engine_switch";
+     *  {"old_tool","new_tool","old_model","new_model","reason"} (models and
+     *  reason nullable — reason is "quota_exceeded" for issue #97's auto
+     *  fail-over, absent for a human-initiated switch). */
+    | "engine_switch"
+    /** Marker row for a FAILED auto fail-over attempt (issue #97); content is
+     *  {"tool","fallback","error"} — the attempted switch never completed, so
+     *  `tool` is unchanged (unlike "engine_switch", there is no old/new pair). */
+    | "quota_failover_failed";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";

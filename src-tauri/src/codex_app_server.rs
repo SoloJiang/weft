@@ -365,6 +365,55 @@ pub fn turn_error_text(params: &Value) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
+/// A codex app-server `RateLimitSnapshot` (the `rateLimits` field of an
+/// `account/rateLimits/updated` notification, or of an `account/rateLimits/read`
+/// response) → an [`crate::engine_quota::QuotaSnapshot`] for "codex" (issue #97).
+///
+/// Ground truth: openai/codex `codex-rs/app-server-protocol/src/protocol/v2/account.rs`.
+/// `primary`/`secondary` are independent rolling windows (`usedPercent`: 0-100
+/// int, `resetsAt`: unix seconds, both camelCase on the wire); `rateLimitReachedType`
+/// is present (any string variant) only once the account has ACTUALLY hit a
+/// limit — that field, not a bare `usedPercent >= 100`, is the authoritative
+/// "exceeded" signal, since a sparse rolling update can carry the reached-type
+/// without a fresh percent on either window. When both windows are present, the
+/// more severe one wins (picked by percent, ties favor `primary`). `None` when
+/// the payload carries nothing usable — never fabricates an `Ok` reading from an
+/// absent/malformed snapshot.
+pub(crate) fn codex_quota_snapshot(rate_limits: &Value) -> Option<crate::engine_quota::QuotaSnapshot> {
+    if !rate_limits.is_object() {
+        return None;
+    }
+    let reached = rate_limits["rateLimitReachedType"].as_str().is_some();
+    let window = |key: &str| -> Option<(u32, Option<i64>)> {
+        let w = &rate_limits[key];
+        let pct = w["usedPercent"].as_i64()?.clamp(0, 100) as u32;
+        Some((pct, w["resetsAt"].as_i64()))
+    };
+    let primary = window("primary").map(|(pct, resets)| (pct, resets, "primary"));
+    let secondary = window("secondary").map(|(pct, resets)| (pct, resets, "secondary"));
+    let picked = match (primary, secondary) {
+        (Some(p), Some(s)) => Some(if s.0 > p.0 { s } else { p }),
+        (Some(p), None) => Some(p),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    };
+    let (used_percent, resets_at, window_label) = match picked {
+        Some((pct, resets, label)) => (Some(pct), resets, Some(label.to_string())),
+        None => (None, None, None),
+    };
+    if used_percent.is_none() && !reached {
+        return None;
+    }
+    Some(crate::engine_quota::QuotaSnapshot {
+        tool: "codex".to_string(),
+        status: crate::engine_quota::status_for(used_percent, reached),
+        used_percent,
+        resets_at,
+        window_label,
+        observed_at: crate::engine_quota::now_unix(),
+    })
+}
+
 /// Running `ToolCall` from an app-server `item.started` tool item.
 fn appserver_tool_call(item: &Value) -> crate::lead_chat::proto::ToolCall {
     crate::lead_chat::proto::ToolCall {
@@ -778,7 +827,27 @@ impl Client {
             self.shutdown_and_reap().await;
             return Err(e);
         }
+        // Issue #97: prime the quota hub right away instead of waiting for the
+        // first `account/rateLimits/updated` push, which may not arrive until
+        // AFTER a turn already ran on this connection — decoupled task so a
+        // slow/unsupported endpoint can never delay the connection itself.
+        let quota_probe = self.clone();
+        tauri::async_runtime::spawn(async move { quota_probe.refresh_quota_snapshot().await });
         Ok(())
+    }
+
+    /// Best-effort `account/rateLimits/read` → the engine_quota hub (issue #97).
+    /// Errors (older codex without this endpoint, a transient hiccup) are
+    /// swallowed: this is a proactive nice-to-have, never load-bearing for the
+    /// connection or a turn — the notification path (`read_loop`'s
+    /// `account/rateLimits/updated` branch) still populates the hub reactively
+    /// either way.
+    async fn refresh_quota_snapshot(&self) {
+        if let Ok(result) = self.request("account/rateLimits/read", Value::Null).await {
+            if let Some(snapshot) = codex_quota_snapshot(&result["rateLimits"]) {
+                crate::engine_quota::report(snapshot);
+            }
+        }
     }
 
     /// Demux the server's stdout for the connection's lifetime: correlate replies
@@ -829,6 +898,13 @@ impl Client {
                             ThreadMsg::AskResolved { request_id: params["requestId"].clone() },
                         )
                         .await;
+                    } else if method == "account/rateLimits/updated" {
+                        // Issue #97: account-scoped, no threadId to route on (and
+                        // no chat row to render) — land straight in the quota hub
+                        // instead of going through ChatEvent/route_resolved.
+                        if let Some(snapshot) = codex_quota_snapshot(&params["rateLimits"]) {
+                            crate::engine_quota::report(snapshot);
+                        }
                     }
                 }
                 Incoming::ServerRequest { id, method, params } => {
@@ -1498,6 +1574,66 @@ mod tests {
         );
         // A clean turn carries no error text.
         assert!(turn_error_text(&json!({"turn":{"status":"completed"}})).is_none());
+    }
+
+    #[test]
+    fn codex_quota_snapshot_reads_the_more_severe_window() {
+        use crate::engine_quota::QuotaStatus;
+        // Real-shaped `RateLimitSnapshot` (openai/codex app-server-protocol v2):
+        // a healthy primary (5h) window, secondary (7d weekly) approaching its cap.
+        let snapshot = codex_quota_snapshot(&json!({
+            "limitId": "codex",
+            "limitName": null,
+            "primary": {"usedPercent": 20, "windowDurationMins": 300, "resetsAt": 1_700_003_600},
+            "secondary": {"usedPercent": 85, "windowDurationMins": 10080, "resetsAt": 1_700_500_000},
+            "credits": null,
+            "individualLimit": null,
+            "spendControlReached": null,
+            "planType": "plus",
+            "rateLimitReachedType": null,
+        }))
+        .expect("usable snapshot");
+        assert_eq!(snapshot.tool, "codex");
+        assert_eq!(snapshot.status, QuotaStatus::Warning);
+        assert_eq!(snapshot.used_percent, Some(85));
+        assert_eq!(snapshot.resets_at, Some(1_700_500_000));
+        assert_eq!(snapshot.window_label.as_deref(), Some("secondary"));
+    }
+
+    #[test]
+    fn codex_quota_snapshot_reached_type_wins_even_over_a_low_percent() {
+        use crate::engine_quota::QuotaStatus;
+        // A sparse rolling update: the account just got rejected, but this
+        // particular push carries a stale/low usedPercent alongside it — the
+        // reached-type flag must still win (see the function's own doc).
+        let snapshot = codex_quota_snapshot(&json!({
+            "primary": {"usedPercent": 12, "resetsAt": null},
+            "secondary": null,
+            "rateLimitReachedType": "rate_limit_reached",
+        }))
+        .expect("usable snapshot");
+        assert_eq!(snapshot.status, QuotaStatus::Exceeded);
+    }
+
+    #[test]
+    fn codex_quota_snapshot_none_for_empty_or_malformed_payload() {
+        assert!(codex_quota_snapshot(&json!(null)).is_none());
+        assert!(codex_quota_snapshot(&json!({})).is_none());
+        assert!(codex_quota_snapshot(&json!({"primary": null, "secondary": null, "rateLimitReachedType": null})).is_none());
+        // Malformed usedPercent (not a number) on both windows: nothing usable.
+        assert!(codex_quota_snapshot(&json!({"primary": {"usedPercent": "oops"}})).is_none());
+    }
+
+    #[test]
+    fn codex_quota_snapshot_single_window_only() {
+        use crate::engine_quota::QuotaStatus;
+        // Only primary present (a freshly-created account has no secondary yet).
+        let snapshot = codex_quota_snapshot(&json!({
+            "primary": {"usedPercent": 100, "resetsAt": 1_700_100_000},
+        }))
+        .expect("usable snapshot");
+        assert_eq!(snapshot.status, QuotaStatus::Exceeded);
+        assert_eq!(snapshot.window_label.as_deref(), Some("primary"));
     }
 
     #[test]

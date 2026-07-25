@@ -3020,6 +3020,23 @@ fn codex_first_turn_text(system_prompt: &str, message: &str, had_native: bool) -
     }
 }
 
+/// issue #97: whether a `text` delta arriving on codex_consumer's anonymous
+/// slot (`item: None`) is an exact repeat of what's already at the TAIL of the
+/// accumulated buffer. codex app-server's only `item:None` deltas are error
+/// surfacing (see `codex_consumer`'s `None` arm) — a top-level `error`
+/// notification can be followed by the SAME message again via
+/// `turn/completed`'s embedded `turn.error.message`
+/// (`codex_app_server::turn_error_text`), which otherwise doubles the bubble.
+/// `ends_with` (not a whole-buffer `==`) so a repeat that follows OTHER
+/// already-buffered text (e.g. a transient reconnect banner ahead of the real
+/// failure) is still caught, not just a bare first-delta repeat. An
+/// empty/whitespace-only `text` is never "duplicate" — it just has nothing to
+/// dedupe against and should flow through as a harmless no-op append.
+fn is_anonymous_slot_duplicate(buf: &str, text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && buf.trim_end().ends_with(text)
+}
+
 /// One long-lived task per codex session: consume the thread's app-server
 /// stream, driving the SAME timeline-row / Push pipeline the stdout reader uses,
 /// and flushing the queue on turn end. Mirrors [`spawn_reader`]'s event handling.
@@ -3121,6 +3138,16 @@ async fn codex_consumer(
                         let Some(c) = inner.current.as_mut() else {
                             continue;
                         };
+                        // issue #97: codex app-server's ONLY `item:None` deltas are
+                        // error surfacing — a top-level `error` notification, then
+                        // possibly the SAME message again via `turn/completed`'s
+                        // embedded `turn.error.message` (see
+                        // `codex_app_server::turn_error_text`) — both land in this
+                        // same anonymous slot. Absorb the repeat instead of
+                        // doubling the bubble.
+                        if is_anonymous_slot_duplicate(&c.1, &text) {
+                            continue;
+                        }
                         c.1.push_str(&text);
                         let row = c.0;
                         if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
@@ -3375,7 +3402,22 @@ async fn codex_consumer(
                         queue: queue_items(&inner.turn),
                     },
                 );
+                let tool_for_quota_check = inner.tool.clone();
                 drop(inner);
+                // issue #97: a turn that just failed while the engine_quota hub's
+                // last-observed reading for this tool says Exceeded is a
+                // candidate for an auto fail-over — decoupled (own task, see
+                // `spawn_quota_failover_check`) so it can safely re-lock `eng`
+                // without deadlocking THIS task.
+                if status == "error" {
+                    crate::lead_chat::commands::spawn_quota_failover_check(
+                        app.clone(),
+                        db.clone(),
+                        thread_id,
+                        session_id,
+                        tool_for_quota_check,
+                    );
+                }
                 // This turn is over: drop its active-turn id so a subsequent
                 // interrupt won't target a finished turn (the flush below re-sets
                 // it for the next turn).
@@ -6144,6 +6186,15 @@ fn spawn_reader(
                     );
                 }
             }
+            // Issue #97: a structured usage-limit reading, independent of the
+            // main event classification below (claude's `rate_limit_event` can
+            // arrive on any line, not just the first) — lands in the
+            // account-scoped quota hub directly, never as a chat row.
+            if let Some(snapshot) = crate::adapters::adapter_for(&inner.tool)
+                .and_then(|a| a.quota_signal(&line))
+            {
+                crate::engine_quota::report(snapshot);
+            }
             let event = crate::adapters::adapter_for(&inner.tool)
                 .map(|a| a.parse_line(&line))
                 .unwrap_or(super::proto::ChatEvent::Other);
@@ -6550,6 +6601,19 @@ fn spawn_reader(
                             queue: queue_items(&inner.turn),
                         },
                     );
+                    // issue #97: same auto fail-over candidate check as
+                    // `codex_consumer`'s TurnEnd arm — decoupled (own task) so
+                    // it can safely re-lock `eng` without deadlocking THIS task,
+                    // which is still holding `inner` right here.
+                    if status == "error" {
+                        crate::lead_chat::commands::spawn_quota_failover_check(
+                            app.clone(),
+                            db.clone(),
+                            thread_id,
+                            inner.session_id,
+                            inner.tool.clone(),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -6843,6 +6907,51 @@ mod tests {
             serde_json::from_str(&text_row_content("hi", Some("sub-1"))).unwrap();
         assert_eq!(v["text"], "hi");
         assert_eq!(v["agentThread"], "sub-1");
+    }
+
+    // ---- issue #97: anonymous-slot usage-limit double-render fix ----
+
+    #[test]
+    fn anonymous_slot_dup_catches_the_exact_repeat() {
+        // The reported bug: an "error" notification lands the full message
+        // first (buf goes empty -> the message), then turn/completed's error
+        // text arrives with the SAME message — must be recognized as a repeat.
+        assert!(is_anonymous_slot_duplicate(
+            "usage limit reached",
+            "usage limit reached"
+        ));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_ignores_a_first_delta_into_an_empty_buffer() {
+        // The very first delta on a freshly-opened row: nothing to repeat yet.
+        assert!(!is_anonymous_slot_duplicate("", "usage limit reached"));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_does_not_eat_a_different_second_error() {
+        // Two DISTINCT errors in the same turn (e.g. a transient reconnect
+        // banner ahead of the real failure) must both survive.
+        assert!(!is_anonymous_slot_duplicate(
+            "Reconnecting to Codex…",
+            "usage limit reached"
+        ));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_matches_a_repeat_after_other_buffered_text() {
+        // The repeat can follow OTHER already-buffered text, not just be the
+        // whole buffer verbatim — `ends_with`, not `==`.
+        assert!(is_anonymous_slot_duplicate(
+            "Reconnecting to Codex…usage limit reached",
+            "usage limit reached"
+        ));
+    }
+
+    #[test]
+    fn anonymous_slot_dup_ignores_whitespace_only_text() {
+        assert!(!is_anonymous_slot_duplicate("usage limit reached", "   "));
+        assert!(!is_anonymous_slot_duplicate("usage limit reached", ""));
     }
 
     fn test_tool_call(name: &str, collab_threads: Vec<String>) -> super::super::proto::ToolCall {

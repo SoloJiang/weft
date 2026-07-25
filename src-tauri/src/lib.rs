@@ -25,6 +25,10 @@ mod coordinator;
 mod curator;
 mod deps_bootstrap;
 mod detect;
+/// issue #97 额度感知:claude `rate_limit_event` / codex app-server
+/// `account/rateLimits/*` 的结构化解析结果落在这里(tool-keyed 全局快照),供
+/// Resources 面板展示与达限 fail-over 判断消费。
+mod engine_quota;
 mod gc;
 pub mod git;
 /// Test-only: shared driver for the generated ask-hook scripts (see the module
@@ -326,6 +330,8 @@ pub fn run() {
             tools::detect_tools,
             commands::get_default_tool,
             commands::set_default_tool,
+            commands::get_quota_failover_enabled,
+            commands::set_quota_failover_enabled,
             commands::get_tool_commands,
             commands::set_tool_command,
             commands::list_skill_sources,
