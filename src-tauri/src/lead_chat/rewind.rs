@@ -44,7 +44,7 @@ pub(crate) fn dispatched_text(per_turn_tool: bool, row_id: i32, content_json: &s
         return d.to_string();
     }
     let mut out = v["text"].as_str().unwrap_or_default().to_string();
-    let mut list = |key: &str| -> Vec<String> {
+    let list = |key: &str| -> Vec<String> {
         v[key]
             .as_array()
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())

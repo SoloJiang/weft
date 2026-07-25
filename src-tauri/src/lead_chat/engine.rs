@@ -3318,17 +3318,26 @@ async fn acp_consumer(
                     let i = eng.lock().await;
                     (i.thread_id, i.tool.clone(), i.ask_dir.clone())
                 };
+                // Precise Always key (issue #89): ACP family + session intent +
+                // raw detail so two different commands never share a grant.
+                let action_key = crate::ask::action_key(&["Acp", &intent_key, &detail]);
                 // Clone the registry BEFORE any await — State guards are !Send.
                 let asks = app
                     .try_state::<crate::ask::AskRegistry>()
                     .map(|s| s.inner().clone());
                 let want = if let Some(asks) = asks {
-                    match asks.auto_decision(thread_id, &dir, &summary) {
+                    match asks.auto_decision(thread_id, &dir, &action_key) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
                         Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,
                         None => {
-                            let (id, rx) =
-                                asks.request(thread_id, &dir, &tool, &summary, &detail);
+                            let (id, rx) = asks.request(
+                                thread_id,
+                                &dir,
+                                &tool,
+                                &summary,
+                                &detail,
+                                &action_key,
+                            );
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(3600),
                                 rx,
@@ -3347,7 +3356,6 @@ async fn acp_consumer(
                 } else {
                     crate::acp::Want::RejectOnce
                 };
-                let _ = intent_key;
                 client.reply_permission(&request_id, &options, want).await;
             }
             SessionEvent::Chat(_) => {}
