@@ -417,6 +417,14 @@ async fn stalled_direction_ids(
 ///
 /// Reads only — the marker is written by the engine's recovery path. This file
 /// still persists nothing of its own (stall/redrive state stays in memory).
+///
+/// Depends on a WRITE-ORDER contract on that side: `recover_from_freeze` stamps
+/// the marker before any of its writes expose a recoverable idle session. The
+/// session row and the marker are read in two separate awaits here, so were the
+/// stamp to move after the `idle` persist, a sweep interleaving between them
+/// would see an idle+native session with no marker and re-drive anyway — the
+/// exact case this window prevents. That ordering is asserted in a comment at
+/// the write site; don't reorder it.
 async fn freeze_grace_elapsed(
     db: &Db,
     thread_id: i32,
