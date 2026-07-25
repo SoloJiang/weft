@@ -2314,6 +2314,33 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_payloads_do_not_blow_the_stack() {
+        // `json_value_has_cred_key` recurses, and `args_text` is
+        // server-controlled. What keeps that safe is that `serde_json`
+        // enforces its own nesting limit while PARSING, so a `Value` that
+        // exists at all is shallow enough to walk — and anything deeper
+        // simply fails to parse and degrades to the (iterative) textual scan
+        // rather than reaching the recursion. Measured here: nesting parses
+        // up to ~126 and is rejected beyond, with no depth crashing.
+        for depth in [100usize, 128, 5_000, 100_000] {
+            let payload = format!(
+                "{}{}{}",
+                r#"{"a":"#.repeat(depth),
+                r#"{"apiToken":"sk-1"}"#,
+                "}".repeat(depth)
+            );
+            assert_eq!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "get_status",
+                    args_text: &payload
+                }),
+                RiskLevel::NetworkOrCredential,
+                "depth {depth} lost the key"
+            );
+        }
+    }
+
+    #[test]
     fn escaped_quote_payloads_stay_linear() {
         // Round-4 review P1: skipping `\"` pairs made the scan jump OVER
         // later quote bytes, so the per-quote scans stopped telescoping and
