@@ -1,0 +1,64 @@
+// weft Ask Bridge — surfaces every opencode tool call to weft for a human
+// decision. Written into a throwaway worktree's `.opencode/plugins/` by
+// `bus/inject.rs::inject_opencode_ask_plugin`, which substitutes the ASK_URL
+// placeholder below with this session's /ask endpoint (the placeholder token
+// appears exactly ONCE in this file, by contract). Kept as a standalone file
+// (not a Rust string literal) so `tests/frontend/opencodeAskPlugin.test.ts` can
+// execute this exact source instead of a copy of it.
+//
+// FAIL-CLOSED by design: weft's Needs-you card is the ONLY thing that shows this
+// call to a human, so the tool proceeds on an explicit "allow" from weft and on
+// nothing else. If weft can't be reached (app quit or crashed, port moved) or
+// answers with anything that isn't a decision, then nobody reviewed this call —
+// an unsupervised agent must stop rather than run unreviewed. `tool.execute.before`
+// denies by throwing (opencode's own contract), so every non-allow verdict
+// funnels through the single throw at the bottom.
+const ASK_URL = "__URL__";
+
+// One message per verdict, so the agent's transcript says which of the three
+// non-allow outcomes happened (and, for a down bridge, what to do about it).
+const DENIAL_REASON = {
+  deny: () => "Denied in weft",
+  unreachable: (detail) =>
+    "weft's permission bridge is unreachable (" +
+    detail +
+    "). Nobody can approve this tool call while weft is down, so it is denied. " +
+    "Start weft again and retry.",
+  undecided: (detail) =>
+    "weft's permission bridge answered without a decision (" +
+    detail +
+    "), so this tool call was not reviewed by a human and is denied.",
+};
+
+// Ask weft, and reduce every outcome to ONE verdict:
+// "allow" | "deny" | "unreachable" | "undecided".
+async function askWeft(toolName, toolInput) {
+  let res;
+  try {
+    res = await fetch(ASK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool_name: toolName, tool_input: toolInput }),
+    });
+  } catch (e) {
+    return { verdict: "unreachable", detail: String((e && e.message) || e) };
+  }
+  if (!res.ok) return { verdict: "undecided", detail: "HTTP " + res.status };
+  let decision;
+  try {
+    decision = (await res.json())?.hookSpecificOutput?.permissionDecision;
+  } catch (e) {
+    return { verdict: "undecided", detail: "unreadable response body" };
+  }
+  if (decision === "allow") return { verdict: "allow", detail: "" };
+  if (decision === "deny") return { verdict: "deny", detail: "" };
+  return { verdict: "undecided", detail: "decision=" + String(decision) };
+}
+
+export const WeftAsk = async () => ({
+  "tool.execute.before": async (input, output) => {
+    const { verdict, detail } = await askWeft(input.tool, output.args);
+    if (verdict === "allow") return;
+    throw new Error(DENIAL_REASON[verdict](detail));
+  },
+});

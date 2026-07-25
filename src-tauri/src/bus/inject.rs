@@ -31,6 +31,46 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
     format!("{base}/ask/{thread}/{dir}?tool={tool}")
 }
 
+/// The shared, FAIL-CLOSED tail of both bash ask-hook scripts — claude's
+/// per-worktree `.weft-ask-hook.sh` (below) and codex's global helper
+/// (`codex.rs::ensure_codex_hook_in`, which splices it in at
+/// `__DECIDE_OR_DENY__`). Expects `$resp` = curl's stdout and `$rc` = curl's
+/// exit status, prints exactly one PreToolUse decision, and always exits 0.
+///
+/// Why it can't just print `$resp` and exit: "exit 0 with no output" means
+/// *continue* to both consumers — Codex documents it as success, and claude
+/// falls back to its own permission flow, which the user's own allowlist can
+/// auto-approve — so a weft that isn't answering (app quit or crashed, port
+/// moved, curl missing) would ALLOW every tool call of an unsupervised agent.
+/// Instead, only a body carrying one of weft's two actual verdicts is passed
+/// through; anything else emits the same explicit deny shape a human's Deny
+/// answer produces (`bus/server.rs::hook_decision`, which #139 made the
+/// timeout/cancel fallback for the same reason). Exit status stays 0 in every
+/// branch on purpose: a NON-zero exit is reported as a hook error and the tool
+/// call continues, i.e. it would be fail-open all over again.
+///
+/// The gate matches the exact `"permissionDecision":"<verdict>"` pairs
+/// `hook_decision`'s compact JSON emits — not a bare `permissionDecision`
+/// substring — so a body cut off mid-answer (weft crashing between headers and
+/// body) denies instead of being forwarded as garbage the consumer then ignores.
+/// Both passthrough tests fail loudly if that serialization ever changes.
+///
+/// Authored flush-left with NO trailing newline; codex's copy is re-indented by
+/// its own writer.
+pub(crate) const HOOK_DECIDE_OR_DENY: &str = r#"case "$resp" in
+  *'"permissionDecision":"allow"'*|*'"permissionDecision":"deny"'*)
+    printf '%s' "$resp"
+    exit 0
+    ;;
+esac
+if [ "$rc" -eq 0 ] && [ -n "$resp" ]; then
+  reason="weft's permission bridge answered without a decision, so this tool call was not reviewed by a human and is denied."
+else
+  reason="weft could not be reached, so nobody can approve this tool call - denied by default. Start weft again (or check that its local ask bridge is up), then retry."
+fi
+printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}' "$reason"
+exit 0"#;
+
 /// Install the Ask Bridge for a session. Claude gets a worktree-local
 /// PreToolUse settings file; Codex writes only a worktree route file consumed
 /// by Weft's stable global hook in `~/.codex/config.toml`; OpenCode bridges via
@@ -52,15 +92,15 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
         return Injection { args: vec![] };
     }
     let script = cwd.join(".weft-ask-hook.sh");
-    // Reads the PreToolUse JSON on stdin, asks weft, echoes weft's decision JSON
-    // (empty on failure/timeout → the tool falls back to its own prompt).
-    // -m matches the server's ASK_WAIT: hold the call until the human answers in
-    // Needs-you rather than timing out into the tool's own hidden prompt.
+    // Reads the PreToolUse JSON on stdin, asks weft, echoes weft's decision JSON —
+    // or, when weft doesn't answer with one, an explicit deny (fail-closed; see
+    // HOOK_DECIDE_OR_DENY). -m matches the server's ASK_WAIT: hold the call until
+    // the human answers in Needs-you rather than timing out into a fallback.
     let body = format!(
         "#!/usr/bin/env bash\n\
          resp=$(curl -s -m 3600 -X POST '{url}' -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)\n\
-         [ -n \"$resp\" ] && printf '%s' \"$resp\"\n\
-         exit 0\n"
+         rc=$?\n\
+         {HOOK_DECIDE_OR_DENY}\n"
     );
     if std::fs::write(&script, body).is_err() {
         return Injection { args: vec![] };
@@ -108,30 +148,18 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
 /// OpenCode has no PreToolUse hook; its analog is a local plugin's
 /// `tool.execute.before`, which is async and throws to deny. Drop a plugin in
 /// the worktree's `.opencode/plugins/` that POSTs each tool action to weft's
-/// /ask endpoint and throws on a deny verdict — same Ask Bridge, same endpoint,
-/// same allow/deny contract as claude/codex. Auto-loaded (no launch flag).
+/// /ask endpoint and throws unless weft explicitly allows — same Ask Bridge,
+/// same endpoint, same allow/deny contract as claude/codex. Auto-loaded (no
+/// launch flag). The plugin source lives in `weft-ask-plugin.js` (see its
+/// header for the fail-closed contract) so the node test can run that exact
+/// file; only `__URL__` is substituted here.
 fn inject_opencode_ask_plugin(base: &str, thread: i32, dir: &str, cwd: &Path) -> Injection {
     let url = ask_url(base, thread, dir, "opencode");
     let plugins = cwd.join(".opencode").join("plugins");
     if std::fs::create_dir_all(&plugins).is_err() {
         return Injection { args: vec![] };
     }
-    let template = r#"// weft Ask Bridge — surfaces tool approvals to weft, blocks on deny.
-export const WeftAsk = async () => ({
-  "tool.execute.before": async (input, output) => {
-    let decision;
-    try {
-      const res = await fetch("__URL__", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tool_name: input.tool, tool_input: output.args }),
-      });
-      decision = (await res.json())?.hookSpecificOutput?.permissionDecision;
-    } catch (e) { /* weft unreachable → fall back to opencode's own flow */ }
-    if (decision === "deny") throw new Error("Denied in weft");
-  },
-});
-"#;
+    let template = include_str!("weft-ask-plugin.js");
     let body = template.replace("__URL__", &url);
     let _ = std::fs::write(plugins.join("weft-ask.js"), body);
     crate::git::git_exclude(cwd, ".opencode/plugins/weft-ask.js");
@@ -333,6 +361,163 @@ mod tests {
         assert!(plugin.contains("tool.execute.before"));
         assert!(plugin.contains("/ask/1/10?tool=opencode"));
         assert!(plugin.contains("Denied in weft"));
+        // The URL placeholder must be fully substituted — an unsubstituted
+        // template would POST to a literal "__URL__" and (now) deny everything.
+        assert!(
+            !plugin.contains("__URL__"),
+            "placeholder must be substituted:\n{plugin}"
+        );
+        // Fail-closed shape: an unreachable bridge is a named verdict with a
+        // message, not a swallowed exception. The BEHAVIOR of each verdict is
+        // covered by tests/frontend/opencodeAskPlugin.test.ts, which runs this
+        // exact file; these asserts only keep the wiring from silently reverting.
+        assert!(
+            plugin.contains("unreachable") && plugin.contains("undecided"),
+            "plugin must name the non-allow verdicts:\n{plugin}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 127.0.0.1 port with nothing listening: bind an ephemeral port, learn its
+    /// number, then drop the listener. Beats hardcoding a port some service on a
+    /// dev box might actually be serving.
+    #[cfg(unix)]
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    #[cfg(unix)]
+    const HOOK_PAYLOAD: &str = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
+
+    /// Run a generated hook script the way the engine does: PreToolUse JSON on
+    /// stdin, decision JSON on stdout. Returns `(stdout, exit code)`.
+    #[cfg(unix)]
+    fn run_hook_script(script: &Path, cwd: &Path, payload: &str) -> (String, Option<i32>) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("bash")
+            .arg(script)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            out.status.code(),
+        )
+    }
+
+    /// Assert a hook script emitted exactly one well-formed PreToolUse decision
+    /// and exited 0 (a NON-zero exit is reported as a hook error and the tool
+    /// call CONTINUES — so a "crash to deny" would still be fail-open).
+    #[cfg(unix)]
+    fn decision_of(stdout: &str, code: Option<i32>) -> serde_json::Value {
+        assert_eq!(code, Some(0), "hook must exit 0; stdout={stdout:?}");
+        let body: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("hook must print one decision JSON, got {stdout:?}: {e}"));
+        assert_eq!(
+            body["hookSpecificOutput"]["hookEventName"], "PreToolUse",
+            "decision must carry the PreToolUse envelope: {body}"
+        );
+        body["hookSpecificOutput"].clone()
+    }
+
+    /// The Ask Bridge is the ONLY thing that surfaces a tool call to the human,
+    /// so a weft that can't be reached (app quit/crashed, port moved) must DENY,
+    /// not fall through. Before this, the script printed nothing and exited 0,
+    /// which claude treats as "no decision → normal permission flow" (a user
+    /// allowlist can auto-approve) — an unsupervised agent ran unreviewed.
+    #[test]
+    #[cfg(unix)]
+    fn claude_ask_hook_denies_when_weft_is_unreachable() {
+        let dir = std::env::temp_dir().join(format!("weft-askh-down-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = format!("http://127.0.0.1:{}", closed_port());
+        let inj = inject_ask_hook(&base, 1, "10", "claude", &dir);
+        assert_eq!(inj.args[0], "--settings");
+
+        let (stdout, code) =
+            run_hook_script(&dir.join(".weft-ask-hook.sh"), &dir, HOOK_PAYLOAD);
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "deny",
+            "unreachable weft must fail CLOSED, not fall through: {out}"
+        );
+        assert!(
+            out["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("could not be reached"),
+            "the reason must tell the human weft is down: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other side of the same seam: when weft IS reachable, the human's real
+    /// answer must reach the engine unchanged. Without this, "deny everything"
+    /// would pass the test above.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn claude_ask_hook_passes_a_real_weft_decision_through() {
+        use crate::ask::{Answer, AskRegistry};
+        let asks = AskRegistry::new();
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let (base, _h) =
+            crate::bus::server::serve(crate::bus::BusRegistry::new(), db, asks.clone())
+                .await
+                .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("weft-askh-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = inject_ask_hook(&base, 1, "10", "claude", &dir);
+
+        let script = dir.join(".weft-ask-hook.sh");
+        let run_dir = dir.clone();
+        let run =
+            tokio::task::spawn_blocking(move || run_hook_script(&script, &run_dir, HOOK_PAYLOAD));
+
+        // Poll for the ask to register (bounded, so a regression fails fast
+        // instead of hanging on the hook's 3600s curl timeout).
+        let step = std::time::Duration::from_millis(20);
+        let mut waited = std::time::Duration::ZERO;
+        while asks.open().is_empty() {
+            tokio::time::sleep(step).await;
+            waited += step;
+            assert!(
+                waited < std::time::Duration::from_secs(20),
+                "the hook never reached weft's /ask endpoint"
+            );
+        }
+        let id = asks.open()[0].id;
+        assert!(asks.answer(id, Answer::Allow));
+
+        // Bounded: the hook's own curl timeout is an hour, so a regression that
+        // never resolves the request must fail the test, not hang the suite.
+        let (stdout, code) = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("hook did not exit after the human answered")
+            .unwrap();
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "allow",
+            "a human's Allow must pass through untouched: {out}"
+        );
+        assert_eq!(out["permissionDecisionReason"], "Approved in weft");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

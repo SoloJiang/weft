@@ -154,6 +154,23 @@ fn weft_entry_inline(command: &str) -> toml_edit::InlineTable {
     entry
 }
 
+/// Prefix every non-empty line of `text` with `prefix`. The shared hook tail is
+/// authored flush-left (claude's script has no nesting); Codex's copy is spliced
+/// inside a `while` loop, so it gets re-indented rather than being duplicated at
+/// a second indent level.
+fn indent_lines(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn ensure_codex_hook_in(cfg: &Path, helper: &Path) {
     let Ok(text) = std::fs::read_to_string(cfg) else {
         return; // Codex not set up — don't fabricate a config.
@@ -163,7 +180,10 @@ fn ensure_codex_hook_in(cfg: &Path, helper: &Path) {
             return;
         }
     }
-    let helper_body = r#"#!/usr/bin/env bash
+    // `__DECIDE_OR_DENY__` is spliced (indented) with the shared fail-closed tail
+    // claude's per-worktree hook also uses — one source for "pass weft's decision
+    // through, otherwise deny explicitly".
+    let helper_template = r#"#!/usr/bin/env bash
 dir="${PWD:-.}"
 while :; do
   route="$dir/.weft-codex-ask-url"
@@ -174,6 +194,10 @@ while :; do
     # path, and any userinfo — rather than glob-matching the raw string: a glob on
     # "http://127.0.0.1:*" is defeated by http://127.0.0.1:80@attacker.example, whose
     # actual host is attacker.example. Non-http or non-loopback → exit without posting.
+    # These two guards stay PASS-THROUGH (exit 0, no output), NOT deny: the route file
+    # is attacker-controlled here, so denying would let any repo brick Codex sessions
+    # by planting one. Weft is not involved in that case; Codex's own approval flow
+    # stays authoritative, exactly as in a plain Codex session.
     case "$url" in
       http://*) ;;
       *) exit 0 ;;
@@ -187,15 +211,22 @@ while :; do
       *) exit 0 ;;
     esac
     resp="$(curl -s -m 3600 -X POST "$url" -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)"
-    [ -n "$resp" ] && printf '%s' "$resp"
-    exit 0
+    rc=$?
+__DECIDE_OR_DENY__
   fi
+  # No route file anywhere up the tree: this is NOT a Weft worktree. The hook is
+  # global (~/.codex/config.toml), so it also runs for the user's own hand-started
+  # Codex sessions — those must stay untouched (exit 0, no output), never denied.
   [ "$dir" = "/" ] && exit 0
   next="$(dirname "$dir")"
   [ "$next" = "$dir" ] && exit 0
   dir="$next"
 done
 "#;
+    let helper_body = helper_template.replace(
+        "__DECIDE_OR_DENY__",
+        &indent_lines(crate::bus::inject::HOOK_DECIDE_OR_DENY, "    "),
+    );
     if std::fs::write(helper, helper_body.as_bytes()).is_err() {
         return;
     }
@@ -677,5 +708,207 @@ mod tests {
         ensure_codex_trusted_in(&cfg, "/x");
         assert!(!cfg.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn helper_splices_the_shared_fail_closed_tail() {
+        // The tail lives once (bus::inject::HOOK_DECIDE_OR_DENY) and is shared with
+        // claude's per-worktree hook; a dropped splice would silently restore the
+        // fail-open `[ -n "$resp" ] && printf …` behavior.
+        let base = fresh_dir("helper-tail");
+        let cfg = base.join("config.toml");
+        let helper = base.join("weft-codex-hook.sh");
+        std::fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
+
+        ensure_codex_hook_in(&cfg, &helper);
+
+        let helper_text = std::fs::read_to_string(&helper).unwrap();
+        assert!(
+            !helper_text.contains("__DECIDE_OR_DENY__"),
+            "the splice marker must be substituted:\n{helper_text}"
+        );
+        assert!(
+            helper_text.contains("\"permissionDecision\":\"deny\""),
+            "the explicit-deny fallback must be present:\n{helper_text}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A 127.0.0.1 port with nothing listening: bind an ephemeral port, learn its
+    /// number, then drop the listener. Beats hardcoding a port some service on a
+    /// dev box might actually be serving.
+    #[cfg(unix)]
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    #[cfg(unix)]
+    const HOOK_PAYLOAD: &str = r#"{"tool_name":"shell","tool_input":{"command":"rm -rf /"}}"#;
+
+    /// Write the global helper, then run it from `run_in` exactly as Codex does:
+    /// PreToolUse JSON on stdin, decision JSON on stdout. Returns `(stdout, code)`.
+    #[cfg(unix)]
+    fn run_helper(tag: &str, route_url: Option<&str>, nested: bool) -> (String, Option<i32>) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let base = fresh_dir(tag);
+        let cfg = base.join("config.toml");
+        let helper = base.join("weft-codex-hook.sh");
+        std::fs::write(&cfg, "model = \"gpt-5\"\n").unwrap();
+        ensure_codex_hook_in(&cfg, &helper);
+
+        // A stand-in worktree: the route file (when any) sits at its root, and the
+        // hook runs from a nested dir so the walk-up path is exercised too.
+        let wt = base.join("wt");
+        let run_in = if nested {
+            wt.join("pkg").join("src")
+        } else {
+            wt.clone()
+        };
+        std::fs::create_dir_all(&run_in).unwrap();
+        if let Some(url) = route_url {
+            std::fs::write(wt.join(".weft-codex-ask-url"), url).unwrap();
+        }
+
+        let mut child = Command::new("bash")
+            .arg(&helper)
+            .current_dir(&run_in)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(HOOK_PAYLOAD.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            out.status.code(),
+        )
+    }
+
+    /// Same assertions as the claude hook's: one well-formed decision, exit 0
+    /// (Codex reports a NON-zero exit as a hook error and continues the call, so
+    /// "crash to deny" would still be fail-open).
+    #[cfg(unix)]
+    fn decision_of(stdout: &str, code: Option<i32>) -> serde_json::Value {
+        assert_eq!(code, Some(0), "hook must exit 0; stdout={stdout:?}");
+        let body: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("hook must print one decision JSON, got {stdout:?}: {e}"));
+        assert_eq!(body["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        body["hookSpecificOutput"].clone()
+    }
+
+    /// Codex's own hook contract: "exit 0 with no output is treated as success and
+    /// Codex continues." So the pre-existing `[ -n "$resp" ] && printf …; exit 0`
+    /// ALLOWED every tool call whenever weft wasn't answering. It must deny.
+    #[test]
+    #[cfg(unix)]
+    fn codex_hook_denies_when_weft_is_unreachable() {
+        let url = format!("http://127.0.0.1:{}/ask/2/30?tool=codex", closed_port());
+        let (stdout, code) = run_helper("hook-down", Some(&url), true);
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "deny",
+            "unreachable weft must fail CLOSED, not continue: {out}"
+        );
+        assert!(
+            out["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("could not be reached"),
+            "the reason must tell the human weft is down: {out}"
+        );
+    }
+
+    /// The other side of the seam: a reachable weft's real answer must reach Codex
+    /// unchanged, so "deny everything" can't pass the test above.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn codex_hook_passes_a_real_weft_decision_through() {
+        use crate::ask::{Answer, AskRegistry};
+        let asks = AskRegistry::new();
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let (base, _h) =
+            crate::bus::server::serve(crate::bus::BusRegistry::new(), db, asks.clone())
+                .await
+                .unwrap();
+
+        let url = format!("{base}/ask/2/30?tool=codex");
+        let poll = asks.clone();
+        let run = tokio::task::spawn_blocking(move || run_helper("hook-live", Some(&url), true));
+
+        let step = std::time::Duration::from_millis(20);
+        let mut waited = std::time::Duration::ZERO;
+        while poll.open().is_empty() {
+            tokio::time::sleep(step).await;
+            waited += step;
+            assert!(
+                waited < std::time::Duration::from_secs(20),
+                "the hook never reached weft's /ask endpoint"
+            );
+        }
+        let id = poll.open()[0].id;
+        assert!(poll.answer(id, Answer::Allow));
+
+        // Bounded: the hook's own curl timeout is an hour, so a regression that
+        // never resolves the request must fail the test, not hang the suite.
+        let (stdout, code) = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("hook did not exit after the human answered")
+            .unwrap();
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "allow",
+            "a human's Allow must pass through untouched: {out}"
+        );
+        assert_eq!(out["permissionDecisionReason"], "Approved in weft");
+    }
+
+    /// The deliberate exception to fail-closed. This hook is GLOBAL
+    /// (`~/.codex/config.toml`), so it also runs for the user's own hand-started
+    /// Codex sessions; with no `.weft-codex-ask-url` anywhere up the tree, weft
+    /// isn't involved and the session must be left completely alone.
+    #[test]
+    #[cfg(unix)]
+    fn codex_hook_stays_silent_outside_a_weft_worktree() {
+        let (stdout, code) = run_helper("hook-foreign", None, true);
+        assert_eq!(code, Some(0));
+        assert!(
+            stdout.is_empty(),
+            "a non-weft Codex session must be untouched, got: {stdout:?}"
+        );
+    }
+
+    /// The second exception: a route file is repo-plantable, so a non-loopback one
+    /// is IGNORED (silent pass-through), not denied — otherwise any repo could
+    /// brick Codex by planting a file. Doubles as a behavioral check on the
+    /// userinfo-stripping host guard: the real host here is 127.0.0.2, and if the
+    /// guard regressed, curl would fail against a closed port and the fail-closed
+    /// tail would print a deny — making this assertion fail instead of silently
+    /// posting the payload off-box.
+    #[test]
+    #[cfg(unix)]
+    fn codex_hook_ignores_a_non_loopback_route_without_posting() {
+        let url = format!(
+            "http://127.0.0.1:{}@127.0.0.2:{}/ask/2/30?tool=codex",
+            closed_port(),
+            closed_port()
+        );
+        let (stdout, code) = run_helper("hook-planted", Some(&url), false);
+        assert_eq!(code, Some(0));
+        assert!(
+            stdout.is_empty(),
+            "a planted non-loopback route must be ignored, not denied or posted to, got: {stdout:?}"
+        );
     }
 }
