@@ -1644,7 +1644,17 @@ impl SwitchTarget {
 /// nothing changed passes its own error through, because "the switch failed"
 /// already describes that accurately and the underlying message is the more
 /// useful thing to show. A code exists only where that sentence would be
-/// WRONG or incomplete — which is exactly these three states.
+/// WRONG or incomplete — which is exactly these three states (the third,
+/// `repo::SWITCH_MARKER_LOST_CODE`, is declared where it is raised).
+///
+/// COPY RULE for anyone adding one, because getting this wrong is the single
+/// most repeated mistake in this PR's review history — four times, in four
+/// different strings: only a code raised BEFORE
+/// `engine::teardown_for_switch` may tell the user nothing changed. Past that
+/// point the live turn has been killed and its open and queued rows finalized
+/// as `interrupted`, so the copy must say the engine is unchanged AND the
+/// running turn was interrupted. Today only [`SWITCH_MARKER_ERROR_CODE`] is
+/// raised early enough to claim the former.
 ///
 /// The stamp could not be written: nothing happened at all.
 pub const SWITCH_MARKER_ERROR_CODE: &str = "switch_marker_stamp_failed";
@@ -1898,6 +1908,33 @@ async fn persist_switch_writes(
     }
 }
 
+/// Drop whatever engine is currently cached for `key`, tearing it down
+/// properly rather than letting the handle fall out of scope with a live child
+/// behind it.
+///
+/// A switch calls this TWICE, and the second call is the load-bearing one
+/// (review round 9). `teardown_for_switch` lands the surface on `idle`, and
+/// `revive`'s stall sweep selects idle surfaces — so during the gap between
+/// the teardown and the switch transaction (which `stop_quiet` can stretch to
+/// ~120s against a wedged engine) the sweep can run `try_revive_lead`, whose
+/// `lead_engine` call BUILDS AND CACHES an engine from the tool the DB still
+/// says is current: the OLD one. `lead_engine`/`worker_engine` return a cached
+/// entry when they find one, so the rebuild at the end of the switch would
+/// hand back that stale engine — the command reports "switched to codex", the
+/// badge says codex, and every subsequent message goes to claude. That is
+/// issue #96's core confusion, reintroduced by the very sweep this PR's grace
+/// marker exists to hold off.
+///
+/// Clearing the slot again right before the rebuild makes the resurrection
+/// harmless rather than merely unlikely: whatever the gap produced is torn
+/// down, and the rebuild constructs from the tool the transaction just
+/// committed.
+async fn drop_cached_engine(app: &AppHandle, key: i64) {
+    if let Some(eng) = app.state::<LeadChatState>().remove(key) {
+        engine::teardown_for_switch(app, &eng).await;
+    }
+}
+
 /// Switch the LEAD's engine identity and/or model override for `thread_id` —
 /// issue #96 layer 1 of 3 (independent of any worker's tool and of the global
 /// default; see `switch_worker_tool` / `set_default_tool`). Semantics:
@@ -1967,9 +2004,7 @@ pub async fn switch_lead_tool(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(thread_id, "lead");
     }
-    if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
-        engine::teardown_for_switch(&app, &eng).await;
-    }
+    drop_cached_engine(&app, lead_key(thread_id)).await;
 
     // The lead's OWN timeline only — `list_lead_messages` returns every row for
     // the thread, including every worker's chat (session_id = Some(_)); the
@@ -1992,6 +2027,11 @@ pub async fn switch_lead_tool(
     persist_switch(&db, stamped, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
+
+    // The switch is committed; discard anything the stall sweep resurrected
+    // while the teardown was running, so the rebuild below cannot hand back an
+    // engine built from the OLD tool. See `drop_cached_engine`.
+    drop_cached_engine(&app, lead_key(thread_id)).await;
 
     let lang = lang.unwrap_or_else(|| "en".to_string());
     let eng = lead_engine(&app, &db, thread_id, &lang)
@@ -2068,9 +2108,7 @@ pub async fn switch_worker_tool(
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
     }
-    if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
-        engine::teardown_for_switch(&app, &eng).await;
-    }
+    drop_cached_engine(&app, session_id as i64).await;
 
     let messages = repo::list_lead_messages(&db, dir.thread_id).await.unwrap_or_default();
     let own: Vec<_> = messages
@@ -2092,6 +2130,10 @@ pub async fn switch_worker_tool(
     persist_switch(&db, stamped, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
+
+    // Same reasoning as switch_lead_tool: discard a sweep-resurrected engine
+    // before rebuilding.
+    drop_cached_engine(&app, session_id as i64).await;
 
     let eng = worker_engine(&app, &db, session_id)
         .await
@@ -2438,6 +2480,12 @@ mod live_slot_tests {
 ///     way to obtain one is a successful `stamp_switch_marker`. There is no
 ///     runtime mutation that removes the gate and still builds — which is the
 ///     point of spending a type on it.
+///   - "the rebuild clears a sweep-resurrected engine first"
+///     ([`drop_cached_engine`], review round 9) is likewise placement in the
+///     command bodies and is NOT covered — deleting that call compiles and
+///     leaves every test green, which was checked rather than assumed. It
+///     needs a live `LeadChatState` and a concurrent sweep, neither of which
+///     is reachable here.
 ///   - "the stamp precedes the ask cancellation and the teardown" is enforced
 ///     by placement in the two `#[tauri::command]` bodies, and is NOT covered:
 ///     this crate has no `AppHandle` test harness (tauri's `test` feature is

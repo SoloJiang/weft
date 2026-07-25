@@ -394,7 +394,7 @@ export const zh = {
     switchReloadConfirm: "重新加载",
     switchedToast: "已切换：{{from}} → {{to}}",
     switchReloadedToast: "{{tool}} 已重新加载",
-    switchMarkerLost: "这次切换的记录在执行过程中不见了——多半是同时有别的操作回退了这段对话。什么都没改，请重试。",
+    switchMarkerLost: "这次切换的记录在执行过程中不见了——多半是同时有别的操作回退了这段对话。这个会话还在原来的引擎上，但正在进行的那轮已经被中断。请重试。",
     switchMarkerFailed: "这次切换没能记录下来，已原样保留——会话还在原来的引擎上。请重试。",
     switchCleanupFailed: "切换没成功，善后也没做干净。这个会话还在原来的引擎上，但正在进行的那轮已经被中断；稍后可能多出一条「继续未完成的工作」提示。请重试。",
     engineSwitchedMarker: "引擎已切换",

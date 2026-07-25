@@ -409,7 +409,7 @@ export const en = {
     switchedToast: "Switched {{from}} → {{to}}",
     switchReloadedToast: "{{tool}} reloaded",
     switchMarkerLost:
-      "This switch's record disappeared while it was running — most likely something else rewound this conversation at the same time. Nothing was changed. Try again.",
+      "This switch's record disappeared while it was running — most likely something else rewound this conversation at the same time. This session is still on its current engine, but the turn that was running was interrupted. Try again.",
     switchMarkerFailed:
       "Couldn't record this switch, so nothing was changed — the session is still on its current engine. Try again.",
     switchCleanupFailed:
