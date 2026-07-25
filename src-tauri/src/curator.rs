@@ -987,7 +987,9 @@ fn curator_exec_tool(preferred: &str) -> &str {
         if crate::lead_chat::engine::is_acp_tool(t) {
             continue;
         }
-        if crate::detect::resolve_tool_path(t).is_some() {
+        // Honor Settings command overrides / absolute pins (same as run_exec).
+        let cmd = crate::tool_command::command_for(t);
+        if crate::detect::resolve_tool_path(&cmd).is_some() {
             eprintln!(
                 "[weft][curator] default tool {preferred} is ACP-only; using {t} for analysis"
             );

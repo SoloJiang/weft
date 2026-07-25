@@ -403,7 +403,7 @@ fn opencode_output(state: &Value) -> String {
 /// Cap tool output so a pathological stdout / large file read can't bloat the
 /// persisted row, its push payload, or the React store. The collapsed row shows
 /// only a summary anyway, and the expanded view already paginates.
-fn cap_output(s: String) -> String {
+pub(crate) fn cap_output(s: String) -> String {
     const MAX: usize = 16_000;
     if s.chars().count() <= MAX {
         return s;

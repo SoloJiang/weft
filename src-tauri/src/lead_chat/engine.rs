@@ -1463,6 +1463,8 @@ pub struct EngineInner {
     /// 解析出 mcp/model/window,turn 结束更新 context_tokens)。
     pub last_context_tokens: Option<u64>,
     pub last_model: Option<String>,
+    /// Reasoning effort / thinking level from ACP configOptions or updates.
+    pub last_reasoning: Option<String>,
     pub last_window: Option<u64>,
     pub last_mcp_servers: Vec<super::proto::McpServer>,
     pub last_tools: Vec<String>,
@@ -1524,6 +1526,8 @@ pub struct PersistedMeta {
     pub context_tokens: Option<u64>,
     pub window: Option<u64>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub mcp_servers: Vec<super::proto::McpServer>,
     #[serde(default)]
@@ -1620,6 +1624,7 @@ async fn persist_engine_meta(db: &Db, inner: &EngineInner) {
         context_tokens: inner.last_context_tokens,
         window: inner.last_window,
         model: inner.last_model.clone(),
+        reasoning_effort: inner.last_reasoning.clone(),
         mcp_servers: inner.last_mcp_servers.clone(),
         tools: inner.last_tools.clone(),
     };
@@ -1687,6 +1692,7 @@ pub async fn absorb_probe_meta(
             context_tokens: inner.last_context_tokens,
             window: inner.last_window,
             model: inner.last_model.clone(),
+            reasoning_effort: inner.last_reasoning.clone(),
             mcp_servers: inner.last_mcp_servers.clone(),
             tools: inner.last_tools.clone(),
         };
@@ -1694,6 +1700,9 @@ pub async fn absorb_probe_meta(
             inner.last_context_tokens = m.context_tokens;
             inner.last_window = m.window;
             inner.last_model = m.model.clone();
+            if m.reasoning_effort.is_some() {
+                inner.last_reasoning = m.reasoning_effort.clone();
+            }
             inner.last_mcp_servers = m.mcp_servers.clone();
             persist_engine_meta(db, &inner).await;
         }
@@ -1747,6 +1756,7 @@ pub fn apply_persisted_meta(inner: &mut EngineInner, json: &str) {
     inner.last_context_tokens = m.context_tokens;
     inner.last_window = m.window;
     inner.last_model = m.model;
+    inner.last_reasoning = m.reasoning_effort;
     inner.last_mcp_servers = m.mcp_servers;
     inner.last_tools = m.tools;
 }
@@ -2961,28 +2971,33 @@ async fn spawn_acp_turn(
     };
 
     let had_native = native.is_some();
-    let (session_id, open_model) = match native {
+    let (session_id, open_model, open_thinking) = match native {
         Some(id) => {
             // Prefer resume; fall back to load (hand-cut rewind files).
             match client.resume_session(&id, &cwd, mcp.clone()).await {
-                Ok(open) => (open.session_id, open.model),
+                Ok(open) => (open.session_id, open.model, open.thinking),
                 Err(_) => {
                     let sid = client
                         .load_session(&id, &cwd, mcp.clone())
                         .await
                         .unwrap_or(id);
-                    (sid, None)
+                    (sid, None, None)
                 }
             }
         }
         None => {
             let open = client.new_session(&cwd, mcp).await?;
-            (open.session_id, open.model)
+            (open.session_id, open.model, open.thinking)
         }
     };
-    if let Some(model) = open_model {
+    if open_model.is_some() || open_thinking.is_some() {
         let mut g = eng.lock().await;
-        g.last_model = Some(model);
+        if let Some(model) = open_model {
+            g.last_model = Some(model);
+        }
+        if let Some(thinking) = open_thinking {
+            g.last_reasoning = Some(thinking);
+        }
     }
 
     // Always resubscribe when the runtime lost the route (child restart /
@@ -3032,6 +3047,16 @@ async fn spawn_acp_turn(
 
     // Non-blocking: codex-style. Launch prompt on a background task so send()
     // returns while the consumer streams; finalize when prompt resolves.
+    // Final stop check immediately before arming the prompt task — a takeover
+    // between stop_won and here must not start session/prompt after cancel.
+    let prompt_epoch = {
+        let g = eng.lock().await;
+        if g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch) {
+            let _ = client.cancel(&session_id).await;
+            return Err(anyhow::anyhow!("engine stopped before ACP prompt"));
+        }
+        g.reset_epoch
+    };
     let (a, d, e, c, s, txt) = (
         app.clone(),
         db.clone(),
@@ -3040,8 +3065,15 @@ async fn spawn_acp_turn(
         session_id.clone(),
         text,
     );
-    let prompt_epoch = eng.lock().await.reset_epoch;
     tauri::async_runtime::spawn(async move {
+        // Re-validate under the lock once more right before the RPC — stop may
+        // have landed while this task was scheduled.
+        {
+            let g = e.lock().await;
+            if g.stopped || g.reset_epoch != prompt_epoch {
+                return;
+            }
+        }
         match c.prompt(&s, &txt).await {
             Ok(outcome) => {
                 let (cancelled, stopped) = {
@@ -3149,21 +3181,11 @@ async fn acp_emit_turn_end(
         }
         let thread_id = inner.thread_id;
         let session_id = inner.session_id;
-        if let Some(u) = pending_usage.as_ref() {
-            if let Some(ct) = u.total_tokens.or(u.input_tokens) {
-                inner.last_context_tokens = Some(ct);
-                let _ = app.emit(
-                    EVENT,
-                    Push::Usage {
-                        thread_id,
-                        session_id,
-                        context_tokens: ct,
-                        window: inner.last_window,
-                        model: inner.last_model.clone(),
-                    },
-                );
-            }
-        }
+        // Prompt-result usage is billing counters (totalTokens/inputTokens),
+        // not the live context window. Context comes only from usage_update
+        // notifications (SessionEvent::Usage → last_context_tokens). Do not
+        // overwrite that here — OMP's totalTokens is ~2× used.
+        let _ = pending_usage;
         persist_engine_meta(&db, &inner).await;
         let status = if inner.interrupting || pending_cancel {
             "interrupted"
@@ -3359,10 +3381,13 @@ async fn acp_consumer(
                     },
                 );
             }
-            SessionEvent::Meta { model, thinking: _ } => {
+            SessionEvent::Meta { model, thinking } => {
                 let mut inner = eng.lock().await;
                 if model.is_some() {
                     inner.last_model = model;
+                }
+                if thinking.is_some() {
+                    inner.last_reasoning = thinking;
                 }
             }
             SessionEvent::Permission {
@@ -6335,6 +6360,7 @@ mod tests {
             context_tokens: Some(57_000),
             window: Some(200_000),
             model: Some("claude-sonnet-4-5".into()),
+            reasoning_effort: None,
             mcp_servers: vec![super::super::proto::McpServer {
                 name: "context7".into(),
                 status: "connected".into(),
@@ -6412,6 +6438,7 @@ mod tests {
             context_tokens: Some(57_000),
             window: Some(100_000),
             model: Some("kept".into()),
+            reasoning_effort: None,
             mcp_servers: vec![],
             tools: vec![],
         };
@@ -6938,6 +6965,7 @@ mod tests {
             pending_command_refresh: false,
             last_context_tokens: None,
             last_model: None,
+            last_reasoning: None,
             last_window: None,
             last_mcp_servers: vec![],
             last_tools: vec![],
@@ -7288,6 +7316,7 @@ mod tests {
             pending_command_refresh: false,
             last_context_tokens: None,
             last_model: None,
+            last_reasoning: None,
             last_window: None,
             last_mcp_servers: vec![],
             last_tools: vec![],

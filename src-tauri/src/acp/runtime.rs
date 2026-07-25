@@ -79,9 +79,14 @@ struct Inner {
     next_id: i64,
     pending: PendingMap,
     sessions: SessionMap,
-    /// Permission request ids still awaiting a reply — safety-net / duplicate
-    /// replies only fire while the id is present (omp reuses id:0 across turns).
-    pending_permission_ids: std::collections::HashSet<String>,
+    /// Permission request ids still awaiting a reply, mapped to a monotonic
+    /// generation. Safety-net timers capture the generation at arm time so a
+    /// stale 1h timer cannot reject a later request that reused omp's id:0.
+    pending_permission_ids: std::collections::HashMap<String, u64>,
+    permission_gen: u64,
+    /// session/update events that arrived before subscribe() installed a route
+    /// (OMP often emits available_commands_update right after session/new).
+    pending_updates: std::collections::HashMap<String, Vec<SessionEvent>>,
     _child: tokio::process::Child,
     _reg: crate::proc_registry::Registration,
 }
@@ -251,7 +256,9 @@ impl ClientHandle {
             next_id: 1,
             pending: HashMap::new(),
             sessions: HashMap::new(),
-            pending_permission_ids: std::collections::HashSet::new(),
+            pending_permission_ids: std::collections::HashMap::new(),
+            permission_gen: 0,
+            pending_updates: std::collections::HashMap::new(),
             _child: child,
             _reg: reg,
         });
@@ -352,6 +359,14 @@ impl ClientHandle {
         if let Some(inner) = self.inner.lock().await.as_mut() {
             if let Some(route) = inner.sessions.get(sid) {
                 let _ = route.events.send(ev);
+            } else if !sid.is_empty() {
+                // Buffer until subscribe installs the route (commands/meta often
+                // race ahead of spawn_acp_turn's subscribe call).
+                const MAX_BUFFERED: usize = 64;
+                let buf = inner.pending_updates.entry(sid.to_string()).or_default();
+                if buf.len() < MAX_BUFFERED {
+                    buf.push(ev);
+                }
             }
         }
     }
@@ -371,7 +386,7 @@ impl ClientHandle {
         let intent = intent_key_from_params(&params);
         let req_key = Self::permission_id_key(&id);
 
-        let auto = {
+        let (auto, gen) = {
             let mut g = self.inner.lock().await;
             let Some(inner) = g.as_mut() else {
                 drop(g);
@@ -380,19 +395,22 @@ impl ClientHandle {
                     .await;
                 return;
             };
-            // pending set keys by JSON-RPC id (omp reuses 0)
-            inner.pending_permission_ids.insert(req_key);
+            // pending map keys by JSON-RPC id (omp reuses 0) → generation
+            inner.permission_gen = inner.permission_gen.wrapping_add(1);
+            let gen = inner.permission_gen;
+            inner.pending_permission_ids.insert(req_key.clone(), gen);
             let Some(route) = inner.sessions.get_mut(&sid) else {
                 drop(g);
                 self.reply_permission(&id, &options, Want::RejectOnce).await;
                 return;
             };
             // always-cache keys by intent, NOT request id
-            if let Some(w) = route.always.get(&intent) {
+            let auto = if let Some(w) = route.always.get(&intent) {
                 Some(w)
             } else {
                 route.auto_want
-            }
+            };
+            (auto, gen)
         };
         if let Some(want) = auto {
             self.reply_permission(&id, &options, want).await;
@@ -426,7 +444,7 @@ impl ClientHandle {
         let opts_t = options.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            me.reply_permission_if_pending(&id_t, &opts_t, Want::RejectOnce)
+            me.reply_permission_if_pending_gen(&id_t, &opts_t, Want::RejectOnce, gen)
                 .await;
         });
     }
@@ -445,7 +463,7 @@ impl ClientHandle {
                 return;
             };
             let key = Self::permission_id_key(id);
-            if !inner.pending_permission_ids.remove(&key) {
+            if inner.pending_permission_ids.remove(&key).is_none() {
                 return; // already answered or unknown
             }
         }
@@ -457,6 +475,28 @@ impl ClientHandle {
     }
 
     async fn reply_permission_if_pending(&self, id: &Value, options: &[Value], want: Want) {
+        self.reply_permission(id, options, want).await;
+    }
+
+    /// Timeout path: only reject if the pending generation still matches.
+    async fn reply_permission_if_pending_gen(
+        &self,
+        id: &Value,
+        options: &[Value],
+        want: Want,
+        gen: u64,
+    ) {
+        {
+            let mut g = self.inner.lock().await;
+            let Some(inner) = g.as_mut() else {
+                return;
+            };
+            let key = Self::permission_id_key(id);
+            match inner.pending_permission_ids.get(&key) {
+                Some(g) if *g == gen => {}
+                _ => return, // answered, or a newer request reused this id
+            }
+        }
         self.reply_permission(id, options, want).await;
     }
 
@@ -589,6 +629,10 @@ impl ClientHandle {
         let inner = g
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("ACP not connected"))?;
+        let buffered = inner
+            .pending_updates
+            .remove(session_id)
+            .unwrap_or_default();
         inner.sessions.insert(
             session_id.to_string(),
             SessionRoute {
@@ -597,6 +641,11 @@ impl ClientHandle {
                 auto_want: None,
             },
         );
+        if let Some(route) = inner.sessions.get(session_id) {
+            for ev in buffered {
+                let _ = route.events.send(ev);
+            }
+        }
         Ok(())
     }
 

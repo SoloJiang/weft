@@ -130,7 +130,7 @@ fn tool_call_update(update: &Value) -> UpdateOut {
     if id.is_empty() {
         return UpdateOut::Ignore;
     }
-    let output = extract_tool_output(update);
+    let output = crate::lead_chat::proto::cap_output(extract_tool_output(update));
     let is_error = status == "failed";
     UpdateOut::Chat(ChatEvent::ToolResults {
         items: vec![ToolResultItem {

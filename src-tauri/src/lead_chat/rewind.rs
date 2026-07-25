@@ -559,6 +559,7 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
     let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
     let want = normalize_ws(text);
     let mut user_hits = 0usize;
+    let mut seen_users = 0usize;
     let mut cut_at = None;
     for (i, line) in lines.iter().enumerate() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -584,7 +585,9 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
                     .join("\n")
             })
             .unwrap_or_default();
-        if !omp_user_body_matches(&body, &want, user_hits == 0) {
+        let is_first_user = seen_users == 0;
+        seen_users += 1;
+        if !omp_user_body_matches(&body, &want, is_first_user) {
             continue;
         }
         user_hits += 1;
@@ -1209,6 +1212,20 @@ mod tests {
             dispatched_text(true, 7, stamped),
             "look\n\nAttached images (read them as needed):\n- /tmp/weft-attachments/msg7-0.png\n"
         );
+    }
+
+    #[test]
+    fn omp_first_user_is_row_order_not_match_count() {
+        // Unrelated first user row must consume the "first" slot so a later
+        // `notes\n\nrun tests` cannot match as system-prepend.
+        let want = normalize_ws("run tests");
+        let first = "hello world";
+        let later = "notes\n\nrun tests";
+        assert!(!omp_user_body_matches(first, &want, true));
+        // After first row visited, later blank-paragraph is not first.
+        assert!(!omp_user_body_matches(later, &want, false));
+        // Exact later still matches.
+        assert!(omp_user_body_matches("run tests", &want, false));
     }
 
     #[test]

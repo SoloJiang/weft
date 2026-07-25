@@ -299,6 +299,7 @@ pub async fn lead_engine(
         pending_command_refresh: false,
         last_context_tokens: None,
         last_model: None,
+        last_reasoning: None,
         last_window: None,
         last_mcp_servers: vec![],
         last_tools: vec![],
@@ -419,6 +420,7 @@ pub struct LeadStateInfo {
     pub context_tokens: Option<u64>,
     pub window: Option<u64>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub mcp_servers: Vec<crate::lead_chat::proto::McpServer>,
     pub tools: Vec<String>,
 }
@@ -608,6 +610,7 @@ mod tests {
             context_tokens: None,
             window: None,
             model: None,
+            reasoning_effort: None,
             mcp_servers: vec![],
             tools: vec![],
         };
@@ -661,6 +664,7 @@ pub async fn lead_state(
                 context_tokens: snap.context_tokens,
                 window: snap.window,
                 model: snap.model,
+                reasoning_effort: snap.reasoning_effort.clone(),
                 mcp_servers: snap.mcp_servers,
                 tools: snap.tools,
             })
@@ -685,6 +689,7 @@ pub async fn lead_state(
                 context_tokens: i.last_context_tokens,
                 window: i.last_window,
                 model: i.last_model.clone(),
+                reasoning_effort: i.last_reasoning.clone(),
                 mcp_servers: i.last_mcp_servers.clone(),
                 tools: i.last_tools.clone(),
             })
@@ -1188,6 +1193,7 @@ pub(crate) async fn chat_open_worker_impl(
                 pending_command_refresh: false,
                 last_context_tokens: None,
                 last_model: None,
+                last_reasoning: None,
                 last_window: None,
                 last_mcp_servers: vec![],
                 last_tools: vec![],
@@ -1310,6 +1316,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         pending_command_refresh: false,
         last_context_tokens: None,
         last_model: None,
+        last_reasoning: None,
         last_window: None,
         last_mcp_servers: vec![],
         last_tools: vec![],
