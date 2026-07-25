@@ -24,3 +24,21 @@ export type SwitchKind = "switch" | "reload";
 export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
   return oldTool !== "" && oldTool === newTool ? "reload" : "switch";
 }
+
+/** Stable code `switch_lead_tool`/`switch_worker_tool` reject with when their
+ *  durable transaction does not commit (Rust: `SWITCH_FAILED_ERROR_CODE`). The
+ *  backend sends the CODE and logs the database detail, so this locale's copy
+ *  comes from `src/i18n/*.ts` rather than raw SQLite text.
+ *
+ *  Same shape as `isProcessQuotaDegradedError`: tauri commands reject with
+ *  strings today, while tests and future adapters may surface an `Error` or a
+ *  `{ code }` object. Anything else falls through to the caller's generic
+ *  handling, so an unrelated failure is never explained away as this one. */
+export const SWITCH_FAILED_ERROR_CODE = "switch_failed";
+
+export function isSwitchFailedError(error: unknown): boolean {
+  if (typeof error === "string") return error.includes(SWITCH_FAILED_ERROR_CODE);
+  if (error instanceof Error) return error.message.includes(SWITCH_FAILED_ERROR_CODE);
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return String(error.code) === SWITCH_FAILED_ERROR_CODE;
+}

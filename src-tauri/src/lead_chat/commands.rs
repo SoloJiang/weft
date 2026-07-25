@@ -1595,6 +1595,30 @@ async fn insert_switch_marker(
     }
 }
 
+/// Stable, locale-independent code a failed switch rejects with, matched by
+/// `src/session/engineSwitch.ts` so the dialog renders translated copy from
+/// `src/i18n/{en,zh}.ts` instead of raw SQLite text. Same contract as
+/// `process_quota::DEGRADED_ERROR_CODE`: reject with the CODE, log the detail.
+///
+/// ONE code, because the atomic write leaves exactly one failure mode — the
+/// transaction did not commit, so no tool change, no cleared native id, no
+/// marker. Earlier revisions of this PR carried three, one per failure mode of
+/// a multi-step design; that count is a good smell test for whether the design
+/// underneath has too many states.
+///
+/// COPY RULE: this is raised AFTER `engine::teardown_for_switch`, so the copy
+/// must NOT say nothing changed. The live turn has been killed and its open and
+/// queued rows finalized as `interrupted`; only the engine identity is
+/// untouched. Getting that wrong was the most repeated mistake in this PR's
+/// review history.
+pub const SWITCH_FAILED_ERROR_CODE: &str = "switch_failed";
+
+/// Reject with [`SWITCH_FAILED_ERROR_CODE`] and log the cause.
+fn switch_failure(surface: &str, err: impl std::fmt::Display) -> String {
+    eprintln!("[weft] engine switch failed for {surface}; nothing was persisted: {err}");
+    SWITCH_FAILED_ERROR_CODE.to_string()
+}
+
 /// Switch the LEAD's engine identity and/or model override for `thread_id` —
 /// issue #96 layer 1 of 3 (independent of any worker's tool and of the global
 /// default; see `switch_worker_tool` / `set_default_tool`). Semantics:
@@ -1676,7 +1700,7 @@ pub async fn switch_lead_tool(
     // structurally impossible rather than merely guarded.
     repo::switch_lead_engine_txn(&db, thread_id, &tool, model.as_deref())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| switch_failure(&format!("thread {thread_id}"), e))?;
 
     let lang = lang.unwrap_or_else(|| "en".to_string());
     let eng = lead_engine(&app, &db, thread_id, &lang)
@@ -1757,7 +1781,7 @@ pub async fn switch_worker_tool(
     // why the marker and the native-id clear simply joined it.
     repo::switch_worker_engine_txn(&db, sess.direction_id, session_id, &tool, model.as_deref())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| switch_failure(&format!("session {session_id}"), e))?;
 
     let eng = worker_engine(&app, &db, session_id)
         .await
@@ -2145,6 +2169,22 @@ mod switch_write_tests {
         repo::set_lead_native_id(db, th.id, "lead-nat-1").await.unwrap();
         repo::set_session_native_id(db, sess.id, "worker-nat-1").await.unwrap();
         (th.id, dir.id, sess.id)
+    }
+
+    /// The code is a cross-language contract with
+    /// `src/session/engineSwitch.ts`'s `SWITCH_FAILED_ERROR_CODE`, which no
+    /// compiler checks across the boundary. Pins the Rust half: the rejection
+    /// is the CODE alone, with the cause going to the log — renaming it here
+    /// without updating the matcher and both locale files goes red on this
+    /// side too.
+    #[test]
+    fn a_failed_switch_rejects_with_the_stable_code_only() {
+        assert_eq!(
+            super::switch_failure("thread 7", "database is locked"),
+            "switch_failed",
+            "spelling is mirrored in src/session/engineSwitch.ts — update both"
+        );
+        assert_eq!(super::SWITCH_FAILED_ERROR_CODE, "switch_failed");
     }
 
     #[tokio::test]
