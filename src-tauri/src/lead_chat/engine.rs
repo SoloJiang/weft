@@ -3519,7 +3519,9 @@ async fn codex_consumer(
                 let (tool, summary, detail, risk, action_key) =
                     codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
-                match registry.auto_decision(thread_id, &dir, &action_key) {
+                // `risk` gates issue #103's read-only batch/issue grants inside
+                // auto_decision; it never widens Full/Always, which ignore it.
+                match registry.auto_decision(thread_id, &dir, risk, &action_key) {
                     // dangerous mode / full access / always-allow: reply inline (fast).
                     Some(d) => {
                         let allow = matches!(d, crate::ask::Decision::Allow);
@@ -4650,6 +4652,178 @@ async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
     FreezeClaim::Owned(taken)
 }
 
+/// Proof that the turn-freeze grace marker actually landed in the DB — step 3
+/// of [`recover_from_freeze`], and the precondition for its step 5.
+///
+/// Zero-sized with a private field, and produced ONLY by
+/// [`stamp_freeze_marker`] on a successful write. That is deliberate: the
+/// dependency it encodes ("clear the native id only if the marker is durable")
+/// used to be an `if` over a `bool` two screens below the write, and a mutation
+/// run showed deleting that `if` broke nothing any test could see. A witness
+/// cannot be produced by an accidental edit, and it makes the dataflow between
+/// the two steps visible at the signature rather than in a comment.
+#[must_use]
+pub(super) struct FreezeMarkerStamped(());
+
+/// Step 3 of [`recover_from_freeze`]: stamp the `turn_freeze_recovered`
+/// coordination marker. `None` — meaning step 5 MUST be skipped — when there is
+/// no DB at all, or when the write failed.
+///
+/// Split out of `recover_from_freeze`, together with
+/// [`clear_native_context_after_freeze`], for ONE reason: that function needs an
+/// `AppHandle`, and this crate cannot build one under `cargo test`. `AppHandle`
+/// here is the concrete `Wry` runtime (58 unparameterized uses in this file
+/// alone), while `tauri::test::mock_app` only yields `MockRuntime` — so the
+/// pair, and the invariant binding them, were unreachable from any test. These
+/// two take `&Db`/`&EngineRef`, both of which a test can build for real.
+///
+/// Returns `Option`, NOT `Result<Option<_>>`, and that is the load-bearing part
+/// of the signature rather than a shortcut (review round 1, P1 — pushed back).
+/// The only thing any caller can do with a failed stamp is skip the clear, which
+/// is exactly what `None` already says, so a `Result` would add a SECOND way to
+/// spell "no durable marker" (`Err(_)` alongside `Ok(None)`) whose only correct
+/// handling is to collapse into the first. Two representations of the gate's
+/// false case is precisely the room-to-get-it-wrong this witness type exists to
+/// remove — the original defect was a gate that could be dropped by accident.
+/// The error is not swallowed either: the *decision* is preserved in the return
+/// value and only the `DbErr` text is logged, because nothing upstream can act
+/// on it — `recover_from_freeze` returns `bool` and its sole caller is a
+/// detached `tauri::async_runtime::spawn` in `spawn_watchdog` that discards even
+/// that, so there is no caller to propagate to.
+pub(super) async fn stamp_freeze_marker(
+    db: Option<&Db>,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Option<FreezeMarkerStamped> {
+    let db = db?;
+    match repo::mark_turn_freeze_recovered(db, thread_id, session_id).await {
+        Ok(()) => Some(FreezeMarkerStamped(())),
+        Err(err) => {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
+            );
+            None
+        }
+    }
+}
+
+/// Step 5 of [`recover_from_freeze`]: clear the native session id, BOTH mirrors
+/// (durable + in-memory), and only when `stamped` proves step 3 landed.
+///
+/// The gate is the point. `revive` reads a missing native id as "never ran"
+/// UNLESS a marker says the recovery cleared it
+/// (`revive::has_resumable_context`), so clearing after a failed stamp destroys
+/// the only evidence this session ever ran and leaves it permanently invisible
+/// to every stall sweep — the exact defect PR #133 removed, reintroduced through
+/// the error path.
+///
+/// Skipping the clear instead leaves the session with its native id and no
+/// marker, i.e. an ordinary stall: visible, re-drivable, and if the transport
+/// really is still wedged the next turn simply trips the freeze watchdog again
+/// and retries the whole recovery — with a fresh chance to stamp. That
+/// self-heals; permanent invisibility never does. Failing toward VISIBLE is
+/// deliberate: one extra re-drive is cheap, work silently stranded forever is
+/// not.
+///
+/// Both mirrors are gated together so they cannot desync (an earlier revision
+/// split them and that was a P1). The in-memory mirror is cleared even with no
+/// `Db` present — same as before this was extracted — since a missing `Db` is a
+/// test/teardown shape, not a failed write. The app-server connection was
+/// already dropped by the caller regardless, so a resumed conversation
+/// reconnects fresh even on the skip path.
+///
+/// Returns `()`, not `Result<()>`, because a failed `clear_native_id` is
+/// terminal HERE by design and not by omission (review round 1, P1 — pushed
+/// back). Aborting is not an available option at this point in
+/// `recover_from_freeze`: `take_frozen_turn` has already taken the app-server
+/// client and reset the turn in memory, so an early return would leak that
+/// connection, strand the drained rows as `streaming`, and leave the DB claiming
+/// `running` for a turn that is over. Handing the error upward would therefore
+/// buy the same `eprintln!` one frame higher while moving that reasoning away
+/// from the code it justifies. The state this failure leaves behind is the
+/// benign one either way: a session that kept its native id AND has a durable
+/// marker, which `revive::has_resumable_context` still reads as resumable.
+pub(super) async fn clear_native_context_after_freeze(
+    stamped: Option<&FreezeMarkerStamped>,
+    db: Option<&Db>,
+    eng: &EngineRef,
+    session_id: Option<i32>,
+    thread_id: i32,
+) {
+    if stamped.is_none() {
+        return;
+    }
+    if let Some(db) = db {
+        if let Err(err) = clear_native_id(db, session_id, thread_id).await {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
+            );
+        }
+    }
+    eng.lock().await.native_id = None;
+}
+
+/// A default-ish [`EngineInner`] for tests. Lives out here rather than in this
+/// file's `mod tests` because `revive`'s own tests need it too (the freeze
+/// recovery's DB steps take an `&EngineRef`), and because a test-only
+/// constructor belongs next to the type it constructs — same placement as
+/// `codex_app_server::Client::test_stub`.
+#[cfg(test)]
+pub(super) fn test_inner(tool: &str) -> EngineInner {
+    EngineInner {
+        thread_id: 1,
+        tool: tool.into(),
+        command: None,
+        session_id: None,
+        cwd: "/tmp".into(),
+        extra_args: vec![],
+        system_prompt: String::new(),
+        native_id: None,
+        pending_context_digest: None,
+        slash_commands: vec![],
+        turn: TurnState::default(),
+        turn_id: 0,
+        ask_dir: "lead".into(),
+        clock: TurnClock::default(),
+        child: None,
+        child_reg: None,
+        child_permit: None,
+        stdin: None,
+        current: None,
+        open_texts: std::collections::HashMap::new(),
+        turn_saw_text: false,
+        interrupting: false,
+        generation: 0,
+        reset_epoch: 0,
+        pending_skill_refresh: false,
+        pending_command_refresh: false,
+        last_context_tokens: None,
+        last_model: None,
+        last_window: None,
+        last_mcp_servers: vec![],
+        last_tools: vec![],
+        probe_seq: 0,
+        probe_committed: 0,
+        current_origin_tag: None,
+        tool_rows: std::collections::HashMap::new(),
+        stopped: false,
+        codex_client: None,
+        turn_user_row: None,
+        last_assistant_uuid: None,
+        rewinding: false,
+        worktree_id: None,
+    }
+}
+
+/// A live [`EngineRef`] carrying `native_id` — the in-memory half of what the
+/// freeze recovery's native-id clear touches. Test-only.
+#[cfg(test)]
+pub(super) fn test_engine_ref(native_id: Option<&str>) -> EngineRef {
+    let mut inner = test_inner("codex");
+    inner.native_id = native_id.map(str::to_string);
+    Arc::new(tokio::sync::Mutex::new(inner))
+}
+
 /// Re-confirm and execute the turn-freeze auto-recovery (issue #93). The
 /// sweep's verdict was computed under a lock already dropped, so this re-runs
 /// the FULL check (busy + silent past `freeze_secs` + not legitimately blocked
@@ -4746,16 +4920,18 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     // nothing (review round 4), so a declined recovery can't suppress a
     // legitimate re-drive for a whole window.
     //
-    // This marker is now the SOLE guard, and `marker_stamped` carries whether
-    // it landed all the way to the native-id clear below, which is GATED on
-    // it. That gate is not tidiness: `revive` reads a missing native id as
-    // "never ran" unless a marker says the recovery cleared it, so clearing
-    // after a failed insert would destroy the only evidence this session ever
-    // ran and strand it permanently — the very defect this PR removes, coming
-    // back through the error path. Skipping the clear leaves an ordinary,
-    // visible, re-drivable stall that self-heals (a still-wedged transport
-    // just trips the watchdog again, with a fresh chance to stamp). See the
-    // gate for the full reasoning.
+    // This marker is now the SOLE guard, and the `FreezeMarkerStamped` witness
+    // it yields carries whether it landed all the way to the native-id clear
+    // below, which REQUIRES it. That gate is not tidiness: `revive` reads a
+    // missing native id as "never ran" unless a marker says the recovery
+    // cleared it, so clearing after a failed insert would destroy the only
+    // evidence this session ever ran and strand it permanently — the very
+    // defect this PR removes, coming back through the error path. Skipping the
+    // clear leaves an ordinary, visible, re-drivable stall that self-heals (a
+    // still-wedged transport just trips the watchdog again, with a fresh chance
+    // to stamp). See [`clear_native_context_after_freeze`] for the full
+    // reasoning, and [`stamp_freeze_marker`] for why both steps live in their
+    // own functions rather than inline here.
     //
     // Aborting outright is not available as a fail-closed option: by this
     // point `take_frozen_turn` has taken the app-server client and reset the
@@ -4770,17 +4946,9 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     // surviving transport to be re-driven back into. For the app-server
     // dialect no ordering window is left, since its only idle exposure is the
     // `persist_activity` below.
-    let marker_stamped = match app.try_state::<Db>() {
-        None => false,
-        Some(db) => match repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
-            Ok(()) => true,
-            Err(err) => {
-                eprintln!(
-                    "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
-                );
-                false
-            }
-        },
+    let stamped = {
+        let db = app.try_state::<Db>();
+        stamp_freeze_marker(db.as_deref(), thread_id, session_id).await
     };
     if let Some((c, drain)) = taken {
         c.shutdown().await;
@@ -4858,34 +5026,19 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         // did. Here, we are that "whatever".
         emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
     }
-    // Gated on the marker, and the gate is the point. `revive` now reads a
-    // missing native id as "never ran" UNLESS a marker says the recovery
-    // cleared it (`has_resumable_context`). So clearing the id after a FAILED
-    // marker write would destroy the only evidence that this session ever ran
-    // and leave it permanently invisible to the re-drive — the exact defect
-    // this PR exists to remove, reintroduced through the error path.
-    //
-    // Skipping the clear instead leaves the session with its native id and no
-    // marker, i.e. an ordinary stall: visible, re-drivable, and if the
-    // transport really is still wedged the next turn simply trips the freeze
-    // watchdog again and retries this whole recovery — with a fresh chance to
-    // stamp the marker. That self-heals; permanent invisibility never does.
-    // Failing toward VISIBLE is deliberate: one extra re-drive is cheap, work
-    // silently stranded forever is not.
-    //
-    // Both mirrors are gated together so they cannot desync (an earlier
-    // revision split them and that was a P1). The connection was already
-    // dropped above regardless, so a resumed conversation reconnects fresh
-    // even on this path.
-    if marker_stamped {
-        if let Some(db) = app.try_state::<Db>() {
-            if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
-                eprintln!(
-                    "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
-                );
-            }
-        }
-        eng.lock().await.native_id = None;
+    // Step 5, gated on the marker witness from step 3 — see
+    // [`clear_native_context_after_freeze`] for why that gate is the whole
+    // point, and why both native-id mirrors are gated together.
+    {
+        let db = app.try_state::<Db>();
+        clear_native_context_after_freeze(
+            stamped.as_ref(),
+            db.as_deref(),
+            eng,
+            session_id,
+            thread_id,
+        )
+        .await;
     }
     if let Some(bus) = app.try_state::<crate::bus::BusRegistry>() {
         bus.ask_human(thread_id, &dir, &freeze_recovery_text(freeze_secs));
@@ -7598,52 +7751,6 @@ mod tests {
         assert!(!per_turn("mystery"));
     }
 
-    fn test_inner(tool: &str) -> EngineInner {
-        EngineInner {
-            thread_id: 1,
-            tool: tool.into(),
-            command: None,
-            session_id: None,
-            cwd: "/tmp".into(),
-            extra_args: vec![],
-            system_prompt: String::new(),
-            native_id: None,
-            pending_context_digest: None,
-            slash_commands: vec![],
-            turn: TurnState::default(),
-            turn_id: 0,
-            ask_dir: "lead".into(),
-            clock: TurnClock::default(),
-            child: None,
-            child_reg: None,
-            child_permit: None,
-            stdin: None,
-            current: None,
-            open_texts: std::collections::HashMap::new(),
-            turn_saw_text: false,
-            interrupting: false,
-            generation: 0,
-            reset_epoch: 0,
-            pending_skill_refresh: false,
-            pending_command_refresh: false,
-            last_context_tokens: None,
-            last_model: None,
-            last_window: None,
-            last_mcp_servers: vec![],
-            last_tools: vec![],
-            probe_seq: 0,
-            probe_committed: 0,
-            current_origin_tag: None,
-            tool_rows: std::collections::HashMap::new(),
-            stopped: false,
-            codex_client: None,
-            turn_user_row: None,
-            last_assistant_uuid: None,
-            rewinding: false,
-            worktree_id: None,
-        }
-    }
-
     #[test]
     fn mark_hidden_turn_started_sets_busy_and_clears_origin_tag() {
         let mut inner = test_inner("claude");
@@ -7902,6 +8009,129 @@ mod tests {
         // Still busy — this function never resets state when there's no
         // client to take; that stays the reader task's job for this dialect.
         assert!(eng.lock().await.turn.busy);
+    }
+
+    // ---- issue #93 / PR #133: the marker-gated native-id clear ----
+    //
+    // `recover_from_freeze` itself is unreachable from a test — it takes the
+    // concrete `AppHandle<Wry>`, see `stamp_freeze_marker`'s doc — so these
+    // drive the exact two functions it calls, in the order it calls them, over
+    // a real `Db` and a real `EngineRef`. The failure they need (the marker
+    // write failing while its neighbours succeed) comes from the test-only
+    // seam `repo::fail_write`, NOT from hand-built rows: the first revision of
+    // `revive`'s own freeze tests asserted a post-recovery shape production
+    // never produces, and that was worse than having no test.
+
+    /// A workspace + thread whose lead has already captured a native id — the
+    /// state a freeze recovery finds when it fires.
+    async fn freeze_fixture() -> (Db, i32) {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        repo::set_lead_native_id(&db, t.id, "nat-1").await.unwrap();
+        (db, t.id)
+    }
+
+    /// PR #133's core fix, which mutation testing showed had ZERO regression
+    /// protection (the whole suite stayed green with the gate deleted): when
+    /// `mark_turn_freeze_recovered` fails, the native-id clear must be skipped
+    /// — BOTH mirrors — so the session never lands in `native_id = None &&
+    /// marker = None`. `revive::has_resumable_context` reads that combination
+    /// as "never ran" and excludes it from every stall sweep; nothing
+    /// automated can recreate the id while it is excluded, so the exclusion is
+    /// permanent, not one window.
+    #[tokio::test]
+    async fn failed_freeze_marker_skips_the_native_id_clear() {
+        let (db, thread_id) = freeze_fixture().await;
+        let eng = test_engine_ref(Some("nat-1"));
+
+        let stamped = repo::fail_write::while_failing(
+            "mark_turn_freeze_recovered",
+            stamp_freeze_marker(Some(&db), thread_id, None),
+        )
+        .await;
+        assert!(
+            stamped.is_none(),
+            "a failed marker write must be reported as 'no witness', never swallowed"
+        );
+
+        clear_native_context_after_freeze(stamped.as_ref(), Some(&db), &eng, None, thread_id).await;
+
+        let marker = repo::last_turn_freeze_recovery_secs(&db, thread_id, None)
+            .await
+            .unwrap();
+        let durable = repo::lead_native_id(&db, thread_id).await.unwrap();
+        assert_eq!(marker, None, "precondition: the marker write really did fail");
+        // THE invariant, stated as the defect is stated.
+        assert!(
+            !(durable.is_none() && marker.is_none()),
+            "native_id=None && marker=None is the permanently-invisible shape PR #133 removed"
+        );
+        // …and satisfied by KEEPING the id (the only option left once the
+        // marker is gone), not by some other row appearing.
+        assert_eq!(durable.as_deref(), Some("nat-1"));
+        assert_eq!(
+            eng.lock().await.native_id.as_deref(),
+            Some("nat-1"),
+            "the in-memory mirror is gated too — splitting the two mirrors was a P1"
+        );
+    }
+
+    /// The positive control the test above needs to mean anything: with the
+    /// marker write succeeding, the clear DOES happen, both mirrors. Without
+    /// this, gutting `clear_native_context_after_freeze` into a no-op would
+    /// leave the failure test green.
+    #[tokio::test]
+    async fn stamped_freeze_marker_clears_both_native_id_mirrors() {
+        let (db, thread_id) = freeze_fixture().await;
+        let eng = test_engine_ref(Some("nat-1"));
+
+        let stamped = stamp_freeze_marker(Some(&db), thread_id, None).await;
+        assert!(stamped.is_some(), "an unarmed marker write must succeed");
+
+        clear_native_context_after_freeze(stamped.as_ref(), Some(&db), &eng, None, thread_id).await;
+
+        assert_eq!(repo::lead_native_id(&db, thread_id).await.unwrap(), None);
+        assert_eq!(eng.lock().await.native_id, None);
+        assert!(
+            repo::last_turn_freeze_recovery_secs(&db, thread_id, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "…and the marker authorising the clear is durable, so `revive` still \
+             reads this session as resumable"
+        );
+    }
+
+    /// No `Db` registered (app teardown, or a test harness) must still clear
+    /// the in-memory mirror — the shape the pre-extraction code had, preserved
+    /// on purpose: a missing `Db` is not a failed write, and leaving a stale
+    /// native id in memory would make the next send resume the wedged session.
+    #[tokio::test]
+    async fn stamped_freeze_marker_clears_the_memory_mirror_without_a_db() {
+        let eng = test_engine_ref(Some("nat-1"));
+        let (db, thread_id) = freeze_fixture().await;
+        let stamped = stamp_freeze_marker(Some(&db), thread_id, None).await;
+
+        clear_native_context_after_freeze(stamped.as_ref(), None, &eng, None, thread_id).await;
+
+        assert_eq!(eng.lock().await.native_id, None);
+    }
+
+    /// No `Db` at all also means no marker can exist, so there is no witness
+    /// and nothing may be cleared — the same fail-visible direction as a
+    /// failed write.
+    #[tokio::test]
+    async fn no_db_yields_no_freeze_marker_witness() {
+        let eng = test_engine_ref(Some("nat-1"));
+
+        let stamped = stamp_freeze_marker(None, 1, None).await;
+        assert!(stamped.is_none());
+        clear_native_context_after_freeze(stamped.as_ref(), None, &eng, None, 1).await;
+
+        assert_eq!(eng.lock().await.native_id.as_deref(), Some("nat-1"));
     }
 
     // ---- session_gate: a cleared `child` must hand its slot back ----

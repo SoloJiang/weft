@@ -14,7 +14,7 @@ import { needsBarMotion } from "../lib/motion";
  * (single active ask). Collapses on answer.
  */
 export function PermissionBar({ asks }: { asks: PermissionAsk[] }) {
-  const { answerPermission } = useStore();
+  const { answerPermission, releaseSessionReadOnly } = useStore();
   const reduce = useReducedMotion();
   const ask = asks[0];
   return (
@@ -28,6 +28,7 @@ export function PermissionBar({ asks }: { asks: PermissionAsk[] }) {
           <PermissionConfirmationCard
             ask={ask}
             onAnswer={(askId, answer) => void answerPermission(askId, answer)}
+            onReleaseSessionReadOnly={() => void releaseSessionReadOnly(ask.thread, ask.dir)}
             className="flex-row items-center gap-2 rounded-[var(--radius-lg)] border border-waiting/40 bg-waiting/10 px-3 py-2 text-[12.5px]"
             actionsClassName="shrink-0"
             enableShortcuts

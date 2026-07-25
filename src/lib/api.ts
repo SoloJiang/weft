@@ -20,6 +20,7 @@ import type {
   PermissionAsk,
   ProcessQuotaStatus,
   Proposal,
+  ReadOnlyGrants,
   RepoChecks,
   RepoGraph,
   RepoRef,
@@ -272,6 +273,20 @@ export const api = {
   // rule (actionKey is the canonical action identity, not the display summary).
   revokeAuthGrant: (thread: number, dir: string | null, actionKey: string | null) =>
     invoke<void>("revoke_auth_grant", { thread, dir, actionKey }),
+
+  // Read-only auto-allow grants (issue #103) — in-memory only, NEVER persisted
+  // (contrast the Full/Always grants above): a live snapshot, not something
+  // restored at boot.
+  readOnlyGrants: () => invoke<ReadOnlyGrants>("read_only_grants"),
+  // "Release all read-only for this session": resolves the open ReadOnly-tier
+  // backlog in (thread, dir) to Allow and installs a forward-looking rule for
+  // the rest of the session. Returns how many open asks were just released.
+  releaseSessionReadOnly: (thread: number, dir: string) =>
+    invoke<number>("release_session_read_only", { thread, dir }),
+  // Revoke a read-only grant. dir=null revokes the whole issue's propagation;
+  // dir set revokes just that one session's batch grant.
+  revokeReadOnlyGrant: (thread: number, dir: string | null) =>
+    invoke<void>("revoke_read_only_grant", { thread, dir }),
 
   // Needs-you: open agent→human questions, aggregated across the workspace.
   needsYou: (workspaceId: number) =>

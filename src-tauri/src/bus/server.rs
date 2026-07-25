@@ -130,9 +130,11 @@ async fn handle_ask(
 
     let (summary, detail, risk, action_key) = summarize(tool_name, req.get("tool_input"));
 
-    // A standing rule (full access / always-allow) decides without surfacing.
-    // Matches on the canonical action_key, NOT the (possibly lossy) summary.
-    if asks.auto_decision(thread, &dir, &action_key) == Some(Decision::Allow) {
+    // A standing rule (full access / always-allow / issue #103's read-only
+    // batch-or-issue grant) decides without surfacing. Matches on the
+    // canonical action_key, NOT the (possibly lossy) summary; `risk` gates the
+    // read-only grants (never widens Full/Always, which ignore it entirely).
+    if asks.auto_decision(thread, &dir, risk, &action_key) == Some(Decision::Allow) {
         return hook_decision("allow", "Auto-approved by a weft rule");
     }
 

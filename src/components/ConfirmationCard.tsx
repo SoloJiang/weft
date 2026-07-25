@@ -257,6 +257,11 @@ type PermissionConfirmationCardProps = {
   readonly summaryMode?: "inline" | "block";
   /** Bind keyboard shortcuts (Enter/⌘↩/Esc). Only for a single active in-session ask. */
   readonly enableShortcuts?: boolean;
+  /** "Release all read-only for this session" (issue #103's batch action) —
+   *  a session-wide rule, not an answer to THIS one ask, so it's a separate
+   *  callback rather than a new `PermissionAnswer` variant. Omitted → the menu
+   *  item doesn't render (callers that can't resolve a (thread, dir) scope). */
+  readonly onReleaseSessionReadOnly?: () => void;
 };
 
 export function PermissionConfirmationCard({
@@ -270,6 +275,7 @@ export function PermissionConfirmationCard({
   showToolIcon = false,
   summaryMode = "inline",
   enableShortcuts = false,
+  onReleaseSessionReadOnly,
 }: PermissionConfirmationCardProps) {
   const { t } = useTranslation();
   const detailTitle = ask.detail || ask.summary;
@@ -417,6 +423,14 @@ export function PermissionConfirmationCard({
             >
               {t("needs.fullAccess")}
             </DropdownMenuItem>
+            {onReleaseSessionReadOnly && (
+              <DropdownMenuItem
+                title={t("needs.releaseReadOnlyTitle")}
+                onSelect={onReleaseSessionReadOnly}
+              >
+                {t("needs.releaseReadOnly")}
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
         <ConfirmationAction
