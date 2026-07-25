@@ -930,20 +930,20 @@ fn tool_specs() -> Value {
     json!([
         {
             "name": "bus_post",
-            "description": "Post a message to another task's inbox in this thread.",
+            "description": "Post a message to another participant's inbox in this thread. `to` is either \"lead\" (the thread lead; the lead has no numeric id) or the exact numeric id from a worker's messages' `from` field (not a display name or issue number). Prefer bus_post over broadcast when a specific participant must see the message, including when they may be idle.",
             "inputSchema": { "type": "object",
                 "properties": { "to": str_prop(), "text": str_prop() },
                 "required": ["to", "text"] }
         },
         {
             "name": "bus_broadcast",
-            "description": "Send a message to every other task in this thread.",
+            "description": "Send a message to every other participant currently active on the bus. Idle participants may miss it — use bus_post with \"lead\" or a worker's numeric id when a specific participant must receive the update.",
             "inputSchema": { "type": "object",
                 "properties": { "text": str_prop() }, "required": ["text"] }
         },
         {
             "name": "bus_inbox",
-            "description": "Read and clear your unread messages from other tasks.",
+            "description": "Read and clear your unread messages from other tasks. Call this whenever you are told there are new messages; do not assume silence means nothing happened.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
