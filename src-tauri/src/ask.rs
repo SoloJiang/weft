@@ -217,18 +217,20 @@ const CRED_NET_MARKERS: &[&str] = &[
     // product (`src/network/mod.rs`, `tokenizer.py` both matched before this
     // fix), so a raw substring check produced frequent false positives on
     // the MOST severe tier, eroding trust in the badge exactly the way
-    // under-classifying would. `_token`/`token=`/`--token` keep a punctuation-
-    // anchored signal for shell-variable/assignment/CLI-flag shapes
-    // (`$GITHUB_TOKEN`, `AUTH_TOKEN`, `token=xyz`, `["--token", "abc"]`)
-    // without matching a bare path segment or module/file name. The literal
+    // under-classifying would. `token=` keeps a punctuation-anchored signal
+    // for the assignment shape (`token=xyz`, `AUTH_TOKEN=xyz`) without
+    // matching a bare path segment or module/file name. The literal
     // `"network":`/`"token":` JSON-key forms that used to live here were
     // superseded by the credential-key check (round-3 review: those two literals
     // missed single-quoted pseudo-JSON and a space before the colon — see
     // `matches_cred_net`).
     //
-    // The `--token` CLI-flag shape is NOT a plain substring entry here — it
-    // needs an argument boundary after it, so it lives in `has_token_flag`.
-    "_token",
+    // The other two "token" shapes are NOT plain substring entries: `_token`
+    // (shell variable / credential file) and `--token` (CLI option) both need
+    // a boundary check to avoid matching the middle of a longer name, so they
+    // live in `has_anchored_token`. `_token` was a bare entry here until
+    // round-4 — see that function for why every `*_token*.rs` source file a
+    // coding agent edits was reading as the most severe tier.
     "token=",
 ];
 
@@ -707,32 +709,67 @@ fn has_cred_key(text: &str, payload: Option<&str>) -> bool {
 /// Deliberately double-dashed: a single-dash `-token` would match the tail
 /// of an ordinary kebab-case source path (`src/auth/refresh-token.rs`),
 /// while a path segment never carries a `--` prefix.
-fn has_token_flag(haystack_lower: &str) -> bool {
-    haystack_lower.match_indices("--token").any(|(pos, m)| {
-        // A COMPLETE flag is bounded on BOTH sides, by the SAME set of
-        // continuation characters. Leading side: `feature--token`,
-        // `feature_--token`, and `feature---token` are all one longer
-        // argument whose tail merely reads as the flag. Trailing side:
-        // `--tokens`, `--tokenizer`, and `--token-file` are all a DIFFERENT
-        // option. Anything else — whitespace, `=`, a quote, `,`, `]`, or the
-        // end of input — is a real argument boundary.
-        let is_continuation =
-            |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
-        let opens_a_flag = !haystack_lower[..pos]
-            .chars()
-            .next_back()
-            .is_some_and(is_continuation);
-        let ends_the_flag = !haystack_lower[pos + m.len()..]
-            .chars()
-            .next()
-            .is_some_and(is_continuation);
-        opens_a_flag && ends_the_flag
+/// Characters that continue an identifier, a filename, or a CLI option, and
+/// therefore are NOT a boundary. `.` is in here specifically because it is
+/// what separates a source file from a credential: `generate_token.py` and
+/// `oauth_token_store.rs` are code, `auth_token` and `$GITHUB_TOKEN` are not.
+fn is_identifier_continuation(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
+
+/// The punctuation-anchored "token" shapes, with whether each must also START
+/// a token to count.
+///
+/// `--token` MUST (`true`): without a leading boundary, `feature--token` — a
+/// branch name whose tail merely reads as the flag — matches.
+///
+/// `_token` must NOT (`false`): it is a SUFFIX by construction. The whole
+/// point is to match the tail of `$GITHUB_TOKEN` / `auth_token`, where the
+/// character before the underscore is an ordinary identifier character.
+const ANCHORED_TOKEN_MARKERS: &[(&str, bool)] = &[("--token", true), ("_token", false)];
+/// Whether `haystack_lower` contains one of `ANCHORED_TOKEN_MARKERS` as a
+/// COMPLETE token rather than as a fragment of a longer one.
+///
+/// Both entries need a TRAILING boundary, and for the same reason: without
+/// one, the marker matches the middle of a longer name. `--tokens 500` and
+/// `--tokenizer bpe` are ordinary LLM/NLP options, not credentials — and
+/// `generate_token.py`, `oauth_token_store.rs`, `refresh_token_test.go` are
+/// ordinary SOURCE FILES, which a coding agent edits constantly. Flagging
+/// those as the most severe tier is the same cried-wolf harm this whole
+/// change removes, so `_token` gets the same boundary discipline `--token`
+/// got rather than staying a bare substring.
+///
+/// What survives, because none of these continue the identifier: `$GITHUB_TOKEN`
+/// and `cat ~/.config/auth_token` (end of input), `AUTH_TOKEN=x` (`=`),
+/// `{"auth_token": "x"}` (a quote), `x-auth_token: abc` (`:`).
+///
+/// KNOWN, ACCEPTED cost: a credential name that keeps going loses the marker
+/// — `GITHUB_TOKEN_FILE=/run/secrets/x`, `auth_token.json`. Those name a
+/// PATH to a secret rather than the secret itself, which is the credential-
+/// path markers' job (`.env`, `.netrc`, …), and this direction only ever
+/// costs an over-flag, never a missed one, for the ordinary-source-file case
+/// that made the marker misfire far more often than it fired.
+fn has_anchored_token(haystack_lower: &str) -> bool {
+    ANCHORED_TOKEN_MARKERS.iter().any(|(marker, needs_leading)| {
+        haystack_lower.match_indices(marker).any(|(pos, m)| {
+            let opens = !needs_leading
+                || !haystack_lower[..pos]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_identifier_continuation);
+            let ends = !haystack_lower[pos + m.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_identifier_continuation);
+            opens && ends
+        })
     })
 }
 
 /// The single check every `classify_*` function uses for "does this text
 /// show network access or a credential": the flat substring list, the
-/// boundary-checked `--token` flag shape, and the credential-key check
+/// boundary-checked anchored `token` shapes (`has_anchored_token`), and
+/// the credential-key check
 /// (round-3/round-4 — see `has_cred_key`). One function so command/file/other
 /// never drift apart on which of the three checks they remember to run.
 ///
@@ -749,7 +786,7 @@ fn has_token_flag(haystack_lower: &str) -> bool {
 fn matches_cred_net(text: &str, payload: Option<&str>) -> bool {
     let lower = text.to_ascii_lowercase();
     contains_marker(&lower, CRED_NET_MARKERS)
-        || has_token_flag(&lower)
+        || has_anchored_token(&lower)
         || has_cred_key(text, payload)
 }
 
@@ -2459,7 +2496,7 @@ mod tests {
                 "{args_text:?} should be network/credential"
             );
         }
-        assert!(has_token_flag("deploy --token"));
+        assert!(has_anchored_token("deploy --token"));
     }
 
     #[test]
@@ -2553,6 +2590,77 @@ mod tests {
             }),
             RiskLevel::Write
         );
+    }
+
+    #[test]
+    fn snake_case_token_source_files_are_not_credentials() {
+        // The `_token` marker was a bare substring until round-4, so every
+        // ordinary snake_case source file with a token segment read as the
+        // MOST severe tier — and unlike the args-blob scan this fires through
+        // `classify_file` too, so a plain `Read` of one was red as well.
+        // Same cried-wolf harm, a third door into it.
+        let paths = [
+            "src/generate_token.py",
+            "src/oauth_token_store.rs",
+            "src/auth/refresh_token_test.go",
+        ];
+        for path in paths {
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Read", path }),
+                RiskLevel::NetworkOrCredential,
+                "Read {path:?} must not be flagged network/credential"
+            );
+            assert_ne!(
+                classify_risk(RiskSignal::File { tool_name: "Write", path }),
+                RiskLevel::NetworkOrCredential,
+                "Write {path:?} must not be flagged network/credential"
+            );
+            let args_text = format!(r#"{{"path":"{path}","content":"x"}}"#);
+            assert_ne!(
+                classify_risk(RiskSignal::Other {
+                    tool_name: "write_file",
+                    args_text: &args_text
+                }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} must not be flagged network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn token_suffix_still_fires_at_a_real_boundary() {
+        // The narrowing must not cost the shapes `_token` exists for. Asserted
+        // on the predicate itself, because at the `classify_risk` level most
+        // of these ALSO trip a marker of their own (`curl `, `token=`) and
+        // would pass even with `_token` deleted outright — a test that cannot
+        // fail is not a guard.
+        for text in [
+            "echo $github_token",            // shell variable, end of input
+            "cat ~/.config/auth_token",      // credential file, no extension
+            "export auth_token=abc",         // assignment
+            r#"{"auth_token": "sk-1"}"#,     // json key, quote
+            r#"curl -h "x-auth_token: abc""#, // header, colon
+            "run --token sk-1",              // the sibling anchored shape
+        ] {
+            assert!(has_anchored_token(text), "{text:?} lost its anchor");
+        }
+        for text in [
+            "src/generate_token.py",
+            "src/oauth_token_store.rs",
+            "src/auth/refresh_token_test.go",
+            "github_token_file=/run/secrets/x", // accepted cost, see the fn doc
+        ] {
+            assert!(!has_anchored_token(text), "{text:?} should not anchor");
+        }
+        // End to end on the two commands that DO isolate `_token` — `echo`
+        // and `cat` are read-only-shaped, so nothing else can be lifting them.
+        for cmd in ["echo $GITHUB_TOKEN", "cat ~/.config/auth_token"] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::NetworkOrCredential,
+                "{cmd:?} should be network/credential"
+            );
+        }
     }
 
     #[test]
@@ -2839,6 +2947,11 @@ mod tests {
             ("write_file", r#"{"path":"src/token.rs","content":"x"}"#),
             ("write_file", r#"{"path":"src/auth/token_refresh.rs","content":"x"}"#),
             ("edit_file", r#"{"path":"src/auth/refresh-token.rs","content":"x"}"#),
+            // This one fired through the SEPARATE round-2 `_token` substring
+            // marker rather than the args-blob scan, so it survived the first
+            // pass of this fix and needed the marker's own boundary check —
+            // see `has_anchored_token`.
+            ("write_file", r#"{"path":"src/generate_token.py","content":"x"}"#),
         ] {
             let risk = classify_risk(RiskSignal::Other { tool_name, args_text });
             println!("  {tool_name:?} args={args_text:?} -> {risk:?} (pre-fix: NetworkOrCredential)");
