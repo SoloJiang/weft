@@ -119,6 +119,53 @@ fn yarn_lock_is_berry(dir: &Path) -> bool {
     }
 }
 
+/// Whether this Berry checkout links dependencies into `node_modules` instead
+/// of generating a PnP loader. We only need the simple project-local setting
+/// here; risky ancestor configs are rejected before an install is planned.
+fn yarn_berry_uses_node_modules_linker(dir: &Path) -> bool {
+    for name in [".yarnrc.yml", ".yarnrc.yaml"] {
+        let Ok(raw) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            if !key.trim().eq_ignore_ascii_case("nodeLinker") {
+                continue;
+            }
+            let value = value
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"');
+            return value.eq_ignore_ascii_case("node-modules")
+                || value.eq_ignore_ascii_case("node_modules");
+        }
+    }
+    false
+}
+
+/// Generated Berry paths that must be ignored before automatic bootstrap can
+/// create them. Check files/directories that Yarn actually writes, not the
+/// `.yarn` parent: a common `.yarn/*` rule ignores those children but not the
+/// parent directory itself.
+fn yarn_berry_generated_outputs(dir: &Path) -> Vec<&'static str> {
+    let mut outputs = vec![".yarn/install-state.gz", ".yarn/cache"];
+    if yarn_berry_uses_node_modules_linker(dir) {
+        return outputs;
+    }
+    match declared_package_manager(dir).as_deref() {
+        Some(declared) if declared.starts_with("yarn@2.") => outputs.push(".pnp.js"),
+        Some(_) => outputs.push(".pnp.cjs"),
+        // A lockfile alone does not reveal the Yarn generation. Require both
+        // possible PnP outputs to be ignored rather than risk a worker diff.
+        None => outputs.extend([".pnp.cjs", ".pnp.js"]),
+    }
+    outputs
+}
+
 /// Detect the package manager from lockfiles + packageManager. None when there
 /// is no package.json, or when the declared tool is unsupported / ambiguous in
 /// a way that would risk writing the wrong lockfile.
@@ -215,12 +262,12 @@ pub(crate) fn node_modules_ready(dir: &Path) -> bool {
             nm.is_dir() && nm.join(".modules.yaml").is_file()
         }
         PackageManager::YarnBerry => {
-            // Only real Berry completion artifacts count. plan_install_with may
-            // pre-create empty output dirs for containment; a non-empty
-            // node_modules alone must never suppress retries after a failed install.
+            // Only real Berry outputs count. plan_install_with may pre-create
+            // containment directories, and install-state alone survives a
+            // deleted node_modules tree for the node-modules linker.
             dir.join(".pnp.cjs").is_file()
                 || dir.join(".pnp.js").is_file()
-                || dir.join(".yarn/install-state.gz").is_file()
+                || dir.join("node_modules/.yarn-state.yml").is_file()
         }
         PackageManager::YarnClassic => {
             // Classic writes `.yarn-integrity` only after a successful install.
@@ -383,14 +430,12 @@ fn yarn_risky_config_in_scope(dir: &Path) -> bool {
 fn ensure_contained_output_dirs(dir: &Path, rels: &[&str]) -> bool {
     for rel in rels {
         let path = dir.join(rel);
-        if path.exists() || path.symlink_metadata().is_ok() {
-            // If it's a symlink, require the target to stay under the worktree.
-            if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                if meta.file_type().is_symlink() {
-                    if !path_is_under(dir, &path) {
-                        return false;
-                    }
-                }
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            // Automatic bootstrap never follows an existing symlinked output
+            // root. Even a dangling link is unsafe because its target can be
+            // outside the worktree once the package manager creates it.
+            if meta.file_type().is_symlink() {
+                return false;
             }
             if path.exists() && !path_is_under(dir, &path) {
                 return false;
@@ -433,6 +478,7 @@ fn yarn_config_executes_repo_code(dir: &Path) -> bool {
             || lower.contains("globalfolder")
             || lower.contains("cachedir")
             || lower.contains("cachefolder")
+            || lower.contains("cache-folder")
             || lower.contains("virtualfolder")
             || lower.contains("injectenvironmentfiles")
         {
@@ -604,10 +650,11 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
     if !output_tree_is_gitignored(dir, "node_modules") {
         return None;
     }
-    // Yarn Berry also emits .pnp.* and .yarn/install-state.gz; those must be
-    // ignored too or they leak into worker diffs.
+    // Yarn Berry emits PnP/install-state/cache outputs in addition to
+    // node_modules. Those concrete generated paths must be ignored too or they
+    // leak into worker diffs.
     if matches!(pm, PackageManager::YarnBerry) {
-        for rel in [".pnp.cjs", ".pnp.js", ".yarn"] {
+        for rel in yarn_berry_generated_outputs(dir) {
             if !output_tree_is_gitignored(dir, rel) {
                 return None;
             }
@@ -632,11 +679,11 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
     if matches!(pm, PackageManager::YarnBerry) {
         for rel in [".pnp.cjs", ".pnp.js", ".yarn/install-state.gz"] {
             let path = dir.join(rel);
-            if path.exists() || path.symlink_metadata().is_ok() {
-                if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                    if meta.file_type().is_symlink() && !path_is_under(dir, &path) {
-                        return None;
-                    }
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                // A dangling `.pnp.*` symlink cannot be canonicalized safely;
+                // skip every symlinked Berry output on this automatic path.
+                if meta.file_type().is_symlink() {
+                    return None;
                 }
                 if path.exists() && !path_is_under(dir, &path) {
                     return None;
@@ -659,6 +706,9 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "--prefer-offline".to_string(),
                 "--ignore-scripts".to_string(),
                 "--ignore-pnpmfile".to_string(),
+                // A project .npmrc can otherwise start a persistent pnpm
+                // store-server that outlives the best-effort bootstrap.
+                "--no-use-store-server".to_string(),
                 "--modules-dir".to_string(),
                 "node_modules".to_string(),
                 "--virtual-store-dir".to_string(),
@@ -737,6 +787,11 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
             )
         }
         PackageManager::Npm => {
+            // npm ci processes package.json workspaces too; reject paths that
+            // would cause its clean install to touch a sibling/canonical repo.
+            if package_json_workspaces_escape(dir) {
+                return None;
+            }
             // Force local install into this worktree. Project .npmrc can set
             // global=true / prefix=../../../... and otherwise write into the
             // canonical repo above .worktrees/.
@@ -1041,11 +1096,13 @@ fn kill_process_tree(pid: u32) {
         .status();
 }
 
-/// Best-effort install for one worktree path. Never panics; logs and returns.
-pub fn maybe_bootstrap(worktree: &Path) {
+/// Best-effort install for one worktree path. Callers decide how to log an
+/// install failure so materialize can remain non-blocking while still observing
+/// the result.
+pub fn maybe_bootstrap(worktree: &Path) -> Result<(), String> {
     let cfg = Config::from_env();
     let Some(plan) = plan_install_with(worktree, &cfg) else {
-        return;
+        return Ok(());
     };
     let label = format!(
         "{} {} in {}",
@@ -1054,31 +1111,29 @@ pub fn maybe_bootstrap(worktree: &Path) {
         worktree.display()
     );
     let started = Instant::now();
-    match run_plan(&plan, cfg.timeout) {
-        Ok(()) => {
-            eprintln!(
-                "[weft] deps bootstrap ok ({:.1}s): {label}",
-                started.elapsed().as_secs_f64()
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "[weft] deps bootstrap skipped after {:.1}s: {label}: {err}",
-                started.elapsed().as_secs_f64()
-            );
-        }
-    }
+    run_plan(&plan, cfg.timeout).map_err(|err| {
+        format!(
+            "deps bootstrap failed after {:.1}s: {label}: {err}",
+            started.elapsed().as_secs_f64()
+        )
+    })?;
+    eprintln!(
+        "[weft] deps bootstrap ok ({:.1}s): {label}",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Bootstrap every worktree path in a materialize result (best-effort).
 #[allow(dead_code)]
-pub fn maybe_bootstrap_worktrees<'a, I>(paths: I)
+pub fn maybe_bootstrap_worktrees<'a, I>(paths: I) -> Result<(), String>
 where
     I: IntoIterator<Item = &'a str>,
 {
     for p in paths {
-        maybe_bootstrap(Path::new(p));
+        maybe_bootstrap(Path::new(p))?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1196,6 +1251,21 @@ mod tests {
     }
 
     #[test]
+    fn node_modules_ready_yarn_berry_node_modules_linker_needs_state_file() {
+        let d = tmp();
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.0.0" }"#);
+        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        write(&d, ".yarnrc.yml", "nodeLinker: node-modules\n");
+        write(&d, ".yarn/install-state.gz", "state");
+        assert!(
+            !node_modules_ready(&d),
+            "install-state alone survives a deleted node_modules tree"
+        );
+        write(&d, "node_modules/.yarn-state.yml", "state\n");
+        assert!(node_modules_ready(&d));
+    }
+
+    #[test]
     fn node_modules_ready_npm_needs_package_lock_marker() {
         let d = tmp();
         write(&d, "package.json", "{}");
@@ -1232,6 +1302,7 @@ mod tests {
         assert!(plan.args.iter().any(|a| a == "--frozen-lockfile"));
         assert!(plan.args.iter().any(|a| a == "--ignore-scripts"));
         assert!(plan.args.iter().any(|a| a == "--ignore-pnpmfile"));
+        assert!(plan.args.iter().any(|a| a == "--no-use-store-server"));
         assert!(plan.args.iter().any(|a| a == "--ignore-workspace"));
         assert!(plan
             .args
@@ -1285,6 +1356,17 @@ mod tests {
     }
 
     #[test]
+    fn plan_install_yarn_classic_skips_hyphenated_cache_override() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{ "packageManager": "yarn@1.22.0" }"#);
+        write(&d, "yarn.lock", "# yarn lockfile v1\n");
+        write(&d, ".yarnrc", "--cache-folder ../../../escaped-cache\n");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
     fn plan_install_yarn_berry_is_immutable_and_skips_classic_flags() {
         let d = tmp();
         let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
@@ -1302,6 +1384,17 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "YARN_IGNORE_PATH" && v == "1"));
+    }
+
+    #[test]
+    fn plan_install_yarn_berry_accepts_gitignored_generated_paths() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        // `.yarn/*` ignores the generated children but not the `.yarn` parent.
+        write(&d, ".gitignore", "node_modules/\n.pnp.cjs\n.yarn/*\n");
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
+        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_some());
     }
 
     #[test]
@@ -1479,6 +1572,20 @@ mod tests {
             r#"{ "packageManager": "bun@1.2.0", "workspaces": ["../../../outside"] }"#,
         );
         write(&d, "bun.lock", "");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
+    fn plan_install_npm_skips_escaping_workspaces() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(
+            &d,
+            "package.json",
+            r#"{ "workspaces": ["../../../outside"] }"#,
+        );
+        write(&d, "package-lock.json", "{}");
         assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
     }
 

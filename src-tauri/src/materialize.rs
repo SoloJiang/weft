@@ -83,10 +83,12 @@ fn home_token(home: &Path) -> String {
 async fn bootstrap_worktree_deps(path: &str) {
     let p = path.to_string();
     let join = tokio::task::spawn_blocking(move || {
-        crate::deps_bootstrap::maybe_bootstrap(std::path::Path::new(&p));
+        crate::deps_bootstrap::maybe_bootstrap(std::path::Path::new(&p))
     });
-    if let Err(e) = join.await {
-        eprintln!("[weft] deps bootstrap task join failed for {path}: {e}");
+    match join.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[weft] {e}"),
+        Err(e) => eprintln!("[weft] deps bootstrap task join failed for {path}: {e}"),
     }
 }
 
