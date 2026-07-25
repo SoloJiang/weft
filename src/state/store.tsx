@@ -10,7 +10,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../lib/api";
 import { createDeltaCoalescer } from "./deltaCoalescer";
-import { applyLeadConsumed, applyLeadFinalize, mergeLeadSnapshot } from "./leadSnapshot";
+import { applyLeadConsumed, applyLeadFinalize, mergeLeadSnapshot, withText } from "./leadSnapshot";
 import {
   beginChatHistoryLoad,
   failChatHistoryLoad,
@@ -1576,7 +1576,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             } catch {
               /* fresh row */
             }
-            return { ...x, content: JSON.stringify({ text: existing + text }) };
+            // withText preserves any other field already on the row (issue
+            // #99's agentThread) instead of rebuilding a bare {text} object —
+            // see its doc for why that matters for a branch-tagged row.
+            return { ...x, content: withText(x.content, existing + text) };
           }),
         };
       }

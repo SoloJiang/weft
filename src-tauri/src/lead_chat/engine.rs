@@ -804,13 +804,46 @@ fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'stati
     }
 }
 
+/// Build a `kind:"tool"` row's persisted content (issue #99): `agentThread`
+/// tags a sub-agent's OWN tool call (e.g. it calling `read_file`) with which
+/// sub-agent produced it, and — orthogonally — a `collabAgentToolCall` call's
+/// `collab_threads` tags the row with whichever sub-agent thread id(s) IT
+/// knows about, so the frontend can anchor that thread's branch here. Neither
+/// key is present at all when empty/None, so an ordinary tool call's content
+/// is byte-identical to pre-#99 output — same contract as `text_row_content`.
+/// Pure and DB-free by design: `persist_tool_calls` is the only caller in the
+/// live path, but keeping this separate lets it be unit-tested directly.
+fn tool_row_content(call: &super::proto::ToolCall, agent_thread: Option<&str>) -> serde_json::Value {
+    let mut content = serde_json::json!({
+        "name": call.name,
+        "summary": call.summary,
+        "input": call.input,
+        "output": call.output.clone().unwrap_or_default(),
+        "is_error": call.is_error,
+    });
+    if let Some(obj) = content.as_object_mut() {
+        if let Some(t) = agent_thread {
+            obj.insert("agentThread".into(), t.into());
+        }
+        if !call.collab_threads.is_empty() {
+            obj.insert("collabThreads".into(), call.collab_threads.clone().into());
+        }
+    }
+    content
+}
+
 /// Persist a turn's tool calls as `kind:"tool"` rows (running until their result
-/// arrives). Shared by spawn_reader (claude/exec) and codex_consumer (app-server).
+/// arrives). Shared by spawn_reader (claude/exec, always `agent_thread: None` —
+/// those dialects have no collab/sub-agent concept) and codex_consumer
+/// (app-server, issue #99). `merge_tool_results` mutates this row's stored
+/// content value in place (never rebuilds it), so both tags `tool_row_content`
+/// sets survive into the result.
 async fn persist_tool_calls(
     app: &AppHandle,
     db: &Db,
     inner: &mut EngineInner,
     tools: Vec<super::proto::ToolCall>,
+    agent_thread: Option<String>,
 ) {
     let thread_id = inner.thread_id;
     for call in tools {
@@ -818,15 +851,9 @@ async fn persist_tool_calls(
         let running = call.output.is_none();
         let trackable = running && !call.id.is_empty();
         let status = tool_row_status(!running, trackable, call.is_error);
-        let content = serde_json::json!({
-            "name": call.name,
-            "summary": call.summary,
-            "input": call.input,
-            "output": call.output.unwrap_or_default(),
-            "is_error": call.is_error,
-        });
+        let call_id = call.id.clone();
+        let content = tool_row_content(&call, agent_thread.as_deref());
         let content_str = content.to_string();
-        let call_id = call.id;
         match repo::insert_lead_message(
             db,
             thread_id,
@@ -873,6 +900,19 @@ async fn merge_tool_results(
         if let Some(obj) = content.as_object_mut() {
             obj.insert("output".into(), item.output.into());
             obj.insert("is_error".into(), item.is_error.into());
+            // issue #99: a `spawnAgent` collab call's `receiverThreadIds` is
+            // empty at item/started (captured — emptily — into this row's
+            // content by persist_tool_calls) and only becomes known HERE, at
+            // item/completed. Merge it in now so the frontend can still anchor
+            // that thread's branch to this row once it re-renders — until
+            // then, the child's own rows (already tagged with agentThread)
+            // have no known anchor yet and correctly render top-level/flat
+            // (collabBranches.ts's groupTimeline is a stateless whole-array
+            // recompute, so this is an honest "not resolved yet", not a wrong
+            // guess: nothing is hidden, it just hasn't grouped yet).
+            if !item.collab_threads.is_empty() {
+                obj.insert("collabThreads".into(), item.collab_threads.clone().into());
+            }
         }
         let status = if item.is_error { "error" } else { "complete" };
         let content_str = content.to_string();
@@ -1086,19 +1126,20 @@ async fn finalize_current_text(app: &AppHandle, db: &Db, inner: &mut EngineInner
     let Some((id, text, _)) = inner.current.take() else {
         return;
     };
-    finalize_text_row(app, db, inner, id, text, status, false).await;
+    // `current` (the anonymous slot) is never a sub-agent branch — see its doc.
+    finalize_text_row(app, db, inner, id, text, status, false, None).await;
 }
 
 /// Finalize every item-keyed open text row (app-server parallel streams) with
 /// `status`. Row order is already fixed by insertion; drain order is irrelevant.
 async fn finalize_open_texts(app: &AppHandle, db: &Db, inner: &mut EngineInner, status: &str) {
-    let rows: Vec<(i32, String)> = inner
+    let rows: Vec<(i32, String, Option<String>)> = inner
         .open_texts
         .drain()
-        .map(|(_, (id, text, _))| (id, text))
+        .map(|(_, r)| (r.row, r.buf, r.agent_thread))
         .collect();
-    for (id, text) in rows {
-        finalize_text_row(app, db, inner, id, text, status, false).await;
+    for (id, text, agent_thread) in rows {
+        finalize_text_row(app, db, inner, id, text, status, false, agent_thread.as_deref()).await;
     }
 }
 
@@ -1109,6 +1150,9 @@ async fn finalize_open_texts(app: &AppHandle, db: &Db, inner: &mut EngineInner, 
 /// (authoritative TextDone override / standalone rows inserted empty) — the
 /// finalize push must then carry the content even when sentinels changed nothing,
 /// or the live React state keeps the stale streamed chunks until a reload.
+/// `agent_thread` (issue #99) is re-embedded into the rewritten content here —
+/// this is the row's LAST content write for the turn, so a cold reload must see
+/// the same tag the live view showed, not lose it to this rebuild.
 async fn finalize_text_row(
     app: &AppHandle,
     db: &Db,
@@ -1117,6 +1161,7 @@ async fn finalize_text_row(
     text: String,
     status: &str,
     replaced: bool,
+    agent_thread: Option<&str>,
 ) {
     let thread_id = inner.thread_id;
     let origin_tag = inner.current_origin_tag.clone();
@@ -1139,13 +1184,8 @@ async fn finalize_text_row(
     } else {
         (text, false)
     };
-    let _ = repo::update_lead_message(
-        db,
-        id,
-        &serde_json::json!({ "text": clean }).to_string(),
-        status,
-    )
-    .await;
+    let _ = repo::update_lead_message(db, id, &text_row_content(&clean, agent_thread), status)
+        .await;
     let _ = app.emit(
         EVENT,
         Push::Finalize {
@@ -1188,10 +1228,12 @@ async fn cleanup_disconnected_turn(
     let current = inner.current.take().map(|(id, text, _)| (id, text));
     // Item-keyed open rows freeze like `current`: raw text + terminal status
     // (no sentinel pass — mirrors the anonymous slot's disconnect handling).
-    let orphan_texts: Vec<(i32, String)> = inner
+    // `agent_thread` (issue #99) rides along so this freeze doesn't drop the
+    // sub-agent tag a cold reload would otherwise disagree with the live view on.
+    let orphan_texts: Vec<(i32, String, Option<String>)> = inner
         .open_texts
         .drain()
-        .map(|(_, (id, text, _))| (id, text))
+        .map(|(_, r)| (r.row, r.buf, r.agent_thread))
         .collect();
     let turn_saw_text = inner.turn_saw_text;
     inner.turn_saw_text = false;
@@ -1234,14 +1276,10 @@ async fn cleanup_disconnected_turn(
     // insert below (same rule as the TurnEnd path), or the disconnect would
     // append a spurious terminal bubble after it.
     let had_orphan_texts = !orphan_texts.is_empty() || turn_saw_text;
-    for (id, text) in orphan_texts {
-        let _ = repo::update_lead_message(
-            db,
-            id,
-            &serde_json::json!({ "text": text }).to_string(),
-            status,
-        )
-        .await;
+    for (id, text, agent_thread) in orphan_texts {
+        let _ =
+            repo::update_lead_message(db, id, &text_row_content(&text, agent_thread.as_deref()), status)
+                .await;
         emit_finalize(app, thread_id, id, status);
     }
     if let Ok(Some(row)) = persist_disconnected_turn_row(
@@ -1382,6 +1420,47 @@ impl TurnClock {
     }
 }
 
+/// One app-server item-keyed streaming text row's live state (issue #99 adds
+/// `agent_thread` to the pre-existing (row id, buf, last-flush) tuple). Only
+/// `open_texts` uses this — the anonymous `current` slot (exec/claude/opencode,
+/// and app-server's own item-less events) never attributes to a sub-agent, so
+/// it keeps its plain tuple type unchanged.
+pub struct OpenTextRow {
+    pub row: i32,
+    pub buf: String,
+    pub last_flush: std::time::Instant,
+    /// The sub-agent thread this row belongs to, already normalized against the
+    /// session's own thread id (`branch_of`) — None = mainline. Re-embedded into
+    /// the row's persisted content on EVERY rewrite (streaming throttle tick,
+    /// finalize, disconnect cleanup, hard stop) so a cold reload groups it
+    /// identically to the live view — see `text_row_content`.
+    pub agent_thread: Option<String>,
+}
+
+/// Normalizes a raw wire `agent_thread` (whatever `threadId` the event arrived
+/// on — see `codex_app_server::notification_to_event`) against this session's
+/// OWN thread id into a grouping-ready value: `None` for the session's own
+/// mainline activity (including every non-app-server dialect, which never sets
+/// a raw thread at all), `Some(id)` for a genuine sub-agent's row. This is the
+/// ONE place "is this row foreign" is decided (issue #99) — everything
+/// downstream (row content, tool rows) just carries whatever this returns.
+fn branch_of(raw: Option<String>, own_thread: &str) -> Option<String> {
+    raw.filter(|t| t != own_thread)
+}
+
+/// Build a `kind:"text"` row's persisted content, `agentThread` included only
+/// when this row belongs to a sub-agent (issue #99) — an untagged row is
+/// byte-identical to pre-#99 output. Centralizing this is what lets the tag
+/// survive every rewrite of a row's content (throttled streaming update,
+/// finalize, disconnect cleanup, hard stop all funnel through it) instead of
+/// only its first insert, which would desync the live view from a cold reload.
+fn text_row_content(text: &str, agent_thread: Option<&str>) -> String {
+    match agent_thread {
+        Some(t) => serde_json::json!({ "text": text, "agentThread": t }).to_string(),
+        None => serde_json::json!({ "text": text }).to_string(),
+    }
+}
+
 pub struct EngineInner {
     pub thread_id: i32,
     /// claude | codex | opencode — selects the wire dialect + process model.
@@ -1428,10 +1507,12 @@ pub struct EngineInner {
     /// Streaming assistant row being built: (row id, accumulated text, last DB flush).
     /// exec/claude 的单串行匿名槽;app-server 的 item 键控行走 `open_texts`。
     pub current: Option<(i32, String, std::time::Instant)>,
-    /// app-server 并行流式 item → 其开放文本行 (row id, 累积文本, last DB flush)。
-    /// 镜像 `tool_rows` 的按 item 分键模式:主叙述与各 collab 子 agent 的
-    /// agentMessage 各自成行,工具行不再切断文本,item/completed 以权威全文定稿。
-    pub open_texts: std::collections::HashMap<String, (i32, String, std::time::Instant)>,
+    /// app-server 并行流式 item → 其开放文本行。镜像 `tool_rows` 的按 item 分键
+    /// 模式:主叙述与各 collab 子 agent 的 agentMessage 各自成行,工具行不再切断
+    /// 文本,item/completed 以权威全文定稿。`agent_thread`(issue #99)与行同寿命,
+    /// 每次内容重建(节流更新/finalize/disconnect/hard stop)都要带上它,否则冷
+    /// 加载会读到丢了标记的最终内容——见 `OpenTextRow` 文档。
+    pub open_texts: std::collections::HashMap<String, OpenTextRow>,
     /// 本轮已落过「即插即定稿」的独立文本行(standalone TextDone:/plan 内容、
     /// 未流式的 agentMessage)。这类行不经过 current/open_texts,turn 失败时
     /// 终态插入要靠它抑制,否则真实输出之后还会追加 *_before_output 气泡。
@@ -2860,19 +2941,27 @@ async fn codex_consumer(
         Arc::new(crossbeam_skiplist::SkipMap::new());
     while let Some(msg) = rx.recv().await {
         match msg {
-            ThreadMsg::Event(ChatEvent::TextDelta { text, item }) => {
+            ThreadMsg::Event(ChatEvent::TextDelta { text, item, agent_thread }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 // Ensure the target row exists: item-keyed rows in `open_texts`
                 // (parallel app-server streams), the anonymous slot in `current`
-                // (errors / turn-failure texts / non-item dialect paths).
+                // (errors / turn-failure texts / non-item dialect paths). A NEW
+                // item-keyed row's origin (issue #99) is normalized ONCE here —
+                // sticky for the row's whole life (OpenTextRow::agent_thread),
+                // never re-derived from a later delta on the same item.
                 let missing = match &item {
                     Some(k) => !inner.open_texts.contains_key(k),
                     None => inner.current.is_none(),
                 };
                 if missing {
+                    let branch = branch_of(agent_thread, &thread);
+                    let content = match &item {
+                        Some(_) => text_row_content("", branch.as_deref()),
+                        None => r#"{"text":""}"#.to_string(),
+                    };
                     let Ok(m) = repo::insert_lead_message(
                         &db,
                         thread_id,
@@ -2880,19 +2969,28 @@ async fn codex_consumer(
                         turn,
                         "assistant",
                         "text",
-                        r#"{"text":""}"#,
+                        &content,
                         "streaming",
                     )
                     .await
                     else {
                         continue;
                     };
-                    let fresh = (m.id, String::new(), std::time::Instant::now());
                     match &item {
                         Some(k) => {
-                            inner.open_texts.insert(k.clone(), fresh);
+                            inner.open_texts.insert(
+                                k.clone(),
+                                OpenTextRow {
+                                    row: m.id,
+                                    buf: String::new(),
+                                    last_flush: std::time::Instant::now(),
+                                    agent_thread: branch,
+                                },
+                            );
                         }
-                        None => inner.current = Some(fresh),
+                        None => {
+                            inner.current = Some((m.id, String::new(), std::time::Instant::now()))
+                        }
                     }
                     let _ = app.emit(
                         EVENT,
@@ -2904,19 +3002,38 @@ async fn codex_consumer(
                 }
                 // Read the in-flight turn's tag before borrowing the slot mutably.
                 let origin_tag = inner.current_origin_tag.clone();
-                let slot = match &item {
-                    Some(k) => inner.open_texts.get_mut(k),
-                    None => inner.current.as_mut(),
+                let row = match &item {
+                    Some(k) => {
+                        let Some(c) = inner.open_texts.get_mut(k) else {
+                            continue;
+                        };
+                        c.buf.push_str(&text);
+                        let row = c.row;
+                        if c.last_flush.elapsed().as_millis() >= STREAM_THROTTLE_MS {
+                            c.last_flush = std::time::Instant::now();
+                            let content = text_row_content(&c.buf, c.agent_thread.as_deref());
+                            let _ =
+                                repo::update_lead_message(&db, row, &content, "streaming").await;
+                            emit_lead_delta(&app, thread_id, row, &c.buf, false, origin_tag);
+                        }
+                        row
+                    }
+                    None => {
+                        let Some(c) = inner.current.as_mut() else {
+                            continue;
+                        };
+                        c.1.push_str(&text);
+                        let row = c.0;
+                        if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
+                            c.2 = std::time::Instant::now();
+                            let content = serde_json::json!({ "text": c.1 }).to_string();
+                            let _ =
+                                repo::update_lead_message(&db, row, &content, "streaming").await;
+                            emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
+                        }
+                        row
+                    }
                 };
-                let Some(c) = slot else { continue };
-                c.1.push_str(&text);
-                let row = c.0;
-                if c.2.elapsed().as_millis() >= STREAM_THROTTLE_MS {
-                    c.2 = std::time::Instant::now();
-                    let content = serde_json::json!({ "text": c.1 }).to_string();
-                    let _ = repo::update_lead_message(&db, row, &content, "streaming").await;
-                    emit_lead_delta(&app, thread_id, row, &c.1, false, origin_tag);
-                }
                 let _ = app.emit(
                     EVENT,
                     Push::Delta {
@@ -2926,7 +3043,7 @@ async fn codex_consumer(
                     },
                 );
             }
-            ThreadMsg::Event(ChatEvent::TextDone { item, text }) => {
+            ThreadMsg::Event(ChatEvent::TextDone { item, text, agent_thread }) => {
                 let mut inner = eng.lock().await;
                 note_turn_activity(&app, &db, &eng, &mut inner);
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
@@ -2935,12 +3052,18 @@ async fn codex_consumer(
                     // authoritative full body over the accumulated frames. When
                     // that body differs (dropped/duped delta frames), the
                     // finalize push must carry it so the live view heals too.
-                    Some((row, buf, _)) => {
+                    // The row's origin was already decided at its FIRST delta
+                    // (OpenTextRow::agent_thread) — this event's OWN agent_thread
+                    // is redundant with it (same item, same thread) and unused.
+                    Some(OpenTextRow { row, buf, agent_thread: tag, .. }) => {
                         let auth = text.filter(|t| !t.is_empty());
                         let replaced = auth.as_deref().is_some_and(|t| t != buf);
                         let body = auth.unwrap_or(buf);
-                        finalize_text_row(&app, &db, &mut inner, row, body, "complete", replaced)
-                            .await;
+                        finalize_text_row(
+                            &app, &db, &mut inner, row, body, "complete", replaced,
+                            tag.as_deref(),
+                        )
+                        .await;
                     }
                     // No open row (content items never stream): land the text as
                     // a standalone completed row.
@@ -2950,6 +3073,8 @@ async fn codex_consumer(
                         };
                         let thread_id = inner.thread_id;
                         let (sid, turn) = (inner.session_id, inner.turn_id);
+                        let branch = branch_of(agent_thread, &thread);
+                        let content = text_row_content("", branch.as_deref());
                         let Ok(m) = repo::insert_lead_message(
                             &db,
                             thread_id,
@@ -2957,7 +3082,7 @@ async fn codex_consumer(
                             turn,
                             "assistant",
                             "text",
-                            r#"{"text":""}"#,
+                            &content,
                             "streaming",
                         )
                         .await
@@ -2974,11 +3099,15 @@ async fn codex_consumer(
                         // Inserted empty + finalized at once: the push must carry
                         // the body or the live view shows an empty bubble.
                         // (finalize_text_row records turn_saw_text.)
-                        finalize_text_row(&app, &db, &mut inner, m.id, t, "complete", true).await;
+                        finalize_text_row(
+                            &app, &db, &mut inner, m.id, t, "complete", true,
+                            branch.as_deref(),
+                        )
+                        .await;
                     }
                 }
             }
-            ThreadMsg::Event(ChatEvent::Assistant { texts, tools, .. }) => {
+            ThreadMsg::Event(ChatEvent::Assistant { texts, tools, agent_thread, .. }) => {
                 // Codex streams text via deltas; non-text items are tool calls →
                 // inline `kind:"tool"` rows, filled by their item.completed result.
                 // Text rows are NOT finalized here: each agentMessage closes via
@@ -2991,7 +3120,12 @@ async fn codex_consumer(
                 if !texts.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
-                persist_tool_calls(&app, &db, &mut inner, tools).await;
+                // Every tool this event carries is stamped with the SAME origin
+                // (issue #99) — app-server only ever sends one per event, so this
+                // is unambiguous; a sub-agent's own `read_file` call lands under
+                // its branch instead of looking like unattributed mainline noise.
+                let branch = branch_of(agent_thread, &thread);
+                persist_tool_calls(&app, &db, &mut inner, tools, branch).await;
             }
             ThreadMsg::Event(ChatEvent::ToolResults { items }) => {
                 let mut inner = eng.lock().await;
@@ -4116,7 +4250,10 @@ fn freeze_recovery_text(freeze_secs: u64) -> String {
 /// inserted row and fail a message that is about to be delivered.
 struct FrozenTurnDrain {
     current: Option<(i32, String)>,
-    orphan_texts: Vec<(i32, String)>,
+    // agent_thread (issue #99) rides along so this freeze doesn't drop the
+    // sub-agent tag a cold reload would otherwise disagree with the live
+    // view on — same reasoning as `cleanup_disconnected_turn`'s orphan_texts.
+    orphan_texts: Vec<(i32, String, Option<String>)>,
     orphan_tools: Vec<(i32, serde_json::Value)>,
     drained_queue: Vec<i32>,
     turn_saw_text: bool,
@@ -4154,10 +4291,10 @@ fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<
         return None;
     }
     let current = inner.current.take().map(|(id, text, _)| (id, text));
-    let orphan_texts: Vec<(i32, String)> = inner
+    let orphan_texts: Vec<(i32, String, Option<String>)> = inner
         .open_texts
         .drain()
-        .map(|(_, (id, text, _))| (id, text))
+        .map(|(_, r)| (r.row, r.buf, r.agent_thread))
         .collect();
     let orphan_tools: Vec<(i32, serde_json::Value)> =
         inner.tool_rows.drain().map(|(_, v)| v).collect();
@@ -4380,11 +4517,13 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
             }
             // Item-keyed open rows freeze like `current`: raw text + terminal
             // status (mirrors cleanup_disconnected_turn's disconnect handling).
-            for (id, text) in drain.orphan_texts {
+            // agent_thread (issue #99) preserved via text_row_content — see
+            // FrozenTurnDrain's doc.
+            for (id, text, agent_thread) in drain.orphan_texts {
                 let _ = repo::update_lead_message(
                     &db,
                     id,
-                    &serde_json::json!({ "text": text }).to_string(),
+                    &text_row_content(&text, agent_thread.as_deref()),
                     "interrupted",
                 )
                 .await;
@@ -4687,7 +4826,7 @@ pub async fn stop_quiet(
 ) -> (
     i32,
     Option<i32>,
-    Vec<(i32, String)>,
+    Vec<(i32, String, Option<String>)>,
     Vec<(i32, serde_json::Value)>,
 ) {
     let mut inner = eng.lock().await;
@@ -4695,14 +4834,16 @@ pub async fn stop_quiet(
     // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
     // Hard stops also shut the codex client down, so the consumer's disconnect
     // cleanup never runs for them — without this drain an item row would stay
-    // `streaming` forever and could be finalized under a later turn.
-    let mut texts: Vec<(i32, String)> = inner
+    // `streaming` forever and could be finalized under a later turn. `current`
+    // is never a sub-agent branch (issue #99); an open_texts row carries
+    // whichever tag it was created with.
+    let mut texts: Vec<(i32, String, Option<String>)> = inner
         .current
         .take()
-        .map(|(id, text, _)| (id, text))
+        .map(|(id, text, _)| (id, text, None))
         .into_iter()
         .collect();
-    texts.extend(inner.open_texts.drain().map(|(_, (id, text, _))| (id, text)));
+    texts.extend(inner.open_texts.drain().map(|(_, r)| (r.row, r.buf, r.agent_thread)));
     // Drain tool rows still awaiting a result, but DON'T finalize here: the
     // caller makes the stop visible (sets `stopped`) first. Awaiting DB/event
     // work while the engine is reset-but-not-yet-stopped would let a concurrent
@@ -4750,11 +4891,11 @@ pub async fn stop(app: &AppHandle, eng: &EngineRef) {
         // Stop is now visible to the engine, so finalizing here can't race a
         // concurrent send into a turn we'd wrongly kill.
         finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
-        for (id, text) in texts {
+        for (id, text, agent_thread) in texts {
             let _ = repo::update_lead_message(
                 &db,
                 id,
-                &serde_json::json!({ "text": text }).to_string(),
+                &text_row_content(&text, agent_thread.as_deref()),
                 "interrupted",
             )
             .await;
@@ -5656,7 +5797,9 @@ fn spawn_reader(
                         },
                     );
                 }
-                super::proto::ChatEvent::Assistant { texts, tools, uuid } => {
+                super::proto::ChatEvent::Assistant { texts, tools, uuid, .. } => {
+                    // claude/exec/opencode never populate agent_thread (no
+                    // collab/sub-agent concept in these dialects) — ignored (`..`).
                     // claude assistant events carry the transcript uuid — the
                     // rewind anchor candidate for this turn (last one wins).
                     if uuid.is_some() {
@@ -5744,7 +5887,8 @@ fn spawn_reader(
                         apply_lead_sentinels(&app, &db, &mut inner, thread_id, sentinels).await;
                     }
                     // Every dialect's tool calls become inline `kind:"tool"` rows.
-                    persist_tool_calls(&app, &db, &mut inner, tools).await;
+                    // claude/exec/opencode: never a sub-agent branch (issue #99).
+                    persist_tool_calls(&app, &db, &mut inner, tools, None).await;
                 }
                 super::proto::ChatEvent::ToolResults { items } => {
                     merge_tool_results(&app, &db, &mut inner, items).await;
@@ -6167,6 +6311,87 @@ fn emit_lead_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- issue #99: sub-agent branch attribution (branch_of / text_row_content) ----
+
+    #[test]
+    fn branch_of_normalizes_own_thread_to_mainline() {
+        // The session's own thread id — main narration — is NOT a branch, even
+        // though app-server tags EVERY event (including mainline ones) with a
+        // threadId. Only a DIFFERENT thread id is a genuine sub-agent.
+        assert_eq!(branch_of(Some("lead-1".into()), "lead-1"), None);
+        assert_eq!(
+            branch_of(Some("sub-1".into()), "lead-1"),
+            Some("sub-1".into())
+        );
+        // No raw thread at all (claude/exec/opencode; app-server's anonymous
+        // error slot) — always mainline, regardless of the session's own id.
+        assert_eq!(branch_of(None, "lead-1"), None);
+    }
+
+    #[test]
+    fn text_row_content_omits_tag_when_mainline() {
+        // Untagged output must be BYTE-IDENTICAL to pre-#99 rows: this is what
+        // lets an old row (persisted before this feature existed) and a fresh
+        // mainline row render through the exact same code path either side of
+        // the upgrade — no migration, no schema bump.
+        assert_eq!(text_row_content("hello", None), r#"{"text":"hello"}"#);
+    }
+
+    #[test]
+    fn text_row_content_embeds_tag_when_branched() {
+        let v: serde_json::Value =
+            serde_json::from_str(&text_row_content("hi", Some("sub-1"))).unwrap();
+        assert_eq!(v["text"], "hi");
+        assert_eq!(v["agentThread"], "sub-1");
+    }
+
+    fn test_tool_call(name: &str, collab_threads: Vec<String>) -> super::super::proto::ToolCall {
+        super::super::proto::ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+            summary: String::new(),
+            output: None,
+            is_error: false,
+            collab_threads,
+        }
+    }
+
+    #[test]
+    fn tool_row_content_omits_tags_for_ordinary_mainline_call() {
+        // A mainline (non-branched, non-collab) tool row's content must be
+        // exactly what it was before #99 — no agentThread, no collabThreads key
+        // at all (not even `null`), so an old persisted row and a fresh one
+        // parse identically.
+        let call = test_tool_call("read_file", Vec::new());
+        let v = tool_row_content(&call, None);
+        assert_eq!(v["name"], "read_file");
+        assert!(v.get("agentThread").is_none());
+        assert!(v.get("collabThreads").is_none());
+    }
+
+    #[test]
+    fn tool_row_content_tags_a_sub_agents_own_call() {
+        // The exact review counterexample, from the OTHER side: the row itself
+        // (e.g. a sub-agent's own read_file) carries agentThread so it can
+        // never be confused with the lead's own mainline read_file.
+        let call = test_tool_call("read_file", Vec::new());
+        let v = tool_row_content(&call, Some("sub-1"));
+        assert_eq!(v["agentThread"], "sub-1");
+        assert!(v.get("collabThreads").is_none());
+    }
+
+    #[test]
+    fn tool_row_content_carries_collab_threads_for_the_anchor_row() {
+        // The collabAgentToolCall row ITSELF is mainline (issued by the lead —
+        // no agentThread), but carries collabThreads so the frontend can anchor
+        // that sub-agent's branch here.
+        let call = test_tool_call("collabAgentToolCall", vec!["sub-1".into(), "sub-2".into()]);
+        let v = tool_row_content(&call, None);
+        assert!(v.get("agentThread").is_none());
+        assert_eq!(v["collabThreads"], serde_json::json!(["sub-1", "sub-2"]));
+    }
 
     /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
     /// while empty/corrupt JSON leaves the fresh engine untouched.
@@ -6992,9 +7217,17 @@ mod tests {
         inner.interrupting = true; // set by `interrupt()` just before this fires
         inner.current_origin_tag = Some("im-reply-target".into());
         inner.current = Some((10, "partial reply".into(), std::time::Instant::now()));
+        // agent_thread: Some(..) — issue #99: a sub-agent's own stream freezing
+        // mid-turn must keep its tag through this reset path too, exactly like
+        // cleanup_disconnected_turn / stop_quiet.
         inner.open_texts.insert(
             "item-1".into(),
-            (11, "parallel stream".into(), std::time::Instant::now()),
+            OpenTextRow {
+                row: 11,
+                buf: "parallel stream".into(),
+                last_flush: std::time::Instant::now(),
+                agent_thread: Some("sub-1".into()),
+            },
         );
         inner
             .tool_rows
@@ -7029,7 +7262,10 @@ mod tests {
         assert!(inner.turn.try_begin_send());
 
         assert_eq!(drain.current, Some((10, "partial reply".into())));
-        assert_eq!(drain.orphan_texts, vec![(11, "parallel stream".into())]);
+        assert_eq!(
+            drain.orphan_texts,
+            vec![(11, "parallel stream".into(), Some("sub-1".into()))]
+        );
         assert_eq!(
             drain.orphan_tools,
             vec![(12, serde_json::json!({"tool": "bash"}))]
