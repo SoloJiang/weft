@@ -31,6 +31,7 @@ import type {
   SessionMetaSnapshot,
   SkillSource,
   SlashCmd,
+  SwitchOutcome,
   TestPlan,
   Thread,
   ThreadOverview,
@@ -206,6 +207,20 @@ export const api = {
    *  lead), so it takes no mode. */
   leadRewind: (threadId: number, messageId: number, lang?: string) =>
     invoke<RewindOutcome>("lead_rewind", { threadId, messageId, lang }),
+  /** Switch the LEAD's engine identity and/or model override (issue #96/#98,
+   *  layer 1 of 3 — independent of any worker's tool and of the global
+   *  default). Clears the native session id and stages a history digest for
+   *  the new engine's first turn; `model=null` clears any override. Same
+   *  tool + same model is a valid "reload" (force the engine to restart, e.g.
+   *  to pick up an externally-edited CLI config). */
+  switchLeadTool: (threadId: number, tool: string, model: string | null, lang?: string) =>
+    invoke<SwitchOutcome>("switch_lead_tool", { threadId, tool, model, lang }),
+  /** Switch a WORKER's engine identity and/or model override (issue #96/#98,
+   *  layer 2 of 3 — independent of the thread's lead and of the global
+   *  default). Same semantics as switchLeadTool, keyed by session id; also
+   *  updates the owning direction's `tool` so a later reopen doesn't revert it. */
+  switchWorkerTool: (sessionId: number, tool: string, model: string | null) =>
+    invoke<SwitchOutcome>("switch_worker_tool", { sessionId, tool, model }),
   chatInterrupt: (sessionId: number) =>
     invoke<void>("chat_interrupt", { sessionId }),
   chatStop: (sessionId: number) => invoke<void>("chat_stop", { sessionId }),

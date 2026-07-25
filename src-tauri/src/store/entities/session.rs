@@ -12,6 +12,12 @@ pub struct Model {
     /// NULL = follow the global override; set to freeze this worker to its prior
     /// command when the user excludes existing sessions from a later override.
     pub command: Option<String>,
+    /// Optional per-session model override (issue #98); see `thread.lead_model`
+    /// for the semantics (free-text `--model` value, claude/codex only). Ephemeral
+    /// like `command`: a session recreated via `chat_open_worker`'s cold path
+    /// (no prior `native_session_id`) starts fresh with no override — the durable
+    /// per-task setting is `tool` (mirrored onto `direction.tool`), not `model`.
+    pub model: Option<String>,
     pub cwd: String,
     pub native_session_id: Option<String>,
     pub status: String,

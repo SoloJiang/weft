@@ -74,8 +74,32 @@ const ASK_WAIT: Duration = Duration::from_secs(3600);
 
 /// The Ask Bridge endpoint. A tool's permission hook POSTs its PreToolUse-style
 /// payload here and BLOCKS until the human answers in weft (→ allow/deny) or the
-/// wait elapses (→ empty body, so the tool runs its own prompt — never a
-/// silent stall). Identity (thread/dir) comes from the URL path, not the body.
+/// wait elapses (→ an explicit deny, issue #96). Every weft-spawned engine runs
+/// headless (`-p`/`exec`/`run`, no TTY), so there is no "native interactive
+/// prompt" for an ambiguous/empty response to fall back to — and an empty body
+/// was fail-OPEN for at least two of the three engines this endpoint serves,
+/// confirmed against each hook consumer's OWN code in this repo (not just
+/// claude/opencode's documented behavior, which this repo has no control
+/// over and could drift):
+///   - opencode's hook plugin (`bus/inject.rs::inject_opencode_ask_plugin`)
+///     only throws (denies) on the literal string `"deny"` — an empty `{}`
+///     leaves `decision` `undefined`, which does NOT throw, i.e. silently
+///     ALLOWS.
+///   - codex's global hook script (`codex.rs::ensure_codex_hook_in`) is
+///     `[ -n "$resp" ] && printf '%s' "$resp"; exit 0` — an empty `$resp`
+///     prints nothing and exits 0, and Codex's own hook contract treats
+///     "exit 0, no output" as success/continue (fail-open), matching
+///     opencode's shape exactly rather than being safe by construction.
+///   - claude's behavior on an empty PreToolUse response under headless
+///     `-p` is NOT independently verified from this repo's own code (unlike
+///     the two above, weft has no local hook-consumer script to read) — it
+///     is presumed to deny (or at minimum not silently allow) based on
+///     claude's documented behavior, but that is an external claim, not
+///     something this file confirms the way it confirms the other two.
+/// An explicit, well-formed deny (the same shape a human's real Deny answer
+/// produces) removes the ambiguity for all three regardless of exactly how
+/// each one's undocumented/unverified empty-response path behaves. Identity
+/// (thread/dir) comes from the URL path, not the body.
 async fn handle_ask(
     Path((thread, dir)): Path<(i32, String)>,
     Query(q): Query<HashMap<String, String>>,
@@ -122,11 +146,13 @@ async fn handle_ask(
             };
             hook_decision(d, reason)
         }
-        // timed out or dropped → drop the card, return no decision: the tool
-        // falls back to its native prompt rather than hanging.
+        // Timed out, or the sender was dropped (e.g. `AskRegistry::cancel_for`
+        // tearing down this ask because its engine is being switched/stopped —
+        // issue #96): drop the card and return an EXPLICIT deny — see this
+        // function's doc for why an empty body is the wrong fallback here.
         _ => {
             asks.cancel(id);
-            Json(json!({})).into_response()
+            hook_decision("deny", "No answer in time — denied by default (weft ask bridge)")
         }
     }
 }

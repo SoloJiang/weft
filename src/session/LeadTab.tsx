@@ -11,10 +11,13 @@ import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { RewindDialog, RewindPickerDialog } from "./RewindDialog";
+import { EngineSwitchDialog } from "./EngineSwitchDialog";
 import { useRepoActions } from "./useRepoActions";
 import { api } from "../lib/api";
 import type { EnabledSkill, LeadStateInfo } from "../lib/types";
 import { nativeSessionResumeTarget } from "../lib/resume";
+import { toolFullName } from "../components/ToolIcon";
+import { toast } from "../components/Toast";
 
 type PromptState = {
   title: string;
@@ -89,6 +92,8 @@ export function LeadTab({
     skillsDirtyAt,
     markSkillsDirty,
     mergeLeadMeta,
+    switchLeadTool,
+    installedTools,
     leadRail,
     setLeadRail,
     viewDirection,
@@ -96,6 +101,7 @@ export function LeadTab({
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
   const [promptState, setPromptState] = useState<PromptState | null>(null);
+  const [switchOpen, setSwitchOpen] = useState(false);
   // The right rail is a store toggle (info flips from the top bar — this
   // surface is header-less; tests opens from a test-cases card); the embedded
   // curator panel (compact) never shows either.
@@ -261,8 +267,9 @@ export function LeadTab({
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
   const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
+  const leadThread = threads.find((th) => th.id === tid);
   // The lead engine runs the thread's lead_tool (not always claude).
-  const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
+  const leadTool = leadThread?.lead_tool ?? "claude";
   const resumeTarget = leadResumeTarget?.threadId === tid ? leadResumeTarget : null;
   const sessionResumeAction = (() => {
     if (!resumeTarget) return undefined;
@@ -484,6 +491,7 @@ export function LeadTab({
           }}
           onClose={() => setLeadRail("none")}
           onReload={onReload}
+          onSwitchEngine={() => setSwitchOpen(true)}
           busy={isInFlight(turn.state)}
         />
       )}
@@ -499,6 +507,26 @@ export function LeadTab({
           onEdited={() => setTestPlanEditNonce((n) => n + 1)}
         />
       )}
+      <EngineSwitchDialog
+        open={switchOpen}
+        onOpenChange={setSwitchOpen}
+        scope="lead"
+        currentTool={leadTool}
+        currentModel={leadThread?.lead_model ?? null}
+        installedTools={installedTools}
+        onConfirm={async (tool, model) => {
+          const outcome = await switchLeadTool(tid, tool, model);
+          toast(
+            outcome.old_tool === outcome.new_tool
+              ? t("session.switchReloadedToast", { tool: toolFullName(outcome.new_tool) })
+              : t("session.switchedToast", {
+                  from: toolFullName(outcome.old_tool),
+                  to: toolFullName(outcome.new_tool),
+                }),
+          );
+          return outcome;
+        }}
+      />
     </div>
   );
 }

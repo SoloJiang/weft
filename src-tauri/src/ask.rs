@@ -1294,6 +1294,27 @@ impl AskRegistry {
         }
     }
 
+    /// Cancel every open ask for (thread, dir) without answering (issue #96):
+    /// switching a thread/worker's engine tears down its live process, so any
+    /// ask still waiting on THAT engine's now-abandoned hook call can never be
+    /// resolved by it. Left open, it would sit in Needs-you for up to
+    /// `ASK_WAIT` (an hour) for an engine that no longer exists. Snapshots the
+    /// matching ids first so this never holds the lock across `cancel`'s own
+    /// (re-entrant) lock acquisition.
+    pub fn cancel_for(&self, thread: i32, dir: &str) {
+        let ids: Vec<u64> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.open
+                .iter()
+                .filter(|a| a.thread == thread && a.dir == dir)
+                .map(|a| a.id)
+                .collect()
+        };
+        for id in ids {
+            self.cancel(id);
+        }
+    }
+
     /// Install the transcript-trail consumer's channel (called once at startup,
     /// independent of the IM bridge's `set_notifier`). No snapshot: the trail
     /// only records future resolutions, never replays still-open asks.
@@ -2367,6 +2388,32 @@ mod tests {
         r.cancel(id);
         assert!(r.open().is_empty());
         assert!(rx.await.is_err()); // sender dropped
+    }
+
+    #[tokio::test]
+    async fn cancel_for_only_drops_the_matching_thread_and_dir() {
+        // issue #96: switching an engine must cancel ONLY the asks tied to the
+        // (thread, dir) being torn down — a sibling worker/lead on the same
+        // thread, or the same dir on a DIFFERENT thread, must survive untouched.
+        let r = AskRegistry::new();
+        let (target, rx_target) = r.request(1, "10", "claude", "Run: a", "a", RiskLevel::Unknown, "Run: a");
+        let (sibling_dir, rx_sibling_dir) =
+            r.request(1, "lead", "claude", "Run: b", "b", RiskLevel::Unknown, "Run: b");
+        let (sibling_thread, rx_sibling_thread) =
+            r.request(2, "10", "claude", "Run: c", "c", RiskLevel::Unknown, "Run: c");
+        let (target2, rx_target2) = r.request(1, "10", "claude", "Run: d", "d", RiskLevel::Unknown, "Run: d");
+
+        r.cancel_for(1, "10");
+
+        let open_ids: Vec<u64> = r.open().iter().map(|a| a.id).collect();
+        assert!(!open_ids.contains(&target) && !open_ids.contains(&target2));
+        assert!(open_ids.contains(&sibling_dir) && open_ids.contains(&sibling_thread));
+        assert!(rx_target.await.is_err(), "target ask's sender dropped");
+        assert!(rx_target2.await.is_err(), "second target ask's sender dropped too");
+        // Untouched asks keep their live waiter — dropping the registry (end of
+        // scope) is what would error these, not `cancel_for`.
+        drop(rx_sibling_dir);
+        drop(rx_sibling_thread);
     }
 
     #[tokio::test]

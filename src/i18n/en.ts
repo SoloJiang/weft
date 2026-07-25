@@ -389,6 +389,28 @@ export const en = {
     rewoundMarker: "Rewound from here",
     rewindPickerTitle: "Rewind to a message",
     rewindPickerEmpty: "No messages to rewind to.",
+    switchScopeLead:
+      "Changes only this issue's lead. Workers already running keep their own engine, and this doesn't touch the default engine for new issues.",
+    switchScopeWorker:
+      "Changes only this task's worker. The issue's lead and any other task keep their own engine, and this doesn't touch the default engine for new tasks.",
+    switchTitleLead: "Switch the lead's engine",
+    switchTitleWorker: "Switch this task's engine",
+    switchToolLabel: "Engine",
+    switchModelLabel: "Model override",
+    switchModelHint: "Passed as --model to the CLI. Leave blank to use its own configured default.",
+    switchModelUnsupported: "{{tool}} doesn't support a model override yet.",
+    switchModelPlaceholder: "e.g. opus, gpt-5.5-high…",
+    switchBody:
+      "Clears this conversation's native session — the new engine starts fresh. Your next message carries a condensed summary of the recent conversation so {{tool}} isn't starting blind, which means that content is now also visible to {{tool}}, not just whichever engine ran it before.",
+    switchReloadBody:
+      "Restarts the engine with a fresh native session — use this to pick up a change you made to the CLI's own config (e.g. its default model), or to unstick one that's misbehaving.",
+    switchConfirm: "Switch",
+    switchReloadConfirm: "Reload",
+    switchedToast: "Switched {{from}} → {{to}}",
+    switchReloadedToast: "{{tool}} reloaded",
+    engineSwitchedMarker: "Engine switched",
+    engineReloadedMarker: "Engine reloaded",
+    engineModelCleared: "no override",
   },
   diff: {
     tab: "Diff",
@@ -446,6 +468,9 @@ export const en = {
     showMore_one: "Show {{count}} more",
     showMore_other: "Show {{count}} more",
     showLess: "Show less",
+    engine: "Engine",
+    engineUnknown: "Unknown",
+    switchEngine: "Switch…",
   },
   observe: {
     answerPlaceholder: "Type a reply, press Enter",
@@ -659,7 +684,8 @@ export const en = {
     automationEyebrow: "Automation",
     automationHint: "Automation only works when runaway behavior has a boundary; Weft does not add its own routine approval gate.",
     defaultTool: "Default coding tool",
-    defaultToolHint: "Default tool for issue leads and new tasks. Each approval card can still override it.",
+    defaultToolHint:
+      "Applies to new issues and new tasks only (a write-approval card can still override it per task). Doesn't retroactively change an issue's lead or a task's worker already running — switch those from their own Session panel.",
     noTools: "No coding CLI detected — install codex, claude, or opencode.",
     toolFallback: "{{configured}} is not installed — using {{tool}}.",
     agentCommands: "Agent commands",
