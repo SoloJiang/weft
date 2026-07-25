@@ -444,13 +444,7 @@ export const en = {
     answerPlaceholder: "Type a reply, press Enter",
   },
   bus: {
-    title: "Agent coordination",
     close: "Close",
-    messages_one: "{{count}} message",
-    messages_other: "{{count}} messages",
-    empty: "No messages yet. Tasks post here via the bus; you can too.",
-    broadcast: "Broadcast · all tasks",
-    compose: "Message the bus…",
   },
   resume: {
     copyCommand: "Copy resume command",
