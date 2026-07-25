@@ -82,41 +82,48 @@ Field intent:
 - split: optional coarse task preview
 - risks: only unresolved risks (omit if none)
 
-Valid JSON. Locale matches the user. After the human acts, you may receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision>; clear chat agreement counts the same. Never call propose_directions while the latest plan_card is unanswered, unless the human explicitly skipped the plan discussion."#;
+Valid JSON with normally-escaped strings: paragraph breaks inside a value are the two characters \n\n (one backslash each) — never double-escape them into literal backslash-n text. Locale matches the user. After the human acts, you may receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision>; clear chat agreement counts the same. Never call propose_directions while the latest plan_card is unanswered, unless the human explicitly skipped the plan discussion."#;
 
-/// Repo-onboarding / full-list sentinels. Situational only — appended when the
-/// workspace has no repos or the `<repo_state>` list is truncated.
-const SENTINEL_DIRECTIVES: &str = r#"If no suitable repo exists, output one:
+/// Always-on repo action-card schema. Needed even when some repos already exist,
+/// because the work may still require importing/creating/cloning another one.
+const ACTION_CARD_DIRECTIVES: &str = r#"If no suitable repo exists for the work, output one:
 <weft:action_card>{"title":"...","body":"...","steps":["..."],"actions":[{"id":"...","label":"...","kind":"add"|"new"|"clone"}]}</weft:action_card>
 
-`steps` is optional. kind is add (import folder), new (create repo), or clone (remote URL). Locale matches the user.
+`steps` is optional. kind is add (import folder), new (create repo), or clone (remote URL). Locale matches the user. After a repo action: <weft:repo_action>{...}</weft:repo_action> with status ok/error/cancelled."#;
 
-If <repo_state> is truncated, emit on its own line:
+/// Truncation-only full-list sentinel. Appended when `<repo_state>` is truncated.
+const LIST_REPOS_DIRECTIVES: &str = r#"If <repo_state> is truncated, emit on its own line:
 <weft:list_repos/>
-Replies arrive as <weft:list_repos_result>{...}</weft:list_repos_result>. After a repo action: <weft:repo_action>{...}</weft:repo_action> with status ok/error/cancelled."#;
+Replies arrive as <weft:list_repos_result>{...}</weft:list_repos_result>."#;
 
-/// Always-on conversational lead prompt: role, hard gates, and core sentinels.
-/// Situational repo-onboarding directives are added by `lead_prompt_for` when
-/// the workspace is empty or the repo list is truncated.
+/// Always-on conversational lead prompt: role, hard gates, core sentinels, and
+/// the action-card schema. Truncation-only list_repos guidance is added by
+/// `lead_prompt_for` when the repo list exceeds the always-on preview.
 pub fn lead_prompt() -> String {
     lead_prompt_for(false)
 }
 
-/// Build the lead system prompt. When `include_repo_sentinels` is true, append
-/// action_card / list_repos directives for empty or truncated workspaces.
-pub fn lead_prompt_for(include_repo_sentinels: bool) -> String {
-    let mut prompt = format!("{BASE_PROMPT}\n\n{TEST_CASES_DIRECTIVES}\n\n{PLAN_CARD_DIRECTIVES}");
-    if include_repo_sentinels {
+/// Build the lead system prompt. When `include_list_repos` is true, append the
+/// truncation-only `<weft:list_repos/>` directive.
+pub fn lead_prompt_for(include_list_repos: bool) -> String {
+    let mut prompt = format!(
+        "{BASE_PROMPT}\n\n{TEST_CASES_DIRECTIVES}\n\n{PLAN_CARD_DIRECTIVES}\n\n{ACTION_CARD_DIRECTIVES}"
+    );
+    if include_list_repos {
         prompt.push_str("\n\n");
-        prompt.push_str(SENTINEL_DIRECTIVES);
+        prompt.push_str(LIST_REPOS_DIRECTIVES);
     }
     prompt
 }
 
-/// True when `<repo_state>` implies the lead may need action_card / list_repos
-/// guidance: no repos, or more repos than the always-on list shows.
+/// True when `<repo_state>` is truncated and the lead may need `<weft:list_repos/>`.
+pub fn needs_list_repos_directives(repo_count: usize) -> bool {
+    repo_count > crate::lead_chat::repo_state::MAX_LISTED
+}
+
+/// Backward-compatible alias used by older call sites/tests.
 pub fn needs_repo_sentinels(repo_count: usize) -> bool {
-    repo_count == 0 || repo_count > crate::lead_chat::repo_state::MAX_LISTED
+    needs_list_repos_directives(repo_count)
 }
 
 /// Agent-output language directive (ARCHITECTURE §4.8, layer 2). Appended to the
@@ -251,7 +258,7 @@ pub async fn lead_engine(
         );
         format!(
             "{}{}\n\n{}",
-            lead_prompt_for(needs_repo_sentinels(repos.len())),
+            lead_prompt_for(needs_list_repos_directives(repos.len())),
             lang_directive(lang),
             repo_state
         )
@@ -441,7 +448,7 @@ fn lead_alive(child_alive: bool, has_codex_client: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{lead_alive, lead_prompt, lead_prompt_for, lead_state_label, needs_repo_sentinels};
+    use super::{lead_alive, lead_prompt, lead_prompt_for, lead_state_label, needs_list_repos_directives};
 
     #[test]
     fn busy_turn_reports_busy_even_without_resident_child() {
@@ -473,12 +480,14 @@ mod tests {
         assert!(prompt.contains("Use weft_planner when it materially helps"));
         assert!(!prompt.contains("Start by greeting"));
         assert!(!prompt.contains("call get_task"));
-        // Repo-onboarding sentinels are situational, not always-on.
-        assert!(!prompt.contains("<weft:action_card>"));
-        assert!(lead_prompt_for(true).contains("<weft:action_card>"));
-        assert!(needs_repo_sentinels(0));
-        assert!(needs_repo_sentinels(crate::lead_chat::repo_state::MAX_LISTED + 1));
-        assert!(!needs_repo_sentinels(1));
+        // Action-card schema is always-on so a nonempty workspace can still
+        // import/create/clone another repo; list_repos is truncation-only.
+        assert!(prompt.contains("<weft:action_card>"));
+        assert!(!prompt.contains("<weft:list_repos/>"));
+        assert!(lead_prompt_for(true).contains("<weft:list_repos/>"));
+        assert!(!needs_list_repos_directives(0));
+        assert!(needs_list_repos_directives(crate::lead_chat::repo_state::MAX_LISTED + 1));
+        assert!(!needs_list_repos_directives(1));
     }
 
     /// The discuss-first gate: the split happens only after the human approves
@@ -493,6 +502,10 @@ mod tests {
         assert!(prompt.contains("skip"));
         // Adaptive floor: trivial issues get a compact card, not an interrogation.
         assert!(prompt.contains("For trivial issues do not interrogate"));
+        // Parser persists plan cards verbatim, so the prompt must mandate
+        // normally-escaped JSON paragraph breaks (not double-escaped \\n).
+        assert!(prompt.contains("normally-escaped"));
+        assert!(prompt.contains("never double-escape"));
         // The eager-split bar and the question-rationing rule must be gone.
         assert!(!prompt.contains("clear enough for workers to start"));
         assert!(!prompt.contains("Ask clarifying questions only when"));
@@ -540,11 +553,13 @@ mod tests {
 
     #[test]
     fn lead_prompt_action_card_schema_includes_optional_steps() {
-        let prompt = lead_prompt_for(true);
-        assert!(prompt.contains("\"steps\""));
-        assert!(prompt.contains("`steps` is optional"));
-        assert!(prompt.contains("<weft:repo_action>"));
-        assert!(prompt.contains("<weft:list_repos/>"));
+        let always = lead_prompt();
+        assert!(always.contains("\"steps\""));
+        assert!(always.contains("`steps` is optional"));
+        assert!(always.contains("<weft:repo_action>"));
+        assert!(!always.contains("<weft:list_repos/>"));
+        let with_list = lead_prompt_for(true);
+        assert!(with_list.contains("<weft:list_repos/>"));
     }
 
     #[test]

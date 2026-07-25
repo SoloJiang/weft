@@ -930,14 +930,14 @@ fn tool_specs() -> Value {
     json!([
         {
             "name": "bus_post",
-            "description": "Post a message to another task's inbox in this thread. `to` is the exact numeric id from that participant's messages' `from` field (not a name or issue number). Prefer bus_post over broadcast when a specific worker must see the message, including when that worker may be idle.",
+            "description": "Post a message to another participant's inbox in this thread. `to` is either \"lead\" (the thread lead; the lead has no numeric id) or the exact numeric id from a worker's messages' `from` field (not a display name or issue number). Prefer bus_post over broadcast when a specific participant must see the message, including when they may be idle.",
             "inputSchema": { "type": "object",
                 "properties": { "to": str_prop(), "text": str_prop() },
                 "required": ["to", "text"] }
         },
         {
             "name": "bus_broadcast",
-            "description": "Send a message to every other task currently active on the bus. Idle participants may miss it — use bus_post with their numeric id when a specific worker must receive the update.",
+            "description": "Send a message to every other participant currently active on the bus. Idle participants may miss it — use bus_post with \"lead\" or a worker's numeric id when a specific participant must receive the update.",
             "inputSchema": { "type": "object",
                 "properties": { "text": str_prop() }, "required": ["text"] }
         },
