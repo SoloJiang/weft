@@ -116,13 +116,13 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
 }
 
 export function PermissionRow({ ask }: { ask: PermissionAsk }) {
-  const { answerPermission, selectThread } = useStore();
+  const { answerPermission, goToDirectionRef } = useStore();
   const { t } = useTranslation();
   const context = [ask.thread_title, ask.dir_name].filter(Boolean).join(" · ");
   const contextLink = context ? (
     <button
       type="button"
-      onClick={() => void selectThread(ask.thread)}
+      onClick={() => void goToDirectionRef(ask.thread, ask.dir)}
       title={t("needs.openDirection")}
       className="group flex max-w-full items-center gap-1.5 pt-0.5 text-[11px] text-ink-faint transition-colors hover:text-ink"
     >
@@ -170,11 +170,21 @@ export function AskRow({ item }: { item: NeedItem }) {
     <div className="overflow-hidden rounded-[var(--radius-lg)] border border-waiting/40 bg-waiting/10">
       <div className="flex items-center gap-2 px-3.5 pt-3 text-[12px]">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-waiting" />
-        <span className="truncate font-medium text-ink">
-          {item.direction_name}
-        </span>
-        <span className="text-ink-faint">·</span>
-        <span className="truncate text-ink-muted">{item.thread_title}</span>
+        {/* The worker reference itself is the primary jump target (not just the
+            trailing icon below) — same handler, so hovering either affords the
+            same one-click landing on its timeline. */}
+        <button
+          type="button"
+          onClick={() => void goToAsk(item)}
+          title={t("needs.openDirection")}
+          className="group flex min-w-0 items-center gap-1.5 text-left"
+        >
+          <span className="truncate font-medium text-ink transition-colors group-hover:text-brand">
+            {item.direction_name}
+          </span>
+          <span className="text-ink-faint">·</span>
+          <span className="truncate text-ink-muted">{item.thread_title}</span>
+        </button>
         <span className="ml-auto whitespace-nowrap text-ink-faint tabular-nums">
           {ago(item.ts, t)}
         </span>

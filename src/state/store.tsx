@@ -270,6 +270,12 @@ interface Store {
   refreshNeeds: () => Promise<void>;
   answerAsk: (item: NeedItem, text: string) => Promise<void>;
   goToAsk: (item: NeedItem) => Promise<void>;
+  /** Single-source jump for any worker reference carrying a bus-style
+   *  (thread, dir) pair — board cards, needs-you rows, anywhere a worker's
+   *  name is shown. `dir` is the direction id as a string (backend convention,
+   *  see WorkerConversation's dir-parsing note) or a non-numeric sentinel
+   *  ("lead") for a thread-level ask with no specific direction. */
+  goToDirectionRef: (thread: number, dir: string) => Promise<void>;
   answerPermission: (
     askId: number,
     answer: "allow" | "deny" | "always" | "full",
@@ -2474,21 +2480,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const goToAsk = useCallback(
-    async (item: NeedItem) => {
+  // Single entry for "jump to the worker this reference is about" — reused by
+  // every surface that shows a bus-delivered (thread, dir) pair (Needs-you
+  // rows today; board cards resolve via worktrees instead, see viewDirection).
+  // Prefers a live engine for that direction; falls back to the owning
+  // thread's lead chat when there is none (thread-level ask, or the direction
+  // never spawned a worker). `dir` non-numeric (e.g. the "lead" sentinel) just
+  // fails the live lookup and falls through to the thread — never throws.
+  const goToDirectionRef = useCallback(
+    async (thread: number, dir: string) => {
       setShowNeeds(false);
       setViewing(null);
-      const live = Object.values(sessions).find(
-        (s) => s.directionId === item.direction_id,
-      );
+      const directionId = Number(dir);
+      const live = Number.isFinite(directionId)
+        ? Object.values(sessions).find((s) => s.directionId === directionId)
+        : undefined;
       if (live) {
-        setActiveThreadId(item.thread_id);
+        setActiveThreadId(thread);
         openWorker(live.directionId, live.repoId);
         return;
       }
-      await selectThread(item.thread_id);
+      await selectThread(thread);
     },
     [sessions, selectThread, openWorker],
+  );
+
+  const goToAsk = useCallback(
+    (item: NeedItem) => goToDirectionRef(item.thread_id, String(item.direction_id)),
+    [goToDirectionRef],
   );
 
   useEffect(() => {
@@ -2739,6 +2758,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshNeeds,
     answerAsk,
     goToAsk,
+    goToDirectionRef,
     answerPermission,
     repoProfiles,
     repoEdges,
