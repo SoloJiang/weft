@@ -25,6 +25,7 @@ import {
 import { Button } from "../components/ui/Button";
 import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
+import { Segmented } from "../components/ui/Segmented";
 import { Toggle } from "../components/ui/Toggle";
 import { SkillsSettings } from "../components/SkillsSettings";
 import { BackupSettings } from "../settings/Backup";
@@ -1225,35 +1226,6 @@ function SettingRow({
       </div>
       <span className="min-w-4 flex-1" />
       {children && <div className="shrink-0">{children}</div>}
-    </div>
-  );
-}
-
-function Segmented({
-  value,
-  onChange,
-  options,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  options: { value: string; label: string; icon?: ReactNode }[];
-}) {
-  return (
-    <div className="inline-flex items-center gap-0.5 rounded-[var(--radius-md)] bg-bg p-0.5">
-      {options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          onClick={() => onChange(o.value)}
-          className={cn(
-            "flex h-[28px] items-center gap-1.5 whitespace-nowrap rounded-[var(--radius-sm)] px-3 text-[12px] font-medium transition-colors duration-150",
-            value === o.value ? "bg-raised text-ink" : "text-ink-muted hover:text-ink",
-          )}
-        >
-          {o.icon}
-          {o.label}
-        </button>
-      ))}
     </div>
   );
 }

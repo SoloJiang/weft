@@ -303,6 +303,8 @@ pub fn run() {
             lead_chat::commands::chat_reorder_queue,
             lead_chat::commands::chat_rewind,
             lead_chat::commands::lead_rewind,
+            lead_chat::commands::switch_lead_tool,
+            lead_chat::commands::switch_worker_tool,
             lead_chat::commands::lead_dequeue,
             lead_chat::commands::lead_edit_queued,
             lead_chat::commands::lead_reorder_queue,

@@ -565,6 +565,34 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
     Ok(a.update(&db.0).await?)
 }
 
+/// Switch a thread's lead engine identity + model override (issue #96/#98).
+/// `model=None` clears any override (follow the CLI's own default). Also
+/// clears `lead_command`: a per-tool alias pin (e.g. `claude` → `cc-claude`)
+/// is meaningless once `lead_tool` names a DIFFERENT tool identity, and
+/// carrying it forward would silently try to spawn the old alias as the new
+/// tool's binary. Does NOT touch `native_id` or any live in-memory engine —
+/// the caller (lead_chat::commands::switch_lead_tool) owns that half of the
+/// switch (tear down the live engine, clear native id, reconstruct fresh) so
+/// this stays a plain, independently-testable field update. No-op fields
+/// (same tool, same model) still write through — callers may use this to
+/// force-reload an engine so an externally-edited CLI config takes effect.
+pub async fn switch_thread_tool(
+    db: &Db,
+    thread_id: i32,
+    tool: &str,
+    model: Option<&str>,
+) -> Result<thread::Model> {
+    let m = thread::Entity::find_by_id(thread_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+    let mut a: thread::ActiveModel = m.into();
+    a.lead_tool = Set(tool.to_string());
+    a.lead_command = Set(None);
+    a.lead_model = Set(model.map(str::to_string));
+    Ok(a.update(&db.0).await?)
+}
+
 pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
     Ok(plan::Entity::find()
         .filter(plan::Column::ThreadId.eq(thread_id))
@@ -1131,6 +1159,51 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
     Ok(a.update(&db.0).await?)
 }
 
+/// Atomically switch BOTH halves of a worker's engine identity/model override
+/// (issue #96/#98) — `direction.tool` (the durable side `chat_open_worker_impl`
+/// reads whenever it (re)creates a session, e.g. the very next open after this
+/// switch cleared the session's native id, which flips that function's
+/// resume-vs-recreate branch to "recreate") AND `session.tool`/`session.model`
+/// (the live side `worker_engine`/every `chat_send` reads). ONE transaction,
+/// not two independent `.update()` calls: a torn write — the direction commits
+/// but the session write fails, or vice versa — would leave the two readers
+/// disagreeing about which tool this worker is actually running, silently
+/// reintroducing #96's core confusion in a harder-to-notice shape (the panel
+/// shows the new tool; the next message goes to the old one). Also clears
+/// `session.command`: a per-tool alias pin from the OLD tool would otherwise
+/// try to spawn the NEW tool identity under the old alias binary. No-op for
+/// the session half if that row is gone (a session can be reclaimed between
+/// the caller's lookup and this write — moot, not a failure, same posture as
+/// the old `switch_session_tool`); the direction half is required (not found
+/// is a real error, same as before).
+pub async fn switch_worker_tool_txn(
+    db: &Db,
+    direction_id: i32,
+    session_id: i32,
+    tool: &str,
+    model: Option<&str>,
+) -> Result<direction::Model> {
+    use sea_orm::TransactionTrait;
+    let txn = db.0.begin().await?;
+    let d = direction::Entity::find_by_id(direction_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+    let mut da: direction::ActiveModel = d.into();
+    da.tool = Set(tool.to_string());
+    let updated = da.update(&txn).await?;
+
+    if let Some(s) = session::Entity::find_by_id(session_id).one(&txn).await? {
+        let mut sa: session::ActiveModel = s.into();
+        sa.tool = Set(tool.to_string());
+        sa.command = Set(None);
+        sa.model = Set(model.map(str::to_string));
+        sa.update(&txn).await?;
+    }
+    txn.commit().await?;
+    Ok(updated)
+}
+
 /// A direction's diff "vs target" config: `(stored, base_ref)` where `stored`
 /// is the per-task target branch ("" = use the repo default) and `base_ref` is
 /// the bound repo's default branch (the effective default). Both empty if the
@@ -1644,28 +1717,54 @@ pub async fn set_session_native_id_opt(
 /// deletion-fenced insert as the rest of the timeline (`insert_lead_message`),
 /// so a thread deleted mid-recovery can't leave an orphaned row.
 ///
-/// Honesty note (review round 4, P2): this row was originally meant to
-/// double as an issue #116 coordination point — its `created_at`, read back
-/// via [`last_turn_freeze_recovery_secs`], was meant to let #116's idle
-/// re-drive hold off re-dispatching into the same wedge for a grace window.
-/// #116 landed WITHOUT wiring that consult up: `revive.rs`'s
-/// `stalled_direction_ids` never reads this marker, and a repo-wide grep
-/// confirms [`last_turn_freeze_recovery_secs`] has no caller outside this
-/// file's own round-trip test. The marker is stamped and readable but
-/// currently has NO consumer. What actually keeps #116 from immediately
-/// re-driving a just-recovered direction into the same wedge is an unrelated
-/// side effect: `recover_from_freeze` also clears the session's
-/// `native_session_id` (see `set_session_native_id_opt` /
-/// `set_lead_native_id_opt`), and `stalled_direction_ids` only selects a
-/// direction whose `native_session_id.is_some()` — so the just-recovered
-/// direction is (accidentally) invisible to #116 until its next native
-/// session is established. That protection is fragile: it depends entirely
-/// on THAT field staying cleared at THAT moment, and would silently vanish if
-/// either side changes — a future refactor that stops clearing
-/// `native_session_id` here, or a redrive path that stops gating on it, would
-/// reopen a redrive storm with nothing left to prevent it. Wiring this marker
-/// into a real grace window (or removing it if that's judged unnecessary) is
-/// open follow-up work, not done here.
+/// This row IS the issue #116 coordination point: its `created_at`, read back
+/// via [`last_turn_freeze_recovery_secs`], is what
+/// `lead_chat::revive::freeze_recovery_state` consults to withhold a
+/// just-self-healed lead/worker from the idle re-drive for one grace window,
+/// rather than racing this recovery straight back into the same wedge.
+///
+/// History, because the shape here only makes sense with it (review round 4,
+/// P2): #116 originally landed WITHOUT that consult — `revive.rs` never read
+/// this marker, and the getter had no caller outside this file's own
+/// round-trip test. What kept the re-drive off a just-recovered direction in
+/// the meantime was an unrelated SIDE EFFECT: `recover_from_freeze` also
+/// clears the session's `native_session_id` (see `set_session_native_id_opt` /
+/// `set_lead_native_id_opt`), and `revive::stalled_direction_ids` only selects
+/// a direction whose `native_session_id.is_some()`. Real protection, but
+/// accidental — it depended entirely on THAT field staying cleared at THAT
+/// moment, and would have vanished silently under a refactor that stopped
+/// clearing it, or a re-drive path that stopped gating on it. The grace window
+/// no longer RIDES on that: it reads this marker directly, and has tests that
+/// go red if the read is removed.
+///
+/// The native-id clear is still there, but it is NOT a second guard — `revive`
+/// deliberately stopped treating a missing native id as "not selectable",
+/// because that is what made a freeze-recovered session invisible to the
+/// re-drive forever instead of for one window. The dependency now runs the
+/// other way: `recover_from_freeze` clears the id ONLY if this row was
+/// stamped, since this row is the sole evidence separating "never ran" from
+/// "ran, and the recovery cleared its id" (`revive::has_resumable_context`).
+/// Clearing after a failed stamp would erase that evidence and strand the
+/// session permanently.
+///
+/// Reused (not just freeze recovery) by `lead_chat::commands::{switch_lead_tool,
+/// switch_worker_tool}` (issue #96/#98, adversarial re-review of PR #139, P2):
+/// a deliberate engine/model switch also clears the native id and lands the
+/// engine at idle, which is the EXACT shape `revive`'s stall sweep looks for —
+/// without this stamp, a thread/session that had EVER gone through a genuine
+/// freeze-recovery at any point in its (possibly much older) history would
+/// read `has_resumable_context() == true` from that stale marker alone once
+/// its OWN grace window had long since elapsed, letting the very next sweep
+/// tick (every 60s) auto-redrive the freshly-switched, not-yet-human-verified
+/// engine into a "resume stalled work" prompt — a false positive with no
+/// connection to the switch that just happened. Calling this on a switch too
+/// re-stamps the grace window with the CURRENT time, so `revive`'s existing
+/// (unmodified) cooldown check holds off exactly the way it already does
+/// after a real freeze recovery. The name stays freeze-scoped (renaming would
+/// touch `recover_from_freeze`'s established call site for no behavioral
+/// gain); read it as "the native context was deliberately reset and the next
+/// automated re-drive should back off for one grace window", of which a
+/// self-healed freeze is one cause and a human-initiated switch is another.
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
@@ -4847,6 +4946,120 @@ mod tests {
         assert_eq!(d2.name, "api work");
         assert_eq!(d2.slug, "main");
         assert_eq!(d2.branch, "feature/add-login");
+    }
+
+    #[tokio::test]
+    async fn switch_thread_tool_updates_identity_and_clears_stale_pin() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        // A command alias pin for the OLD tool must not survive onto the new one.
+        // `applyToExisting=false` pins the existing thread to its prior resolved
+        // command ("claude") — see `apply_to_existing_true_clears_pins_so_rows_
+        // follow_global` above for why `true` would instead CLEAR the pin.
+        set_tool_command(&db, "claude", "cc-claude", false).await.unwrap();
+        assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_command.as_deref(), Some("claude"));
+
+        let switched = switch_thread_tool(&db, t.id, "codex", Some("gpt-5.5-high")).await.unwrap();
+        assert_eq!(switched.lead_tool, "codex");
+        assert_eq!(switched.lead_model.as_deref(), Some("gpt-5.5-high"));
+        assert_eq!(switched.lead_command, None, "stale claude alias pin must be cleared");
+
+        // A model override clears the same way when the caller passes None.
+        let cleared = switch_thread_tool(&db, t.id, "codex", None).await.unwrap();
+        assert_eq!(cleared.lead_model, None);
+
+        assert!(switch_thread_tool(&db, 9999, "codex", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn switch_direction_and_session_tool_stay_in_lockstep() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd").await.unwrap();
+        set_session_native_id(&db, s.id, "native-1").await.unwrap();
+        // A stale alias pin for the OLD tool must not survive the switch either.
+        {
+            let mut a: session::ActiveModel = get_session(&db, s.id).await.unwrap().unwrap().into();
+            a.command = Set(Some("cc-claude".to_string()));
+            a.update(&db.0).await.unwrap();
+        }
+
+        switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
+            .await
+            .unwrap();
+
+        let d2 = get_direction(&db, d.id).await.unwrap().unwrap();
+        assert_eq!(d2.tool, "opencode", "direction.tool must follow the switch — chat_open_worker_impl's cold-recreate path reads it, not session.tool");
+        let s2 = get_session(&db, s.id).await.unwrap().unwrap();
+        assert_eq!(s2.tool, "opencode");
+        assert_eq!(s2.model.as_deref(), Some("kimi-for-coding/k2p6"));
+        assert_eq!(s2.command, None, "stale claude alias pin must be cleared");
+        // Switching direction/session tool does not itself touch native id —
+        // that is the caller's (lead_chat::commands) job, layered separately.
+        assert_eq!(s2.native_session_id.as_deref(), Some("native-1"));
+
+        assert!(switch_worker_tool_txn(&db, 9999, s.id, "codex", None).await.is_err());
+        // A missing session is tolerated (not an error) on the session half —
+        // see the function doc — as long as the direction is real.
+        assert!(switch_worker_tool_txn(&db, d.id, 9999, "codex", None).await.is_ok());
+    }
+
+    /// Adversarial re-review of PR #139, P1: the direction/session writes used
+    /// to be two independent `.update()` calls — a failure on the SECOND write
+    /// left the FIRST one committed, so `direction.tool` and `session.tool`
+    /// could disagree (exactly the "which engine is this worker really
+    /// talking to" confusion issue #96 exists to fix, recurring in a
+    /// harder-to-notice shape). Proves the fix is a REAL transaction, not just
+    /// a "no error happened" happy-path check: forces the session half to fail
+    /// with a genuine DB error (renaming the `session` table out from under a
+    /// live transaction — deterministic, no timing/locking dependency, unlike
+    /// a busy-snapshot race) while the direction half is perfectly healthy,
+    /// then asserts the direction was rolled back too.
+    #[tokio::test]
+    async fn switch_worker_tool_txn_rolls_back_direction_when_session_write_fails() {
+        use sea_orm::ConnectionTrait;
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd").await.unwrap();
+
+        // Make the session half of the transaction fail with a real DB error
+        // (not a simulated one) while leaving `direction` completely healthy.
+        db.0.execute_unprepared("ALTER TABLE session RENAME TO session_renamed_for_test")
+            .await
+            .unwrap();
+
+        let err = switch_worker_tool_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
+        assert!(err.is_err(), "the session-table write must fail (table renamed away)");
+
+        // Restore the table so the read-back below (and any other test using
+        // this connection) sees the schema it expects.
+        db.0.execute_unprepared("ALTER TABLE session_renamed_for_test RENAME TO session")
+            .await
+            .unwrap();
+
+        let d2 = get_direction(&db, d.id).await.unwrap().unwrap();
+        assert_eq!(
+            d2.tool, "claude",
+            "direction.tool must be ROLLED BACK, not left at the new value, when the session half fails"
+        );
+        let s2 = get_session(&db, s.id).await.unwrap().unwrap();
+        assert_eq!(s2.tool, "claude", "session.tool untouched — the write never committed");
+        assert_eq!(s2.model, None);
     }
 
     #[tokio::test]

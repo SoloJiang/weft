@@ -17,8 +17,9 @@ the choice persists (localStorage `weft-theme`), applied via `data-theme` on
 `<html>` (an inline script in `index.html` sets it before first paint — no
 flash). Dark mood: a control room at night — violet-tinted near-black, the
 **indigo** brand glowing like the work lines of the weft mark, **orange** marking
-convergence. Light mood: violet-tinted paper, the same brand deepened for
-contrast. Both are designed palettes, not inverts.
+convergence. Light mood: a cool-white desktop canvas, with graphite controls and
+orange reserved for compact permission and outcome cues. Both are designed
+palettes, not inverts.
 
 Mechanism: Tailwind `@theme` colors reference per-theme `--c-*` vars; dark is the
 `:root` default, light overrides under `:root[data-theme="light"]`. Add a color
@@ -83,11 +84,11 @@ is its own green (below), not the brand, so structure and liveness read distinct
 | error / exited | `--status-error` | `oklch(0.64 0.20 25)` red | ✕ |
 
 The tables above are the **dark** palette (`:root`). The **light** palette
-(`:root[data-theme="light"]`) keeps the same hues, flipped for a near-white
-violet paper: `--c-bg` `oklch(0.975 0.004 292)`, `--c-surface` `oklch(0.995 0.002 292)`,
-`--c-raised` white, `--c-ink` `oklch(0.26 0.02 292)`, brand deepened to the true
-`#4F46E5` `oklch(0.51 0.23 277)`, status colors darkened (~L 0.55–0.62) for AA on
-white. Exact values live in `src/index.css`; both tables stay in lockstep.
+(`:root[data-theme="light"]`) uses a neutral cool-white canvas: `--c-bg`
+`oklch(0.982 0.003 255)`, `--c-surface` `oklch(0.992 0.002 255)`, and a white
+raised writing surface. Graphite `--c-brand` makes primary controls decisive;
+orange remains an accessible secondary accent. Status colors are darkened for AA
+on white. Exact values live in `src/index.css`; both tables stay in lockstep.
 
 Color never stands alone — the glyph and a text label always accompany it
 (see Accessibility in PRODUCT.md).

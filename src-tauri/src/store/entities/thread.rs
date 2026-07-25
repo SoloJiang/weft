@@ -16,6 +16,13 @@ pub struct Model {
     /// Set when the user excludes existing sessions from a newly-configured
     /// command override, freezing this lead to its prior command.
     pub lead_command: Option<String>,
+    /// Optional per-thread model override (issue #98), passed as `--model
+    /// <value>` to the lead's CLI (claude/codex; a free-text value, not
+    /// validated against a model list — the CLI is the authority). NULL =
+    /// follow the CLI's own configured default. Cleared whenever `lead_tool`
+    /// switches to a different tool identity (an override tuned for one CLI's
+    /// model names is meaningless for another's).
+    pub lead_model: Option<String>,
     /// Last-known engine meta snapshot (JSON `PersistedMeta`): context tokens,
     /// window, model, MCP servers, tools. Written at init/turn-end so the
     /// Session panel survives an app relaunch instead of blanking until the

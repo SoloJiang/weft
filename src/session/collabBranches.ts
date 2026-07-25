@@ -96,6 +96,9 @@ const NESTABLE_KIND: Record<LeadMessage["kind"], boolean> = {
   test_cases: false,
   settled: false,
   rewind: false,
+  // Same system-owned, always-top-level marker treatment as `rewind` (issue
+  // #96/#98) — see EngineSwitchMarker in ChatTimeline.tsx.
+  engine_switch: false,
 };
 
 function parseContentObject(row: LeadMessage): Record<string, unknown> {

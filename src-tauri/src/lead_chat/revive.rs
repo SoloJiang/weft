@@ -17,6 +17,11 @@
 //! reason; it gets a visible, honest Needs-you notice instead, so a lead that
 //! bus_post'd it is never left believing the wake landed.
 //!
+//! Both stall selectors also honour the turn-freeze auto-recovery grace window
+//! (issue #93 ↔ #116): a lead or worker the engine watchdog just unwedged is
+//! withheld from re-drive for one cooldown window rather than being dispatched
+//! straight back into the same freeze — see [`freeze_recovery_state`].
+//!
 //! [`spawn_stall_watch`] runs an immediate first pass before its timer loop, so
 //! it covers "at boot" too — that first pass IS what used to be a separate
 //! boot-only scan in [`sweep`] below, with its OWN independent, boot-scoped
@@ -68,7 +73,22 @@ const STALL_REDRIVE_SWEEP_DEFAULT_SECS: u64 = 60;
 /// while still eventually retrying (a transient failure — CLI briefly missing —
 /// shouldn't strand the thread forever). Override with
 /// `WEFT_STALL_REDRIVE_COOLDOWN_SECS`.
+///
+/// Doubles as the turn-freeze recovery GRACE WINDOW — see
+/// [`freeze_recovery_state`] for why the two share one value and one knob.
 const STALL_REDRIVE_COOLDOWN_DEFAULT_SECS: u64 = 300;
+
+/// The resolved redrive cooldown / freeze-recovery grace window. One resolver
+/// so the runtime sweep ([`spawn_stall_watch`]) and the boot sweep
+/// ([`try_revive_lead`], via [`stalled_direction_ids`]) can never disagree
+/// about how long an automated intervention holds the thread. `0` disables
+/// both gates.
+fn stall_redrive_cooldown_secs() -> u64 {
+    crate::commands::env_secs(
+        "WEFT_STALL_REDRIVE_COOLDOWN_SECS",
+        STALL_REDRIVE_COOLDOWN_DEFAULT_SECS,
+    )
+}
 
 /// Names the exact worker bus ids (= direction ids) that went idle without
 /// delivering, so the lead can address them: without these it has no worker
@@ -139,10 +159,7 @@ pub fn spawn_stall_watch(app: AppHandle) {
         if sweep_secs == 0 {
             return; // disabled
         }
-        let cooldown_secs = crate::commands::env_secs(
-            "WEFT_STALL_REDRIVE_COOLDOWN_SECS",
-            STALL_REDRIVE_COOLDOWN_DEFAULT_SECS,
-        );
+        let cooldown_secs = stall_redrive_cooldown_secs();
         // Owned by this async task for its whole lifetime, mirroring the engine
         // watchdog's `stall_notices`: no DB/EngineInner field exists for either
         // (stall markers never persist — see the module doc). Passed by
@@ -184,8 +201,25 @@ async fn run_stall_pass(
     };
     let db = Db(db.0.clone(), db.1);
 
-    match collect_stalled_leads(&db).await {
+    // TWO readings, because the two gates measure different things and a slow
+    // pass must not blur them.
+    //
+    // `scan_started` gates the freeze-recovery grace window, which is evaluated
+    // INSIDE the scan against marker rows read during it. Reading it up front
+    // keeps that comparison against a time no later than the rows it judges: a
+    // slow pass can then only widen the hold-off, never shorten it — the safe
+    // direction for a guard whose whole job is to not re-drive too early.
+    let scan_started = now_secs();
+    match collect_stalled_leads(&db, scan_started, cooldown_secs).await {
         Ok(stalled) => {
+            // The cooldown, by contrast, measures the gap between two DISPATCHES,
+            // so it needs the clock as of now — after the scan. Stamping
+            // `last_redrive` with the pre-scan reading would let the scan's own
+            // duration count against the window it is about to open: a pass
+            // slowed by SQLite contention could burn most of the cooldown before
+            // dispatching anything, and the next pass would re-drive the same
+            // unresolved thread a sweep later instead of a cooldown later —
+            // exactly the redrive storm the window exists to bound.
             let now = now_secs();
             // Prune threads that recovered on their own so a stale cooldown
             // from long ago can't shadow a genuinely fresh stall episode much
@@ -296,21 +330,43 @@ async fn collect_targets(
 /// re-driven — intended, not a leak: that question lived only in the in-memory
 /// AskRegistry (cleared on restart), so re-driving the lead re-surfaces it
 /// instead of stalling forever on an answer that can no longer arrive.
-async fn collect_stalled_leads(db: &Db) -> anyhow::Result<Vec<(i32, Vec<i32>)>> {
+///
+/// Freeze guard: a lead the turn-freeze watchdog just auto-recovered (issue
+/// #93) is skipped for [`freeze_recovery_state`]'s grace window — re-dispatching
+/// it seconds after the self-heal would race straight back into the same wedge.
+async fn collect_stalled_leads(
+    db: &Db,
+    now: u64,
+    grace_secs: u64,
+) -> anyhow::Result<Vec<(i32, Vec<i32>)>> {
     let mut stalled = Vec::new();
     for ws in repo::list_workspaces(db).await? {
         for th in repo::list_threads(db, ws.id).await? {
-            // The lead must have orchestration context to resume from (a native
-            // id) and be legitimately idle — NOT "running" (an interrupted turn,
-            // already handled by collect_targets) and NOT "stopped" (taken over
-            // in the user's terminal).
-            if repo::lead_native_id(db, th.id).await?.is_none() {
-                continue;
-            }
+            // The lead must be legitimately idle — NOT "running" (an interrupted
+            // turn, already handled by collect_targets) and NOT "stopped" (taken
+            // over in the user's terminal).
             if repo::lead_status(db, th.id).await?.as_deref() != Some("idle") {
                 continue;
             }
-            let dirs = stalled_direction_ids(db, th.id).await?;
+            // `None` session = the lead's own marker (repo::mark_turn_freeze_recovered).
+            let (recovered, grace_elapsed) =
+                freeze_recovery_state(db, th.id, None, now, grace_secs).await?;
+            if !grace_elapsed {
+                continue;
+            }
+            // Shared rule — see `has_resumable_context`. Excluding a recovered
+            // lead stranded MORE than the worker case does: every in-progress
+            // task on the issue stayed stalled until a human stepped in. Past
+            // the window it is re-driven like any other stall; the resume prompt
+            // is already written for a lead that must re-derive state ("check
+            // each one's current state and latest output") and carries the
+            // stalled worker ids explicitly, so a fresh native session can
+            // orient itself through tools rather than from memory.
+            let native = repo::lead_native_id(db, th.id).await?;
+            if !has_resumable_context(native.is_some(), recovered) {
+                continue;
+            }
+            let dirs = stalled_direction_ids(db, th.id, now, grace_secs).await?;
             if !dirs.is_empty() {
                 stalled.push((th.id, dirs));
             }
@@ -325,7 +381,19 @@ async fn collect_stalled_leads(db: &Db) -> anyhow::Result<Vec<(i32, Vec<i32>)>> 
 /// "review" (awaiting the human) are legitimate rest states, not stalls; a
 /// "running" session is an interrupted turn (collect_targets owns it) and
 /// "stopped" is a worker taken over in the user's terminal.
-async fn stalled_direction_ids(db: &Db, thread_id: i32) -> anyhow::Result<Vec<i32>> {
+///
+/// Freeze guard: a worker session the turn-freeze watchdog just auto-recovered
+/// (issue #93) is withheld for [`freeze_recovery_state`]'s grace window, so the
+/// lead isn't told to re-dispatch a worker whose transport was reset seconds
+/// ago. Applied HERE rather than at each call site so the boot revive prompt
+/// ([`try_revive_lead`]) and the runtime sweep ([`collect_stalled_leads`]) share
+/// one definition of "stalled and safe to re-dispatch now".
+async fn stalled_direction_ids(
+    db: &Db,
+    thread_id: i32,
+    now: u64,
+    grace_secs: u64,
+) -> anyhow::Result<Vec<i32>> {
     let mut ids = Vec::new();
     for dir in repo::list_directions(db, thread_id).await? {
         if dir.status != "planning" && dir.status != "working" {
@@ -334,11 +402,107 @@ async fn stalled_direction_ids(db: &Db, thread_id: i32) -> anyhow::Result<Vec<i3
         let Some(sess) = repo::latest_session_for_direction(db, dir.id).await? else {
             continue;
         };
-        if sess.native_session_id.is_some() && sess.status == "idle" {
-            ids.push(dir.id);
+        if sess.status != "idle" {
+            continue;
         }
+        // ONE marker read feeding both decisions below.
+        let (recovered, grace_elapsed) =
+            freeze_recovery_state(db, thread_id, Some(sess.id), now, grace_secs).await?;
+        if !grace_elapsed {
+            continue;
+        }
+        // Shared rule — see `has_resumable_context`. Excluding a recovered
+        // worker here is what made it invisible FOREVER rather than for one
+        // grace window: nothing automated can recreate the id while it is
+        // excluded, so the re-drive could never come back for it.
+        if !has_resumable_context(sess.native_session_id.is_some(), recovered) {
+            continue;
+        }
+        ids.push(dir.id);
     }
     Ok(ids)
+}
+
+/// A (thread, session)'s turn-freeze recovery facts, in ONE read: `(last
+/// recovery, grace elapsed)`. `None` = it never froze, the overwhelmingly
+/// common case. The flag is `true` when it never froze or the last recovery is
+/// at least `grace_secs` old; `false` while it is still inside the window and
+/// must NOT be re-driven.
+///
+/// Both halves are needed together, which is why this returns the timestamp
+/// rather than just the verdict: [`stalled_direction_ids`] uses the flag to
+/// hold off, and the presence of the marker to tell a session whose native id
+/// the recovery CLEARED apart from one that never captured a native id at all.
+///
+/// This is the consumer side of issue #93's `turn_freeze_recovered` marker
+/// (`repo::mark_turn_freeze_recovered` / `repo::last_turn_freeze_recovery_secs`)
+/// — the coordination point that lets this file tell "just came back from a
+/// freeze auto-recovery" apart from an ordinary clean turn-end. Until it
+/// existed, the only thing keeping the sweep from re-dispatching a
+/// just-recovered session straight back into the same wedge was a SIDE EFFECT:
+/// `recover_from_freeze` also clears the native session id, and both selection
+/// predicates require one. That is real protection but accidental — it
+/// evaporates the moment the clear moves, or a redrive path that doesn't key on
+/// the native id is added. This gate makes it the design.
+///
+/// Reuses the redrive cooldown value ([`stall_redrive_cooldown_secs`]) rather
+/// than introducing a second knob, because the two express the SAME rule: at
+/// most one automated intervention per thread per window. A freeze recovery is
+/// the terminal event of one such intervention — it interrupted the turn, reset
+/// the native context, and posted its own Needs-you notice — so it should spend
+/// the same budget a redrive does. Two independent knobs could only be set into
+/// incoherence (grace < cooldown ⇒ a freeze is re-driven sooner than a plain
+/// redrive would be; grace > cooldown ⇒ the cooldown stops describing the real
+/// gap). `0` disables both together, which is the honest "off" for the pair.
+///
+/// Reads only — the marker is written by the engine's recovery path. This file
+/// still persists nothing of its own (stall/redrive state stays in memory).
+///
+/// Depends on TWO contracts on the writer's side, both in `recover_from_freeze`:
+///
+/// 1. Write order — the marker is stamped before any write that exposes a
+///    recoverable idle session. The session row and the marker are read in two
+///    separate awaits here, so were the stamp to move after the `idle` persist,
+///    a sweep interleaving between them would see an idle session with no
+///    marker and re-drive anyway, which is the exact case this window prevents.
+/// 2. The native-id clear is GATED on the stamp having succeeded. The marker is
+///    the sole evidence that distinguishes "never ran" from "ran, and the
+///    recovery cleared its id" ([`has_resumable_context`]), so clearing after a
+///    failed stamp would erase that evidence and strand the session for good.
+///
+/// The clear is NOT a second guard — an earlier revision of this PR paired them
+/// as mutual backups and that is reverted; `revive` no longer treats a missing
+/// native id as "not selectable" at all.
+/// Does this surface (lead or worker session) have orchestration context a
+/// re-drive can resume from? `native_id_present` is the stored id; `recovered`
+/// is its last turn-freeze recovery, if any.
+///
+/// ONE rule, deliberately shared by both axes. A missing native id means two
+/// OPPOSITE things and only the marker separates them: never captured one (the
+/// surface never ran — nothing to resume) versus captured one and had it
+/// deliberately cleared by the freeze auto-recovery (it DID run; losing native
+/// context is the recovery working as designed, and the next dispatch opens the
+/// fresh session it intended).
+///
+/// It lives here as a shared predicate because the review caught the SAME defect
+/// twice — first on worker sessions, then, after that was fixed, on the lead
+/// axis, which had been patched separately and kept the old rule. Two call sites
+/// encoding the same rule independently is how the second one got missed; a
+/// third axis should reuse this rather than re-derive it.
+fn has_resumable_context(native_id_present: bool, recovered: Option<u64>) -> bool {
+    native_id_present || recovered.is_some()
+}
+
+async fn freeze_recovery_state(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    now: u64,
+    grace_secs: u64,
+) -> anyhow::Result<(Option<u64>, bool)> {
+    let last = repo::last_turn_freeze_recovery_secs(db, thread_id, session_id).await?;
+    // Same shape as the redrive gate — including its backward-clock safety.
+    Ok((last, cooldown_elapsed(last, now, grace_secs)))
 }
 
 /// Threads' in-progress directions whose latest worker session is `stopped` —
@@ -406,6 +570,9 @@ fn stopped_worker_notice_text(direction_id: i32) -> String {
 /// `saturating_sub` makes a clock that moved backward (or a `now` a test passes
 /// before `last`) fail safe as "cooldown not yet elapsed" rather than underflow.
 /// Pure → unit-tested.
+///
+/// Also backs [`freeze_recovery_state`], whose window is the same rule keyed on a
+/// different event — see there for why they share one value.
 fn cooldown_elapsed(last: Option<u64>, now: u64, cooldown_secs: u64) -> bool {
     match last {
         None => true,
@@ -561,7 +728,8 @@ async fn try_revive_lead(app: &AppHandle, db: &Db, thread_id: i32) -> anyhow::Re
     // and stay retryable on failure. A normal interrupted lead (no stalled tasks)
     // keeps the exact previous behavior: plain REVIVE_PROMPT, skip-if-busy,
     // stop-on-fail — a pure regression.
-    let stalled_dirs = stalled_direction_ids(db, thread_id).await?;
+    let stalled_dirs =
+        stalled_direction_ids(db, thread_id, now_secs(), stall_redrive_cooldown_secs()).await?;
     if stalled_dirs.is_empty() {
         nudge_eng_if_idle(app, db, &eng, REVIVE_PROMPT).await?;
     } else {
@@ -743,6 +911,33 @@ mod tests {
 
     fn empty() -> HashSet<i64> {
         HashSet::new()
+    }
+
+    /// The shared rule, exhaustively: all four combinations of "has a native
+    /// id" × "has a freeze marker". The two middle rows are the whole point —
+    /// a missing id means opposite things depending on the marker, and getting
+    /// that wrong on ONE axis is the defect this predicate was extracted to
+    /// stop happening a third time.
+    #[test]
+    fn resumable_context_rule_is_exhaustive() {
+        // Ordinary live surface: id present, never froze.
+        assert!(has_resumable_context(true, None));
+        // Froze, then started a fresh session that captured a new id.
+        assert!(has_resumable_context(true, Some(1)));
+        // Froze and the recovery cleared the id — it DID run; resumable.
+        assert!(has_resumable_context(false, Some(1)));
+        // Never captured an id and never froze — never ran; nothing to resume.
+        assert!(!has_resumable_context(false, None));
+    }
+
+    /// The default-configuration selection: real "now", the shipped grace
+    /// window. Every pre-existing stall test goes through this, so they keep
+    /// asserting the plain (never-froze) behavior — no marker row means
+    /// `freeze_recovery_state` is vacuously true and selection is unchanged.
+    async fn collect_stalled(db: &Db) -> Vec<(i32, Vec<i32>)> {
+        collect_stalled_leads(db, now_secs(), STALL_REDRIVE_COOLDOWN_DEFAULT_SECS)
+            .await
+            .unwrap()
     }
 
     /// THE leftover-session shape: a non-done direction whose latest session has a
@@ -930,7 +1125,7 @@ mod tests {
         idle_lead(&db, th).await;
         let dir = stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         // Thread + its stalled worker id, so the resume prompt can address it.
         assert_eq!(stalled, vec![(th, vec![dir])]);
     }
@@ -943,7 +1138,7 @@ mod tests {
         idle_lead(&db, th).await;
         let dir = stalled_direction(&db, th, repo_id, "planning").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert_eq!(stalled, vec![(th, vec![dir])]);
     }
 
@@ -964,7 +1159,7 @@ mod tests {
             want.push(dir);
         }
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         // ONE thread entry despite two stalled directions, carrying BOTH worker ids.
         assert_eq!(stalled.len(), 1);
         assert_eq!(stalled[0].0, th);
@@ -984,7 +1179,7 @@ mod tests {
         repo::set_lead_status(&db, th, "running").await.unwrap();
         stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -998,7 +1193,7 @@ mod tests {
         repo::set_lead_status(&db, th, "stopped").await.unwrap();
         stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -1010,7 +1205,7 @@ mod tests {
         repo::set_lead_status(&db, th, "idle").await.unwrap(); // idle, but no native id
         stalled_direction(&db, th, repo_id, "working").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -1022,7 +1217,7 @@ mod tests {
         idle_lead(&db, th).await;
         stalled_direction(&db, th, repo_id, "done").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -1034,7 +1229,7 @@ mod tests {
         idle_lead(&db, th).await;
         stalled_direction(&db, th, repo_id, "queued").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -1046,7 +1241,7 @@ mod tests {
         idle_lead(&db, th).await;
         stalled_direction(&db, th, repo_id, "review").await;
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -1061,7 +1256,7 @@ mod tests {
         repo::set_direction_status(&db, dir, "working").await.unwrap();
         running_session(&db, dir, repo_id).await; // native id + RUNNING (not drained)
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -1076,7 +1271,7 @@ mod tests {
         let sess = running_session(&db, dir, repo_id).await;
         repo::set_session_status(&db, sess, "stopped").await.unwrap();
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 
@@ -1093,8 +1288,231 @@ mod tests {
             .unwrap();
         repo::set_session_status(&db, s.id, "idle").await.unwrap(); // idle, no native id
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
+    }
+
+    // ---- Turn-freeze grace window (issue #93 marker ↔ issue #116 re-drive) ----
+
+    /// The shipped window, aliased so the boundary arithmetic below reads.
+    const GRACE: u64 = STALL_REDRIVE_COOLDOWN_DEFAULT_SECS;
+
+    /// Stamp the turn-freeze recovery marker and hand back the exact
+    /// unix-seconds it recorded. Reading the stamp back (instead of assuming
+    /// it equals whatever the test read from the clock) is what makes the
+    /// `+GRACE` boundary assertions deterministic: `created_at` is written by
+    /// `repo::now`, which can tick a second past the test's own reading.
+    async fn mark_recovered(db: &Db, thread_id: i32, session_id: Option<i32>) -> u64 {
+        repo::mark_turn_freeze_recovered(db, thread_id, session_id)
+            .await
+            .unwrap();
+        repo::last_turn_freeze_recovery_secs(db, thread_id, session_id)
+            .await
+            .unwrap()
+            .expect("marker recorded")
+    }
+
+    /// The state a REAL worker freeze-recovery leaves behind: marker stamped
+    /// AND `native_session_id` cleared (`recover_from_freeze` does both). The
+    /// plain [`mark_recovered`] fixture keeps the native id, which only happens
+    /// when the session went on to start a fresh native session afterwards — so
+    /// tests that mean "just recovered" must use this one, or they assert a
+    /// shape production never produces (review finding on the first revision of
+    /// these tests).
+    /// The lead-axis twin of [`recovered_worker`]: marker stamped AND the lead's
+    /// native id cleared, exactly what `recover_from_freeze` leaves behind for a
+    /// lead (`clear_native_id` → `set_lead_native_id_opt(.., None)`).
+    async fn recovered_lead(db: &Db, thread_id: i32) -> u64 {
+        let stamped = mark_recovered(db, thread_id, None).await;
+        repo::set_lead_native_id_opt(db, thread_id, None)
+            .await
+            .unwrap();
+        stamped
+    }
+
+    async fn recovered_worker(db: &Db, thread_id: i32, direction_id: i32) -> u64 {
+        let sess = session_of(db, direction_id).await;
+        let stamped = mark_recovered(db, thread_id, Some(sess)).await;
+        repo::set_session_native_id_opt(db, sess, None).await.unwrap();
+        stamped
+    }
+
+    async fn session_of(db: &Db, direction_id: i32) -> i32 {
+        repo::latest_session_for_direction(db, direction_id)
+            .await
+            .unwrap()
+            .expect("direction has a session")
+            .id
+    }
+
+    /// A worker the freeze watchdog JUST auto-recovered is held out of the
+    /// re-drive: re-dispatching it seconds after the self-heal would walk
+    /// straight back into the same wedge. Asserted at both ends of the window
+    /// (the instant of recovery, and one second short of it closing), and only
+    /// after proving the very same shape IS selected without the marker — so
+    /// the test can't pass for the wrong reason.
+    #[tokio::test]
+    async fn excludes_stalled_worker_inside_the_freeze_grace_window() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        assert_eq!(
+            collect_stalled(&db).await,
+            vec![(th, vec![dir])],
+            "precondition: this is the selected stall shape before any freeze"
+        );
+
+        // The REAL post-recovery state: marker stamped AND native id cleared.
+        let stamped = recovered_worker(&db, th, dir).await;
+
+        for now in [stamped, stamped + GRACE.saturating_sub(1)] {
+            let stalled = collect_stalled_leads(&db, now, GRACE).await.unwrap();
+            assert!(
+                stalled.is_empty(),
+                "re-driven {}s into a {GRACE}s grace window",
+                now - stamped
+            );
+        }
+    }
+
+    /// …and the hold-off is a WINDOW, not a permanent exclusion. This is the
+    /// case the first revision of these tests got wrong: it stamped a marker on
+    /// a fixture that still had its native id, a shape the real recovery path
+    /// never produces. With the id actually cleared — as `recover_from_freeze`
+    /// leaves it — the old `native_session_id.is_some()` predicate rejected the
+    /// session before ever consulting the marker, and since nothing automated
+    /// can recreate the id while it is excluded, the worker was invisible
+    /// FOREVER rather than for one window. Past the window it must be an
+    /// ordinary stall again.
+    #[tokio::test]
+    async fn selects_freeze_recovered_worker_with_cleared_native_id_after_the_window() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        let stamped = recovered_worker(&db, th, dir).await;
+        assert_eq!(
+            repo::latest_session_for_direction(&db, dir)
+                .await
+                .unwrap()
+                .expect("session")
+                .native_session_id,
+            None,
+            "precondition: the recovery cleared the native id"
+        );
+
+        let stalled = collect_stalled_leads(&db, stamped + GRACE, GRACE)
+            .await
+            .unwrap();
+        assert_eq!(stalled, vec![(th, vec![dir])]);
+    }
+
+    /// A session that kept its native id (recovered, then started a fresh
+    /// native session, then stalled again inside the window) is held off too —
+    /// the marker gates on the recovery, not on whether an id happens to be
+    /// present.
+    #[tokio::test]
+    async fn selects_recovered_worker_that_kept_its_native_id_after_the_window() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        let stamped = mark_recovered(&db, th, Some(session_of(&db, dir).await)).await;
+
+        assert!(
+            collect_stalled_leads(&db, stamped, GRACE)
+                .await
+                .unwrap()
+                .is_empty(),
+            "held off inside the window"
+        );
+        let stalled = collect_stalled_leads(&db, stamped + GRACE, GRACE)
+            .await
+            .unwrap();
+        assert_eq!(stalled, vec![(th, vec![dir])]);
+    }
+
+    /// The LEAD's own recovery (marker keyed `session_id = NULL`) holds the
+    /// whole thread off, even though its worker never froze — the lead is the
+    /// thing the re-drive would nudge, so its wedge is the one that matters.
+    #[tokio::test]
+    async fn excludes_stalled_lead_inside_its_own_freeze_grace_window() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        stalled_direction(&db, th, repo_id, "working").await;
+
+        // The REAL post-recovery lead state: marker stamped AND native id cleared.
+        let stamped = recovered_lead(&db, th).await;
+
+        let stalled = collect_stalled_leads(&db, stamped, GRACE).await.unwrap();
+        assert!(stalled.is_empty());
+    }
+
+    /// …and likewise recovers normal selection after the window — with the
+    /// lead's native id CLEARED, as `recover_from_freeze` leaves it. Same defect
+    /// the worker path had, one level up and strictly worse: the old
+    /// `lead_native_id.is_none()` check ran before the marker was ever consulted,
+    /// so a freeze-recovered lead could never be auto-redriven and EVERY
+    /// in-progress task on that issue stayed stalled until a human stepped in.
+    #[tokio::test]
+    async fn selects_freeze_recovered_lead_with_cleared_native_id_after_the_window() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        let stamped = recovered_lead(&db, th).await;
+        assert_eq!(
+            repo::lead_native_id(&db, th).await.unwrap(),
+            None,
+            "precondition: the recovery cleared the lead's native id"
+        );
+
+        let stalled = collect_stalled_leads(&db, stamped + GRACE, GRACE)
+            .await
+            .unwrap();
+        assert_eq!(stalled, vec![(th, vec![dir])]);
+    }
+
+    /// The grace is keyed per (thread, session), not per thread: a sibling
+    /// task's freeze must not withhold a task that never froze, or one wedged
+    /// worker would silently freeze the whole thread's recovery.
+    #[tokio::test]
+    async fn freeze_grace_withholds_only_the_recovered_session() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let frozen = stalled_direction(&db, th, repo_id, "working").await;
+        let healthy = mk_direction(&db, th, repo_id, "beta").await;
+        repo::set_direction_status(&db, healthy, "working")
+            .await
+            .unwrap();
+        let healthy_sess = running_session(&db, healthy, repo_id).await;
+        repo::set_session_status(&db, healthy_sess, "idle")
+            .await
+            .unwrap();
+
+        let stamped = mark_recovered(&db, th, Some(session_of(&db, frozen).await)).await;
+
+        let stalled = collect_stalled_leads(&db, stamped, GRACE).await.unwrap();
+        // Thread still selected — carrying ONLY the task that didn't just heal.
+        assert_eq!(stalled, vec![(th, vec![healthy])]);
+    }
+
+    /// `0` is the honest "off" for the shared knob (same as the redrive
+    /// cooldown it borrows its value from): no window, so a just-recovered
+    /// session is immediately eligible again.
+    #[tokio::test]
+    async fn freeze_grace_of_zero_disables_the_hold_off() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        let stamped = mark_recovered(&db, th, Some(session_of(&db, dir).await)).await;
+
+        let stalled = collect_stalled_leads(&db, stamped, 0).await.unwrap();
+        assert_eq!(stalled, vec![(th, vec![dir])]);
     }
 
     /// An in-progress task with no session at all hasn't reached a worker → not
@@ -1107,7 +1525,7 @@ mod tests {
         let dir = mk_direction(&db, th, repo_id, "alpha").await;
         repo::set_direction_status(&db, dir, "working").await.unwrap();
 
-        let stalled = collect_stalled_leads(&db).await.unwrap();
+        let stalled = collect_stalled(&db).await;
         assert!(stalled.is_empty());
     }
 

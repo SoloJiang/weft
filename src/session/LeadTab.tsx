@@ -11,16 +11,24 @@ import { Dialog, DialogContent } from "../components/ui/Dialog";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { RewindDialog, RewindPickerDialog } from "./RewindDialog";
+import { EngineSwitchDialog } from "./EngineSwitchDialog";
 import { useRepoActions } from "./useRepoActions";
 import { api } from "../lib/api";
-import type { EnabledSkill } from "../lib/types";
-import { resumeCommand } from "../lib/resume";
+import type { EnabledSkill, LeadStateInfo } from "../lib/types";
+import { nativeSessionResumeTarget } from "../lib/resume";
+import { toolFullName } from "../components/ToolIcon";
+import { toast } from "../components/Toast";
 
 type PromptState = {
   title: string;
   placeholder?: string;
   value: string;
   resolve: (v: string | null) => void;
+};
+
+type LeadResumeTarget = Pick<LeadStateInfo, "command" | "cwd"> & {
+  readonly nativeId: string;
+  readonly threadId: number;
 };
 
 // Host-owned local slash items, mapped to the composer's LocalSlashSpec below.
@@ -84,6 +92,8 @@ export function LeadTab({
     skillsDirtyAt,
     markSkillsDirty,
     mergeLeadMeta,
+    switchLeadTool,
+    installedTools,
     leadRail,
     setLeadRail,
     viewDirection,
@@ -91,6 +101,7 @@ export function LeadTab({
   const { t } = useTranslation();
   const { run, busy: actionsBusy } = useRepoActions();
   const [promptState, setPromptState] = useState<PromptState | null>(null);
+  const [switchOpen, setSwitchOpen] = useState(false);
   // The right rail is a store toggle (info flips from the top bar — this
   // surface is header-less; tests opens from a test-cases card); the embedded
   // curator panel (compact) never shows either.
@@ -98,6 +109,8 @@ export function LeadTab({
   const [skills, setSkills] = useState<EnabledSkill[]>([]);
   // The lead's working dir — resolves relative file paths it mentions in chat.
   const [leadCwd, setLeadCwd] = useState<string | undefined>(undefined);
+  const [leadResumeTarget, setLeadResumeTarget] = useState<LeadResumeTarget | null>(null);
+  const [leadResumeRefreshNonce, setLeadResumeRefreshNonce] = useState(0);
   // Live test-case count for the plan card, sourced from the test_plan table so
   // it matches what the panel's View opens. Bumped by a user panel edit (which
   // rewrites the table WITHOUT a test_cases card); lead re-emits refetch via the
@@ -168,6 +181,9 @@ export function LeadTab({
     };
   }, [tid, leadTurn[tid ?? -1]?.state, skillsDirtyAt, mergeLeadMeta]);
 
+  const leadTurnState = tid == null ? undefined : leadTurn[tid]?.state;
+  const leadSlashCommands = tid == null ? undefined : leadSlash[tid];
+
   useEffect(() => {
     // Drop the previous thread's cwd immediately — otherwise a relative file
     // ref clicked during the fetch window would resolve against the old lead
@@ -178,13 +194,41 @@ export function LeadTab({
     void api
       .leadState(tid)
       .then((st) => {
-        if (alive) setLeadCwd(st.cwd);
+        if (!alive) return;
+        setLeadCwd(st.cwd);
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
   }, [tid]);
+
+  useEffect(() => {
+    if (tid == null) {
+      setLeadResumeTarget(null);
+      return;
+    }
+    let alive = true;
+    void api
+      .leadState(tid)
+      .then((st) => {
+        if (!alive) return;
+        if (!st.native_id) {
+          setLeadResumeTarget(null);
+          return;
+        }
+        setLeadResumeTarget({
+          threadId: tid,
+          nativeId: st.native_id,
+          cwd: st.cwd,
+          command: st.command,
+        });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [tid, leadTurnState, leadSlashCommands, leadResumeRefreshNonce]);
 
   // The latest test_cases card id only grows (append-only timeline). The lead
   // ALWAYS emits a test_cases card when it (re)writes the test_plan table, so
@@ -223,8 +267,40 @@ export function LeadTab({
   // The lead's own timeline: worker chat rows carry a session_id, skip them.
   const msgs = (leadMessages[tid] ?? []).filter((m) => m.session_id == null);
   const turn = leadTurn[tid] ?? { state: "stopped" as const, queue: [] };
+  const leadThread = threads.find((th) => th.id === tid);
   // The lead engine runs the thread's lead_tool (not always claude).
-  const leadTool = threads.find((th) => th.id === tid)?.lead_tool ?? "claude";
+  const leadTool = leadThread?.lead_tool ?? "claude";
+  const resumeTarget = leadResumeTarget?.threadId === tid ? leadResumeTarget : null;
+  const sessionResumeAction = (() => {
+    if (!resumeTarget) return undefined;
+    const target = nativeSessionResumeTarget(
+      leadTool,
+      resumeTarget.cwd,
+      resumeTarget.nativeId,
+      resumeTarget.command,
+    );
+    switch (target.kind) {
+      case "open-codex":
+        return {
+          kind: "open-codex" as const,
+          onOpen: () => {
+            void api.openUrl(target.url).catch(() => {});
+          },
+        };
+      case "copy-terminal-command":
+        return {
+          kind: "copy-terminal-command" as const,
+          onCopy: async () => {
+            try {
+              await navigator.clipboard.writeText(target.command);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        };
+    }
+  })();
   // Rewind is scoped to claude/codex/opencode leads — the tools with native
   // fork support (same gate as the worker); the lead rewinds conversation-only.
   const canRewind = leadTool === "claude" || leadTool === "codex" || leadTool === "opencode" || leadTool === "omp";
@@ -238,6 +314,15 @@ export function LeadTab({
     // would otherwise stick the lead to the default "en" for this run.
     const r = await api.leadRewind(tid, rewindId, currentLang());
     setPrefill((p) => ({ text: r.rewound_text, seq: p.seq + 1 }));
+    setLeadResumeTarget((current) => {
+      if (current?.threadId !== tid) return current;
+      if (r.native_id == null) return null;
+      return { ...current, nativeId: r.native_id };
+    });
+    // The immediate update above prevents an old native id from being used
+    // while the fresh state fetch is in flight; the fetch also covers a target
+    // that was not yet hydrated when rewind completed.
+    setLeadResumeRefreshNonce((nonce) => nonce + 1);
   };
 
   // 重载会话:先注入新启用的 skill 到 lead cwd(并标记静默 re-spawn,claude 下条消息拾取),
@@ -319,15 +404,7 @@ export function LeadTab({
           onStop={() => void interruptLead(tid)}
           onNeedSlashCommands={() => discoverLeadSlash(tid)}
           onRewindPicker={canRewind ? () => setPickerOpen(true) : undefined}
-          onTakeOver={async () => {
-            const st = await api.leadState(tid);
-            if (!st.native_id) return false;
-            await api.leadStop(tid);
-            await navigator.clipboard.writeText(
-              resumeCommand(leadTool, st.cwd, st.native_id, st.command),
-            );
-            return true;
-          }}
+          sessionResumeAction={sessionResumeAction}
         />
         <Dialog
           open={promptState != null}
@@ -414,6 +491,7 @@ export function LeadTab({
           }}
           onClose={() => setLeadRail("none")}
           onReload={onReload}
+          onSwitchEngine={() => setSwitchOpen(true)}
           busy={isInFlight(turn.state)}
         />
       )}
@@ -429,6 +507,26 @@ export function LeadTab({
           onEdited={() => setTestPlanEditNonce((n) => n + 1)}
         />
       )}
+      <EngineSwitchDialog
+        open={switchOpen}
+        onOpenChange={setSwitchOpen}
+        scope="lead"
+        currentTool={leadTool}
+        currentModel={leadThread?.lead_model ?? null}
+        installedTools={installedTools}
+        onConfirm={async (tool, model) => {
+          const outcome = await switchLeadTool(tid, tool, model);
+          toast(
+            outcome.old_tool === outcome.new_tool
+              ? t("session.switchReloadedToast", { tool: toolFullName(outcome.new_tool) })
+              : t("session.switchedToast", {
+                  from: toolFullName(outcome.old_tool),
+                  to: toolFullName(outcome.new_tool),
+                }),
+          );
+          return outcome;
+        }}
+      />
     </div>
   );
 }
