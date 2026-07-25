@@ -398,6 +398,7 @@ export const zh = {
     engineReloadedMarker: "引擎已重新加载",
     engineModelCleared: "无覆盖",
     engineSwitchedQuotaReason: "自动 · 额度达限",
+    quotaFailoverFailedMarker: "自动 fail-over {{from}} → {{to}} 失败",
   },
   diff: {
     tab: "改动",

@@ -1871,6 +1871,22 @@ fn quota_failover_cooldowns() -> &'static std::sync::Mutex<std::collections::Has
     COOLDOWNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Read-only peek: would [`claim_quota_failover_slot`] currently refuse
+/// `key`? Doesn't mutate — [`decide_quota_failover`] folds this into its
+/// otherwise-pure "should we switch" verdict so the cooldown gate is covered
+/// by that function's own unit tests. `maybe_failover_on_quota` still calls
+/// the MUTATING `claim_quota_failover_slot` right before actually
+/// dispatching a switch (a peek alone can't claim: two decisions racing for
+/// the same key could otherwise both read "not active" and both switch).
+fn quota_failover_cooldown_active(key: QuotaFailoverKey) -> bool {
+    let cooldowns = quota_failover_cooldowns()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cooldowns
+        .get(&key)
+        .is_some_and(|last| last.elapsed().as_secs() < QUOTA_FAILOVER_COOLDOWN_SECS)
+}
+
 /// Claims the fail-over slot for `key` (thread_id, session_id) iff it hasn't
 /// already fired within [`QUOTA_FAILOVER_COOLDOWN_SECS`] — a one-shot gate,
 /// not a queue: a call that returns `false` should just skip this round
@@ -1907,25 +1923,81 @@ pub fn spawn_quota_failover_check(
     });
 }
 
-/// issue #97: auto-switch a thread/session away from `tool` onto its
-/// [`fallback_tool`] when ALL of:
-///   1. the [`K_QUOTA_FAILOVER_ENABLED`] setting is on (opt-in, see its doc);
-///   2. the engine_quota hub's LAST-OBSERVED reading for `tool` says
-///      [`crate::engine_quota::QuotaStatus::Exceeded`] (structured — never a
-///      guess from turn-failure text);
-///   3. Weft actually knows a fallback for `tool`;
-///   4. that fallback isn't ALSO known-exceeded — the loop-breaker: two
-///      simultaneously exhausted engines must never ping-pong;
-///   5. this (thread, session) hasn't already auto-switched within the last
-///      [`QUOTA_FAILOVER_COOLDOWN_SECS`] — the storm-breaker.
+/// The verdict [`decide_quota_failover`] returns: switch to a concrete
+/// fallback, or skip (with a reason — not user-facing, just gives tests and
+/// the debug log a concrete case instead of a bare `false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailoverDecision {
+    SwitchTo(&'static str),
+    Skip(FailoverSkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailoverSkipReason {
+    Disabled,
+    NotExceeded,
+    NoFallback,
+    FallbackAlsoExceeded,
+    CooldownActive,
+}
+
+/// issue #97: EVERY branch of "should we auto-switch away from `tool`, and to
+/// whom" — pulled out of [`maybe_failover_on_quota`] into one pure function
+/// (no DB/AppHandle/global state — every input is a plain value the caller
+/// already resolved) so a regression in this judgment fails a fast unit test
+/// instead of silently no-oping. Review note (issue #97, mirroring the #139
+/// P0 lesson this issue's brief calls out by name): mutation-testing
+/// `maybe_failover_on_quota`'s OLD all-in-one body found that replacing its
+/// entire implementation with a no-op left every existing test green — this
+/// split is the fix. `maybe_failover_on_quota`'s only remaining untested seam
+/// is the final dispatch: a thin, one-line-per-branch match on `session_id`
+/// that reuses #139's already-shipped switch machinery verbatim.
 ///
-/// Reuses [`switch_lead_tool_inner`]/[`switch_worker_tool_inner`] VERBATIM —
-/// the exact six-step teardown/persist/reconstruct sequence #139 shipped and
-/// reviewed, never a hand-rolled partial tool/model update (the #139-review
-/// lesson this issue's brief calls out by name: a claimed switch must
-/// actually reach the backend, not just look like it did in the UI). Every
-/// failure is logged and swallowed — best-effort throughout, since nothing is
-/// waiting on this fire-and-forget check.
+/// Gate order (first match wins):
+///   1. [`K_QUOTA_FAILOVER_ENABLED`] must be on (opt-in — see its doc);
+///   2. `status` must be [`crate::engine_quota::QuotaStatus::Exceeded`]
+///      (structured — never a guess from turn-failure text);
+///   3. [`fallback_tool`] must know a fallback for `tool`;
+///   4. that fallback must NOT also be known-exceeded — the loop-breaker:
+///      two simultaneously exhausted engines must never ping-pong;
+///   5. `cooldown_ok` must be true — the storm-breaker (see
+///      [`quota_failover_cooldown_active`]).
+fn decide_quota_failover(
+    tool: &str,
+    enabled: bool,
+    status: Option<crate::engine_quota::QuotaStatus>,
+    fallback_status: Option<crate::engine_quota::QuotaStatus>,
+    cooldown_ok: bool,
+) -> FailoverDecision {
+    use crate::engine_quota::QuotaStatus;
+    if !enabled {
+        return FailoverDecision::Skip(FailoverSkipReason::Disabled);
+    }
+    if status != Some(QuotaStatus::Exceeded) {
+        return FailoverDecision::Skip(FailoverSkipReason::NotExceeded);
+    }
+    let Some(fallback) = fallback_tool(tool) else {
+        return FailoverDecision::Skip(FailoverSkipReason::NoFallback);
+    };
+    if fallback_status == Some(QuotaStatus::Exceeded) {
+        return FailoverDecision::Skip(FailoverSkipReason::FallbackAlsoExceeded);
+    }
+    if !cooldown_ok {
+        return FailoverDecision::Skip(FailoverSkipReason::CooldownActive);
+    }
+    FailoverDecision::SwitchTo(fallback)
+}
+
+/// issue #97: auto-switch a thread/session away from `tool` onto its
+/// fallback engine when [`decide_quota_failover`] says to. Thin wiring only —
+/// resolve the impure inputs (setting, hub readings, cooldown peek), delegate
+/// the judgment call to the pure function, then dispatch. Reuses
+/// [`switch_lead_tool_inner`]/[`switch_worker_tool_inner`] VERBATIM — the
+/// exact six-step teardown/persist/reconstruct sequence #139 shipped and
+/// reviewed, never a hand-rolled partial tool/model update. Every failure is
+/// logged AND left as a durable, visible marker (issue #97 review P2) —
+/// best-effort throughout, since nothing is waiting on this fire-and-forget
+/// check.
 async fn maybe_failover_on_quota(
     app: &AppHandle,
     db: &Db,
@@ -1941,27 +2013,19 @@ async fn maybe_failover_on_quota(
             .as_deref(),
         Some("1") | Some("true")
     );
-    if !enabled {
-        return;
-    }
-    let Some(snapshot) = crate::engine_quota::current(tool) else {
-        return;
+    let status = crate::engine_quota::current(tool).map(|s| s.status);
+    let fallback_status = fallback_tool(tool).and_then(crate::engine_quota::current).map(|s| s.status);
+    let key: QuotaFailoverKey = (thread_id, session_id);
+    let cooldown_ok = !quota_failover_cooldown_active(key);
+
+    let fallback = match decide_quota_failover(tool, enabled, status, fallback_status, cooldown_ok) {
+        FailoverDecision::Skip(_) => return,
+        FailoverDecision::SwitchTo(fallback) => fallback,
     };
-    if snapshot.status != crate::engine_quota::QuotaStatus::Exceeded {
-        return;
-    }
-    let Some(fallback) = fallback_tool(tool) else {
-        return;
-    };
-    if let Some(fb_snapshot) = crate::engine_quota::current(fallback) {
-        if fb_snapshot.status == crate::engine_quota::QuotaStatus::Exceeded {
-            eprintln!(
-                "[weft][quota] {tool} exceeded but fallback {fallback} is ALSO exceeded — staying put (thread {thread_id}, session {session_id:?})"
-            );
-            return;
-        }
-    }
-    if !claim_quota_failover_slot((thread_id, session_id)) {
+    // Re-check-and-claim for real right before dispatching: closes the tiny
+    // race between the peek above and here (two concurrent calls for the
+    // same key), at the cost of a redundant read in the common case.
+    if !claim_quota_failover_slot(key) {
         return;
     }
     eprintln!(
@@ -1982,12 +2046,50 @@ async fn maybe_failover_on_quota(
     };
     if let Err(err) = result {
         eprintln!("[weft][quota] auto fail-over {tool} -> {fallback} failed: {err}");
+        insert_quota_failover_failed_marker(app, db, thread_id, session_id, tool, fallback, &err)
+            .await;
+    }
+}
+
+/// issue #97 review P2: a failed auto fail-over attempt used to leave only an
+/// `eprintln!` behind — indistinguishable, from the user's seat, from the
+/// feature not existing at all. Durable, visible marker mirroring
+/// `insert_switch_marker`'s "system-owned, always part of the record"
+/// treatment for the SUCCESS case.
+async fn insert_quota_failover_failed_marker(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    tool: &str,
+    fallback: &str,
+    error: &str,
+) {
+    let turn_id = repo::next_turn_id(db, thread_id).await.unwrap_or(1);
+    let content = serde_json::json!({ "tool": tool, "fallback": fallback, "error": error }).to_string();
+    match repo::insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        turn_id,
+        "system",
+        "quota_failover_failed",
+        &content,
+        "complete",
+    )
+    .await
+    {
+        Ok(m) => {
+            let _ = app.emit(engine::EVENT, engine::Push::Message { thread_id, message: m });
+        }
+        Err(e) => eprintln!("[weft] quota-failover-failed marker insert failed: {e}"),
     }
 }
 
 #[cfg(test)]
 mod quota_failover_tests {
     use super::*;
+    use crate::engine_quota::QuotaStatus;
 
     #[test]
     fn fallback_tool_alternates_claude_and_codex_only() {
@@ -2002,7 +2104,12 @@ mod quota_failover_tests {
         // Distinct key per test run (module-global hub) so parallel test
         // threads can't collide on the same cooldown slot.
         let key: QuotaFailoverKey = (900_001, None);
+        assert!(!quota_failover_cooldown_active(key), "nothing claimed yet");
         assert!(claim_quota_failover_slot(key), "first claim should succeed");
+        assert!(
+            quota_failover_cooldown_active(key),
+            "the peek must agree with the claim it just observed"
+        );
         assert!(
             !claim_quota_failover_slot(key),
             "immediate second claim within the cooldown must be refused"
@@ -2010,7 +2117,84 @@ mod quota_failover_tests {
         // A DIFFERENT key (e.g. a worker session on the same thread) is
         // independent — the cooldown is keyed, not global.
         let other: QuotaFailoverKey = (900_001, Some(1));
+        assert!(!quota_failover_cooldown_active(other));
         assert!(claim_quota_failover_slot(other));
+    }
+
+    // ---- decide_quota_failover: the P1 fix — every gate as a plain unit test ----
+
+    #[test]
+    fn decide_switches_to_the_fallback_on_the_happy_path() {
+        assert_eq!(
+            decide_quota_failover("claude", true, Some(QuotaStatus::Exceeded), Some(QuotaStatus::Ok), true),
+            FailoverDecision::SwitchTo("codex")
+        );
+        assert_eq!(
+            decide_quota_failover("codex", true, Some(QuotaStatus::Exceeded), None, true),
+            FailoverDecision::SwitchTo("claude"),
+            "no fallback reading yet (never observed) is NOT the same as exceeded"
+        );
+    }
+
+    #[test]
+    fn decide_skips_when_disabled_even_if_everything_else_would_switch() {
+        assert_eq!(
+            decide_quota_failover("claude", false, Some(QuotaStatus::Exceeded), Some(QuotaStatus::Ok), true),
+            FailoverDecision::Skip(FailoverSkipReason::Disabled)
+        );
+    }
+
+    #[test]
+    fn decide_skips_when_not_exceeded() {
+        for status in [None, Some(QuotaStatus::Ok), Some(QuotaStatus::Warning)] {
+            assert_eq!(
+                decide_quota_failover("claude", true, status, Some(QuotaStatus::Ok), true),
+                FailoverDecision::Skip(FailoverSkipReason::NotExceeded),
+                "status {status:?} must not switch"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_skips_when_the_tool_has_no_known_fallback() {
+        assert_eq!(
+            decide_quota_failover("opencode", true, Some(QuotaStatus::Exceeded), None, true),
+            FailoverDecision::Skip(FailoverSkipReason::NoFallback)
+        );
+    }
+
+    #[test]
+    fn decide_skips_when_the_fallback_is_also_exceeded() {
+        assert_eq!(
+            decide_quota_failover(
+                "claude",
+                true,
+                Some(QuotaStatus::Exceeded),
+                Some(QuotaStatus::Exceeded),
+                true
+            ),
+            FailoverDecision::Skip(FailoverSkipReason::FallbackAlsoExceeded),
+            "two simultaneously exhausted engines must never ping-pong"
+        );
+    }
+
+    #[test]
+    fn decide_skips_when_the_cooldown_is_active() {
+        assert_eq!(
+            decide_quota_failover("claude", true, Some(QuotaStatus::Exceeded), Some(QuotaStatus::Ok), false),
+            FailoverDecision::Skip(FailoverSkipReason::CooldownActive)
+        );
+    }
+
+    #[test]
+    fn decide_gate_order_disabled_wins_over_every_other_reason() {
+        // Every OTHER gate would also fail here (no fallback for "opencode",
+        // fallback_status irrelevant) — Disabled must still be the reported
+        // reason, proving the check-order the doc comment promises.
+        assert_eq!(
+            decide_quota_failover("opencode", false, Some(QuotaStatus::Exceeded), None, false),
+            FailoverDecision::Skip(FailoverSkipReason::Disabled)
+        );
     }
 }
 

@@ -99,6 +99,9 @@ const NESTABLE_KIND: Record<LeadMessage["kind"], boolean> = {
   // Same system-owned, always-top-level marker treatment as `rewind` (issue
   // #96/#98) — see EngineSwitchMarker in ChatTimeline.tsx.
   engine_switch: false,
+  // Same treatment — a failed auto fail-over attempt (issue #97) is also a
+  // system-owned marker, never a per-agent row.
+  quota_failover_failed: false,
 };
 
 function parseContentObject(row: LeadMessage): Record<string, unknown> {

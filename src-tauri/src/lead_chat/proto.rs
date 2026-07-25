@@ -184,6 +184,21 @@ pub fn extract_native(tool: &str, line: &str) -> Option<String> {
 /// string claude's CLI hasn't sent us before (defensive against protocol
 /// drift) — the caller still falls back to a plain percent reading via
 /// `more_severe`, so an unrecognized status never SILENTLY loses a real signal.
+///
+/// Review note: the binary's strings also contain `errorCode:
+/// E.enum(["credits_required"])`, which could look like a 4th `status` value
+/// at a glance. It is NOT — it's a SEPARATE, unrelated field: (a) its own
+/// schema doc reads "Rate limit information for claude.ai subscription
+/// users" next to a `CLAUDE_IN_SLACK_V2` reference, i.e. a different
+/// (Slack-bot) integration's schema entirely, not the CLI's `rate_limit_event`
+/// one; and (b) the CLI's OWN `rate_limit_info.status` schema (`Ezf` in the
+/// bundle) is `E.enum(["allowed","allowed_warning","rejected"])` — exactly
+/// the three arms below, no fourth. Separately, `errorCode:"credits_required"`
+/// DOES appear parsed off a REACTIVE HTTP 429 response's `error.details`
+/// elsewhere in the bundle (a different code path than this proactive
+/// stream event this function reads) — out of scope here; if a real
+/// `rate_limit_event` sample ever surfaces a `credits_required`-shaped
+/// `status`, add it as a fourth `Exceeded` arm then.
 fn claude_rate_limit_status(raw: &str) -> Option<crate::engine_quota::QuotaStatus> {
     use crate::engine_quota::QuotaStatus;
     match raw {

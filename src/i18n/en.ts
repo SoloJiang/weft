@@ -412,6 +412,7 @@ export const en = {
     engineReloadedMarker: "Engine reloaded",
     engineModelCleared: "no override",
     engineSwitchedQuotaReason: "auto — quota exceeded",
+    quotaFailoverFailedMarker: "Auto fail-over {{from}} → {{to}} failed",
   },
   diff: {
     tab: "Diff",

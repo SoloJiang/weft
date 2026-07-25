@@ -633,6 +633,14 @@ function TimelineRow({
     return <EngineSwitchMarker content={c} />;
   }
 
+  // A FAILED auto fail-over attempt (issue #97 review P2): without this, a
+  // transient error during the switch would leave the user's engine sitting
+  // exhausted with no visible sign Weft even tried — same "system-owned,
+  // always part of the record" treatment as a successful switch marker.
+  if (m.kind === "quota_failover_failed") {
+    return <QuotaFailoverFailedMarker content={c} />;
+  }
+
   if (m.kind === "tool") {
     const content = parse(m.content);
     const name = typeof content.name === "string" ? content.name : "tool";
@@ -1013,6 +1021,32 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
             {t("session.engineSwitchedQuotaReason")}
           </span>
         )}
+      </span>
+      <span className="h-px flex-1 bg-border" />
+    </div>
+  );
+}
+
+/** issue #97 review P2: a failed auto fail-over attempt — same quiet centered
+ *  divider as `EngineSwitchMarker`, but a danger tone (nothing actually
+ *  changed) and no before/after tool pair to show. */
+function QuotaFailoverFailedMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const tool = typeof content.tool === "string" ? content.tool : "";
+  const fallback = typeof content.fallback === "string" ? content.fallback : "";
+  return (
+    <div className="flex items-center gap-3 px-2 py-1.5">
+      <span className="h-px flex-1 bg-border" />
+      <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-danger">
+        <ToolIcon tool={tool} size={12} />
+        <ArrowRight size={10} />
+        <ToolIcon tool={fallback} size={12} />
+        <span>
+          {t("session.quotaFailoverFailedMarker", {
+            from: toolFullName(tool),
+            to: toolFullName(fallback),
+          })}
+        </span>
       </span>
       <span className="h-px flex-1 bg-border" />
     </div>

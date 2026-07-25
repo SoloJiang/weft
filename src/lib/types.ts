@@ -304,8 +304,14 @@ export interface LeadMessage {
      *  timeline; content is {"from_message_id": number, "deleted": number}. */
     | "rewind"
     /** Marker row for an engine/model switch (issue #96/#98); content is
-     *  {"old_tool","new_tool","old_model","new_model"} (models nullable). */
-    | "engine_switch";
+     *  {"old_tool","new_tool","old_model","new_model","reason"} (models and
+     *  reason nullable — reason is "quota_exceeded" for issue #97's auto
+     *  fail-over, absent for a human-initiated switch). */
+    | "engine_switch"
+    /** Marker row for a FAILED auto fail-over attempt (issue #97); content is
+     *  {"tool","fallback","error"} — the attempted switch never completed, so
+     *  `tool` is unchanged (unlike "engine_switch", there is no old/new pair). */
+    | "quota_failover_failed";
   /** kind-shaped JSON string, e.g. {"text": "..."} for kind=text */
   content: string;
   status: "streaming" | "complete" | "interrupted" | "error" | "queued";
