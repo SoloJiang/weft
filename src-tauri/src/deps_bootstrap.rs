@@ -249,6 +249,32 @@ pub(crate) fn node_modules_ready(dir: &Path) -> bool {
     }
 }
 
+
+/// True when the worktree's Yarn config can load repository-controlled code
+/// (`yarnPath` / `yarn-path` / Berry plugins). Automatic bootstrap must not
+/// invoke Yarn in that case — the worker can still install itself later.
+fn yarn_config_executes_repo_code(dir: &Path) -> bool {
+    for name in [".yarnrc.yml", ".yarnrc.yaml", ".yarnrc"] {
+        let Ok(raw) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        let lower = raw.to_ascii_lowercase();
+        if lower.contains("yarnpath")
+            || lower.contains("yarn-path")
+            || lower.contains("plugins:")
+            || lower.contains("pluginpath")
+        {
+            return true;
+        }
+    }
+    // Checked-in Yarn binary / plugin payloads under .yarn/ are also a signal
+    // that the project expects to load local Yarn code.
+    if dir.join(".yarn/releases").is_dir() || dir.join(".yarn/plugins").is_dir() {
+        return true;
+    }
+    false
+}
+
 /// Build the install plan from process env, or None when bootstrap should be skipped.
 #[allow(dead_code)]
 pub(crate) fn plan_install(dir: &Path) -> Option<InstallPlan> {
@@ -303,22 +329,45 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
             }
             ("pnpm".to_string(), args)
         }
-        PackageManager::YarnClassic => (
-            "yarn".to_string(),
-            vec![
+        PackageManager::YarnClassic => {
+            // Skip when the project can load repo-controlled Yarn code.
+            if yarn_config_executes_repo_code(dir) {
+                return None;
+            }
+            let mut args = vec![
                 "install".to_string(),
                 "--prefer-offline".to_string(),
                 "--ignore-scripts".to_string(),
-            ],
-        ),
+            ];
+            // Keep classic installs immutable when a lockfile exists.
+            if dir.join("yarn.lock").is_file() {
+                args.push("--frozen-lockfile".to_string());
+            }
+            ("yarn".to_string(), args)
+        }
         // Berry rejects Classic-only flags like --prefer-offline.
-        PackageManager::YarnBerry => (
-            "yarn".to_string(),
-            vec![
-                "install".to_string(),
-                "--mode=skip-build".to_string(), // skip build scripts (Berry)
-            ],
-        ),
+        PackageManager::YarnBerry => {
+            // yarnPath / plugins in .yarnrc.yml execute repo JS before install.
+            // Do not auto-bootstrap those trees.
+            if yarn_config_executes_repo_code(dir) {
+                return None;
+            }
+            // Without a lockfile, Berry would create/update yarn.lock — skip.
+            if !dir.join("yarn.lock").is_file() {
+                return None;
+            }
+            // Ignore project yarnPath via env (defense in depth if config scan misses).
+            env.push(("YARN_IGNORE_PATH".to_string(), "1".to_string()));
+            env.push(("YARN_ENABLE_IMMUTABLE_INSTALLS".to_string(), "true".to_string()));
+            (
+                "yarn".to_string(),
+                vec![
+                    "install".to_string(),
+                    "--immutable".to_string(),
+                    "--mode=skip-build".to_string(), // skip build scripts (Berry)
+                ],
+            )
+        }
         PackageManager::Npm => {
             if dir.join("package-lock.json").is_file() || dir.join("npm-shrinkwrap.json").is_file() {
                 (
@@ -717,14 +766,33 @@ mod tests {
     }
 
     #[test]
-    fn plan_install_yarn_berry_skips_classic_flags() {
+    fn plan_install_yarn_berry_is_immutable_and_skips_classic_flags() {
         let d = tmp();
         write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
-        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        write(&d, "yarn.lock", "__metadata:
+  version: 8
+");
         let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
         assert_eq!(plan.program, "yarn");
         assert!(!plan.args.iter().any(|a| a == "--prefer-offline"));
+        assert!(plan.args.iter().any(|a| a == "--immutable"));
         assert!(plan.args.iter().any(|a| a == "--mode=skip-build"));
+        assert!(plan
+            .env
+            .iter()
+            .any(|(k, v)| k == "YARN_IGNORE_PATH" && v == "1"));
+    }
+
+    #[test]
+    fn plan_install_yarn_berry_skips_when_yarnpath_configured() {
+        let d = tmp();
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
+        write(&d, "yarn.lock", "__metadata:
+  version: 8
+");
+        write(&d, ".yarnrc.yml", "yarnPath: .yarn/releases/yarn-4.1.0.cjs
+");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
     }
 
     #[test]
