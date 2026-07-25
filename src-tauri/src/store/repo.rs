@@ -1637,6 +1637,74 @@ pub async fn set_session_native_id_opt(
     Ok(())
 }
 
+/// Stamp a (thread, session) as having just gone through the turn-freeze
+/// auto-recovery (issue #93): an invisible timeline marker row (`kind`
+/// excluded from the frontend's text/tool timeline allowlist, same as
+/// `"meta"`). `session_id = None` for the lead. Uses the SAME
+/// deletion-fenced insert as the rest of the timeline (`insert_lead_message`),
+/// so a thread deleted mid-recovery can't leave an orphaned row.
+///
+/// Honesty note (review round 4, P2): this row was originally meant to
+/// double as an issue #116 coordination point — its `created_at`, read back
+/// via [`last_turn_freeze_recovery_secs`], was meant to let #116's idle
+/// re-drive hold off re-dispatching into the same wedge for a grace window.
+/// #116 landed WITHOUT wiring that consult up: `revive.rs`'s
+/// `stalled_direction_ids` never reads this marker, and a repo-wide grep
+/// confirms [`last_turn_freeze_recovery_secs`] has no caller outside this
+/// file's own round-trip test. The marker is stamped and readable but
+/// currently has NO consumer. What actually keeps #116 from immediately
+/// re-driving a just-recovered direction into the same wedge is an unrelated
+/// side effect: `recover_from_freeze` also clears the session's
+/// `native_session_id` (see `set_session_native_id_opt` /
+/// `set_lead_native_id_opt`), and `stalled_direction_ids` only selects a
+/// direction whose `native_session_id.is_some()` — so the just-recovered
+/// direction is (accidentally) invisible to #116 until its next native
+/// session is established. That protection is fragile: it depends entirely
+/// on THAT field staying cleared at THAT moment, and would silently vanish if
+/// either side changes — a future refactor that stops clearing
+/// `native_session_id` here, or a redrive path that stops gating on it, would
+/// reopen a redrive storm with nothing left to prevent it. Wiring this marker
+/// into a real grace window (or removing it if that's judged unnecessary) is
+/// open follow-up work, not done here.
+pub async fn mark_turn_freeze_recovered(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<()> {
+    insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        0,
+        "system",
+        "turn_freeze_recovered",
+        "{}",
+        "complete",
+    )
+    .await?;
+    Ok(())
+}
+
+/// The most recent turn-freeze auto-recovery for a (thread, session), as
+/// unix-seconds (same clock as `now()`/`created_at`) — the read side of
+/// [`mark_turn_freeze_recovered`]. `None` if it never happened (the common
+/// case) or the stamp fails to parse (defensive — never panics on a bad row).
+pub async fn last_turn_freeze_recovery_secs(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<Option<u64>> {
+    let q = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("turn_freeze_recovered"))
+        .order_by_desc(lead_message::Column::Id);
+    let q = match session_id {
+        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
+        None => q.filter(lead_message::Column::SessionId.is_null()),
+    };
+    Ok(q.one(&db.0).await?.and_then(|m| m.created_at.parse().ok()))
+}
+
 /// Set a worker session's activity status directly. Unlike
 /// `set_session_native_id` (which forces `running` as a side effect of
 /// capturing the id), this writes whatever caller-chosen value — e.g.
