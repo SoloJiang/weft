@@ -1919,6 +1919,16 @@ pub const MARKER_KIND_RECOVERED: &str = "turn_freeze_recovered";
 /// reason that one is: the frontend renders an allowlist of kinds.
 pub const MARKER_KIND_PENDING: &str = "turn_freeze_pending";
 
+/// Stable code [`promote_turn_freeze_marker`] fails with when the pending row
+/// it was told to promote is gone — a concurrent `rewind` deleting timeline
+/// rows is the realistic way. Rejected as a CODE rather than a sentence for
+/// the same reason every other switch outcome is: it reaches
+/// `EngineSwitchDialog` through `persist_switch`, and
+/// `src/session/engineSwitch.ts` maps it to translated copy. Lives here
+/// rather than in `lead_chat::commands` only because this is the layer that
+/// raises it; the frontend map is the other half of the contract.
+pub const SWITCH_MARKER_LOST_CODE: &str = "switch_marker_lost";
+
 /// Claim the grace window WITHOUT claiming that a reset happened — the switch
 /// path's step 0. Returns the row id, which
 /// [`promote_turn_freeze_marker`] needs to promote it and
@@ -1943,8 +1953,17 @@ pub async fn mark_turn_freeze_pending(
     Ok(row.id)
 }
 
-/// Turn a pending marker into a real one, and restamp its clock so the grace
-/// window runs from THIS moment rather than from whenever it was claimed.
+/// Turn a pending marker into a real one: DELETE the pending row and insert a
+/// fresh recovered one, so the grace window runs from THIS moment rather than
+/// from whenever it was claimed. Still exactly one marker per switch.
+///
+/// Delete-and-insert rather than an in-place kind/timestamp update (review
+/// round 8): every reader picks the newest marker by `id DESC`, so an updated
+/// row would carry the newest TIMESTAMP while keeping its old, possibly
+/// lower ID — and any recovered marker inserted in between (a real freeze
+/// recovery, a concurrent switch) would then win the ordering and hide the
+/// switch that just committed, handing it an already-elapsed window. A fresh
+/// row is newest on both axes, so no reader has to be taught a new order.
 ///
 /// Generic over the connection so it can run inside the switch's own
 /// transaction: the promotion and the writes it vouches for (tool/model and
@@ -1959,17 +1978,46 @@ pub async fn promote_turn_freeze_marker<C: sea_orm::ConnectionTrait>(
     conn: &C,
     marker_id: i32,
 ) -> Result<()> {
-    let res = lead_message::Entity::update_many()
-        .col_expr(lead_message::Column::Kind, Expr::value(MARKER_KIND_RECOVERED))
-        .col_expr(lead_message::Column::CreatedAt, Expr::value(now()))
-        .filter(lead_message::Column::Id.eq(marker_id))
+    let pending = lead_message::Entity::find_by_id(marker_id)
         .filter(lead_message::Column::Kind.eq(MARKER_KIND_PENDING))
-        .exec(conn)
-        .await?;
-    if res.rows_affected != 1 {
-        anyhow::bail!("pending grace marker {marker_id} was not there to promote");
-    }
+        .one(conn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!(SWITCH_MARKER_LOST_CODE))?;
+    let (thread_id, session_id) = (pending.thread_id, pending.session_id);
+    lead_message::Entity::delete_by_id(marker_id).exec(conn).await?;
+    insert_marker_row(conn, thread_id, session_id, MARKER_KIND_RECOVERED).await?;
     Ok(())
+}
+
+/// One grace-marker row, deletion-fenced like every other timeline insert.
+/// Generic over the connection so [`promote_turn_freeze_marker`] can use it
+/// inside the switch's transaction.
+async fn insert_marker_row<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    thread_id: i32,
+    session_id: Option<i32>,
+    kind: &str,
+) -> Result<i32> {
+    let res = conn
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO lead_message \
+             (thread_id, session_id, turn_id, role, kind, content, status, created_at) \
+             SELECT ?, ?, 0, 'system', ?, '{}', 'complete', ? \
+             WHERE EXISTS (SELECT 1 FROM thread WHERE id = ?)",
+            [
+                thread_id.into(),
+                session_id.into(),
+                kind.into(),
+                now().into(),
+                thread_id.into(),
+            ],
+        ))
+        .await?;
+    if res.rows_affected() == 0 {
+        anyhow::bail!("thread {thread_id} no longer exists (deleted)");
+    }
+    i32::try_from(res.last_insert_id()).map_err(|_| anyhow::anyhow!("marker id out of i32 range"))
 }
 
 /// The newest grace marker of EITHER kind, as unix-seconds — the cooldown
@@ -1977,18 +2025,30 @@ pub async fn promote_turn_freeze_marker<C: sea_orm::ConnectionTrait>(
 /// exactly what it is for) but never in
 /// [`last_turn_freeze_recovery_secs`].
 ///
-/// Two indexed point lookups rather than one `kind IN (…)` scan: M0019's
-/// `(thread_id, kind, session_id, id)` index makes each an
-/// `ORDER BY id DESC LIMIT 1` read straight off the index, and the stall sweep
-/// repeats this on every pass.
+/// ONE statement, deliberately (review round 8). Two point lookups read the
+/// two kinds at two different instants, and `promote_turn_freeze_marker` moves
+/// a row between them atomically — so a sweep interleaving there could see
+/// neither, read the window as elapsed, and re-drive a surface whose switch
+/// was mid-commit. A single query sees one snapshot and always finds exactly
+/// one of the pair. `kind IN (…)` still rides M0019's
+/// `(thread_id, kind, session_id, id)` index as two seeks.
 pub async fn last_turn_freeze_guard_secs(
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Result<Option<u64>> {
-    let recovered = last_marker_secs(db, thread_id, session_id, MARKER_KIND_RECOVERED).await?;
-    let pending = last_marker_secs(db, thread_id, session_id, MARKER_KIND_PENDING).await?;
-    Ok(recovered.max(pending))
+    let q = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(
+            lead_message::Column::Kind
+                .is_in([MARKER_KIND_RECOVERED, MARKER_KIND_PENDING]),
+        )
+        .order_by_desc(lead_message::Column::Id);
+    let q = match session_id {
+        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
+        None => q.filter(lead_message::Column::SessionId.is_null()),
+    };
+    Ok(q.one(&db.0).await?.and_then(|m| m.created_at.parse().ok()))
 }
 
 pub async fn mark_turn_freeze_recovered(
@@ -5356,6 +5416,75 @@ mod tests {
         // see the function doc — as long as the direction is real.
         let mw3 = mark_turn_freeze_pending(&db, t.id, Some(s.id)).await.unwrap();
         assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None, mw3).await.is_ok());
+    }
+
+    /// PR #140 round 8: the cooldown reader sees BOTH marker kinds in one
+    /// snapshot, and a promotion never leaves it seeing neither.
+    ///
+    /// The window this guards is small but real: promotion moves a row from
+    /// pending to recovered atomically, so a reader that queried the two kinds
+    /// separately could land either side of that commit and find nothing —
+    /// reading the grace period as elapsed and letting the sweep re-drive a
+    /// surface mid-switch. Single-statement, so there is no "between".
+    ///
+    /// COVERAGE LIMIT, stated rather than implied: this pins the contract
+    /// ("whichever kind the row currently has, one query finds it"), NOT the
+    /// race. A mutation that restores the two-statement reader leaves this
+    /// green, because the defect is purely temporal — both versions agree on
+    /// every static state. Observing it would need either a deterministic
+    /// interleaving hook this crate does not have, or a hammer loop whose
+    /// flakiness would cost more than it proves. The single statement is the
+    /// argument; this test only stops the contract regressing around it.
+    #[tokio::test]
+    async fn the_guard_reader_finds_a_marker_of_either_kind() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+
+        assert_eq!(last_turn_freeze_guard_secs(&db, t.id, None).await.unwrap(), None);
+
+        let pending = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
+        assert!(
+            last_turn_freeze_guard_secs(&db, t.id, None).await.unwrap().is_some(),
+            "a pending claim holds the cooldown"
+        );
+        assert_eq!(
+            last_turn_freeze_recovery_secs(&db, t.id, None).await.unwrap(),
+            None,
+            "but is not evidence"
+        );
+
+        promote_turn_freeze_marker(&db.0, pending).await.unwrap();
+        assert!(
+            last_turn_freeze_guard_secs(&db, t.id, None).await.unwrap().is_some(),
+            "and after promotion the cooldown is still found — never a gap where neither \
+             kind is visible"
+        );
+        assert!(last_turn_freeze_recovery_secs(&db, t.id, None).await.unwrap().is_some());
+    }
+
+    /// Promoting a marker that is gone — a concurrent `rewind` deleting
+    /// timeline rows is the realistic way — fails with the stable code the UI
+    /// translates, not with an English sentence that would reach the dialog raw.
+    #[tokio::test]
+    async fn promoting_a_vanished_marker_fails_with_the_stable_code() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let pending = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
+        delete_turn_freeze_marker(&db, pending).await.unwrap();
+
+        let err = promote_turn_freeze_marker(&db.0, pending).await.unwrap_err();
+
+        assert_eq!(err.to_string(), SWITCH_MARKER_LOST_CODE);
+        // And a marker that is merely already promoted is refused too, rather
+        // than silently re-promoted into a second row.
+        let again = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
+        promote_turn_freeze_marker(&db.0, again).await.unwrap();
+        assert_eq!(
+            promote_turn_freeze_marker(&db.0, again).await.unwrap_err().to_string(),
+            SWITCH_MARKER_LOST_CODE
+        );
     }
 
     /// PR #140 round 6: the lead's tool/model write and its native-id clear are

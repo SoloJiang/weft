@@ -37,6 +37,7 @@ export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
 export const SWITCH_ERROR_I18N: Record<string, string> = {
   switch_marker_stamp_failed: "session.switchMarkerFailed",
   switch_cleanup_failed: "session.switchCleanupFailed",
+  switch_marker_lost: "session.switchMarkerLost",
 };
 
 /** The ONE discriminated value the dialog maps from — a code, or null when the

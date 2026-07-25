@@ -2774,6 +2774,35 @@ mod switch_gate_tests {
         );
     }
 
+    /// Review round 8 — a marker inserted BETWEEN the claim and the commit
+    /// must not out-rank the switch that just committed.
+    ///
+    /// Readers take the newest marker by `id DESC`. Promotion used to update
+    /// the pending row in place, which made it newest by clock while keeping
+    /// its older id — so a freeze recovery (or a concurrent switch) landing in
+    /// the gap would win the ordering and hand the fresh switch a window that
+    /// had already elapsed. Promotion inserts a fresh row instead.
+    #[tokio::test]
+    async fn a_marker_landing_mid_switch_cannot_outrank_the_committed_one() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
+
+        let stamped = stamp_switch_marker(&db, target).await.unwrap();
+        // A real freeze recovery stamps its own marker while the switch is
+        // still tearing down — higher id than the pending claim.
+        let interloper = repo::mark_turn_freeze_recovered(&db, th, Some(sess)).await.unwrap();
+
+        persist_switch(&db, stamped, "codex", None).await.unwrap();
+
+        let newest = *marker_ids(&db, th).await.last().expect("a marker survives");
+        assert!(
+            newest > interloper,
+            "the committed switch's marker must be the newest row, or the window the \
+             reader finds belongs to the interloper and is already partly spent"
+        );
+    }
+
     /// Review round 7 — a switch that dies between claiming the window and
     /// committing must not look resumable afterwards.
     ///
@@ -2825,7 +2854,11 @@ mod switch_gate_tests {
     /// renaming one here without updating the map goes red on this side too.
     #[test]
     fn the_switch_error_codes_are_distinct_and_stable() {
-        let codes = [SWITCH_MARKER_ERROR_CODE, SWITCH_CLEANUP_ERROR_CODE];
+        let codes = [
+            SWITCH_MARKER_ERROR_CODE,
+            SWITCH_CLEANUP_ERROR_CODE,
+            repo::SWITCH_MARKER_LOST_CODE,
+        ];
         for (i, a) in codes.iter().enumerate() {
             for (j, b) in codes.iter().enumerate() {
                 assert!(i == j || !b.contains(a), "{a} is a substring of {b}");
@@ -2833,7 +2866,7 @@ mod switch_gate_tests {
         }
         assert_eq!(
             codes,
-            ["switch_marker_stamp_failed", "switch_cleanup_failed"],
+            ["switch_marker_stamp_failed", "switch_cleanup_failed", "switch_marker_lost"],
             "spellings are mirrored in src/session/engineSwitch.ts — update both"
         );
     }
@@ -2947,10 +2980,12 @@ mod switch_gate_tests {
 
         persist_switch(&db, stamped, "codex", None).await.unwrap();
 
-        assert_eq!(
-            marker_ids(&db, th).await,
-            pending,
-            "promotion edits that row rather than adding a second — one switch, one marker"
+        let after = marker_ids(&db, th).await;
+        assert_eq!(after.len(), 1, "still one marker for one switch");
+        assert!(
+            after[0] > pending[0],
+            "but a FRESH row, so it is newest by id as well as by clock — an in-place \
+             update would be newest by clock only, and every reader picks by id DESC"
         );
         assert!(
             repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
