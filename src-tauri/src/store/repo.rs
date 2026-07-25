@@ -1646,7 +1646,7 @@ pub async fn set_session_native_id_opt(
 ///
 /// This row IS the issue #116 coordination point: its `created_at`, read back
 /// via [`last_turn_freeze_recovery_secs`], is what
-/// `lead_chat::revive::freeze_grace_elapsed` consults to withhold a
+/// `lead_chat::revive::freeze_recovery_state` consults to withhold a
 /// just-self-healed lead/worker from the idle re-drive for one grace window,
 /// rather than racing this recovery straight back into the same wedge.
 ///
