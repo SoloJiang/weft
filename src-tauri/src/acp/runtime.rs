@@ -171,15 +171,8 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
         .ok_or_else(|| anyhow::anyhow!("no ACP backend registered for {backend_id}"))?;
     let id = backend.id();
     let key = pool_key(id, program);
-    let existing = {
-        let g = POOL.clients.lock().await;
-        g.get(&key).cloned()
-    };
-    if let Some(c) = existing {
-        c.ensure_connected(backend, program).await?;
-        return Ok(c);
-    }
-    // Serialize first create so two first turns cannot spawn two children.
+    // Hold CREATE_LOCK across lookup+ensure so maybe_reap_if_idle cannot remove
+    // a handle another caller just acquired (unsubscribe/reap race).
     let _create = CREATE_LOCK.lock().await;
     let existing = {
         let g = POOL.clients.lock().await;
@@ -756,6 +749,9 @@ impl ClientHandle {
     /// Drop this program-keyed pool entry when no routes remain so command-pin
     /// changes do not accumulate orphan ACP children for the app lifetime.
     async fn maybe_reap_if_idle(&self) {
+        // Same lock as client() acquisition — empty-check + pool remove are
+        // atomic w.r.t. a concurrent get-or-create for this key.
+        let _create = CREATE_LOCK.lock().await;
         let prog = self.program.lock().await.clone();
         let Some(program) = prog else {
             return;
@@ -781,6 +777,8 @@ impl ClientHandle {
                 _ => None,
             }
         };
+        // Drop CREATE_LOCK before await reap (shutdown takes other locks).
+        drop(_create);
         if let Some(c) = removed {
             c.shutdown_and_reap().await;
         }

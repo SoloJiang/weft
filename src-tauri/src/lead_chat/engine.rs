@@ -3021,6 +3021,28 @@ pub(crate) fn is_acp_tool(tool: &str) -> bool {
 /// Drive a turn over the generic ACP runtime (omp today). Mirrors the
 /// connection-shaped codex app-server path: ensure session, subscribe a
 /// long-lived consumer once, then `session/prompt`.
+
+/// Clear a never-prompted first ACP native id (engine + DB) so the next send
+/// re-opens and still prepends the system prompt.
+async fn clear_acp_native_never_prompted(
+    _app: &AppHandle,
+    db: &Db,
+    eng: &EngineRef,
+    session_id: Option<i32>,
+    thread_id: i32,
+) {
+    {
+        let mut g = eng.lock().await;
+        g.native_id = None;
+        g.acp_client = None;
+    }
+    if let Some(sid) = session_id {
+        let _ = repo::set_session_native_id_opt(db, sid, None).await;
+    } else {
+        let _ = repo::set_lead_native_id_opt(db, thread_id, None).await;
+    }
+}
+
 async fn spawn_acp_turn(
     app: AppHandle,
     db: Db,
@@ -3109,7 +3131,13 @@ async fn spawn_acp_turn(
             }
         }
         None => {
-            let open = client.new_session(&cwd, mcp).await?;
+            let open = match client.new_session(&cwd, mcp).await {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("[weft][acp] session/new failed: {e}");
+                    return Err(anyhow::anyhow!("acp_session_open_failed"));
+                }
+            };
             (open.session_id, open.model, open.thinking)
         }
     };
@@ -3197,6 +3225,11 @@ async fn spawn_acp_turn(
         // next send reuses a stale-epoch consumer that drops every update.
         let _ = client.cancel(&session_id).await;
         client.unsubscribe(&session_id).await;
+        // First open never got session/prompt — drop native id so the next
+        // send re-opens and still prepends the system prompt.
+        if prior_native.is_none() {
+            clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
+        }
         return Err(anyhow::anyhow!("engine stopped during ACP connect"));
     }
 
@@ -3226,12 +3259,18 @@ async fn spawn_acp_turn(
             || g.interrupting
             || expected_epoch.is_some_and(|e| e != g.reset_epoch)
         {
+            drop(g);
             let _ = client.cancel(&session_id).await;
+            client.unsubscribe(&session_id).await;
+            if prior_native.is_none() {
+                clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
+            }
             return Err(anyhow::anyhow!("engine stopped before ACP prompt"));
         }
         g.reset_epoch
     };
-    let (a, d, e, c, s, txt, imgs) = (
+    let first_open = prior_native.is_none();
+    let (a, d, e, c, s, txt, imgs, first_open, sid_opt, tid) = (
         app.clone(),
         db.clone(),
         eng.clone(),
@@ -3239,6 +3278,9 @@ async fn spawn_acp_turn(
         session_id.clone(),
         text,
         out.images.clone(),
+        first_open,
+        sid,
+        thread_id_i,
     );
     tauri::async_runtime::spawn(async move {
         // Re-validate under the lock once more right before the RPC — stop may
@@ -3246,6 +3288,12 @@ async fn spawn_acp_turn(
         {
             let g = e.lock().await;
             if g.stopped || g.interrupting || g.reset_epoch != prompt_epoch {
+                drop(g);
+                let _ = c.cancel(&s).await;
+                c.unsubscribe(&s).await;
+                if first_open {
+                    clear_acp_native_never_prompted(&a, &d, &e, sid_opt, tid).await;
+                }
                 return;
             }
         }
