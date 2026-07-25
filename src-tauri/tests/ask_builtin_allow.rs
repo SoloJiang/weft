@@ -187,21 +187,53 @@ async fn read_inside_the_worktree_is_auto_approved() {
         out.contains("\"permissionDecision\":\"allow\""),
         "a read inside the worktree must not cost a human click, got {out}"
     );
-    // Glob too — including the no-`path` form that defaults to the session's
-    // own cwd. (`Grep` is deliberately NOT here; see
-    // `content_search_still_surfaces_the_card`.)
+    // NotebookRead too — the other literal-path reader.
+    let nb = file_in(&wt, "analysis.ipynb");
+    let out = ask_unattended(
+        &base,
+        thread,
+        &dir.to_string(),
+        "claude",
+        "NotebookRead",
+        serde_json::json!({ "notebook_path": nb }),
+    )
+    .await;
+    assert!(
+        out.contains("\"permissionDecision\":\"allow\""),
+        "NotebookRead inside the worktree must be auto-approved, got {out}"
+    );
+}
+
+/// Neither PATTERN-taking builtin is auto-approved, whatever its arguments —
+/// the line the allowlist draws after round 3 (Codex, PR #146): an entry must
+/// name ONE literal path this module can resolve and judge.
+///
+/// `Glob` earned its removal twice over. `../outside/*` walked out of the root,
+/// and once relative `..` was refused, `{..,src}/*` did the same thing through
+/// brace expansion — TEXTUAL, so it reads as one ordinary path component while
+/// expanding to `../*`. Neither shape needs a special case now.
+#[tokio::test]
+async fn pattern_language_builtins_are_never_auto_approved() {
+    let tree = TempTree::new("patterns");
+    let wt = tree.dir("wt");
+    file_in(&wt, "src/main.rs");
+    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+
     for (tool, input) in [
+        // Entirely inside the worktree — still gated.
         ("Glob", serde_json::json!({ "pattern": "**/*.rs" })),
-        (
-            "Glob",
-            serde_json::json!({ "pattern": "**/*.rs", "path": wt.to_string_lossy() }),
-        ),
+        // The brace-expansion escape, which no amount of component
+        // inspection would have caught.
+        ("Glob", serde_json::json!({ "pattern": "{..,src}/*" })),
+        ("Glob", serde_json::json!({ "pattern": "{/etc,src}/*" })),
     ] {
-        let out = ask_unattended(&base, thread, &dir.to_string(), "claude", tool, input).await;
-        assert!(
-            out.contains("\"permissionDecision\":\"allow\""),
-            "{tool} inside the worktree must be auto-approved, got {out}"
-        );
+        let base2 = base.clone();
+        let dir_s = dir.to_string();
+        let call =
+            tokio::spawn(async move { ask(&base2, thread, &dir_s, "claude", tool, input).await });
+        let id = wait_for_card(&asks, &format!("{tool} (a pattern-taking builtin)")).await;
+        assert!(asks.answer(id, Answer::Deny));
+        assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
     }
 }
 
@@ -307,6 +339,44 @@ async fn credential_file_inside_the_worktree_still_surfaces_the_card() {
     assert!(asks.answer(id, Answer::Allow));
     let out = call.await.unwrap();
     assert!(out.contains("\"permissionDecision\":\"allow\""));
+}
+
+/// A credential file reached through an innocuously NAMED symlink inside the
+/// worktree still surfaces the card — the seam between the two conditions
+/// (Codex, PR #146).
+///
+/// `handle_ask` classifies the RAW argument; containment resolves it. A
+/// `config.txt -> .env` alias hands them different paths: harmless-looking to
+/// the veto, contained to the resolver. Renaming a secret must not launder it.
+#[cfg(unix)]
+#[tokio::test]
+async fn credential_reached_through_a_symlink_alias_surfaces_the_card() {
+    let tree = TempTree::new("aliascred");
+    let wt = tree.dir("wt");
+    let secret = wt.join(".env");
+    std::fs::write(&secret, b"TOKEN=1").unwrap();
+    let alias = wt.join("config.txt");
+    std::os::unix::fs::symlink(&secret, &alias).unwrap();
+    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+
+    let base2 = base.clone();
+    let dir_s = dir.to_string();
+    let alias_s = alias.to_string_lossy().to_string();
+    let call = tokio::spawn(async move {
+        ask(
+            &base2,
+            thread,
+            &dir_s,
+            "claude",
+            "Read",
+            serde_json::json!({ "file_path": alias_s }),
+        )
+        .await
+    });
+
+    let id = wait_for_card(&asks, "a credential reached through a symlink alias").await;
+    assert!(asks.answer(id, Answer::Deny));
+    assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
 }
 
 /// A mutating builtin is untouched by any of this, even on a path the read
@@ -441,112 +511,6 @@ async fn direction_from_another_thread_fails_closed() {
     });
 
     let id = wait_for_card(&asks, "a direction routed under the wrong thread").await;
-    assert!(asks.answer(id, Answer::Deny));
-    assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
-}
-
-/// A `Glob` whose PATTERN climbs out of the worktree with `..` must still stop
-/// for the human — the second hole Codex found on PR #146.
-///
-/// Nothing else catches this shape: the pattern isn't absolute so containment
-/// never inspects it, the session resolves fine, and `classify_risk` correctly
-/// rates a Glob read-only. Only the relative-`..` rule refuses it.
-#[tokio::test]
-async fn glob_pattern_climbing_out_of_the_worktree_surfaces_the_card() {
-    let tree = TempTree::new("globescape");
-    let wt = tree.dir("wt");
-    file_in(&wt, "src/main.rs");
-    tree.file("elsewhere/notes.rs");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
-
-    // Sanity: the ordinary relative pattern on the same session is still
-    // auto-approved, so the assertion below is about `..`, not about relative
-    // patterns being refused wholesale.
-    let ok = ask_unattended(
-        &base,
-        thread,
-        &dir.to_string(),
-        "claude",
-        "Glob",
-        serde_json::json!({ "pattern": "**/*.rs" }),
-    )
-    .await;
-    assert!(
-        ok.contains("\"permissionDecision\":\"allow\""),
-        "an ordinary relative glob must stay auto-approved, got {ok}"
-    );
-
-    let base2 = base.clone();
-    let dir_s = dir.to_string();
-    let call = tokio::spawn(async move {
-        ask(
-            &base2,
-            thread,
-            &dir_s,
-            "claude",
-            "Glob",
-            serde_json::json!({ "pattern": "../elsewhere/*" }),
-        )
-        .await
-    });
-
-    let id = wait_for_card(&asks, "a glob pattern climbing out of the worktree").await;
-    assert!(asks.answer(id, Answer::Deny));
-    assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
-}
-
-/// The same fail-closed identity check, exercised through the form that names
-/// NO path — the hole Codex found on PR #146.
-///
-/// `direction_from_another_thread_fails_closed` only ever sent a `Read` with an
-/// explicit `file_path`, so it was caught by the absolute-path rule and never
-/// proved anything about the identity check itself. A cwd-defaulting
-/// `Glob {"pattern": "**/*.rs"}` has nothing for that rule to reject, so a stale or
-/// cross-thread route could list an unverified cwd with no human in the loop.
-/// Same wrong-thread route, targetless call: must still surface the card.
-///
-/// Uses `Glob`, not `Grep` — `Grep` came off the allowlist entirely, so it
-/// would now pass this test for a reason that has nothing to do with identity.
-#[tokio::test]
-async fn targetless_glob_on_a_foreign_route_fails_closed() {
-    let tree = TempTree::new("targetless");
-    let wt = tree.dir("wt");
-    file_in(&wt, "src/main.rs");
-    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
-
-    // Sanity: the SAME targetless call on the session's REAL route is
-    // auto-approved — so the assertion below is about identity, not about
-    // targetless calls being refused across the board.
-    let ok = ask_unattended(
-        &base,
-        thread,
-        &dir.to_string(),
-        "claude",
-        "Glob",
-        serde_json::json!({ "pattern": "**/*.rs" }),
-    )
-    .await;
-    assert!(
-        ok.contains("\"permissionDecision\":\"allow\""),
-        "a targetless Glob on its own session must stay auto-approved, got {ok}"
-    );
-
-    let base2 = base.clone();
-    let dir_s = dir.to_string();
-    let other_thread = thread + 4242;
-    let call = tokio::spawn(async move {
-        ask(
-            &base2,
-            other_thread,
-            &dir_s,
-            "claude",
-            "Glob",
-            serde_json::json!({ "pattern": "**/*.rs" }),
-        )
-        .await
-    });
-
-    let id = wait_for_card(&asks, "a targetless Glob on a foreign route").await;
     assert!(asks.answer(id, Answer::Deny));
     assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
 }

@@ -40,8 +40,10 @@
 //! its additional directories, and DO prompt outside them. `ReadOnlyPath`
 //! adopts that same rule — read-only tools, scoped to the session's own
 //! directories — with weft's DB supplying the directory set (`session_roots`).
-//! Parity is a CEILING, not a target: `Grep` is on claude's don't-prompt list
-//! and is deliberately NOT on this one (see the omissions on `SAFE_BUILTINS`).
+//! Parity is a CEILING, not a target: `Grep` and `Glob` are both on claude's
+//! don't-prompt list and deliberately NOT on this one — an allowlisted tool
+//! must name ONE literal path this module can resolve and judge, which rules
+//! out anything taking a pattern (see the omissions on `SAFE_BUILTINS`).
 //!
 //! That set is NOT always identical to the engine's own cwd, and the difference
 //! is deliberate: a lead's cwd is an almost-empty scratch dir
@@ -110,6 +112,23 @@ pub enum SafeScope {
 ///   read-only-command classifier (`ask::READ_ONLY_COMMAND_WORDS`) but it is a
 ///   display heuristic, and promoting it into a gate that skips the human is a
 ///   separate, deliberate product decision — not something to slip in here.
+/// - `Glob` — REMOVED after review (Codex, PR #146), for the reason that
+///   generalizes: a glob PATTERN is a small language, and its expansion — not
+///   its spelling — decides what gets read. Two independent escapes were found
+///   in it. A leading `../` (fixed by component inspection), and then
+///   `{..,src}/*`, where brace expansion is TEXTUAL and happens before
+///   matching, so `{..,src}` reads as one ordinary component while expanding
+///   to `../*`; `{/etc,src}/*` synthesizes an absolute alternative the same
+///   way. Gating that safely means modelling brace expansion, extglob, and
+///   whatever the next release adds, across engines — and every gap in that
+///   model fails OPEN.
+///
+///   Hence the line this list now draws: NO PATTERN LANGUAGES. `Read` and
+///   `NotebookRead` name one literal path that this module can resolve and
+///   check; `Glob` and `Grep` take expressions whose meaning is decided
+///   elsewhere. The practical cost is small — `Glob` did not appear at all in
+///   the weft-launched transcripts sampled for this change, while `Read`
+///   dominated them.
 /// - `Grep` — REMOVED after review (Codex, PR #146). It was listed alongside
 ///   `Read` as "same exposure, same scoping", and that was wrong in a way that
 ///   breaks condition 2: a content search never names the files it reads, so
@@ -145,9 +164,7 @@ const SAFE_BUILTINS: &[(&str, &str, SafeScope)] = &[
     // Reads a file's contents. Path-scoped: `Read` is exactly the tool that
     // could otherwise walk out of the worktree into `~/.ssh`.
     ("claude", "Read", SafeScope::ReadOnlyPath),
-    // Lists paths matching a glob. Returns names, not contents — still
-    // path-scoped, since a listing outside the working dir is a leak too.
-    ("claude", "Glob", SafeScope::ReadOnlyPath),
+    // `Glob` is NOT here — see the omissions above for why it was removed.
     // `Grep` is NOT here — see the omissions above for why it was removed.
     // Legacy notebook reader (superseded by `Read` in claude 2.x, still present
     // in older CLIs weft may be pointed at). Read-only by construction.
@@ -204,6 +221,16 @@ pub fn safe_scope(engine: &str, tool_name: &str) -> Option<SafeScope> {
 /// location that isn't there, and the honest answer to "can't establish it" is
 /// the card. A read of a nonexistent file was going to fail in the engine
 /// anyway.
+///
+/// The RESOLVED path is also re-run through the credential check, and that is
+/// not belt-and-braces — it closes a seam between this module's two conditions.
+/// `handle_ask` computes `classify_risk` from the RAW argument while this
+/// function resolves it, so a symlink gives the two of them different paths to
+/// judge: `config.txt -> .env`, both inside the worktree, reads as `ReadOnly`
+/// on the name the request used and stays contained on the name it resolves
+/// to, and the secret comes back with no card. Judging the resolved target
+/// here means the veto applies to the file actually opened, not to the alias
+/// pointing at it. Caught in review by Codex on PR #146.
 fn contained(path: &str, roots: &[PathBuf]) -> bool {
     let p = Path::new(path);
     if !p.is_absolute() {
@@ -212,7 +239,24 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
     let Ok(real) = std::fs::canonicalize(p) else {
         return false;
     };
-    roots.iter().any(|r| real.starts_with(r))
+    if !roots.iter().any(|r| real.starts_with(r)) {
+        return false;
+    }
+    resolved_target_is_read_only(&real)
+}
+
+/// The credential veto, applied to a path AFTER symlink resolution.
+///
+/// Reuses `classify_risk`'s `File` signal so the marker list stays single-
+/// sourced. `tool_name` is pinned to `"Read"` on purpose: the caller has
+/// already established that the TOOL is a read-only builtin, so what is being
+/// asked here is only "is this destination credential-shaped", and a fixed
+/// read verb keeps the verdict a function of the path alone.
+fn resolved_target_is_read_only(resolved: &Path) -> bool {
+    crate::ask::classify_risk(crate::ask::RiskSignal::File {
+        tool_name: "Read",
+        path: &resolved.to_string_lossy(),
+    }) == crate::ask::RiskLevel::ReadOnly
 }
 
 /// Every absolute-path-shaped string anywhere in `input` is inside `roots`, and
@@ -405,9 +449,10 @@ mod tests {
         // the machine. If any of these ever answers Some(..), the bridge has
         // stopped gating the thing it exists to gate.
         for name in [
-            // Removed from the allowlist after review: a content search never
-            // names the files it reads, so the credential veto can't see them.
+            // Both removed from the allowlist after review — they take PATTERN
+            // languages, whose expansion (not spelling) decides what is read.
             "Grep",
+            "Glob",
             "Bash",
             "BashOutput",
             "KillShell",
@@ -534,6 +579,44 @@ mod tests {
             Some(&json!({ "file_path": inner_link.to_string_lossy() })),
             &[root]
         ));
+    }
+
+    /// A symlink with an innocuous NAME pointing at a credential-shaped file
+    /// INSIDE the same root is refused — the seam between this module's two
+    /// conditions.
+    ///
+    /// `handle_ask` classifies the RAW argument while this module resolves it,
+    /// so `config.txt -> .env` gives them different paths to judge: `ReadOnly`
+    /// on the name the request used, contained on the name it resolves to. The
+    /// veto has to follow the resolution. Codex caught it on PR #146.
+    #[cfg(unix)]
+    #[test]
+    fn credential_target_behind_an_innocuous_symlink_is_refused() {
+        let base = TempTree::new("aliased-cred");
+        let root = base.0.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret = root.join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        let alias = root.join("config.txt");
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+
+        // The raw name is innocuous AND the target is inside the root, so
+        // neither the risk verdict on the argument nor containment refuses it.
+        assert_eq!(
+            crate::ask::classify_risk(crate::ask::RiskSignal::File {
+                tool_name: "Read",
+                path: &alias.to_string_lossy(),
+            }),
+            crate::ask::RiskLevel::ReadOnly,
+            "premise: the alias itself looks harmless"
+        );
+        assert!(
+            !paths_contained(
+                Some(&json!({ "file_path": alias.to_string_lossy() })),
+                &[root]
+            ),
+            "the veto must follow the symlink to what is actually opened"
+        );
     }
 
     #[test]
