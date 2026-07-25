@@ -2341,7 +2341,7 @@ pub async fn send(
         )
     };
     if skill_pending || cmd_now {
-        let (tid, _sid, _texts, orphans) = stop_quiet(eng).await;
+        let (tid, _sid, _texts, orphans, _was_busy) = stop_quiet(eng).await;
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
@@ -4508,8 +4508,7 @@ pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_mess
 /// interruption that did not happen is the same class of lie as the "nothing
 /// changed" claims earlier rounds removed, pointing the other way.
 pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) -> bool {
-    let was_busy = { eng.lock().await.turn.busy };
-    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+    let (thread_id, session_id, texts, orphans, was_busy) = stop_quiet(eng).await;
     let had_open_rows = !texts.is_empty() || !orphans.is_empty();
     let mut drained_queue = 0usize;
     if let Some(db) = app.try_state::<Db>() {
@@ -5358,6 +5357,12 @@ pub fn spawn_watchdog(app: AppHandle) {
 /// Kill the live child + reset turn state WITHOUT emitting a "stopped" event —
 /// the UI keeps its last (idle) state. Used by the skill-refresh restart so the
 /// bounce is invisible; `stop` wraps this and then emits "stopped".
+/// The trailing `bool` is whether a turn was BUSY at the moment this reset it,
+/// captured inside the same critical section (PR #140 review round 14). Read
+/// through a separate `eng.lock()` beforehand it describes a different state
+/// from the one actually reset — a send admitted in the gap gets interrupted
+/// while the flag says `false`, a turn that finished cleanly reports `true` —
+/// and `teardown_for_switch` turns that flag into a sentence shown to the user.
 pub async fn stop_quiet(
     eng: &EngineRef,
 ) -> (
@@ -5365,9 +5370,11 @@ pub async fn stop_quiet(
     Option<i32>,
     Vec<(i32, String, Option<String>)>,
     Vec<(i32, serde_json::Value)>,
+    bool,
 ) {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
+    let was_busy = inner.turn.busy;
     // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
     // Hard stops also shut the codex client down, so the consumer's disconnect
     // cleanup never runs for them — without this drain an item row would stay
@@ -5416,7 +5423,7 @@ pub async fn stop_quiet(
     // stop-then-restart (which resets `stopped`/`busy` and would otherwise slip
     // past those flags). send_reservation_valid compares the captured reset_epoch.
     inner.reset_epoch += 1;
-    (target.0, target.1, texts, orphan_tools)
+    (target.0, target.1, texts, orphan_tools, was_busy)
 }
 
 /// Stop the engine outright (e.g. before a terminal takeover or by the runaway
@@ -5426,7 +5433,7 @@ pub async fn stop_quiet(
 /// (which skips "stopped"). Distinct from "idle" so a cleanly-idle session can
 /// still be driven by a bus post.
 pub async fn stop(app: &AppHandle, eng: &EngineRef) {
-    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+    let (thread_id, session_id, texts, orphans, _was_busy) = stop_quiet(eng).await;
     let mut inner = eng.lock().await;
     inner.stopped = true;
     drop(inner);
