@@ -1646,6 +1646,15 @@ pub fn set_keep_awake(power: tauri::State<'_, crate::power::PowerGuard>, on: boo
     Ok(())
 }
 
+/// Production default for the runaway-guard idle-kill cap: 30 min (1800s).
+/// Named (not an inline literal) so `lead_chat::engine`'s turn-freeze
+/// auto-recovery threshold — a DIFFERENT, faster-firing mechanism (issue #93)
+/// that must always fire well before this cap does, or it's silently
+/// shadowed/made dead code by this one — can cross-module sentinel-test
+/// against it (see `lead_chat::engine`'s
+/// `turn_freeze_threshold_stays_under_idle_watchdog_default` test). §7 跑飞护栏.
+pub(crate) const IDLE_WATCHDOG_DEFAULT_SECS: u64 = 1800;
+
 /// Runaway-guardrail caps (§7 跑飞护栏), enforced per busy turn by the chat
 /// engine's watchdog (lead_chat::engine::spawn_watchdog). Configurable at
 /// runtime from Settings; seeded from the WEFT_* env defaults so an env
@@ -1658,8 +1667,8 @@ impl Default for GuardrailState {
     fn default() -> Self {
         Self {
             inner: std::sync::Mutex::new((
-                env_secs("WEFT_IDLE_WATCHDOG_SECS", 1800), // 30 min
-                env_secs("WEFT_WALL_CAP_SECS", 7200),      // 2 h
+                env_secs("WEFT_IDLE_WATCHDOG_SECS", IDLE_WATCHDOG_DEFAULT_SECS),
+                env_secs("WEFT_WALL_CAP_SECS", 7200), // 2 h
             )),
         }
     }

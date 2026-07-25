@@ -3739,15 +3739,44 @@ const TURN_FREEZE_DEFAULT_SECS: u64 = 600;
 /// user be shown a hint" but "should we cut this turn loose now". Kept as its
 /// own named predicate (not a reuse of `stall_verdict`) because the two answer
 /// independent questions on independent thresholds, and `stall_verdict`'s own
-/// contract is purely visual ("No side effects, no kill" — see its doc). Pure →
-/// unit-tested.
+/// contract is purely visual ("No side effects, no kill" — see its doc).
+///
+/// `has_open_tool_call` (review round 1, P0): claude / codex-exec / opencode
+/// share `spawn_reader`, whose `ChatEvent` vocabulary has NO "tool still
+/// running" event — a `Bash`-type tool goes `tool_use` (refreshes the clock) →
+/// **zero stdout for the tool's ENTIRE execution** → `tool_result` (refreshes
+/// the clock). A legitimate `cargo build` / `pnpm install` / large `git clone`
+/// silently exceeds `freeze_secs` routinely and would otherwise be
+/// misjudged frozen and destructively interrupted mid-flight — not a false
+/// ALARM, a false KILL: `recover_from_freeze` clears native context, which is
+/// not undoable. `has_open_tool_call` must be true whenever a tool_use has
+/// been seen without its matching tool_result — see the caller's
+/// `!inner.tool_rows.is_empty()`. Structural guarantee for claude/codex-exec
+/// (their adapters always set `tool_rows` for a running call). codex
+/// app-server ALSO populates `tool_rows` for tool calls that ride the shared
+/// `ChatEvent::Assistant{tools}` pipeline (e.g. `collabAgentToolCall` — see
+/// `codex_consumer`'s `persist_tool_calls` call), on top of its own dedicated
+/// `outputDelta` heartbeat for direct command-execution streaming (see
+/// `ThreadMsg::Heartbeat`) — belt and suspenders, not load-bearing either way.
+/// opencode's adapter is the one real gap: it CANNOT populate `tool_rows` for a
+/// running call (its wire has no stable per-call id to correlate running→
+/// completed frames — see `parse_opencode`'s comment), so it falls back to its
+/// own re-emitted progress lines refreshing `last_activity` directly (already
+/// happens for free: every raw stdout line updates the clock before parsing —
+/// see `spawn_reader`) — weaker, not structurally proven, a documented
+/// residual gap (PR body, issue #93). Pure → unit-tested.
 pub(crate) fn freeze_verdict(
     busy: bool,
     quiet_secs: u64,
     freeze_secs: u64,
     has_open_ask: bool,
+    has_open_tool_call: bool,
 ) -> bool {
-    freeze_secs > 0 && busy && !has_open_ask && quiet_secs >= freeze_secs
+    freeze_secs > 0
+        && busy
+        && !has_open_ask
+        && !has_open_tool_call
+        && quiet_secs >= freeze_secs
 }
 
 /// Does open permission ask `(k_dir, k_thread)` block engine `ask_dir`@`thread_id`
@@ -3771,7 +3800,8 @@ fn ask_blocks(k_dir: &str, k_thread: i32, ask_dir: &str, thread_id: i32) -> bool
 
 /// Is there an open PERMISSION ask (AskRegistry) that legitimately blocks this
 /// engine's turn on the human — i.e. it's waiting, not stalled? Thread-scoped for
-/// lead asks via `ask_blocks`. Used by both the stall gate and the kill gate.
+/// lead asks via `ask_blocks`. Used by the stall gate, the kill gate, and the
+/// turn-freeze auto-recovery gate (issue #93).
 fn has_blocking_perm_ask(app: &AppHandle, ask_dir: &str, thread_id: i32) -> bool {
     app.try_state::<crate::ask::AskRegistry>()
         .map(|a| {
@@ -3888,17 +3918,37 @@ fn freeze_recovery_text(freeze_secs: u64) -> String {
 /// Re-confirm and execute the turn-freeze auto-recovery (issue #93). The
 /// sweep's verdict was computed under a lock already dropped, so this re-runs
 /// the FULL check (busy + silent past `freeze_secs` + not legitimately blocked
-/// on a human) under a FRESH lock before acting — mirrors
+/// on a human + no open tool call) under a FRESH lock before acting — mirrors
 /// `post_stall_notice_confirmed`'s race-closing re-check. When it still holds:
 ///   1. `interrupt()` — the existing soft-protocol-interrupt-then-kill-fallback
 ///      path (same one a user's own Stop button rides), so the frozen turn
 ///      lands in the SAME honest, resumable `idle` state a normal interrupt
 ///      does (never the harder `STATUS_STOPPED` the kill gate below uses).
-///   2. Clear the native session id, so the NEXT send opens a brand-new native
+///      Called INLINE (this fn is itself dispatched off the sweep loop as an
+///      independent task — see the caller) so its up-to-~120s worst case
+///      (codex app-server's `interrupt` RPC) never blocks other engines.
+///   2. For codex app-server: force-drop `codex_client` (review round 1,
+///      P1-b). `interrupt()`'s app-server branch may have hit `request()`'s
+///      reply timeout WITHOUT tearing the connection down (codex_app_server.rs
+///      only drops the pending-map entry on that path, not the connection —
+///      see `request`), so `is_alive()` (which only checks the handle is
+///      populated, not real liveness) would still call it live. That is
+///      EXACTLY the scenario this feature targets: the app-server's own demux
+///      read_loop stuck in an unbounded read. Mirrors `stop_quiet`'s kill path
+///      (`codex_client.take()` + `shutdown()`) so the next send reconnects
+///      fresh instead of reusing a connection `is_alive()` would wrongly
+///      trust. No-op for every non-app-server dialect (client is already
+///      `None`).
+///   3. Clear the native session id, so the NEXT send opens a brand-new native
 ///      session instead of resuming one whose transport may still be wedged
 ///      (mirrors the "no native id ⇒ fresh session next send" contract
 ///      `rewind` already ships).
-///   3. Post a Needs-you notice — this is a self-heal, but the user should
+///   4. Stamp a `turn_freeze_recovered` marker (`repo::mark_turn_freeze_recovered`)
+///      — the issue #116 (idle re-drive) coordination point: its `created_at`
+///      lets #116 tell "just came back from a freeze auto-recovery" apart from
+///      an ordinary clean turn-end, so it can hold off re-dispatching into the
+///      same wedge for a grace window instead of racing this self-heal.
+///   5. Post a Needs-you notice — this is a self-heal, but the user should
 ///      still know their native context was reset.
 /// Returns false when the turn already ended in the gap (nothing to do).
 async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64) -> bool {
@@ -3906,17 +3956,31 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         let inner = eng.lock().await;
         let quiet = inner.clock.last_activity.elapsed().as_secs();
         let has_open_ask = has_blocking_perm_ask(app, &inner.ask_dir, inner.thread_id);
-        let act = freeze_verdict(inner.turn.busy, quiet, freeze_secs, has_open_ask);
+        let act = freeze_verdict(
+            inner.turn.busy,
+            quiet,
+            freeze_secs,
+            has_open_ask,
+            !inner.tool_rows.is_empty(),
+        );
         (inner.thread_id, inner.session_id, inner.ask_dir.clone(), act)
     };
     if !act {
         return false;
     }
     let _ = interrupt(app, eng).await;
+    if let Some(c) = eng.lock().await.codex_client.take() {
+        c.shutdown().await;
+    }
     if let Some(db) = app.try_state::<Db>() {
         if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
             eprintln!(
                 "[weft] turn-freeze recovery: failed to clear native id for thread {thread_id}: {err}"
+            );
+        }
+        if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, session_id).await {
+            eprintln!(
+                "[weft] turn-freeze recovery: failed to stamp coordination marker for thread {thread_id}: {err}"
             );
         }
     }
@@ -3938,12 +4002,14 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
 ///      hung/stuck task is never invisible. Threshold `WEFT_STALL_HINT_SECS`
 ///      (default 480s = 8 min, 0 disables); runs even when both kill caps are off.
 ///   3. Recover — a busy turn whose transport has gone silent past
-///      `WEFT_TURN_FREEZE_SECS` (default 600s = 10 min, 0 disables) is cut
-///      loose with a soft interrupt and its native session id cleared, so the
-///      NEXT send self-heals onto a fresh session instead of sitting frozen
-///      until a human notices and restarts the app (issue #93). Fires once per
-///      silent episode; superseded by a kill in the same tick (one notice, the
-///      stronger action, not two).
+///      `WEFT_TURN_FREEZE_SECS` (default 600s = 10 min, 0 disables) — AND has
+///      no open tool call in flight, see `freeze_verdict` — is cut loose with
+///      a soft interrupt and its native session id cleared, so the NEXT send
+///      self-heals onto a fresh session instead of sitting frozen until a
+///      human notices and restarts the app (issue #93). Fires once per silent
+///      episode (dispatched off this loop as an independent task, never
+///      awaited inline here — see the call site); superseded by a kill in the
+///      same tick (one notice, the stronger action, not two).
 pub fn spawn_watchdog(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // Env-only knob (like the cap env seeds); read once at start. 0 disables.
@@ -4026,9 +4092,23 @@ pub fn spawn_watchdog(app: AppHandle) {
                         let now = stall_verdict(true, quiet, stall_secs, has_open_ask);
                         // (3) Turn-freeze auto-recovery gate (issue #93) — rising edge
                         // only: don't re-fire every 15s while an already-handled
-                        // episode is still (or again) past the threshold.
+                        // episode is still (or again) past the threshold. `tool_rows`
+                        // non-empty ⇒ a tool_use has been seen with no matching
+                        // tool_result yet ⇒ exempt (review round 1, P0): claude /
+                        // codex-exec share `spawn_reader`, whose wire is silent for a
+                        // tool's ENTIRE execution (no interim event) — without this a
+                        // legitimate `cargo build` / `pnpm install` past the threshold
+                        // would be misjudged frozen and destructively interrupted. See
+                        // `freeze_verdict`'s doc for the full reasoning (incl. the
+                        // opencode residual gap).
                         let freeze_fire = !freeze_handled.contains(&key)
-                            && freeze_verdict(true, quiet, freeze_secs, has_open_ask);
+                            && freeze_verdict(
+                                true,
+                                quiet,
+                                freeze_secs,
+                                has_open_ask,
+                                !inner.tool_rows.is_empty(),
+                            );
                         // (2) Stall visibility. Re-assert `stalled` EVERY sweep while
                         // stalled (not only on the flip) so a clobbering push — a
                         // queue-change `busy`, or a post-reload hydration snapshot that
@@ -4113,8 +4193,25 @@ pub fn spawn_watchdog(app: AppHandle) {
                             // notice and the freeze recovery notice can coexist this one
                             // tick (the stall hint isn't retracted here — only a KILL
                             // supersedes it, same as before).
-                            if freeze_fire && recover_from_freeze(&app, &eng, freeze_secs).await {
+                            //
+                            // Dispatched as an INDEPENDENT task, not awaited inline
+                            // (review round 1, P1-a): `recover_from_freeze` calls
+                            // `interrupt()`, which for the codex app-server dialect can
+                            // block up to ~120s inside `request()`'s bounded RPC wait —
+                            // exactly when the app-server's OWN transport is the thing
+                            // that's wedged (the freeze target scenario). Awaiting it
+                            // HERE would stall this whole sweep tick, delaying the
+                            // stall/kill/freeze checks for every OTHER busy engine at
+                            // the moment the system is most under stress. `freeze_handled`
+                            // is marked SYNCHRONOUSLY before the spawn (not from the
+                            // task's result) so a slow-to-complete recovery can't cause a
+                            // duplicate dispatch on the next tick.
+                            if freeze_fire {
                                 freeze_handled.insert(key);
+                                let (app2, eng2) = (app.clone(), eng.clone());
+                                tauri::async_runtime::spawn(async move {
+                                    recover_from_freeze(&app2, &eng2, freeze_secs).await;
+                                });
                             }
                             continue;
                         };
@@ -5951,14 +6048,14 @@ mod tests {
 
     #[test]
     fn freeze_fires_when_busy_and_silent_past_threshold() {
-        assert!(freeze_verdict(true, 600, 600, false)); // exactly at threshold
-        assert!(freeze_verdict(true, 1200, 600, false)); // well past
+        assert!(freeze_verdict(true, 600, 600, false, false)); // exactly at threshold
+        assert!(freeze_verdict(true, 1200, 600, false, false)); // well past
     }
 
     #[test]
     fn freeze_hidden_before_threshold() {
-        assert!(!freeze_verdict(true, 599, 600, false)); // one short of the boundary
-        assert!(!freeze_verdict(true, 0, 600, false));
+        assert!(!freeze_verdict(true, 599, 600, false, false)); // one short of the boundary
+        assert!(!freeze_verdict(true, 0, 600, false, false));
     }
 
     #[test]
@@ -5966,18 +6063,28 @@ mod tests {
         // A turn blocked on a human ask is legitimately paused, not frozen — the
         // watchdog must never auto-interrupt a turn that's waiting on a
         // permission decision.
-        assert!(!freeze_verdict(true, 9999, 600, true));
+        assert!(!freeze_verdict(true, 9999, 600, true, false));
+    }
+
+    #[test]
+    fn freeze_suppressed_while_tool_in_flight() {
+        // Review round 1, P0: a tool_use with no matching tool_result yet means
+        // claude/codex-exec are silently executing a (possibly long-running,
+        // legitimate) tool — cargo build, pnpm install, a large git clone — not
+        // frozen. However long the silence, this must never fire while true, or
+        // a healthy turn gets destructively interrupted and loses native context.
+        assert!(!freeze_verdict(true, 999_999, 600, false, true));
     }
 
     #[test]
     fn freeze_hidden_when_idle() {
         // No in-flight turn → never auto-recovered, however stale the clock reads.
-        assert!(!freeze_verdict(false, 9999, 600, false));
+        assert!(!freeze_verdict(false, 9999, 600, false, false));
     }
 
     #[test]
     fn freeze_disabled_when_threshold_zero() {
-        assert!(!freeze_verdict(true, 1_000_000, 0, false));
+        assert!(!freeze_verdict(true, 1_000_000, 0, false, false));
     }
 
     #[test]
@@ -5995,6 +6102,16 @@ mod tests {
         // flag must always appear BEFORE the auto-recovery acts, so the user is
         // never surprised by an action they had no warning of.
         assert!(TURN_FREEZE_DEFAULT_SECS > STALL_HINT_DEFAULT_SECS);
+    }
+
+    #[test]
+    fn turn_freeze_threshold_stays_under_idle_watchdog_default() {
+        // Review round 1, P2: cross-module invariant — freeze must always fire
+        // well before the runaway guard's idle-kill cap does, or a future
+        // change to EITHER default could silently shadow freeze into dead code
+        // (idle_cap would always kill first, so freeze's own action never
+        // triggers) with no test going red to catch it.
+        assert!(TURN_FREEZE_DEFAULT_SECS < crate::commands::IDLE_WATCHDOG_DEFAULT_SECS);
     }
 
     #[tokio::test]
@@ -6016,6 +6133,45 @@ mod tests {
         // Clearing again (no meta row left) is a harmless no-op, not an error —
         // the watchdog sweep must never fail loudly on a repeat/late tick.
         clear_native_id(&db, None, t.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_freeze_recovered_marker_roundtrips_for_the_lead() {
+        // Review round 1: the issue #116 coordination point. No marker yet →
+        // None; after `mark_turn_freeze_recovered`, the getter returns a
+        // plausible unix-seconds timestamp (same clock as `repo::now`/
+        // `created_at`) close to "now".
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        assert_eq!(
+            repo::last_turn_freeze_recovery_secs(&db, t.id, None)
+                .await
+                .unwrap(),
+            None
+        );
+
+        repo::mark_turn_freeze_recovered(&db, t.id, None)
+            .await
+            .unwrap();
+
+        let stamped = repo::last_turn_freeze_recovery_secs(&db, t.id, None)
+            .await
+            .unwrap()
+            .expect("marker recorded");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(now.saturating_sub(stamped) < 30, "stamp should read as ~now");
+        // A real row via the standard listing path (list_lead_messages does NOT
+        // filter by kind — the frontend's text/tool allowlist is what keeps it
+        // off the timeline, the same way "meta" rows already are today).
+        let rows = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "turn_freeze_recovered");
     }
 
     #[test]

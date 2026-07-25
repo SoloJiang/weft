@@ -1631,6 +1631,55 @@ pub async fn set_session_native_id_opt(
     Ok(())
 }
 
+/// Stamp a (thread, session) as having just gone through the turn-freeze
+/// auto-recovery (issue #93 review round 1 ↔ issue #116 coordination): an
+/// invisible timeline marker row (`kind` excluded from the frontend's
+/// text/tool timeline allowlist, same as `"meta"`) whose `created_at` is the
+/// coordination point #116's idle re-drive consults via
+/// [`last_turn_freeze_recovery_secs`] to hold off re-dispatching into the same
+/// wedge for a grace window, instead of racing this self-heal. `session_id =
+/// None` for the lead. Uses the SAME deletion-fenced insert as the rest of the
+/// timeline (`insert_lead_message`), so a thread deleted mid-recovery can't
+/// leave an orphaned row.
+pub async fn mark_turn_freeze_recovered(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<()> {
+    insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        0,
+        "system",
+        "turn_freeze_recovered",
+        "{}",
+        "complete",
+    )
+    .await?;
+    Ok(())
+}
+
+/// The most recent turn-freeze auto-recovery for a (thread, session), as
+/// unix-seconds (same clock as `now()`/`created_at`) — the read side of
+/// [`mark_turn_freeze_recovered`]. `None` if it never happened (the common
+/// case) or the stamp fails to parse (defensive — never panics on a bad row).
+pub async fn last_turn_freeze_recovery_secs(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<Option<u64>> {
+    let q = lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("turn_freeze_recovered"))
+        .order_by_desc(lead_message::Column::Id);
+    let q = match session_id {
+        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
+        None => q.filter(lead_message::Column::SessionId.is_null()),
+    };
+    Ok(q.one(&db.0).await?.and_then(|m| m.created_at.parse().ok()))
+}
+
 /// Set a worker session's activity status directly. Unlike
 /// `set_session_native_id` (which forces `running` as a side effect of
 /// capturing the id), this writes whatever caller-chosen value — e.g.
