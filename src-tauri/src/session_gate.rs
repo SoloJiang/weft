@@ -49,6 +49,32 @@ pub async fn acquire_session_slot() -> Option<OwnedSemaphorePermit> {
     gate().clone().acquire_owned().await.ok()
 }
 
+/// The slot ceiling `gate()` was actually sized with. `max_active_sessions()` is a
+/// pure function of an env var that's fixed for the process lifetime, so re-reading
+/// it here is deterministic and always agrees with what `gate()` used — but memoizing
+/// it too (mirroring `gate()`'s own `OnceLock`) makes that agreement structural
+/// rather than "trust the env doesn't change", which is what a read-only dashboard
+/// snapshot needs to never show a `max` that could disagree with the live semaphore.
+fn configured_max() -> usize {
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(max_active_sessions)
+}
+
+/// Pure bookkeeping: given the semaphore's current `available` permits out of
+/// `max`, how many are held right now. Extracted so the arithmetic is
+/// unit-testable in isolation, independent of the process-wide `gate()`.
+fn slots_from_available(available: usize, max: usize) -> (usize, usize) {
+    (max.saturating_sub(available), max)
+}
+
+/// Read-only snapshot of the gate for the resource dashboard (issue #112):
+/// `(active, max)` — how many of the configured slots are held right now vs the
+/// ceiling. Pure read via `Semaphore::available_permits()`; never acquires or
+/// releases a permit, so calling it cannot perturb queuing or admission.
+pub fn active_session_slots() -> (usize, usize) {
+    slots_from_available(gate().available_permits(), configured_max())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +123,25 @@ mod tests {
         // Smoke: the real gate hands out at least one slot.
         let permit = acquire_session_slot().await;
         assert!(permit.is_some());
+    }
+
+    #[test]
+    fn slots_from_available_computes_used_as_max_minus_available() {
+        assert_eq!(slots_from_available(8, 8), (0, 8));
+        assert_eq!(slots_from_available(5, 8), (3, 8));
+        assert_eq!(slots_from_available(0, 8), (8, 8));
+    }
+
+    /// Smoke test against the REAL process-wide gate. Other tests in this binary
+    /// (this module's own `acquire_session_slot_yields_a_permit`, plus any engine
+    /// test exercising a real session spawn) can concurrently hold permits on the
+    /// same static `gate()`, so this only asserts structural invariants that must
+    /// hold no matter what else is mid-flight — never an exact before/after delta,
+    /// which would be flaky under that shared global state.
+    #[tokio::test]
+    async fn active_session_slots_reports_within_bounds() {
+        let (used, max) = active_session_slots();
+        assert!(max >= 1, "the gate always has at least one slot");
+        assert!(used <= max, "used ({used}) must never exceed max ({max})");
     }
 }

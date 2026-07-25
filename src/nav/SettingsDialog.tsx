@@ -10,6 +10,7 @@ import {
   Database,
   ExternalLink,
   FolderOpen,
+  Gauge,
   KeyRound,
   MessageSquare,
   Monitor,
@@ -27,6 +28,7 @@ import { Input } from "../components/ui/Input";
 import { Toggle } from "../components/ui/Toggle";
 import { SkillsSettings } from "../components/SkillsSettings";
 import { BackupSettings } from "../settings/Backup";
+import { ResourcesSettings } from "../settings/Resources";
 import { toolFullName } from "../components/ToolIcon";
 import { currentLang, setLang, type Lang } from "../i18n";
 import { api } from "../lib/api";
@@ -40,7 +42,14 @@ import {
 import { useStore } from "../state/store";
 import { useTheme, type ThemePref } from "../state/theme";
 
-type SettingsPage = "general" | "appearance" | "automation" | "skills" | "im" | "backup";
+type SettingsPage =
+  | "general"
+  | "appearance"
+  | "automation"
+  | "skills"
+  | "im"
+  | "backup"
+  | "resources";
 
 type NavItem = {
   id: SettingsPage;
@@ -64,6 +73,12 @@ const NAV_GROUPS: { labelKey: string; items: NavItem[] }[] = [
       { id: "skills", icon: Boxes, labelKey: "settings.skills", implemented: true },
       { id: "im", icon: MessageSquare, labelKey: "settings.im", implemented: true },
       { id: "backup", icon: Database, labelKey: "settings.backup", implemented: true },
+    ],
+  },
+  {
+    labelKey: "settings.groupSystem",
+    items: [
+      { id: "resources", icon: Gauge, labelKey: "settings.resources", implemented: true },
     ],
   },
 ];
@@ -153,6 +168,8 @@ function renderSettingsPage(active: SettingsPage) {
       return <BackupSettings />;
     case "skills":
       return <SkillsSettings />;
+    case "resources":
+      return <ResourcesSettings />;
   }
 }
 

@@ -35,6 +35,7 @@
 //! 逼近 ulimit 时连 `ps`/`kill` 都要 fork 会失败,故枚举与杀进程一律走 syscall
 //! (`libc::killpg`、Linux `/proc`、macOS `proc_pidinfo`),绝不 shell 外化。
 
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -80,7 +81,7 @@ pub enum OwnerKind {
 }
 
 impl OwnerKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             OwnerKind::GlobalAppServer => "global_app_server",
             OwnerKind::Session => "session",
@@ -439,6 +440,61 @@ pub fn instance_group_ids() -> Vec<i32> {
     groups.into_iter().collect()
 }
 
+// ── UI 归因(issue #112 资源仪表盘,只读)──────────────────────────────────────
+//
+// 下面两个函数只**读**既有登记表 / `instance_pids()`,不改动上面的口径、reap 或
+// admission 逻辑;供只读资源面板展示「进程树从哪儿来」与「大概占多少内存」。
+
+/// 一个 owner 分类的直接子进程计数,供仪表盘的「进程树」展示。数的是**登记表里
+/// 的直接子进程**(session/lead_thread/curator/... 各开了几个受管进程),不含它们
+/// 的后代——后代总量由 [`count_instance_processes`] 单独给出,两者在 UI 上并列
+/// 展示(「共 N 个进程,来自 M 个会话 + ...」),不是同一层级、不重复计数。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerCount {
+    pub kind: &'static str,
+    pub count: u64,
+}
+
+/// 按 owner kind 分组统计登记表(见 [`OwnerCount`])。只保留非零分类,顺序固定为
+/// [`OwnerKind`] 的声明顺序(不是 hash 顺序),让前端每次渲染的分类顺序不跳动。
+pub fn instance_owner_counts() -> Vec<OwnerCount> {
+    let regs = registered();
+    let kinds = [
+        OwnerKind::GlobalAppServer,
+        OwnerKind::Session,
+        OwnerKind::LeadThread,
+        OwnerKind::Curator,
+        OwnerKind::Opencode,
+        OwnerKind::Preview,
+        OwnerKind::Probe,
+        OwnerKind::Other,
+    ];
+    kinds
+        .into_iter()
+        .filter_map(|kind| {
+            let count = regs.iter().filter(|r| r.owner.kind == kind).count() as u64;
+            (count > 0).then_some(OwnerCount { kind: kind.as_str(), count })
+        })
+        .collect()
+}
+
+/// 本实例 owned 子树(见 [`instance_pids`])的常驻内存(RSS)合计,单位字节。逐 pid
+/// 走 fork-free 的平台 syscall(macOS `proc_pidinfo` / Linux `/proc/<pid>/status`),
+/// 单个 pid 读失败(已退出等)按 0 计入合计,不让整体求和因单点失败而报废——与
+/// `count_instance_processes` 同样的「尽力而为」哲学。`None` 仅在平台没有 fork-free
+/// 枚举时出现(与 [`instance_pids`] 同一条件);真实测得「当前 0 个 owned 进程」时是
+/// `Some(0)`,不是 `None`——调用方不应把两者混为一谈。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn instance_memory_bytes() -> Option<u64> {
+    Some(instance_pids().iter().filter_map(|&pid| proc_resident_bytes(pid)).sum())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn instance_memory_bytes() -> Option<u64> {
+    None
+}
+
 // ── 平台相关:进程枚举(fork-free)────────────────────────────────────────────
 
 /// `(ppid, pgid)`。macOS 走 `proc_pidinfo`,Linux 读 `/proc/<pid>/stat`,均 fork-free、
@@ -462,6 +518,35 @@ fn proc_ppid_pgid(pid: i32) -> Option<(i32, i32)> {
     };
     if n == sz {
         Some((info.pbi_ppid as i32, info.pbi_pgid as i32))
+    } else {
+        None
+    }
+}
+
+/// This pid's resident memory (RSS), in bytes. `None` if the pid vanished
+/// mid-read or the syscall failed; callers sum via `filter_map` so one bad pid
+/// (already exited) doesn't zero out the whole tree's total — mirrors
+/// `proc_ppid_pgid`'s same "success iff kernel filled the full struct" check.
+#[cfg(target_os = "macos")]
+fn proc_resident_bytes(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: 传入本地栈上 proc_taskinfo 及其正确 size;成功时内核填满 sz 字节
+    // (与上面 proc_ppid_pgid 的 PROC_PIDTBSDINFO 调用同一套路)。
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            sz,
+        )
+    };
+    if n == sz {
+        Some(info.pti_resident_size)
     } else {
         None
     }
@@ -512,6 +597,30 @@ fn parse_stat_ppid_pgid(s: &str) -> Option<(i32, i32)> {
     let ppid = it.next()?.parse::<i32>().ok()?;
     let pgrp = it.next()?.parse::<i32>().ok()?;
     Some((ppid, pgrp))
+}
+
+/// This pid's resident memory (RSS), in bytes, read from `/proc/<pid>/status`.
+/// `None` if the pid vanished mid-read or the file is malformed.
+#[cfg(target_os = "linux")]
+fn proc_resident_bytes(pid: i32) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    parse_vmrss_kb(&s).map(|kb| kb.saturating_mul(1024))
+}
+
+/// Parse the `VmRSS:  1234 kB` line out of `/proc/<pid>/status` content.
+/// Extracted as a pure function (mirrors `parse_stat_ppid_pgid` above) so it's
+/// unit-testable without a real `/proc`, and compiles on non-Linux hosts too.
+#[cfg(any(target_os = "linux", test))]
+fn parse_vmrss_kb(s: &str) -> Option<u64> {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.trim().split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -808,5 +917,56 @@ mod tests {
             "dropping the registration deregisters even without reap"
         );
         let _ = child.kill().await; // 无 reap 发生,直接杀掉哨兵子进程收尾
+    }
+
+    /// `/proc/<pid>/status` 的 `VmRSS:` 行解析:纯字符串、不依赖 /proc,可在 macOS
+    /// 上也跑(与 `parse_stat_handles_comm_with_parens_and_spaces` 同一惯例)。
+    #[test]
+    fn parse_vmrss_kb_reads_the_vmrss_line() {
+        let status = "Name:\tsh\nVmPeak:\t   10240 kB\nVmRSS:\t    2048 kB\nVmHWM:\t   3072 kB\n";
+        assert_eq!(parse_vmrss_kb(status), Some(2048));
+        // 缺 VmRSS 行 → None(不 panic)。
+        assert_eq!(parse_vmrss_kb("Name:\tsh\nVmPeak:\t 10240 kB\n"), None);
+        // 畸形数值 → None。
+        assert_eq!(parse_vmrss_kb("VmRSS:\tnot-a-number kB\n"), None);
+    }
+
+    /// 仪表盘的内存读数必须反映真实 owned 子树:起一个子进程后,合计 RSS 应 > 0。
+    #[tokio::test]
+    async fn instance_memory_bytes_reflects_owned_subtree() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let cfg = configure(&mut cmd, Owner::other("test-mem"));
+        let mut child = cmd.spawn().expect("spawn");
+        let reg = cfg.register(&child);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let bytes = instance_memory_bytes().expect("macOS/Linux always yield Some");
+        assert!(bytes > 0, "owned subtree should report nonzero RSS, got {bytes}");
+        reap(&mut child, &reg).await;
+    }
+
+    /// `instance_owner_counts` 分组必须按登记的 owner kind 统计,且过滤掉计数为零
+    /// 的分类(前端渲染只关心「实际存在」的分类)。
+    #[tokio::test]
+    async fn owner_counts_group_by_kind_and_skip_zero() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let cfg = configure(&mut cmd, Owner::session("s1"));
+        let mut child = cmd.spawn().expect("spawn");
+        let reg = cfg.register(&child);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let counts = instance_owner_counts();
+        assert!(
+            counts.iter().any(|c| c.kind == "session" && c.count >= 1),
+            "the registered session-owned child must show up under the session kind"
+        );
+        assert!(
+            counts.iter().all(|c| c.count > 0),
+            "zero-count owner kinds must not appear in the breakdown"
+        );
+        reap(&mut child, &reg).await;
     }
 }
