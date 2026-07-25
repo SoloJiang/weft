@@ -4250,7 +4250,10 @@ fn freeze_recovery_text(freeze_secs: u64) -> String {
 /// inserted row and fail a message that is about to be delivered.
 struct FrozenTurnDrain {
     current: Option<(i32, String)>,
-    orphan_texts: Vec<(i32, String)>,
+    // agent_thread (issue #99) rides along so this freeze doesn't drop the
+    // sub-agent tag a cold reload would otherwise disagree with the live
+    // view on — same reasoning as `cleanup_disconnected_turn`'s orphan_texts.
+    orphan_texts: Vec<(i32, String, Option<String>)>,
     orphan_tools: Vec<(i32, serde_json::Value)>,
     drained_queue: Vec<i32>,
     turn_saw_text: bool,
@@ -4288,10 +4291,10 @@ fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<
         return None;
     }
     let current = inner.current.take().map(|(id, text, _)| (id, text));
-    let orphan_texts: Vec<(i32, String)> = inner
+    let orphan_texts: Vec<(i32, String, Option<String>)> = inner
         .open_texts
         .drain()
-        .map(|(_, (id, text, _))| (id, text))
+        .map(|(_, r)| (r.row, r.buf, r.agent_thread))
         .collect();
     let orphan_tools: Vec<(i32, serde_json::Value)> =
         inner.tool_rows.drain().map(|(_, v)| v).collect();
@@ -4514,11 +4517,13 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
             }
             // Item-keyed open rows freeze like `current`: raw text + terminal
             // status (mirrors cleanup_disconnected_turn's disconnect handling).
-            for (id, text) in drain.orphan_texts {
+            // agent_thread (issue #99) preserved via text_row_content — see
+            // FrozenTurnDrain's doc.
+            for (id, text, agent_thread) in drain.orphan_texts {
                 let _ = repo::update_lead_message(
                     &db,
                     id,
-                    &serde_json::json!({ "text": text }).to_string(),
+                    &text_row_content(&text, agent_thread.as_deref()),
                     "interrupted",
                 )
                 .await;
@@ -7212,9 +7217,17 @@ mod tests {
         inner.interrupting = true; // set by `interrupt()` just before this fires
         inner.current_origin_tag = Some("im-reply-target".into());
         inner.current = Some((10, "partial reply".into(), std::time::Instant::now()));
+        // agent_thread: Some(..) — issue #99: a sub-agent's own stream freezing
+        // mid-turn must keep its tag through this reset path too, exactly like
+        // cleanup_disconnected_turn / stop_quiet.
         inner.open_texts.insert(
             "item-1".into(),
-            (11, "parallel stream".into(), std::time::Instant::now()),
+            OpenTextRow {
+                row: 11,
+                buf: "parallel stream".into(),
+                last_flush: std::time::Instant::now(),
+                agent_thread: Some("sub-1".into()),
+            },
         );
         inner
             .tool_rows
@@ -7249,7 +7262,10 @@ mod tests {
         assert!(inner.turn.try_begin_send());
 
         assert_eq!(drain.current, Some((10, "partial reply".into())));
-        assert_eq!(drain.orphan_texts, vec![(11, "parallel stream".into())]);
+        assert_eq!(
+            drain.orphan_texts,
+            vec![(11, "parallel stream".into(), Some("sub-1".into()))]
+        );
         assert_eq!(
             drain.orphan_tools,
             vec![(12, serde_json::json!({"tool": "bash"}))]
