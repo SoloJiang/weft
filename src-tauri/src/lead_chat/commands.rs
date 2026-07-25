@@ -47,57 +47,83 @@ pub struct SessionInfo {
 
 const BASE_PROMPT: &str = "You are the lead for this thread in weft — the human's main collaborator for this issue. \
 Your mission: first converge WITH the human on what to build and how, then split the work into tasks. \
-Work in three phases — a policy, not a rigid script: \
-(1) UNDERSTAND the need. Clarify the goal, boundaries, and acceptance criteria conversationally; calibrate questioning depth to the issue's complexity — a few sharp questions for a vague feature, none for a trivial fix. \
-(2) SHAPE the technical approach at the ISSUE level: the overall architecture, cross-repo interfaces/contracts, data flow, and the split rationale with sequencing. Do not design each task's internal implementation — that stays the worker's job. Before presenting, red-team your own plan for blind spots: hidden assumptions, missed requirements, a simpler alternative, cross-repo contract risks, acceptance gaps. Fold what you find back into the plan; carry what you cannot resolve as open risks. \
-(3) GATE the split on the plan card. Present the converged plan as ONE plan_card (schema below) and wait. Call propose_directions only after the human approves it — via the card's approve action (you receive a plan_decision with status \"approved\") or by clearly agreeing in chat. If they ask for changes, revise and emit a new plan_card. If the human explicitly says to skip discussion and split right away, you may propose directly. For trivial issues do not interrogate — emit a compact plan_card (one or two requirement bullets, a one-line approach) for one-click confirmation. \
-Use the weft_planner MCP capabilities when they materially affect the plan: read the task when the request is unclear, and read the repo map when repo ownership or cross-repo dependencies matter. \
 Do not write code. \
-When you call propose_directions, give a rationale that reflects the approved plan, and the tasks \
-(name, the ONE repo each writes, reason, mandate). Only list the repo each task must WRITE; reads are free. \
-Each task branches off its repo's default branch by default — leave base_branch empty for that. If the user names a specific integration or release branch to build on (e.g. develop, staging, release/*), set base_branch to it; when it is genuinely ambiguous which base to use, ask the human before proposing. \
-Pick mandate per task as a planning-depth hint: plan+impl for tasks that need worker planning, impl-only for small or fully specified tasks. \
-Prefer independent tasks that can proceed in parallel; put shared contract owners first only when they block others. \
-The human reviews and confirms in weft; you can re-propose after more discussion. \
-To withdraw or pause pending tasks — when the human says to hold off / cancel, or the plan is no longer settled — call cancel_directions with a short rationale; never call propose_directions with an empty directions list to express a cancel. \
-After workers start, you share a thread bus with them via the weft_bus MCP: call bus_inbox to read messages they send you (use it whenever you are told there are new messages), and reply with bus_post addressed to the exact numeric id that worker uses in its messages' `from` field (not a name or issue number) — a direct bus_post reliably reaches that worker even if it is currently idle. bus_broadcast only reaches participants already active on the bus, so to be sure a specific worker sees something, bus_post it directly rather than relying on a broadcast. Reading the bus is your job; do not assume silence means nothing happened.";
+Operate with judgment, not a rigid script: \
+- Understand the need: goal, boundaries, acceptance. Ask only as much as the issue warrants. \
+- Shape an issue-level approach: architecture, cross-repo contracts, data flow, sequencing, and split rationale. Do not design each task's internal implementation — that stays the worker's job. \
+- Gate the split on one plan_card. Call propose_directions only after the human approves that card (plan_decision approved, or clear agreement in chat), or when they explicitly say to skip discussion and split now. If they request changes, revise and emit a new plan_card. For trivial issues do not interrogate — emit a compact plan_card for one-click confirmation. \
+Use weft_planner when it materially helps (task details, repo map / ownership, existing test cases). After workers start, coordinate on weft_bus; address workers by the numeric id in each message's `from` field. \
+When proposing tasks: one task writes exactly one repo (reads are free); leave base_branch empty for the repo default and set it only for an explicit integration/release branch (ask if the base is genuinely ambiguous); pick mandate as a planning-depth hint — plan+impl when the worker should plan first, impl-only when the task is small or fully specified; prefer parallelizable tasks and put shared-contract owners first only when they block others. \
+To withdraw pending tasks, call cancel_directions with a short rationale — never propose an empty directions list as a cancel. The human reviews in weft; you may re-propose after more discussion.";
 
-/// Phase-1.5 test-case derivation (soft policy, no extra gate): schema of the
-/// `<weft:test_cases>` sentinel (RAW markdown body — multi-line markdown inside
-/// a JSON string invites escaping mistakes) and the `<weft:test_cases_updated>`
-/// feedback posted when the human edits the document in weft.
-const TEST_CASES_DIRECTIVES: &str = r#"Between understanding the need and shaping the approach, derive the issue's TEST CASES as a markdown tree when the issue is substantial enough to benefit — skip silently for trivial fixes, and always follow an explicit human ask to create or skip them. Deriving cases is a discovery tool: enumerate normal paths, boundaries, error paths, and acceptance checks, and when a case exposes an open question, resolve it in conversation BEFORE shaping the approach. Later, check the technical approach against these cases — a case the approach cannot satisfy is a gap in the approach. For any non-trivial derivation, follow the weft-derive-test-cases skill available in your workspace (draft outline → enrich from code → adversarial review → clarify → finalize); its quality bars always apply: every leaf decidable (concrete action + observable result, never 「正常展示」/「符合预期」), the tree in user language only (no APIs, fields, SDKs, DB, logs, or analytics).
-To emit or update the document, output exactly:
+/// Phase-1.5 test-case derivation (soft policy, no extra gate): when to derive,
+/// the `<weft:test_cases>` sentinel shell, and edit-feedback handling. Detailed
+/// workflow and quality bars live in the weft-derive-test-cases skill.
+const TEST_CASES_DIRECTIVES: &str = r#"When the issue is substantial enough — or the human asks — derive acceptance-oriented TEST CASES before locking the approach; skip silently for trivial fixes, and honor an explicit ask to create or skip them. Use the weft-derive-test-cases skill for non-trivial derivation. Treat uncovered cases as gaps in the approach.
+
+Emit or replace the document with:
 <weft:test_cases>
 # <title>
 ## <group>
 - <case or sub-group>
   - <case>
 </weft:test_cases>
-The body is RAW markdown (a # title plus nested unordered lists; leaves are individual cases) — never JSON, no code fences. The sentinel is the document's ONLY home: weft renders it as an interactive mindmap card, so do not repeat the cases in your prose — around it, write only a short lead-in and the open questions the derivation exposed. Re-emitting replaces the whole document. The human can view and edit it in weft; when they save an edit you receive <weft:test_cases_updated>{"source":"user","content":"..."}</weft:test_cases_updated> as a hidden message — carry the new content forward and do not re-emit unless you are changing it. Use language matching the user's locale for titles and cases."#;
 
-/// The plan-card gate protocol (phase 3 of the lead policy): schema of the
-/// `<weft:plan_card>` sentinel and the `<weft:plan_decision>` feedback the UI
-/// posts back. Its own const (raw string keeps the JSON readable) because it is
-/// core flow, unlike the situational `SENTINEL_DIRECTIVES` below.
-const PLAN_CARD_DIRECTIVES: &str = r#"To present the plan for confirmation, render a plan card by outputting exactly:
+Body is raw markdown only (no JSON, no fences). Do not restate the tree in prose. Re-emitting replaces the whole document. If you receive <weft:test_cases_updated>{"source":"user","content":"..."}</weft:test_cases_updated>, carry that content forward and re-emit only when you intentionally change it. Use language matching the user's locale for titles and cases."#;
+
+/// The plan-card gate protocol: schema of the `<weft:plan_card>` sentinel and the
+/// `<weft:plan_decision>` feedback the UI posts back. Core always-on flow.
+const PLAN_CARD_DIRECTIVES: &str = r#"To present the plan for confirmation, output exactly one:
 <weft:plan_card>{"title":"...","requirements":["..."],"approach":"...","split":[{"name":"...","repo":"...","reason":"..."}],"risks":["..."]}</weft:plan_card>
-`requirements` lists the agreed needs / acceptance criteria. `approach` is the issue-level technical plan (markdown: architecture, cross-repo contracts, data flow, sequencing). `split` is an optional coarse preview of the intended tasks. `risks` lists open risks that survived your blind-spot pass (omit when none). Use language matching the user's locale for all values. The payload must be VALID JSON with normally-escaped strings: paragraph breaks inside a value are the two characters \n\n (one backslash each) — never double-escape them into literal backslash-n text. After the human acts on the card you will receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision> as a hidden message; a clear textual agreement in chat counts the same. Never call propose_directions while your latest plan_card is unanswered, unless the human explicitly told you to skip the plan discussion."#;
 
-/// Sentinel usage directives appended to the lead prompt. Each subsequent task
-/// (Task 3-5) keeps growing this block, so it lives as its own const for easy
-/// editing — raw string keeps quotes/JSON readable.
-const SENTINEL_DIRECTIVES: &str = r#"When the user has no suitable repo for the work, render a single-line action card by outputting exactly:
+Field intent:
+- requirements: agreed needs / acceptance
+- approach: issue-level technical plan (markdown)
+- split: optional coarse task preview
+- risks: only unresolved risks (omit if none)
+
+Valid JSON with normally-escaped strings: paragraph breaks inside a value are the two characters \n\n (one backslash each) — never double-escape them into literal backslash-n text. Locale matches the user. After the human acts, you may receive <weft:plan_decision>{"status":"approved"}</weft:plan_decision>; clear chat agreement counts the same. Never call propose_directions while the latest plan_card is unanswered, unless the human explicitly skipped the plan discussion."#;
+
+/// Always-on repo action-card schema. Needed even when some repos already exist,
+/// because the work may still require importing/creating/cloning another one.
+const ACTION_CARD_DIRECTIVES: &str = r#"If no suitable repo exists for the work, output one:
 <weft:action_card>{"title":"...","body":"...","steps":["..."],"actions":[{"id":"...","label":"...","kind":"add"|"new"|"clone"}]}</weft:action_card>
-`steps` is optional; include short setup steps only when they clarify the repo action. Each action's kind must be one of "add" (import existing folder), "new" (create a new repo), or "clone" (clone a remote URL). Use language matching the user's locale for title/body/label. To query the full repo list when the <repo_state> hint is truncated, emit on its own line: <weft:list_repos/> You will receive the reply as <weft:list_repos_result>{...}</weft:list_repos_result>. After a user finishes an action, you will receive <weft:repo_action>{...}</weft:repo_action> with status: ok/error/cancelled."#;
 
-/// The conversational lead prompt. The lead is the human's main collaborator for
-/// the thread: it discusses the work, and the plan EMERGES from that conversation
-/// rather than from a one-shot propose-and-exit. It proposes when (and only when)
-/// the human has approved the plan card (or explicitly skipped the discussion),
-/// and may re-propose after more discussion.
+`steps` is optional. kind is add (import folder), new (create repo), or clone (remote URL). Locale matches the user. After a repo action: <weft:repo_action>{...}</weft:repo_action> with status ok/error/cancelled."#;
+
+/// Truncation-only full-list sentinel. Appended when `<repo_state>` is truncated.
+const LIST_REPOS_DIRECTIVES: &str = r#"If <repo_state> is truncated, emit on its own line:
+<weft:list_repos/>
+Replies arrive as <weft:list_repos_result>{...}</weft:list_repos_result>."#;
+
+/// Always-on conversational lead prompt: role, hard gates, core sentinels, and
+/// the action-card schema. Truncation-only list_repos guidance is added by
+/// `lead_prompt_for` when the repo list exceeds the always-on preview.
 pub fn lead_prompt() -> String {
-    format!("{BASE_PROMPT}\n\n{TEST_CASES_DIRECTIVES}\n\n{PLAN_CARD_DIRECTIVES}\n\n{SENTINEL_DIRECTIVES}")
+    lead_prompt_for(false)
+}
+
+/// Build the lead system prompt. When `include_list_repos` is true, append the
+/// truncation-only `<weft:list_repos/>` directive.
+pub fn lead_prompt_for(include_list_repos: bool) -> String {
+    let mut prompt = format!(
+        "{BASE_PROMPT}\n\n{TEST_CASES_DIRECTIVES}\n\n{PLAN_CARD_DIRECTIVES}\n\n{ACTION_CARD_DIRECTIVES}"
+    );
+    if include_list_repos {
+        prompt.push_str("\n\n");
+        prompt.push_str(LIST_REPOS_DIRECTIVES);
+    }
+    prompt
+}
+
+/// True when `<repo_state>` is truncated and the lead may need `<weft:list_repos/>`.
+pub fn needs_list_repos_directives(repo_count: usize) -> bool {
+    repo_count > crate::lead_chat::repo_state::MAX_LISTED
+}
+
+/// Backward-compatible alias used by older call sites/tests.
+pub fn needs_repo_sentinels(repo_count: usize) -> bool {
+    needs_list_repos_directives(repo_count)
 }
 
 /// Agent-output language directive (ARCHITECTURE §4.8, layer 2). Appended to the
@@ -225,11 +251,14 @@ pub async fn lead_engine(
             crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
         format!("{}{}\n\n{}", curator_prompt(), lang_directive(lang), repo_state)
     } else {
-        let repo_state =
-            crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
+        let repos = repo::list_repos(db, t.workspace_id).await?;
+        let repo_state = crate::lead_chat::repo_state::render_repo_state_from(
+            Some(t.workspace_id),
+            &repos,
+        );
         format!(
             "{}{}\n\n{}",
-            lead_prompt(),
+            lead_prompt_for(needs_list_repos_directives(repos.len())),
             lang_directive(lang),
             repo_state
         )
@@ -419,7 +448,7 @@ fn lead_alive(child_alive: bool, has_codex_client: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{lead_alive, lead_prompt, lead_state_label};
+    use super::{lead_alive, lead_prompt, lead_prompt_for, lead_state_label, needs_list_repos_directives};
 
     #[test]
     fn busy_turn_reports_busy_even_without_resident_child() {
@@ -447,26 +476,36 @@ mod tests {
     fn lead_prompt_is_policy_not_fixed_sequence() {
         let prompt = lead_prompt();
         assert!(prompt.contains("converge WITH the human"));
-        assert!(prompt.contains("a policy, not a rigid script"));
-        assert!(prompt
-            .contains("Use the weft_planner MCP capabilities when they materially affect the plan"));
+        assert!(prompt.contains("Operate with judgment, not a rigid script"));
+        assert!(prompt.contains("Use weft_planner when it materially helps"));
         assert!(!prompt.contains("Start by greeting"));
         assert!(!prompt.contains("call get_task"));
+        // Action-card schema is always-on so a nonempty workspace can still
+        // import/create/clone another repo; list_repos is truncation-only.
+        assert!(prompt.contains("<weft:action_card>"));
+        assert!(!prompt.contains("<weft:list_repos/>"));
+        assert!(lead_prompt_for(true).contains("<weft:list_repos/>"));
+        assert!(!needs_list_repos_directives(0));
+        assert!(needs_list_repos_directives(crate::lead_chat::repo_state::MAX_LISTED + 1));
+        assert!(!needs_list_repos_directives(1));
     }
 
     /// The discuss-first gate: the split happens only after the human approves
-    /// the plan card (or explicitly skips), the plan is red-teamed for blind
-    /// spots first, and the old "split as soon as scope is clear" bar is gone.
+    /// the plan card (or explicitly skips). Judgment replaces rigid red-team
+    /// scripts; the old "split as soon as scope is clear" bar stays gone.
     #[test]
     fn lead_prompt_gates_split_on_plan_approval() {
         let prompt = lead_prompt();
         assert!(prompt.contains("<weft:plan_card>"));
         assert!(prompt.contains("<weft:plan_decision>"));
-        assert!(prompt.contains("red-team your own plan for blind spots"));
         assert!(prompt.contains("Call propose_directions only after the human approves"));
         assert!(prompt.contains("skip"));
         // Adaptive floor: trivial issues get a compact card, not an interrogation.
         assert!(prompt.contains("For trivial issues do not interrogate"));
+        // Parser persists plan cards verbatim, so the prompt must mandate
+        // normally-escaped JSON paragraph breaks (not double-escaped \\n).
+        assert!(prompt.contains("normally-escaped"));
+        assert!(prompt.contains("never double-escape"));
         // The eager-split bar and the question-rationing rule must be gone.
         assert!(!prompt.contains("clear enough for workers to start"));
         assert!(!prompt.contains("Ask clarifying questions only when"));
@@ -475,24 +514,21 @@ mod tests {
     }
 
     /// Phase 1.5: the test-case derivation is a soft policy — adaptive, no new
-    /// gate — with a RAW-markdown sentinel and an edit-feedback loop.
+    /// gate — with a raw-markdown sentinel, edit-feedback loop, and skill pointer.
     #[test]
     fn lead_prompt_derives_test_cases_before_shaping() {
         let prompt = lead_prompt();
         assert!(prompt.contains("<weft:test_cases>"));
-        assert!(prompt.contains("Between understanding the need and shaping the approach"));
+        assert!(prompt.contains("before locking the approach"));
         assert!(prompt.contains("skip silently for trivial fixes"));
-        assert!(prompt.contains("RAW markdown"));
+        assert!(prompt.contains("raw markdown only"));
         assert!(prompt.contains("<weft:test_cases_updated>"));
-        // Discovery loop: cases expose questions BEFORE the approach is shaped,
-        // and the approach is later checked against the cases.
-        assert!(prompt.contains("resolve it in conversation BEFORE shaping the approach"));
-        assert!(prompt.contains("a case the approach cannot satisfy is a gap in the approach"));
-        // The built-in methodology skill is referenced, with its two hard
-        // quality bars inlined as the always-on floor.
+        // Approach must still be checked against the cases; detailed quality
+        // bars live in the skill rather than always-on prompt prose.
+        assert!(prompt.contains("Treat uncovered cases as gaps in the approach"));
         assert!(prompt.contains("weft-derive-test-cases"));
-        assert!(prompt.contains("every leaf decidable"));
-        assert!(prompt.contains("user language only"));
+        assert!(!prompt.contains("every leaf decidable"));
+        assert!(!prompt.contains("user language only"));
     }
 
     /// plan_decision feedback gets its own sentinel tag; everything else keeps
@@ -517,10 +553,13 @@ mod tests {
 
     #[test]
     fn lead_prompt_action_card_schema_includes_optional_steps() {
-        let prompt = lead_prompt();
-        assert!(prompt.contains("\"steps\""));
-        assert!(prompt.contains("`steps` is optional"));
-        assert!(prompt.contains("<weft:repo_action>"));
+        let always = lead_prompt();
+        assert!(always.contains("\"steps\""));
+        assert!(always.contains("`steps` is optional"));
+        assert!(always.contains("<weft:repo_action>"));
+        assert!(!always.contains("<weft:list_repos/>"));
+        let with_list = lead_prompt_for(true);
+        assert!(with_list.contains("<weft:list_repos/>"));
     }
 
     #[test]

@@ -251,6 +251,11 @@ export interface LeadMessage {
   /** Engine-side rewind anchor (claude assistant uuid / codex turn id), recorded
    *  on the user row that opened a turn. Backend-owned; the UI never reads it. */
   native_anchor?: string | null;
+  /** Unix-millis when the agent produced its first observed activity for the
+   *  turn this ("user") row opened — the delivery receipt's third tier
+   *  ("已被 agent 消费", issue #94). Null/absent = not yet observed (still just
+   *  "delivered"). Only ever set on a "user" row whose status is "complete". */
+  consumed_at?: number | null;
   created_at: string;
 }
 
@@ -340,6 +345,15 @@ export type LeadChatPush =
       thread_id: number;
       session_id: number | null;
       native_id: string | null;
+    }
+  | {
+      /** The delivery receipt's third tier (issue #94): the agent produced its
+       *  first observed activity for the turn `message_id` (a "user" row)
+       *  opened. Fired at most once per turn. */
+      type: "consumed";
+      thread_id: number;
+      message_id: number;
+      consumed_at: number;
     };
 
 /** Rewind scope for `chat_rewind`: the conversation rows, the worktree code
@@ -498,6 +512,11 @@ export interface RepoEdge {
 export interface RepoGraph {
   nodes: RepoProfile[];
   edges: RepoEdge[];
+  /** Whether an analysis pass (auto or forced) is currently queued or running for
+   *  this workspace, from the backend's coalesced per-workspace gate. Lets the UI
+   *  render a not-yet-analyzed repo as "queued" (a pass will reach it) rather than
+   *  indistinguishable from "pending" (nothing scheduled — needs a manual click). */
+  analysis_active: boolean;
 }
 
 /** One item waiting in the engine's send queue (mirrors Rust QueuedItem). */
@@ -633,11 +652,13 @@ export interface FullGrant {
   dir: string;
 }
 
-/** A persisted "always allow" grant: this exact `summary` from (thread, dir). */
+/** A persisted "always allow" grant: this exact `action_key` (the canonical,
+ *  precise action identity — distinct from the ask's display `summary`) from
+ *  (thread, dir) auto-allows. See ask.rs::Ask::action_key. */
 export interface AlwaysGrant {
   thread: number;
   dir: string;
-  summary: string;
+  action_key: string;
 }
 
 /** Standing authorization grants that persist across restarts (Ask Bridge). The

@@ -113,6 +113,17 @@ export function ConfirmationAction(props: ComponentProps<typeof Button>) {
   return <Button type="button" {...props} />;
 }
 
+/** A visible (never hover-only) preview of an ask's full raw detail — see
+ *  `hasHiddenDetail` below for why this must not be opt-in. Bounded height with
+ *  its own scroll so a very long command/path list can't blow out the card. */
+function DetailPreview({ detail }: { readonly detail: string }) {
+  return (
+    <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-[var(--radius-md)] border border-border/60 bg-bg px-2 py-1.5 font-mono text-[11px] leading-relaxed text-ink-muted">
+      {detail}
+    </pre>
+  );
+}
+
 type PermissionConfirmationCardProps = {
   readonly ask: PermissionAsk;
   readonly onAnswer: (askId: number, answer: PermissionAnswer) => void;
@@ -142,6 +153,13 @@ export function PermissionConfirmationCard({
   const { t } = useTranslation();
   const detailTitle = ask.detail || ask.summary;
   const isBlockSummary = summaryMode === "block";
+  // `summary` may truncate to a single line (a multi-line command's first
+  // line — issue #89's cross-engine normalization) while `detail` carries the
+  // rest. Surfacing the rest ONLY via the hover `title` is not an informed
+  // decision: this card's Enter/⌘Enter shortcuts (below) can approve before a
+  // human ever hovers, so a hidden trailing line — e.g. a destructive second
+  // command — must be visible BY DEFAULT via `DetailPreview`, not opt-in.
+  const hasHiddenDetail = ask.detail.includes("\n");
   const rootRef = useRef<HTMLDivElement>(null);
 
   // On the in-session card (a single active ask) the keyboard answers it:
@@ -189,24 +207,38 @@ export function PermissionConfirmationCard({
       {/* `flex-1` matters in the in-session ROW layout: it stretches the title
           block so the actions pin to the card's right edge — a short summary
           ("/bin/echo hi") otherwise left the buttons floating mid-card. In the
-          default column layout it has no visible effect. */}
-      <div className="flex min-w-0 flex-1 items-center gap-2">
-        <ShieldQuestion size={14} className="shrink-0 text-waiting" />
-        {showToolIcon && <ToolIcon tool={ask.tool} size={13} />}
-        <ConfirmationTitle
-          className={cn("min-w-0 flex-1 truncate text-ink-muted", titleClassName)}
-        >
-          <span className="text-ink">{toolFullName(ask.tool)}</span>{" "}
-          {t("needs.wantsPermission")}
-          {!isBlockSummary && ask.summary && (
-            <span
-              className="ml-1.5 font-mono text-[11.5px] text-ink"
-              title={detailTitle}
-            >
-              {ask.summary}
-            </span>
+          default column layout it has no visible effect. `items-start` (rather
+          than `items-center`) lets that column grow taller without squashing
+          the icon/timestamp when a DetailPreview is showing below the title. */}
+      <div className="flex min-w-0 flex-1 items-start gap-2">
+        <ShieldQuestion size={14} className="mt-0.5 shrink-0 text-waiting" />
+        {showToolIcon && (
+          <ToolIcon tool={ask.tool} size={13} className="mt-0.5 shrink-0" />
+        )}
+        {/* Own flex-col wrapper (not just ConfirmationTitle's own classes): the
+            preview must be a SIBLING of the truncating title, never its
+            descendant — nesting it inside would inherit `truncate`'s
+            `overflow-hidden`/`nowrap` and clip the very content it exists to
+            reveal. */}
+        <div className="min-w-0 flex-1">
+          <ConfirmationTitle
+            className={cn("truncate text-ink-muted", titleClassName)}
+          >
+            <span className="text-ink">{toolFullName(ask.tool)}</span>{" "}
+            {t("needs.wantsPermission")}
+            {!isBlockSummary && ask.summary && (
+              <span
+                className="ml-1.5 font-mono text-[11.5px] text-ink"
+                title={detailTitle}
+              >
+                {ask.summary}
+              </span>
+            )}
+          </ConfirmationTitle>
+          {!isBlockSummary && hasHiddenDetail && (
+            <DetailPreview detail={ask.detail} />
           )}
-        </ConfirmationTitle>
+        </div>
         {timestamp}
       </div>
       {context}
@@ -218,6 +250,7 @@ export function PermissionConfirmationCard({
           {ask.summary}
         </p>
       )}
+      {isBlockSummary && hasHiddenDetail && <DetailPreview detail={ask.detail} />}
       <ConfirmationActions className={actionsClassName}>
         <ConfirmationAction
           size="sm"

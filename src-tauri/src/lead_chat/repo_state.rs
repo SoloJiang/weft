@@ -8,7 +8,7 @@
 
 use crate::store::{repo, Db};
 
-const MAX_LISTED: usize = 8;
+pub const MAX_LISTED: usize = 8;
 const FIELD_CAP: usize = 80;
 const ELLIPSIS: char = '…';
 const EMPTY_HINT: &str =
@@ -18,13 +18,22 @@ const EMPTY_HINT: &str =
 /// the empty form (no DB access) so the lead engine can call this even before
 /// a workspace is bound.
 pub async fn render_repo_state(db: &Db, workspace_id: Option<i32>) -> anyhow::Result<String> {
-    let ws_id_line = match workspace_id {
-        Some(id) => format!("current_workspace_id: {id}"),
-        None => "current_workspace_id: null".to_string(),
-    };
     let repos = match workspace_id {
         Some(id) => repo::list_repos(db, id).await?,
         None => Vec::new(),
+    };
+    Ok(render_repo_state_from(workspace_id, &repos))
+}
+
+/// Pure renderer used when the caller already loaded the repo list (so lead
+/// prompt assembly can decide situational sentinels without a second query).
+pub fn render_repo_state_from(
+    workspace_id: Option<i32>,
+    repos: &[crate::store::entities::repo_ref::Model],
+) -> String {
+    let ws_id_line = match workspace_id {
+        Some(id) => format!("current_workspace_id: {id}"),
+        None => "current_workspace_id: null".to_string(),
     };
     let total = repos.len();
 
@@ -55,7 +64,7 @@ pub async fn render_repo_state(db: &Db, workspace_id: Option<i32>) -> anyhow::Re
         }
     }
 
-    Ok(format!("<repo_state>\n{body}\n</repo_state>"))
+    format!("<repo_state>\n{body}\n</repo_state>")
 }
 
 /// Single-line + length-clip a string so it can't escape the `name @ path`

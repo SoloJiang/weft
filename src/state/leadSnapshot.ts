@@ -31,6 +31,33 @@ export function applyLeadFinalize(
   return orderLeadMessages(updated);
 }
 
+/** Apply a live "consumed" push (issue #94): stamp `consumed_at` on the one
+ *  row it names. No reordering — unlike a delivery seq, this never changes a
+ *  row's position, only what receipt it renders. */
+export function applyLeadConsumed(
+  rows: LeadMessage[],
+  messageId: number,
+  consumedAt: number,
+): LeadMessage[] {
+  return rows.map((row) => (row.id === messageId ? { ...row, consumed_at: consumedAt } : row));
+}
+
+/** A sent message's delivery lifecycle, as the UI needs to distinguish "the
+ *  agent never got this" from "the agent has it but hasn't answered yet"
+ *  (issue #94). `null` = nothing worth a receipt (queued rows render via
+ *  QueueStack instead; a streaming/unknown status has no user-row meaning). */
+export type ReceiptState = "delivered" | "consumed" | "interrupted" | "error";
+
+/** Pure classifier — single source of truth for the receipt: every renderer
+ *  maps through this instead of re-deriving `status`/`consumed_at` booleans
+ *  ad hoc at each call site. */
+export function receiptStateOf(m: Pick<LeadMessage, "status" | "consumed_at">): ReceiptState | null {
+  if (m.status === "error") return "error";
+  if (m.status === "interrupted") return "interrupted";
+  if (m.status !== "complete") return null;
+  return m.consumed_at != null ? "consumed" : "delivered";
+}
+
 function textOf(row: LeadMessage): string | null {
   try {
     const parsed = JSON.parse(row.content) as { text?: unknown };

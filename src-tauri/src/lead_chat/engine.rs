@@ -173,6 +173,14 @@ pub enum Push {
         session_id: Option<i32>,
         native_id: Option<String>,
     },
+    /// The delivery receipt's third tier (issue #94): the agent produced its
+    /// first observed activity for the turn `message_id` (a "user" row)
+    /// opened. Fired at most once per turn — see [`note_turn_activity`].
+    Consumed {
+        thread_id: i32,
+        message_id: i32,
+        consumed_at: i64,
+    },
 }
 
 /// 进行中 turn 最多排队多少条人类消息（满后 send 拒绝入队）。
@@ -389,6 +397,12 @@ fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
     inner.clock.begin_turn();
     // Plumbing starts a turn directly (not via send): keep the invariant.
     inner.current_origin_tag = None;
+    // No user row opens a hidden turn (it carries no `queue_id`/tracked row) —
+    // clear the pointer rather than leave it stale on whatever real turn ran
+    // last. Left stale, it would misattribute this turn's outcome to that old
+    // row: the rewind anchor (`set_lead_message_anchor` on TurnEnd) and the
+    // "consumed" receipt (`note_turn_activity`) both key off `turn_user_row`.
+    inner.turn_user_row = None;
     inner.turn_id
 }
 
@@ -518,6 +532,70 @@ async fn mark_queued_status(
         }
         Err(e) => eprintln!("[weft] queued message {status} finalize failed: {e}"),
     }
+}
+
+/// Record that the child produced SOME event for the in-flight turn — proof the
+/// agent is actively working, not merely that bytes reached its stdin. This is
+/// the ONE choke point every dialect's reader (resident/per-turn stdout in
+/// `spawn_reader`, codex app-server's `codex_consumer`) already calls to bump
+/// `clock.last_activity` for the idle watchdog; it now also carries the
+/// delivery receipt's third tier (issue #94 — "已被 agent 消费").
+///
+/// The first time this fires since the turn began, best-effort mark the
+/// turn's opening user row (`turn_user_row`) consumed and push the receipt.
+/// Fire-and-forget, off the engine lock: `mark_message_consumed` is a single
+/// idempotent UPDATE keyed by message id, so a dropped/delayed mark only
+/// delays the UI receipt — it can never block, retry into, or corrupt turn
+/// delivery (no OCC state is read or written here).
+///
+/// PR #117 review, P2: a QUEUED delivery's row only flips `status ==
+/// "complete"` AFTER its turn is already dispatched (`mark_queued_delivered`
+/// runs after `spawn_turn`/`client.start_turn` — see the flush sites), so the
+/// agent's first activity can race ahead of that flip and find the row
+/// `NotEligible`. Burning the one-shot gate on that transient outcome would
+/// strand the receipt at "delivered" forever even though the agent is
+/// actively working — so a `NotEligible` result re-arms the gate (only if
+/// this engine is still on the SAME turn/row) instead of accepting it as
+/// final.
+fn note_turn_activity(app: &AppHandle, db: &Db, eng: &EngineRef, inner: &mut EngineInner) {
+    inner.clock.last_activity = std::time::Instant::now();
+    if !inner.clock.mark_consumed_once() {
+        return;
+    }
+    let Some(message_id) = inner.turn_user_row else {
+        return;
+    };
+    let app = app.clone();
+    let db = db.clone();
+    let eng = eng.clone();
+    tauri::async_runtime::spawn(async move {
+        match repo::mark_message_consumed(&db, message_id).await {
+            Ok(repo::ConsumeMark::Marked(m)) => {
+                let _ = app.emit(
+                    EVENT,
+                    Push::Consumed {
+                        thread_id: m.thread_id,
+                        message_id: m.id,
+                        consumed_at: m.consumed_at.unwrap_or_default(),
+                    },
+                );
+            }
+            Ok(repo::ConsumeMark::AlreadyConsumed) => {}
+            Ok(repo::ConsumeMark::NotEligible) => {
+                let mut i = eng.lock().await;
+                // Ownership-guarded like every other post-await re-lock in
+                // this file: only re-arm if turn_user_row still names THIS
+                // row. If it moved on (a stop/reset, or the turn already
+                // advanced), a stale retry permit would misattribute a LATER
+                // turn's activity — advance_dequeued_turn already retargeted
+                // the gate correctly for that turn, don't second-guess it.
+                if i.turn_user_row == Some(message_id) {
+                    i.clock.rearm_consumed_gate();
+                }
+            }
+            Err(e) => eprintln!("[weft] mark_message_consumed failed: {e}"),
+        }
+    });
 }
 
 /// Single construction point for the Push::Turn state event. `state` is the wire
@@ -1246,6 +1324,12 @@ pub struct TurnClock {
     /// idle-save immediately followed by the feedback turn (same second)
     /// from being misread as a mid-turn save.
     pub started_millis: u64,
+    /// True once SOME activity has been observed for the in-flight turn.
+    /// Gates the one-time "consumed" receipt (issue #94, [`note_turn_activity`])
+    /// so repeated stdout lines / delta events within one turn don't re-query
+    /// the DB after the first — `mark_message_consumed` is idempotent on its
+    /// own, this just avoids the redundant round-trips.
+    consumed_marked: bool,
 }
 
 impl Default for TurnClock {
@@ -1254,6 +1338,7 @@ impl Default for TurnClock {
             started: None,
             last_activity: std::time::Instant::now(),
             started_millis: 0,
+            consumed_marked: false,
         }
     }
 }
@@ -1266,6 +1351,7 @@ impl TurnClock {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
+        self.consumed_marked = false;
     }
     /// Re-sync with the queue state after a turn ends (queued pop = new turn).
     fn on_turn_end(&mut self, still_busy: bool) {
@@ -1274,6 +1360,25 @@ impl TurnClock {
         } else {
             self.started = None;
         }
+    }
+    /// True only the FIRST call since the turn began (`begin_turn`) — the
+    /// caller uses this to fire the one-time "consumed" mark. Pure state flip,
+    /// no I/O: [`note_turn_activity`] is what actually persists/pushes it.
+    fn mark_consumed_once(&mut self) -> bool {
+        if self.consumed_marked {
+            false
+        } else {
+            self.consumed_marked = true;
+            true
+        }
+    }
+    /// Un-burn the one-shot gate: the attempted mark turned out to be
+    /// `NotEligible` (transient — e.g. a queued row not yet flipped to
+    /// "complete"), not a settled outcome, so the NEXT activity event should
+    /// retry rather than silently giving up on this turn's receipt forever
+    /// (PR #117 review, P2).
+    fn rearm_consumed_gate(&mut self) {
+        self.consumed_marked = false;
     }
 }
 
@@ -2040,6 +2145,28 @@ fn promote_queued_reservation(inner: &mut EngineInner, origin_tag: Option<String
     inner.turn_id
 }
 
+/// Retarget the two pieces of bookkeeping every EOF/TurnEnd handler must sync
+/// to whatever `TurnState::on_turn_end` just returned: `turn_user_row` (the
+/// rewind anchor AND the "consumed" receipt, issue #94, both key off it — see
+/// `note_turn_activity`) and `current_origin_tag` (rides the next turn's
+/// output frames). `None` (queue drained, engine goes idle) clears both.
+///
+/// Every dialect's turn-end site MUST route through this rather than
+/// hand-rolling the same two lines: a hand-rolled copy is exactly how PR
+/// #117's review found a P1 bug — the per-turn EOF branch in `spawn_reader`
+/// dequeued the next turn via `on_turn_end` but left `turn_user_row` pointing
+/// at the turn that just ended, so the dequeued turn's first activity
+/// mis-marked the WRONG (already-finished, or already-failed) row
+/// "consumed" and the row that actually ran was never marked at all —
+/// precisely the delivered/consumed truth-inversion issue #94 exists to
+/// prevent. Pure state transition, no I/O — callers still own their own
+/// EXTRA dialect-specific resets (e.g. claude's `last_assistant_uuid`, codex
+/// app-server's `turn_saw_text`) alongside this call.
+fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
+    inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+    inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+}
+
 /// Send a human message: optimistic-persist + either write through or queue.
 /// `images` ride the outbound message as base64 blocks; `files` are appended
 /// as plain paths (the agent reads them with its own tools).
@@ -2735,7 +2862,7 @@ async fn codex_consumer(
         match msg {
             ThreadMsg::Event(ChatEvent::TextDelta { text, item }) => {
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &eng, &mut inner);
                 let thread_id = inner.thread_id;
                 let (sid, turn) = (inner.session_id, inner.turn_id);
                 // Ensure the target row exists: item-keyed rows in `open_texts`
@@ -2801,7 +2928,7 @@ async fn codex_consumer(
             }
             ThreadMsg::Event(ChatEvent::TextDone { item, text }) => {
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &eng, &mut inner);
                 let streamed = item.as_ref().and_then(|k| inner.open_texts.remove(k));
                 match streamed {
                     // The item streamed: finalize its row, preferring the
@@ -2860,7 +2987,7 @@ async fn codex_consumer(
                 // unrelated stream's sentence into fragment bubbles. Serial
                 // ordering still holds: an item's completion precedes its tools.
                 let mut inner = eng.lock().await;
-                inner.clock.last_activity = std::time::Instant::now();
+                note_turn_activity(&app, &db, &eng, &mut inner);
                 if !texts.is_empty() {
                     finalize_current_text(&app, &db, &mut inner, "complete").await;
                 }
@@ -2983,14 +3110,9 @@ async fn codex_consumer(
                     }
                 }
                 let next = inner.turn.on_turn_end();
-                // Rewind bookkeeping passes to the dequeued turn: its user row is
-                // the queued row's id (None for plumbing turns or going idle).
-                inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+                advance_dequeued_turn(&mut inner, &next);
                 inner.last_assistant_uuid = None;
                 inner.turn_saw_text = false;
-                // Next turn's tag becomes the in-flight tag (None when going idle),
-                // so the dequeued turn's output frames carry its own origin_tag.
-                inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
                 let next_turn_id = if next.is_some() {
                     inner.turn_id += 1;
                     Some(inner.turn_id)
@@ -3122,7 +3244,8 @@ async fn codex_consumer(
             ThreadMsg::Heartbeat => {
                 // outputDelta from a long-running command: no row change, just keep
                 // the turn alive so the idle watchdog doesn't reap it mid-output.
-                eng.lock().await.clock.last_activity = std::time::Instant::now();
+                let mut inner = eng.lock().await;
+                note_turn_activity(&app, &db, &eng, &mut inner);
             }
             ThreadMsg::Approval { id, method, params } => {
                 // An approval (command / file-change / permissions) — route to Weft's
@@ -3132,23 +3255,17 @@ async fn codex_consumer(
                 // asks never reach here — they're declined in the read_loop.
                 let is_perm = method.contains("permissions");
                 let (thread_id, dir) = {
-                    let i = eng.lock().await;
+                    let mut i = eng.lock().await;
+                    // An approval request IS the agent actively working on
+                    // this turn — it just needs a human before it can go
+                    // further. Without this, a turn whose FIRST event is an
+                    // approval (no preceding text/tool-call delta) would
+                    // leave the receipt stuck at "delivered" while the user
+                    // stares at a Needs-you card that proves otherwise (PR
+                    // #117 review, P2).
+                    note_turn_activity(&app, &db, &eng, &mut i);
                     (i.thread_id, i.ask_dir.clone())
                 };
-                // command/cwd may sit at the top level (commandExecution ask) or
-                // nested under `item` (the generic permissions ask) — read both.
-                let cmd = params["command"]
-                    .as_str()
-                    .or_else(|| params["item"]["command"].as_str());
-                let is_cmd = method.contains("commandExecution") || cmd.is_some();
-                let net = params
-                    .get("networkApprovalContext")
-                    .or_else(|| params["item"].get("networkApprovalContext"))
-                    .filter(|v| !v.is_null());
-                let has_changes = params["changes"]
-                    .as_array()
-                    .or_else(|| params["item"]["changes"].as_array())
-                    .is_some_and(|c| !c.is_empty());
                 // Requested permission profile (also echoed back as the grant on allow).
                 let requested = params
                     .get("permissions")
@@ -3156,39 +3273,16 @@ async fn codex_consumer(
                     .or_else(|| params["params"].get("permissions"))
                     .filter(|v| !v.is_null())
                     .cloned();
-                // Network FIRST: a network-only ask arrives as a commandExecution
-                // approval (so is_cmd is true) with the command omitted, so the cmd
-                // branch would otherwise mislabel + Always-key it as Bash.
-                let (tool, summary) = if let Some(net) = net {
-                    let host = net["host"]
-                        .as_str()
-                        .or_else(|| net["url"].as_str())
-                        .or_else(|| net["domain"].as_str())
-                        .unwrap_or("network");
-                    ("Network", format!("network access: {host}"))
-                } else if is_cmd {
-                    ("Bash", cmd.unwrap_or("(command)").to_string())
-                } else if has_changes {
-                    // Include the changed path(s): the AskRegistry keys Always rules
-                    // by (thread, dir, summary), so a constant "apply file changes"
-                    // would let one Always blanket-allow every later edit.
-                    ("Edit", codex_change_approval_summary(&params))
-                } else {
-                    // A permission escalation — key it by the REQUESTED scope, else an
-                    // Always for one profile silently grants a later, different one.
-                    let scope = requested
-                        .as_ref()
-                        .map(|v| v.to_string().chars().take(120).collect::<String>())
-                        .unwrap_or_else(|| "(unspecified)".to_string());
-                    ("Permission", format!("permission: {scope}"))
-                };
-                let detail = params["cwd"]
-                    .as_str()
-                    .or_else(|| params["item"]["cwd"].as_str())
-                    .unwrap_or_default()
-                    .to_string();
+                // `summary` is a compact DISPLAY label (may truncate — a >3-path
+                // edit, a 120-char permission scope); `detail` is the FULL raw
+                // content (untruncated, shown in the detail tooltip / IM
+                // plain-text card); `action_key` is the EXACT action identity
+                // used ONLY for Always-grant matching (never displayed) — see
+                // #89. Mirrors `bus::server::summarize`'s claude/opencode shape
+                // so both engines share the same canonical action-key semantics.
+                let (tool, summary, detail, action_key) = codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
-                match registry.auto_decision(thread_id, &dir, &summary) {
+                match registry.auto_decision(thread_id, &dir, &action_key) {
                     // dangerous mode / full access / always-allow: reply inline (fast).
                     Some(d) => {
                         let allow = matches!(d, crate::ask::Decision::Allow);
@@ -3205,7 +3299,14 @@ async fn codex_consumer(
                     // stale card is answered. A late reply to an already-resolved turn
                     // is harmless (codex ignores it).
                     None => {
-                        let (aid, rx) = registry.request(thread_id, &dir, tool, &summary, &detail);
+                        let (aid, rx) = registry.request(
+                            thread_id,
+                            &dir,
+                            tool,
+                            &summary,
+                            &detail,
+                            &action_key,
+                        );
                         // Remember this card by server-request id so a later
                         // serverRequest/resolved can cancel it; clear on answer.
                         let key = id.to_string();
@@ -3248,10 +3349,100 @@ async fn codex_consumer(
 }
 
 
-/// Specific Needs-you summary for an app-server file-change approval: the
-/// changed path(s) (top-level or nested under `item`), so each distinct edit
-/// gets its own Always-rule key instead of one blanket "apply file changes".
-fn codex_change_approval_summary(params: &serde_json::Value) -> String {
+/// The (tool, summary, detail, action_key) quadruple for a codex app-server
+/// approval — computed ONCE so the Needs-you card, the IM card, and Always
+/// matching all agree. `summary` is a compact DISPLAY label that may truncate
+/// (a >3-path edit, a 120-char permission scope); `detail` is the FULL raw
+/// content (untruncated); `action_key` is the EXACT action identity used ONLY
+/// for Always-grant matching (never displayed). Mirrors `bus::server::summarize`'s
+/// claude/opencode shape so both engines share the same canonical semantics —
+/// see issue #89.
+fn codex_approval_fields(
+    method: &str,
+    params: &serde_json::Value,
+) -> (&'static str, String, String, String) {
+    // command/cwd may sit at the top level (commandExecution ask) or nested
+    // under `item` (the generic permissions ask) — read both.
+    let cmd = params["command"]
+        .as_str()
+        .or_else(|| params["item"]["command"].as_str());
+    let is_cmd = method.contains("commandExecution") || cmd.is_some();
+    let net = params
+        .get("networkApprovalContext")
+        .or_else(|| params["item"].get("networkApprovalContext"))
+        .filter(|v| !v.is_null());
+    let has_changes = params["changes"]
+        .as_array()
+        .or_else(|| params["item"]["changes"].as_array())
+        .is_some_and(|c| !c.is_empty());
+
+    // Network FIRST: a network-only ask arrives as a commandExecution approval
+    // (so is_cmd is true) with the command omitted, so the cmd branch would
+    // otherwise mislabel + Always-key it as Bash.
+    if let Some(net) = net {
+        let host = net["host"]
+            .as_str()
+            .or_else(|| net["url"].as_str())
+            .or_else(|| net["domain"].as_str())
+            .unwrap_or("network");
+        let action_key = crate::ask::action_key(&["Network", host]);
+        return (
+            "Network",
+            format!("network access: {host}"),
+            host.to_string(),
+            action_key,
+        );
+    }
+    if is_cmd {
+        let full = cmd.unwrap_or("(command)").to_string();
+        let first = full.lines().next().unwrap_or("").to_string();
+        // action_key = the full, untruncated command — a later line or arg
+        // change is a different action even if the first line (and thus
+        // `summary`) matches. Routed through the SAME collision-resistant
+        // encoding as bus::server::summarize (crate::ask::action_key) — a bare
+        // `format!("Bash:{full}")` join is a fixed-literal-prefixed string, so
+        // it's safe here in isolation, but using one canonical helper for every
+        // engine's action_key removes any need to re-litigate that argument
+        // per call site (see #89's round-2 finding on the claude/opencode side).
+        let action_key = crate::ask::action_key(&["Bash", &full]);
+        return ("Bash", format!("Run: {first}"), full.clone(), action_key);
+    }
+    if has_changes {
+        // `full_paths` is the UNTRUNCATED changed-path list: the AskRegistry
+        // keys Always rules by action_key, so a >3-path edit whose display
+        // summary caps at "first 3 + N" must still disambiguate from a
+        // DIFFERENT >3-path edit sharing that same capped label.
+        let (summary, full_paths) = codex_change_approval_summary(params);
+        let action_key = crate::ask::action_key(&["Edit", &full_paths]);
+        return ("Edit", summary, full_paths, action_key);
+    }
+    // A permission escalation — key it by the REQUESTED scope, else an Always
+    // for one profile silently grants a later, different one.
+    let requested = params
+        .get("permissions")
+        .or_else(|| params["item"].get("permissions"))
+        .or_else(|| params["params"].get("permissions"))
+        .filter(|v| !v.is_null());
+    let scope_json = requested
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "(unspecified)".to_string());
+    let scope_label: String = scope_json.chars().take(120).collect();
+    let action_key = crate::ask::action_key(&["Permission", &scope_json]);
+    (
+        "Permission",
+        format!("permission: {scope_label}"),
+        scope_json,
+        action_key,
+    )
+}
+
+/// Specific Needs-you summary for an app-server file-change approval: a compact
+/// DISPLAY label capped at 3 paths (`take(3) + "+N"`), plus the FULL
+/// (untruncated) changed-path list (top-level or nested under `item`) for the
+/// detail panel / action key — so a >3-path edit still gets its own exact
+/// Always-rule key instead of colliding with a different >3-path edit that
+/// happens to share its first 3 paths + count (issue #89).
+fn codex_change_approval_summary(params: &serde_json::Value) -> (String, String) {
     let changes = params["changes"]
         .as_array()
         .or_else(|| params["item"]["changes"].as_array());
@@ -3259,17 +3450,20 @@ fn codex_change_approval_summary(params: &serde_json::Value) -> String {
         .map(|cs| cs.iter().filter_map(|c| c["path"].as_str()).collect())
         .unwrap_or_default();
     if paths.is_empty() {
-        return "apply file changes".to_string();
+        return ("apply file changes".to_string(), String::new());
     }
-    let mut s = format!(
+    let mut summary = format!(
         "apply file changes: {}",
         paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
     );
     let more = paths.len().saturating_sub(3);
     if more > 0 {
-        s.push_str(&format!(" +{more}"));
+        summary.push_str(&format!(" +{more}"));
     }
-    s
+    // JSON-array encoding: unambiguous (each path quoted/escaped) even if a
+    // path itself contains ", ".
+    let full = serde_json::to_string(&paths).unwrap_or_default();
+    (summary, full)
 }
 
 /// One per-turn process (codex/opencode): the message rides the argv, events
@@ -5052,7 +5246,7 @@ fn spawn_reader(
             if inner.generation != generation {
                 return; // superseded by a respawn/stop
             }
-            inner.clock.last_activity = std::time::Instant::now();
+            note_turn_activity(&app, &db, &eng, &mut inner);
             let thread_id = inner.thread_id;
             // Per-turn dialects carry the native session id on their events.
             if inner.native_id.is_none() {
@@ -5398,13 +5592,10 @@ fn spawn_reader(
                         );
                     }
                     let next = inner.turn.on_turn_end();
-                    // Rewind bookkeeping passes to the dequeued turn: its user row
-                    // is the queued row's id (None for plumbing turns/going idle).
-                    inner.turn_user_row = next.as_ref().and_then(|n| n.queue_id);
+                    // Set BEFORE `next`'s input is dispatched below so its output
+                    // frames carry the retargeted origin tag.
+                    advance_dequeued_turn(&mut inner, &next);
                     inner.last_assistant_uuid = None;
-                    // The next turn's tag becomes the in-flight tag (None when going
-                    // idle), set BEFORE its input is dispatched so its frames carry it.
-                    inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
                     if let Some(next) = next {
                         inner.turn_id += 1;
                         let next_turn_id = inner.turn_id;
@@ -5557,8 +5748,13 @@ fn spawn_reader(
             }
             inner.child = None;
             let next = inner.turn.on_turn_end();
-            // Carry the dequeued turn's tag (None when going idle) onto its frames.
-            inner.current_origin_tag = next.as_ref().and_then(|n| n.origin_tag.clone());
+            // A kill-only interrupt (see interrupt()) leaves `generation`/the
+            // queue untouched, so THIS EOF branch — not a reset — is what runs
+            // for a per-turn dialect's interrupted turn; it must retarget
+            // turn_user_row/current_origin_tag to `next` like every other
+            // dequeue site (see advance_dequeued_turn's own doc for why this
+            // one previously didn't, and what broke).
+            advance_dequeued_turn(&mut inner, &next);
             if let Some(next) = next {
                 inner.turn_id += 1;
                 let next_turn_id = inner.turn_id;
@@ -6302,19 +6498,107 @@ mod tests {
         let b = codex_change_approval_summary(&serde_json::json!({
             "item": {"changes": [{"path": "src/b.rs"}]}
         }));
-        assert_eq!(a, "apply file changes: src/a.rs");
-        assert_eq!(b, "apply file changes: src/b.rs");
-        assert_ne!(a, b);
-        // >3 paths are capped with a +N suffix.
+        assert_eq!(a.0, "apply file changes: src/a.rs");
+        assert_eq!(b.0, "apply file changes: src/b.rs");
+        assert_ne!(a.0, b.0);
+        assert_eq!(a.1, r#"["src/a.rs"]"#);
+        // >3 paths are capped with a +N suffix in the DISPLAY summary...
         let many = codex_change_approval_summary(&serde_json::json!({
             "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"4"},{"path":"5"}]
         }));
-        assert_eq!(many, "apply file changes: 1, 2, 3 +2");
+        assert_eq!(many.0, "apply file changes: 1, 2, 3 +2");
+        // ...but the FULL path list (used for the action key) keeps every path.
+        assert_eq!(many.1, r#"["1","2","3","4","5"]"#);
         // no paths → the generic label (still answerable, just not Always-specific).
         assert_eq!(
             codex_change_approval_summary(&serde_json::json!({})),
-            "apply file changes"
+            ("apply file changes".to_string(), String::new())
         );
+    }
+
+    /// Issue #89's Codex ">3-path edit" acceptance case: two DIFFERENT >3-path
+    /// edits can share the SAME capped display summary (first 3 + count), so the
+    /// action_key must be built from the full path list, not the summary.
+    #[test]
+    fn codex_change_approval_full_paths_disambiguate_beyond_the_take3_cap() {
+        let a = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"4"}]
+        }));
+        let b = codex_change_approval_summary(&serde_json::json!({
+            "changes": [{"path":"1"},{"path":"2"},{"path":"3"},{"path":"5"}]
+        }));
+        assert_eq!(a.0, b.0, "both display as \"apply file changes: 1, 2, 3 +1\"");
+        // ...but the full (untruncated) list disambiguates them.
+        assert_ne!(a.1, b.1);
+    }
+
+    /// Issue #89: `codex_approval_fields` produces the (tool, summary, detail,
+    /// action_key) quadruple for every approval kind, with `action_key` always
+    /// exact even where `summary` truncates for display.
+    #[test]
+    fn codex_approval_fields_action_key_is_exact_and_summary_may_truncate() {
+        // Bash: summary truncates to the first line; action_key carries the full
+        // multi-line command (mirrors bus::server::summarize's claude shape).
+        let (tool, summary, detail, key) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"command": "npm test\nrm -rf /", "cwd": "/repo"}),
+        );
+        assert_eq!(tool, "Bash");
+        assert_eq!(summary, "Run: npm test");
+        assert_eq!(detail, "npm test\nrm -rf /");
+        assert!(key.contains("rm -rf /"));
+        // A different multi-line command sharing the same first line differs in key.
+        let (_, summary2, _, key2) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"command": "npm test\necho safe"}),
+        );
+        assert_eq!(summary2, summary);
+        assert_ne!(key2, key);
+
+        // Network: keyed by host — network FIRST beats the commandExecution method.
+        let (tool, summary, _detail, key) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"networkApprovalContext": {"host": "example.com"}}),
+        );
+        assert_eq!(tool, "Network");
+        assert_eq!(summary, "network access: example.com");
+        assert_eq!(key, crate::ask::action_key(&["Network", "example.com"]));
+
+        // Edit: action_key carries the FULL path list even beyond the 3-path cap.
+        let (tool, summary, _detail, key) = codex_approval_fields(
+            "applyPatchApproval",
+            &serde_json::json!({"changes": [{"path":"a"},{"path":"b"},{"path":"c"},{"path":"d"}]}),
+        );
+        assert_eq!(tool, "Edit");
+        assert_eq!(summary, "apply file changes: a, b, c +1");
+        assert!(key.contains('d'));
+
+        // Permission: summary truncates the scope at 120 chars; action_key (and
+        // detail) keep it whole.
+        let long_scope = "x".repeat(200);
+        let (tool, summary, detail, key) = codex_approval_fields(
+            "elicitation/permissions",
+            &serde_json::json!({"permissions": {"note": long_scope}}),
+        );
+        assert_eq!(tool, "Permission");
+        assert!(summary.len() < detail.len());
+        assert_eq!(key, crate::ask::action_key(&["Permission", &detail]));
+    }
+
+    /// Same collision class as `bus::server`'s round-2 finding, mirrored on the
+    /// codex side for defense in depth: the fixed literal kind tags ("Bash",
+    /// "Edit", ...) already make a bare `format!` join safe here in isolation
+    /// (no two kinds share a prefix), but routing through the shared
+    /// `crate::ask::action_key` helper — rather than re-deriving that argument —
+    /// is what actually GUARANTEES it, and keeps both engines' action_keys
+    /// built by the same one canonical, provably-injective encoding.
+    #[test]
+    fn codex_approval_fields_action_key_uses_the_shared_collision_resistant_encoding() {
+        let (_, _, _, bash_key) = codex_approval_fields(
+            "codex/commandExecution",
+            &serde_json::json!({"command": "echo hi"}),
+        );
+        assert_eq!(bash_key, crate::ask::action_key(&["Bash", "echo hi"]));
     }
 
     #[test]
@@ -6578,6 +6862,64 @@ mod tests {
         assert!(inner.clock.started.is_some(), "promotion starts the turn clock");
     }
 
+    fn queued_outgoing(queue_id: i32, origin_tag: &str) -> Outgoing {
+        Outgoing {
+            text: "text".into(),
+            origin_tag: Some(origin_tag.into()),
+            queue_id: Some(queue_id),
+            ..Default::default()
+        }
+    }
+
+    /// PR #117 review, P1: reproduces the exact scenario from a real per-turn
+    /// dialect's kill-only interrupt (opencode always; codex without the
+    /// app-server) — turn A is interrupted, B sits queued behind it, A's
+    /// stdout then EOFs and `on_turn_end` dequeues B. Without
+    /// `advance_dequeued_turn` retargeting `turn_user_row`, the pointer would
+    /// still read A: B's first activity would then mis-mark A "consumed" (A
+    /// never ran again) while B's own row — the one the agent actually
+    /// processed — stayed "delivered" forever. That is the exact
+    /// delivered/consumed truth-inversion issue #94 exists to prevent.
+    #[test]
+    fn advance_dequeued_turn_retargets_from_the_finished_turn_to_the_dequeued_one() {
+        let mut inner = test_inner("opencode");
+        // Turn A just finished (interrupted): its bookkeeping is still live
+        // until on_turn_end + advance_dequeued_turn catch up.
+        inner.turn_user_row = Some(1); // A's message id
+        inner.current_origin_tag = Some("a-tag".into());
+        inner.turn.busy = true;
+        inner.turn.queue.push_back(queued_outgoing(2, "b-tag")); // B's message id
+
+        let next = inner.turn.on_turn_end(); // pops B
+        advance_dequeued_turn(&mut inner, &next);
+
+        assert_eq!(
+            inner.turn_user_row,
+            Some(2),
+            "must retarget to B's row, not linger on A's finished turn"
+        );
+        assert_eq!(inner.current_origin_tag.as_deref(), Some("b-tag"));
+    }
+
+    /// The other half of the same bookkeeping: a drained queue must clear
+    /// `turn_user_row`/`current_origin_tag` rather than leave them pointing at
+    /// the turn that just ended — an idle engine must not attribute a LATER,
+    /// unrelated turn's activity (e.g. a hidden bus-wake read) to an old row.
+    #[test]
+    fn advance_dequeued_turn_clears_pointers_when_the_queue_drains_to_idle() {
+        let mut inner = test_inner("opencode");
+        inner.turn_user_row = Some(1);
+        inner.current_origin_tag = Some("a-tag".into());
+        inner.turn.busy = true; // empty queue: on_turn_end goes idle
+
+        let next = inner.turn.on_turn_end();
+        assert!(next.is_none(), "precondition: nothing queued behind A");
+        advance_dequeued_turn(&mut inner, &next);
+
+        assert_eq!(inner.turn_user_row, None);
+        assert_eq!(inner.current_origin_tag, None);
+    }
+
     #[test]
     fn turn_clock_follows_queue() {
         let mut c = TurnClock::default();
@@ -6588,6 +6930,39 @@ mod tests {
         assert!(c.started.is_some());
         c.on_turn_end(false); // queue drained → idle
         assert!(c.started.is_none());
+    }
+
+    /// [`TurnClock::mark_consumed_once`] fires exactly once per turn — the gate
+    /// `note_turn_activity` uses so a chatty turn's later stdout lines / delta
+    /// events don't re-query the DB after the first "consumed" mark landed.
+    #[test]
+    fn mark_consumed_once_fires_once_then_resets_on_new_turn() {
+        let mut c = TurnClock::default();
+        // Fresh clock, no turn begun yet: still gates true→false like any other
+        // "first observation" — begin_turn is what a real send always calls
+        // first, but the gate itself doesn't depend on it.
+        assert!(c.mark_consumed_once(), "first observation fires");
+        assert!(!c.mark_consumed_once(), "second observation in the same turn no-ops");
+        assert!(!c.mark_consumed_once(), "third+ stays a no-op");
+        // A new turn resets the gate — begin_turn is called at EVERY turn-start
+        // site (direct send, promoted queue, dequeue via on_turn_end(true)).
+        c.begin_turn();
+        assert!(c.mark_consumed_once(), "a new turn re-arms the gate");
+        assert!(!c.mark_consumed_once(), "and gates again within that turn");
+    }
+
+    /// `on_turn_end(true)` (a queued message popped into a fresh turn) goes
+    /// through `begin_turn` internally, so it must re-arm the gate exactly like
+    /// a direct/promoted send does — a dequeued turn's activity must still be
+    /// attributable to ITS OWN opening row, not silently skipped because the
+    /// previous turn already consumed the gate.
+    #[test]
+    fn mark_consumed_once_rearms_across_queue_dequeue() {
+        let mut c = TurnClock::default();
+        c.begin_turn();
+        assert!(c.mark_consumed_once());
+        c.on_turn_end(true); // dequeue: still busy → begin_turn() again
+        assert!(c.mark_consumed_once(), "the dequeued turn gets its own first mark");
     }
 
     #[test]
@@ -6770,6 +7145,7 @@ mod tests {
             created_at: "0".into(),
             seq: None,
             native_anchor: None,
+            consumed_at: None,
         };
         let plain = Outgoing { text: "edited".into(), queue_id: Some(1), ..Default::default() };
         // Plain text, no attachments → use the (edited) Outgoing text.

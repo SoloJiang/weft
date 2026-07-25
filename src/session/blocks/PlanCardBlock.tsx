@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AlertTriangle, Check, GitBranch, ListTree } from "lucide-react";
+import { Check, GitBranch, ListTree } from "lucide-react";
 
 import { Button } from "../../components/ui/Button";
-import { Markdown } from "../../components/Markdown";
+import { PlanSummary } from "./PlanSummary";
 
 /** Coarse direction preview inside a plan card (not the real proposal — the
  *  Needs-you direction card stays the authoritative confirmation surface). */
@@ -65,31 +65,12 @@ export function PlanCardBlock({
         </span>
         {title ? <span className="min-w-0 truncate text-sm font-medium text-ink">{title}</span> : null}
       </div>
-      {requirements.length > 0 ? (
-        <section className="mt-3">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-ink-faint">
-            {t("planCard.requirements")}
-          </div>
-          <ul className="mt-1.5 grid gap-1 text-xs text-ink-muted">
-            {requirements.map((r, i) => (
-              <li key={`${i}-${r}`} className="flex gap-2">
-                <Check size={13} className="mt-px shrink-0 text-ink-faint" />
-                <span className="min-w-0 leading-relaxed">{r}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-      {approach ? (
-        <section className="mt-3">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-ink-faint">
-            {t("planCard.approach")}
-          </div>
-          <div className="mt-1.5 max-w-[62ch] text-xs leading-relaxed text-ink-muted">
-            <Markdown text={approach} cwd={cwd} />
-          </div>
-        </section>
-      ) : null}
+      {/* Requirements → approach → risks share PlanSummary with the merged
+          ScopeReview screen (issue #104) — one place defines how a plan reads.
+          Risks now render right after the approach (still open risks are the
+          thing most worth seeing before approving) instead of dangling after
+          the split preview, where they used to be easy to scroll past. */}
+      <PlanSummary requirements={requirements} approach={approach} risks={risks} cwd={cwd} />
       {split.length > 0 ? (
         <section className="mt-3">
           <div className="text-[11px] font-medium uppercase tracking-wide text-ink-faint">
@@ -106,21 +87,6 @@ export function PlanCardBlock({
                   </span>
                   {s.reason ? <span>{s.reason}</span> : null}
                 </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-      {risks.length > 0 ? (
-        <section className="mt-3">
-          <div className="text-[11px] font-medium uppercase tracking-wide text-ink-faint">
-            {t("planCard.risks")}
-          </div>
-          <ul className="mt-1.5 grid gap-1 text-xs text-ink-muted">
-            {risks.map((r, i) => (
-              <li key={`${i}-${r}`} className="flex gap-2">
-                <AlertTriangle size={13} className="mt-px shrink-0 text-amber-500" />
-                <span className="min-w-0 leading-relaxed">{r}</span>
               </li>
             ))}
           </ul>

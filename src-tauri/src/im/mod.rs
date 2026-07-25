@@ -1949,8 +1949,8 @@ mod tests {
         let t2 = crate::store::repo::create_thread(&db, w.id, "结算优化", "feature", "claude")
             .await
             .unwrap();
-        let _ = asks.request(t1.id, "10", "claude", "Run: npm test", "npm test");
-        let _ = asks.request(t2.id, "20", "codex", "Edit src/foo.rs", "src/foo.rs");
+        let _ = asks.request(t1.id, "10", "claude", "Run: npm test", "npm test", "npm test");
+        let _ = asks.request(t2.id, "20", "codex", "Edit src/foo.rs", "src/foo.rs", "src/foo.rs");
 
         let items = build_resync_items(&db, &asks).await;
         assert_eq!(items.len(), 2);
@@ -1973,7 +1973,7 @@ mod tests {
         // 异常路径：DB 里没有这个 thread 行（route 残留），label 退化为 summary。
         let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
         let asks = crate::ask::AskRegistry::new();
-        let _ = asks.request(999, "10", "claude", "Run: npm test", "npm test");
+        let _ = asks.request(999, "10", "claude", "Run: npm test", "npm test", "npm test");
         let items = build_resync_items(&db, &asks).await;
         assert_eq!(items, vec![(999, "Run: npm test".to_string())]);
     }
