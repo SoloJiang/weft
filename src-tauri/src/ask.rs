@@ -217,23 +217,21 @@ const CRED_NET_MARKERS: &[&str] = &[
     // product (`src/network/mod.rs`, `tokenizer.py` both matched before this
     // fix), so a raw substring check produced frequent false positives on
     // the MOST severe tier, eroding trust in the badge exactly the way
-    // under-classifying would. These punctuation-anchored forms keep the
-    // signal — a JSON `"network":` key (Codex's own permission-scope shape,
-    // see `codex_approval_fields`'s final Permission branch); a
-    // `_token`-suffixed identifier (`$GITHUB_TOKEN`, `AUTH_TOKEN`); a
-    // `token=` shell assignment; a `"token":` JSON key — without matching a
-    // bare path segment or module/file name.
-    "\"network\":",
+    // under-classifying would. `_token`/`token=` keep a punctuation-anchored
+    // signal for shell-variable/assignment shapes (`$GITHUB_TOKEN`,
+    // `AUTH_TOKEN`, `token=xyz`) without matching a bare path segment or
+    // module/file name. The literal `"network":`/`"token":` JSON-key forms
+    // that used to live here were superseded by `has_json_key` (round-3
+    // review: those two literals missed single-quoted pseudo-JSON and a
+    // space before the colon — see `matches_cred_net`).
     "_token",
     "token=",
-    "\"token\":",
 ];
 
 /// Leading commands treated as read-only when they open a shell command that
 /// didn't already match `CRED_NET_MARKERS`, has NO shell control construct
-/// anywhere (see `has_shell_control`), and — for `find`/`git branch`, whose
-/// OWN flags decide destructiveness — isn't flagged destructive (see
-/// `find_is_destructive`/`git_branch_is_destructive`). Matched against the
+/// anywhere (see `has_shell_control`), and passes that command's OWN flag
+/// policy (see `FLAG_POLICIES` / `is_read_only_command`). Matched against the
 /// START of the (trimmed) command text so e.g. `"lsof"` doesn't false-match
 /// the `"ls"` entry (see `starts_with_command`).
 const READ_ONLY_COMMAND_WORDS: &[&str] = &[
@@ -258,6 +256,179 @@ const READ_ONLY_COMMAND_WORDS: &[&str] = &[
     "git show",
     "git branch",
     "git rev-parse",
+];
+
+/// Per-command flag WHITELISTS for the read-only leading-command check.
+///
+/// Round-3 review (issue #101): round-2 added a flag BLACKLIST for exactly
+/// the two commands a first pass of adversarial testing happened to probe
+/// (`find -delete`/`-exec`, `git branch -d`/`-D`) — and the very next review
+/// round found two MORE holes in the SAME blacklist shape, on COMMANDS THAT
+/// WEREN'T EVEN ON THE BLACKLIST'S RADAR: `git log`/`git diff`/`git show`
+/// all accept `--output=<file>` (redirects generated output to an arbitrary
+/// path — confirmed against real git), and round-2's OWN new
+/// `git_branch_is_destructive` check used an exact-token match
+/// (`"-d" | "--delete"`) that `git branch -vd` (a POSIX-bundled short
+/// option, `-v` + `-d` in one token — confirmed: real git deletes the
+/// branch) walked straight past. A per-command dangerous-flag blacklist is
+/// structurally doomed: every command has an open-ended, evolving flag
+/// surface, and each new safe-looking command added to
+/// `READ_ONLY_COMMAND_WORDS` is a fresh, un-audited attack surface.
+///
+/// So: every command here (except `find`, see below) is governed by a SAFE-
+/// flag whitelist instead — `is_read_only_command` accepts it ONLY when
+/// EVERY flag-shaped token is in ITS OWN whitelist below (after POSIX short-
+/// option unbundling, so `-vd` becomes `-v` + `-d` and is correctly
+/// rejected — see `flags_in_token`). An unrecognized flag defaults to
+/// `Write`. This flips the failure direction: a legitimate-but-unlisted
+/// invocation (`git log --follow`) reads as "needs a closer look" instead of
+/// a genuinely destructive one reading as "safe to skim" — the SAME safety
+/// bias this whole classifier already commits to everywhere else. A count-
+/// like flag (`-5`, `-20`) is accepted for ANY command without needing to be
+/// listed (`is_universally_safe_flag`).
+///
+/// KNOWN, ACCEPTED precision loss: a short flag with a DIRECTLY-ATTACHED
+/// value (`-M50%`, `-n5`, no space) unbundles character-by-character and
+/// will usually fail the whitelist even though the space-separated form
+/// (`-M 50%`, `-n 5`) passes — this only ever pushes a legitimate invocation
+/// toward `Write`, never the other way, so it's accepted rather than adding
+/// per-flag arity metadata for marginal precision.
+///
+/// `find` is NOT here: its flags (`-delete`, `-exec`, `-name`, …) are
+/// multi-letter SINGLE-dash tokens that do NOT POSIX-bundle the way these
+/// do (`-delete` is one flag, not six) — unbundling would misparse it. Its
+/// action vocabulary (the primaries capable of a side effect: delete/exec/
+/// write-to-file) is a small, closed, well-documented set, so it keeps its
+/// own dedicated blacklist-style check (`find_is_destructive`) rather than
+/// forcing an ill-fitting generic mechanism onto it — see that function's
+/// doc comment for why a blacklist is still defensible there specifically.
+///
+/// `date` is here (governs its FLAGS) but has an ADDITIONAL check
+/// (`date_has_digit_positional`) for a danger the flag whitelist can't see
+/// at all: a bare POSITIONAL argument with no flag whatsoever.
+/// SHORT flag entries below are lowercase-only and MUST stay that way:
+/// `classify_command` lowercases the whole command before any of this runs,
+/// so `flags_in_token` only ever produces lowercase short flags (`-D`
+/// arrives as `-d`) — an uppercase entry here would be dead, unreachable
+/// code (caught in review: several entries — `-A`/`-C`/`-F`/`-G`/`-I`/`-L`/
+/// `-M`/`-N`/`-P`/`-R`/`-S`/`-T` — were written uppercase and never matched
+/// anything). This means this whitelist is CASE-BLIND by construction (a
+/// side effect of the pre-existing whole-command lowercasing, not something
+/// introduced here): `git diff -M` (rename detection) and a hypothetical
+/// different `-m` are indistinguishable to this check. Every real command
+/// below happens to have no UNSAFE lowercase counterpart to an intended
+/// uppercase-safe flag, so this is a precision tradeoff, not a safety one —
+/// but it's worth remembering before adding a new entry.
+const FLAG_POLICIES: &[(&str, &[&str])] = &[
+    (
+        "ls",
+        &[
+            "-l", "-a", "-h", "-r", "-t", "-s", "-f", "-p", "-g", "--color", "--all",
+            "--almost-all", "--human-readable", "--recursive",
+        ],
+    ),
+    (
+        "cat",
+        &["-n", "-a", "-b", "-e", "-s", "-t", "-v", "--number", "--show-all", "--squeeze-blank"],
+    ),
+    (
+        "head",
+        &["-n", "-c", "-q", "-v", "--lines", "--bytes", "--quiet", "--silent", "--verbose"],
+    ),
+    (
+        "tail",
+        &["-n", "-c", "-f", "-q", "-v", "--lines", "--bytes", "--follow", "--quiet", "--verbose"],
+    ),
+    ("pwd", &["-l", "-p"]),
+    ("wc", &["-l", "-w", "-c", "-m"]),
+    (
+        "file",
+        // NOT whitelisted: `-C`/`--compile` — GNU file actually WRITES a
+        // compiled `.mgc` magic-database file; the exact class of surprise
+        // this whitelist-over-blacklist redesign exists to catch even for
+        // "obviously read-only" commands.
+        &["-i", "-b", "-z", "-l", "-k", "-s", "-n", "--mime-type", "--brief"],
+    ),
+    ("which", &["-a", "-s"]),
+    ("whoami", &[]),
+    (
+        // Flags only — see `date_has_digit_positional` for the positional-
+        // argument half of this command's check. NOT whitelisted: `-s`/
+        // `--set[=STRING]` (GNU) sets the system clock.
+        "date",
+        &["-u", "-i", "-r", "-d", "-j", "--date", "--reference", "--iso-8601", "--rfc-2822", "--rfc-3339"],
+    ),
+    (
+        "grep",
+        &[
+            "-i", "-v", "-n", "-c", "-l", "-r", "-w", "-x", "-e", "-f", "-g", "-p", "-o", "-a",
+            "-b", "--color", "--include", "--exclude",
+        ],
+    ),
+    (
+        "egrep",
+        &["-i", "-v", "-n", "-c", "-l", "-r", "-w", "-x", "-o", "-a", "-b", "--color", "--include", "--exclude"],
+    ),
+    (
+        "fgrep",
+        &["-i", "-v", "-n", "-c", "-l", "-r", "-w", "-x", "-o", "-a", "-b", "--color", "--include", "--exclude"],
+    ),
+    ("echo", &["-n", "-e"]),
+    (
+        "git status",
+        &[
+            "-s", "--short", "-b", "--branch", "--long", "-v", "--verbose", "--ignored", "-u",
+            "--untracked-files", "--porcelain", "-z",
+        ],
+    ),
+    (
+        // NOT whitelisted: `--output`/`--output=<file>` — round-3 review,
+        // confirmed against real git: writes the generated diff to an
+        // arbitrary path, silently overwriting it.
+        "git diff",
+        &[
+            "--stat", "--name-only", "--name-status", "-p", "--patch", "-u", "--color",
+            "--no-color", "--cached", "--staged", "-w", "--ignore-all-space",
+            "--ignore-space-change", "-b", "--numstat", "--shortstat", "--unified", "-m", "-c",
+            "--find-renames", "--find-copies",
+        ],
+    ),
+    (
+        // NOT whitelisted: `--output` — same as `git diff`.
+        "git log",
+        &[
+            "--oneline", "--stat", "--name-only", "--name-status", "-p", "--patch", "--graph",
+            "--all", "--author", "-n", "--max-count", "--since", "--until", "--pretty",
+            "--format", "--color", "--no-color", "--abbrev-commit", "--decorate", "--reverse",
+            "--merges", "--no-merges",
+        ],
+    ),
+    (
+        // NOT whitelisted: `--output` — same as `git diff`.
+        "git show",
+        &[
+            "--stat", "--name-only", "--name-status", "-p", "--patch", "--color", "--no-color",
+            "--pretty", "--format", "--abbrev-commit",
+        ],
+    ),
+    (
+        // NOT whitelisted: `-d`/`-D`/`--delete` (removes a branch — round-2's
+        // original finding) or `-m`/`-M`/`--move`/`-c`/`-C`/`--copy` (also
+        // mutating). Round-3 review: round-2's exact-token check for
+        // `-d`/`--delete` missed `-vd` (POSIX-bundled `-v`+`-d`) — the
+        // whitelist here is immune to that class of bug BY CONSTRUCTION,
+        // since `-vd` unbundles to `-v` (whitelisted) + `-d` (NOT
+        // whitelisted, so the whole command still fails the check).
+        "git branch",
+        &["-a", "--all", "-r", "--remotes", "-v", "--verbose", "--list"],
+    ),
+    (
+        "git rev-parse",
+        &[
+            "--show-toplevel", "--show-cdup", "--git-dir", "--is-inside-work-tree",
+            "--abbrev-ref", "--short", "--verify", "-q", "--quiet",
+        ],
+    ),
 ];
 
 /// Whole-word verbs (matched via `words`, NOT raw substring — so "runbook"
@@ -337,6 +508,39 @@ fn contains_marker(haystack_lower: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| haystack_lower.contains(m))
 }
 
+/// Whether `haystack` (lowercased) contains a JSON-object-KEY-shaped mention
+/// of `key` — tolerant of single OR double quotes and optional whitespace
+/// before the colon (`"network":`, `'network':`, `"network" :`). Round-3
+/// review: a single literal substring (`"network":`, no space, double-quote
+/// only) missed single-quoted pseudo-JSON and a space before the colon —
+/// both were found in real MCP-args-shaped text. Still anchored to "this
+/// looks like a JSON key" (quote…quote…colon), NOT a bare word, so unlike
+/// word-boundary matching it does NOT match a file path segment (a path
+/// never contains a quote character) — safe to use in `classify_file` too.
+fn has_json_key(haystack: &str, key: &str) -> bool {
+    for quote in ['"', '\''] {
+        let quoted = format!("{quote}{key}{quote}");
+        if let Some(pos) = haystack.find(&quoted) {
+            let after = &haystack[pos + quoted.len()..];
+            if after.trim_start().starts_with(':') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The single check every `classify_*` function uses for "does this text
+/// show network access or a credential": the flat substring list PLUS the
+/// quote/spacing-tolerant JSON-key check for "network"/"token" (round-3
+/// review — see `has_json_key`). One function so command/file/other never
+/// drift apart on which of the two checks they remember to run.
+fn matches_cred_net(haystack_lower: &str) -> bool {
+    contains_marker(haystack_lower, CRED_NET_MARKERS)
+        || has_json_key(haystack_lower, "network")
+        || has_json_key(haystack_lower, "token")
+}
+
 /// True when `trimmed` (already lowercased) starts with `word` as a whole
 /// leading token — `word` itself, or `word` followed by a space — so
 /// `"lsof -i"` does NOT match the `"ls"` entry the way a bare `starts_with`
@@ -394,32 +598,102 @@ fn has_shell_control(text: &str) -> bool {
 }
 
 /// `find`'s OWN flags — not shell metacharacters — decide whether it's
-/// destructive: `-delete` removes every match outright, and
-/// `-exec`/`-execdir`/`-ok`/`-okdir` run an arbitrary command per match.
-/// `find . -exec rm -rf {} \;` also trips `has_shell_control` via its `;`,
-/// but `find . -name '*.tmp' -delete` has NO shell metacharacters at all —
-/// this flag check is the only signal that catches that form.
+/// destructive. This stays a dedicated blacklist (unlike every other command
+/// below — see `FLAG_POLICIES`'s doc comment) because `find`'s action
+/// vocabulary (the primaries capable of a side effect, as opposed to its
+/// dozens of purely-filtering tests like `-name`/`-type`/-mtime`/…) is a
+/// small, closed, well-documented set: `-delete` removes every match
+/// outright; `-exec`/`-execdir`/`-ok`/`-okdir` run an arbitrary command per
+/// match; `-fprint`/`-fprint0`/`-fprintf`/`-fls` (round-3 review: missed in
+/// the first pass) write matching paths to an arbitrary FILE, the same
+/// shape of surprise as `git log --output`. `find . -exec rm -rf {} \;`
+/// also trips `has_shell_control` via its `;`, but `find . -name '*.tmp'
+/// -delete` has NO shell metacharacters at all — this flag check is the
+/// only signal that catches that form.
 fn find_is_destructive(trimmed: &str) -> bool {
-    const DESTRUCTIVE_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "-okdir"];
+    const DESTRUCTIVE_FIND_FLAGS: &[&str] = &[
+        "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+    ];
     DESTRUCTIVE_FIND_FLAGS.iter().any(|f| trimmed.contains(f))
 }
 
-/// `git branch`'s delete flags are what make it destructive — `git branch
-/// -a` (list) and `git branch feature-x` (create) are read-adjacent/low-
-/// risk, but `git branch -D important-work` force-removes one, with no
-/// shell metacharacter in sight. Matched as a whole whitespace-separated
-/// token (already lowercased upstream, so `-D` arrives as `-d`) so a branch
-/// NAME that happens to contain "delete" doesn't spuriously match.
-fn git_branch_is_destructive(trimmed: &str) -> bool {
-    trimmed
-        .split_whitespace()
-        .any(|tok| matches!(tok, "-d" | "--delete"))
+/// `date`'s FLAGS are governed by its `FLAG_POLICIES` entry like every other
+/// generic command, but `date` ALSO has a danger the flag whitelist can't
+/// see at all: BSD/macOS's `date [[[mm]dd]HH]MM[[cc]yy][.ss]]` form SETS the
+/// system clock via a bare POSITIONAL argument — no flag whatsoever. GNU
+/// date's only positional form is `+FORMAT` (custom OUTPUT formatting,
+/// safe), distinguishable because it starts with `+`, never a digit — so any
+/// token starting with an ASCII digit is treated as a potential date-setting
+/// positional argument.
+fn date_has_digit_positional(trimmed: &str) -> bool {
+    let rest = trimmed.strip_prefix("date").unwrap_or(trimmed).trim_start();
+    rest.split_whitespace()
+        .any(|tok| tok.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Every INDIVIDUAL flag a command-line token implies: a long option
+/// (`--foo`, `--foo=bar`) is one flag (the part before `=`); a short option
+/// is unbundled per POSIX convention — `-vd` means `-v` AND `-d`, so EACH
+/// letter becomes its own flag to check against a whitelist (round-3
+/// review: an exact-token check for `"-d"` walked right past `-vd`; per-
+/// character unbundling is immune to that class of bug by construction). A
+/// bare `-` (stdin/stdout placeholder) or `--` (POSIX end-of-options marker)
+/// is not a flag. A token that isn't dash-prefixed at all (a path, a
+/// pattern, a branch name, a commit-ish) yields nothing — it's a positional
+/// argument, not a flag, and this whitelist doesn't restrict those (`date`
+/// is the one command where a positional argument itself is dangerous; see
+/// `date_has_digit_positional`, checked separately).
+fn flags_in_token(token: &str) -> Vec<String> {
+    if token == "--" {
+        return Vec::new();
+    }
+    if let Some(rest) = token.strip_prefix("--") {
+        let name = rest.split('=').next().unwrap_or("");
+        return vec![format!("--{name}")];
+    }
+    if let Some(rest) = token.strip_prefix('-') {
+        if rest.is_empty() {
+            return Vec::new();
+        }
+        return rest.chars().map(|c| format!("-{c}")).collect();
+    }
+    Vec::new()
+}
+
+/// A flag that's safe for ANY command without needing to appear in that
+/// command's own whitelist: purely digits after the dash (`-5`, `-20`) is a
+/// count/limit — common across `ls`/`head`/`tail`/`git log` and inherently
+/// non-destructive on its own.
+fn is_universally_safe_flag(flag: &str) -> bool {
+    flag.strip_prefix('-')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether every flag-shaped token in `trimmed` (after the leading `word`)
+/// is on `word`'s `FLAG_POLICIES` whitelist (or is a universally-safe count
+/// flag) — see `FLAG_POLICIES`'s doc comment for why this replaced a
+/// per-command dangerous-flag blacklist. No policy defined for `word` fails
+/// CLOSED (`false`) rather than silently trusting an unrecognized command's
+/// flags — every `READ_ONLY_COMMAND_WORDS` entry other than `find` MUST have
+/// a `FLAG_POLICIES` entry, and a missing one is a bug, not an all-clear.
+fn every_flag_is_whitelisted(word: &str, trimmed: &str) -> bool {
+    let Some((_, safe_flags)) = FLAG_POLICIES.iter().find(|(w, _)| *w == word) else {
+        return false;
+    };
+    let rest = trimmed.strip_prefix(word).unwrap_or(trimmed);
+    rest.split_whitespace().all(|tok| {
+        flags_in_token(tok)
+            .iter()
+            .all(|f| is_universally_safe_flag(f) || safe_flags.contains(&f.as_str()))
+    })
 }
 
 /// Whether the (already lowercased) command text is safely read-only: no
-/// shell control construct anywhere, AND its leading word is a recognized
-/// read-only command, AND — for `find`/`git branch`, whose own flags decide
-/// destructiveness — it isn't flagged destructive.
+/// shell control construct anywhere, its leading word is a recognized
+/// read-only command, and — `find` via its own action-vocabulary blacklist,
+/// `date` via an ADDITIONAL positional-argument check, every other command
+/// via its `FLAG_POLICIES` safe-flag whitelist — it isn't flagged
+/// destructive.
 fn is_read_only_command(lower: &str) -> bool {
     if has_shell_control(lower) {
         return false;
@@ -434,10 +708,10 @@ fn is_read_only_command(lower: &str) -> bool {
     if *word == "find" {
         return !find_is_destructive(trimmed);
     }
-    if *word == "git branch" {
-        return !git_branch_is_destructive(trimmed);
+    if *word == "date" && date_has_digit_positional(trimmed) {
+        return false;
     }
-    true
+    every_flag_is_whitelisted(word, trimmed)
 }
 
 /// A shell command's tier: credential/network markers beat everything, a
@@ -448,7 +722,7 @@ fn is_read_only_command(lower: &str) -> bool {
 /// command is never waved through as read-only.
 fn classify_command(cmd: &str) -> RiskLevel {
     let lower = cmd.to_ascii_lowercase();
-    if contains_marker(&lower, CRED_NET_MARKERS) {
+    if matches_cred_net(&lower) {
         return RiskLevel::NetworkOrCredential;
     }
     if is_read_only_command(&lower) {
@@ -468,7 +742,7 @@ fn classify_file(tool_name: &str, path: &str) -> RiskLevel {
         tool_name.to_ascii_lowercase(),
         path.to_ascii_lowercase()
     );
-    if contains_marker(&haystack, CRED_NET_MARKERS) {
+    if matches_cred_net(&haystack) {
         return RiskLevel::NetworkOrCredential;
     }
     let w = words(tool_name);
@@ -484,10 +758,11 @@ fn classify_file(tool_name: &str, path: &str) -> RiskLevel {
 /// Any other tool call's tier (MCP tools, `WebFetch`/`WebSearch`/`TodoWrite`,
 /// a Codex permission-scope escalation, …): a couple of high-confidence
 /// exact-name overrides, then credential/network markers scanned across BOTH
-/// the tool name and its args (a secret/URL can show up in either), then a
-/// write verb in EITHER the tool name OR the args (round-2 review, issue
-/// #101 P0-b — see below), then the tool name's own read-only verb, else
-/// `Unknown`.
+/// the tool name and its args (a secret/URL can show up in either — see
+/// `matches_cred_net`), then a camelCase/compound "token" key (round-3
+/// review — see below), then a write verb in EITHER the tool name OR the
+/// args (round-2 review, issue #101 P0-b — see below), then the tool name's
+/// own read-only verb, else `Unknown`.
 fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     // High-confidence overrides for common built-ins that would otherwise be
     // UNDER-classified by the generic scan below: both tokenize to a word
@@ -502,7 +777,22 @@ fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
         tool_name.to_ascii_lowercase(),
         args_text.to_ascii_lowercase()
     );
-    if contains_marker(&haystack, CRED_NET_MARKERS) {
+    if matches_cred_net(&haystack) {
+        return RiskLevel::NetworkOrCredential;
+    }
+    let args_words = words(args_text);
+    // Round-3 review: `matches_cred_net`'s literal anchors (`_token`,
+    // `token=`, the `has_json_key` check) never match a camelCase/compound
+    // key like `accessToken`/`apiToken` — no underscore, no adjacent
+    // quote+colon around the LITERAL word "token" (the key IS "accessToken",
+    // not "token"). The SAME camelCase-aware tokenizer already used for
+    // verb-matching below splits "accessToken" into ["access","token"], so
+    // an EXACT "token" word catches it. Scoped to `classify_other` only
+    // (never `classify_file`/`classify_command`): args_text is never a bare
+    // file path the way `tokenizer.py` is, so this can't reintroduce the
+    // round-2 P2 false positive — a path segment "tokenizer" tokenizes to
+    // ["tokenizer"], which is NOT the exact word "token".
+    if has_word(&args_words, &["token"]) {
         return RiskLevel::NetworkOrCredential;
     }
     let name_words = words(tool_name);
@@ -516,7 +806,6 @@ fn classify_other(tool_name: &str, args_text: &str) -> RiskLevel {
     // upgrade-only — args are scanned against WRITE_TOOL_WORDS only, never
     // against READ_ONLY_TOOL_WORDS, so they can push the tier UP toward
     // Write but never pull it down toward ReadOnly.
-    let args_words = words(args_text);
     if has_word(&name_words, WRITE_TOOL_WORDS) || has_word(&args_words, WRITE_TOOL_WORDS) {
         return RiskLevel::Write;
     }
@@ -1369,12 +1658,168 @@ mod tests {
         );
         // The flag-aware check must not overcorrect into flagging EVERY
         // `git branch` invocation — listing/creating are genuinely low-risk,
-        // and this codebase's own `git_branch_is_destructive` must leave
-        // them alone (P2's "more precise, not just stricter" concern).
+        // and `git branch`'s FLAG_POLICIES whitelist must leave them alone
+        // (P2's "more precise, not just stricter" concern).
         assert_eq!(
             classify_risk(RiskSignal::Command("git branch -a")),
             RiskLevel::ReadOnly
         );
+    }
+
+    // ---- round-3 adversarial review (issue #101): round-2's OWN new
+    // defenses had holes, found by testing against REAL git/date — a
+    // per-command dangerous-flag BLACKLIST is structurally doomed (every
+    // command has an open-ended flag surface); `FLAG_POLICIES` replaces it
+    // with a safe-flag WHITELIST + default-deny. --------------------------
+
+    #[test]
+    fn command_git_output_flag_is_not_read_only() {
+        // Round-3 P0-1: `git diff`/`git log`/`git show` accept
+        // `--output=<file>`, confirmed against real git to overwrite that
+        // file's content — zero shell metacharacters, so only a flag check
+        // (not `has_shell_control`) can catch it. `--output` is deliberately
+        // NOT on any of the three commands' whitelists.
+        for cmd in [
+            "git diff --output=notes.txt",
+            "git log --output=notes.txt",
+            "git show --output=notes.txt",
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} must not be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn command_git_branch_bundled_delete_flag_is_not_read_only() {
+        // Round-3 P0-2: round-2's OWN new `git_branch_is_destructive` used
+        // an EXACT token match (`"-d" | "--delete"`), which real git's
+        // POSIX-bundled short options walk straight past — `git branch -vd`
+        // (verbose + delete in ONE token) is accepted by git and genuinely
+        // deletes the branch. `-dv`/`-Dv` are the same bug, reordered. The
+        // whitelist-based `every_flag_is_whitelisted` is immune to this
+        // BY CONSTRUCTION: `-vd` unbundles to `-v` (whitelisted) + `-d` (NOT
+        // whitelisted), so the whole command still fails.
+        for cmd in [
+            "git branch -vd important-work",
+            "git branch -dv important-work",
+            "git branch -Dv important-work",
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} must not be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn command_date_set_forms_are_not_read_only() {
+        // Round-3 P1: `date -s`/`--set=` (GNU) and BSD/macOS's bare
+        // positional numeric form both change the system clock. The
+        // positional form needs NO flag at all — `date_has_digit_positional`
+        // is the only signal that catches it.
+        for cmd in [
+            "date -s '2030-01-01'",
+            "date --set='2030-01-01'",
+            "date 010112302030",
+        ] {
+            assert_ne!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} must not be read-only"
+            );
+        }
+        // A safe display-only invocation must still classify ReadOnly — the
+        // fix must not overcorrect into flagging every `date` call.
+        assert_eq!(
+            classify_risk(RiskSignal::Command("date -u")),
+            RiskLevel::ReadOnly
+        );
+        assert_eq!(classify_risk(RiskSignal::Command("date")), RiskLevel::ReadOnly);
+    }
+
+    #[test]
+    fn command_flag_whitelist_still_allows_common_safe_invocations() {
+        // The structural fix (default-deny unknown flags) must not gut
+        // everyday read-only usage — every one of these has a real,
+        // reasonably common shape.
+        for cmd in [
+            "git log --oneline -n 20",
+            "git log -5",
+            "git diff --stat",
+            "git status -s",
+            "ls -la",
+            "ls -alh",
+            "grep -rn TODO .",
+            "find . -name '*.rs' -type f",
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} should stay read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn command_unknown_flag_on_a_read_only_command_defaults_to_write() {
+        // The core of the structural fix: an UNRECOGNIZED flag on an
+        // otherwise-safe leading command must default-deny (Write), not
+        // silently pass through as it would under a dangerous-flag
+        // blacklist that simply never heard of this particular flag.
+        assert_eq!(
+            classify_risk(RiskSignal::Command("ls --some-flag-nobody-has-heard-of")),
+            RiskLevel::Write
+        );
+    }
+
+    #[test]
+    fn command_uppercase_documented_flags_still_classify_read_only() {
+        // Self-review catch: `classify_command` lowercases the whole command
+        // before any flag check runs, so a `FLAG_POLICIES` entry written
+        // uppercase (as real tool docs usually spell it — `ls -A`, `grep
+        // -A`, `date -I`, `git diff -M`) is DEAD, unreachable code — it can
+        // never match the lowercased flag `flags_in_token` actually
+        // produces. Every entry was corrected to lowercase; this test uses
+        // the flags AS A USER WOULD TYPE THEM (mixed/upper case) to prove
+        // they resolve correctly end-to-end, not just that the lowercase
+        // table entries exist.
+        for cmd in [
+            "ls -A",
+            "grep -A 3 -B 3 TODO file.txt",
+            "date -I",
+            "git diff -M",
+            "cat -A file.txt",
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Command(cmd)),
+                RiskLevel::ReadOnly,
+                "{cmd:?} should be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn every_read_only_command_word_has_a_flag_policy_except_find() {
+        // Defense in depth for `every_flag_is_whitelisted`'s fail-closed
+        // behavior: a `READ_ONLY_COMMAND_WORDS` entry with no matching
+        // `FLAG_POLICIES` row doesn't cause a panic or a false ReadOnly — it
+        // fails closed to Write — but it WOULD be a silent usability
+        // regression (that command always classifies Write, whitelist or
+        // not) that's easy to miss when adding a new entry to one list and
+        // forgetting the other. This test makes the omission loud instead.
+        for word in READ_ONLY_COMMAND_WORDS {
+            if *word == "find" {
+                continue; // handled separately — see FLAG_POLICIES's doc comment
+            }
+            assert!(
+                FLAG_POLICIES.iter().any(|(w, _)| w == word),
+                "{word:?} is in READ_ONLY_COMMAND_WORDS but has no FLAG_POLICIES entry"
+            );
+        }
     }
 
     #[test]
@@ -1538,6 +1983,73 @@ mod tests {
         );
     }
 
+    // ---- round-3 adversarial review (issue #101 P2): the literal anchors
+    // for "token"/"network" missed camelCase compound keys, single-quoted
+    // pseudo-JSON, and a space before the colon — all common shapes in
+    // hand-written or non-standard-JSON MCP payloads. Confirmed falling to
+    // Unknown (bounded severity, but a real recall gap) before this fix. ---
+
+    #[test]
+    fn other_camelcase_token_keys_are_credential_shaped() {
+        // Neither "_token" (no underscore in camelCase) nor `"token":` (the
+        // literal key is "accessToken", not "token") match — but the SAME
+        // camelCase-aware tokenizer used for verb-matching splits
+        // "accessToken" into exact words ["access", "token"].
+        for args_text in [
+            r#"{"accessToken": "xyz"}"#,
+            r#"{"apiToken": "xyz"}"#,
+        ] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn other_single_quoted_and_spaced_json_keys_are_credential_shaped() {
+        // `has_json_key` tolerates single quotes and whitespace before the
+        // colon — variations a hand-written or non-standard-JSON MCP payload
+        // might use.
+        for args_text in [r#"{'network': true}"#, r#"{"network" : true}"#] {
+            assert_eq!(
+                classify_risk(RiskSignal::Other { tool_name: "get_status", args_text }),
+                RiskLevel::NetworkOrCredential,
+                "{args_text:?} should be network/credential"
+            );
+        }
+    }
+
+    #[test]
+    fn other_json_key_check_requires_a_colon_not_just_a_quoted_word() {
+        // `has_json_key` specifically requires the quoted word to be
+        // followed by a colon (a KEY position) — a quoted VALUE that merely
+        // contains the word must not match it, else it would just be a
+        // differently-shaped substring check with extra steps.
+        assert!(!has_json_key(r#"{"description": "a network issue"}"#, "network"));
+        assert!(has_json_key(r#"{"network": true}"#, "network"));
+    }
+
+    #[test]
+    fn other_bare_token_word_anywhere_in_args_is_upgrade_only_over_caution() {
+        // Unlike `has_json_key` (key-position only), the camelCase-aware
+        // word-boundary check for "token" (see `classify_other`) does NOT
+        // distinguish a key from a value — "token" appearing ANYWHERE in
+        // args_text is treated as a signal. This is a DELIBERATE, documented
+        // over-caution tradeoff (consistent with WRITE_TOOL_WORDS's own
+        // args_text scan, which has the same key/value-agnostic shape): a
+        // benign mention ("please rotate the token") costs an occasional
+        // over-flagged card, never a missed dangerous one.
+        assert_eq!(
+            classify_risk(RiskSignal::Other {
+                tool_name: "get_status",
+                args_text: r#"{"comment": "rotate the api token soon"}"#
+            }),
+            RiskLevel::NetworkOrCredential
+        );
+    }
+
     // ---- round-2 adversarial review (issue #101 P0-b): `args_text` was
     // never scanned for a write verb — an MCP tool NAME is fully
     // attacker/server-controlled (this is issue #101's OWN motivating
@@ -1670,6 +2182,79 @@ mod tests {
             let risk = classify_risk(RiskSignal::File { tool_name: "Read", path });
             println!("  Read {path:?} -> {risk:?} (pre-fix: NetworkOrCredential)");
             assert_ne!(risk, RiskLevel::NetworkOrCredential, "{path:?} still a false positive");
+        }
+
+        println!("\n--- transcript complete: every example above matches its post-fix expectation ---\n");
+    }
+
+    /// Round-3 adversarial review transcript (issue #101): round-2 shipped a
+    /// per-command dangerous-flag BLACKLIST for `find`/`git branch`; this
+    /// round found real-git-confirmed holes in exactly that shape on
+    /// commands the blacklist never covered at all (`git diff`/`log`/`show
+    /// --output`) AND in round-2's own new `git branch` check itself
+    /// (`-vd` bundling past an exact `"-d"` match). Run with `cargo test
+    /// --lib ask::tests::round_3_review_examples_transcript -- --nocapture`
+    /// to see the transcript.
+    #[test]
+    fn round_3_review_examples_transcript() {
+        println!("\n--- issue #101 round-3 review: before/after transcript ---");
+
+        println!("\n[P0-1] `git diff`/`log`/`show --output=<file>` (must NOT be ReadOnly):");
+        for cmd in [
+            "git diff --output=notes.txt",
+            "git log --output=notes.txt",
+            "git show --output=notes.txt",
+        ] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (pre-fix: ReadOnly)");
+            assert_ne!(risk, RiskLevel::ReadOnly, "{cmd:?} regressed to ReadOnly");
+        }
+
+        println!("\n[P0-2] `git branch` bundled short delete flag (must NOT be ReadOnly):");
+        for cmd in [
+            "git branch -vd important-work",
+            "git branch -dv important-work",
+            "git branch -Dv important-work",
+        ] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (pre-fix, round-2's exact-token check: ReadOnly)");
+            assert_ne!(risk, RiskLevel::ReadOnly, "{cmd:?} regressed to ReadOnly");
+        }
+
+        println!("\n[P1] `date -s`/`--set=`/bare positional (must NOT be ReadOnly):");
+        for cmd in ["date -s '2030-01-01'", "date --set='2030-01-01'", "date 010112302030"] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (pre-fix: ReadOnly)");
+            assert_ne!(risk, RiskLevel::ReadOnly, "{cmd:?} regressed to ReadOnly");
+        }
+
+        println!("\n[P2] camelCase / single-quote / spaced-colon credential shapes (must be NetworkOrCredential):");
+        for (tool_name, args_text) in [
+            ("get_status", r#"{"accessToken": "xyz"}"#),
+            ("get_status", r#"{"apiToken": "xyz"}"#),
+            ("get_status", r#"{'network': true}"#),
+            ("get_status", r#"{"network" : true}"#),
+        ] {
+            let risk = classify_risk(RiskSignal::Other { tool_name, args_text });
+            println!("  {tool_name:?} args={args_text:?} -> {risk:?} (pre-fix: Unknown)");
+            assert_eq!(
+                risk,
+                RiskLevel::NetworkOrCredential,
+                "{tool_name:?}/{args_text:?} still not caught"
+            );
+        }
+
+        println!("\n[sanity] common safe invocations must STILL be ReadOnly (no overcorrection):");
+        for cmd in [
+            "git log --oneline -n 20",
+            "git branch -a",
+            "ls -la",
+            "find . -name '*.rs' -type f",
+            "date -u",
+        ] {
+            let risk = classify_risk(RiskSignal::Command(cmd));
+            println!("  {cmd:?} -> {risk:?} (expected: ReadOnly)");
+            assert_eq!(risk, RiskLevel::ReadOnly, "{cmd:?} should still be read-only");
         }
 
         println!("\n--- transcript complete: every example above matches its post-fix expectation ---\n");

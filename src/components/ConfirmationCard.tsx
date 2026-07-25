@@ -143,7 +143,10 @@ function DetailPreview({ detail }: { readonly detail: string }) {
  *  the VISIBLE height, but that's CSS, not content — the underlying string
  *  was otherwise unbounded, so a pathologically large args blob (a giant
  *  pasted file, a huge code arg) still cost a full parse+stringify and put
- *  the whole thing in the DOM. This bounds both; the truncation note (see
+ *  the whole thing in the DOM. `formatDetail` enforces this cap in TWO
+ *  places (round-3 review: the first pass only capped the OUTPUT, so
+ *  `JSON.parse`/`JSON.stringify` still ran on the full, untruncated input
+ *  every time — see that function). The truncation note (see
  *  `DetailPreview`) makes clear there's more than what's shown. */
 const MAX_DETAIL_CHARS = 20_000;
 
@@ -155,8 +158,25 @@ const MAX_DETAIL_CHARS = 20_000;
  *  already carried end-to-end since #119 — no new data, no new channel.
  *  Returns the (possibly truncated) text plus how many characters were cut,
  *  so the caller can render a translated truncation note — this function
- *  itself returns no user-facing string. */
+ *  itself returns no user-facing string.
+ *
+ *  Checks the RAW length BEFORE attempting `JSON.parse` (round-3 review):
+ *  parsing+re-stringifying only to truncate the OUTPUT still pays the full
+ *  parse cost on a payload already past the cap — exactly the cost this cap
+ *  exists to avoid for the common "huge blob" case (a large `write_file`
+ *  arg, a big pasted code arg). Upstream (`ask.rs`/`bus/server.rs`/
+ *  `engine.rs`) has no length cap of its own on `detail`/`args_text`, so
+ *  this really can be arbitrarily large. A SEPARATE cap after formatting
+ *  still applies for the rarer case where a moderately-sized raw payload
+ *  pretty-prints into something larger than the cap (deep nesting adds
+ *  indentation on every line). */
 function formatDetail(detail: string): { text: string; omittedChars: number } {
+  if (detail.length > MAX_DETAIL_CHARS) {
+    return {
+      text: detail.slice(0, MAX_DETAIL_CHARS),
+      omittedChars: detail.length - MAX_DETAIL_CHARS,
+    };
+  }
   let formatted: string;
   try {
     formatted = JSON.stringify(JSON.parse(detail), null, 2);
