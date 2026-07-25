@@ -273,6 +273,8 @@ export const en = {
     baseBranch: "Base branch",
     baseBranchHint: "Branch the work off this (blank = the repo's default branch)",
     planSummary: "Plan summary",
+    readOnlyPropagationNote:
+      "Approving also lets these workers run read-only checks (like git status) without asking — revocable anytime from the board.",
   },
   notify: {
     needsTitle: "Needs you",
@@ -308,6 +310,9 @@ export const en = {
     denyTitle: "Deny this request and let the agent decide what to do",
     fullAccess: "Full access",
     fullAccessTitle: "Auto-approve everything from this task",
+    releaseReadOnly: "Release all read-only for this session",
+    releaseReadOnlyTitle:
+      "Auto-allow every read-only request in this session from now on (writes and network/credential requests still ask)",
     emptyTitle: "Nothing needs you",
     emptyBody:
       "When an agent hits a decision only you can make, it asks here. Answer once and the reply goes straight back to its inbox, so you never have to go hunting for the session.",
@@ -471,6 +476,13 @@ export const en = {
     engine: "Engine",
     engineUnknown: "Unknown",
     switchEngine: "Switch…",
+    // Issue #103: read-only auto-allow status for this session (in-memory
+    // only — never survives a restart, never covers writes or network/
+    // credential requests).
+    access: "Access",
+    readOnlyIssueTrusted: "Read-only trusted (whole issue)",
+    readOnlySessionTrusted: "Read-only trusted (this session)",
+    revokeReadOnlyTrust: "Revoke",
   },
   observe: {
     answerPlaceholder: "Type a reply, press Enter",
@@ -918,6 +930,17 @@ export const en = {
     revokeFailed: "Couldn't revoke access — it's still active. Please try again.",
     grantNotSaved:
       "Access granted for now, but couldn't be saved — you may be asked again after a restart.",
+    // Issue #103: read-only auto-allow — a SEPARATE, narrower, in-memory-only
+    // grant from Full/Always above (never survives a restart, never covers
+    // writes or network/credential requests).
+    readOnlyIssue: "Read-only trusted",
+    readOnlyIssueTitle:
+      "Approving this issue's dispatch auto-allows read-only requests from every one of its workers — click to revoke",
+    revokeReadOnlyTitle: "Revoke read-only trust?",
+    revokeReadOnlyIssueBody:
+      "Every worker under this issue will stop auto-allowing read-only requests — the next one will ask you again. This does not affect Full access or always-allow rules.",
+    readOnlyReleased_one: "Released {{count}} read-only request.",
+    readOnlyReleased_other: "Released {{count}} read-only requests.",
   },
   ai: {
     shellSnippet: "Shell snippet",

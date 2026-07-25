@@ -116,7 +116,7 @@ export function WriteTriggerRow({ item }: { item: WriteTrigger }) {
 }
 
 export function PermissionRow({ ask }: { ask: PermissionAsk }) {
-  const { answerPermission, goToDirectionRef } = useStore();
+  const { answerPermission, releaseSessionReadOnly, goToDirectionRef } = useStore();
   const { t } = useTranslation();
   const context = [ask.thread_title, ask.dir_name].filter(Boolean).join(" · ");
   const contextLink = context ? (
@@ -136,6 +136,7 @@ export function PermissionRow({ ask }: { ask: PermissionAsk }) {
     <PermissionConfirmationCard
       ask={ask}
       onAnswer={(askId, answer) => void answerPermission(askId, answer)}
+      onReleaseSessionReadOnly={() => void releaseSessionReadOnly(ask.thread, ask.dir)}
       className="overflow-hidden rounded-[var(--radius-lg)] border-waiting/40 bg-waiting/10 px-3.5 pb-0 pt-3"
       actionsClassName="-mx-3.5 mt-1 self-stretch border-t border-border bg-bg/40 px-3.5 py-2.5"
       context={contextLink}

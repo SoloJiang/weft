@@ -199,8 +199,16 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
 
       <div className="shrink-0 border-t border-border bg-bg/95 px-5 py-3 backdrop-blur">
         <div className="mx-auto flex w-full max-w-[820px] items-center gap-3">
+          {/* Issue #103: approving dispatch also propagates a read-only
+              auto-allow to this issue's workers (backend: confirm_proposal →
+              grant_read_only_issue) — an "informed decision" caption so the
+              scope-widening isn't a silent side effect. Purely presentational;
+              no new state, doesn't touch `confirm()`'s own logic. */}
+          <span className="min-w-0 flex-1 text-[11px] leading-snug text-ink-faint">
+            {t("scope.readOnlyPropagationNote")}
+          </span>
           <Button
-            className="ml-auto"
+            className="ml-auto shrink-0"
             variant="primary"
             onClick={() => void confirm()}
             disabled={confirming || dirs.length === 0}
