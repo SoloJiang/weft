@@ -4674,6 +4674,20 @@ pub(super) struct FreezeMarkerStamped(());
 /// alone), while `tauri::test::mock_app` only yields `MockRuntime` — so the
 /// pair, and the invariant binding them, were unreachable from any test. These
 /// two take `&Db`/`&EngineRef`, both of which a test can build for real.
+///
+/// Returns `Option`, NOT `Result<Option<_>>`, and that is the load-bearing part
+/// of the signature rather than a shortcut (review round 1, P1 — pushed back).
+/// The only thing any caller can do with a failed stamp is skip the clear, which
+/// is exactly what `None` already says, so a `Result` would add a SECOND way to
+/// spell "no durable marker" (`Err(_)` alongside `Ok(None)`) whose only correct
+/// handling is to collapse into the first. Two representations of the gate's
+/// false case is precisely the room-to-get-it-wrong this witness type exists to
+/// remove — the original defect was a gate that could be dropped by accident.
+/// The error is not swallowed either: the *decision* is preserved in the return
+/// value and only the `DbErr` text is logged, because nothing upstream can act
+/// on it — `recover_from_freeze` returns `bool` and its sole caller is a
+/// detached `tauri::async_runtime::spawn` in `spawn_watchdog` that discards even
+/// that, so there is no caller to propagate to.
 pub(super) async fn stamp_freeze_marker(
     db: Option<&Db>,
     thread_id: i32,
@@ -4715,6 +4729,18 @@ pub(super) async fn stamp_freeze_marker(
 /// test/teardown shape, not a failed write. The app-server connection was
 /// already dropped by the caller regardless, so a resumed conversation
 /// reconnects fresh even on the skip path.
+///
+/// Returns `()`, not `Result<()>`, because a failed `clear_native_id` is
+/// terminal HERE by design and not by omission (review round 1, P1 — pushed
+/// back). Aborting is not an available option at this point in
+/// `recover_from_freeze`: `take_frozen_turn` has already taken the app-server
+/// client and reset the turn in memory, so an early return would leak that
+/// connection, strand the drained rows as `streaming`, and leave the DB claiming
+/// `running` for a turn that is over. Handing the error upward would therefore
+/// buy the same `eprintln!` one frame higher while moving that reasoning away
+/// from the code it justifies. The state this failure leaves behind is the
+/// benign one either way: a session that kept its native id AND has a durable
+/// marker, which `revive::has_resumable_context` still reads as resumable.
 pub(super) async fn clear_native_context_after_freeze(
     stamped: Option<&FreezeMarkerStamped>,
     db: Option<&Db>,
