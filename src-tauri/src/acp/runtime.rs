@@ -79,8 +79,9 @@ struct Inner {
     next_id: i64,
     pending: PendingMap,
     sessions: SessionMap,
-    /// Permission request ids already answered — safety-net must not double-reply.
-    answered_permission_ids: std::collections::HashSet<String>,
+    /// Permission request ids still awaiting a reply — safety-net / duplicate
+    /// replies only fire while the id is present (omp reuses id:0 across turns).
+    pending_permission_ids: std::collections::HashSet<String>,
     _child: tokio::process::Child,
     _reg: crate::proc_registry::Registration,
 }
@@ -98,8 +99,13 @@ static POOL: LazyLock<Pool> = LazyLock::new(|| Pool {
     clients: Mutex::new(HashMap::new()),
 });
 
+/// Serializes first-time ACP child creation so two concurrent first turns cannot
+/// each spawn a child and race the pool insert.
+static CREATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 /// Get or create the global client for `backend_id` (e.g. `"omp"`).
-pub async fn client(backend_id: &str) -> anyhow::Result<ClientHandle> {
+/// `program` is the effective binary (session pin or global override).
+pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHandle> {
     let backend = backend_for(backend_id)
         .ok_or_else(|| anyhow::anyhow!("no ACP backend registered for {backend_id}"))?;
     let id = backend.id();
@@ -108,27 +114,27 @@ pub async fn client(backend_id: &str) -> anyhow::Result<ClientHandle> {
         g.get(id).cloned()
     };
     if let Some(c) = existing {
-        // Must not hold POOL.clients across ensure_connected (it awaits).
-        c.ensure_connected(backend).await?;
+        // Already pooled — keep the running child (command pin applies on next
+        // full shutdown/respawn). Must not hold POOL.clients across ensure.
+        c.ensure_connected(backend, program).await?;
+        return Ok(c);
+    }
+    // Serialize first create so two first turns cannot spawn two children.
+    let _create = CREATE_LOCK.lock().await;
+    let existing = {
+        let g = POOL.clients.lock().await;
+        g.get(id).cloned()
+    };
+    if let Some(c) = existing {
+        c.ensure_connected(backend, program).await?;
         return Ok(c);
     }
     let handle = ClientHandle {
         backend_id: id,
         inner: Arc::new(Mutex::new(None)),
     };
-    handle.ensure_connected(backend).await?;
-    // Insert only after connect succeeds. Race: two first callers may both connect;
-    // keep the first inserted and drop the second's child on insert loss.
-    {
-        let mut g = POOL.clients.lock().await;
-        if let Some(c) = g.get(id) {
-            let kept = c.clone();
-            drop(g);
-            handle.shutdown_and_reap().await;
-            return Ok(kept);
-        }
-        g.insert(id, handle.clone());
-    }
+    handle.ensure_connected(backend, program).await?;
+    POOL.clients.lock().await.insert(id, handle.clone());
     Ok(handle)
 }
 
@@ -157,20 +163,23 @@ impl ClientHandle {
         self.backend_id
     }
 
-    async fn ensure_connected(&self, backend: Arc<dyn AcpBackend>) -> anyhow::Result<()> {
+    async fn ensure_connected(
+        &self,
+        backend: Arc<dyn AcpBackend>,
+        program: &str,
+    ) -> anyhow::Result<()> {
         if self.inner.lock().await.is_some() {
             return Ok(());
         }
-        self.spawn(backend).await
+        self.spawn(backend, program).await
     }
 
-    async fn spawn(&self, backend: Arc<dyn AcpBackend>) -> anyhow::Result<()> {
+    async fn spawn(&self, backend: Arc<dyn AcpBackend>, program: &str) -> anyhow::Result<()> {
         let mut g = self.inner.lock().await;
         if g.is_some() {
             return Ok(());
         }
-        let program = crate::tool_command::command_for(backend.id());
-        let (prog, args) = backend.spawn_argv(&program);
+        let (prog, args) = backend.spawn_argv(program);
         let mut command = Command::new(&prog);
         command.args(&args);
         command.env("PATH", crate::detect::tool_path());
@@ -215,7 +224,7 @@ impl ClientHandle {
             next_id: 1,
             pending: HashMap::new(),
             sessions: HashMap::new(),
-            answered_permission_ids: std::collections::HashSet::new(),
+            pending_permission_ids: std::collections::HashSet::new(),
             _child: child,
             _reg: reg,
         });
@@ -332,24 +341,27 @@ impl ClientHandle {
             .cloned()
             .unwrap_or_default();
         let (summary, detail) = summary_from_params(&params);
-        let key = intent_key_from_params(&params);
+        let intent = intent_key_from_params(&params);
+        let req_key = Self::permission_id_key(&id);
 
-        // Always-cache / auto_want short-circuit under lock, then reply.
         let auto = {
             let mut g = self.inner.lock().await;
             let Some(inner) = g.as_mut() else {
+                drop(g);
                 let _ = self
                     .write_raw(encode_error_response(&id, -32000, "not connected"))
                     .await;
                 return;
             };
+            // pending set keys by JSON-RPC id (omp reuses 0)
+            inner.pending_permission_ids.insert(req_key);
             let Some(route) = inner.sessions.get_mut(&sid) else {
-                // No subscriber — reject once if possible.
                 drop(g);
                 self.reply_permission(&id, &options, Want::RejectOnce).await;
                 return;
             };
-            if let Some(w) = route.always.get(&key) {
+            // always-cache keys by intent, NOT request id
+            if let Some(w) = route.always.get(&intent) {
                 Some(w)
             } else {
                 route.auto_want
@@ -360,36 +372,28 @@ impl ClientHandle {
             return;
         }
 
-        // Forward to subscriber; if nobody handles, reject after timeout via helper task.
-        let (summary2, detail2, key2, options2) =
-            (summary.clone(), detail.clone(), key.clone(), options.clone());
         let delivered = {
             let g = self.inner.lock().await;
-            if let Some(inner) = g.as_ref() {
-                if let Some(route) = inner.sessions.get(&sid) {
+            g.as_ref()
+                .and_then(|inner| inner.sessions.get(&sid))
+                .map(|route| {
                     route
                         .events
                         .send(SessionEvent::Permission {
                             request_id: id.clone(),
-                            summary: summary2,
-                            detail: detail2,
-                            intent_key: key2,
-                            options: options2,
+                            summary: summary.clone(),
+                            detail: detail.clone(),
+                            intent_key: intent.clone(),
+                            options: options.clone(),
                         })
                         .is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+                })
+                .unwrap_or(false)
         };
         if !delivered {
             self.reply_permission(&id, &options, Want::RejectOnce).await;
             return;
         }
-        // Safety net: if engine never answers within ASK budget, reject once —
-        // but only if still unanswered (see reply_permission).
         let me = self.clone();
         let id_t = id.clone();
         let opts_t = options.clone();
@@ -405,7 +409,8 @@ impl ClientHandle {
     }
 
     /// Answer a permission request (called by engine after Ask, or auto paths).
-    /// Idempotent: a second call with the same id is a no-op.
+    /// Idempotent while the id is pending: once removed, further calls no-op so
+    /// a reused JSON-RPC id (omp has used `0`) can be accepted on the next ask.
     pub async fn reply_permission(&self, id: &Value, options: &[Value], want: Want) {
         {
             let mut g = self.inner.lock().await;
@@ -413,8 +418,8 @@ impl ClientHandle {
                 return;
             };
             let key = Self::permission_id_key(id);
-            if !inner.answered_permission_ids.insert(key) {
-                return; // already answered
+            if !inner.pending_permission_ids.remove(&key) {
+                return; // already answered or unknown
             }
         }
         let option_id = pick_option_id(options, want)
@@ -534,6 +539,18 @@ impl ClientHandle {
                 })
                 .collect(),
         }
+    }
+
+    pub async fn is_alive(&self) -> bool {
+        self.inner.lock().await.is_some()
+    }
+
+    pub async fn is_subscribed(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|i| i.sessions.contains_key(session_id))
     }
 
     pub async fn subscribe(
@@ -725,7 +742,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires omp on PATH"]
     async fn omp_acp_pong_live() {
-        let c = client("omp").await.expect("client");
+        let c = client("omp", "omp").await.expect("client");
         let cwd = std::env::temp_dir();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sid = c.new_session(&cwd, vec![]).await.expect("new");

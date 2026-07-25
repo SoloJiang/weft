@@ -2767,7 +2767,7 @@ async fn spawn_acp_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, tool, ask_dir, had_client) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir) = {
         let i = eng.lock().await;
         if i.stopped || i.interrupting || expected_epoch.is_some_and(|e| e != i.reset_epoch) {
             return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
@@ -2779,32 +2779,49 @@ async fn spawn_acp_turn(
             i.thread_id,
             i.system_prompt.clone(),
             i.tool.clone(),
+            i.command.clone(),
             i.ask_dir.clone(),
-            i.acp_client.is_some(),
         )
     };
     let backend = crate::acp::backend_for(&tool)
         .ok_or_else(|| anyhow::anyhow!("not an ACP tool: {tool}"))?;
-    let client = crate::acp::runtime::client(backend.id()).await?;
+    let program = crate::tool_command::effective(command.as_deref(), &tool);
+    let client = crate::acp::runtime::client(backend.id(), &program).await?;
 
-    // MCP list from the live bus base.
+    // MCP list: mirror lead_engine inject branches (thread.kind), not ask_dir alone
+    // — lead/concierge/curator all store ask_dir="lead".
     let base = app
         .try_state::<crate::BusBase>()
         .map(|b| b.0.clone())
         .unwrap_or_default();
-    let include_planner = sid.is_none() && ask_dir == "lead";
-    let include_global = ask_dir == "concierge" || ask_dir.contains("concierge");
-    let include_curator = ask_dir == "curator";
     let mcp = if base.is_empty() {
         vec![]
+    } else if sid.is_none() {
+        // Lead-kind engine: choose MCP from thread kind.
+        let kind = repo::get_thread(&db, thread_id_i)
+            .await
+            .ok()
+            .flatten()
+            .map(|th| th.kind)
+            .unwrap_or_default();
+        match kind.as_str() {
+            // Concierge: weft_global only (never bus).
+            "concierge" => crate::bus::inject::acp_mcp_servers(
+                &base, thread_id_i, "lead", false, false, true, false,
+            ),
+            // Curator: curator MCP + bus under LEAD identity.
+            "curator" => crate::bus::inject::acp_mcp_servers(
+                &base, thread_id_i, crate::bus::LEAD, true, false, false, true,
+            ),
+            // Issue lead: planner + bus.
+            _ => crate::bus::inject::acp_mcp_servers(
+                &base, thread_id_i, crate::bus::LEAD, true, true, false, false,
+            ),
+        }
     } else {
+        // Worker: bus only under direction id.
         crate::bus::inject::acp_mcp_servers(
-            &base,
-            thread_id_i,
-            &ask_dir,
-            include_planner,
-            include_global,
-            include_curator,
+            &base, thread_id_i, &ask_dir, true, false, false, false,
         )
     };
 
@@ -2820,13 +2837,9 @@ async fn spawn_acp_turn(
         None => client.new_session(&cwd, mcp).await?,
     };
 
-    // Subscribe consumer once per native session.
-    let need_sub = {
-        let g = eng.lock().await;
-        g.acp_client.is_none()
-            || g.native_id.as_deref() != Some(session_id.as_str())
-            || !had_client
-    };
+    // Always resubscribe when the runtime lost the route (child restart /
+    // shutdown clears sessions) even if the engine still holds acp_client.
+    let need_sub = !client.is_subscribed(&session_id).await;
     if need_sub {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         client.subscribe(&session_id, tx).await?;
@@ -4548,12 +4561,23 @@ pub async fn stop_quiet(
     if let Some(c) = inner.codex_client.take() {
         c.shutdown().await;
     }
-    if let Some(c) = inner.acp_client.take() {
-        // Drop engine's handle; global child stays for other sessions. Unsubscribe
-        // is best-effort via drop of consumer when channel closes.
-        let _ = c;
+    // Cancel any in-flight ACP prompt and drop the session route so a late
+    // acp_emit_turn_end cannot overwrite stopped → idle after takeover.
+    let acp = inner.acp_client.take();
+    let acp_sid = inner.native_id.clone();
+    // Drop the engine lock before awaiting ACP cancel/unsubscribe (they take
+    // the runtime mutex). Re-lock afterwards for the remaining field clears.
+    drop(inner);
+    if let Some(c) = acp {
+        if let Some(sid) = acp_sid {
+            let _ = c.cancel(&sid).await;
+            c.unsubscribe(&sid).await;
+        }
     }
+    let mut inner = eng.lock().await;
     inner.child = None;
+    inner.child_reg = None;
+    inner.child_permit = None;
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();

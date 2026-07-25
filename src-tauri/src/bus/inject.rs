@@ -38,15 +38,19 @@ pub fn acp_mcp_servers(
     base: &str,
     thread: i32,
     dir: &str,
+    include_bus: bool,
     include_planner: bool,
     include_global: bool,
     include_curator: bool,
 ) -> Vec<crate::acp::McpServerSpec> {
     let mut out = Vec::new();
-    out.push(crate::acp::McpServerSpec {
-        name: "weft_bus".into(),
-        url: mcp_url(base, thread, dir),
-    });
+    // Concierge is global-only (no per-thread bus) — same as inject_global path.
+    if include_bus {
+        out.push(crate::acp::McpServerSpec {
+            name: "weft_bus".into(),
+            url: mcp_url(base, thread, dir),
+        });
+    }
     if include_planner {
         out.push(crate::acp::McpServerSpec {
             name: "weft_planner".into(),

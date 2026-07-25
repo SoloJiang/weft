@@ -529,7 +529,9 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
         return Err(anyhow!("ordinal is 1-based"));
     }
     let Some(src) = find_omp_session_file(cwd, session_id)? else {
-        return Ok(None);
+        return Err(anyhow!(
+            "omp rewind: session file for {session_id} not found under ~/.omp/agent/sessions"
+        ));
     };
     let raw = std::fs::read_to_string(&src)
         .with_context(|| format!("read omp session {}", src.display()))?;
@@ -561,10 +563,12 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
                     .join("\n")
             })
             .unwrap_or_default();
-        // First-turn system-prompt prepend stores `{system}\n\n{user}`; match
-        // exact or suffix so ordinal-1 still hits.
+        // First-turn system-prompt prepend stores `{system}\n\n{user}`.
+        // Allow suffix match only when the raw body contains the prepend
+        // separator, so an earlier shorter prompt cannot steal the ordinal.
         let got = normalize_ws(&body);
-        if got != want && !got.ends_with(&want) {
+        let prepended = body.contains("\n\n") && got.ends_with(&want);
+        if got != want && !prepended {
             continue;
         }
         user_hits += 1;
@@ -656,16 +660,30 @@ fn find_omp_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>
 }
 
 fn walkdir_jsonl(root: &Path, session_id: &str) -> Result<Vec<PathBuf>> {
+    use std::collections::HashSet;
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
+    let mut seen = HashSet::new();
     while let Some(dir) = stack.pop() {
+        let Ok(canon) = dir.canonicalize() else {
+            continue;
+        };
+        if !seen.insert(canon) {
+            continue; // cycle / revisit
+        }
         let rd = match std::fs::read_dir(&dir) {
             Ok(r) => r,
             Err(_) => continue,
         };
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() {
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue; // never follow symlink dirs/files into the walk
+            }
+            if meta.is_dir() {
                 stack.push(p);
             } else {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
