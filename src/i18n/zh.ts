@@ -395,6 +395,8 @@ export const zh = {
     switchedToast: "已切换：{{from}} → {{to}}",
     switchReloadedToast: "{{tool}} 已重新加载",
     switchMarkerFailed: "这次切换没能记录下来，已原样保留——会话还在原来的引擎上。请重试。",
+    switchHalfApplied: "引擎已经切过去了，但没能解除它跟旧会话的关联，现在状态不完整。再切换一次即可收尾。",
+    switchCleanupFailed: "切换没成功，善后也没做干净。会话保持原样；稍后可能多出一条「继续未完成的工作」提示。请重试。",
     engineSwitchedMarker: "引擎已切换",
     engineReloadedMarker: "引擎已重新加载",
     engineModelCleared: "无覆盖",

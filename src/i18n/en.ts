@@ -410,6 +410,10 @@ export const en = {
     switchReloadedToast: "{{tool}} reloaded",
     switchMarkerFailed:
       "Couldn't record this switch, so nothing was changed — the session is still on its current engine. Try again.",
+    switchHalfApplied:
+      "This session switched engine, but its previous conversation link couldn't be released, so it isn't fully consistent. Run the switch once more to finish it.",
+    switchCleanupFailed:
+      "The switch didn't go through, and cleaning up after it didn't finish either. The session is unchanged; you may see one stray \"resume unfinished work\" prompt later. Try again.",
     engineSwitchedMarker: "Engine switched",
     engineReloadedMarker: "Engine reloaded",
     engineModelCleared: "no override",

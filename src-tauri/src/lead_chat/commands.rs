@@ -1634,12 +1634,29 @@ impl SwitchTarget {
     }
 }
 
-/// Stable, locale-independent code a failed grace stamp rejects with, matched
-/// by `src/session/engineSwitch.ts` so the dialog renders translated copy from
+/// Stable, locale-independent codes a switch rejects with, matched by
+/// `src/session/engineSwitch.ts` so the dialog renders translated copy from
 /// `src/i18n/{en,zh}.ts` instead of a Rust-authored sentence. Same contract as
 /// `process_quota::DEGRADED_ERROR_CODE`: reject with the CODE, log the DB
 /// detail, never hand the UI an English sentence plus raw SQLite text.
+///
+/// Deliberately NOT one code per failure. A switch that simply failed with
+/// nothing changed passes its own error through, because "the switch failed"
+/// already describes that accurately and the underlying message is the more
+/// useful thing to show. A code exists only where that sentence would be
+/// WRONG or incomplete — which is exactly these three states.
+///
+/// The stamp could not be written: nothing happened at all.
 pub const SWITCH_MARKER_ERROR_CODE: &str = "switch_marker_stamp_failed";
+/// The tool/model write landed but the native-id clear did not, so the session
+/// is half-switched: new tool, old engine's native id. Reporting a plain
+/// failure here would be untrue in the direction that matters — the user's
+/// engine identity really did change.
+pub const SWITCH_HALF_APPLIED_ERROR_CODE: &str = "switch_half_applied";
+/// The switch failed AND its grace marker could not be retracted, leaving a
+/// stray marker that can cost one spurious re-drive prompt later. Distinct
+/// from a clean abort because it is not, in fact, clean.
+pub const SWITCH_CLEANUP_ERROR_CODE: &str = "switch_cleanup_failed";
 
 /// The gate itself, sealed in its own module so the rule cannot be bypassed by
 /// forgetting it — see [`switch_gate::MarkerStamped`].
@@ -1859,18 +1876,37 @@ async fn persist_switch(
         Err(failure) => failure,
     };
     let err = match failure {
-        // Half-applied: keep the marker, it is now load-bearing.
-        SwitchWriteFailure::ToolLandedButClearFailed(err) => return Err(err),
+        // Half-applied: keep the marker, it is now load-bearing. Rejects with
+        // its OWN code — "the switch failed" is an incomplete description of
+        // this state (the tool really did change), and telling the user only
+        // that would be the same dishonesty this PR keeps correcting.
+        SwitchWriteFailure::ToolLandedButClearFailed(err) => {
+            eprintln!(
+                "[weft] engine switch half-applied: the tool/model write landed but the \
+                 native-id clear failed; the grace marker is deliberately kept: {err}"
+            );
+            return Err(anyhow::anyhow!(SWITCH_HALF_APPLIED_ERROR_CODE));
+        }
         SwitchWriteFailure::NothingLanded(err) => err,
     };
     match stamped.retract(db).await {
+        // Nothing landed and the marker is gone: an ordinary failed switch.
+        // Its own error is the honest and most informative thing to report,
+        // and passing it through unchanged is the boundary this PR set in
+        // review round 1 — only states that "the switch failed" describes
+        // BADLY get a code of their own.
         Ok(()) => Err(err),
         // The cleanup failed too. Nothing useful to retry against a database
-        // that just failed twice — but the report must say so, rather than
-        // presenting a half-cleaned abort as a clean one.
-        Err(cleanup) => Err(err.context(format!(
-            "the switch's grace marker could not be retracted either, so a stray marker remains: {cleanup}"
-        ))),
+        // that just failed twice, but the report must not present a
+        // half-cleaned abort as a clean one — so this gets a code as well,
+        // with both causes logged rather than pasted into user-facing text.
+        Err(cleanup) => {
+            eprintln!(
+                "[weft] engine switch aborted AND its grace marker could not be retracted, \
+                 so a stray marker remains — switch failure: {err}; cleanup failure: {cleanup}"
+            );
+            Err(anyhow::anyhow!(SWITCH_CLEANUP_ERROR_CODE))
+        }
     }
 }
 
@@ -2493,7 +2529,7 @@ mod live_slot_tests {
 mod switch_gate_tests {
     use super::{
         persist_switch, refresh_switch_grace, stamp_switch_marker, SwitchTarget,
-        SWITCH_MARKER_ERROR_CODE,
+        SWITCH_CLEANUP_ERROR_CODE, SWITCH_HALF_APPLIED_ERROR_CODE, SWITCH_MARKER_ERROR_CODE,
     };
     use crate::lead_chat::revive::has_resumable_context;
     use crate::store::{repo, Db};
@@ -2817,6 +2853,31 @@ mod switch_gate_tests {
         assert!(failed.is_err(), "a swallowed error would make the switch look fully guarded");
     }
 
+    /// The codes are a cross-language contract with
+    /// `src/session/engineSwitch.ts`'s `SWITCH_ERROR_I18N`, which cannot be
+    /// type-checked across the boundary. This pins the Rust half: distinct
+    /// values (a code that is a substring of another would make the
+    /// frontend's `find` return the wrong copy) and stable spellings, so
+    /// renaming one here without updating the map goes red on this side too.
+    #[test]
+    fn the_switch_error_codes_are_distinct_and_stable() {
+        let codes = [
+            SWITCH_MARKER_ERROR_CODE,
+            SWITCH_HALF_APPLIED_ERROR_CODE,
+            SWITCH_CLEANUP_ERROR_CODE,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for (j, b) in codes.iter().enumerate() {
+                assert!(i == j || !b.contains(a), "{a} is a substring of {b}");
+            }
+        }
+        assert_eq!(
+            codes,
+            ["switch_marker_stamp_failed", "switch_half_applied", "switch_cleanup_failed"],
+            "spellings are mirrored in src/session/engineSwitch.ts — update both"
+        );
+    }
+
     /// Review round 4, finding 1 — the retraction boundary is the FIRST durable
     /// write, not the native-id clear.
     ///
@@ -2838,7 +2899,11 @@ mod switch_gate_tests {
             persist_switch(&db, stamped, "codex", None),
         )
         .await;
-        assert!(failed.is_err(), "the native-id clear must fail (armed seam)");
+        assert_eq!(
+            failed.expect_err("the clear must fail (armed seam)").to_string(),
+            SWITCH_HALF_APPLIED_ERROR_CODE,
+            "half-applied gets its OWN code: reporting a plain failure would be untrue in              the direction that matters, since the tool really did change"
+        );
 
         let s = repo::get_session(&db, sess).await.unwrap().unwrap();
         assert_eq!(s.tool, "codex", "the tool write DID land — this is the half-applied state");
@@ -2885,10 +2950,10 @@ mod switch_gate_tests {
         )
         .await;
 
-        let err = format!("{:#}", failed.expect_err("the switch must fail"));
-        assert!(
-            err.contains("stray marker"),
-            "a half-cleaned abort must not read like a clean one: {err}"
+        let err = failed.expect_err("the switch must fail").to_string();
+        assert_eq!(
+            err, SWITCH_CLEANUP_ERROR_CODE,
+            "rejects with the code the UI translates — the DB causes go to the log, not              into user-facing text (review round 5)"
         );
         assert!(
             repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))

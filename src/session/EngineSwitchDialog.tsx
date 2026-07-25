@@ -7,7 +7,7 @@ import { Button } from "../components/ui/Button";
 import { Field, Input } from "../components/ui/Input";
 import { Segmented } from "../components/ui/Segmented";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
-import { isSwitchMarkerError, modelSupported, switchKindOf } from "./engineSwitch";
+import { modelSupported, switchErrorCodeOf, switchKindOf, SWITCH_ERROR_I18N } from "./engineSwitch";
 
 /** Which layer this dialog changes (issue #96 pitfall #4: "switching the lead
  *  ≠ switching a worker ≠ changing the global default" — the dogfooding
@@ -75,12 +75,13 @@ export function EngineSwitchDialog({
       await onConfirm(tool, modelOk ? model.trim() || null : null);
       onOpenChange(false);
     } catch (e) {
-      // The one backend rejection with a stable code (the grace-marker stamp,
-      // issue #96/#98) gets translated copy; everything else still surfaces
-      // its raw message, which is what the other failures here have always
-      // done. Keeping the fallback means this can't swallow an unrelated
-      // error behind a wrong explanation.
-      setErr(isSwitchMarkerError(e) ? t("session.switchMarkerFailed") : String(e));
+      // Backend rejections that carry a stable code (issue #96/#98) get
+      // translated copy; everything else still surfaces its raw message, which
+      // is what the other failures here have always done. Keeping the fallback
+      // means this can't swallow an unrelated error behind a wrong
+      // explanation.
+      const code = switchErrorCodeOf(e);
+      setErr(code ? t(SWITCH_ERROR_I18N[code]) : String(e));
       if (import.meta.env.DEV) console.error("engine switch failed:", String(e));
       setBusy(false);
     }

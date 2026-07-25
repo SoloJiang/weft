@@ -25,21 +25,37 @@ export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
   return oldTool !== "" && oldTool === newTool ? "reload" : "switch";
 }
 
-/** Stable code `switch_lead_tool`/`switch_worker_tool` reject with when the
- *  freeze-recovery grace marker can't be stamped (Rust:
- *  `SWITCH_MARKER_ERROR_CODE`). The backend deliberately sends the CODE and
- *  logs the database detail, so this locale's copy comes from `src/i18n/*.ts`
- *  rather than an English sentence built in Rust. */
-export const SWITCH_MARKER_ERROR_CODE = "switch_marker_stamp_failed";
+/** The switch outcomes the backend names with a stable code instead of an
+ *  English sentence (Rust: `SWITCH_MARKER_ERROR_CODE` /
+ *  `SWITCH_HALF_APPLIED_ERROR_CODE` / `SWITCH_CLEANUP_ERROR_CODE`). It sends
+ *  the CODE and logs the database detail, so this locale's copy comes from
+ *  `src/i18n/*.ts`.
+ *
+ *  Only outcomes where "the switch failed" would be wrong or incomplete get
+ *  one; an ordinary failed switch passes its own message through, which is why
+ *  `switchErrorCodeOf` returning null is a normal result, not a gap. */
+export const SWITCH_ERROR_I18N: Record<string, string> = {
+  switch_marker_stamp_failed: "session.switchMarkerFailed",
+  switch_half_applied: "session.switchHalfApplied",
+  switch_cleanup_failed: "session.switchCleanupFailed",
+};
 
-/** Recognize that rejection without coupling UI copy to the backend message.
- *  Same shape as `isProcessQuotaDegradedError`: tauri commands currently
- *  reject with strings, while tests and future adapters may surface an Error
- *  or a `{ code }` object. Anything else falls through to the caller's generic
- *  handling, so this never swallows an unrelated failure. */
-export function isSwitchMarkerError(error: unknown): boolean {
-  if (typeof error === "string") return error.includes(SWITCH_MARKER_ERROR_CODE);
-  if (error instanceof Error) return error.message.includes(SWITCH_MARKER_ERROR_CODE);
-  if (typeof error !== "object" || error === null || !("code" in error)) return false;
-  return String(error.code) === SWITCH_MARKER_ERROR_CODE;
+/** The ONE discriminated value the dialog maps from — a code, or null when the
+ *  rejection is an ordinary one to render verbatim. Deriving it once and
+ *  looking the copy up beats a boolean matcher per outcome, which is how the
+ *  set silently goes stale when a fourth is added.
+ *
+ *  Shape tolerance mirrors `isProcessQuotaDegradedError`: tauri commands
+ *  currently reject with strings, while tests and future adapters may surface
+ *  an `Error` or a `{ code }` object. */
+export function switchErrorCodeOf(error: unknown): string | null {
+  const codes = Object.keys(SWITCH_ERROR_I18N);
+  const text = (() => {
+    if (typeof error === "string") return error;
+    if (error instanceof Error) return error.message;
+    if (typeof error === "object" && error !== null && "code" in error) return String(error.code);
+    return null;
+  })();
+  if (text === null) return null;
+  return codes.find((code) => text.includes(code)) ?? null;
 }
