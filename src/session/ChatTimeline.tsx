@@ -506,9 +506,11 @@ function isLatestProposal(m: LeadMessage, all: LeadMessage[]): boolean {
 // A delivery receipt (issue #94) is only worth showing while it's the newest
 // information on screen: once a later row exists — a reply, a tool call, even
 // a newer user send — that row is louder proof of what happened than a stale
-// "delivered"/"processing" tag left on an old bubble. `all` is already the
-// filtered, meta/queued-free `visible` list, so "last row" means "last VISIBLE
-// row" — exactly the reader's current view of the conversation's tip.
+// "delivered"/"processing" tag left on an old bubble. `all` is the TOP-LEVEL
+// row list (`topLevelRows`, issue #99) — meta/queued-free AND with any
+// collab-branch children folded out — so "last row" means "last row the
+// reader can see without expanding anything," exactly the conversation's
+// visible tip.
 function isTail(m: LeadMessage, all: LeadMessage[]): boolean {
   return all.length > 0 && all[all.length - 1].id === m.id;
 }
