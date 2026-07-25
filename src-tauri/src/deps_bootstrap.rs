@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use sha1::{Digest, Sha1};
+
 /// Env-backed knobs for deps bootstrap. Tests pass an explicit `Config` so they
 /// never race on process-global environment variables.
 #[derive(Clone, Debug)]
@@ -479,6 +481,8 @@ fn yarn_config_executes_repo_code(dir: &Path) -> bool {
             || lower.contains("cachedir")
             || lower.contains("cachefolder")
             || lower.contains("cache-folder")
+            || lower.contains("modulesfolder")
+            || lower.contains("modules-folder")
             || lower.contains("virtualfolder")
             || lower.contains("injectenvironmentfiles")
         {
@@ -527,21 +531,55 @@ fn project_config_interpolates_env_secrets(dir: &Path) -> bool {
 
 /// True when a workspace package path/glob can escape the worktree.
 fn workspace_path_escapes(dir: &Path, raw: &str) -> bool {
-    let s = raw.trim().trim_matches(|c| c == '\'' || c == '"' || c == ',');
-    if s.is_empty() {
-        return false;
+    let mut pattern = raw.trim().trim_matches(|c| c == '\'' || c == '"' || c == ',');
+    // pnpm permits exclusion patterns. They do not add a workspace, but still
+    // validate their target so malformed/escaping config cannot bypass the
+    // automatic-path containment gate.
+    if let Some(without_negation) = pattern.strip_prefix('!') {
+        pattern = without_negation.trim();
     }
-    // Globs still escape if they start with ../ or are absolute outside.
-    if relative_path_escapes(s) {
+    if pattern.is_empty() {
         return true;
     }
-    let p = Path::new(s);
-    if p.is_absolute() {
-        return !path_is_under(dir, p);
+    // Do not recursively walk an untrusted checkout during best-effort
+    // materialization. A recursive workspace glob can be handled by the
+    // worker's own install after it has chosen to trust the repository.
+    if pattern.contains("**") {
+        return true;
     }
-    // For patterns like packages/*, only the non-glob prefix is checked.
-    let prefix = s.split('*').next().unwrap_or(s);
-    let prefix = prefix.trim_end_matches('/');
+    // Globs still escape if they start with ../ or are absolute outside.
+    if relative_path_escapes(pattern) {
+        return true;
+    }
+    let p = Path::new(pattern);
+    if p.is_absolute() && !path_is_under(dir, p) {
+        return true;
+    }
+
+    // Resolve every glob match and canonicalize it. A checked-in symlink can
+    // otherwise make an in-tree-looking pattern such as `packages/*` include
+    // a workspace outside this worktree.
+    let glob_pattern = dir.join(pattern).to_string_lossy().into_owned();
+    let entries = match glob::glob(&glob_pattern) {
+        Ok(entries) => entries,
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let Ok(path) = entry else {
+            return true;
+        };
+        if !path_is_under(dir, &path) {
+            return true;
+        }
+    }
+
+    // A non-matching pattern cannot add a workspace during this install, but
+    // still validate its existing non-glob prefix for symlink escape.
+    let prefix = pattern
+        .split(['*', '?', '[', '{'])
+        .next()
+        .unwrap_or(pattern)
+        .trim_end_matches('/');
     if prefix.is_empty() {
         return false;
     }
@@ -555,44 +593,52 @@ fn workspace_path_escapes(dir: &Path, raw: &str) -> bool {
 
 fn pnpm_workspace_escapes(dir: &Path) -> bool {
     for name in ["pnpm-workspace.yaml", "pnpm-workspace.yml"] {
-        let Ok(raw) = std::fs::read_to_string(dir.join(name)) else {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        // Do not follow a workspace manifest symlink outside the worktree.
+        if !path_is_under(dir, &path) {
+            return true;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return true;
+        };
+        // Parse YAML rather than scanning text: YAML anchors/aliases can turn
+        // an innocuous-looking `*name` entry into an escaping path.
+        let Ok(manifest) = serde_yaml::from_str::<PnpmWorkspaceManifest>(&raw) else {
+            return true;
+        };
+        let Some(packages) = manifest.packages else {
             continue;
         };
-        // Lightweight scan: any packages: entry that escapes the worktree.
-        let mut in_packages = false;
-        for line in raw.lines() {
-            let t = line.trim();
-            if t.starts_with("packages:") {
-                in_packages = true;
-                // Inline form: packages: ['a', '../b']
-                if let Some(rest) = t.strip_prefix("packages:") {
-                    for part in rest.split([',', '[', ']', ' ']) {
-                        let p = part.trim().trim_matches(|c| c == '\'' || c == '"');
-                        if !p.is_empty() && workspace_path_escapes(dir, p) {
-                            return true;
-                        }
-                    }
-                }
-                continue;
-            }
-            if in_packages {
-                if t.is_empty() || t.starts_with('#') {
-                    continue;
-                }
-                // Next top-level key ends the packages block.
-                if !t.starts_with('-') && t.contains(':') && !line.starts_with(' ') && !line.starts_with('\t') {
-                    in_packages = false;
-                    continue;
-                }
-                let item = t.trim_start_matches('-').trim();
-                let item = item.trim_matches(|c| c == '\'' || c == '"');
-                if !item.is_empty() && workspace_path_escapes(dir, item) {
-                    return true;
-                }
-            }
+        if packages.iter().any(|path| workspace_path_escapes(dir, path)) {
+            return true;
         }
     }
     false
+}
+
+#[derive(serde::Deserialize)]
+struct PnpmWorkspaceManifest {
+    #[serde(default)]
+    packages: Option<Vec<String>>,
+}
+
+/// Per-worktree npm cache/log paths owned by Weft, outside `node_modules`.
+/// `npm ci` removes node_modules before installation, so keeping retry state
+/// there defeats `--prefer-offline` and discards failure diagnostics.
+fn managed_npm_cache_dir(dir: &Path, leaf: &str) -> PathBuf {
+    let identity = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut digest = Sha1::new();
+    digest.update(identity.to_string_lossy().as_bytes());
+    let scope = hex::encode(digest.finalize());
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("weft")
+        .join("deps-bootstrap")
+        .join(scope)
+        .join(leaf)
 }
 
 fn package_json_workspaces_escape(dir: &Path) -> bool {
@@ -665,9 +711,7 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
         "node_modules",
         "node_modules/.pnpm",
         "node_modules/.weft-pnpm-store",
-        "node_modules/.weft-npm-cache",
         "node_modules/.weft-bun-cache",
-        "node_modules/.weft-npm-logs",
     ];
     if matches!(pm, PackageManager::YarnBerry) {
         contained.extend([".yarn", ".yarn/cache"]);
@@ -800,19 +844,19 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "npm_config_prefix".to_string(),
                 dir.to_string_lossy().into_owned(),
             ));
-            // Pin cache inside the worktree so relative cache=../../../... in
-            // project .npmrc cannot write into the canonical repository.
+            // Use a per-worktree Weft-managed cache outside node_modules:
+            // npm ci removes node_modules before each clean install.
             env.push((
                 "npm_config_cache".to_string(),
-                dir.join("node_modules/.weft-npm-cache")
+                managed_npm_cache_dir(dir, "cache")
                     .to_string_lossy()
                     .into_owned(),
             ));
-            // logs-dir is independent of cache; pin it too so project
-            // logs-dir=../../../... cannot write into the canonical repo.
+            // logs-dir is independent of cache; keep it beside the managed
+            // cache so project logs-dir=../../../... cannot escape either.
             env.push((
                 "npm_config_logs_dir".to_string(),
-                dir.join("node_modules/.weft-npm-logs")
+                managed_npm_cache_dir(dir, "logs")
                     .to_string_lossy()
                     .into_owned(),
             ));
@@ -933,25 +977,32 @@ fn sanitize_path_for_bootstrap(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Resolve `program` against the sanitized tool PATH to an absolute path.
-fn resolve_package_manager_program(program: &str) -> Result<PathBuf, String> {
-    let path = sanitize_path_for_bootstrap(&crate::detect::tool_path());
+/// Resolve `program` against an already-sanitized tool PATH to an absolute path.
+fn resolve_package_manager_program_in_path(program: &str, path: &str) -> Option<PathBuf> {
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(program);
         if candidate.is_file() {
-            return Ok(candidate);
+            return Some(candidate);
         }
         #[cfg(windows)]
         {
             for ext in ["exe", "cmd", "bat"] {
                 let c = dir.join(format!("{program}.{ext}"));
                 if c.is_file() {
-                    return Ok(c);
+                    return Some(c);
                 }
             }
         }
     }
-    Ok(PathBuf::from(program))
+    None
+}
+
+/// Resolve `program` against the sanitized tool PATH to an absolute path.
+fn resolve_package_manager_program(program: &str) -> Result<PathBuf, String> {
+    let path = sanitize_path_for_bootstrap(&crate::detect::tool_path());
+    resolve_package_manager_program_in_path(program, &path).ok_or_else(|| {
+        format!("could not resolve {program} from the sanitized package-manager PATH")
+    })
 }
 
 fn bootstrap_identity_envs() -> Vec<(String, String)> {
@@ -1367,6 +1418,17 @@ mod tests {
     }
 
     #[test]
+    fn plan_install_yarn_classic_skips_modules_folder_override() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{ "packageManager": "yarn@1.22.0" }"#);
+        write(&d, "yarn.lock", "# yarn lockfile v1\n");
+        write(&d, ".yarnrc", "--modules-folder ../../../escaped-node_modules\n");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
     fn plan_install_yarn_berry_is_immutable_and_skips_classic_flags() {
         let d = tmp();
         let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
@@ -1562,6 +1624,50 @@ mod tests {
     }
 
     #[test]
+    fn plan_install_pnpm_ignores_workspace_alias_that_escapes() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{"name":"x"}"#);
+        write(&d, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(
+            &d,
+            "pnpm-workspace.yaml",
+            "outside: &outside '../out'\npackages:\n  - *outside\n",
+        );
+        let plan = plan_install_with(&d, &test_cfg(true, true)).expect("plan");
+        assert!(
+            plan.args.iter().any(|a| a == "--ignore-workspace"),
+            "YAML aliases must resolve before workspace containment is trusted"
+        );
+    }
+
+    #[test]
+    fn plan_install_pnpm_ignores_recursive_workspace_glob() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{"name":"x"}"#);
+        write(&d, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(&d, "pnpm-workspace.yaml", "packages: ['packages/**']\n");
+        let plan = plan_install_with(&d, &test_cfg(true, true)).expect("plan");
+        assert!(plan.args.iter().any(|a| a == "--ignore-workspace"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pnpm_workspace_escapes_when_glob_matches_external_symlink() {
+        let d = tmp();
+        let outside = tmp();
+        std::fs::create_dir_all(d.join("packages")).unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("packages/outside")).unwrap();
+        write(&d, "pnpm-workspace.yaml", "packages: ['packages/*']\n");
+        assert!(pnpm_workspace_escapes(&d));
+        let absolute_glob = d.join("packages/*").to_string_lossy().into_owned();
+        assert!(workspace_path_escapes(&d, &absolute_glob));
+    }
+
+    #[test]
     fn plan_install_bun_skips_escaping_workspaces() {
         let d = tmp();
         let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
@@ -1604,19 +1710,29 @@ mod tests {
     }
 
     #[test]
-    fn plan_install_npm_pins_logs_dir() {
+    fn plan_install_npm_uses_managed_cache_dirs_outside_node_modules() {
         let d = tmp();
         let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
         write(&d, ".gitignore", "node_modules/\n");
         write(&d, "package.json", "{}");
         write(&d, "package-lock.json", "{}");
         let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
-        assert!(plan.env.iter().any(|(k, v)| {
-            k == "npm_config_logs_dir" && v.ends_with("node_modules/.weft-npm-logs")
-        }));
-        assert!(plan.env.iter().any(|(k, v)| {
-            k == "npm_config_cache" && v.ends_with("node_modules/.weft-npm-cache")
-        }));
+        let cache = plan
+            .env
+            .iter()
+            .find(|(k, _)| k == "npm_config_cache")
+            .map(|(_, v)| PathBuf::from(v))
+            .expect("npm cache path");
+        let logs = plan
+            .env
+            .iter()
+            .find(|(k, _)| k == "npm_config_logs_dir")
+            .map(|(_, v)| PathBuf::from(v))
+            .expect("npm logs path");
+        assert_eq!(cache, managed_npm_cache_dir(&d, "cache"));
+        assert_eq!(logs, managed_npm_cache_dir(&d, "logs"));
+        assert!(!cache.starts_with(d.join("node_modules")));
+        assert!(!logs.starts_with(d.join("node_modules")));
     }
 
     #[test]
@@ -1643,6 +1759,15 @@ mod tests {
     fn sanitize_path_drops_relative_entries() {
         let s = sanitize_path_for_bootstrap(".:/usr/bin:foo/bar:/opt/bin");
         assert_eq!(s, "/usr/bin:/opt/bin");
+    }
+
+    #[test]
+    fn package_manager_program_lookup_fails_closed_when_absent() {
+        let d = tmp();
+        let path = d.to_string_lossy();
+        assert!(
+            resolve_package_manager_program_in_path("weft-not-a-package-manager", &path).is_none()
+        );
     }
 
     #[test]
