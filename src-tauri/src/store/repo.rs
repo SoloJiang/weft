@@ -1782,6 +1782,10 @@ pub async fn set_session_native_id_opt(
     session_id: i32,
     native_id: Option<&str>,
 ) -> Result<()> {
+    // Seam point: `commands::persist_switch` must KEEP its grace marker when
+    // the tool write landed and this clear is what failed — a half-applied
+    // switch. No other way to reach that branch from a test.
+    fail_write!("set_session_native_id_opt");
     if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
         let mut a: session::ActiveModel = s.into();
         a.native_session_id = Set(native_id.map(str::to_string));
@@ -1891,6 +1895,9 @@ pub async fn mark_turn_freeze_recovered(
 /// load-bearing. A missing row is not an error — the switch's cleanup must not
 /// fail louder than the failure it is cleaning up after.
 pub async fn delete_turn_freeze_marker(db: &Db, marker_id: i32) -> Result<()> {
+    // Seam point: the retraction is itself fallible, and a switch whose
+    // cleanup ALSO fails must say so rather than report a clean abort.
+    fail_write!("delete_turn_freeze_marker");
     lead_message::Entity::delete_by_id(marker_id)
         .exec(&db.0)
         .await?;

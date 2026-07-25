@@ -1694,18 +1694,15 @@ mod switch_gate {
         /// "one grace window and nothing else"; review round 2 showed that was
         /// only true when a native id was present.
         ///
-        /// Best-effort and logged, never fatal: cleanup must not fail louder
-        /// than the failure it is cleaning up after, and a surviving marker
-        /// degrades to the pre-retraction behaviour rather than to something
-        /// worse.
-        pub(super) async fn retract(self, db: &Db) {
-            if let Err(err) = repo::delete_turn_freeze_marker(db, self.marker_id).await {
-                eprintln!(
-                    "[weft] engine switch: failed to retract the grace marker \
-                     (row {}) after an aborted switch: {err}",
-                    self.marker_id
-                );
-            }
+        /// Returns `Result` rather than logging and swallowing (review round
+        /// 4): this cleanup is itself a fallible write, and when it fails the
+        /// stray marker is left behind with exactly the consequence the
+        /// retraction exists to prevent. The caller cannot usefully retry — the
+        /// database just failed twice in a row — but it CAN fold the cleanup
+        /// failure into the error it is already returning, so an abort that
+        /// did not fully clean up is never reported as if it had.
+        pub(super) async fn retract(self, db: &Db) -> anyhow::Result<()> {
+            repo::delete_turn_freeze_marker(db, self.marker_id).await
         }
     }
 
@@ -1832,20 +1829,48 @@ use switch_gate::{refresh_switch_grace, stamp_switch_marker, MarkerStamped};
 /// The caller-visible switch sequence is unchanged (persist tool/model → clear
 /// native id); only the auxiliary grace stamp moved, and its one prior
 /// ordering constraint — "before the clear" — still holds.
+/// Which of [`persist_switch_writes`]' two writes failed — the ONE
+/// discriminator the retraction decision keys on, because "is it still safe to
+/// retract?" is precisely "has anything durable landed yet?" (review round 4).
+enum SwitchWriteFailure {
+    /// The tool/model write failed, so NOTHING durable landed: the surface
+    /// still has its old tool and its old native id. The marker describes a
+    /// reset that never happened and is safe to retract.
+    NothingLanded(anyhow::Error),
+    /// The tool/model write landed and the native-id CLEAR failed. The switch
+    /// is half-applied — new tool, old engine's native id — and the marker
+    /// must be KEPT: it is the only thing holding the stall sweep off a
+    /// surface whose next send would otherwise attempt an invalid
+    /// cross-engine resume (issue #96 pitfall 1). Round 3 placed the
+    /// retraction boundary at "the native id is gone"; this is the same rule
+    /// read more carefully — the FIRST durable write is already enough to make
+    /// retraction wrong.
+    ToolLandedButClearFailed(anyhow::Error),
+}
+
 async fn persist_switch(
     db: &Db,
     stamped: MarkerStamped,
     tool: &str,
     model: Option<&str>,
 ) -> anyhow::Result<()> {
-    match persist_switch_writes(db, &stamped, tool, model).await {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            // Still safe to retract: the native id survived this failure, so
-            // the marker is not yet the only evidence the surface ran.
-            stamped.retract(db).await;
-            Err(err)
-        }
+    let failure = match persist_switch_writes(db, &stamped, tool, model).await {
+        Ok(()) => return Ok(()),
+        Err(failure) => failure,
+    };
+    let err = match failure {
+        // Half-applied: keep the marker, it is now load-bearing.
+        SwitchWriteFailure::ToolLandedButClearFailed(err) => return Err(err),
+        SwitchWriteFailure::NothingLanded(err) => err,
+    };
+    match stamped.retract(db).await {
+        Ok(()) => Err(err),
+        // The cleanup failed too. Nothing useful to retry against a database
+        // that just failed twice — but the report must say so, rather than
+        // presenting a half-cleaned abort as a clean one.
+        Err(cleanup) => Err(err.context(format!(
+            "the switch's grace marker could not be retracted either, so a stray marker remains: {cleanup}"
+        ))),
     }
 }
 
@@ -1856,23 +1881,26 @@ async fn persist_switch_writes(
     stamped: &MarkerStamped,
     tool: &str,
     model: Option<&str>,
-) -> anyhow::Result<()> {
+) -> Result<(), SwitchWriteFailure> {
     let target = stamped.target();
     let thread_id = target.thread_id();
     let session_id = target.session_id();
-    match target {
-        SwitchTarget::Lead { thread_id } => {
-            repo::switch_thread_tool(db, thread_id, tool, model).await?;
-        }
+    let tool_write = match target {
+        SwitchTarget::Lead { thread_id } => repo::switch_thread_tool(db, thread_id, tool, model)
+            .await
+            .map(|_| ()),
         SwitchTarget::Worker {
             direction_id,
             session_id,
             ..
-        } => {
-            repo::switch_worker_tool_txn(db, direction_id, session_id, tool, model).await?;
-        }
-    }
-    engine::clear_native_id(db, session_id, thread_id).await
+        } => repo::switch_worker_tool_txn(db, direction_id, session_id, tool, model)
+            .await
+            .map(|_| ()),
+    };
+    tool_write.map_err(SwitchWriteFailure::NothingLanded)?;
+    engine::clear_native_id(db, session_id, thread_id)
+        .await
+        .map_err(SwitchWriteFailure::ToolLandedButClearFailed)
 }
 
 /// Switch the LEAD's engine identity and/or model override for `thread_id` —
@@ -2787,6 +2815,88 @@ mod switch_gate_tests {
             repo::fail_write::while_failing(MARKER_WRITE, refresh_switch_grace(&db, target)).await;
 
         assert!(failed.is_err(), "a swallowed error would make the switch look fully guarded");
+    }
+
+    /// Review round 4, finding 1 — the retraction boundary is the FIRST durable
+    /// write, not the native-id clear.
+    ///
+    /// `persist_switch_writes` persists the tool and then clears the native id.
+    /// If the clear is what fails, the switch is half-applied: new tool, OLD
+    /// engine's native id. Retracting there would drop the only thing holding
+    /// the stall sweep off a surface whose next send would attempt an invalid
+    /// cross-engine resume (issue #96 pitfall 1). Round 3 read the boundary as
+    /// "the native id is gone"; this is the same rule read more carefully.
+    #[tokio::test]
+    async fn a_half_applied_switch_keeps_its_grace_marker() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
+
+        let stamped = stamp_switch_marker(&db, target).await.unwrap();
+        let failed = repo::fail_write::while_failing(
+            "set_session_native_id_opt",
+            persist_switch(&db, stamped, "codex", None),
+        )
+        .await;
+        assert!(failed.is_err(), "the native-id clear must fail (armed seam)");
+
+        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
+        assert_eq!(s.tool, "codex", "the tool write DID land — this is the half-applied state");
+        assert_eq!(
+            s.native_session_id.as_deref(),
+            Some("worker-nat-1"),
+            "and the clear did not, so the old engine's id is still there"
+        );
+        assert!(
+            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+                .await
+                .unwrap()
+                .is_some(),
+            "so the marker must be KEPT: it is what holds the sweep off a half-switched surface"
+        );
+    }
+
+    /// Review round 4, finding 2 — an abort whose cleanup ALSO fails must not
+    /// be reported as a clean one.
+    ///
+    /// Nothing useful to retry against a database that just failed twice, so
+    /// the requirement is honesty rather than recovery: the returned error has
+    /// to say a stray marker remains, and the marker is genuinely still there.
+    #[tokio::test]
+    async fn an_abort_whose_cleanup_fails_says_so() {
+        let db = mem().await;
+        let (th, _dir, sess) = fixture(&db).await;
+        // Two writes have to fail at once, but `while_failing` arms ONE name
+        // per task by design (#144), and nesting just lets the inner scope win.
+        // So the tool write is failed by other means — a direction id that does
+        // not exist, which `switch_worker_tool_txn` rejects — leaving the seam
+        // free for the cleanup. The stamp itself only touches thread/session,
+        // both real, so the marker genuinely lands first.
+        let target = SwitchTarget::Worker {
+            thread_id: th,
+            direction_id: 999_999,
+            session_id: sess,
+        };
+
+        let stamped = stamp_switch_marker(&db, target).await.unwrap();
+        let failed = repo::fail_write::while_failing(
+            "delete_turn_freeze_marker",
+            persist_switch(&db, stamped, "codex", None),
+        )
+        .await;
+
+        let err = format!("{:#}", failed.expect_err("the switch must fail"));
+        assert!(
+            err.contains("stray marker"),
+            "a half-cleaned abort must not read like a clean one: {err}"
+        );
+        assert!(
+            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+                .await
+                .unwrap()
+                .is_some(),
+            "and the marker really is still there, which is what the message claims"
+        );
     }
 
     /// Review round 2, finding 2 — the grace window is restarted once the
