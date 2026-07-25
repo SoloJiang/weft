@@ -21,6 +21,28 @@ export interface ProcessQuotaStatus {
   transitionSeq: number;
 }
 
+/** One owner category's directly-managed child-process count (`proc_registry`'s
+ *  `OwnerKind`, e.g. "session" | "lead_thread" | "curator" | ...). Only non-zero
+ *  categories are included; `kind` is the Rust enum's snake_case tag as-is. */
+export interface ResourceOwnerCount {
+  kind: string;
+  count: number;
+}
+
+/** Read-only local-runtime dashboard snapshot (issue #112). Combines the three
+ *  process-tree safety-net axes — no sampling happens here, this only aggregates
+ *  what `process_quota` / `proc_registry` / `session_gate` already track. */
+export interface ResourceDashboardSnapshot {
+  quota: ProcessQuotaStatus;
+  instanceProcessCount: number;
+  /** Owned-subtree RSS total, bytes. `null` on a platform without the sampler
+   *  (non-macOS/Linux) — render as "unavailable", never as 0. */
+  instanceMemoryBytes: number | null;
+  byOwner: ResourceOwnerCount[];
+  activeSessions: number;
+  maxSessions: number;
+}
+
 export interface Workspace {
   id: number;
   name: string;

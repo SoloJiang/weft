@@ -6140,6 +6140,19 @@ fn spawn_reader(
                 }
             }
             inner.child = None;
+            // Release the session_gate slot HERE, not on the next spawn: a per-turn
+            // process (codex/opencode) has no resident process between turns, so
+            // once its EOF is processed there is no live child left for the permit
+            // to represent. Leaving it held until `spawn_turn` overwrites
+            // `child_permit` (issue #112 dashboard review, session_gate.rs P2) meant
+            // a session sitting idle after its last turn — no queued follow-up,
+            // engine just idle — kept counting as an active slot in
+            // `session_gate::active_session_slots()` forever, until the NEXT turn
+            // (which might be minutes/never). If `next` (below) immediately spawns a
+            // queued turn, it re-acquires its own permit inside `spawn_turn` — fairly,
+            // through the same queue any other waiting session would go through,
+            // rather than this session silently keeping the slot it already earned.
+            inner.child_permit = None;
             let next = inner.turn.on_turn_end();
             // A kill-only interrupt (see interrupt()) leaves `generation`/the
             // queue untouched, so THIS EOF branch — not a reset — is what runs
