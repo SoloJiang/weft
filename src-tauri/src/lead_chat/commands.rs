@@ -718,13 +718,38 @@ pub async fn lead_session_meta(
     // Ticket BEFORE gathering: a slow probe overlapping a fresher one must not
     // roll usage back when it finally lands (see absorb_probe_meta).
     let ticket = engine::take_probe_ticket(&app, thread_id, None).await;
-    let snap = crate::session_meta::gather(
+    let mut snap = crate::session_meta::gather(
         &t.lead_tool,
         &cwd.to_string_lossy(),
         native.as_deref(),
         &command,
     )
     .await;
+    // ACP tools: MCP is what Weft injected on session/new — read engine cache.
+    // Also backfill model/reasoning from the live engine (session/new configOptions).
+    // Use LeadChatState::get (same as lead_state). NEVER write Some([]) when the
+    // engine is missing — absorb_probe_meta would treat that as freshest empty
+    // and wipe last_mcp_servers on a live engine race / ticket ordering quirk.
+    if crate::lead_chat::engine::is_acp_tool(&t.lead_tool) {
+        if let Some(eng) = app.state::<LeadChatState>().get(lead_key(thread_id)) {
+            let g = eng.lock().await;
+            // Some(list) even when only Weft-internal servers (frontend filters
+            // those) → mcpAuthoritative so the panel shows "none" not "pending".
+            snap.mcp_servers = Some(g.last_mcp_servers.clone());
+            if snap.model.is_none() {
+                snap.model = g.last_model.clone();
+            }
+            if snap.reasoning_effort.is_none() {
+                snap.reasoning_effort = g.last_reasoning.clone();
+            }
+            if snap.context_tokens.is_none() {
+                snap.context_tokens = g.last_context_tokens;
+            }
+            if snap.window.is_none() {
+                snap.window = g.last_window;
+            }
+        }
+    }
     // Probe results feed the engine cache + persisted snapshot: codex/opencode
     // model/window/MCP only exist here, never in engine events.
     engine::absorb_probe_meta(&app, &db, thread_id, None, ticket, &snap).await;

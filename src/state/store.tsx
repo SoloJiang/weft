@@ -1653,7 +1653,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           [p.thread_id]: applyLeadConsumed(m[p.thread_id] ?? [], p.message_id, p.consumed_at),
         }));
       } else if (p.type === "activity") {
-        const act = { name: p.name, summary: p.summary };
+        // Empty name = explicit clear (thinking → first answer token).
+        const act = p.name ? { name: p.name, summary: p.summary } : null;
         if (p.session_id != null) {
           const sid = p.session_id;
           setWorkerActivity((a) => ({ ...a, [sid]: act }));

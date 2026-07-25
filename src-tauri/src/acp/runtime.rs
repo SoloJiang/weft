@@ -37,6 +37,10 @@ pub enum SessionEvent {
         model: Option<String>,
         thinking: Option<String>,
     },
+    /// Streaming reasoning text (agent_thought_chunk) for the busy indicator.
+    Thought {
+        text: String,
+    },
     /// Permission needed — engine/runtime resolves via Ask and replies on the wire.
     /// Carries enough for the default handler; custom handlers may be installed later.
     Permission {
@@ -372,6 +376,7 @@ impl ClientHandle {
                 window,
             },
             UpdateOut::Meta { model, thinking } => SessionEvent::Meta { model, thinking },
+            UpdateOut::Thought { text } => SessionEvent::Thought { text },
             UpdateOut::Ignore => return,
         };
         if let Some(inner) = self.inner.lock().await.as_mut() {

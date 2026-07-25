@@ -347,7 +347,8 @@ function BusyIndicator({
   cwd?: string;
 }) {
   const { t } = useTranslation();
-  if (activity) return <ToolStatus name={activity.name} summary={activity.summary} cwd={cwd} />;
+  // Empty name = explicit clear from the engine (e.g. thinking → first answer token).
+  if (activity?.name) return <ToolStatus name={activity.name} summary={activity.summary} cwd={cwd} />;
   return (
     <div className="flex items-center gap-1.5 px-1 text-[11px] text-ink-faint">
       <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-running" />
@@ -373,18 +374,20 @@ function ToolStatus({ name, summary, cwd }: { name: string; summary: string; cwd
   const labelKey = toolLabelKey(name);
   const { target, targetToken, added, removed } = compactToolTarget(name, summary);
   // For unrecognized tools (MCP etc.) the generic "Calling" says nothing —
-  // show the cleaned tool identity instead.
+  // show the cleaned tool identity instead. Thinking streams freeform text in
+  // `summary` — show that tail rather than a path-like target.
   const generic = labelKey === "session.toolCalling";
+  const thinking = labelKey === "session.toolThinking";
   return (
     <ToolActivity
       icon={Icon}
       label={generic ? cleanToolName(name) : t(labelKey)}
-      target={generic ? undefined : target}
-      targetToken={generic ? undefined : targetToken}
+      target={generic || thinking ? undefined : target}
+      targetToken={generic || thinking ? undefined : targetToken}
       cwd={cwd}
-      summary={generic ? summary : undefined}
-      added={added}
-      removed={removed}
+      summary={generic || thinking ? summary : undefined}
+      added={thinking ? undefined : added}
+      removed={thinking ? undefined : removed}
     />
   );
 }

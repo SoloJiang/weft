@@ -19,6 +19,10 @@ pub enum UpdateOut {
         model: Option<String>,
         thinking: Option<String>,
     },
+    /// Streaming model reasoning (agent_thought_chunk). Not final answer text.
+    Thought {
+        text: String,
+    },
     Ignore,
 }
 
@@ -29,7 +33,7 @@ pub fn update_to_out(update: &Value) -> UpdateOut {
     };
     match kind {
         "agent_message_chunk" => text_delta(update),
-        "agent_thought_chunk" => UpdateOut::Ignore,
+        "agent_thought_chunk" => thought_chunk(update),
         "user_message_chunk" => UpdateOut::Ignore,
         "tool_call" => tool_call_start(update),
         "tool_call_update" => tool_call_update(update),
@@ -55,6 +59,19 @@ fn text_delta(update: &Value) -> UpdateOut {
         text: text.to_string(),
         item: None,
     })
+}
+
+fn thought_chunk(update: &Value) -> UpdateOut {
+    let text = update
+        .pointer("/content/text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if text.is_empty() {
+        return UpdateOut::Ignore;
+    }
+    UpdateOut::Thought {
+        text: text.to_string(),
+    }
 }
 
 fn tool_call_start(update: &Value) -> UpdateOut {
@@ -286,12 +303,15 @@ mod tests {
     }
 
     #[test]
-    fn thought_chunk_ignored() {
+    fn thought_chunk_maps() {
         let u = json!({
             "sessionUpdate": "agent_thought_chunk",
             "content": { "type": "text", "text": "hmm" }
         });
-        assert!(matches!(update_to_out(&u), UpdateOut::Ignore));
+        match update_to_out(&u) {
+            UpdateOut::Thought { text } => assert_eq!(text, "hmm"),
+            o => panic!("{o:?}"),
+        }
     }
 
     #[test]

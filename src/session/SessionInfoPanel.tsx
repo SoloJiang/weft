@@ -158,7 +158,11 @@ export function SessionInfoPanel({
               )}
             />
           ) : (
-            <div className="mt-1.5 text-[11px] text-ink-faint">{t("sessionInfo.pending")}</div>
+            <div className="mt-1.5 text-[11px] text-ink-faint">
+              {meta?.mcpAuthoritative
+                ? t("sessionInfo.noMcp")
+                : t("sessionInfo.pending")}
+            </div>
           )}
         </Section>
       </div>
@@ -265,8 +269,9 @@ function OverflowList<T>({
  *  LeadTab/WorkerConversation), so there's no real window where this default
  *  would show a reading that never arrives. */
 function skillDiscoverySupported(tool: string | undefined): boolean {
-  // OpenCode has no engine-skills probe; OMP/ACP session_meta returns skills:None.
-  return tool !== "opencode" && tool !== "omp";
+  // OpenCode has no engine-skills probe. OMP scans the session cwd after Weft
+  // materializes skills (gather_omp → Some(list), empty = authoritative zero).
+  return tool !== "opencode";
 }
 
 /** One Skills reading's tri-state: `undefined` means no authoritative result

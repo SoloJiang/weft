@@ -308,6 +308,28 @@ async fn gather_claude(cwd: &str) -> SessionMetaSnapshot {
 /// 按 tool 分派。claude 只在带外补 skill(其余 meta 走事件流);其他未知 tool 返回空。
 /// `command` is the effective binary for this session (per-session/lead pin, else
 /// the global alias) so MCP/skill probes hit the binary actually driving it.
+/// OMP/ACP: skills from the lead/worker cwd (Weft materializes into `.agents`
+/// and `.claude`). MCP is injected by Weft over ACP session/new — the engine
+/// cache is the authority and is overlaid in `lead_session_meta` / worker meta.
+async fn gather_omp(cwd: &str) -> SessionMetaSnapshot {
+    // Prefer .agents (ACP/omp ecosystem); also scan .claude since inject writes both.
+    let skills = crate::skills::cwd_skills(std::path::Path::new(cwd), &[".agents", ".claude"])
+        .into_iter()
+        .map(|s| SkillInfo {
+            name: s.name,
+            description: s.description,
+        })
+        .collect::<Vec<_>>();
+    SessionMetaSnapshot {
+        context_tokens: None,
+        window: None,
+        model: None,
+        mcp_servers: None, // engine overlay supplies injected MCP
+        skills: Some(skills),
+        reasoning_effort: None,
+    }
+}
+
 pub async fn gather(
     tool: &str,
     cwd: &str,
@@ -318,6 +340,7 @@ pub async fn gather(
         "codex" => gather_codex(cwd, command).await,
         "opencode" => gather_opencode(cwd, native_id, command).await,
         "claude" => gather_claude(cwd).await,
+        "omp" => gather_omp(cwd).await,
         _ => SessionMetaSnapshot::default(),
     }
 }

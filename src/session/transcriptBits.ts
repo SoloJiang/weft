@@ -3,6 +3,7 @@
 
 import type { ComponentType } from "react";
 import {
+  Brain,
   FilePen,
   FileText,
   ListTodo,
@@ -20,7 +21,7 @@ const MANIFEST_FILE_TARGET_RE =
   /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]*(?:Dockerfile|Makefile|\.gitignore|\.env(?:\.[\w.-]+)?))(?:$|[\s"'`),.;:!?，。；！？、])/;
 const PATH_SEP_TARGET_RE =
   /(?:^|[\s"'`])((?:~[\\/]|(?:[A-Za-z]:[\\/])?)[^\s"'`,;!?，。；！？、]+[\\/][^\s"'`,;!?，。；！？、]+)(?:$|[\s"'`),.;:!?，。；！？、])/;
-type ToolKind = "command" | "edit" | "search" | "read" | "sync" | "todo" | "generic";
+type ToolKind = "command" | "edit" | "search" | "read" | "sync" | "todo" | "thinking" | "generic";
 
 /** Map a (cleaned) tool name to a glyph so the pills are scannable. */
 export function toolIcon(name: string): ComponentType<LucideProps> {
@@ -31,6 +32,7 @@ export function toolIcon(name: string): ComponentType<LucideProps> {
     read: FileText,
     sync: Radio,
     todo: ListTodo,
+    thinking: Brain,
     generic: Wrench,
   };
   return icons[toolKind(name)];
@@ -52,6 +54,7 @@ export function toolLabelKey(name: string) {
     read: "session.toolReading",
     sync: "session.toolSyncing",
     todo: "session.toolOrganizing",
+    thinking: "session.toolThinking",
     generic: "session.toolCalling",
   };
   return labels[toolKind(name)];
@@ -67,6 +70,7 @@ export function toolDoneLabelKey(name: string) {
     read: "session.toolRead",
     sync: "session.toolSynced",
     todo: "session.toolOrganized",
+    thinking: "session.toolThought",
     generic: "session.toolCalled",
   };
   return labels[toolKind(name)];
@@ -173,6 +177,7 @@ function toolNameTokens(name: string): string[] {
 function toolKind(name: string): ToolKind {
   const tokens = toolNameTokens(name);
   const has = (token: string) => tokens.includes(token);
+  if (has("thinking") || has("thought") || has("reasoning")) return "thinking";
   if (has("write") || has("edit") || has("patch")) return "edit";
   if (has("filechange") || (has("file") && has("change"))) return "edit";
   if (has("apply") && has("patch")) return "edit";

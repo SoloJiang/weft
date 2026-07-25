@@ -52,7 +52,10 @@ export function metaFromInit(
   },
 ): SessionMeta {
   const grouped = groupMcpTools(p.mcp_servers, p.tools);
-  const authoritative = p.model != null;
+  // Model OR a non-empty MCP list makes this init authoritative for servers.
+  // ACP open often has MCP before/without a model field — must not keep the
+  // empty "pending" placeholder in that case.
+  const authoritative = p.model != null || grouped.length > 0;
   const keepPrevServers = !authoritative && grouped.length === 0;
   return {
     contextTokens: prev?.contextTokens,
@@ -118,11 +121,19 @@ export function metaFromSnapshot(snap: {
   mcp_servers: { name: string; status: string }[];
   tools: string[];
 }): SessionMeta {
+  const mcpServers = groupMcpTools(snap.mcp_servers, snap.tools);
+  // Engine cache is authoritative even when every server is Weft-internal
+  // (filtered out) — the panel must show "none" not perpetual "pending".
+  const hasEngineSignal =
+    snap.model != null ||
+    snap.mcp_servers.length > 0 ||
+    snap.context_tokens != null;
   return {
     contextTokens: snap.context_tokens ?? undefined,
     window: snap.window ?? undefined,
     model: snap.model ?? undefined,
-    mcpServers: groupMcpTools(snap.mcp_servers, snap.tools),
+    mcpServers,
+    mcpAuthoritative: hasEngineSignal ? true : undefined,
   };
 }
 
@@ -139,7 +150,9 @@ export function fillMetaHoles(prev: SessionMeta | undefined, snap: SessionMeta):
     window: prev.window ?? snap.window,
     model: prev.model ?? snap.model,
     mcpServers: fillServers ? snap.mcpServers : prev.mcpServers,
-    mcpAuthoritative: prev.mcpAuthoritative,
+    // Promote authority when the snapshot is a real engine reading (even if
+    // user-visible servers are empty after filtering Weft-internal pipes).
+    mcpAuthoritative: prev.mcpAuthoritative || snap.mcpAuthoritative,
     engineSkills: prev.engineSkills ?? snap.engineSkills,
     reasoningEffort: prev.reasoningEffort ?? snap.reasoningEffort,
   };

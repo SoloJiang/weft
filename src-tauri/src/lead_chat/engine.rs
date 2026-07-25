@@ -3005,7 +3005,8 @@ async fn spawn_acp_turn(
         }
         // Seed MCP list from what we injected so Session Info is not empty after
         // the first turn (OMP has no separate mcp discovery event).
-        if g.last_mcp_servers.is_empty() && !mcp_for_meta.is_empty() {
+        if !mcp_for_meta.is_empty() {
+            // Refresh names from this turn's inject set (idempotent).
             g.last_mcp_servers = mcp_for_meta
                 .into_iter()
                 .map(|s| super::proto::McpServer {
@@ -3014,6 +3015,21 @@ async fn spawn_acp_turn(
                 })
                 .collect();
         }
+        // Always push Init after ACP open so Session Info hydrates MCP/model
+        // immediately (probe gather used to return empty defaults for omp).
+        let _ = app.emit(
+            EVENT,
+            Push::Init {
+                thread_id: g.thread_id,
+                session_id: g.session_id,
+                native_id: session_id.clone(),
+                slash_commands: g.slash_commands.clone(),
+                mcp_servers: g.last_mcp_servers.clone(),
+                tools: g.last_tools.clone(),
+                model: g.last_model.clone(),
+                window: g.last_window,
+            },
+        );
     }
 
     // Always resubscribe when the runtime lost the route (child restart /
@@ -3311,9 +3327,53 @@ async fn acp_consumer(
 ) {
     use crate::acp::runtime::SessionEvent;
     use super::proto::ChatEvent;
+    // Accumulated thought text for the busy-line chip (cleared on answer tokens).
+    let mut thought_buf = String::new();
     while let Some(msg) = rx.recv().await {
         match msg {
+            SessionEvent::Thought { text } => {
+                thought_buf.push_str(&text);
+                // Live reasoning on the busy line so the turn doesn't look stuck
+                // before the first answer token. Show a tail window of the buffer.
+                let summary = {
+                    let chars: Vec<char> = thought_buf.chars().collect();
+                    if chars.len() > 160 {
+                        format!("…{}", chars[chars.len() - 160..].iter().collect::<String>())
+                    } else {
+                        thought_buf.clone()
+                    }
+                };
+                let thread_id = eng.lock().await.thread_id;
+                let session_id = eng.lock().await.session_id;
+                let _ = app.emit(
+                    EVENT,
+                    Push::Activity {
+                        thread_id,
+                        session_id,
+                        name: "thinking".into(),
+                        summary,
+                    },
+                );
+            }
+
             SessionEvent::Chat(ChatEvent::TextDelta { text, item: _ }) => {
+                // Answer tokens started — drop the thinking activity chip.
+                if !thought_buf.is_empty() {
+                    thought_buf.clear();
+                    let (thread_id, session_id) = {
+                        let i = eng.lock().await;
+                        (i.thread_id, i.session_id)
+                    };
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Activity {
+                            thread_id,
+                            session_id,
+                            name: String::new(),
+                            summary: String::new(),
+                        },
+                    );
+                }
                 let mut inner = eng.lock().await;
                 inner.clock.last_activity = std::time::Instant::now();
                 let thread_id = inner.thread_id;
@@ -3356,6 +3416,23 @@ async fn acp_consumer(
                 );
             }
             SessionEvent::Chat(ChatEvent::Assistant { tools, .. }) => {
+                // Tool calls also end the thinking phase (no TextDelta first).
+                if !thought_buf.is_empty() {
+                    thought_buf.clear();
+                    let (thread_id, session_id) = {
+                        let i = eng.lock().await;
+                        (i.thread_id, i.session_id)
+                    };
+                    let _ = app.emit(
+                        EVENT,
+                        Push::Activity {
+                            thread_id,
+                            session_id,
+                            name: String::new(),
+                            summary: String::new(),
+                        },
+                    );
+                }
                 let mut inner = eng.lock().await;
                 inner.clock.last_activity = std::time::Instant::now();
                 persist_tool_calls(&app, &db, &mut inner, tools).await;
