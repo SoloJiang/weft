@@ -641,6 +641,48 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
     Ok(a.update(&db.0).await?)
 }
 
+/// Test-only rendezvous immediately after a switch transaction's FIRST
+/// statement — the point where "did this take the write lock yet?" is
+/// answerable (PR #140 review round 15).
+///
+/// A barrier rather than a signal, and placed AFTER the statement rather than
+/// before, because neither alternative works: a probe before the first
+/// statement leaves a scheduling gap and cannot discriminate, and a plain
+/// signal after it would let the test race ahead. Note also why the test does
+/// not simply hold the write lock and watch the switch block — with the lock
+/// held, a write-first transaction's opening statement blocks INSIDE the
+/// critical section, so a rendezvous placed after it could never be reached
+/// and the correct implementation would deadlock. Nothing is held while the
+/// probe runs; the test asks a third connection whether the lock is taken.
+///
+/// `#[cfg(test)]` throughout, like `fail_write` (#144): production builds
+/// contain no expansion at all.
+#[cfg(test)]
+pub(crate) mod txn_probe {
+    tokio::task_local! {
+        pub static AFTER_FIRST_STATEMENT: std::sync::Arc<tokio::sync::Barrier>;
+    }
+}
+
+/// Rendezvous with an armed [`txn_probe`], or nothing at all.
+macro_rules! probe_after_first_statement {
+    () => {
+        #[cfg(test)]
+        {
+            let armed = crate::store::repo::txn_probe::AFTER_FIRST_STATEMENT
+                .try_with(std::sync::Arc::clone)
+                .ok();
+            if let Some(barrier) = armed {
+                // TWICE: the first rendezvous tells the test the statement has
+                // run, the second holds the transaction here while the test
+                // probes the lock. Between them it touches nothing.
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+    };
+}
+
 /// Switch a thread's lead engine identity + model override (issue #96/#98).
 /// `model=None` clears any override (follow the CLI's own default). Also
 /// clears `lead_command`: a per-tool alias pin (e.g. `claude` → `cc-claude`)
@@ -684,6 +726,7 @@ pub async fn switch_lead_engine_txn(
     if touched.rows_affected == 0 {
         anyhow::bail!("thread {thread_id} not found");
     }
+    probe_after_first_statement!();
 
     // The native-id clear, in the SAME transaction — the identical strip
     // `set_lead_native_id_opt(.., None)` performs, against `txn`. The lead's
@@ -1322,6 +1365,7 @@ pub async fn switch_worker_engine_txn(
     if touched.rows_affected == 0 {
         anyhow::bail!("direction {direction_id} not found");
     }
+    probe_after_first_statement!();
     let thread_id = direction::Entity::find_by_id(direction_id)
         .one(&txn)
         .await?
@@ -5311,95 +5355,64 @@ mod tests {
         (Db(a, false), Db(b, false))
     }
 
-    /// PR #140 round 11: the switch transactions take the write lock with their
-    /// FIRST statement, because a deferred read→write upgrade is not safe under
-    /// WAL — `insert_lead_message` documents the same hazard and is why it is
-    /// not a transaction at all.
+    /// PR #140 rounds 11/15: the switch transactions take the write lock with
+    /// their FIRST statement, because a deferred read→write upgrade is not
+    /// safe under WAL — `insert_lead_message` documents the same hazard and is
+    /// why it is not a transaction at all. The busy timeout cannot repair a
+    /// stale snapshot, and by the time this runs the command has already torn
+    /// the live engine down, so a spurious abort is not a harmless retry.
     ///
-    /// Both halves matter. The first pins the hazard as an executable fact
-    /// rather than a comment: the read-first shape really does abort when
-    /// another connection commits in between, and the busy timeout cannot
-    /// repair it (unlike ordinary writer contention). The second pins the fix:
-    /// the same interleaving leaves `switch_lead_engine_txn` unharmed. Without
-    /// the first half the second proves nothing, since a test that never
-    /// reproduces the hazard passes either way.
+    /// DETERMINISTIC, with no sleeps: the transaction rendezvouses with the
+    /// test immediately after its first statement (`probe_after_first_statement!`),
+    /// and while it is parked there a THIRD connection asks the only question
+    /// that separates the two shapes — is the write lock already held?
     ///
-    /// It matters here specifically because the command has already torn the
-    /// live engine down by the time this transaction runs, so a spurious abort
-    /// is not a harmless retry.
+    ///   - write-first: the opening `UPDATE` took it, so the probe is refused.
+    ///   - read-first:  the opening `SELECT` took nothing, so the probe wins,
+    ///                  and its commit then poisons the transaction's snapshot.
+    ///
+    /// Two earlier versions of this test were timing-based and could silently
+    /// stop discriminating on a loaded runner; this one has no timing in it.
     #[tokio::test]
-    async fn a_concurrent_commit_cannot_poison_the_switch_transaction() {
-        use sea_orm::TransactionTrait;
+    async fn the_switch_transaction_holds_the_write_lock_from_its_first_statement() {
+        use sea_orm::ConnectionTrait;
         let dir = tempfile::tempdir().expect("tempdir");
-        let (a, b) = shared_file_db(dir.path()).await;
+        let (a, probe) = shared_file_db(dir.path()).await;
         let ws = create_workspace(&a, "ws").await.unwrap();
         let t = create_thread(&a, ws.id, "Issue", "feature", "claude").await.unwrap();
+        // The probe must fail fast rather than wait for the lock, or it would
+        // block until the parked transaction commits.
+        probe.0.execute_unprepared("PRAGMA busy_timeout=0;").await.unwrap();
 
-        // (1) The hazard, reproduced: read first, let the other connection
-        // commit, then try to upgrade.
-        let txn = a.0.begin().await.unwrap();
-        let read = thread::Entity::find_by_id(t.id).one(&txn).await.unwrap().unwrap();
-        rename_thread(&b, t.id, "renamed by another connection").await.unwrap();
-        let mut stale: thread::ActiveModel = read.into();
-        stale.lead_tool = Set("codex".to_string());
-        let upgraded = stale.update(&txn).await;
-        let _ = txn.rollback().await;
-        assert!(
-            upgraded.is_err(),
-            "precondition: a deferred read→write upgrade must fail once another \
-             connection has committed — if this ever starts passing, the write-first \
-             ordering below is no longer load-bearing and this test should be revisited"
-        );
-
-        // (2) The fix, under the interleaving that actually matters: another
-        // connection's write commits WHILE the switch transaction is open.
-        //
-        // Staged by having B hold the write lock across A's start. Write-first,
-        // A's opening statement blocks on that lock and proceeds once B
-        // commits. Read-first, A's read succeeds immediately (WAL readers never
-        // block), pinning a snapshot that B's commit then invalidates — and the
-        // busy timeout cannot repair a stale snapshot.
-        //
-        // Everything the spawned side needs is prepared HERE, in the main task
-        // (review round 12): opening the file and running migrations inside
-        // the spawn put them in the timing window, so on a loaded runner the
-        // writer below could commit while the switch was still migrating —
-        // leaving it to run uncontended and pass even against the read-first
-        // regression it exists to reject. The spawn now does nothing but issue
-        // the call, and a barrier confirms it is running before the writer
-        // commits.
-        let held = b.0.begin().await.unwrap();
-        thread::Entity::update_many()
-            .col_expr(thread::Column::Title, Expr::value("held by another connection"))
-            .filter(thread::Column::Id.eq(t.id))
-            .exec(&held)
-            .await
-            .unwrap();
-
-        let (a2, _b2) = shared_file_db(dir.path()).await;
-        let (started, running) = tokio::sync::oneshot::channel::<()>();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        // A third handle for the transaction itself, so `a` stays available
+        // here for the read-back at the end.
+        let (writer, _spare) = shared_file_db(dir.path()).await;
         let switching = {
+            let barrier = std::sync::Arc::clone(&barrier);
             let tid = t.id;
             tokio::spawn(async move {
-                let _ = started.send(());
-                switch_lead_engine_txn(&a2, tid, "codex", Some("opus")).await
+                txn_probe::AFTER_FIRST_STATEMENT
+                    .scope(barrier, switch_lead_engine_txn(&writer, tid, "codex", Some("opus")))
+                    .await
             })
         };
-        running.await.expect("switch task started");
-        // Residual, stated rather than implied: this proves the task is
-        // RUNNING, not that its first statement has reached SQLite — no hook
-        // exposes that. The remaining window is one statement dispatch rather
-        // than an open-plus-migrate, and it still fails safe (an early commit
-        // just means an uncontended run, which passes either way), so the
-        // failure mode is a mutation slipping through, never a spurious red.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        held.commit().await.unwrap();
 
-        switching
-            .await
-            .expect("join")
-            .expect("a commit landing mid-transaction must not abort the switch");
+        // Parked after its first statement — no clock involved, the barrier is
+        // what orders this.
+        barrier.wait().await;
+        let contended = probe
+            .0
+            .execute_unprepared("UPDATE thread SET title = 'probe' WHERE id = 1;")
+            .await;
+        assert!(
+            contended.is_err(),
+            "the transaction must already hold the write lock after its FIRST statement; a \
+             read-first shape would leave it free here and then abort on the stale snapshot"
+        );
 
+        barrier.wait().await;
+        switching.await.expect("join").expect("the switch itself must succeed");
         let after = get_thread(&a, t.id).await.unwrap().unwrap();
         assert_eq!(after.lead_tool, "codex");
         assert_eq!(after.lead_model.as_deref(), Some("opus"));
