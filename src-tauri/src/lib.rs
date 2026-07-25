@@ -41,6 +41,9 @@ mod power;
 pub mod proc_registry;
 mod process_quota;
 pub mod profile;
+/// issue #112 本地资源仪表盘:只读聚合 proc_registry / process_quota /
+/// session_gate 已有的采样,不新增采样、不碰任何安全网写路径。
+mod resource_dashboard;
 mod session_gate;
 mod session_meta;
 mod sidecar;
@@ -268,6 +271,7 @@ pub fn run() {
             commands::db_change_password,
             commands::set_guardrails,
             process_quota::process_quota_status,
+            resource_dashboard::resource_dashboard_snapshot,
             commands::session_for,
             commands::session_meta,
             commands::effective_config,

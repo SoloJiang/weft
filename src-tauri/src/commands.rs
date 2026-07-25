@@ -2771,17 +2771,34 @@ mod tests {
         .unwrap();
         let asks = crate::ask::AskRegistry::new();
         let (remove_id, remove_rx) =
-            asks.request(thread.id, "", "claude", "Run: rm", "rm -rf tmp", "rm -rf tmp");
+            asks.request(
+                thread.id,
+                "",
+                "claude",
+                "Run: rm",
+                "rm -rf tmp",
+                crate::ask::RiskLevel::Unknown,
+                "rm -rf tmp",
+            );
         let (repo_scoped_id, repo_scoped_rx) = asks.request(
             keep_thread.id,
             &keep_direction.id.to_string(),
             "claude",
             "Run: clean",
             "rm -rf tmp",
+            crate::ask::RiskLevel::Unknown,
             "rm -rf tmp",
         );
         let (keep_id, _keep_rx) =
-            asks.request(keep_thread.id, "20", "claude", "Run: test", "pnpm test", "pnpm test");
+            asks.request(
+                keep_thread.id,
+                "20",
+                "claude",
+                "Run: test",
+                "pnpm test",
+                crate::ask::RiskLevel::Unknown,
+                "pnpm test",
+            );
 
         cancel_workspace_asks(&db, &asks, ws.id).await.unwrap();
 
@@ -2939,9 +2956,25 @@ mod tests {
         });
         // open asks for the two directions the repo delete removes
         let (ask_a, _r1) =
-            asks.request(thread.id, &dir_a.id.to_string(), "codex", "Run: x", "x", "x");
+            asks.request(
+                thread.id,
+                &dir_a.id.to_string(),
+                "codex",
+                "Run: x",
+                "x",
+                crate::ask::RiskLevel::Unknown,
+                "x",
+            );
         let (ask_routed, _r2) =
-            asks.request(thread.id, &dir_routed.id.to_string(), "codex", "Run: y", "y", "y");
+            asks.request(
+                thread.id,
+                &dir_routed.id.to_string(),
+                "codex",
+                "Run: y",
+                "y",
+                crate::ask::RiskLevel::Unknown,
+                "y",
+            );
 
         purge_repo_ask_footprint(&db, &asks, repo_a.id)
             .await
