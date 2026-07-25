@@ -5,11 +5,8 @@ import type { McpServerInfo, SessionMeta } from "../lib/types";
 const norm = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
-/** Weft 自己在 spawn 时注入的内部协调 MCP(见 `bus/inject.rs`):是 Weft 的管道,不是
- *  用户配置的 MCP。面板只展示用户的 MCP,所以三家统一过滤掉。claude 的 `system/init`
- *  会带上它们(codex/opencode 的探测本就不含),在此统一隐藏以保持一致。
- *  **精确名单,不是前缀匹配** —— 开放的 `^weft[-_]` 会误伤用户自己命名的 `weft_analytics`
- *  这类真实 server(claude 的 `mcp_servers[].name` 原样来自用户 `.mcp.json`)。 */
+/** Weft 自己在 spawn 时注入的内部协调 MCP(见 `bus/inject.rs`)。精确名单,不是前缀
+ *  匹配。面板展示时 status 标为 `weft`,与用户配置的 server 区分。 */
 const WEFT_INTERNAL_MCP = new Set(["weft_bus", "weft_planner", "weft_global"]);
 const isInternalMcp = (name: string) => WEFT_INTERNAL_MCP.has(name.toLowerCase());
 
@@ -28,13 +25,17 @@ export function groupMcpTools(
     list.push(m[2]);
     byPrefix.set(key, list);
   }
-  return servers
-    .filter((s) => !isInternalMcp(s.name))
-    .map((s) => ({
-      name: s.name,
-      status: s.status,
-      tools: byPrefix.get(norm(s.name)) ?? [],
-    }));
+  // Show every server on the session, including Weft pipes (weft_bus /
+  // weft_planner / weft_global). Hiding them made ACP/omp look MCP-less even
+  // though those pipes are what the agent actually has. Tag Weft pipes so the
+  // row still reads as infrastructure.
+  return servers.map((s) => ({
+    name: s.name,
+    status: isInternalMcp(s.name) && (s.status === "connected" || !s.status)
+      ? "weft"
+      : s.status,
+    tools: byPrefix.get(norm(s.name)) ?? [],
+  }));
 }
 
 /** init push → SessionMeta(init 不带 usage,保留旧 contextTokens)。
