@@ -657,11 +657,7 @@ pub async fn switch_lead_engine_txn(
     thread_id: i32,
     tool: &str,
     model: Option<&str>,
-    marker_id: i32,
 ) -> Result<thread::Model> {
-    // Seam point: `commands::persist_switch` must RETRACT its grace marker
-    // when this write fails, and that path has no other way to be reached from
-    // a test. See `fail_write`'s doc for the boundary.
     fail_write!("switch_lead_engine_txn");
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
@@ -698,10 +694,14 @@ pub async fn switch_lead_engine_txn(
             ma.update(&txn).await?;
         }
     }
-    // …and the pending grace marker becomes a real one in the same commit, so
-    // "the native id is gone" and "there is evidence this surface ran" can
-    // never disagree.
-    promote_turn_freeze_marker(&txn, marker_id).await?;
+    // …and the grace marker is written in the SAME commit. This is the whole
+    // fix: "the native id is gone" and "there is evidence this surface ran"
+    // are two halves of one invariant (`revive::has_resumable_context`), and a
+    // transaction is what makes them unable to disagree. Everything else this
+    // PR tried — stamping first and gating, retracting on failure, a pending
+    // kind promoted later — existed only to make an EARLIER stamp safe, and
+    // none of it is needed once the two writes are atomic.
+    insert_marker_row(&txn, thread_id, None, MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
     Ok(updated)
 }
@@ -1295,7 +1295,6 @@ pub async fn switch_worker_engine_txn(
     session_id: i32,
     tool: &str,
     model: Option<&str>,
-    marker_id: i32,
 ) -> Result<direction::Model> {
     use sea_orm::TransactionTrait;
     let txn = db.0.begin().await?;
@@ -1322,7 +1321,7 @@ pub async fn switch_worker_engine_txn(
         sa.update(&txn).await?;
     }
     // Same commit as the writes above — see the lead twin.
-    promote_turn_freeze_marker(&txn, marker_id).await?;
+    insert_marker_row(&txn, updated.thread_id, Some(session_id), MARKER_KIND_RECOVERED).await?;
     txn.commit().await?;
     Ok(updated)
 }
@@ -1825,10 +1824,6 @@ pub async fn set_session_native_id_opt(
     session_id: i32,
     native_id: Option<&str>,
 ) -> Result<()> {
-    // Seam point: `commands::persist_switch` must KEEP its grace marker when
-    // the tool write landed and this clear is what failed — a half-applied
-    // switch. No other way to reach that branch from a test.
-    fail_write!("set_session_native_id_opt");
     if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
         let mut a: session::ActiveModel = s.into();
         a.native_session_id = Set(native_id.map(str::to_string));
@@ -1899,98 +1894,13 @@ pub async fn set_session_native_id_opt(
 /// "skip the clear and let it stall again" — by then the id belongs to an
 /// engine the thread no longer runs. Both writers therefore honour the same
 /// contract: this row exists before the native id is allowed to go missing.
-/// The two kinds a grace marker can have. Splitting them separates the TWO
-/// jobs one marker row was doing, which is the root cause the PR #140 review
-/// chain kept circling:
-///   - a **cooldown**: hold the stall sweep off this surface for one window;
-///   - **evidence that the surface ran** and had its native context
-///     deliberately reset, which is what `revive::has_resumable_context` reads
-///     a marker as when no native id is present.
-///
-/// A freeze recovery earns both at once, so it writes [`MARKER_KIND_RECOVERED`]
-/// directly. An engine/model switch must claim the cooldown BEFORE it tears
-/// the engine down, but has not reset anything yet at that point — so it
-/// writes [`MARKER_KIND_PENDING`], which grants only the cooldown, and the
-/// switch's own transaction promotes it. If the app dies in between, the
-/// pending row costs at most one stale cooldown window and can never be
-/// mistaken for evidence of a reset that never happened.
+/// The grace marker's kind. Written by a freeze auto-recovery
+/// ([`mark_turn_freeze_recovered`]) and by an engine/model switch — the latter
+/// from inside its own transaction, so the row and the native-id clear it
+/// vouches for commit together.
 pub const MARKER_KIND_RECOVERED: &str = "turn_freeze_recovered";
-/// See [`MARKER_KIND_RECOVERED`]. Invisible to the timeline for the same
-/// reason that one is: the frontend renders an allowlist of kinds.
-pub const MARKER_KIND_PENDING: &str = "turn_freeze_pending";
-
-/// Stable code [`promote_turn_freeze_marker`] fails with when the pending row
-/// it was told to promote is gone — a concurrent `rewind` deleting timeline
-/// rows is the realistic way. Rejected as a CODE rather than a sentence for
-/// the same reason every other switch outcome is: it reaches
-/// `EngineSwitchDialog` through `persist_switch`, and
-/// `src/session/engineSwitch.ts` maps it to translated copy. Lives here
-/// rather than in `lead_chat::commands` only because this is the layer that
-/// raises it; the frontend map is the other half of the contract.
-pub const SWITCH_MARKER_LOST_CODE: &str = "switch_marker_lost";
-
-/// Claim the grace window WITHOUT claiming that a reset happened — the switch
-/// path's step 0. Returns the row id, which
-/// [`promote_turn_freeze_marker`] needs to promote it and
-/// [`delete_turn_freeze_marker`] needs to retract it.
-pub async fn mark_turn_freeze_pending(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-) -> Result<i32> {
-    fail_write!("mark_turn_freeze_pending");
-    let row = insert_lead_message(
-        db,
-        thread_id,
-        session_id,
-        0,
-        "system",
-        MARKER_KIND_PENDING,
-        "{}",
-        "complete",
-    )
-    .await?;
-    Ok(row.id)
-}
-
-/// Turn a pending marker into a real one: DELETE the pending row and insert a
-/// fresh recovered one, so the grace window runs from THIS moment rather than
-/// from whenever it was claimed. Still exactly one marker per switch.
-///
-/// Delete-and-insert rather than an in-place kind/timestamp update (review
-/// round 8): every reader picks the newest marker by `id DESC`, so an updated
-/// row would carry the newest TIMESTAMP while keeping its old, possibly
-/// lower ID — and any recovered marker inserted in between (a real freeze
-/// recovery, a concurrent switch) would then win the ordering and hide the
-/// switch that just committed, handing it an already-elapsed window. A fresh
-/// row is newest on both axes, so no reader has to be taught a new order.
-///
-/// Generic over the connection so it can run inside the switch's own
-/// transaction: the promotion and the writes it vouches for (tool/model and
-/// the native-id clear) must commit together or not at all, or the surface
-/// could end up with its id cleared and no evidence it ever ran — the very
-/// defect PR #140 exists to remove.
-///
-/// Errors when it does not update exactly one row. That is deliberate rather
-/// than the tolerant no-op most `_opt` setters use: a silent miss here would
-/// let the transaction commit the id clear with no marker behind it.
-pub async fn promote_turn_freeze_marker<C: sea_orm::ConnectionTrait>(
-    conn: &C,
-    marker_id: i32,
-) -> Result<()> {
-    let pending = lead_message::Entity::find_by_id(marker_id)
-        .filter(lead_message::Column::Kind.eq(MARKER_KIND_PENDING))
-        .one(conn)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!(SWITCH_MARKER_LOST_CODE))?;
-    let (thread_id, session_id) = (pending.thread_id, pending.session_id);
-    lead_message::Entity::delete_by_id(marker_id).exec(conn).await?;
-    insert_marker_row(conn, thread_id, session_id, MARKER_KIND_RECOVERED).await?;
-    Ok(())
-}
-
 /// One grace-marker row, deletion-fenced like every other timeline insert.
-/// Generic over the connection so [`promote_turn_freeze_marker`] can use it
+/// Generic over the connection so the switch transactions can use it
 /// inside the switch's transaction.
 async fn insert_marker_row<C: sea_orm::ConnectionTrait>(
     conn: &C,
@@ -2020,47 +1930,16 @@ async fn insert_marker_row<C: sea_orm::ConnectionTrait>(
     i32::try_from(res.last_insert_id()).map_err(|_| anyhow::anyhow!("marker id out of i32 range"))
 }
 
-/// The newest grace marker of EITHER kind, as unix-seconds — the cooldown
-/// side of the split. A pending marker counts here (holding the sweep off is
-/// exactly what it is for) but never in
-/// [`last_turn_freeze_recovery_secs`].
-///
-/// ONE statement, deliberately (review round 8). Two point lookups read the
-/// two kinds at two different instants, and `promote_turn_freeze_marker` moves
-/// a row between them atomically — so a sweep interleaving there could see
-/// neither, read the window as elapsed, and re-drive a surface whose switch
-/// was mid-commit. A single query sees one snapshot and always finds exactly
-/// one of the pair. `kind IN (…)` still rides M0019's
-/// `(thread_id, kind, session_id, id)` index as two seeks.
-pub async fn last_turn_freeze_guard_secs(
-    db: &Db,
-    thread_id: i32,
-    session_id: Option<i32>,
-) -> Result<Option<u64>> {
-    let q = lead_message::Entity::find()
-        .filter(lead_message::Column::ThreadId.eq(thread_id))
-        .filter(
-            lead_message::Column::Kind
-                .is_in([MARKER_KIND_RECOVERED, MARKER_KIND_PENDING]),
-        )
-        .order_by_desc(lead_message::Column::Id);
-    let q = match session_id {
-        Some(id) => q.filter(lead_message::Column::SessionId.eq(id)),
-        None => q.filter(lead_message::Column::SessionId.is_null()),
-    };
-    Ok(q.one(&db.0).await?.and_then(|m| m.created_at.parse().ok()))
-}
-
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
     session_id: Option<i32>,
-) -> Result<i32> {
+) -> Result<()> {
     // Seam point: the failure this write's CALLERS must degrade correctly for
     // (`engine::stamp_freeze_marker` → the gated native-id clear) has no other
     // way to be reached from a test. See `fail_write`'s doc for the boundary.
     fail_write!("mark_turn_freeze_recovered");
-    let row = insert_lead_message(
+    insert_lead_message(
         db,
         thread_id,
         session_id,
@@ -2071,31 +1950,6 @@ pub async fn mark_turn_freeze_recovered(
         "complete",
     )
     .await?;
-    Ok(row.id)
-}
-
-/// Undo one [`mark_turn_freeze_recovered`] stamp, by the id it returned.
-///
-/// Only the engine/model switch needs this, and only on its own failure path:
-/// it stamps BEFORE tearing anything down (so an abort is honestly a no-op),
-/// which means a switch that then fails has published a marker for a reset
-/// that never happened. Leaving it is not merely a wasted grace window —
-/// [`crate::lead_chat::revive::has_resumable_context`] reads a marker as
-/// "this surface ran and had its native context deliberately cleared", so on a
-/// surface with NO native id (one rewound to before its first message, say)
-/// the stray marker would make it re-drivable forever.
-///
-/// Deletes BY ID, never "the newest marker for this (thread, session)": a real
-/// freeze recovery could have stamped its own row in between, and that one is
-/// load-bearing. A missing row is not an error — the switch's cleanup must not
-/// fail louder than the failure it is cleaning up after.
-pub async fn delete_turn_freeze_marker(db: &Db, marker_id: i32) -> Result<()> {
-    // Seam point: the retraction is itself fallible, and a switch whose
-    // cleanup ALSO fails must say so rather than report a clean abort.
-    fail_write!("delete_turn_freeze_marker");
-    lead_message::Entity::delete_by_id(marker_id)
-        .exec(&db.0)
-        .await?;
     Ok(())
 }
 
@@ -5356,8 +5210,7 @@ mod tests {
         set_tool_command(&db, "claude", "cc-claude", false).await.unwrap();
         assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_command.as_deref(), Some("claude"));
 
-        let m1 = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
-        let switched = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high"), m1)
+        let switched = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high"))
             .await
             .unwrap();
         assert_eq!(switched.lead_tool, "codex");
@@ -5365,11 +5218,10 @@ mod tests {
         assert_eq!(switched.lead_command, None, "stale claude alias pin must be cleared");
 
         // A model override clears the same way when the caller passes None.
-        let m2 = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
-        let cleared = switch_lead_engine_txn(&db, t.id, "codex", None, m2).await.unwrap();
+        let cleared = switch_lead_engine_txn(&db, t.id, "codex", None).await.unwrap();
         assert_eq!(cleared.lead_model, None);
 
-        assert!(switch_lead_engine_txn(&db, 9999, "codex", None, m2).await.is_err());
+        assert!(switch_lead_engine_txn(&db, 9999, "codex", None).await.is_err());
     }
 
     #[tokio::test]
@@ -5392,8 +5244,7 @@ mod tests {
             a.update(&db.0).await.unwrap();
         }
 
-        let mw = mark_turn_freeze_pending(&db, t.id, Some(s.id)).await.unwrap();
-        switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"), mw)
+        switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("kimi-for-coding/k2p6"))
             .await
             .unwrap();
 
@@ -5410,81 +5261,10 @@ mod tests {
         // across engines. Atomic here, that pair cannot exist.
         assert_eq!(s2.native_session_id, None, "the switch clears it in the same write");
 
-        let mw2 = mark_turn_freeze_pending(&db, t.id, Some(s.id)).await.unwrap();
-        assert!(switch_worker_engine_txn(&db, 9999, s.id, "codex", None, mw2).await.is_err());
+        assert!(switch_worker_engine_txn(&db, 9999, s.id, "codex", None).await.is_err());
         // A missing session is tolerated (not an error) on the session half —
         // see the function doc — as long as the direction is real.
-        let mw3 = mark_turn_freeze_pending(&db, t.id, Some(s.id)).await.unwrap();
-        assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None, mw3).await.is_ok());
-    }
-
-    /// PR #140 round 8: the cooldown reader sees BOTH marker kinds in one
-    /// snapshot, and a promotion never leaves it seeing neither.
-    ///
-    /// The window this guards is small but real: promotion moves a row from
-    /// pending to recovered atomically, so a reader that queried the two kinds
-    /// separately could land either side of that commit and find nothing —
-    /// reading the grace period as elapsed and letting the sweep re-drive a
-    /// surface mid-switch. Single-statement, so there is no "between".
-    ///
-    /// COVERAGE LIMIT, stated rather than implied: this pins the contract
-    /// ("whichever kind the row currently has, one query finds it"), NOT the
-    /// race. A mutation that restores the two-statement reader leaves this
-    /// green, because the defect is purely temporal — both versions agree on
-    /// every static state. Observing it would need either a deterministic
-    /// interleaving hook this crate does not have, or a hammer loop whose
-    /// flakiness would cost more than it proves. The single statement is the
-    /// argument; this test only stops the contract regressing around it.
-    #[tokio::test]
-    async fn the_guard_reader_finds_a_marker_of_either_kind() {
-        let db = mem().await;
-        let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
-
-        assert_eq!(last_turn_freeze_guard_secs(&db, t.id, None).await.unwrap(), None);
-
-        let pending = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
-        assert!(
-            last_turn_freeze_guard_secs(&db, t.id, None).await.unwrap().is_some(),
-            "a pending claim holds the cooldown"
-        );
-        assert_eq!(
-            last_turn_freeze_recovery_secs(&db, t.id, None).await.unwrap(),
-            None,
-            "but is not evidence"
-        );
-
-        promote_turn_freeze_marker(&db.0, pending).await.unwrap();
-        assert!(
-            last_turn_freeze_guard_secs(&db, t.id, None).await.unwrap().is_some(),
-            "and after promotion the cooldown is still found — never a gap where neither \
-             kind is visible"
-        );
-        assert!(last_turn_freeze_recovery_secs(&db, t.id, None).await.unwrap().is_some());
-    }
-
-    /// Promoting a marker that is gone — a concurrent `rewind` deleting
-    /// timeline rows is the realistic way — fails with the stable code the UI
-    /// translates, not with an English sentence that would reach the dialog raw.
-    #[tokio::test]
-    async fn promoting_a_vanished_marker_fails_with_the_stable_code() {
-        let db = mem().await;
-        let ws = create_workspace(&db, "ws").await.unwrap();
-        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
-        let pending = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
-        delete_turn_freeze_marker(&db, pending).await.unwrap();
-
-        let err = promote_turn_freeze_marker(&db.0, pending).await.unwrap_err();
-
-        assert_eq!(err.to_string(), SWITCH_MARKER_LOST_CODE);
-        // And a marker that is merely already promoted is refused too, rather
-        // than silently re-promoted into a second row.
-        let again = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
-        promote_turn_freeze_marker(&db.0, again).await.unwrap();
-        assert_eq!(
-            promote_turn_freeze_marker(&db.0, again).await.unwrap_err().to_string(),
-            SWITCH_MARKER_LOST_CODE
-        );
+        assert!(switch_worker_engine_txn(&db, d.id, 9999, "codex", None).await.is_ok());
     }
 
     /// PR #140 round 6: the lead's tool/model write and its native-id clear are
@@ -5509,11 +5289,10 @@ mod tests {
 
         // Claimed BEFORE the table goes away — this is the switch's own step 0,
         // and the transaction below is what would have promoted it.
-        let mrb = mark_turn_freeze_pending(&db, t.id, None).await.unwrap();
         db.0.execute_unprepared("ALTER TABLE lead_message RENAME TO lead_message_renamed_for_test")
             .await
             .unwrap();
-        let err = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high"), mrb).await;
+        let err = switch_lead_engine_txn(&db, t.id, "codex", Some("gpt-5.5-high")).await;
         assert!(err.is_err(), "the native-id half must fail (table renamed away)");
         db.0.execute_unprepared("ALTER TABLE lead_message_renamed_for_test RENAME TO lead_message")
             .await
@@ -5564,9 +5343,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mrb = mark_turn_freeze_pending(&db, t.id, Some(s.id)).await.unwrap();
         let err =
-            switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high"), mrb).await;
+            switch_worker_engine_txn(&db, d.id, s.id, "opencode", Some("gpt-5.5-high")).await;
         assert!(err.is_err(), "the session-table write must fail (table renamed away)");
 
         // Restore the table so the read-back below (and any other test using

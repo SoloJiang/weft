@@ -1595,360 +1595,9 @@ async fn insert_switch_marker(
     }
 }
 
-/// Which surface an engine switch's durable writes target. ONE discriminated
-/// value rather than a lead-vs-worker branch re-derived at each write, so the
-/// marker gate in [`persist_switch`] is written once and the two axes are
-/// physically unable to disagree about it. That shape is not decoration: the
-/// defect this closes was the SAME rule enforced in one place
-/// (`engine::recover_from_freeze`) and silently dropped in another (these two
-/// commands), and `revive::has_resumable_context` carries a warning about
-/// exactly that failure mode for exactly that reason.
-#[derive(Clone, Copy)]
-enum SwitchTarget {
-    Lead {
-        thread_id: i32,
-    },
-    Worker {
-        thread_id: i32,
-        direction_id: i32,
-        session_id: i32,
-    },
-}
-
-impl SwitchTarget {
-    fn thread_id(self) -> i32 {
-        match self {
-            SwitchTarget::Lead { thread_id } => thread_id,
-            SwitchTarget::Worker { thread_id, .. } => thread_id,
-        }
-    }
-
-    /// `None` for the lead — the same `Option<session_id>` discriminator
-    /// `repo::mark_turn_freeze_recovered` and `engine::clear_native_id`
-    /// already key on, so neither can be handed the wrong axis.
-    fn session_id(self) -> Option<i32> {
-        match self {
-            SwitchTarget::Lead { .. } => None,
-            SwitchTarget::Worker { session_id, .. } => Some(session_id),
-        }
-    }
-}
-
-/// Stable, locale-independent codes a switch rejects with, matched by
-/// `src/session/engineSwitch.ts` so the dialog renders translated copy from
-/// `src/i18n/{en,zh}.ts` instead of a Rust-authored sentence. Same contract as
-/// `process_quota::DEGRADED_ERROR_CODE`: reject with the CODE, log the DB
-/// detail, never hand the UI an English sentence plus raw SQLite text.
-///
-/// Deliberately NOT one code per failure. A switch that simply failed with
-/// nothing changed passes its own error through, because "the switch failed"
-/// already describes that accurately and the underlying message is the more
-/// useful thing to show. A code exists only where that sentence would be
-/// WRONG or incomplete — which is exactly these three states (the third,
-/// `repo::SWITCH_MARKER_LOST_CODE`, is declared where it is raised).
-///
-/// COPY RULE for anyone adding one, because getting this wrong is the single
-/// most repeated mistake in this PR's review history — four times, in four
-/// different strings: only a code raised BEFORE
-/// `engine::teardown_for_switch` may tell the user nothing changed. Past that
-/// point the live turn has been killed and its open and queued rows finalized
-/// as `interrupted`, so the copy must say the engine is unchanged AND the
-/// running turn was interrupted. Today only [`SWITCH_MARKER_ERROR_CODE`] is
-/// raised early enough to claim the former.
-///
-/// The stamp could not be written: nothing happened at all.
-pub const SWITCH_MARKER_ERROR_CODE: &str = "switch_marker_stamp_failed";
-/// The switch failed AND its grace marker could not be retracted, leaving a
-/// stray marker that can cost one spurious re-drive prompt later. Distinct
-/// from a clean abort because it is not, in fact, clean.
-pub const SWITCH_CLEANUP_ERROR_CODE: &str = "switch_cleanup_failed";
-
-/// The gate itself, sealed in its own module so the rule cannot be bypassed by
-/// forgetting it — see [`switch_gate::MarkerStamped`].
-mod switch_gate {
-    use super::{repo, Db, SwitchTarget, SWITCH_MARKER_ERROR_CODE};
-
-    /// Proof that a switch's grace marker landed, and the only key that opens
-    /// [`super::persist_switch`]. The field is private to this module, so
-    /// [`stamp_switch_marker`] is the ONLY way to obtain one: a call site
-    /// physically cannot persist a switch — or clear a native id — without
-    /// having stamped first. The rule is carried by the type rather than by a
-    /// comment both commands have to remember, because a comment is exactly
-    /// what it was before, and both commands forgot it (see
-    /// `revive::has_resumable_context`, which records the same rule being
-    /// fixed on one axis and missed on another).
-    ///
-    /// It also carries the `SwitchTarget` the stamp was made against, so the
-    /// axis that was stamped and the axis that gets written are the same
-    /// value by construction, not by two matching arguments.
-    ///
-    /// Sibling, not duplicate, of `engine::FreezeMarkerStamped` (PR #144),
-    /// which landed the same idea on the freeze-recovery axis while this was in
-    /// review. They stay separate on purpose: that one is a ZST guarding
-    /// `clear_native_context_after_freeze` in `engine`, this one carries a
-    /// payload and guards `persist_switch` here, and the two guard different
-    /// write sets with different failure policies (skip the clear vs. abort the
-    /// whole operation). Merging them would erase that distinction and buy
-    /// nothing. That both reviews independently reached for a witness is the
-    /// signal worth keeping: a comment was not enough, twice.
-    pub(super) struct MarkerStamped {
-        target: SwitchTarget,
-        /// The row [`stamp_switch_marker`] inserted, so [`Self::retract`] can
-        /// remove exactly that one.
-        marker_id: i32,
-    }
-
-    impl MarkerStamped {
-        pub(super) fn target(&self) -> SwitchTarget {
-            self.target
-        }
-
-        /// The pending row the switch transaction promotes — see
-        /// `repo::promote_turn_freeze_marker`. Only [`super::persist_switch_writes`]
-        /// needs it; everything else goes through [`Self::retract`].
-        pub(super) fn marker_id(&self) -> i32 {
-            self.marker_id
-        }
-
-        /// Undo this stamp — for the failure paths AFTER step 0, where the
-        /// switch published a grace marker for a native-context reset that
-        /// then never happened.
-        ///
-        /// Necessary because the marker is not only a cooldown: on a surface
-        /// with no native id (rewound to before its first message, or idle
-        /// without ever capturing one) `revive::has_resumable_context` reads a
-        /// marker alone as "it ran and its context was deliberately cleared",
-        /// so a stray one makes that surface re-drivable FOREVER rather than
-        /// for one window. An earlier revision of this PR claimed the cost was
-        /// "one grace window and nothing else"; review round 2 showed that was
-        /// only true when a native id was present.
-        ///
-        /// Returns `Result` rather than logging and swallowing (review round
-        /// 4): this cleanup is itself a fallible write, and when it fails the
-        /// stray marker is left behind with exactly the consequence the
-        /// retraction exists to prevent. The caller cannot usefully retry — the
-        /// database just failed twice in a row — but it CAN fold the cleanup
-        /// failure into the error it is already returning, so an abort that
-        /// did not fully clean up is never reported as if it had.
-        pub(super) async fn retract(self, db: &Db) -> anyhow::Result<()> {
-            repo::delete_turn_freeze_marker(db, self.marker_id).await
-        }
-    }
-
-    /// Stamp the freeze-recovery grace marker for `target` (see
-    /// `repo::mark_turn_freeze_recovered`'s doc for why a switch reuses it).
-    ///
-    /// Callers must run this BEFORE any other effect of the switch —
-    /// destructive ones (`AskRegistry::cancel_for`,
-    /// `engine::teardown_for_switch`, which interrupts the live turn and its
-    /// queue) as much as durable ones. That is what lets a failure honestly
-    /// report that nothing happened: the surface still holds its old tool, its
-    /// old native id, and an unfinalized turn.
-    ///
-    /// Stamping before the teardown is also the ordering
-    /// `engine::recover_from_freeze` documents for its own copy of this
-    /// sequence — "FIRST of the DB writes on purpose … so no sweep can observe
-    /// a recoverable idle session whose marker is not visible yet".
-    /// `teardown_for_switch` persists `idle`, which is precisely that
-    /// exposure, so any position after it leaves a window where `revive`'s
-    /// sweep can select a surface whose fresh marker has not landed.
-    ///
-    /// A spurious marker (stamped, then the switch fails later for an
-    /// unrelated reason) costs one grace window of no auto-redrive and nothing
-    /// else — the deliberately cheap side of the trade.
-    pub(super) async fn stamp_switch_marker(
-        db: &Db,
-        target: SwitchTarget,
-    ) -> Result<MarkerStamped, String> {
-        let thread_id = target.thread_id();
-        let session_id = target.session_id();
-        match repo::mark_turn_freeze_pending(db, thread_id, session_id).await {
-            Ok(marker_id) => Ok(MarkerStamped { target, marker_id }),
-            Err(err) => {
-                eprintln!(
-                    "[weft] engine switch aborted before any effect: could not stamp the \
-                     freeze-recovery grace marker for thread {thread_id} (session \
-                     {session_id:?}): {err}"
-                );
-                Err(SWITCH_MARKER_ERROR_CODE.to_string())
-            }
-        }
-    }
-
-}
-
-use switch_gate::{stamp_switch_marker, MarkerStamped};
-
-/// The two durable writes an engine/model switch makes, openable only with a
-/// [`MarkerStamped`] — the GATE that `engine::recover_from_freeze` already
-/// enforces on its own copy of this sequence (see the long comment at its
-/// `if marker_stamped`).
-///
-///   1. the tool/model persist (`repo::switch_lead_engine_txn` /
-///      `repo::switch_worker_engine_txn`).
-///   2. `engine::clear_native_id` — issue #96 pitfall 1: a native id minted by
-///      the OLD engine, handed to the NEW one as `--resume`/`resume`, fails
-///      fast with "No conversation found".
-///
-/// Why the marker must already be in hand: the stamp and step 2 are the two
-/// halves of ONE invariant (`revive::has_resumable_context`) — a surface left
-/// with NEITHER a native id NOR a marker reads as "never ran", and drops out
-/// of the automated re-drive candidate pool silently, until some later real
-/// freeze or switch happens to stamp one. Clearing the id after a failed stamp
-/// produces exactly that shape.
-///
-/// `recover_from_freeze` resolves the same tension by SKIPPING the clear: its
-/// tool identity did not change, so the old native id is still valid, and the
-/// session merely stalls again — visibly, re-drivably, with a fresh chance to
-/// stamp. That degrade is NOT available here. A switch has already changed
-/// which engine the id belongs to, so keeping it is pitfall 1 rather than a
-/// safe no-op. So a switch fails instead — and fails at the stamp, before any
-/// effect at all, which is what makes "retry the switch" a complete recovery
-/// rather than a second half-applied attempt. The engine reconstruction in
-/// both callers sits after this `?` and is therefore gated too: a switch that
-/// could not record itself never rebuilds an engine.
-///
-/// CONSUMES the token, and owns the retraction decision, because this function
-/// is the exact boundary at which retracting flips from correct to catastrophic
-/// (review round 3):
-///   - fail here and the native id is still intact, so the marker is merely a
-///     spurious cooldown — and on an id-less surface a permanent
-///     `has_resumable_context` false positive. It is retracted.
-///   - succeed and the native id is GONE, so that marker becomes the ONLY
-///     evidence this surface ever ran. Retracting it now would strand the
-///     surface silently — the precise defect this whole PR exists to remove.
-///
-/// Round 2 grouped every post-stamp failure onto one retraction point, which
-/// swept the engine rebuild in with it and did exactly that. Consuming the
-/// token here means the rebuild — and anything else downstream — has no token
-/// left to retract with; the mistake is not merely documented, it does not
-/// compile. Nothing else between the stamp and this call is fallible (ask
-/// cancellation, `teardown_for_switch` and the digest build all return `()` or
-/// swallow into `unwrap_or_default`), so this really is the only place a
-/// retraction can be owed.
-///
-/// The caller-visible switch sequence is unchanged (persist tool/model → clear
-/// native id); only the auxiliary grace stamp moved, and its one prior
-/// ordering constraint — "before the clear" — still holds.
-async fn persist_switch(
-    db: &Db,
-    stamped: MarkerStamped,
-    tool: &str,
-    model: Option<&str>,
-) -> anyhow::Result<()> {
-    let err = match persist_switch_writes(db, &stamped, tool, model).await {
-        Ok(()) => return Ok(()),
-        // ONE atomic write per axis, so a failure means nothing landed: the
-        // surface still has its old tool AND its old native id, and the marker
-        // describes a reset that never happened. There is no longer a
-        // half-applied case to distinguish — see `persist_switch_writes`.
-        Err(err) => err,
-    };
-    match stamped.retract(db).await {
-        // Nothing landed and the marker is gone: an ordinary failed switch.
-        // Its own error is the honest and most informative thing to report,
-        // and passing it through unchanged is the boundary this PR set in
-        // review round 1 — only states that "the switch failed" describes
-        // BADLY get a code of their own.
-        Ok(()) => Err(err),
-        // The cleanup failed too. Nothing useful to retry against a database
-        // that just failed twice, but the report must not present a
-        // half-cleaned abort as a clean one — so this gets a code as well,
-        // with both causes logged rather than pasted into user-facing text.
-        Err(cleanup) => {
-            eprintln!(
-                "[weft] engine switch aborted AND its grace marker could not be retracted, \
-                 so a stray marker remains — switch failure: {err}; cleanup failure: {cleanup}"
-            );
-            Err(anyhow::anyhow!(SWITCH_CLEANUP_ERROR_CODE))
-        }
-    }
-}
-
-/// The durable write itself — ONE transaction per axis, covering BOTH the
-/// tool/model change and the native-id clear.
-///
-/// It was two separate writes until review round 6. Naming the half-applied
-/// state (new tool + old engine's native id) and holding the stall sweep off
-/// it with the grace marker only DELAYED it: the marker expires, and the
-/// user's next send never consults it at all — `worker_engine` reads the
-/// mismatched pair directly and tries to resume the old engine's conversation
-/// with the new one. Atomicity removes the state instead of describing it,
-/// which is why this fix deleted a variant, an error code, a translation and a
-/// test rather than adding any.
-///
-/// Split from [`persist_switch`] only so that function can own the retraction
-/// on the error path without duplicating the call.
-async fn persist_switch_writes(
-    db: &Db,
-    stamped: &MarkerStamped,
-    tool: &str,
-    model: Option<&str>,
-) -> anyhow::Result<()> {
-    match stamped.target() {
-        SwitchTarget::Lead { thread_id } => {
-            repo::switch_lead_engine_txn(db, thread_id, tool, model, stamped.marker_id())
-                .await
-                .map(|_| ())
-        }
-        SwitchTarget::Worker {
-            direction_id,
-            session_id,
-            ..
-        } => repo::switch_worker_engine_txn(
-            db,
-            direction_id,
-            session_id,
-            tool,
-            model,
-            stamped.marker_id(),
-        )
-        .await
-        .map(|_| ()),
-    }
-}
-
-/// Drop whatever engine is currently cached for `key`, tearing it down
-/// properly rather than letting the handle fall out of scope with a live child
-/// behind it.
-///
-/// A switch calls this TWICE, and the second call is the load-bearing one
-/// (review round 9). `teardown_for_switch` lands the surface on `idle`, and
-/// `revive`'s stall sweep selects idle surfaces — so during the gap between
-/// the teardown and the switch transaction (which `stop_quiet` can stretch to
-/// ~120s against a wedged engine) the sweep can run `try_revive_lead`, whose
-/// `lead_engine` call BUILDS AND CACHES an engine from the tool the DB still
-/// says is current: the OLD one. `lead_engine`/`worker_engine` return a cached
-/// entry when they find one, so the rebuild at the end of the switch would
-/// hand back that stale engine — the command reports "switched to codex", the
-/// badge says codex, and every subsequent message goes to claude. That is
-/// issue #96's core confusion, reintroduced by the very sweep this PR's grace
-/// marker exists to hold off.
-///
-/// Clearing the slot again right before the rebuild makes the resurrection
-/// harmless rather than merely unlikely: whatever the gap produced is torn
-/// down, and the rebuild constructs from the tool the transaction just
-/// committed.
-async fn drop_cached_engine(app: &AppHandle, key: i64) {
-    if let Some(eng) = app.state::<LeadChatState>().remove(key) {
-        engine::teardown_for_switch(app, &eng).await;
-    }
-}
-
 /// Switch the LEAD's engine identity and/or model override for `thread_id` —
 /// issue #96 layer 1 of 3 (independent of any worker's tool and of the global
 /// default; see `switch_worker_tool` / `set_default_tool`). Semantics:
-///   0. stamp the freeze-recovery grace marker (`stamp_switch_marker` →
-///      `repo::mark_turn_freeze_recovered` — see its doc for why a switch
-///      reuses it: prevents `revive`'s stall sweep from auto-redriving this
-///      freshly-switched lead within the next tick). FIRST, before any other
-///      effect, and the GATE on every step below: the [`MarkerStamped`] it
-///      returns is the only key that opens [`persist_switch`]. A failed stamp
-///      aborts here, where "nothing happened" is literally true — the lead
-///      still has its old tool, its old native id, its pending asks, and its
-///      live engine mid-turn. Every later position would have to walk that
-///      back. See [`persist_switch`] for why aborting beats the degrade
-///      `recover_from_freeze` can afford.
 ///   1. cancel any ask still pending for this thread's lead
 ///      (`AskRegistry::cancel_for`) — it can never be answered by the engine
 ///      that is about to be torn down.
@@ -1956,13 +1605,18 @@ async fn drop_cached_engine(app: &AppHandle, key: i64) {
 ///      finalization as Stop, but landing on "idle" rather than
 ///      `STATUS_STOPPED` (`engine::teardown_for_switch`), since this is a
 ///      replacement, not a stop the user needs to explicitly resume from.
-///   3. make the switch durable via [`persist_switch`]: persist the new
-///      tool/model (`repo::switch_lead_engine_txn`, which also clears any stale
-///      command-alias pin) and clear the native session id
-///      (`engine::clear_native_id` — the SAME contract turn-freeze recovery
-///      and rewind already rely on: dogfooding pitfall #1, a stale native id
-///      handed to a different engine's `--resume`/`resume` fails fast with
-///      "No conversation found").
+///   3. make the switch durable in ONE transaction
+///      (`repo::switch_lead_engine_txn`): the new tool/model (which also
+///      clears any stale command-alias pin), the native session id
+///      cleared (dogfooding pitfall #1: a stale native id handed to a
+///      different engine's `--resume`/`resume` fails fast with "No
+///      conversation found"), and the freeze-recovery grace marker that
+///      vouches for that clear. The marker and the clear are the two halves of
+///      `revive::has_resumable_context`; committing them together is what makes
+///      the defect this fixes impossible rather than merely guarded, and is
+///      why none of the gating/retraction machinery earlier revisions of this
+///      PR carried is present. See `repo::mark_turn_freeze_recovered` for why a
+///      switch writes that marker at all.
 ///   4. reconstruct the engine fresh via `lead_engine` — the exact construction
 ///      path a cold app boot uses (re-injects the ask-hook/MCP servers/
 ///      system-prompt for the NEW tool identity), never a hand-patched partial
@@ -1995,16 +1649,12 @@ pub async fn switch_lead_tool(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("thread {thread_id} not found"))?;
 
-    // Step 0 — before the ask cancellation and the teardown below, both of
-    // which are destructive (the teardown interrupts the live turn and
-    // finalizes its queued rows). Failing here is the only failure that
-    // genuinely leaves the lead untouched.
-    let stamped = stamp_switch_marker(&db, SwitchTarget::Lead { thread_id }).await?;
-
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(thread_id, "lead");
     }
-    drop_cached_engine(&app, lead_key(thread_id)).await;
+    if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
+        engine::teardown_for_switch(&app, &eng).await;
+    }
 
     // The lead's OWN timeline only — `list_lead_messages` returns every row for
     // the thread, including every worker's chat (session_id = Some(_)); the
@@ -2019,19 +1669,14 @@ pub async fn switch_lead_tool(
         .collect();
     let digest = engine::build_switch_digest(&before.lead_tool, &tool, &messages);
 
-    // CONSUMES the step-0 token, and self-retracts if these writes fail. Past
-    // this line there is no token left, which is deliberate: the native id is
-    // now cleared, so the marker is the only evidence this lead ever ran and
-    // must survive every failure below it.
-    let target = SwitchTarget::Lead { thread_id };
-    persist_switch(&db, stamped, &tool, model.as_deref())
+    // ONE transaction: the new tool/model, the native-id clear (issue #96
+    // pitfall 1) and the grace marker that vouches for it. The marker and the
+    // clear are the two halves of `revive::has_resumable_context`, and
+    // committing them together is what makes the defect this PR fixes
+    // structurally impossible rather than merely guarded.
+    repo::switch_lead_engine_txn(&db, thread_id, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-
-    // The switch is committed; discard anything the stall sweep resurrected
-    // while the teardown was running, so the rebuild below cannot hand back an
-    // engine built from the OLD tool. See `drop_cached_engine`.
-    drop_cached_engine(&app, lead_key(thread_id)).await;
 
     let lang = lang.unwrap_or_else(|| "en".to_string());
     let eng = lead_engine(&app, &db, thread_id, &lang)
@@ -2053,10 +1698,10 @@ pub async fn switch_lead_tool(
 
 /// Switch a WORKER's engine identity and/or model override for `session_id` —
 /// issue #96 layer 2 of 3 (independent of the thread's lead and of the global
-/// default; see `switch_lead_tool` / `set_default_tool`). Same step 0-6
-/// semantics as `switch_lead_tool` — including step 0's marker gate, shared
-/// verbatim through [`stamp_switch_marker`]/[`persist_switch`] rather than
-/// restated here — with two worker-specific differences:
+/// default; see `switch_lead_tool` / `set_default_tool`). Same six-step
+/// semantics as `switch_lead_tool` — including step 3's single transaction,
+/// which `repo::switch_worker_engine_txn` provides rather than this restating
+/// it — with two worker-specific differences:
 ///   - the tool/model write is `repo::switch_worker_engine_txn` — ONE transaction
 ///     covering BOTH `direction.tool` (the durable side: `chat_open_worker_impl`'s
 ///     cold-recreate path, which fires the very next time this worker is
@@ -2092,23 +1737,12 @@ pub async fn switch_worker_tool(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("direction {} not found", sess.direction_id))?;
 
-    // Step 0, same reasoning as switch_lead_tool: ahead of the ask
-    // cancellation and the turn-interrupting teardown, so an abort here is the
-    // one that really did nothing.
-    let stamped = stamp_switch_marker(
-        &db,
-        SwitchTarget::Worker {
-            thread_id: dir.thread_id,
-            direction_id: sess.direction_id,
-            session_id,
-        },
-    )
-    .await?;
-
     if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
         asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
     }
-    drop_cached_engine(&app, session_id as i64).await;
+    if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
+        engine::teardown_for_switch(&app, &eng).await;
+    }
 
     let messages = repo::list_lead_messages(&db, dir.thread_id).await.unwrap_or_default();
     let own: Vec<_> = messages
@@ -2117,23 +1751,13 @@ pub async fn switch_worker_tool(
         .collect();
     let digest = engine::build_switch_digest(&sess.tool, &tool, &own);
 
-    // Consumes the step-0 token, on the worker axis — same retraction contract
-    // as switch_lead_tool. Sharing one gated function is the point: the defect
-    // it guards against was first fixed on the freeze-recovery path and then
-    // missed here, so the rule now has exactly one implementation, and a type
-    // that cannot be skipped.
-    let target = SwitchTarget::Worker {
-        thread_id: dir.thread_id,
-        direction_id: sess.direction_id,
-        session_id,
-    };
-    persist_switch(&db, stamped, &tool, model.as_deref())
+    // ONE transaction, worker axis — see switch_lead_tool. It already covered
+    // both halves of the tool write itself (`direction.tool` for the
+    // cold-recreate path, `session.tool`/`model` for the live one), which is
+    // why the marker and the native-id clear simply joined it.
+    repo::switch_worker_engine_txn(&db, sess.direction_id, session_id, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
-
-    // Same reasoning as switch_lead_tool: discard a sweep-resurrected engine
-    // before rebuilding.
-    drop_cached_engine(&app, session_id as i64).await;
 
     let eng = worker_engine(&app, &db, session_id)
         .await
@@ -2469,57 +2093,32 @@ mod live_slot_tests {
     }
 }
 
-/// The engine-switch marker gate ([`stamp_switch_marker`] → [`persist_switch`])
-/// — issue #96/#98, adversarial re-review of PR #139 (P2).
+/// The engine/model switch's durable write — issue #96/#98, adversarial
+/// re-review of PR #139 (P2).
 ///
-/// WHAT IS ENFORCED WHERE, so these tests are not read as covering more than
-/// they do:
-///   - "the durable writes cannot run without a stamped marker" is a COMPILE
-///     -TIME property, not one of these tests. `persist_switch` demands a
-///     [`MarkerStamped`], whose field is private to `switch_gate`, so the only
-///     way to obtain one is a successful `stamp_switch_marker`. There is no
-///     runtime mutation that removes the gate and still builds — which is the
-///     point of spending a type on it.
-///   - "the rebuild clears a sweep-resurrected engine first"
-///     ([`drop_cached_engine`], review round 9) is likewise placement in the
-///     command bodies and is NOT covered — deleting that call compiles and
-///     leaves every test green, which was checked rather than assumed. It
-///     needs a live `LeadChatState` and a concurrent sweep, neither of which
-///     is reachable here.
-///   - "the stamp precedes the ask cancellation and the teardown" is enforced
-///     by placement in the two `#[tauri::command]` bodies, and is NOT covered:
-///     this crate has no `AppHandle` test harness (tauri's `test` feature is
-///     not enabled), so ask cancellation, `teardown_for_switch`, the
-///     `lead_engine`/`worker_engine` rebuild, the digest, and the visible
-///     `engine_switch` marker are all out of reach here.
-///   - what these DO cover, over the `&Db`-only core: the stamp writes the
-///     marker; the durable pair lands the full end state; a failed stamp
-///     rejects with the stable code and leaves the surface exactly as it was,
-///     still resumable by `revive`'s own predicate; and a retry after an abort
-///     completes rather than half-applying.
+/// The defect: `mark_turn_freeze_recovered` and `clear_native_id` were two
+/// independent writes, so a failed marker write followed by a successful clear
+/// left the surface at `native_id = None && marker = None` — the one
+/// combination `revive::has_resumable_context` reads as "never ran", which
+/// silently drops it out of the automated re-drive pool.
 ///
-/// Failure injection is `repo::fail_write::while_failing`, the house seam
-/// (PR #144), armed on `"mark_turn_freeze_recovered"`. Its selectivity is what
-/// makes these attributable: ONLY that write fails while every neighbour in
-/// the sequence stays healthy, so an ungated implementation would genuinely
-/// succeed at persisting the tool and clearing the native id. It is
-/// task-scoped, so these run in parallel with the rest of the suite without a
-/// serializing lock, and `#[cfg(test)]`-stripped in production builds.
+/// The fix is ONE transaction per axis (`repo::switch_lead_engine_txn` /
+/// `switch_worker_engine_txn`) covering the tool/model change, the native-id
+/// clear and the marker. They commit together or not at all, so the bad
+/// combination cannot be observed. Nine rounds of review went into the
+/// alternatives — stamping early and gating, retracting on failure, a pending
+/// marker kind promoted at commit — and every one of them existed only to make
+/// an EARLIER stamp safe. Atomicity removes the need for all of it.
 ///
-/// (An earlier revision of this PR used a `BEFORE INSERT` trigger scoped to
-/// `kind = 'turn_freeze_recovered'`, written before #144 landed. Same
-/// selectivity, but two techniques for one job is a divergence not worth
-/// keeping — and #144 instruments the exact write these tests need.)
-///
-/// Verified non-vacuous by mutation: make `stamp_switch_marker` hand back a
-/// token even when the insert failed — #139's defect in this shape — and both
-/// failure tests go red.
+/// SCOPE: these cover the `&Db` core. The `#[tauri::command]` wrappers are out
+/// of reach (this crate has no `AppHandle` harness), so ask cancellation,
+/// `teardown_for_switch`, the engine rebuild and the digest are NOT claimed as
+/// covered — and neither are the concurrency windows between this command and
+/// `revive`'s sweep or a concurrent `rewind`, which are pre-existing and
+/// tracked separately. The transactions' own rollback proofs live in
+/// `store::repo`'s tests, where a failure can be injected between the halves.
 #[cfg(test)]
-mod switch_gate_tests {
-    use super::{
-        persist_switch, stamp_switch_marker, SwitchTarget,
-        SWITCH_CLEANUP_ERROR_CODE, SWITCH_MARKER_ERROR_CODE,
-    };
+mod switch_write_tests {
     use crate::lead_chat::revive::has_resumable_context;
     use crate::store::{repo, Db};
 
@@ -2527,11 +2126,11 @@ mod switch_gate_tests {
         Db::connect("sqlite::memory:").await.unwrap()
     }
 
-    /// (thread_id, direction_id, session_id), with a native id captured on BOTH
-    /// axes so each test can prove the clear did or did not happen.
+    /// (thread_id, direction_id, session_id) with a native id on BOTH axes, so
+    /// each test can prove the clear happened.
     async fn fixture(db: &Db) -> (i32, i32, i32) {
         let ws = repo::create_workspace(db, "ws").await.unwrap();
-        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-switch-gate", "main", "", true)
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-switch", "main", "", true)
             .await
             .unwrap();
         let th = repo::create_thread(db, ws.id, "issue", "feature", "claude")
@@ -2548,78 +2147,65 @@ mod switch_gate_tests {
         (th.id, dir.id, sess.id)
     }
 
-    /// The one store write these tests fail, by the name #144 registered it
-    /// under at `repo::mark_turn_freeze_recovered`'s `fail_write!`.
-    const MARKER_WRITE: &str = "mark_turn_freeze_pending";
-
-    /// Ids of every grace-marker row on the thread (either kind), ascending.
-    async fn marker_ids(db: &Db, thread_id: i32) -> Vec<i32> {
-        let mut ids: Vec<i32> = repo::list_lead_messages(db, thread_id)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|m| m.kind.starts_with("turn_freeze_"))
-            .map(|m| m.id)
-            .collect();
-        ids.sort_unstable();
-        ids
-    }
-
     #[tokio::test]
-    async fn lead_switch_stamps_the_marker_then_persists_and_clears() {
+    async fn a_lead_switch_lands_tool_clear_and_marker_together() {
         let db = mem().await;
         let (th, _dir, _sess) = fixture(&db).await;
 
-        let stamped = stamp_switch_marker(&db, SwitchTarget::Lead { thread_id: th })
-            .await
-            .unwrap();
-        persist_switch(&db, stamped, "codex", Some("gpt-5.5-high"))
+        repo::switch_lead_engine_txn(&db, th, "codex", Some("gpt-5.5-high"))
             .await
             .unwrap();
 
         let t = repo::get_thread(&db, th).await.unwrap().unwrap();
         assert_eq!(t.lead_tool, "codex");
         assert_eq!(t.lead_model.as_deref(), Some("gpt-5.5-high"));
-        assert_eq!(repo::lead_native_id(&db, th).await.unwrap(), None, "native id cleared");
+        let native = repo::lead_native_id(&db, th).await.unwrap();
+        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap();
+        assert_eq!(native, None, "issue #96 pitfall 1: the old engine's id must not survive");
+        assert!(recovered.is_some(), "and the marker that vouches for it is in the same commit");
         assert!(
-            repo::last_turn_freeze_recovery_secs(&db, th, None)
-                .await
-                .unwrap()
-                .is_some(),
-            "the grace marker is what holds revive's sweep off the freshly-switched lead"
+            has_resumable_context(native.is_some(), recovered),
+            "id-gone-AND-marker-gone is the silent-strand shape the transaction rules out"
         );
     }
 
     #[tokio::test]
-    async fn worker_switch_stamps_the_marker_then_persists_and_clears() {
+    async fn a_worker_switch_lands_tool_clear_and_marker_together() {
         let db = mem().await;
         let (th, dir, sess) = fixture(&db).await;
 
-        let stamped = stamp_switch_marker(
-            &db,
-            SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess },
-        )
-        .await
-        .unwrap();
-        persist_switch(&db, stamped, "codex", Some("gpt-5.5-high"))
+        repo::switch_worker_engine_txn(&db, dir, sess, "codex", Some("gpt-5.5-high"))
             .await
             .unwrap();
 
-        // BOTH halves of switch_worker_engine_txn — the durable side a cold
-        // reopen reads and the live side every send reads.
+        // BOTH halves of the tool write: `direction.tool` is what
+        // `chat_open_worker_impl`'s cold-recreate path reads, `session.tool`
+        // what the live path reads.
         assert_eq!(repo::get_direction(&db, dir).await.unwrap().unwrap().tool, "codex");
         let s = repo::get_session(&db, sess).await.unwrap().unwrap();
         assert_eq!(s.tool, "codex");
         assert_eq!(s.model.as_deref(), Some("gpt-5.5-high"));
-        assert_eq!(s.native_session_id, None, "native id cleared");
-        assert!(
-            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        // Session-scoped, not thread-scoped: a worker switch must not stamp
-        // the LEAD's grace window and mute its independent re-drive.
+        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap();
+        assert_eq!(s.native_session_id, None);
+        assert!(recovered.is_some());
+        assert!(has_resumable_context(s.native_session_id.is_some(), recovered));
+    }
+
+    /// The worker's marker is session-scoped. A worker switch must not stamp
+    /// the LEAD's grace window and mute its independent re-drive.
+    #[tokio::test]
+    async fn a_worker_switch_does_not_stamp_the_leads_window() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+
+        repo::switch_worker_engine_txn(&db, dir, sess, "codex", None)
+            .await
+            .unwrap();
+
+        assert!(repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(
             repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap(),
             None,
@@ -2627,451 +2213,32 @@ mod switch_gate_tests {
         );
     }
 
-    /// The P2 itself, lead axis: the marker write fails, so the switch never
-    /// gets a token to proceed with. Asserts the abort is CLEAN — the tool is
-    /// untouched, the native id is untouched, and, the invariant that actually
-    /// matters, `revive` still sees resumable context, so this lead stays in
-    /// the auto-redrive candidate pool instead of silently dropping out of it.
-    /// The rejection carries the stable code, not a sentence: `EngineSwitchDialog`
-    /// renders translated copy off it (`src/session/engineSwitch.ts`).
+    /// A failed switch changes nothing — the transaction is the guarantee, and
+    /// the surface stays coherently on its old engine. Driven through #144's
+    /// seam on the lead write.
     #[tokio::test]
-    async fn lead_switch_aborts_and_changes_nothing_when_the_marker_write_fails() {
+    async fn a_failed_switch_leaves_the_surface_on_its_old_engine() {
         let db = mem().await;
         let (th, _dir, _sess) = fixture(&db).await;
 
-        let err = repo::fail_write::while_failing(
-            MARKER_WRITE,
-            stamp_switch_marker(&db, SwitchTarget::Lead { thread_id: th }),
-        )
-        .await;
-
-        assert_eq!(
-            err.err().as_deref(),
-            Some(SWITCH_MARKER_ERROR_CODE),
-            "aborts with the stable code the UI translates, not a Rust-authored sentence"
-        );
-
-        let t = repo::get_thread(&db, th).await.unwrap().unwrap();
-        assert_eq!(t.lead_tool, "claude", "tool/model persist must not have run");
-        assert_eq!(t.lead_model, None);
-        let native = repo::lead_native_id(&db, th).await.unwrap();
-        assert_eq!(native.as_deref(), Some("lead-nat-1"), "native id must survive");
-        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap();
-        assert_eq!(recovered, None, "the marker genuinely did not land");
-        assert!(
-            has_resumable_context(native.is_some(), recovered),
-            "no-id-AND-no-marker is the silent-forever shape this gate exists to prevent"
-        );
-    }
-
-    /// Same defect, worker axis — asserted independently rather than assumed
-    /// from the lead case. The two axes reach `persist_switch` through
-    /// different repo writers and store their native id in different places
-    /// (a `session` column vs a `lead_message` meta row), and this is the exact
-    /// pair where a rule fixed on one axis has already been missed on the other.
-    #[tokio::test]
-    async fn worker_switch_aborts_and_changes_nothing_when_the_marker_write_fails() {
-        let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-
-        let err = repo::fail_write::while_failing(
-            MARKER_WRITE,
-            stamp_switch_marker(
-                &db,
-                SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess },
-            ),
-        )
-        .await;
-
-        assert_eq!(
-            err.err().as_deref(),
-            Some(SWITCH_MARKER_ERROR_CODE),
-            "aborts with the stable code the UI translates, not a Rust-authored sentence"
-        );
-
-        assert_eq!(
-            repo::get_direction(&db, dir).await.unwrap().unwrap().tool,
-            "claude",
-            "tool persist must not have run"
-        );
-        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
-        assert_eq!(s.tool, "claude");
-        assert_eq!(s.model, None);
-        assert_eq!(
-            s.native_session_id.as_deref(),
-            Some("worker-nat-1"),
-            "native id must survive — clearing it here is what strands the worker"
-        );
-        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap();
-        assert_eq!(recovered, None, "the marker genuinely did not land");
-        assert!(
-            has_resumable_context(s.native_session_id.is_some(), recovered),
-            "no-id-AND-no-marker is the silent-forever shape this gate exists to prevent"
-        );
-    }
-
-    /// Review round 2, finding 1 — the regression test for the retraction.
-    ///
-    /// The stamp lands, then the tool persist fails. Without the retraction the
-    /// surface keeps a grace marker for a native-context reset that never
-    /// happened, and on a surface with NO native id that is not a spent window
-    /// but a permanent false positive: `has_resumable_context(false, Some(m))`
-    /// is true forever, so the stall sweep can auto-redrive something with
-    /// nothing to resume. The fixture therefore has NO native id — the shape a
-    /// lead rewound to before its first message is left in.
-    #[tokio::test]
-    async fn a_switch_that_fails_after_stamping_leaves_no_grace_marker() {
-        let db = mem().await;
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let th = repo::create_thread(&db, ws.id, "issue", "feature", "claude")
-            .await
-            .unwrap();
-        let target = SwitchTarget::Lead { thread_id: th.id };
-
-        let stamped = stamp_switch_marker(&db, target).await.unwrap();
         let failed = repo::fail_write::while_failing(
             "switch_lead_engine_txn",
-            persist_switch(&db, stamped, "codex", None),
-        )
-        .await;
-        assert!(failed.is_err(), "the tool persist must fail (armed seam)");
-        // No explicit retract here: `persist_switch` owns it, precisely so a
-        // caller cannot get the decision wrong in either direction.
-
-        let recovered = repo::last_turn_freeze_recovery_secs(&db, th.id, None).await.unwrap();
-        assert_eq!(recovered, None, "the stamp for a switch that failed must not survive");
-        assert!(
-            !has_resumable_context(
-                repo::lead_native_id(&db, th.id).await.unwrap().is_some(),
-                recovered
-            ),
-            "a lead with no native id and a failed switch must stay OUT of the re-drive pool"
-        );
-        assert_eq!(
-            repo::get_thread(&db, th.id).await.unwrap().unwrap().lead_tool,
-            "claude",
-            "and the tool itself never changed"
-        );
-    }
-
-    /// Retraction deletes BY ID, so an unrelated marker — a real freeze
-    /// recovery that happened to land in between — survives. Deleting "the
-    /// newest marker for this surface" would eat that one instead, silently
-    /// removing a guard that IS load-bearing.
-    #[tokio::test]
-    async fn retracting_a_stamp_spares_an_unrelated_marker() {
-        let db = mem().await;
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let th = repo::create_thread(&db, ws.id, "issue", "feature", "claude")
-            .await
-            .unwrap();
-
-        let stamped = stamp_switch_marker(&db, SwitchTarget::Lead { thread_id: th.id })
-            .await
-            .unwrap();
-        // A genuine freeze recovery stamps AFTER the switch did — so this is
-        // the newest row, and a "delete the newest" implementation would take
-        // it rather than the switch's own.
-        let freeze_marker = repo::mark_turn_freeze_recovered(&db, th.id, None).await.unwrap();
-
-        let failed = repo::fail_write::while_failing(
-            "switch_lead_engine_txn",
-            persist_switch(&db, stamped, "codex", None),
+            repo::switch_lead_engine_txn(&db, th, "codex", Some("opus")),
         )
         .await;
         assert!(failed.is_err());
 
-        let left: Vec<_> = marker_ids(&db, th.id).await;
-        assert_eq!(left, vec![freeze_marker], "only the switch's own stamp is removed");
-    }
-
-    /// Review round 3, finding 1 — the regression for the retraction's OTHER
-    /// side, which round 2 got wrong.
-    ///
-    /// Once `persist_switch` succeeds the native id is gone, so the marker is
-    /// the only evidence this surface ever ran. Round 2 grouped every
-    /// post-stamp failure onto one retraction point, which swept the engine
-    /// rebuild in with it: a rebuild failure retracted the marker and left the
-    /// surface at `native_id = None && marker = None` — the exact silent
-    /// strand this PR exists to remove, reintroduced by its own cleanup.
-    ///
-    /// The fix is structural (`persist_switch` consumes the token, so nothing
-    /// downstream holds one to retract with), and structural fixes are not
-    /// runtime-observable. What IS observable, and what this pins, is the state
-    /// a successful persist leaves behind: no native id, marker present, and
-    /// therefore still resumable by `revive`'s own predicate. If a future edit
-    /// retracts here, this goes red.
-    #[tokio::test]
-    async fn a_persisted_switch_keeps_the_marker_that_is_now_its_only_evidence() {
-        let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
-
-        let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        persist_switch(&db, stamped, "codex", None).await.unwrap();
-
-        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
-        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
-            .await
-            .unwrap();
-        assert_eq!(s.native_session_id, None, "the clear happened");
-        assert!(recovered.is_some(), "so the marker MUST still be there");
-        assert!(
-            has_resumable_context(s.native_session_id.is_some(), recovered),
-            "id gone + marker gone is the silent-strand shape; the marker is what prevents it"
-        );
-    }
-
-    /// Review round 8 — a marker inserted BETWEEN the claim and the commit
-    /// must not out-rank the switch that just committed.
-    ///
-    /// Readers take the newest marker by `id DESC`. Promotion used to update
-    /// the pending row in place, which made it newest by clock while keeping
-    /// its older id — so a freeze recovery (or a concurrent switch) landing in
-    /// the gap would win the ordering and hand the fresh switch a window that
-    /// had already elapsed. Promotion inserts a fresh row instead.
-    #[tokio::test]
-    async fn a_marker_landing_mid_switch_cannot_outrank_the_committed_one() {
-        let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
-
-        let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        // A real freeze recovery stamps its own marker while the switch is
-        // still tearing down — higher id than the pending claim.
-        let interloper = repo::mark_turn_freeze_recovered(&db, th, Some(sess)).await.unwrap();
-
-        persist_switch(&db, stamped, "codex", None).await.unwrap();
-
-        let newest = *marker_ids(&db, th).await.last().expect("a marker survives");
-        assert!(
-            newest > interloper,
-            "the committed switch's marker must be the newest row, or the window the \
-             reader finds belongs to the interloper and is already partly spent"
-        );
-    }
-
-    /// Review round 7 — a switch that dies between claiming the window and
-    /// committing must not look resumable afterwards.
-    ///
-    /// Simulates the crash directly: stamp, then never persist. The pending row
-    /// survives, exactly as it would across an app restart, and the assertion
-    /// is that `revive` still refuses this surface — it has no native id and
-    /// no COMMITTED marker, so nothing vouches for a reset that never
-    /// happened. What the pending row does still buy is the cooldown, which is
-    /// the only thing it was claimed for.
-    #[tokio::test]
-    async fn a_switch_that_dies_before_committing_never_looks_resumable() {
-        let db = mem().await;
-        let ws = repo::create_workspace(&db, "ws").await.unwrap();
-        let th = repo::create_thread(&db, ws.id, "issue", "feature", "claude")
-            .await
-            .unwrap();
-
-        // No native id on purpose: the shape a rewound-to-empty surface has,
-        // where a stray marker is the whole difference between invisible and
-        // permanently re-drivable.
-        let _stamped = stamp_switch_marker(&db, SwitchTarget::Lead { thread_id: th.id })
-            .await
-            .unwrap();
-        // …and then nothing. No persist, no retract — the process is gone.
-
-        let recovered = repo::last_turn_freeze_recovery_secs(&db, th.id, None).await.unwrap();
-        assert_eq!(recovered, None, "a pending marker is not evidence of a reset");
-        assert!(
-            !has_resumable_context(
-                repo::lead_native_id(&db, th.id).await.unwrap().is_some(),
-                recovered
-            ),
-            "so the never-completed switch cannot make this surface re-drivable"
-        );
-        assert!(
-            repo::last_turn_freeze_guard_secs(&db, th.id, None)
-                .await
-                .unwrap()
-                .is_some(),
-            "it does still hold the cooldown, which is the one thing it was claimed for"
-        );
-    }
-
-    /// The codes are a cross-language contract with
-    /// `src/session/engineSwitch.ts`'s `SWITCH_ERROR_I18N`, which cannot be
-    /// type-checked across the boundary. This pins the Rust half: distinct
-    /// values (a code that is a substring of another would make the
-    /// frontend's `find` return the wrong copy) and stable spellings, so
-    /// renaming one here without updating the map goes red on this side too.
-    #[test]
-    fn the_switch_error_codes_are_distinct_and_stable() {
-        let codes = [
-            SWITCH_MARKER_ERROR_CODE,
-            SWITCH_CLEANUP_ERROR_CODE,
-            repo::SWITCH_MARKER_LOST_CODE,
-        ];
-        for (i, a) in codes.iter().enumerate() {
-            for (j, b) in codes.iter().enumerate() {
-                assert!(i == j || !b.contains(a), "{a} is a substring of {b}");
-            }
-        }
+        let t = repo::get_thread(&db, th).await.unwrap().unwrap();
+        assert_eq!(t.lead_tool, "claude");
+        assert_eq!(t.lead_model, None);
         assert_eq!(
-            codes,
-            ["switch_marker_stamp_failed", "switch_cleanup_failed", "switch_marker_lost"],
-            "spellings are mirrored in src/session/engineSwitch.ts — update both"
+            repo::lead_native_id(&db, th).await.unwrap().as_deref(),
+            Some("lead-nat-1")
         );
-    }
-
-    /// Review round 6 — the half-applied state is GONE, not merely described.
-    ///
-    /// Until this round the tool/model write and the native-id clear were two
-    /// writes, and a failure between them left new tool + old engine's native
-    /// id. Rounds 4 and 5 kept the grace marker and gave that state its own
-    /// error code, which only DELAYED it: the window expires, and the user's
-    /// next send never consults the marker at all — `worker_engine` reads the
-    /// mismatched pair directly. They are one transaction now, so the pair
-    /// cannot be observed at all; this asserts that, on the axis where the two
-    /// values live in the same row.
-    ///
-    /// The transaction's own rollback is covered from the other side, in
-    /// `store::repo`'s tests, where the failure can be injected between the
-    /// two halves.
-    #[tokio::test]
-    async fn a_switch_never_leaves_a_new_tool_paired_with_an_old_native_id() {
-        let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
-
-        let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        persist_switch(&db, stamped, "codex", None).await.unwrap();
-
-        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
-        assert_eq!(s.tool, "codex");
         assert_eq!(
-            s.native_session_id, None,
-            "the tool change and the id clear are one write — they cannot disagree"
-        );
-    }
-
-    /// Review round 4, finding 2 — an abort whose cleanup ALSO fails must not
-    /// be reported as a clean one.
-    ///
-    /// Nothing useful to retry against a database that just failed twice, so
-    /// the requirement is honesty rather than recovery: the returned error has
-    /// to say a stray marker remains, and the marker is genuinely still there.
-    #[tokio::test]
-    async fn an_abort_whose_cleanup_fails_says_so() {
-        let db = mem().await;
-        let (th, _dir, sess) = fixture(&db).await;
-        // Two writes have to fail at once, but `while_failing` arms ONE name
-        // per task by design (#144), and nesting just lets the inner scope win.
-        // So the tool write is failed by other means — a direction id that does
-        // not exist, which `switch_worker_engine_txn` rejects — leaving the seam
-        // free for the cleanup. The stamp itself only touches thread/session,
-        // both real, so the marker genuinely lands first.
-        let target = SwitchTarget::Worker {
-            thread_id: th,
-            direction_id: 999_999,
-            session_id: sess,
-        };
-
-        let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        let failed = repo::fail_write::while_failing(
-            "delete_turn_freeze_marker",
-            persist_switch(&db, stamped, "codex", None),
-        )
-        .await;
-
-        let err = failed.expect_err("the switch must fail").to_string();
-        assert_eq!(
-            err, SWITCH_CLEANUP_ERROR_CODE,
-            "rejects with the code the UI translates — the DB causes go to the log, not              into user-facing text (review round 5)"
-        );
-        assert!(
-            repo::last_turn_freeze_guard_secs(&db, th, Some(sess))
-                .await
-                .unwrap()
-                .is_some(),
-            "and the marker really is still there, which is what the message claims"
-        );
-        // It is still only a PENDING one, so what it costs is one stale
-        // cooldown window — never resumability for a switch that never
-        // committed (review round 7).
-        assert_eq!(
-            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap(),
+            repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap(),
             None,
-            "a stray marker from an aborted switch must not read as evidence of a reset"
+            "and no marker vouching for a reset that never happened"
         );
-    }
-
-    /// The grace window runs from the COMMIT, not from step 0 — otherwise a
-    /// slow `teardown_for_switch` (its interrupt runs up to ~120s against a
-    /// wedged app-server, versus a 300s default cooldown that can be
-    /// configured lower) eats the window before the new engine is even up.
-    ///
-    /// It is the promotion that restamps the clock, inside the switch's own
-    /// transaction, which is why there is no separate refresh step any more.
-    /// Asserted on the row's identity and kind rather than on a clock:
-    /// `created_at` is whole seconds, so a time comparison inside one test
-    /// tick would be flaky.
-    #[tokio::test]
-    async fn committing_a_switch_promotes_the_pending_marker_in_place() {
-        let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
-
-        let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        let pending = marker_ids(&db, th).await;
-        assert_eq!(pending.len(), 1, "step 0 claimed exactly one row");
-        assert_eq!(
-            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap(),
-            None,
-            "which is not yet evidence of anything"
-        );
-
-        persist_switch(&db, stamped, "codex", None).await.unwrap();
-
-        let after = marker_ids(&db, th).await;
-        assert_eq!(after.len(), 1, "still one marker for one switch");
-        assert!(
-            after[0] > pending[0],
-            "but a FRESH row, so it is newest by id as well as by clock — an in-place \
-             update would be newest by clock only, and every reader picks by id DESC"
-        );
-        assert!(
-            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
-                .await
-                .unwrap()
-                .is_some(),
-            "and it now counts as evidence, in the same commit as the native-id clear"
-        );
-    }
-
-    /// A retry after an aborted switch must be a COMPLETE recovery, not a
-    /// second half-applied attempt — the property that makes "fail and let the
-    /// user retry" the right trade-off over degrading, and the reason the
-    /// stamp sits ahead of every other effect. Same calls, marker writes
-    /// healthy again, lands the full end state.
-    #[tokio::test]
-    async fn retrying_after_an_aborted_switch_completes_it() {
-        let db = mem().await;
-        let (th, dir, sess) = fixture(&db).await;
-        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
-        assert!(
-            repo::fail_write::while_failing(MARKER_WRITE, stamp_switch_marker(&db, target))
-                .await
-                .is_err()
-        );
-
-        // Outside the armed scope the same call is healthy again — the seam is
-        // task-scoped, which is exactly the shape a user's retry has.
-        let stamped = stamp_switch_marker(&db, target).await.unwrap();
-        persist_switch(&db, stamped, "codex", None).await.unwrap();
-
-        assert_eq!(repo::get_direction(&db, dir).await.unwrap().unwrap().tool, "codex");
-        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
-        assert_eq!(s.tool, "codex");
-        assert_eq!(s.native_session_id, None);
-        assert!(repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
-            .await
-            .unwrap()
-            .is_some());
     }
 }

@@ -24,38 +24,3 @@ export type SwitchKind = "switch" | "reload";
 export function switchKindOf(oldTool: string, newTool: string): SwitchKind {
   return oldTool !== "" && oldTool === newTool ? "reload" : "switch";
 }
-
-/** The switch outcomes the backend names with a stable code instead of an
- *  English sentence (Rust: `SWITCH_MARKER_ERROR_CODE` /
- *  `SWITCH_CLEANUP_ERROR_CODE`). It sends
- *  the CODE and logs the database detail, so this locale's copy comes from
- *  `src/i18n/*.ts`.
- *
- *  Only outcomes where "the switch failed" would be wrong or incomplete get
- *  one; an ordinary failed switch passes its own message through, which is why
- *  `switchErrorCodeOf` returning null is a normal result, not a gap. */
-export const SWITCH_ERROR_I18N: Record<string, string> = {
-  switch_marker_stamp_failed: "session.switchMarkerFailed",
-  switch_cleanup_failed: "session.switchCleanupFailed",
-  switch_marker_lost: "session.switchMarkerLost",
-};
-
-/** The ONE discriminated value the dialog maps from — a code, or null when the
- *  rejection is an ordinary one to render verbatim. Deriving it once and
- *  looking the copy up beats a boolean matcher per outcome, which is how the
- *  set silently goes stale when a fourth is added.
- *
- *  Shape tolerance mirrors `isProcessQuotaDegradedError`: tauri commands
- *  currently reject with strings, while tests and future adapters may surface
- *  an `Error` or a `{ code }` object. */
-export function switchErrorCodeOf(error: unknown): string | null {
-  const codes = Object.keys(SWITCH_ERROR_I18N);
-  const text = (() => {
-    if (typeof error === "string") return error;
-    if (error instanceof Error) return error.message;
-    if (typeof error === "object" && error !== null && "code" in error) return String(error.code);
-    return null;
-  })();
-  if (text === null) return null;
-  return codes.find((code) => text.includes(code)) ?? null;
-}
