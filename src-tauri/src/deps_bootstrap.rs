@@ -215,18 +215,12 @@ pub(crate) fn node_modules_ready(dir: &Path) -> bool {
             nm.is_dir() && nm.join(".modules.yaml").is_file()
         }
         PackageManager::YarnBerry => {
-            // PnP: .pnp.cjs / .pnp.js; node-modules linker: non-empty node_modules.
-            // install-state is also evidence of a completed Berry install.
+            // Only real Berry completion artifacts count. plan_install_with may
+            // pre-create empty output dirs for containment; a non-empty
+            // node_modules alone must never suppress retries after a failed install.
             dir.join(".pnp.cjs").is_file()
                 || dir.join(".pnp.js").is_file()
                 || dir.join(".yarn/install-state.gz").is_file()
-                || {
-                    let nm = dir.join("node_modules");
-                    nm.is_dir()
-                        && std::fs::read_dir(&nm)
-                            .map(|mut e| e.next().is_some())
-                            .unwrap_or(false)
-                }
         }
         PackageManager::YarnClassic => {
             // Classic writes `.yarn-integrity` only after a successful install.
@@ -286,11 +280,46 @@ fn relative_path_escapes(s: &str) -> bool {
 /// True when package-manager output trees are gitignored in this worktree.
 /// Bootstrap creates large untracked trees; if they are not ignored they leak
 /// into worker diffs via `git ls-files --others --exclude-standard`.
+fn resolve_git_program() -> PathBuf {
+    // Resolve git against a sanitized absolute PATH *before* entering an
+    // untrusted worktree. A relative PATH entry (especially ".") must never
+    // pick up a repo-provided `git` binary.
+    let path = sanitize_path_for_bootstrap(&crate::detect::tool_path());
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("git");
+        if candidate.is_file() {
+            return candidate;
+        }
+        #[cfg(windows)]
+        {
+            for ext in ["exe", "cmd", "bat"] {
+                let c = dir.join(format!("git.{ext}"));
+                if c.is_file() {
+                    return c;
+                }
+            }
+        }
+    }
+    // Last resort: absolute common locations, never a bare relative name.
+    for candidate in ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"] {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from("/usr/bin/git")
+}
+
 fn output_tree_is_gitignored(dir: &Path, rel: &str) -> bool {
-    // Prefer git check-ignore when available.
-    let out = std::process::Command::new("git")
+    // Prefer git check-ignore when available. Resolve git absolutely first so
+    // a worktree-planted `./git` cannot run with Weft's full environment.
+    let git = resolve_git_program();
+    let out = std::process::Command::new(&git)
         .args(["check-ignore", "-q", "--", rel])
         .current_dir(dir)
+        .env_clear()
+        .env("PATH", sanitize_path_for_bootstrap(&crate::detect::tool_path()))
+        .env("GIT_TERMINAL_PROMPT", "0")
         .status();
     match out {
         Ok(st) if st.success() => true,
@@ -400,11 +429,17 @@ fn yarn_config_executes_repo_code(dir: &Path) -> bool {
             || lower.contains("pnpunpluggedfolder")
             || lower.contains("pnppath")
             || lower.contains("pnpcachedatapath")
+            || lower.contains("pnpmstorefolder")
             || lower.contains("globalfolder")
             || lower.contains("cachedir")
             || lower.contains("cachefolder")
             || lower.contains("virtualfolder")
+            || lower.contains("injectenvironmentfiles")
         {
+            return true;
+        }
+        // Any ${...} interpolation can reintroduce secrets after env scrub.
+        if lower.contains("${") {
             return true;
         }
     }
@@ -421,21 +456,127 @@ fn yarn_config_executes_repo_code(dir: &Path) -> bool {
 /// registry auth (e.g. `_authToken=${GITHUB_TOKEN}`). Automatic bootstrap
 /// refuses these trees rather than risk secret exfiltration.
 fn project_config_interpolates_env_secrets(dir: &Path) -> bool {
-    for name in [".npmrc", ".yarnrc", ".yarnrc.yml", ".yarnrc.yaml"] {
+    for name in [".npmrc", ".yarnrc", ".yarnrc.yml", ".yarnrc.yaml", "bunfig.toml"] {
         let Ok(raw) = std::fs::read_to_string(dir.join(name)) else {
             continue;
         };
         let lower = raw.to_ascii_lowercase();
+        // Yarn injectEnvironmentFiles can restore secrets after env_clear.
+        if lower.contains("injectenvironmentfiles") {
+            return true;
+        }
         if lower.contains("${")
             && (lower.contains("authtoken")
                 || lower.contains("_auth")
                 || lower.contains("password")
-                || lower.contains("token"))
+                || lower.contains("token")
+                || lower.contains("npmregistryserver")
+                || name.starts_with(".yarn"))
         {
             return true;
         }
     }
     false
+}
+
+/// True when a workspace package path/glob can escape the worktree.
+fn workspace_path_escapes(dir: &Path, raw: &str) -> bool {
+    let s = raw.trim().trim_matches(|c| c == '\'' || c == '"' || c == ',');
+    if s.is_empty() {
+        return false;
+    }
+    // Globs still escape if they start with ../ or are absolute outside.
+    if relative_path_escapes(s) {
+        return true;
+    }
+    let p = Path::new(s);
+    if p.is_absolute() {
+        return !path_is_under(dir, p);
+    }
+    // For patterns like packages/*, only the non-glob prefix is checked.
+    let prefix = s.split('*').next().unwrap_or(s);
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return false;
+    }
+    let candidate = dir.join(prefix);
+    if candidate.exists() {
+        return !path_is_under(dir, &candidate);
+    }
+    // Non-existent: component-level parent-dir already handled; accept in-tree.
+    false
+}
+
+fn pnpm_workspace_escapes(dir: &Path) -> bool {
+    for name in ["pnpm-workspace.yaml", "pnpm-workspace.yml"] {
+        let Ok(raw) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        // Lightweight scan: any packages: entry that escapes the worktree.
+        let mut in_packages = false;
+        for line in raw.lines() {
+            let t = line.trim();
+            if t.starts_with("packages:") {
+                in_packages = true;
+                // Inline form: packages: ['a', '../b']
+                if let Some(rest) = t.strip_prefix("packages:") {
+                    for part in rest.split([',', '[', ']', ' ']) {
+                        let p = part.trim().trim_matches(|c| c == '\'' || c == '"');
+                        if !p.is_empty() && workspace_path_escapes(dir, p) {
+                            return true;
+                        }
+                    }
+                }
+                continue;
+            }
+            if in_packages {
+                if t.is_empty() || t.starts_with('#') {
+                    continue;
+                }
+                // Next top-level key ends the packages block.
+                if !t.starts_with('-') && t.contains(':') && !line.starts_with(' ') && !line.starts_with('\t') {
+                    in_packages = false;
+                    continue;
+                }
+                let item = t.trim_start_matches('-').trim();
+                let item = item.trim_matches(|c| c == '\'' || c == '"');
+                if !item.is_empty() && workspace_path_escapes(dir, item) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn package_json_workspaces_escape(dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let mut paths = Vec::new();
+    match json.get("workspaces") {
+        Some(serde_json::Value::Array(arr)) => {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    paths.push(s.to_string());
+                }
+            }
+        }
+        Some(serde_json::Value::Object(obj)) => {
+            if let Some(serde_json::Value::Array(arr)) = obj.get("packages") {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        paths.push(s.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    paths.iter().any(|p| workspace_path_escapes(dir, p))
 }
 
 /// Build the install plan from process env, or None when bootstrap should be skipped.
@@ -463,17 +604,45 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
     if !output_tree_is_gitignored(dir, "node_modules") {
         return None;
     }
+    // Yarn Berry also emits .pnp.* and .yarn/install-state.gz; those must be
+    // ignored too or they leak into worker diffs.
+    if matches!(pm, PackageManager::YarnBerry) {
+        for rel in [".pnp.cjs", ".pnp.js", ".yarn"] {
+            if !output_tree_is_gitignored(dir, rel) {
+                return None;
+            }
+        }
+    }
     // Prevent symlink escape of install outputs into the canonical repo.
-    if !ensure_contained_output_dirs(
-        dir,
-        &[
-            "node_modules",
-            "node_modules/.pnpm",
-            "node_modules/.weft-pnpm-store",
-            "node_modules/.weft-npm-cache",
-        ],
-    ) {
+    let mut contained = vec![
+        "node_modules",
+        "node_modules/.pnpm",
+        "node_modules/.weft-pnpm-store",
+        "node_modules/.weft-npm-cache",
+        "node_modules/.weft-bun-cache",
+        "node_modules/.weft-npm-logs",
+    ];
+    if matches!(pm, PackageManager::YarnBerry) {
+        contained.extend([".yarn", ".yarn/cache"]);
+    }
+    if !ensure_contained_output_dirs(dir, &contained) {
         return None;
+    }
+    // Existing Berry PnP artifacts must not be escape symlinks either.
+    if matches!(pm, PackageManager::YarnBerry) {
+        for rel in [".pnp.cjs", ".pnp.js", ".yarn/install-state.gz"] {
+            let path = dir.join(rel);
+            if path.exists() || path.symlink_metadata().is_ok() {
+                if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                    if meta.file_type().is_symlink() && !path_is_under(dir, &path) {
+                        return None;
+                    }
+                }
+                if path.exists() && !path_is_under(dir, &path) {
+                    return None;
+                }
+            }
+        }
     }
 
     let mut env = Vec::new();
@@ -501,10 +670,11 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "node_modules/.weft-pnpm-store".to_string(),
             ];
             // Only ignore a *parent* workspace. If this worktree itself is a
-            // pnpm workspace, we must install all packages.
-            if !(dir.join("pnpm-workspace.yaml").is_file()
-                || dir.join("pnpm-workspace.yml").is_file())
-            {
+            // pnpm workspace, we must install all packages — but only when every
+            // packages glob stays inside the worktree.
+            let has_local_workspace = dir.join("pnpm-workspace.yaml").is_file()
+                || dir.join("pnpm-workspace.yml").is_file();
+            if !has_local_workspace || pnpm_workspace_escapes(dir) {
                 args.push("--ignore-workspace".to_string());
             }
             // Immutable only: never rewrite the tracked lockfile from bootstrap.
@@ -583,6 +753,14 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                     .to_string_lossy()
                     .into_owned(),
             ));
+            // logs-dir is independent of cache; pin it too so project
+            // logs-dir=../../../... cannot write into the canonical repo.
+            env.push((
+                "npm_config_logs_dir".to_string(),
+                dir.join("node_modules/.weft-npm-logs")
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
             if dir.join("package-lock.json").is_file() || dir.join("npm-shrinkwrap.json").is_file() {
                 (
                     "npm".to_string(),
@@ -608,7 +786,18 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
             }
         }
         PackageManager::Bun => {
-            let mut args = vec!["install".to_string(), "--ignore-scripts".to_string()];
+            // Escaping workspace package paths would install into the canonical repo.
+            if package_json_workspaces_escape(dir) {
+                return None;
+            }
+            let mut args = vec![
+                "install".to_string(),
+                "--ignore-scripts".to_string(),
+                // Force cache inside the worktree; bunfig.toml can set
+                // [install.cache] dir = "../../../escaped".
+                "--cache-dir".to_string(),
+                "node_modules/.weft-bun-cache".to_string(),
+            ];
             if dir.join("bun.lock").is_file() || dir.join("bun.lockb").is_file() {
                 // Immutable when a lockfile exists.
                 args.push("--frozen-lockfile".to_string());
@@ -993,9 +1182,16 @@ mod tests {
     fn node_modules_ready_yarn_berry_accepts_pnp() {
         let d = tmp();
         write(&d, "package.json", r#"{ "packageManager": "yarn@4.0.0" }"#);
-        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        write(&d, "yarn.lock", "__metadata:
+  version: 8
+");
         assert!(!node_modules_ready(&d));
-        write(&d, ".pnp.cjs", "// pnp\n");
+        // Pre-created containment dirs must not look ready.
+        std::fs::create_dir_all(d.join("node_modules/.pnpm")).unwrap();
+        write(&d, "node_modules/left-pad/package.json", "{}");
+        assert!(!node_modules_ready(&d), "partial nm without berry marker is not ready");
+        write(&d, ".pnp.cjs", "// pnp
+");
         assert!(node_modules_ready(&d));
     }
 
@@ -1092,7 +1288,7 @@ mod tests {
     fn plan_install_yarn_berry_is_immutable_and_skips_classic_flags() {
         let d = tmp();
         let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
-        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, ".gitignore", "node_modules/\n.pnp.cjs\n.pnp.js\n.yarn/\n");
         write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
         write(&d, "yarn.lock", "__metadata:
   version: 8
@@ -1204,6 +1400,116 @@ mod tests {
         write(&d, "package.json", "{}");
         write(&d, "pnpm-lock.yaml", "");
         assert!(plan_install_with(&d, &test_cfg(false, true)).is_none());
+    }
+
+    #[test]
+    fn plan_install_yarn_skips_pnpm_store_folder_override() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n.pnp.cjs\n.pnp.js\n.yarn/\n");
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
+        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        write(&d, ".yarnrc.yml", "nodeLinker: pnpm\npnpmStoreFolder: ../../../escaped-yarn-store\n");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
+    fn plan_install_yarn_skips_inject_environment_files() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n.pnp.cjs\n.pnp.js\n.yarn/\n");
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
+        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        write(
+            &d,
+            ".yarnrc.yml",
+            "injectEnvironmentFiles: [\"../../../secret.env\"]\n",
+        );
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
+    fn plan_install_yarn_skips_when_pnp_symlink_escapes() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n.pnp.cjs\n.pnp.js\n.yarn/\n");
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
+        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink("../../../victim", d.join(".pnp.cjs"));
+            assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+        }
+    }
+
+    #[test]
+    fn plan_install_yarn_skips_when_berry_outputs_not_ignored() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        // Only node_modules ignored — Berry PnP artifacts would leak.
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{ "packageManager": "yarn@4.1.0" }"#);
+        write(&d, "yarn.lock", "__metadata:\n  version: 8\n");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
+    fn plan_install_pnpm_ignores_workspace_when_packages_escape() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{"name":"x"}"#);
+        write(&d, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(&d, "pnpm-workspace.yaml", "packages:\n  - '../../../outside'\n");
+        let plan = plan_install_with(&d, &test_cfg(true, true)).expect("plan");
+        assert!(
+            plan.args.iter().any(|a| a == "--ignore-workspace"),
+            "escaping workspace packages must force --ignore-workspace"
+        );
+    }
+
+    #[test]
+    fn plan_install_bun_skips_escaping_workspaces() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(
+            &d,
+            "package.json",
+            r#"{ "packageManager": "bun@1.2.0", "workspaces": ["../../../outside"] }"#,
+        );
+        write(&d, "bun.lock", "");
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
+    }
+
+    #[test]
+    fn plan_install_bun_pins_cache_dir() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", r#"{ "packageManager": "bun@1.2.0" }"#);
+        write(&d, "bun.lock", "");
+        let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--cache-dir" && w[1] == "node_modules/.weft-bun-cache"));
+    }
+
+    #[test]
+    fn plan_install_npm_pins_logs_dir() {
+        let d = tmp();
+        let _ = std::process::Command::new("git").args(["init"]).current_dir(&d).status();
+        write(&d, ".gitignore", "node_modules/\n");
+        write(&d, "package.json", "{}");
+        write(&d, "package-lock.json", "{}");
+        let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
+        assert!(plan.env.iter().any(|(k, v)| {
+            k == "npm_config_logs_dir" && v.ends_with("node_modules/.weft-npm-logs")
+        }));
+        assert!(plan.env.iter().any(|(k, v)| {
+            k == "npm_config_cache" && v.ends_with("node_modules/.weft-npm-cache")
+        }));
     }
 
     #[test]
