@@ -7,11 +7,12 @@ const norm = (s: string) =>
 
 /** Weft 自己在 spawn 时注入的内部协调 MCP(见 `bus/inject.rs`)。精确名单,不是前缀
  *  匹配。面板展示时 status 标为 `weft`,与用户配置的 server 区分。 */
-const WEFT_INTERNAL_MCP = new Set(["weft_bus", "weft_planner", "weft_global"]);
+const WEFT_INTERNAL_MCP = new Set(["weft_bus", "weft_planner", "weft_global", "weft_curator"]);
 const isInternalMcp = (name: string) => WEFT_INTERNAL_MCP.has(name.toLowerCase());
 
 /** claude init:把扁平 tools 里 `mcp__<server>__<tool>` 按 server 归到对应条目。
- *  codex/opencode 不传 tools,这里只产出 server + 状态(tools 为空)。weft_* 内部 server 过滤掉。 */
+ *  codex/opencode 不传 tools,这里只产出 server + 状态(tools 为空)。
+ *  Weft 内部 server status 标为 `weft`(见 WEFT_INTERNAL_MCP)。 */
 export function groupMcpTools(
   servers: { name: string; status: string }[],
   tools: string[],
