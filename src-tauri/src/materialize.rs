@@ -75,6 +75,23 @@ fn home_token(home: &Path) -> String {
 /// `<repo>/.worktrees/weft/<branch>` on the direction's branch.
 /// Idempotent: an existing worktree row/path is reused. Returns empty if the
 /// direction has no repo bound (shouldn't happen for a confirmed write direction).
+
+/// Best-effort JS dependency install for a just-materialized / recreated worktree.
+/// Never fails materialize — a registry blip must not block worker dispatch.
+/// Runs on a blocking thread so a multi-minute `pnpm install` does not stall
+/// the async runtime while still finishing before we return the worktree.
+async fn bootstrap_worktree_deps(path: &str) {
+    let p = path.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        crate::deps_bootstrap::maybe_bootstrap(std::path::Path::new(&p))
+    });
+    match join.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[weft] {e}"),
+        Err(e) => eprintln!("[weft] deps bootstrap task join failed for {path}: {e}"),
+    }
+}
+
 pub async fn materialize_direction(
     db: &Db,
     direction_id: i32,
@@ -122,6 +139,9 @@ pub async fn materialize_direction(
                 &git::local_branch_ref(&existing.branch),
             );
         if git::is_registered_worktree(repo_path, wt_path, &existing.branch) && !base_mismatch {
+            // Already materialized and registered — still try deps in case a prior
+            // reclaim left the checkout without node_modules. No-op when ready.
+            bootstrap_worktree_deps(&existing.path).await;
             return Ok(vec![existing]);
         }
         // The dir was reclaimed (remove_direction_worktree) or replaced, but the row (and
@@ -249,9 +269,11 @@ pub async fn materialize_direction(
         }
         if changed {
             if let Some(updated) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
+                bootstrap_worktree_deps(&updated.path).await;
                 return Ok(vec![updated]);
             }
         }
+        bootstrap_worktree_deps(&existing.path).await;
         return Ok(vec![existing]);
     }
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
@@ -408,7 +430,10 @@ pub async fn materialize_direction(
     }
     .await;
     match finish {
-        Ok(rec) => Ok(vec![rec]),
+        Ok(rec) => {
+            bootstrap_worktree_deps(&rec.path).await;
+            Ok(vec![rec])
+        }
         Err(err) => {
             // Remove the checkout we own (created OR adopted as a crash orphan); delete the
             // branch ONLY if we own it — a pre-existing branch reused by the fallback must
