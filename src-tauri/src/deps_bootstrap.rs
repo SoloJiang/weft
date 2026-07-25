@@ -178,6 +178,31 @@ pub(crate) fn detect_package_manager(dir: &Path) -> Option<PackageManager> {
     }
 }
 
+
+/// True when at least one package.json dependency name exists under node_modules.
+/// Fallback readiness signal when a package manager leaves no integrity file.
+fn top_level_dep_present(dir: &Path, node_modules: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    for key in ["dependencies", "devDependencies", "optionalDependencies"] {
+        let Some(obj) = json.get(key).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for name in obj.keys() {
+            // Scoped packages live at node_modules/@scope/name
+            let path = node_modules.join(name);
+            if path.is_dir() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// True when the worktree already has a usable dependency install.
 pub(crate) fn node_modules_ready(dir: &Path) -> bool {
     let Some(pm) = detect_package_manager(dir) else {
@@ -202,20 +227,24 @@ pub(crate) fn node_modules_ready(dir: &Path) -> bool {
                             .unwrap_or(false)
                 }
         }
-        PackageManager::YarnClassic | PackageManager::Npm => {
+        PackageManager::YarnClassic => {
+            // Classic writes `.yarn-integrity` only after a successful install.
             let nm = dir.join("node_modules");
-            nm.is_dir()
-                && std::fs::read_dir(&nm)
-                    .map(|mut e| e.next().is_some())
-                    .unwrap_or(false)
+            nm.is_dir() && nm.join(".yarn-integrity").is_file()
+        }
+        PackageManager::Npm => {
+            // Modern npm writes `node_modules/.package-lock.json` on success.
+            // Without it, a partial tree (timeout mid-install) must not count as ready.
+            let nm = dir.join("node_modules");
+            nm.is_dir() && nm.join(".package-lock.json").is_file()
         }
         PackageManager::Bun => {
-            // Bun may use node_modules or (rarely) other layouts; require non-empty nm.
+            // Bun leaves `.bun` metadata under node_modules when install completes.
             let nm = dir.join("node_modules");
             nm.is_dir()
-                && std::fs::read_dir(&nm)
-                    .map(|mut e| e.next().is_some())
-                    .unwrap_or(false)
+                && (nm.join(".bun").exists()
+                    || nm.join(".package-lock.json").is_file()
+                    || top_level_dep_present(dir, &nm))
         }
     }
 }
@@ -244,13 +273,27 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
     // branches). Workers that need scripts can install themselves later.
     let (program, args) = match pm {
         PackageManager::Pnpm => {
+            // Containment: force modules + virtual store inside the worktree so a
+            // malicious .npmrc `modules-dir=../../../...` cannot write into the
+            // canonical repo. Also ignore pnpmfile hooks (they run JS even with
+            // --ignore-scripts).
             let mut args = vec![
                 "install".to_string(),
                 "--prefer-offline".to_string(),
                 "--ignore-scripts".to_string(),
+                "--ignore-pnpmfile".to_string(),
+                "--modules-dir".to_string(),
+                "node_modules".to_string(),
+                "--virtual-store-dir".to_string(),
+                "node_modules/.pnpm".to_string(),
             ];
+            // Immutable only: never rewrite the tracked lockfile from bootstrap.
             if dir.join("pnpm-lock.yaml").is_file() {
                 args.push("--frozen-lockfile".to_string());
+            } else {
+                // No lockfile: still avoid creating one in the worker checkout.
+                args.push("--lockfile".to_string());
+                args.push("false".to_string());
             }
             if cfg.pnpm_global_virtual_store {
                 env.push((
@@ -299,10 +342,14 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 )
             }
         }
-        PackageManager::Bun => (
-            "bun".to_string(),
-            vec!["install".to_string(), "--ignore-scripts".to_string()],
-        ),
+        PackageManager::Bun => {
+            let mut args = vec!["install".to_string(), "--ignore-scripts".to_string()];
+            // Without a lockfile, prevent bun.lock creation in the worker tree.
+            if !(dir.join("bun.lock").is_file() || dir.join("bun.lockb").is_file()) {
+                args.push("--no-save".to_string());
+            }
+            ("bun".to_string(), args)
+        }
     };
 
     Some(InstallPlan {
@@ -345,53 +392,19 @@ fn looks_like_frozen_lockfile_error(stderr: &[u8], stdout: &[u8]) -> bool {
         || combined.contains("err_pnpm_lockfile")
 }
 
-/// Run one install plan. Returns Ok(()) on success. On a frozen-lockfile-only
-/// failure for pnpm, retries once without `--frozen-lockfile` under the SAME
-/// overall deadline.
+/// Run one install plan. Immutable only — never rewrite lockfiles on failure.
 fn run_plan(plan: &InstallPlan, overall_timeout: Option<Duration>) -> Result<(), String> {
-    let started = Instant::now();
-    let first = run_command(plan, remaining(overall_timeout, started))?;
-    if first.status.success() {
+    let out = run_command(plan, overall_timeout)?;
+    if out.status.success() {
         return Ok(());
     }
-
-    let can_retry_unfrozen = plan.program == "pnpm"
-        && plan.args.iter().any(|a| a == "--frozen-lockfile")
-        && looks_like_frozen_lockfile_error(&first.stderr, &first.stdout);
-
-    if can_retry_unfrozen {
-        let mut retry = plan.clone();
-        retry.args.retain(|a| a != "--frozen-lockfile");
-        let second = run_command(&retry, remaining(overall_timeout, started))?;
-        if second.status.success() {
-            return Ok(());
-        }
-        return Err(format!(
-            "{} {} failed (retry without frozen-lockfile): exit {} — {}",
-            retry.program,
-            retry.args.join(" "),
-            second.status.code().unwrap_or(-1),
-            output_tail(&second.stderr, 400)
-        ));
-    }
-
     Err(format!(
         "{} {} failed: exit {} — {}",
         plan.program,
         plan.args.join(" "),
-        first.status.code().unwrap_or(-1),
-        output_tail(&first.stderr, 400)
+        out.status.code().unwrap_or(-1),
+        output_tail(&out.stderr, 400)
     ))
-}
-
-fn remaining(overall: Option<Duration>, started: Instant) -> Option<Duration> {
-    let limit = overall?;
-    let used = started.elapsed();
-    if used >= limit {
-        Some(Duration::from_millis(1))
-    } else {
-        Some(limit - used)
-    }
 }
 
 fn run_command(plan: &InstallPlan, timeout: Option<Duration>) -> Result<Output, String> {
@@ -638,13 +651,15 @@ mod tests {
     }
 
     #[test]
-    fn node_modules_ready_npm_needs_nonempty() {
+    fn node_modules_ready_npm_needs_package_lock_marker() {
         let d = tmp();
         write(&d, "package.json", "{}");
+        write(&d, "package-lock.json", "{}");
         assert!(!node_modules_ready(&d));
         std::fs::create_dir_all(d.join("node_modules")).unwrap();
-        assert!(!node_modules_ready(&d));
         write(&d, "node_modules/left-pad/package.json", "{}");
+        assert!(!node_modules_ready(&d), "partial tree without integrity is not ready");
+        write(&d, "node_modules/.package-lock.json", "{}");
         assert!(node_modules_ready(&d));
     }
 
@@ -669,6 +684,11 @@ mod tests {
         assert!(plan.args.iter().any(|a| a == "--prefer-offline"));
         assert!(plan.args.iter().any(|a| a == "--frozen-lockfile"));
         assert!(plan.args.iter().any(|a| a == "--ignore-scripts"));
+        assert!(plan.args.iter().any(|a| a == "--ignore-pnpmfile"));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--modules-dir" && w[1] == "node_modules"));
         assert!(plan
             .env
             .iter()
@@ -705,6 +725,16 @@ mod tests {
         assert_eq!(plan.program, "yarn");
         assert!(!plan.args.iter().any(|a| a == "--prefer-offline"));
         assert!(plan.args.iter().any(|a| a == "--mode=skip-build"));
+    }
+
+    #[test]
+    fn plan_install_bun_without_lock_uses_no_save() {
+        let d = tmp();
+        write(&d, "package.json", r#"{ "packageManager": "bun@1.2.0" }"#);
+        let plan = plan_install_with(&d, &test_cfg(true, false)).expect("plan");
+        assert_eq!(plan.program, "bun");
+        assert!(plan.args.iter().any(|a| a == "--no-save"));
+        assert!(plan.args.iter().any(|a| a == "--ignore-scripts"));
     }
 
     #[test]
