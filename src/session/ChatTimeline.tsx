@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useTranslation } from "react-i18next";
-import { ArrowRight, Check, Copy, Sparkles, Undo2 } from "lucide-react";
+import { ArrowRight, Check, CheckCheck, Copy, Sparkles, Undo2, type LucideIcon } from "lucide-react";
 import type { LeadMessage, PermissionAsk, QueuedItem, ResolvedProposal } from "../lib/types";
+import { receiptStateOf, type ReceiptState } from "../state/leadSnapshot";
 import { Markdown, STREAM_CARET_CLASS } from "../components/Markdown";
 import { QueueStack } from "./QueueStack";
 import {
@@ -489,6 +490,56 @@ function isLatestProposal(m: LeadMessage, all: LeadMessage[]): boolean {
   return false;
 }
 
+// A delivery receipt (issue #94) is only worth showing while it's the newest
+// information on screen: once a later row exists — a reply, a tool call, even
+// a newer user send — that row is louder proof of what happened than a stale
+// "delivered"/"processing" tag left on an old bubble. `all` is already the
+// filtered, meta/queued-free `visible` list, so "last row" means "last VISIBLE
+// row" — exactly the reader's current view of the conversation's tip.
+function isTail(m: LeadMessage, all: LeadMessage[]): boolean {
+  return all.length > 0 && all[all.length - 1].id === m.id;
+}
+
+// Single source of truth for the receipt's visuals — one Record per concern
+// (icon, copy, color) keyed by the SAME ReceiptState `receiptStateOf` derives,
+// so a new state is a compile error here until every map handles it (no
+// re-derived booleans, no nested ternaries).
+const RECEIPT_ICON: Record<ReceiptState, LucideIcon | null> = {
+  delivered: Check,
+  consumed: CheckCheck,
+  interrupted: null,
+  error: null,
+};
+const RECEIPT_LABEL_KEYS: Record<ReceiptState, string> = {
+  delivered: "lead.receiptDelivered",
+  consumed: "lead.receiptConsumed",
+  interrupted: "lead.interrupted",
+  error: "lead.errored",
+};
+const RECEIPT_CLASS: Record<ReceiptState, string> = {
+  delivered: "text-ink-faint",
+  consumed: "text-ink-faint",
+  interrupted: "text-waiting",
+  error: "text-danger",
+};
+
+/** The line under a sent message: "message never reached the agent" (error /
+ *  interrupted — always shown, permanent history) vs "reached it, here's
+ *  where it stands" (delivered / consumed — shown only at the timeline's
+ *  tail, see `isTail`). Distinguishing these at a glance is the point of
+ *  issue #94: a stuck "delivered" forever reads very differently from a
+ *  silently vanished send. */
+function ReceiptLine({ state }: { state: ReceiptState }) {
+  const { t } = useTranslation();
+  const Icon = RECEIPT_ICON[state];
+  return (
+    <p className={cn("flex items-center gap-1 self-end text-[11px]", RECEIPT_CLASS[state])}>
+      {Icon && <Icon size={11} />}
+      {t(RECEIPT_LABEL_KEYS[state])}
+    </p>
+  );
+}
+
 function TimelineRow({
   m,
   all,
@@ -785,6 +836,14 @@ function TimelineRow({
     const images = stringArray(c.images);
     const files = stringArray(c.files);
     const text = String(c.text ?? "");
+    // Delivery receipt (issue #94): error/interrupted are permanent history —
+    // the send genuinely never landed, so that stays visible forever. Delivered
+    // /consumed are transient — only worth a line while this is still the
+    // newest thing on screen (see isTail); once a reply (or a newer send)
+    // exists, IT is the live proof and the old receipt would just be noise.
+    const receipt = receiptStateOf(m);
+    const showReceipt =
+      receipt === "error" || receipt === "interrupted" || (receipt != null && isTail(m, all));
     return (
       <Message role="user">
         <div className="flex max-w-[72%] flex-col gap-2 rounded-[var(--radius-lg)] border border-brand/25 bg-brand-ghost px-3.5 py-2.5">
@@ -816,9 +875,7 @@ function TimelineRow({
               {text}
             </p>
           )}
-          {m.status === "error" && (
-            <p className="self-end text-[11px] text-danger">{t("lead.errored")}</p>
-          )}
+          {showReceipt && receipt && <ReceiptLine state={receipt} />}
         </div>
         {text && (
           <MessageActionsRow align="end">
