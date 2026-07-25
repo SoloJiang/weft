@@ -505,15 +505,23 @@ pub fn instance_owner_counts() -> Vec<OwnerCount> {
         .collect()
 }
 
-/// 本实例 owned 子树(见 [`instance_pids`])的常驻内存(RSS)合计,单位字节。逐 pid
-/// 走 fork-free 的平台 syscall(macOS `proc_pidinfo` / Linux `/proc/<pid>/status`),
-/// 单个 pid 读失败(已退出等)按 0 计入合计,不让整体求和因单点失败而报废——与
-/// `count_instance_processes` 同样的「尽力而为」哲学。`None` 仅在平台没有 fork-free
-/// 枚举时出现(与 [`instance_pids`] 同一条件);真实测得「当前 0 个 owned 进程」时是
-/// `Some(0)`,不是 `None`——调用方不应把两者混为一谈。
+/// 本实例 owned 子树(见 [`instance_pids`])**加上 Weft 自身**的常驻内存(RSS)合计,
+/// 单位字节。逐 pid 走 fork-free 的平台 syscall(macOS `proc_pidinfo` / Linux
+/// `/proc/<pid>/status`),单个 pid 读失败(已退出等)按 0 计入合计,不让整体求和因
+/// 单点失败而报废——与 `count_instance_processes` 同样的「尽力而为」哲学。`None` 仅
+/// 在平台没有 fork-free 枚举时出现(与 [`instance_pids`] 同一条件);真实测得「当前
+/// 0 个 owned 子进程」时是 `Some(自身 RSS)`,不是 `None` 也不是 `Some(0)`——调用方
+/// 不应把三者混为一谈。
+///
+/// 故意**不**把 `std::process::id()` 塞进 [`instance_pids`] 本身:那份列表还喂给
+/// [`instance_group_ids`] 的 T2 崩溃兜底(下次启动按 pgid `kill_group`),把 Weft 自己
+/// 的 pid/pgid 混进去是危险的口径污染;这里只在内存求和这一步单独加一项自身读数,
+/// [`instance_pids`] 与 [`count_instance_processes`] 的既有口径(仅后代闭包)不变。
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn instance_memory_bytes() -> Option<u64> {
-    Some(instance_pids().iter().filter_map(|&pid| proc_resident_bytes(pid)).sum())
+    let subtree: u64 = instance_pids().iter().filter_map(|&pid| proc_resident_bytes(pid)).sum();
+    let own = proc_resident_bytes(std::process::id() as i32).unwrap_or(0);
+    Some(subtree + own)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -547,8 +555,14 @@ pub fn instance_usage() -> InstanceUsage {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let pids = instance_pids();
-        let memory_bytes = pids.iter().filter_map(|&pid| proc_resident_bytes(pid)).sum();
-        InstanceUsage { process_count: pids.len(), memory_bytes: Some(memory_bytes) }
+        // process_count stays the subtree-only count ([`count_instance_processes`]'s
+        // existing contract, and what `instance_group_ids`'s T2 crash-fallback pgid
+        // sweep implicitly relies on `instance_pids` never including Weft's own pid).
+        // memory_bytes additionally folds in Weft's own RSS — see
+        // [`instance_memory_bytes`]'s doc for why that addition is memory-only.
+        let subtree: u64 = pids.iter().filter_map(|&pid| proc_resident_bytes(pid)).sum();
+        let own = proc_resident_bytes(std::process::id() as i32).unwrap_or(0);
+        InstanceUsage { process_count: pids.len(), memory_bytes: Some(subtree + own) }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -616,23 +630,30 @@ fn proc_resident_bytes(pid: i32) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn all_pids() -> Vec<i32> {
-    // SAFETY: 先以 NULL 探需要的字节数,再按容量取全量;返回值为写入字节数。
+    // SAFETY: 先以 NULL 探当前 pid 个数,再按容量取全量;buffersize 实参是字节数,
+    // 但**返回值是 pid 个数,不是字节数**——`proc_listallpids` 包装了底层按字节计的
+    // `proc_listpids`,内部已经 `/ sizeof(int)` 过一次才返回(Apple 开源 Libc
+    // libsyscall/wrappers/libproc/libproc.c:`numpids = proc_listpids(...); return
+    // numpids / sizeof(int);`,probe 调用与实取调用同一套逻辑)。之前这里又拿返回值
+    // 除了一次 `size_of::<i32>()`,相当于把一个已经是「个数」的值当「字节数」二次
+    // 折半再折半——四条里丢三条,新起的高 pid agent 尤其容易被截掉;这里改成直接把
+    // 返回值当 pid 个数用,只在 SIZE 实参上保留字节单位。
     unsafe {
-        let need_bytes = libc::proc_listallpids(std::ptr::null_mut(), 0);
-        if need_bytes <= 0 {
+        let need = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if need <= 0 {
             return Vec::new();
         }
-        // proc_listallpids 返回「字节数」;pid 为 i32。宽松扩容防两次调用间进程增长。
-        let cap = (need_bytes as usize) / std::mem::size_of::<i32>() + 1024;
+        // 宽松扩容防两次调用间进程增长。
+        let cap = (need as usize) + 1024;
         let mut buf = vec![0i32; cap];
-        let got_bytes = libc::proc_listallpids(
+        let got = libc::proc_listallpids(
             buf.as_mut_ptr() as *mut libc::c_void,
             (cap * std::mem::size_of::<i32>()) as libc::c_int,
         );
-        if got_bytes <= 0 {
+        if got <= 0 {
             return Vec::new();
         }
-        let count = ((got_bytes as usize) / std::mem::size_of::<i32>()).min(cap);
+        let count = (got as usize).min(cap);
         buf.truncate(count);
         buf.retain(|&p| p > 0);
         buf
@@ -910,6 +931,37 @@ mod tests {
             "count_instance_processes must be exactly filter(is_ours) — the single criterion"
         );
         reap(&mut child, &reg).await;
+    }
+
+    /// Regression guard for the `proc_listallpids` return-value bug (Codex review,
+    /// PR #131): the wrapper's return is a **pid count**, not a byte count — dividing
+    /// it by `size_of::<i32>()` again (as the old code did) kept only ~1/4 of the true
+    /// pid list. The test process's own pid is trivially alive for the entire
+    /// duration of this call, so a correct full-table scan must always find it;
+    /// under the old bug it would be silently dropped whenever it fell outside
+    /// whatever quarter of the kernel's fill order survived the bogus truncation.
+    #[test]
+    fn all_pids_includes_the_test_process_itself() {
+        let me = std::process::id() as i32;
+        let pids = all_pids();
+        assert!(
+            pids.contains(&me),
+            "a correct full-table scan must include the caller's own live pid; got {} pids, self ({me}) missing",
+            pids.len()
+        );
+    }
+
+    /// Regression guard (Codex review, PR #131): the memory total must include
+    /// Weft's OWN resident memory, not only its owned subtree's — the subtree can
+    /// genuinely be empty (no agent running right now), and reporting 0 B in that
+    /// case contradicted the dashboard's "this app plus every agent it spawned"
+    /// copy. Doesn't need `test_guard`: it only asserts a floor from Weft's own
+    /// always-positive RSS, which the unconditional own-pid addend guarantees
+    /// regardless of what other tests concurrently register.
+    #[test]
+    fn instance_memory_bytes_includes_self_even_with_empty_subtree() {
+        let bytes = instance_memory_bytes().expect("macos/linux always sample RSS");
+        assert!(bytes > 0, "must include Weft's own resident memory even with no owned subtree");
     }
 
     /// 最安全关键的守卫:`kill_group` **绝不**给进程组 0(调用者自己的组)、1(init)或

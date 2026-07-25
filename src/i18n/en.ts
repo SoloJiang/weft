@@ -807,7 +807,7 @@ export const en = {
     groupSystem: "System",
     resources: "Resources",
     resourcesHint:
-      "A read-only view of what Weft itself is using on this machine right now — process count, memory, and session concurrency. Sampling lives in the process-tree safety net; this page only displays it.",
+      "A read-only view of process pressure on this machine right now: system-wide process headroom, and what Weft's own process tree, memory, and session concurrency are using. Sampling lives in the process-tree safety net; this page only displays it.",
     resourcesStale: "Refresh failed — showing the last known values.",
     resourcesLoadFailed: "Refresh failed — no data loaded yet.",
     resourcesQuotaGroup: "Process quota",
@@ -833,7 +833,7 @@ export const en = {
       "Resident memory used by Weft's own process tree (this app plus every agent / MCP process it spawned) — not your whole machine's memory.",
     resourcesSessionsGroup: "Concurrent sessions",
     resourcesSessionsLabel: "{{active}} / {{max}} active slots",
-    resourcesSessionsFull: "Full · queuing",
+    resourcesSessionsFull: "Full",
     resourcesSessionsHint:
       "New sessions beyond this limit wait in a queue instead of being rejected.",
   },

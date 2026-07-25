@@ -61,6 +61,17 @@ import type {
 
 export type HomeTab = "board" | "repos" | "settings";
 export type ThreadTab = "lead" | "board";
+/** Settings nav destinations (mirrors `nav/SettingsDialog.tsx`'s own list —
+ *  that file imports this type rather than redeclaring it, so the two can't
+ *  drift). */
+export type SettingsPage =
+  | "general"
+  | "appearance"
+  | "automation"
+  | "skills"
+  | "im"
+  | "backup"
+  | "resources";
 
 export interface OpenSession {
   info: SessionInfo;
@@ -318,10 +329,19 @@ interface Store {
   /** Which workspace-home tab is active (Board · Repos). */
   homeTab: HomeTab;
   setHomeTab: (t: HomeTab) => void;
-  /** Switch to Settings, snapshotting the current view so closeSettings can restore it. */
-  openSettings: () => void;
+  /** Switch to Settings, snapshotting the current view so closeSettings can restore it.
+   *  `page`, when given, is where SettingsScreen should land instead of its "general"
+   *  default (e.g. the quota banner's "View details" jumping straight to Resources) —
+   *  see `settingsInitialPage`. */
+  openSettings: (page?: SettingsPage) => void;
   /** Leave Settings and restore the view that was active when openSettings ran. */
   closeSettings: () => void;
+  /** One-shot landing page for the settings screen currently being opened — set by
+   *  `openSettings(page)`, read by SettingsScreen's initial nav selection, then
+   *  cleared via `clearSettingsInitialPage` so it never leaks into a later plain
+   *  `openSettings()` call (e.g. from the nav rail's gear icon). */
+  settingsInitialPage: SettingsPage | null;
+  clearSettingsInitialPage: () => void;
   /** Jump to the workspace home's Repos tab. */
   openRepoMap: () => void;
   refreshRepoMap: () => Promise<void>;
@@ -547,6 +567,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [repoEdges, setRepoEdges] = useState<RepoEdge[]>([]);
   const [repoAnalysisActive, setRepoAnalysisActive] = useState(false);
   const [homeTab, setHomeTab] = useState<HomeTab>("board");
+  const [settingsInitialPage, setSettingsInitialPage] = useState<SettingsPage | null>(null);
   const [curatorThreadId, setCuratorThreadId] = useState<number | null>(null);
   const [repoDrawerOpen, setRepoDrawerOpen] = useState(false);
   const [repoDrawerTab, setRepoDrawerTabState] = useState<"detail" | "curator">("detail");
@@ -912,20 +933,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setThreadTab("lead");
   }, []);
 
-  const openSettings = useCallback(() => {
-    // Snapshot first — once we flip homeTab + clear thread/viewing the
-    // info is gone and the back arrow can't restore it.
-    prevHomeRef.current = {
-      homeTab,
-      activeThreadId,
-      viewing,
-      showNeeds,
-    };
-    setActiveThreadId(null);
-    setViewing(null);
-    setShowNeeds(false);
-    setHomeTab("settings");
-  }, [homeTab, activeThreadId, viewing, showNeeds]);
+  const openSettings = useCallback(
+    (page?: SettingsPage) => {
+      // Snapshot first — once we flip homeTab + clear thread/viewing the
+      // info is gone and the back arrow can't restore it.
+      prevHomeRef.current = {
+        homeTab,
+        activeThreadId,
+        viewing,
+        showNeeds,
+      };
+      setActiveThreadId(null);
+      setViewing(null);
+      setShowNeeds(false);
+      setSettingsInitialPage(page ?? null);
+      setHomeTab("settings");
+    },
+    [homeTab, activeThreadId, viewing, showNeeds],
+  );
+
+  const clearSettingsInitialPage = useCallback(() => {
+    setSettingsInitialPage(null);
+  }, []);
 
   const closeSettings = useCallback(() => {
     const prev = prevHomeRef.current;
@@ -2823,6 +2852,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setHomeTab,
     openSettings,
     closeSettings,
+    settingsInitialPage,
+    clearSettingsInitialPage,
     openRepoMap,
     refreshRepoMap,
     refreshReposAndMap,

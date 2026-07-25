@@ -39,17 +39,8 @@ import {
   openSystemNotificationSettings,
   type NotifyPermission,
 } from "../lib/notifications";
-import { useStore } from "../state/store";
+import { useStore, type SettingsPage } from "../state/store";
 import { useTheme, type ThemePref } from "../state/theme";
-
-type SettingsPage =
-  | "general"
-  | "appearance"
-  | "automation"
-  | "skills"
-  | "im"
-  | "backup"
-  | "resources";
 
 type NavItem = {
   id: SettingsPage;
@@ -85,8 +76,17 @@ const NAV_GROUPS: { labelKey: string; items: NavItem[] }[] = [
 
 export function SettingsScreen() {
   const { t } = useTranslation();
-  const { closeSettings } = useStore();
-  const [active, setActive] = useState<SettingsPage>("general");
+  const { closeSettings, settingsInitialPage, clearSettingsInitialPage } = useStore();
+  // Seeded once from the store's one-shot request (e.g. the quota banner's "View
+  // details" landing on Resources instead of General) — captured at mount, not
+  // subscribed, so navigating within an already-open Settings never gets yanked
+  // back by a stale request. Consumed immediately after so the NEXT openSettings()
+  // (e.g. the nav rail's plain gear icon) isn't stuck reusing this destination.
+  const [active, setActive] = useState<SettingsPage>(() => settingsInitialPage ?? "general");
+  useEffect(() => {
+    clearSettingsInitialPage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [query, setQuery] = useState("");
 
   const groups = useMemo(() => {

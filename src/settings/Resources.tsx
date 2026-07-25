@@ -6,6 +6,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { needsBarMotion } from "../lib/motion";
+import { shouldApplyProcessQuotaStatus } from "../lib/processQuota";
 import type {
   ProcessQuotaLevel,
   ProcessQuotaStatus,
@@ -41,6 +42,24 @@ const SNAPSHOT_HINT_KEY: Record<Exclude<SnapshotHint, "none">, string> = {
   staleNoData: "settings.resourcesLoadFailed",
 };
 
+/** Reconcile a freshly-polled snapshot with whatever is currently displayed.
+ *  Every OTHER field is a plain point-in-time reading, so the poll always wins
+ *  there — but `quota` also arrives out-of-band via the `process-quota://changed`
+ *  push event, which can land BETWEEN this poll capturing its quota and its
+ *  process/RSS scan finishing (the governor transitioning mid-poll). Keep
+ *  whichever quota reading is actually newer (by `transitionSeq`, the same
+ *  guard `state/store.tsx`'s `applyProcessQuota` uses) instead of letting the
+ *  poll unconditionally clobber a fresher pushed event. */
+function mergeDashboardSnapshot(
+  prev: ResourceDashboardSnapshot | null,
+  next: ResourceDashboardSnapshot,
+): ResourceDashboardSnapshot {
+  if (prev && !shouldApplyProcessQuotaStatus(prev.quota, next.quota)) {
+    return { ...next, quota: prev.quota };
+  }
+  return next;
+}
+
 /** Settings → Resources: read-only local-runtime dashboard (issue #112). Polls
  *  the combined snapshot while mounted and layers the existing
  *  `process-quota://changed` push event on top so a warn/degrade transition
@@ -56,18 +75,19 @@ export function ResourcesSettings() {
 
   useEffect(() => {
     let alive = true;
-    let seq = 0;
     let consecutiveFailures = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Self-rescheduling instead of setInterval: the next poll is queued only
+    // once this one SETTLES, so a scan slower than POLL_MS (a large process
+    // tree — exactly the case this page exists to diagnose) simply runs back
+    // to back instead of piling up concurrent invokes that outrace each other.
     const poll = () => {
-      const mySeq = ++seq;
       void api
         .resourceDashboardSnapshot()
         .then((next) => {
-          // A newer poll (or the unmount cleanup) may have already landed;
-          // never let a slow, out-of-order response regress the display.
-          if (!alive || mySeq !== seq) return;
+          if (!alive) return;
           consecutiveFailures = 0;
-          setSnapshot(next);
+          setSnapshot((prev) => mergeDashboardSnapshot(prev, next));
           setStale(false);
         })
         .catch(() => {
@@ -76,22 +96,28 @@ export function ResourcesSettings() {
           // STALE_AFTER_CONSECUTIVE_FAILURES misses in a row does the panel
           // admit the data might be old — self-clears the instant a poll
           // succeeds again, so it never lingers past the problem.
-          if (!alive || mySeq !== seq) return;
+          if (!alive) return;
           consecutiveFailures += 1;
           if (consecutiveFailures >= STALE_AFTER_CONSECUTIVE_FAILURES) {
             setStale(true);
           }
+        })
+        .finally(() => {
+          if (!alive) return;
+          timer = setTimeout(poll, POLL_MS);
         });
     };
     poll();
-    const id = setInterval(poll, POLL_MS);
     const unlistenPromise = listen<ProcessQuotaStatus>("process-quota://changed", (event) => {
       if (!alive) return;
-      setSnapshot((prev) => (prev ? { ...prev, quota: event.payload } : prev));
+      setSnapshot((prev) => {
+        if (!prev || !shouldApplyProcessQuotaStatus(prev.quota, event.payload)) return prev;
+        return { ...prev, quota: event.payload };
+      });
     });
     return () => {
       alive = false;
-      clearInterval(id);
+      if (timer !== undefined) clearTimeout(timer);
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
@@ -251,7 +277,22 @@ function ThresholdTick({ percent }: { percent: number }) {
 
 // ── 进程树:Weft owned 子树的构成(纯信息展示,无危险配色) ─────────────────────
 
-const OWNER_LABEL_KEY: Record<string, string> = {
+// Mirrors proc_registry.rs's `owner_kinds!` macro tag-for-tag (backend `OwnerKind::as_str()`
+// literals). Typed as a closed union — not `Record<string, string>` — so a new backend
+// variant is a COMPILE error here until its localized label is added, instead of silently
+// falling through to `ownerLabel`'s raw-tag fallback (which would leak an untranslated
+// snake_case tag into, among other places, the Chinese UI).
+type OwnerKindTag =
+  | "global_app_server"
+  | "session"
+  | "lead_thread"
+  | "curator"
+  | "opencode"
+  | "preview"
+  | "probe"
+  | "other";
+
+const OWNER_LABEL_KEY: Record<OwnerKindTag, string> = {
   global_app_server: "settings.resourcesOwnerGlobalAppServer",
   session: "settings.resourcesOwnerSession",
   lead_thread: "settings.resourcesOwnerLeadThread",
@@ -262,9 +303,16 @@ const OWNER_LABEL_KEY: Record<string, string> = {
   other: "settings.resourcesOwnerOther",
 };
 
+function isOwnerKindTag(kind: string): kind is OwnerKindTag {
+  return kind in OWNER_LABEL_KEY;
+}
+
+// `kind` crosses the Tauri IPC boundary as a plain string, so — unlike a value already
+// typed to a frontend union — a runtime narrowing check is unavoidable here; a genuinely
+// unknown tag (older frontend talking to a newer backend that added a variant) still
+// degrades to the raw tag rather than crashing.
 function ownerLabel(kind: string, t: TFunction): string {
-  const key = OWNER_LABEL_KEY[kind];
-  return key ? t(key) : kind;
+  return isOwnerKindTag(kind) ? t(OWNER_LABEL_KEY[kind]) : kind;
 }
 
 function ProcessTree({

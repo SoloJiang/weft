@@ -34,21 +34,31 @@ pub struct ResourceDashboardSnapshot {
 }
 
 #[tauri::command]
-pub fn resource_dashboard_snapshot(
+pub async fn resource_dashboard_snapshot(
     governor: tauri::State<'_, crate::process_quota::ProcessQuotaGovernor>,
-) -> ResourceDashboardSnapshot {
+) -> Result<ResourceDashboardSnapshot, String> {
     let (active_sessions, max_sessions) = crate::session_gate::active_session_slots();
+    let quota = governor.snapshot();
+    let by_owner = crate::proc_registry::instance_owner_counts();
     // Single-scan: count + memory both derive from one `instance_pids()` snapshot
     // instead of each independently re-walking the full process table (see
     // `proc_registry::instance_usage`'s doc — this poll tick is exactly the
-    // per-second-polling case `instance_pids` warned would need it).
-    let usage = crate::proc_registry::instance_usage();
-    ResourceDashboardSnapshot {
-        quota: governor.snapshot(),
+    // per-second-polling case `instance_pids` warned would need it). The scan
+    // itself enumerates every live pid and walks an ancestor chain per pid — real
+    // syscall work that scales with total processes on the box, not just Weft's
+    // own subtree — so it runs on a blocking-pool thread rather than inline on
+    // this async command, which otherwise shares the WebView's IPC-handling task
+    // with every other command (this page polls every 3s; a stall here would
+    // stall unrelated commands issued while it runs).
+    let usage = tokio::task::spawn_blocking(crate::proc_registry::instance_usage)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(ResourceDashboardSnapshot {
+        quota,
         instance_process_count: usage.process_count as u64,
         instance_memory_bytes: usage.memory_bytes,
-        by_owner: crate::proc_registry::instance_owner_counts(),
+        by_owner,
         active_sessions: active_sessions as u64,
         max_sessions: max_sessions as u64,
-    }
+    })
 }

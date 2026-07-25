@@ -784,7 +784,7 @@ export const zh = {
     groupSystem: "系统",
     resources: "运行时资源",
     resourcesHint:
-      "只读展示 Weft 自身在这台机器上的当前占用——进程数、内存、并发会话槽位。采样本身由进程树安全网完成，这个页面只负责展示。",
+      "只读展示这台机器当前的进程压力：既有全系统的进程配额空间，也有 Weft 自身进程树、内存和并发会话槽位的占用。采样本身由进程树安全网完成，这个页面只负责展示。",
     resourcesStale: "刷新失败，当前展示的是最近一次读到的数据。",
     resourcesLoadFailed: "刷新失败，目前还没有取到任何数据。",
     resourcesQuotaGroup: "进程配额",
@@ -809,7 +809,7 @@ export const zh = {
       "Weft 自身进程树（本体 + 它派生的全部 agent / MCP 进程）占用的常驻内存，不是整机内存。",
     resourcesSessionsGroup: "并发会话",
     resourcesSessionsLabel: "{{active}} / {{max}} 个活跃槽位",
-    resourcesSessionsFull: "已满 · 排队中",
+    resourcesSessionsFull: "已满",
     resourcesSessionsHint: "超过上限的新会话会排队等待，不会被拒绝。",
   },
   danger: {
