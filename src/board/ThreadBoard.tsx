@@ -256,9 +256,19 @@ function DirectionCard({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-start gap-2">
-            <div className="min-w-0 flex-1 break-words text-[13px] font-semibold leading-snug text-ink">
+            {/* The card's own name is the most prominent worker reference on
+                it — one click lands on its timeline, same target + resolution
+                as the primary action button below (reused, not reimplemented).
+                No live worktree yet → same disabled state as that button. */}
+            <button
+              type="button"
+              disabled={!firstWrite}
+              title={firstWrite ? t("thread.openSession") : t("thread.noWriteCopy")}
+              onClick={() => firstWrite && viewDirection(direction.id, firstWrite.repo_id)}
+              className="block min-w-0 flex-1 break-words text-left text-[13px] font-semibold leading-snug text-ink transition-colors hover:text-brand disabled:cursor-default disabled:pointer-events-none"
+            >
               {direction.name}
-            </div>
+            </button>
             <div className="flex shrink-0 items-center gap-1">
               {hasNeed && (
                 <button

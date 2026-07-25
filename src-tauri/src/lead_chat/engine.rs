@@ -4179,6 +4179,90 @@ fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<
     })
 }
 
+/// Outcome of [`take_frozen_turn`]'s atomic re-validation (review round 4,
+/// P1). See that function's doc for the race this closes.
+enum FreezeClaim {
+    /// The turn already moved on since the freeze verdict was computed — it
+    /// ended cleanly, or advanced to a NEWER turn (`codex_consumer`'s flush
+    /// branch, this file ~L3180, starting one on the SAME shared connection)
+    /// while `interrupt()`'s up-to-~120s RPC wait was in flight. The caller
+    /// owns NOTHING here and must skip every downstream action: no
+    /// connection drop, no native-id clear, no marker, no user notice.
+    /// Acting anyway is the review round 4 P1 bug — an earlier version took
+    /// + shut down the connection unconditionally, severing the NEWER turn's
+    /// live transport out from under it and leaving that turn permanently
+    /// `busy` with no client left to ever finish or clean it up.
+    Stale,
+    /// Still the SAME turn as of this check: this call exclusively owns
+    /// whatever cleanup follows. `Some` only for the app-server dialect — a
+    /// live `codex_client` was taken and its turn state reset by hand (see
+    /// [`reset_frozen_appserver_turn`] for why that hand-reset is necessary
+    /// once the connection is severed). `None` for every other dialect (claude
+    /// resident / codex-exec / opencode): `interrupt()` already killed their
+    /// child, and THEIR OWN reader task resets turn state once it observes
+    /// EOF (guarded by its own `generation` check, independent of this
+    /// function) — resetting it again here would race that cleanup, so this
+    /// deliberately leaves it alone.
+    Owned(Option<(crate::codex_app_server::Client, FrozenTurnDrain)>),
+}
+
+/// Re-confirm turn ownership AND (app-server dialect) take the live client,
+/// atomically under ONE lock acquisition (review round 4, P1). An earlier
+/// version of `recover_from_freeze` checked turn_id+busy inside
+/// `reset_frozen_appserver_turn`'s own guard, but took `codex_client` in a
+/// SEPARATE, EARLIER lock acquisition — first `{ eng.lock().await
+/// .codex_client.take() }`, THEN (after `.shutdown()`) a second `{
+/// eng.lock().await; reset_frozen_appserver_turn(...) }`. Between those two
+/// locks — indeed across the whole up-to-~120s `interrupt()` wait that
+/// precedes both — `codex_consumer`'s flush branch (this file, ~L3180) can
+/// observe a clean `TurnEnd` for the frozen turn and `start_turn` a NEW one
+/// on the SAME shared connection (`codex_client` is never reassigned by that
+/// path, and `busy` stays true). The first lock would then take the
+/// connection that's now serving the NEWER turn; `shutdown()` severs it out
+/// from under that turn; the second lock's guard correctly refuses to touch
+/// the newer turn's in-memory state (turn_id no longer matches) — but
+/// nothing undoes the disconnect that already happened. The newer turn is
+/// left permanently `busy` with a dead client: `codex_consumer`'s own
+/// `still_active` check (~L3345) also reads false once `codex_client` is
+/// gone, so it skips its OWN disconnect cleanup too — nothing short of the
+/// runaway idle cap ever resets that turn again, and the freeze watchdog can
+/// never re-fire for this engine (`freeze_handled` only clears on `Idle`).
+///
+/// Folding the check and the take into ONE synchronous critical section (no
+/// `.await` between them, no re-lock) closes the window: either
+/// `inner.turn_id`/`busy` still match RIGHT UP TO the moment `codex_client`
+/// is taken — in which case no concurrent flush could have started a newer
+/// turn on it — or they don't, in which case nothing is taken and this
+/// reports [`FreezeClaim::Stale`]. This also sidesteps the OLD code's
+/// deadlock trap by construction rather than by care: `if let Some(c) =
+/// eng.lock().await.codex_client.take() { /* a fresh eng.lock().await HERE
+/// self-deadlocks */ }` extends the temporary `MutexGuard`'s scope over the
+/// whole if-let body (Rust's temporary-lifetime-extension for an `if let`
+/// scrutinee) — this function never needs a second lock at all, since the
+/// reset runs through the SAME `&mut EngineInner` the guard just checked.
+async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
+    let mut inner = eng.lock().await;
+    if inner.turn_id != turn_id || !inner.turn.busy {
+        return FreezeClaim::Stale;
+    }
+    let client = inner.codex_client.take();
+    // `reset_frozen_appserver_turn` re-checks the SAME turn_id+busy guard
+    // just checked above — redundant in practice (this function holds ONE
+    // continuous `&mut` borrow with no `.await` in between the two checks,
+    // so nothing could have changed `inner`) but deliberately NOT asserted
+    // away with `.expect()`/`.unwrap()` (this crate's production paths ban
+    // both — see CLAUDE.md): reusing the guarded function as-is and letting
+    // `and_then`/`map` degrade a theoretically-unreachable mismatch to
+    // "nothing taken" keeps this provably panic-free, not just
+    // panic-free-by-inspection. `and_then` also means a `None` client
+    // (every non-app-server dialect) short-circuits without ever calling
+    // the reset — see [`FreezeClaim::Owned`] for why that dialect must NOT
+    // have its state reset here.
+    let taken = client
+        .and_then(|c| reset_frozen_appserver_turn(&mut inner, turn_id).map(|drain| (c, drain)));
+    FreezeClaim::Owned(taken)
+}
+
 /// Re-confirm and execute the turn-freeze auto-recovery (issue #93). The
 /// sweep's verdict was computed under a lock already dropped, so this re-runs
 /// the FULL check (busy + silent past `freeze_secs` + not legitimately blocked
@@ -4191,40 +4275,44 @@ fn reset_frozen_appserver_turn(inner: &mut EngineInner, turn_id: i32) -> Option<
 ///      Called INLINE (this fn is itself dispatched off the sweep loop as an
 ///      independent task — see the caller) so its up-to-~120s worst case
 ///      (codex app-server's `interrupt` RPC) never blocks other engines.
-///   2. For codex app-server: force-drop `codex_client` (review round 1,
-///      P1-b). `interrupt()`'s app-server branch may have hit `request()`'s
-///      reply timeout WITHOUT tearing the connection down (codex_app_server.rs
-///      only drops the pending-map entry on that path, not the connection —
-///      see `request`), so `is_alive()` (which only checks the handle is
-///      populated, not real liveness) would still call it live. That is
-///      EXACTLY the scenario this feature targets: the app-server's own demux
-///      read_loop stuck in an unbounded read. Mirrors `stop_quiet`'s kill path
-///      (`codex_client.take()` + `shutdown()`) so the next send reconnects
-///      fresh instead of reusing a connection `is_alive()` would wrongly
-///      trust. No-op for every non-app-server dialect (client is already
-///      `None`). Severing the connection here also makes `codex_consumer`'s
-///      OWN disconnect cleanup skip itself (review round 2, P1 — its
-///      `still_active` check reads false once `codex_client` is gone), so
-///      right after the drop this step resets the turn by hand under a fresh
-///      lock — see [`reset_frozen_appserver_turn`] — and finalizes whatever
-///      the frozen turn left open (current/streaming rows, tool calls, queued
-///      follow-ups) as `interrupted`.
+///   2. [`take_frozen_turn`] — re-confirms turn_id+busy STILL match (a fresh
+///      check, after the up-to-~120s wait above) and, ATOMICALLY with that
+///      check (review round 4, P1 — see that function's doc for the race
+///      this closes), takes the app-server `codex_client` (review round 1,
+///      P1-b) if this is that dialect. `is_alive()` (which only checks the
+///      handle is populated, not real liveness) would otherwise still call a
+///      wedged connection live; taking + shutting it down here forces the
+///      next send to reconnect fresh, mirroring `stop_quiet`'s kill path.
+///      Severing the connection also makes `codex_consumer`'s OWN disconnect
+///      cleanup skip itself (review round 2, P1 — its `still_active` check
+///      reads false once `codex_client` is gone), so `take_frozen_turn`
+///      resets the turn by hand in the SAME step — see
+///      [`reset_frozen_appserver_turn`] — finalizing whatever the frozen
+///      turn left open (current/streaming rows, tool calls, queued
+///      follow-ups) as `interrupted` below. A `Stale` claim means the turn
+///      already resolved itself during the wait: steps 3-5 below must NOT
+///      run — see [`FreezeClaim`].
 ///   3. Clear the native session id, so the NEXT send opens a brand-new native
 ///      session instead of resuming one whose transport may still be wedged
 ///      (mirrors the "no native id ⇒ fresh session next send" contract
 ///      `rewind` already ships).
 ///   4. Stamp a `turn_freeze_recovered` marker (`repo::mark_turn_freeze_recovered`)
-///      — the issue #116 (idle re-drive) coordination point: its `created_at`
-///      lets #116 tell "just came back from a freeze auto-recovery" apart from
-///      an ordinary clean turn-end. `revive::freeze_grace_elapsed` reads it and
-///      withholds this lead/worker from re-dispatch for one grace window
-///      instead of racing this self-heal back into the same wedge. Note this
-///      does NOT ride on step 3: the cleared native id happens to exclude the
-///      session from #116's selection too, but that is a side effect of an
-///      unrelated predicate, so the marker is what actually carries the rule.
+///      — an invisible timeline row recording that this recovery happened,
+///      and the issue #116 (idle re-drive) coordination point: its
+///      `created_at` lets #116 tell "just came back from a freeze
+///      auto-recovery" apart from an ordinary clean turn-end, so
+///      `revive::freeze_grace_elapsed` can withhold this lead/worker from
+///      re-dispatch for a grace window instead of racing this self-heal.
+///      That protection deliberately does NOT ride on step 3: the cleared
+///      native id happens to exclude the session from #116's selection too,
+///      but only as a side effect of an unrelated predicate (the accidental,
+///      fragile protection review round 4 flagged — see the history note on
+///      `repo::mark_turn_freeze_recovered`). This marker is what carries the
+///      rule now.
 ///   5. Post a Needs-you notice — this is a self-heal, but the user should
 ///      still know their native context was reset.
-/// Returns false when the turn already ended in the gap (nothing to do).
+/// Returns false when the turn already ended in the gap (nothing to do) —
+/// including whenever [`take_frozen_turn`] reports [`FreezeClaim::Stale`].
 async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64) -> bool {
     let (thread_id, session_id, dir, act, turn_id) = {
         let inner = eng.lock().await;
@@ -4249,92 +4337,87 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
         return false;
     }
     let _ = interrupt(app, eng).await;
-    // Bind the taken client to a local BEFORE branching on it: `if let Some(c)
-    // = eng.lock().await.codex_client.take() { .. }` would extend the
-    // temporary `MutexGuard`'s scope over the whole if-let body (Rust's
-    // temporary-lifetime-extension for an `if let` scrutinee), and the fresh
-    // `eng.lock().await` the reset below needs would then self-deadlock
-    // against that still-held guard.
-    let taken_client = { eng.lock().await.codex_client.take() };
-    if let Some(c) = taken_client {
+    // Re-confirm ownership of turn `turn_id`, atomically with taking the
+    // app-server client — see `take_frozen_turn`'s doc for the review round 4
+    // P1 race this closes. `Stale` means nothing below is ours to touch: no
+    // connection drop, no native-id clear, no marker, no notice.
+    let taken = match take_frozen_turn(eng, turn_id).await {
+        FreezeClaim::Stale => return false,
+        FreezeClaim::Owned(taken) => taken,
+    };
+    if let Some((c, drain)) = taken {
         c.shutdown().await;
         // Round-2 P1: this shutdown makes codex_consumer's own disconnect
         // cleanup skip itself — see `reset_frozen_appserver_turn`'s doc for
-        // why, and why the reset below (not `cleanup_disconnected_turn`) is
-        // the correct replacement.
-        let drain = {
-            let mut inner = eng.lock().await;
-            reset_frozen_appserver_turn(&mut inner, turn_id)
-        };
-        if let Some(drain) = drain {
-            if let Some(db) = app.try_state::<Db>() {
-                persist_activity(&db, session_id, thread_id, "idle").await;
-                // Mirrors `cleanup_disconnected_turn`'s own use of this helper:
-                // finalize whichever open row already exists (`current`), or —
-                // if the turn produced no visible output at all before it
-                // froze — insert a placeholder terminal row so the timeline
-                // doesn't just dangle with no reply and no error marker.
-                // `had_busy_turn` is unconditionally true here — this whole
-                // branch only runs when `reset_frozen_appserver_turn` matched
-                // a genuinely busy turn — so only `had_orphan_texts` gates it.
-                let had_orphan_texts = !drain.orphan_texts.is_empty() || drain.turn_saw_text;
-                if let Ok(Some(row)) = persist_disconnected_turn_row(
-                    &db,
-                    thread_id,
-                    session_id,
-                    turn_id,
-                    "interrupted",
-                    !had_orphan_texts,
-                    drain.current,
-                )
-                .await
-                {
-                    match row {
-                        DisconnectedTurnRow::Finalized { message_id } => {
-                            emit_finalize(app, thread_id, message_id, "interrupted");
-                        }
-                        DisconnectedTurnRow::Inserted(message) => {
-                            let _ = app.emit(EVENT, Push::Message { thread_id, message });
-                        }
+        // why, and why `take_frozen_turn`'s reset (not
+        // `cleanup_disconnected_turn`) is the correct replacement.
+        if let Some(db) = app.try_state::<Db>() {
+            persist_activity(&db, session_id, thread_id, "idle").await;
+            // Mirrors `cleanup_disconnected_turn`'s own use of this helper:
+            // finalize whichever open row already exists (`current`), or —
+            // if the turn produced no visible output at all before it
+            // froze — insert a placeholder terminal row so the timeline
+            // doesn't just dangle with no reply and no error marker.
+            // `had_busy_turn` is unconditionally true here — this whole
+            // branch only runs when `take_frozen_turn` matched a genuinely
+            // busy turn — so only `had_orphan_texts` gates it.
+            let had_orphan_texts = !drain.orphan_texts.is_empty() || drain.turn_saw_text;
+            if let Ok(Some(row)) = persist_disconnected_turn_row(
+                &db,
+                thread_id,
+                session_id,
+                turn_id,
+                "interrupted",
+                !had_orphan_texts,
+                drain.current,
+            )
+            .await
+            {
+                match row {
+                    DisconnectedTurnRow::Finalized { message_id } => {
+                        emit_finalize(app, thread_id, message_id, "interrupted");
                     }
-                }
-                // Item-keyed open rows freeze like `current`: raw text + terminal
-                // status (mirrors cleanup_disconnected_turn's disconnect handling).
-                for (id, text) in drain.orphan_texts {
-                    let _ = repo::update_lead_message(
-                        &db,
-                        id,
-                        &serde_json::json!({ "text": text }).to_string(),
-                        "interrupted",
-                    )
-                    .await;
-                    emit_finalize(app, thread_id, id, "interrupted");
-                }
-                finalize_orphan_tool_rows(app, &db, thread_id, drain.orphan_tools, "interrupted")
-                    .await;
-                if !drain.drained_queue.is_empty() {
-                    match repo::set_queued_status_by_ids(&db, &drain.drained_queue, "interrupted")
-                        .await
-                    {
-                        Ok(rows) => {
-                            for m in rows {
-                                emit_finalize(app, thread_id, m.id, "interrupted");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[weft] turn-freeze recovery: queue finalize failed: {e}");
-                        }
+                    DisconnectedTurnRow::Inserted(message) => {
+                        let _ = app.emit(EVENT, Push::Message { thread_id, message });
                     }
                 }
             }
-            // Tell the frontend the turn is over — nothing else will: the
-            // watchdog sweep's own idle transition (which observes `busy` on
-            // its NEXT tick) only reconciles watchdog-owned bookkeeping
-            // (stall notice / freeze_handled), it never pushes a Turn event
-            // itself, on the assumption that whatever ended the turn already
-            // did. Here, we are that "whatever".
-            emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+            // Item-keyed open rows freeze like `current`: raw text + terminal
+            // status (mirrors cleanup_disconnected_turn's disconnect handling).
+            for (id, text) in drain.orphan_texts {
+                let _ = repo::update_lead_message(
+                    &db,
+                    id,
+                    &serde_json::json!({ "text": text }).to_string(),
+                    "interrupted",
+                )
+                .await;
+                emit_finalize(app, thread_id, id, "interrupted");
+            }
+            finalize_orphan_tool_rows(app, &db, thread_id, drain.orphan_tools, "interrupted")
+                .await;
+            if !drain.drained_queue.is_empty() {
+                match repo::set_queued_status_by_ids(&db, &drain.drained_queue, "interrupted")
+                    .await
+                {
+                    Ok(rows) => {
+                        for m in rows {
+                            emit_finalize(app, thread_id, m.id, "interrupted");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[weft] turn-freeze recovery: queue finalize failed: {e}");
+                    }
+                }
+            }
         }
+        // Tell the frontend the turn is over — nothing else will: the
+        // watchdog sweep's own idle transition (which observes `busy` on
+        // its NEXT tick) only reconciles watchdog-owned bookkeeping
+        // (stall notice / freeze_handled), it never pushes a Turn event
+        // itself, on the assumption that whatever ended the turn already
+        // did. Here, we are that "whatever".
+        emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
     }
     if let Some(db) = app.try_state::<Db>() {
         if let Err(err) = clear_native_id(&db, session_id, thread_id).await {
@@ -6503,10 +6586,11 @@ mod tests {
 
     #[tokio::test]
     async fn turn_freeze_recovered_marker_roundtrips_for_the_lead() {
-        // Review round 1: the issue #116 coordination point. No marker yet →
-        // None; after `mark_turn_freeze_recovered`, the getter returns a
+        // The storage half of the issue #116 coordination point: no marker yet
+        // → None; after `mark_turn_freeze_recovered`, the getter returns a
         // plausible unix-seconds timestamp (same clock as `repo::now`/
-        // `created_at`) close to "now".
+        // `created_at`) close to "now". The grace window built on top of it
+        // lives in `revive::freeze_grace_elapsed` and is tested there.
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let ws = repo::create_workspace(&db, "ws").await.unwrap();
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
@@ -6985,6 +7069,114 @@ mod tests {
         inner.turn.busy = false;
 
         assert!(reset_frozen_appserver_turn(&mut inner, 5).is_none());
+    }
+
+    /// Review round 4, P2 (mutation-proofing): the three `reset_frozen_
+    /// appserver_turn_*` tests above only exercise that PURE leaf function —
+    /// mutation-testing showed a whole mutant class survives that guts
+    /// `recover_from_freeze`'s actual CALL into it, since nothing asserted
+    /// the wiring itself. This test instead drives `take_frozen_turn` — the
+    /// exact async function `recover_from_freeze` calls — over a REAL
+    /// `EngineRef` (an `Arc<Mutex<EngineInner>>`; needs no `AppHandle`, see
+    /// that type's doc), with a genuine `codex_app_server::Client` occupying
+    /// `codex_client` (via the test-only `Client::test_stub`). Gutting
+    /// EITHER the take or the `reset_frozen_appserver_turn` call inside
+    /// `take_frozen_turn` turns this red. The `tokio::time::timeout` also
+    /// guards against a self-deadlock regression (the exact bug class the
+    /// old two-lock take-then-relock shape risked).
+    #[tokio::test]
+    async fn take_frozen_turn_claims_client_and_resets_state_for_the_matching_turn() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 5;
+        inner.codex_client = Some(crate::codex_app_server::Client::test_stub());
+        inner
+            .tool_rows
+            .insert("call-1".into(), (1, serde_json::json!({"tool": "bash"})));
+        inner.turn.queue.push_back(Outgoing {
+            text: "follow-up sent during the freeze".into(),
+            images: vec![],
+            tracked: true,
+            origin_tag: None,
+            queue_id: Some(42),
+            has_attachments: false,
+        });
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let claim = tokio::time::timeout(std::time::Duration::from_secs(5), take_frozen_turn(&eng, 5))
+            .await
+            .expect("take_frozen_turn must not hang/self-deadlock");
+
+        let FreezeClaim::Owned(Some((client, drain))) = claim else {
+            panic!("expected an owned claim carrying the taken app-server client");
+        };
+        // The client was ACTUALLY removed from the engine, not merely
+        // observed — the literal wiring the review round 4 mutation broke.
+        assert!(eng.lock().await.codex_client.is_none());
+        assert!(!eng.lock().await.turn.busy);
+        assert!(eng.lock().await.tool_rows.is_empty());
+        assert!(eng.lock().await.turn.queue.is_empty());
+        assert_eq!(
+            drain.orphan_tools,
+            vec![(1, serde_json::json!({"tool": "bash"}))]
+        );
+        assert_eq!(drain.drained_queue, vec![42]);
+        client.shutdown().await;
+    }
+
+    /// The literal review round 4 P1 scenario: `interrupt()`'s up-to-~120s
+    /// RPC wait let `codex_consumer`'s flush branch advance `turn_id` (a
+    /// NEWER turn is now live on the SAME shared `codex_client`) before
+    /// `recover_from_freeze` resumes. `take_frozen_turn` must report `Stale`
+    /// and leave the newer turn's client + busy state completely untouched —
+    /// an earlier version took + shut the connection down regardless,
+    /// permanently wedging the newer turn (busy forever, no client left to
+    /// ever finish or clean it up).
+    #[tokio::test]
+    async fn take_frozen_turn_leaves_a_newer_turns_client_untouched() {
+        let mut inner = test_inner("codex");
+        inner.turn.busy = true;
+        inner.turn_id = 6; // advanced past the frozen turn_id=5 being recovered
+        inner.codex_client = Some(crate::codex_app_server::Client::test_stub());
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let claim = tokio::time::timeout(std::time::Duration::from_secs(5), take_frozen_turn(&eng, 5))
+            .await
+            .expect("take_frozen_turn must not hang/self-deadlock");
+
+        assert!(matches!(claim, FreezeClaim::Stale));
+        // The newer turn's live connection and busy state are untouched.
+        let mut guard = eng.lock().await;
+        assert!(guard.turn.busy);
+        let client = guard.codex_client.take().expect("client left in place, untouched");
+        drop(guard);
+        client.shutdown().await;
+    }
+
+    /// Non-app-server dialects (claude resident / codex-exec / opencode)
+    /// never populate `codex_client` — the atomic guard must still gate on
+    /// turn_id+busy for them (review round 4 P1: previously it didn't gate
+    /// AT ALL for this case — `recover_from_freeze` ran its native-id-clear +
+    /// marker + user notice unconditionally), reporting `Owned(None)` — NOT
+    /// `Stale`, since the turn genuinely still is the one being recovered.
+    /// It must NOT also reset turn state here: that dialect's own reader
+    /// task resets it via its own EOF/`generation` path once `interrupt()`'s
+    /// kill lands, and doing it twice would race that cleanup.
+    #[tokio::test]
+    async fn take_frozen_turn_reports_owned_none_without_an_appserver_client() {
+        let mut inner = test_inner("claude");
+        inner.turn.busy = true;
+        inner.turn_id = 5;
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+
+        let claim = tokio::time::timeout(std::time::Duration::from_secs(5), take_frozen_turn(&eng, 5))
+            .await
+            .expect("take_frozen_turn must not hang/self-deadlock");
+
+        assert!(matches!(claim, FreezeClaim::Owned(None)));
+        // Still busy — this function never resets state when there's no
+        // client to take; that stays the reader task's job for this dialect.
+        assert!(eng.lock().await.turn.busy);
     }
 
     #[tokio::test]

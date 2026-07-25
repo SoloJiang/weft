@@ -431,12 +431,7 @@ export const zh = {
     answerPlaceholder: "输入回复，回车发送",
   },
   bus: {
-    title: "Agent 协作",
     close: "关闭",
-    messages_other: "{{count}} 条消息",
-    empty: "还没有消息。各任务通过 bus 在这里发言，你也可以。",
-    broadcast: "广播 · 所有任务",
-    compose: "给总线发消息…",
   },
   resume: {
     copyCommand: "复制恢复命令",

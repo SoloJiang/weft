@@ -1638,17 +1638,32 @@ pub async fn set_session_native_id_opt(
 }
 
 /// Stamp a (thread, session) as having just gone through the turn-freeze
-/// auto-recovery (issue #93 review round 1 ↔ issue #116 coordination): an
-/// invisible timeline marker row (`kind` excluded from the frontend's
-/// text/tool timeline allowlist, same as `"meta"`) whose `created_at` is the
-/// coordination point #116's idle re-drive reads back through
-/// [`last_turn_freeze_recovery_secs`]. Its one consumer is
-/// `lead_chat::revive::freeze_grace_elapsed`, which withholds a
-/// just-self-healed lead/worker from re-dispatch for one grace window rather
-/// than racing this recovery back into the same wedge. `session_id = None` for
-/// the lead. Uses the SAME deletion-fenced insert as the rest of the timeline
-/// (`insert_lead_message`), so a thread deleted mid-recovery can't leave an
-/// orphaned row.
+/// auto-recovery (issue #93): an invisible timeline marker row (`kind`
+/// excluded from the frontend's text/tool timeline allowlist, same as
+/// `"meta"`). `session_id = None` for the lead. Uses the SAME
+/// deletion-fenced insert as the rest of the timeline (`insert_lead_message`),
+/// so a thread deleted mid-recovery can't leave an orphaned row.
+///
+/// This row IS the issue #116 coordination point: its `created_at`, read back
+/// via [`last_turn_freeze_recovery_secs`], is what
+/// `lead_chat::revive::freeze_grace_elapsed` consults to withhold a
+/// just-self-healed lead/worker from the idle re-drive for one grace window,
+/// rather than racing this recovery straight back into the same wedge.
+///
+/// History, because the shape here only makes sense with it (review round 4,
+/// P2): #116 originally landed WITHOUT that consult — `revive.rs` never read
+/// this marker, and the getter had no caller outside this file's own
+/// round-trip test. What kept the re-drive off a just-recovered direction in
+/// the meantime was an unrelated SIDE EFFECT: `recover_from_freeze` also
+/// clears the session's `native_session_id` (see `set_session_native_id_opt` /
+/// `set_lead_native_id_opt`), and `revive::stalled_direction_ids` only selects
+/// a direction whose `native_session_id.is_some()`. Real protection, but
+/// accidental — it depended entirely on THAT field staying cleared at THAT
+/// moment, and would have vanished silently under a refactor that stopped
+/// clearing it, or a re-drive path that stopped gating on it. The grace window
+/// no longer rides on that: it reads this marker directly, and has tests that
+/// go red if the read is removed.
+
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,
