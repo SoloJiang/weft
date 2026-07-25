@@ -23,6 +23,7 @@ mod commands_backup;
 pub mod config;
 mod coordinator;
 mod curator;
+mod deps_bootstrap;
 mod detect;
 mod gc;
 pub mod git;

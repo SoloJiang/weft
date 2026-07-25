@@ -13,6 +13,82 @@ use sea_orm::{
 };
 use std::collections::HashMap;
 
+/// Test-only DB-write failure injection.
+///
+/// Why it exists: several already-shipped degradation paths differ from their
+/// happy path ONLY when a single store write fails while the writes around it
+/// succeed. `lead_chat::engine::recover_from_freeze`'s marker-gated native-id
+/// clear (issue #93, PR #133) is the canonical one — and a mutation run proved
+/// the entire suite stayed green with that gate deleted, because nothing in this
+/// crate could make one chosen write fail on demand. The alternative, faking the
+/// post-failure DB rows by hand, is worse than no test at all: it asserts a
+/// shape production may never produce (a lesson this repo has already paid for).
+/// This makes the REAL write return a REAL `Err`.
+///
+/// Boundary — why it cannot leak into production:
+///   * The module is `#[cfg(test)]`, so it exists only while this crate is
+///     compiled as its own test target (`cargo test --lib`). `cargo build`, the
+///     Tauri bundle, and even this crate's `tests/*.rs` integration binaries
+///     link the lib WITHOUT `cfg(test)`, so the arming API is simply absent.
+///   * Call sites go through [`fail_write`], whose entire body sits inside a
+///     `#[cfg(test)]` block: in a production build it expands to nothing — no
+///     branch, no atomic, no static, no symbol. Zero runtime cost, not "cheap".
+///   * Nothing is armed by default and nothing consults an env var, so even in
+///     the test build a write fails only for the task that armed it.
+///
+/// Scope is the TASK, not the process (`tokio::task_local!`), which is what
+/// keeps this from becoming the process-global-static hazard the session-gate
+/// tests needed a serializing lock for: two tests can arm different writes — or
+/// the same one — concurrently without seeing each other, and a panicking test
+/// disarms by unwinding out of the scope. The trade-off is the spawn boundary: a
+/// write performed on a task `spawn`ed from inside the scope does NOT inherit
+/// the arming. Every current seam point is awaited directly, so that holds; a
+/// future caller that spawns needs a different mechanism, not a wider scope.
+#[cfg(test)]
+pub(crate) mod fail_write {
+    use std::future::Future;
+
+    tokio::task_local! {
+        /// The one write name armed for the current task, if any.
+        static ARMED: &'static str;
+    }
+
+    /// Run `fut` with the store write named `name` forced to return `Err`.
+    /// Every other write inside `fut` behaves normally — that selectivity is
+    /// the whole point: the paths under test are the ones where the neighbours
+    /// of a failed write all succeeded.
+    pub(crate) async fn while_failing<T>(name: &'static str, fut: impl Future<Output = T>) -> T {
+        ARMED.scope(name, fut).await
+    }
+
+    /// Whether the calling task armed `name`. Only [`super::fail_write`] calls
+    /// this; outside a `while_failing` scope `try_with` fails, i.e. "not armed".
+    pub(crate) fn is_armed(name: &str) -> bool {
+        ARMED.try_with(|armed| *armed == name).unwrap_or(false)
+    }
+
+    /// The error an armed write returns. Deliberately self-identifying: if this
+    /// text ever surfaces in a real log, the seam escaped its test build.
+    pub(crate) fn injected(name: &str) -> anyhow::Error {
+        anyhow::anyhow!("injected store-write failure at `{name}` (test-only seam)")
+    }
+}
+
+/// Mark a store write as injectable by [`fail_write`]'s `name`. Expands to
+/// NOTHING outside `cfg(test)` — see that module's doc for the boundary. Place
+/// it as the first statement of a write that returns `anyhow::Result`, so an
+/// armed failure lands before any partial mutation.
+macro_rules! fail_write {
+    ($name:literal) => {
+        #[cfg(test)]
+        {
+            if $crate::store::repo::fail_write::is_armed($name) {
+                return Err($crate::store::repo::fail_write::injected($name));
+            }
+        }
+    };
+}
+
 fn now() -> String {
     // RFC3339 without pulling chrono: seconds since epoch is enough for ordering.
     let secs = std::time::SystemTime::now()
@@ -1777,6 +1853,10 @@ pub async fn mark_turn_freeze_recovered(
     thread_id: i32,
     session_id: Option<i32>,
 ) -> Result<()> {
+    // Seam point: the failure this write's CALLERS must degrade correctly for
+    // (`engine::stamp_freeze_marker` → the gated native-id clear) has no other
+    // way to be reached from a test. See `fail_write`'s doc for the boundary.
+    fail_write!("mark_turn_freeze_recovered");
     insert_lead_message(
         db,
         thread_id,
@@ -2925,6 +3005,77 @@ mod tests {
                 .await
                 .unwrap();
         (ws, repo, thread, direction)
+    }
+
+    // ---- the test-only write-failure seam's own contract ----
+
+    /// The property every caller of [`fail_write`] depends on: arming ONE write
+    /// fails exactly that write and leaves its neighbours alone. Without that
+    /// selectivity the seam could not reproduce the situation the gated
+    /// degradation paths exist for — "this write failed, the ones around it
+    /// succeeded" — it would just look like a dead database.
+    #[tokio::test]
+    async fn fail_write_only_fails_the_armed_write() {
+        let db = mem().await;
+        let thread_id = live_thread(&db).await;
+
+        fail_write::while_failing("mark_turn_freeze_recovered", async {
+            assert!(
+                mark_turn_freeze_recovered(&db, thread_id, None).await.is_err(),
+                "the armed write must fail"
+            );
+            // A neighbour sharing the very same INSERT choke point
+            // (`insert_lead_message`) is untouched — the seam keys on the named
+            // write, not on the statement underneath it.
+            assert!(
+                insert_lead_message(&db, thread_id, None, 1, "assistant", "text", "{}", "complete")
+                    .await
+                    .is_ok(),
+                "an unarmed write through the same choke point must still succeed"
+            );
+            // …and so is the other write the freeze recovery performs around it.
+            assert!(set_lead_native_id_opt(&db, thread_id, None).await.is_ok());
+        })
+        .await;
+    }
+
+    /// Arming is scoped to the task that armed it, and ends with the scope:
+    /// nothing is left armed for the rest of the process (which is what lets
+    /// `cargo test`'s parallel threads arm freely without a serializing lock).
+    #[tokio::test]
+    async fn fail_write_arming_ends_with_its_scope() {
+        let db = mem().await;
+        let thread_id = live_thread(&db).await;
+
+        fail_write::while_failing("mark_turn_freeze_recovered", async {
+            assert!(mark_turn_freeze_recovered(&db, thread_id, None).await.is_err());
+        })
+        .await;
+
+        assert!(
+            mark_turn_freeze_recovered(&db, thread_id, None).await.is_ok(),
+            "outside the scope the same write must behave normally"
+        );
+    }
+
+    /// An armed write fails BEFORE it mutates anything — the seam has to model a
+    /// write that didn't happen, not a half-applied one, or every test built on
+    /// it would be asserting against a state production never reaches.
+    #[tokio::test]
+    async fn fail_write_leaves_no_partial_row() {
+        let db = mem().await;
+        let thread_id = live_thread(&db).await;
+
+        fail_write::while_failing("mark_turn_freeze_recovered", async {
+            let _ = mark_turn_freeze_recovered(&db, thread_id, None).await;
+        })
+        .await;
+
+        assert_eq!(
+            last_turn_freeze_recovery_secs(&db, thread_id, None).await.unwrap(),
+            None,
+            "no marker row may survive an injected failure"
+        );
     }
 
     #[tokio::test]

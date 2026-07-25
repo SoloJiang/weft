@@ -6,7 +6,13 @@ use weft::store::Db;
 
 async fn rpc(base: &str, thread: i32, dir: &str, body: serde_json::Value) -> String {
     let url = format!("{base}/bus/{thread}/{dir}/mcp");
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        // This test talks to a loopback listener it just created. Do not let a
+        // machine-level proxy reroute that request (and make the test depend on
+        // a developer's local proxy availability).
+        .no_proxy()
+        .build()
+        .unwrap()
         .post(url)
         .header("Accept", "application/json, text/event-stream")
         .json(&body)
