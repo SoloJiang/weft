@@ -289,6 +289,28 @@ fn yarn_config_executes_repo_code(dir: &Path) -> bool {
     false
 }
 
+
+/// True when a project package-manager config can interpolate process env into
+/// registry auth (e.g. `_authToken=${GITHUB_TOKEN}`). Automatic bootstrap
+/// refuses these trees rather than risk secret exfiltration.
+fn project_config_interpolates_env_secrets(dir: &Path) -> bool {
+    for name in [".npmrc", ".yarnrc", ".yarnrc.yml", ".yarnrc.yaml"] {
+        let Ok(raw) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        let lower = raw.to_ascii_lowercase();
+        if lower.contains("${")
+            && (lower.contains("authtoken")
+                || lower.contains("_auth")
+                || lower.contains("password")
+                || lower.contains("token"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build the install plan from process env, or None when bootstrap should be skipped.
 #[allow(dead_code)]
 pub(crate) fn plan_install(dir: &Path) -> Option<InstallPlan> {
@@ -305,6 +327,9 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
     }
     let pm = detect_package_manager(dir)?;
     if node_modules_ready(dir) {
+        return None;
+    }
+    if project_config_interpolates_env_secrets(dir) {
         return None;
     }
 
@@ -329,6 +354,11 @@ pub(crate) fn plan_install_with(dir: &Path, cfg: &Config) -> Option<InstallPlan>
                 "node_modules".to_string(),
                 "--virtual-store-dir".to_string(),
                 "node_modules/.pnpm".to_string(),
+                // Keep the content-addressable store inside the worktree so a
+                // project .npmrc store-dir cannot write into the canonical repo.
+                // Shared global store is sacrificed for isolation on this path.
+                "--store-dir".to_string(),
+                "node_modules/.weft-pnpm-store".to_string(),
             ];
             // Immutable only: never rewrite the tracked lockfile from bootstrap.
             if dir.join("pnpm-lock.yaml").is_file() {
@@ -493,27 +523,72 @@ fn run_plan(plan: &InstallPlan, overall_timeout: Option<Duration>) -> Result<(),
 
 /// Drop relative PATH entries (especially ".") so child resolution cannot pick
 /// up a package-manager binary planted in the untrusted worktree.
+/// Platform-aware: uses OS path separators and preserves drive-letter paths.
 fn sanitize_path_for_bootstrap(path: &str) -> String {
-    path.split(':')
-        .filter(|e| !e.is_empty())
-        .filter(|e| Path::new(e).is_absolute())
-        .collect::<Vec<_>>()
-        .join(":")
+    let entries: Vec<std::path::PathBuf> = std::env::split_paths(path)
+        .filter(|e| !e.as_os_str().is_empty())
+        .filter(|e| e.is_absolute())
+        .collect();
+    std::env::join_paths(entries)
+        .map(|os| os.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Resolve `program` against the sanitized tool PATH to an absolute path.
 fn resolve_package_manager_program(program: &str) -> Result<PathBuf, String> {
     let path = sanitize_path_for_bootstrap(&crate::detect::tool_path());
-    for dir in path.split(':').filter(|e| !e.is_empty()) {
-        let candidate = Path::new(dir).join(program);
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(program);
         if candidate.is_file() {
             return Ok(candidate);
         }
-        // macOS/Linux may need execute-bit check; existence is enough for spawn.
+        #[cfg(windows)]
+        {
+            for ext in ["exe", "cmd", "bat"] {
+                let c = dir.join(format!("{program}.{ext}"));
+                if c.is_file() {
+                    return Ok(c);
+                }
+            }
+        }
     }
-    // Fall back to bare name only if nothing absolute was found — still safer
-    // than resolving relative entries inside the worktree because PATH is sanitized.
     Ok(PathBuf::from(program))
+}
+
+fn bootstrap_identity_envs() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for key in ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                out.push((key.to_string(), v));
+            }
+        }
+    }
+    if !out.iter().any(|(k, _)| k == "TMPDIR") {
+        out.push((
+            "TMPDIR".to_string(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        ));
+    }
+    out
+}
+
+fn bootstrap_cache_home_envs() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for key in [
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USERPROFILE",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                out.push((key.to_string(), v));
+            }
+        }
+    }
+    out
 }
 
 fn run_command(plan: &InstallPlan, timeout: Option<Duration>) -> Result<Output, String> {
@@ -524,7 +599,13 @@ fn run_command(plan: &InstallPlan, timeout: Option<Duration>) -> Result<Output, 
     let mut cmd = Command::new(&program);
     cmd.args(&plan.args)
         .current_dir(&plan.cwd)
+        // Do NOT inherit Weft's full environment: project package-manager
+        // configs can interpolate secrets into registry auth.
+        .env_clear()
         .env("PATH", path)
+        .envs(bootstrap_identity_envs())
+        .envs(bootstrap_cache_home_envs())
+        .env("TERM", "dumb")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -804,6 +885,10 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--modules-dir" && w[1] == "node_modules"));
         assert!(plan
+            .args
+            .windows(2)
+            .any(|w| w[0] == "--store-dir" && w[1] == "node_modules/.weft-pnpm-store"));
+        assert!(plan
             .env
             .iter()
             .any(|(k, v)| k == "npm_config_enable_global_virtual_store" && v == "true"));
@@ -901,6 +986,20 @@ mod tests {
         assert_eq!(plan.program, "bun");
         assert!(plan.args.iter().any(|a| a == "--frozen-lockfile"));
         assert!(!plan.args.iter().any(|a| a == "--no-save"));
+    }
+
+    #[test]
+    fn plan_install_skips_when_npmrc_interpolates_auth_token() {
+        let d = tmp();
+        write(&d, "package.json", "{}");
+        write(&d, "package-lock.json", "{}");
+        write(
+            &d,
+            ".npmrc",
+            "//registry.example.com/:_authToken=${GITHUB_TOKEN}
+",
+        );
+        assert!(plan_install_with(&d, &test_cfg(true, false)).is_none());
     }
 
     #[test]
