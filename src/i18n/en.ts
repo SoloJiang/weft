@@ -255,6 +255,10 @@ export const en = {
     queueDrag: "Reorder",
     queueAttachmentOnly: "{{count}} image",
     autoReviewDirective: "After the review, fix the findings directly, re-run the checks to verify, then report briefly.",
+    receiptDelivered: "Delivered",
+    receiptConsumed: "Agent started",
+    sendFailedGeneric: "Send failed: {{reason}}",
+    sendFailedUnknown: "unknown error",
   },
   scope: {
     addReposFirst: "Add repos to this workspace first.",

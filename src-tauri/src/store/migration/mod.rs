@@ -51,6 +51,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0037CodeCheckpoint),
             Box::new(M0038CodeCheckpointNestedRepos),
             Box::new(M0039CodeCheckpointIndexTree),
+            Box::new(M0040LeadMessageConsumedAt),
         ]
     }
 }
@@ -1753,6 +1754,49 @@ impl MigrationTrait for M0039CodeCheckpointIndexTree {
     }
 }
 
+/// Adds nullable `consumed_at` (BIGINT, unix-millis) to `lead_message`. The
+/// engine stamps it on the "user" row that opened a turn the first time the
+/// agent produces ANY observed activity for that turn — the "已被 agent 消费"
+/// delivery receipt (issue #94), distinct from `status` (which already tracks
+/// queued/delivered/error/interrupted). A fresh db already has it (M0007
+/// reflects the entity); sqlite has no ADD COLUMN IF NOT EXISTS, so the
+/// duplicate is tolerated like M0032/M0036's column-adds.
+pub struct M0040LeadMessageConsumedAt;
+impl MigrationName for M0040LeadMessageConsumedAt {
+    fn name(&self) -> &str {
+        "m0040_lead_message_consumed_at"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0040LeadMessageConsumedAt {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("lead_message"))
+                    .add_column(ColumnDef::new(Alias::new("consumed_at")).big_integer().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("lead_message"))
+                    .drop_column(Alias::new("consumed_at"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::gateway_components_to_backend;
@@ -1893,6 +1937,24 @@ mod tests {
             .unwrap();
         // Selecting the row back requires the column to exist.
         assert_eq!(m.native_anchor, None, "native_anchor must exist and default to NULL");
+    }
+
+    /// M0040: lead_message.consumed_at is present after migration and defaults to NULL.
+    #[tokio::test]
+    async fn m0040_consumed_at_column_added() {
+        use crate::store::Db;
+        use crate::store::repo::{create_thread, create_workspace, insert_lead_message};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let m = insert_lead_message(&db, t.id, None, 1, "user", "text", r#"{"text":"hi"}"#, "complete")
+            .await
+            .unwrap();
+        // Selecting the row back requires the column to exist.
+        assert_eq!(m.consumed_at, None, "consumed_at must exist and default to NULL");
     }
 
     /// M0037: code_checkpoint exists after migration and round-trips a row.
