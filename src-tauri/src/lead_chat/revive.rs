@@ -1475,6 +1475,97 @@ mod tests {
         assert_eq!(stalled, vec![(th, vec![dir])]);
     }
 
+    /// The DEGRADED recovery, through this file's real selection predicate: a
+    /// worker whose freeze-recovery marker write FAILED must still be
+    /// selectable. `engine::recover_from_freeze` gates its native-id clear on
+    /// that write precisely so this holds — and a mutation run proved nothing
+    /// covered it: deleting the gate left the whole suite green while, in
+    /// production, it stranded the session in `native_id = None && marker =
+    /// None`, the one combination [`has_resumable_context`] rejects forever.
+    ///
+    /// The shape under test is produced by the ENGINE's own recovery steps (the
+    /// two functions `recover_from_freeze` calls, in its order) with the marker
+    /// write failed through the test-only `repo::fail_write` seam — not
+    /// assembled here. That distinction is the lesson from the first revision of
+    /// the tests above, which hand-built a post-recovery shape production never
+    /// produces and passed for the wrong reason.
+    #[tokio::test]
+    async fn selects_stalled_worker_whose_freeze_marker_write_failed() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        assert_eq!(
+            collect_stalled(&db).await,
+            vec![(th, vec![dir])],
+            "precondition: this is the selected stall shape before the recovery"
+        );
+
+        let sess = session_of(&db, dir).await;
+        let eng = engine::test_engine_ref(Some("nat-123"));
+        let stamped = repo::fail_write::while_failing(
+            "mark_turn_freeze_recovered",
+            engine::stamp_freeze_marker(Some(&db), th, Some(sess)),
+        )
+        .await;
+        assert!(stamped.is_none(), "precondition: the marker write failed");
+        engine::clear_native_context_after_freeze(
+            stamped.as_ref(),
+            Some(&db),
+            &eng,
+            Some(sess),
+            th,
+        )
+        .await;
+
+        assert_eq!(
+            collect_stalled(&db).await,
+            vec![(th, vec![dir])],
+            "a failed marker write must leave an ordinary, still-re-drivable stall — \
+             the freeze watchdog can then trip again and retry the stamp"
+        );
+
+        // Teeth: the assertion above only means something because clearing the
+        // id WITHOUT a marker — exactly what the un-gated version did — drops
+        // the same shape out of the sweep entirely, with nothing automated able
+        // to put it back.
+        repo::set_session_native_id_opt(&db, sess, None).await.unwrap();
+        assert!(
+            collect_stalled(&db).await.is_empty(),
+            "sanity: an un-gated clear is the permanently-invisible shape the gate prevents"
+        );
+    }
+
+    /// The lead axis of the same degradation — the strictly worse one, since a
+    /// lead excluded from the sweep strands EVERY in-progress task on the issue,
+    /// not one worker. The review caught the original defect on the worker axis
+    /// first and then again here, which is why `has_resumable_context` is one
+    /// shared predicate; this pins the writer's half of that pairing on both
+    /// axes too.
+    #[tokio::test]
+    async fn selects_stalled_lead_whose_freeze_marker_write_failed() {
+        let db = mem().await;
+        let (th, repo_id) = fixture(&db).await;
+        idle_lead(&db, th).await;
+        let dir = stalled_direction(&db, th, repo_id, "working").await;
+        assert_eq!(collect_stalled(&db).await, vec![(th, vec![dir])], "precondition");
+
+        let eng = engine::test_engine_ref(Some("lead-nat"));
+        let stamped = repo::fail_write::while_failing(
+            "mark_turn_freeze_recovered",
+            engine::stamp_freeze_marker(Some(&db), th, None),
+        )
+        .await;
+        assert!(stamped.is_none(), "precondition: the marker write failed");
+        engine::clear_native_context_after_freeze(stamped.as_ref(), Some(&db), &eng, None, th).await;
+
+        assert_eq!(collect_stalled(&db).await, vec![(th, vec![dir])]);
+
+        // Teeth, lead axis: an un-gated clear takes the whole thread out.
+        repo::set_lead_native_id_opt(&db, th, None).await.unwrap();
+        assert!(collect_stalled(&db).await.is_empty());
+    }
+
     /// The grace is keyed per (thread, session), not per thread: a sibling
     /// task's freeze must not withhold a task that never froze, or one wedged
     /// worker would silently freeze the whole thread's recovery.
