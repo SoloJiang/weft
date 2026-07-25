@@ -1765,6 +1765,13 @@ pub async fn set_session_native_id_opt(
 /// gain); read it as "the native context was deliberately reset and the next
 /// automated re-drive should back off for one grace window", of which a
 /// self-healed freeze is one cause and a human-initiated switch is another.
+///
+/// The switch path gates on this row the same way `recover_from_freeze` does,
+/// only harder: `lead_chat::commands::persist_switch` stamps it FIRST and
+/// aborts the entire switch if it fails, because a switch cannot fall back on
+/// "skip the clear and let it stall again" — by then the id belongs to an
+/// engine the thread no longer runs. Both writers therefore honour the same
+/// contract: this row exists before the native id is allowed to go missing.
 pub async fn mark_turn_freeze_recovered(
     db: &Db,
     thread_id: i32,

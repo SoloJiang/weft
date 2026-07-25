@@ -1595,6 +1595,115 @@ async fn insert_switch_marker(
     }
 }
 
+/// Which surface an engine switch's durable writes target. ONE discriminated
+/// value rather than a lead-vs-worker branch re-derived at each write, so the
+/// marker gate in [`persist_switch`] is written once and the two axes are
+/// physically unable to disagree about it. That shape is not decoration: the
+/// defect this closes was the SAME rule enforced in one place
+/// (`engine::recover_from_freeze`) and silently dropped in another (these two
+/// commands), and `revive::has_resumable_context` carries a warning about
+/// exactly that failure mode for exactly that reason.
+#[derive(Clone, Copy)]
+enum SwitchTarget {
+    Lead {
+        thread_id: i32,
+    },
+    Worker {
+        thread_id: i32,
+        direction_id: i32,
+        session_id: i32,
+    },
+}
+
+impl SwitchTarget {
+    fn thread_id(self) -> i32 {
+        match self {
+            SwitchTarget::Lead { thread_id } => thread_id,
+            SwitchTarget::Worker { thread_id, .. } => thread_id,
+        }
+    }
+
+    /// `None` for the lead — the same `Option<session_id>` discriminator
+    /// `repo::mark_turn_freeze_recovered` and `engine::clear_native_id`
+    /// already key on, so neither can be handed the wrong axis.
+    fn session_id(self) -> Option<i32> {
+        match self {
+            SwitchTarget::Lead { .. } => None,
+            SwitchTarget::Worker { session_id, .. } => Some(session_id),
+        }
+    }
+}
+
+/// The three durable writes an engine/model switch makes, in the ONE order
+/// that has no bad failure state — and the marker GATE that
+/// `engine::recover_from_freeze` already enforces on its own copy of this
+/// sequence (see the long comment at its `if marker_stamped`).
+///
+///   1. `repo::mark_turn_freeze_recovered` — the freeze-recovery grace marker,
+///      reused by a switch (see its doc for why a switch needs it at all).
+///      FIRST, and fatal: everything below is gated on it by a plain `?`.
+///   2. the tool/model persist (`repo::switch_thread_tool` /
+///      `repo::switch_worker_tool_txn`).
+///   3. `engine::clear_native_id` — issue #96 pitfall 1: a native id minted by
+///      the OLD engine, handed to the NEW one as `--resume`/`resume`, fails
+///      fast with "No conversation found".
+///
+/// Why the marker must lead, and why a failed stamp aborts the whole switch:
+/// steps 1 and 3 are the two halves of ONE invariant
+/// (`revive::has_resumable_context`) — a surface left with NEITHER a native id
+/// NOR a marker reads as "never ran", and drops out of the automated re-drive
+/// candidate pool silently, until some later real freeze or switch happens to
+/// stamp one. Running step 3 after a failed step 1 produces exactly that shape.
+///
+/// `recover_from_freeze` resolves the same tension by SKIPPING the clear: its
+/// tool identity did not change, so the old native id is still valid, and the
+/// session merely stalls again — visibly, re-drivably, with a fresh chance to
+/// stamp. That degrade is NOT available here. A switch has already changed
+/// which engine the id belongs to, so keeping it is pitfall 1 rather than a
+/// safe no-op. So this fails instead, and it fails BEFORE step 2 — the first
+/// write that changes anything durable — which is what makes "retry the
+/// switch" a complete recovery rather than a second half-applied attempt. The
+/// engine reconstruction in both callers sits after this `?` and is therefore
+/// gated too: a switch that could not record itself never rebuilds an engine.
+///
+/// Ordering: only steps 2 and 3 are the caller-visible switch sequence
+/// (persist tool/model → clear native id, unchanged). The marker is an
+/// auxiliary stamp whose only prior constraint was "before the clear"; moving
+/// it ahead of step 2 keeps that constraint, gives the abort a clean
+/// nothing-changed state, and matches `recover_from_freeze`'s own "FIRST of
+/// the DB writes on purpose".
+async fn persist_switch(
+    db: &Db,
+    target: SwitchTarget,
+    tool: &str,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
+    let thread_id = target.thread_id();
+    let session_id = target.session_id();
+    repo::mark_turn_freeze_recovered(db, thread_id, session_id)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "engine switch aborted, nothing was changed — retry it. \
+                 Could not stamp the freeze-recovery grace marker for thread \
+                 {thread_id}: {e}"
+            )
+        })?;
+    match target {
+        SwitchTarget::Lead { thread_id } => {
+            repo::switch_thread_tool(db, thread_id, tool, model).await?;
+        }
+        SwitchTarget::Worker {
+            direction_id,
+            session_id,
+            ..
+        } => {
+            repo::switch_worker_tool_txn(db, direction_id, session_id, tool, model).await?;
+        }
+    }
+    engine::clear_native_id(db, session_id, thread_id).await
+}
+
 /// Switch the LEAD's engine identity and/or model override for `thread_id` —
 /// issue #96 layer 1 of 3 (independent of any worker's tool and of the global
 /// default; see `switch_worker_tool` / `set_default_tool`). Semantics:
@@ -1605,15 +1714,19 @@ async fn insert_switch_marker(
 ///      finalization as Stop, but landing on "idle" rather than
 ///      `STATUS_STOPPED` (`engine::teardown_for_switch`), since this is a
 ///      replacement, not a stop the user needs to explicitly resume from.
-///   3. persist the new tool/model (`repo::switch_thread_tool`, which also
-///      clears any stale command-alias pin), re-stamp the freeze-recovery
-///      grace marker (`repo::mark_turn_freeze_recovered` — see its doc for
-///      why a switch reuses it: prevents `revive`'s stall sweep from
-///      auto-redriving this freshly-switched lead within the next tick), and
-///      clear the native session id (`engine::clear_native_id` — the SAME
-///      contract turn-freeze recovery and rewind already rely on: dogfooding
-///      pitfall #1, a stale native id handed to a different engine's
-///      `--resume`/`resume` fails fast with "No conversation found").
+///   3. make the switch durable via [`persist_switch`]: re-stamp the
+///      freeze-recovery grace marker (`repo::mark_turn_freeze_recovered` — see
+///      its doc for why a switch reuses it: prevents `revive`'s stall sweep
+///      from auto-redriving this freshly-switched lead within the next tick),
+///      persist the new tool/model (`repo::switch_thread_tool`, which also
+///      clears any stale command-alias pin), and clear the native session id
+///      (`engine::clear_native_id` — the SAME contract turn-freeze recovery
+///      and rewind already rely on: dogfooding pitfall #1, a stale native id
+///      handed to a different engine's `--resume`/`resume` fails fast with
+///      "No conversation found"). The marker is the GATE on the other two —
+///      a failed stamp aborts the whole command with nothing changed, so
+///      steps 4-6 below never run. See [`persist_switch`] for why aborting
+///      beats the degrade `recover_from_freeze` can afford.
 ///   4. reconstruct the engine fresh via `lead_engine` — the exact construction
 ///      path a cold app boot uses (re-injects the ask-hook/MCP servers/
 ///      system-prompt for the NEW tool identity), never a hand-patched partial
@@ -1666,21 +1779,13 @@ pub async fn switch_lead_tool(
         .collect();
     let digest = engine::build_switch_digest(&before.lead_tool, &tool, &messages);
 
-    repo::switch_thread_tool(&db, thread_id, &tool, model.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
-    // Re-stamp the freeze-recovery grace marker BEFORE clearing native id —
-    // same ordering discipline `recover_from_freeze` uses, and see
-    // `repo::mark_turn_freeze_recovered`'s doc for why a switch reuses it:
-    // without this, `revive`'s stall sweep could read a much-older, unrelated
-    // freeze-recovery marker as "resumable" once ITS OWN grace window had
-    // elapsed and auto-redrive this freshly-switched lead within one sweep
-    // tick. Best-effort (logged, not fatal) — the switch's own correctness
-    // does not depend on it.
-    if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, None).await {
-        eprintln!("[weft] switch_lead_tool: failed to stamp the freeze-recovery grace marker for thread {thread_id}: {err}");
-    }
-    engine::clear_native_id(&db, None, thread_id)
+    // Marker → tool/model → native-id clear, with the marker as the gate on
+    // the other two: see `persist_switch`. A stamp failure surfaces here as a
+    // switch that plainly did not happen (the dialog keeps itself open on an
+    // Err and re-enables its confirm button), which is the recoverable
+    // outcome; the alternatives are a lead stranded out of the re-drive pool,
+    // or a new engine holding the old engine's native id.
+    persist_switch(&db, SwitchTarget::Lead { thread_id }, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1705,8 +1810,10 @@ pub async fn switch_lead_tool(
 /// Switch a WORKER's engine identity and/or model override for `session_id` —
 /// issue #96 layer 2 of 3 (independent of the thread's lead and of the global
 /// default; see `switch_lead_tool` / `set_default_tool`). Same six-step
-/// semantics as `switch_lead_tool`, with two worker-specific differences:
-///   - the durable write is `repo::switch_worker_tool_txn` — ONE transaction
+/// semantics as `switch_lead_tool` — including step 3's marker gate, shared
+/// verbatim through [`persist_switch`] rather than restated here — with two
+/// worker-specific differences:
+///   - the tool/model write is `repo::switch_worker_tool_txn` — ONE transaction
 ///     covering BOTH `direction.tool` (the durable side: `chat_open_worker_impl`'s
 ///     cold-recreate path, which fires the very next time this worker is
 ///     opened since the native id this switch just cleared makes that
@@ -1755,17 +1862,22 @@ pub async fn switch_worker_tool(
         .collect();
     let digest = engine::build_switch_digest(&sess.tool, &tool, &own);
 
-    repo::switch_worker_tool_txn(&db, sess.direction_id, session_id, &tool, model.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
-    // See switch_lead_tool's identical call for why — same grace-window reuse,
-    // same best-effort posture, ordered before the native-id clear.
-    if let Err(err) = repo::mark_turn_freeze_recovered(&db, dir.thread_id, Some(session_id)).await {
-        eprintln!("[weft] switch_worker_tool: failed to stamp the freeze-recovery grace marker for session {session_id}: {err}");
-    }
-    engine::clear_native_id(&db, Some(session_id), dir.thread_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Same gated sequence as switch_lead_tool, on the worker axis — see
+    // `persist_switch`. Sharing that one function is the point: the defect it
+    // guards against was first fixed on the freeze-recovery path and then
+    // missed here, so the rule now has exactly one implementation.
+    persist_switch(
+        &db,
+        SwitchTarget::Worker {
+            thread_id: dir.thread_id,
+            direction_id: sess.direction_id,
+            session_id,
+        },
+        &tool,
+        model.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let eng = worker_engine(&app, &db, session_id)
         .await
@@ -2098,5 +2210,236 @@ mod live_slot_tests {
         let slots = build_worker_slots(&db, vec![snap(sess.id, th.id, true)]).await;
 
         assert!(slots.is_empty());
+    }
+}
+
+/// The engine-switch marker gate ([`persist_switch`]) — issue #96/#98,
+/// adversarial re-review of PR #139 (P2).
+///
+/// SCOPE, stated honestly: these exercise `persist_switch`, the `&Db`-only
+/// durable core, NOT the `#[tauri::command]` wrappers around it. This crate
+/// has no `AppHandle` test harness (tauri's `test` feature is not enabled), so
+/// the surrounding orchestration — ask cancellation, `teardown_for_switch`,
+/// the `lead_engine`/`worker_engine` rebuild, the digest, the visible
+/// `engine_switch` marker — is out of reach here and is not claimed to be
+/// covered. What IS covered is the whole of the defect: the ordering of the
+/// three durable writes and the gate between them.
+///
+/// The failure injection is a `BEFORE INSERT` trigger scoped to
+/// `kind = 'turn_freeze_recovered'`, so ONLY the grace-marker insert fails —
+/// deterministically, with a real DB error, no timing or locking dependency
+/// (same technique as `repo`'s `switch_worker_tool_txn` rollback test, which
+/// renames a table). Scoping it to the kind rather than the whole table is
+/// what makes the failure tests discriminating: every other write in the
+/// sequence stays perfectly healthy, so an ungated implementation WOULD
+/// succeed at persisting the tool and clearing the native id, and the
+/// assertions below would go red. Verified by mutation (gate removed → both
+/// failure tests fail).
+#[cfg(test)]
+mod switch_gate_tests {
+    use super::{persist_switch, SwitchTarget};
+    use crate::lead_chat::revive::has_resumable_context;
+    use crate::store::{repo, Db};
+    use sea_orm::ConnectionTrait;
+
+    async fn mem() -> Db {
+        Db::connect("sqlite::memory:").await.unwrap()
+    }
+
+    /// (thread_id, direction_id, session_id), with a native id captured on BOTH
+    /// axes so each test can prove the clear did or did not happen.
+    async fn fixture(db: &Db) -> (i32, i32, i32) {
+        let ws = repo::create_workspace(db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(db, ws.id, "r", "/tmp/weft-switch-gate", "main", "", true)
+            .await
+            .unwrap();
+        let th = repo::create_thread(db, ws.id, "issue", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = repo::create_direction(db, th.id, "alpha", "claude", repo_ref.id, "why", "impl-only", "")
+            .await
+            .unwrap();
+        let sess = repo::create_session(db, dir.id, repo_ref.id, "claude", "/tmp/wt")
+            .await
+            .unwrap();
+        repo::set_lead_native_id(db, th.id, "lead-nat-1").await.unwrap();
+        repo::set_session_native_id(db, sess.id, "worker-nat-1").await.unwrap();
+        (th.id, dir.id, sess.id)
+    }
+
+    /// Make the grace-marker insert — and nothing else — fail with a genuine
+    /// DB error. `insert_lead_message` is a raw `INSERT … SELECT … WHERE
+    /// EXISTS`, so a row-level BEFORE INSERT trigger aborts the statement.
+    async fn block_marker_writes(db: &Db) {
+        db.0
+            .execute_unprepared(
+                "CREATE TRIGGER weft_test_block_freeze_marker \
+                 BEFORE INSERT ON lead_message FOR EACH ROW \
+                 WHEN NEW.kind = 'turn_freeze_recovered' \
+                 BEGIN SELECT RAISE(ABORT, 'injected: grace-marker insert failed'); END",
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn unblock_marker_writes(db: &Db) {
+        db.0
+            .execute_unprepared("DROP TRIGGER weft_test_block_freeze_marker")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lead_switch_stamps_the_marker_then_persists_and_clears() {
+        let db = mem().await;
+        let (th, _dir, _sess) = fixture(&db).await;
+
+        persist_switch(&db, SwitchTarget::Lead { thread_id: th }, "codex", Some("gpt-5.5-high"))
+            .await
+            .unwrap();
+
+        let t = repo::get_thread(&db, th).await.unwrap().unwrap();
+        assert_eq!(t.lead_tool, "codex");
+        assert_eq!(t.lead_model.as_deref(), Some("gpt-5.5-high"));
+        assert_eq!(repo::lead_native_id(&db, th).await.unwrap(), None, "native id cleared");
+        assert!(
+            repo::last_turn_freeze_recovery_secs(&db, th, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "the grace marker is what holds revive's sweep off the freshly-switched lead"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_switch_stamps_the_marker_then_persists_and_clears() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+
+        persist_switch(
+            &db,
+            SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess },
+            "codex",
+            Some("gpt-5.5-high"),
+        )
+        .await
+        .unwrap();
+
+        // BOTH halves of switch_worker_tool_txn — the durable side a cold
+        // reopen reads and the live side every send reads.
+        assert_eq!(repo::get_direction(&db, dir).await.unwrap().unwrap().tool, "codex");
+        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
+        assert_eq!(s.tool, "codex");
+        assert_eq!(s.model.as_deref(), Some("gpt-5.5-high"));
+        assert_eq!(s.native_session_id, None, "native id cleared");
+        assert!(
+            repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Session-scoped, not thread-scoped: a worker switch must not stamp
+        // the LEAD's grace window and mute its independent re-drive.
+        assert_eq!(
+            repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap(),
+            None,
+            "the lead's own marker is a separate row and must stay unstamped"
+        );
+    }
+
+    /// The P2 itself, lead axis: marker write fails → the switch aborts, the
+    /// tool is NOT persisted (proving the stamp really is first, not merely
+    /// gated), the native id is NOT cleared, and — the invariant that actually
+    /// matters — `revive` still sees resumable context, so this lead stays in
+    /// the auto-redrive candidate pool instead of silently dropping out of it.
+    #[tokio::test]
+    async fn lead_switch_aborts_and_changes_nothing_when_the_marker_write_fails() {
+        let db = mem().await;
+        let (th, _dir, _sess) = fixture(&db).await;
+        block_marker_writes(&db).await;
+
+        let err = persist_switch(&db, SwitchTarget::Lead { thread_id: th }, "codex", Some("opus")).await;
+
+        assert!(err.is_err(), "a failed grace-marker stamp must abort the switch");
+        unblock_marker_writes(&db).await;
+
+        let t = repo::get_thread(&db, th).await.unwrap().unwrap();
+        assert_eq!(t.lead_tool, "claude", "tool/model persist must not have run");
+        assert_eq!(t.lead_model, None);
+        let native = repo::lead_native_id(&db, th).await.unwrap();
+        assert_eq!(native.as_deref(), Some("lead-nat-1"), "native id must survive");
+        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, None).await.unwrap();
+        assert_eq!(recovered, None, "the marker genuinely did not land");
+        assert!(
+            has_resumable_context(native.is_some(), recovered),
+            "no-id-AND-no-marker is the silent-forever shape this gate exists to prevent"
+        );
+    }
+
+    /// Same defect, worker axis — asserted independently rather than assumed
+    /// from the lead case. The two axes reach `persist_switch` through
+    /// different repo writers, and this is the exact pair where a rule fixed
+    /// on one axis has already been missed on the other before.
+    #[tokio::test]
+    async fn worker_switch_aborts_and_changes_nothing_when_the_marker_write_fails() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+        block_marker_writes(&db).await;
+
+        let err = persist_switch(
+            &db,
+            SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess },
+            "codex",
+            Some("opus"),
+        )
+        .await;
+
+        assert!(err.is_err(), "a failed grace-marker stamp must abort the switch");
+        unblock_marker_writes(&db).await;
+
+        assert_eq!(
+            repo::get_direction(&db, dir).await.unwrap().unwrap().tool,
+            "claude",
+            "tool persist must not have run"
+        );
+        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
+        assert_eq!(s.tool, "claude");
+        assert_eq!(s.model, None);
+        assert_eq!(
+            s.native_session_id.as_deref(),
+            Some("worker-nat-1"),
+            "native id must survive — clearing it here is what strands the worker"
+        );
+        let recovered = repo::last_turn_freeze_recovery_secs(&db, th, Some(sess)).await.unwrap();
+        assert_eq!(recovered, None, "the marker genuinely did not land");
+        assert!(
+            has_resumable_context(s.native_session_id.is_some(), recovered),
+            "no-id-AND-no-marker is the silent-forever shape this gate exists to prevent"
+        );
+    }
+
+    /// A retry after an aborted switch must be a COMPLETE recovery, not a
+    /// second half-applied attempt — the property that makes "fail and let the
+    /// user retry" the right trade-off over degrading. Same call, marker
+    /// writes healthy again, lands the full end state.
+    #[tokio::test]
+    async fn retrying_after_an_aborted_switch_completes_it() {
+        let db = mem().await;
+        let (th, dir, sess) = fixture(&db).await;
+        let target = SwitchTarget::Worker { thread_id: th, direction_id: dir, session_id: sess };
+        block_marker_writes(&db).await;
+        assert!(persist_switch(&db, target, "codex", None).await.is_err());
+        unblock_marker_writes(&db).await;
+
+        persist_switch(&db, target, "codex", None).await.unwrap();
+
+        assert_eq!(repo::get_direction(&db, dir).await.unwrap().unwrap().tool, "codex");
+        let s = repo::get_session(&db, sess).await.unwrap().unwrap();
+        assert_eq!(s.tool, "codex");
+        assert_eq!(s.native_session_id, None);
+        assert!(repo::last_turn_freeze_recovery_secs(&db, th, Some(sess))
+            .await
+            .unwrap()
+            .is_some());
     }
 }
