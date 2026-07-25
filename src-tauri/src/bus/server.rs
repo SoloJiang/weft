@@ -5,6 +5,7 @@
 //! itself (no auth; an accepted local-first tradeoff).
 
 use crate::ask::{AskRegistry, Decision};
+use crate::bus::builtin_allow;
 use crate::bus::BusRegistry;
 use crate::store::Db;
 use axum::{
@@ -129,6 +130,32 @@ async fn handle_ask(
     }
 
     let (summary, detail, risk, action_key) = summarize(tool_name, req.get("tool_input"));
+
+    // A read-only BUILTIN of the engine itself (claude's Read/Grep/Glob, …) is
+    // waved through, so a turn that reads twenty files doesn't cost twenty
+    // human clicks (issue #96's 23-minute freeze). Closed allowlist, and every
+    // condition below can only SUBTRACT approvals — see `bus::builtin_allow`
+    // for why this lives here instead of in the hook's matcher.
+    match builtin_allow::safe_scope(tool, tool_name) {
+        // Nothing to point anywhere: the name alone settles it, so this needs
+        // neither the risk verdict nor the session's directories.
+        Some(builtin_allow::SafeScope::NoTarget) => {
+            return hook_decision("allow", "read-only builtin (auto-approved)");
+        }
+        // The arguments decide. BOTH the independent risk verdict (which is
+        // what still catches a credential-shaped file living INSIDE the
+        // worktree, e.g. its own `.env`) and containment in the session's own
+        // directories must agree before skipping the human.
+        Some(builtin_allow::SafeScope::ReadOnlyPath) => {
+            if risk == crate::ask::RiskLevel::ReadOnly {
+                let roots = session_roots(&db, thread, &dir).await;
+                if builtin_allow::paths_contained(req.get("tool_input"), &roots) {
+                    return hook_decision("allow", "read-only builtin (auto-approved)");
+                }
+            }
+        }
+        None => {}
+    }
 
     // A standing rule (full access / always-allow) decides without surfacing.
     // Matches on the canonical action_key, NOT the (possibly lossy) summary.
@@ -269,6 +296,81 @@ async fn session_injected(db: &Db, thread: i32, dir: &str, server: &str) -> bool
         Ok(Some(t)) => session_servers_for_kind(&t.kind).contains(&server),
         _ => false,
     }
+}
+
+/// The directories a session is entitled to READ without asking — the "working
+/// directory and additional directories" that claude's own permission model
+/// scopes `Read`/`Grep`/`Glob` to, expressed in weft's terms.
+///
+/// Derived from weft's OWN database, never from the hook payload: identity is
+/// the (thread, dir) pair in the URL path, and the paths come from the rows
+/// weft wrote when it created the session. A payload field (`cwd`) or an
+/// injected route file would both be things a repo could plant — see the
+/// planted-`.weft-codex-ask-url` defense in `codex::ensure_codex_hook_in` for
+/// the same threat.
+///
+/// - Worker lane (`dir` is a direction id): that direction's worktrees, one per
+///   repo it writes. NOT the canonical repos those worktrees came from —
+///   workers are isolated to their worktree by design, so reading the shared
+///   checkout stays a visible decision.
+/// - Lead (`dir` == `LEAD`): its scratch cwd (`<weft_home>/leads/<thread>`,
+///   see `lead_chat::commands::ensure_lead_cwd`) plus the local checkouts of
+///   its workspace's repos — a lead plans ACROSS those repos and reads them
+///   constantly, which is precisely the traffic that froze a lead for 23
+///   minutes in dogfooding.
+///
+/// Returns pre-canonicalized paths (`builtin_allow::contained` compares real
+/// locations, and this way each root is resolved once per ask rather than once
+/// per path). A root that can't be canonicalized — deleted worktree, repo moved
+/// out from under weft — is DROPPED rather than compared as a raw string.
+///
+/// FAILS CLOSED at every step: a DB error, a deleted thread/direction, or a
+/// direction belonging to a different thread all yield an empty (or narrowed)
+/// list, and `builtin_allow::paths_contained` then refuses every absolute path,
+/// so the call surfaces the Needs-you card exactly as it does today.
+async fn session_roots(db: &Db, thread: i32, dir: &str) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if dir != crate::bus::LEAD {
+        let Ok(direction_id) = dir.parse::<i32>() else {
+            return roots;
+        };
+        // Same ownership check `session_injected` makes: a direction id that
+        // isn't THIS thread's is a stale or forged route, not a session.
+        match crate::store::repo::get_direction(db, direction_id).await {
+            Ok(Some(d)) if d.thread_id == thread => {}
+            _ => return roots,
+        }
+        if let Ok(worktrees) = crate::store::repo::list_worktrees(db, Some(direction_id)).await {
+            roots.extend(worktrees.into_iter().map(|w| std::path::PathBuf::from(w.path)));
+        }
+        return canonicalized(roots);
+    }
+    let Ok(Some(thread_row)) = crate::store::repo::get_thread(db, thread).await else {
+        return roots;
+    };
+    if let Ok(home) = crate::paths::weft_home() {
+        roots.push(home.join("leads").join(thread.to_string()));
+    }
+    if let Ok(repos) = crate::store::repo::list_repos(db, thread_row.workspace_id).await {
+        roots.extend(
+            repos
+                .into_iter()
+                .map(|r| std::path::PathBuf::from(r.local_git_path)),
+        );
+    }
+    canonicalized(roots)
+}
+
+/// Resolve each root to its real location, dropping the ones that no longer
+/// exist. An empty string (an unset `local_git_path` on a legacy row) would
+/// canonicalize to the PROCESS's cwd and silently admit everything under it, so
+/// it is filtered before the syscall.
+fn canonicalized(roots: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    roots
+        .into_iter()
+        .filter(|p| !p.as_os_str().is_empty())
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
 }
 
 /// The PreToolUse hook response carrying a permission decision.

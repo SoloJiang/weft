@@ -145,6 +145,12 @@ fn weft_inner_command_hook(command: &str) -> toml_edit::InlineTable {
 
 /// Weft's full PreToolUse entry as an inline table, for the value-array forms:
 /// `{ matcher = ".*", hooks = [{ type = "command", command = "<command>", timeout = 3650 }] }`.
+///
+/// The `.*` matcher is deliberate and must stay total: a matcher is a positive
+/// filter, so any tool name it fails to match is not "asked about later" — the
+/// hook never sees it and it runs UNGATED. Skipping the human for safe
+/// read-only tools is decided in `bus::builtin_allow`, on a closed allowlist
+/// where an unrecognized name falls through to the Needs-you card instead.
 fn weft_entry_inline(command: &str) -> toml_edit::InlineTable {
     let mut hooks_arr = toml_edit::Array::new();
     hooks_arr.push(toml_edit::Value::InlineTable(weft_inner_command_hook(command)));
