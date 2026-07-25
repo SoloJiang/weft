@@ -406,3 +406,56 @@ async fn direction_from_another_thread_fails_closed() {
     assert!(asks.answer(id, Answer::Deny));
     assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
 }
+
+/// The same fail-closed identity check, exercised through the form that names
+/// NO path — the hole Codex found on PR #146.
+///
+/// `direction_from_another_thread_fails_closed` only ever sent a `Read` with an
+/// explicit `file_path`, so it was caught by the absolute-path rule and never
+/// proved anything about the identity check itself. A cwd-defaulting
+/// `Grep {"pattern": …}` has nothing for that rule to reject, so a stale or
+/// cross-thread route could read from an unverified cwd with no human in the
+/// loop. Same wrong-thread route, targetless call: must still surface the card.
+#[tokio::test]
+async fn targetless_grep_on_a_foreign_route_fails_closed() {
+    let tree = TempTree::new("targetless");
+    let wt = tree.dir("wt");
+    file_in(&wt, "src/main.rs");
+    let (base, asks, thread, dir, _h) = worker_session(&tree.dir("repo"), &wt).await;
+
+    // Sanity: the SAME targetless call on the session's REAL route is
+    // auto-approved — so the assertion below is about identity, not about
+    // targetless calls being refused across the board.
+    let ok = ask_unattended(
+        &base,
+        thread,
+        &dir.to_string(),
+        "claude",
+        "Grep",
+        serde_json::json!({ "pattern": "TODO" }),
+    )
+    .await;
+    assert!(
+        ok.contains("\"permissionDecision\":\"allow\""),
+        "a targetless Grep on its own session must stay auto-approved, got {ok}"
+    );
+
+    let base2 = base.clone();
+    let dir_s = dir.to_string();
+    let other_thread = thread + 4242;
+    let call = tokio::spawn(async move {
+        ask(
+            &base2,
+            other_thread,
+            &dir_s,
+            "claude",
+            "Grep",
+            serde_json::json!({ "pattern": "TODO" }),
+        )
+        .await
+    });
+
+    let id = wait_for_card(&asks, "a targetless Grep on a foreign route").await;
+    assert!(asks.answer(id, Answer::Deny));
+    assert!(call.await.unwrap().contains("\"permissionDecision\":\"deny\""));
+}

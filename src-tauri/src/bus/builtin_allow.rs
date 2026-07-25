@@ -210,7 +210,9 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
 ///    contained. This is what refuses `{"file_path": 42}` and
 ///    `{"file_path": "~/.ssh/id_rsa"}` — values rule 2 would skip because
 ///    neither is an absolute path string. A target key that is ABSENT is fine:
-///    `Grep`/`Glob` default to the session's own cwd, which is a root.
+///    `Grep`/`Glob` then default to the engine's own cwd, which weft set to a
+///    root when it spawned the session — a fact that only holds once the
+///    session RESOLVED, hence the empty-`roots` refusal below.
 /// 2. Recursively, ANY string value that looks like an absolute path must be
 ///    contained. This is the one that doesn't depend on knowing the tool's
 ///    schema: an argument key that isn't in `TARGET_KEYS` — one added by a
@@ -229,10 +231,24 @@ fn contained(path: &str, roots: &[PathBuf]) -> bool {
 ///   claude actually emits — a relative `pattern` plus an absolute `path` — is
 ///   unaffected.
 ///
-/// An empty `roots` (a session weft can't resolve — see `session_roots`) makes
-/// every absolute path fail, so nothing path-scoped is auto-approved. Fail
-/// closed.
+/// An empty `roots` — a session weft could NOT resolve (stale direction,
+/// cross-thread route, deleted worktree; see `session_roots`) — refuses
+/// everything, before the arguments are even looked at.
+///
+/// That check has to come first rather than falling out of the path rules,
+/// because the targetless form has no path to fail on. `Grep {"pattern":
+/// "TODO"}` names nothing and searches the ENGINE'S CWD, and rule 1 waves it
+/// through on the strength of "the cwd is one of our roots" — which is exactly
+/// the fact an empty `roots` says we could not establish. Scanning the
+/// arguments would find nothing to reject and approve a read from an
+/// unverified directory, turning the fail-closed identity check in
+/// `session_roots` into a no-op for precisely the routes it exists to catch.
+/// (Caught in review by Codex on PR #146; this function's own test had
+/// asserted the permissive behavior as correct.)
 pub fn paths_contained(input: Option<&Value>, roots: &[PathBuf]) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
     let Some(v) = input else {
         // No arguments at all: nothing points anywhere. `Read`/`Grep` without
         // arguments is malformed and the engine will reject it on its own.
@@ -526,18 +542,51 @@ mod tests {
         ));
     }
 
+    /// An unresolvable session (stale direction, cross-thread route, deleted
+    /// worktree) auto-approves NOTHING path-scoped — including the forms that
+    /// name no path at all.
+    ///
+    /// The targetless case is the one that matters and the one this test
+    /// originally got WRONG: it asserted that `Grep {"pattern":"x"}` was fine
+    /// with no roots, reasoning that a call naming nothing has nothing to
+    /// contain. But it does have a target — the engine's cwd — and "the cwd is
+    /// one of our roots" is exactly what an empty `roots` means we could not
+    /// establish. Scanning arguments finds nothing to reject, so the identity
+    /// check in `session_roots` silently became a no-op for the very routes it
+    /// guards. Codex caught it in review on PR #146.
     #[test]
-    fn empty_roots_allow_nothing_with_a_path() {
+    fn empty_roots_auto_approve_nothing_at_all() {
         let t = TempTree::new("noroots");
         let f = t.file("a.rs");
         assert!(
             !paths_contained(Some(&json!({ "file_path": f })), &[]),
             "an unresolvable session must not auto-approve a path-scoped read"
         );
-        // A call that names nothing has nothing to contain — the NoTarget
-        // scope, not this one, is what actually governs those tools.
-        assert!(paths_contained(Some(&json!({ "pattern": "x" })), &[]));
-        assert!(paths_contained(None, &[]));
+        for targetless in [
+            json!({ "pattern": "x" }),
+            json!({ "pattern": "x", "output_mode": "content" }),
+            json!({}),
+        ] {
+            assert!(
+                !paths_contained(Some(&targetless), &[]),
+                "a cwd-defaulting call must not be approved against an \
+                 unverified cwd: {targetless}"
+            );
+        }
+        assert!(!paths_contained(None, &[]));
+    }
+
+    /// The mirror of the above, so the empty-roots refusal can't be "fixed" by
+    /// something that also breaks the ordinary cwd-defaulting call: with a
+    /// RESOLVED session, naming no path is still fine.
+    #[test]
+    fn targetless_call_is_fine_once_the_session_resolves() {
+        let t = TempTree::new("targetless-ok");
+        assert!(paths_contained(
+            Some(&json!({ "pattern": "TODO" })),
+            &t.roots()
+        ));
+        assert!(paths_contained(None, &t.roots()));
     }
 
     #[test]
