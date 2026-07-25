@@ -1007,6 +1007,55 @@ impl Client {
 }
 
 #[cfg(test)]
+impl Client {
+    /// Test-only stand-in connection (review round 4, P2's mutation-proofing
+    /// ask): registers a real, but trivial and no-IPC, short-lived child
+    /// process the same way [`Client::connect_session`] would, WITHOUT
+    /// spawning a real `codex app-server` binary or running its handshake.
+    /// Exists purely so an `engine.rs` test can put a genuine `Client` VALUE
+    /// into `EngineInner.codex_client` to exercise the take/shutdown wiring
+    /// AROUND it (`take_frozen_turn`'s atomic re-validation) — that wiring
+    /// only cares that `Option<Client>` is `Some` and that `.shutdown()`
+    /// works, never that the connection can actually talk app-server
+    /// protocol. Mirrors `proc_registry`'s own test helpers (`sh -c "sleep
+    /// …"` as a portable stand-in child — see its `null_cmd`). Never call
+    /// this outside `#[cfg(test)]`.
+    pub(crate) fn test_stub() -> Client {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let configured = crate::proc_registry::configure(
+            &mut command,
+            crate::proc_registry::Owner::other("codex-app-server-test-stub"),
+        );
+        // Test-only code (this whole impl is `#[cfg(test)]`) — the crate's
+        // no-panic rule (CLAUDE.md) governs PRODUCTION paths; a trivial `sh`
+        // spawn failing here would mean the test host itself is broken, so
+        // failing loudly beats silently handing back a misleadingly "already
+        // dead" client.
+        let child = command
+            .spawn()
+            .expect("spawn `sh` stub for codex_app_server test");
+        let reg = configured.register(&child);
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        Client(Arc::new(Mutex::new(Some(Inner {
+            write_tx,
+            next_id: 1,
+            pending: HashMap::new(),
+            threads: HashMap::new(),
+            active_turn: HashMap::new(),
+            _child: child,
+            _reg: reg,
+        }))))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
