@@ -85,6 +85,56 @@ pub(crate) fn decision_of(stdout: &str, code: Option<i32>) -> serde_json::Value 
     body["hookSpecificOutput"].clone()
 }
 
+/// A decision-shaped body, as `hook_decision` serializes it (compact, no spaces).
+///
+/// `truncated` drops only the FINAL brace — deliberately the worst case for the
+/// hook's gates rather than a random cut point: it still starts with `{`, still
+/// ends with `}`, and still contains the verdict pair, so it slips past the
+/// structural check AND the verdict match. Only curl's non-zero exit distinguishes
+/// it from a real answer, which is exactly what makes it prove the `$rc` gate. (A
+/// cut mid-reason would fail the `{`…`}` check too and prove nothing about `$rc`.)
+pub(crate) fn decision_body(verdict: &str, truncated: bool) -> String {
+    let whole = format!(
+        "{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"{verdict}\",\"permissionDecisionReason\":\"canned\"}}}}"
+    );
+    match truncated {
+        true => whole[..whole.len() - 1].to_string(),
+        false => whole,
+    }
+}
+
+/// A one-shot server that answers with EXACTLY `status_line` + `body`, then closes.
+/// Used to drive the responses weft's own axum handler can't produce but a crashing
+/// weft, a stale port, or something else on the port can: an error status carrying a
+/// decision-shaped body, and a body cut off mid-answer (`content_length` larger than
+/// what's actually written makes curl report a partial transfer, exit 18).
+/// Returns the base URL; the connection task ends with the process.
+pub(crate) async fn serve_raw_once(
+    status_line: &'static str,
+    body: String,
+    content_length: usize,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        // Drain one read so curl isn't blocked writing its (tiny) request.
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let head =
+            format!("{status_line}\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\n\r\n");
+        let _ = sock.write_all(head.as_bytes()).await;
+        let _ = sock.write_all(body.as_bytes()).await;
+        let _ = sock.flush().await;
+        // Dropping the socket here closes it — short of Content-Length when the
+        // caller asked for a truncated body.
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// Wait for the Ask Bridge to register the hook's ask, then answer it as the
 /// human would. Bounded so a hook that never reaches weft fails the test instead
 /// of sitting on the script's hour-long curl timeout.

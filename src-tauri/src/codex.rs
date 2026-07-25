@@ -210,7 +210,7 @@ while :; do
       127.0.0.1|localhost) ;;
       *) exit 0 ;;
     esac
-    resp="$(curl -s -m 3600 -X POST "$url" -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)"
+    resp="$(curl -sf -m 3600 -X POST "$url" -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)"
     rc=$?
 __DECIDE_OR_DENY__
   fi
@@ -824,6 +824,47 @@ mod tests {
             "a human's Allow must pass through untouched: {out}"
         );
         assert_eq!(out["permissionDecisionReason"], "Approved in weft");
+    }
+
+    /// Review round 2 (P1), codex's own curl: `-f` is per-script, so the error-status
+    /// gate is verified on this hook too, not only on claude's.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn codex_hook_denies_a_decision_shaped_error_response() {
+        use crate::hook_test_support::{decision_body, decision_of, serve_raw_once};
+        let body = decision_body("allow", false);
+        let len = body.len();
+        let base = serve_raw_once("HTTP/1.1 503 Service Unavailable", body, len).await;
+        let url = format!("{base}/ask/2/30?tool=codex");
+        let (stdout, code) = run_helper("hook-500", Some(&url), true).await;
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "deny",
+            "an allow carried by a 5xx must not pass through: {out}"
+        );
+        assert!(
+            out["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("error status"),
+            "the reason must name the error status: {out}"
+        );
+    }
+
+    /// Review round 2 (P1): same truncated-after-the-verdict case as claude's, on
+    /// codex's spliced copy of the shared tail.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn codex_hook_denies_an_answer_cut_off_after_the_verdict() {
+        use crate::hook_test_support::{decision_body, decision_of, serve_raw_once};
+        let base = serve_raw_once("HTTP/1.1 200 OK", decision_body("allow", true), 4096).await;
+        let url = format!("{base}/ask/2/30?tool=codex");
+        let (stdout, code) = run_helper("hook-cut", Some(&url), true).await;
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "deny",
+            "a truncated allow must not pass through: {out}"
+        );
     }
 
     /// The deliberate exception to fail-closed. This hook is GLOBAL

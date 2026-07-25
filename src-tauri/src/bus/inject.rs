@@ -49,11 +49,18 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
 /// branch on purpose: a NON-zero exit is reported as a hook error and the tool
 /// call continues, i.e. it would be fail-open all over again.
 ///
-/// The gate matches the exact `"permissionDecision":"<verdict>"` pairs
-/// `hook_decision`'s compact JSON emits — not a bare `permissionDecision`
-/// substring — so a body cut off mid-answer (weft crashing between headers and
-/// body) denies instead of being forwarded as garbage the consumer then ignores.
-/// Both passthrough tests fail loudly if that serialization ever changes.
+/// Passthrough requires ALL of: curl reporting a successful transfer (`$rc` 0 —
+/// both scripts pass `-f`, so an HTTP error status is a failure too), a body that
+/// still looks structurally whole (`{`…`}`), and one of the exact
+/// `"permissionDecision":"<verdict>"` pairs `hook_decision`'s compact JSON emits.
+/// The `$rc` gate is what catches a truncated answer: the verdict pair sits
+/// BEFORE `permissionDecisionReason` in that JSON, so a transfer interrupted
+/// after the verdict (weft crashing mid-body → curl exit 18) leaves a body that
+/// matches the pair but is invalid JSON, which the consumer would parse-fail and
+/// then CONTINUE on. This is a structural check, not a JSON parse — the scripts
+/// deliberately depend on nothing but bash and curl — so the exact-pair match and
+/// the `$rc` gate carry the weight together. Both passthrough tests fail loudly
+/// if that serialization ever changes.
 ///
 /// The two reasons are BILINGUAL in one string rather than locale-selected. The
 /// frontend `src/i18n/*.ts` tables are unreachable from here (they are TS modules
@@ -67,16 +74,24 @@ fn ask_url(base: &str, thread: i32, dir: &str, tool: &str) -> String {
 ///
 /// Authored flush-left with NO trailing newline; codex's copy is re-indented by
 /// its own writer.
-pub(crate) const HOOK_DECIDE_OR_DENY: &str = r#"case "$resp" in
-  *'"permissionDecision":"allow"'*|*'"permissionDecision":"deny"'*)
-    printf '%s' "$resp"
-    exit 0
-    ;;
-esac
-if [ "$rc" -eq 0 ] && [ -n "$resp" ]; then
-  reason="weft's permission bridge answered without a decision, so this tool call was not reviewed by a human and is denied. / weft 的授权桥没有返回决定，这次工具调用未经人工确认，已拒绝。"
+pub(crate) const HOOK_DECIDE_OR_DENY: &str = r#"if [ "$rc" -eq 0 ]; then
+  case "$resp" in
+    '{'*'}')
+      case "$resp" in
+        *'"permissionDecision":"allow"'*|*'"permissionDecision":"deny"'*)
+          printf '%s' "$resp"
+          exit 0
+          ;;
+      esac
+      ;;
+  esac
+fi
+if [ "$rc" -eq 0 ]; then
+  reason="weft's permission bridge answered without a usable decision, so this tool call was not reviewed by a human and is denied. / weft 的授权桥没有返回可用的决定，这次工具调用未经人工确认，已拒绝。"
+elif [ "$rc" -eq 22 ]; then
+  reason="weft's permission bridge answered with an error status, so this tool call was not reviewed by a human and is denied. / weft 的授权桥返回了错误状态，这次工具调用未经人工确认，已拒绝。"
 else
-  reason="weft could not be reached, so nobody can approve this tool call - denied by default. Start weft again (or check that its local ask bridge is up), then retry. / 无法连接 weft，没人能批准这次工具调用，已按默认拒绝。请重新启动 weft（或确认本地授权桥仍在监听）后重试。"
+  reason="weft could not be reached (or the answer was cut off), so nobody can approve this tool call - denied by default. Start weft again (or check that its local ask bridge is up), then retry. / 无法连接 weft（或回答被中断），没人能批准这次工具调用，已按默认拒绝。请重新启动 weft（或确认本地授权桥仍在监听）后重试。"
 fi
 printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}' "$reason"
 exit 0"#;
@@ -108,7 +123,7 @@ pub fn inject_ask_hook(base: &str, thread: i32, dir: &str, tool: &str, cwd: &Pat
     // the human answers in Needs-you rather than timing out into a fallback.
     let body = format!(
         "#!/usr/bin/env bash\n\
-         resp=$(curl -s -m 3600 -X POST '{url}' -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)\n\
+         resp=$(curl -sf -m 3600 -X POST '{url}' -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)\n\
          rc=$?\n\
          {HOOK_DECIDE_OR_DENY}\n"
     );
@@ -431,6 +446,84 @@ mod tests {
                 .unwrap_or_default()
                 .contains("could not be reached"),
             "the reason must tell the human weft is down: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 2 (P1): a decision-shaped body arriving with an ERROR status
+    /// must not be forwarded. `-f` makes that a failed transfer, so the hook denies
+    /// instead of handing the engine a body it would ignore (→ continue).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn claude_ask_hook_denies_a_decision_shaped_error_response() {
+        use crate::hook_test_support::{decision_body, decision_of, run_hook_script, serve_raw_once};
+        let body = decision_body("allow", false);
+        let len = body.len();
+        let base = serve_raw_once("HTTP/1.1 500 Internal Server Error", body, len).await;
+
+        let dir = std::env::temp_dir().join(format!("weft-askh-500-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = inject_ask_hook(&base, 1, "10", "claude", &dir);
+
+        let (stdout, code) = run_hook_script(
+            &dir.join(".weft-ask-hook.sh"),
+            &dir,
+            HOOK_PAYLOAD,
+            HOOK_LIMIT,
+        )
+        .await;
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "deny",
+            "an allow carried by a 5xx must not pass through: {out}"
+        );
+        assert!(
+            out["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("error status"),
+            "the reason must name the error status: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review round 2 (P1): the verdict pair sits BEFORE the reason field, so a
+    /// transfer cut right after it leaves a body that matches the gate but is
+    /// invalid JSON — which the engine would parse-fail and then CONTINUE on. The
+    /// `$rc` gate (curl exit 18) is what has to catch this.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn claude_ask_hook_denies_an_answer_cut_off_after_the_verdict() {
+        use crate::hook_test_support::{decision_body, decision_of, run_hook_script, serve_raw_once};
+        let cut = decision_body("allow", true);
+        // The fixture must defeat every gate EXCEPT `$rc`, or this test would pass
+        // for the wrong reason.
+        assert!(
+            cut.contains("\"permissionDecision\":\"allow\"")
+                && cut.starts_with('{')
+                && cut.ends_with('}'),
+            "fixture must slip past the shape and verdict gates: {cut}"
+        );
+        // Promise more than we send → curl reports a partial transfer.
+        let base = serve_raw_once("HTTP/1.1 200 OK", cut, 4096).await;
+
+        let dir = std::env::temp_dir().join(format!("weft-askh-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = inject_ask_hook(&base, 1, "10", "claude", &dir);
+
+        let (stdout, code) = run_hook_script(
+            &dir.join(".weft-ask-hook.sh"),
+            &dir,
+            HOOK_PAYLOAD,
+            HOOK_LIMIT,
+        )
+        .await;
+        let out = decision_of(&stdout, code);
+        assert_eq!(
+            out["permissionDecision"], "deny",
+            "a truncated allow must not pass through: {out}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
