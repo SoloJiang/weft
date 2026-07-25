@@ -29,6 +29,24 @@ export interface ResourceOwnerCount {
   count: number;
 }
 
+/** An engine's usage-limit standing (issue #97) — mirrors the Rust
+ *  `engine_quota::QuotaStatus` discriminant as-is; the warn/exceeded cutoffs
+ *  live in Rust (`engine_quota::status_for`), not re-derived here. */
+export type EngineQuotaLevel = "ok" | "warning" | "exceeded";
+
+/** One engine's most recently observed quota signal (`engine_quota::QuotaSnapshot`).
+ *  `tool` crosses the IPC boundary as a plain string (not narrowed to `Tool`) —
+ *  same defensive-typing reason `ResourceOwnerCount.kind` is a plain string. */
+export interface EngineQuotaSnapshot {
+  tool: string;
+  status: EngineQuotaLevel;
+  usedPercent: number | null;
+  /** Unix seconds the window resets, when the source reported one. */
+  resetsAt: number | null;
+  windowLabel: string | null;
+  observedAt: number;
+}
+
 /** Read-only local-runtime dashboard snapshot (issue #112). Combines the three
  *  process-tree safety-net axes — no sampling happens here, this only aggregates
  *  what `process_quota` / `proc_registry` / `session_gate` already track. */
@@ -41,6 +59,9 @@ export interface ResourceDashboardSnapshot {
   byOwner: ResourceOwnerCount[];
   activeSessions: number;
   maxSessions: number;
+  /** Per-engine usage-limit snapshots (issue #97). An engine never observed
+   *  this run is simply absent — not a fabricated "ok" reading. */
+  engineQuota: EngineQuotaSnapshot[];
 }
 
 export interface Workspace {

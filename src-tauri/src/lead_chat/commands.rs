@@ -1556,6 +1556,12 @@ pub struct SwitchOutcome {
     pub new_tool: String,
     pub old_model: Option<String>,
     pub new_model: Option<String>,
+    /// `None` for a human-initiated switch (Settings/Session panel); a short
+    /// machine tag (currently only `"quota_exceeded"`, issue #97) when Weft
+    /// triggered the switch itself — the frontend marker renders this
+    /// distinctly so an auto fail-over is never mistaken for something the
+    /// user clicked.
+    pub reason: Option<String>,
 }
 
 /// A durable, visible timeline marker for a switch — same "system-owned,
@@ -1574,6 +1580,7 @@ async fn insert_switch_marker(
         "new_tool": outcome.new_tool,
         "old_model": outcome.old_model,
         "new_model": outcome.new_model,
+        "reason": outcome.reason,
     })
     .to_string();
     match repo::insert_lead_message(
@@ -1637,11 +1644,31 @@ pub async fn switch_lead_tool(
     model: Option<String>,
     lang: Option<String>,
 ) -> Result<SwitchOutcome, String> {
+    switch_lead_tool_inner(&app, &db, thread_id, tool, model, lang, None).await
+}
+
+/// The body of [`switch_lead_tool`], taking plain refs instead of Tauri's
+/// `State` extractor so non-IPC backend code can call it too — currently the
+/// only other caller is [`maybe_failover_on_quota`] (issue #97: auto fail-over
+/// on a quota-exceeded turn reuses this EXACT sequence, not a hand-rolled
+/// partial update). See `switch_lead_tool`'s original doc for the full
+/// six-step rationale; this split is purely mechanical (no behavior change).
+/// `reason` rides straight onto the returned/persisted [`SwitchOutcome`] — see
+/// its doc.
+async fn switch_lead_tool_inner(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    tool: String,
+    model: Option<String>,
+    lang: Option<String>,
+    reason: Option<String>,
+) -> Result<SwitchOutcome, String> {
     if !KNOWN_TOOLS.contains(&tool.as_str()) {
         return Err(format!("unknown tool {tool:?}"));
     }
     let model = normalize_model(model);
-    let before = repo::get_thread(&db, thread_id)
+    let before = repo::get_thread(db, thread_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("thread {thread_id} not found"))?;
@@ -1650,7 +1677,7 @@ pub async fn switch_lead_tool(
         asks.cancel_for(thread_id, "lead");
     }
     if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
-        engine::teardown_for_switch(&app, &eng).await;
+        engine::teardown_for_switch(app, &eng).await;
     }
 
     // The lead's OWN timeline only — `list_lead_messages` returns every row for
@@ -1658,7 +1685,7 @@ pub async fn switch_lead_tool(
     // lead's digest must not get polluted with unrelated worker conversations
     // (mirrors LeadTab.tsx's own `session_id == null` filter for what the lead
     // console renders).
-    let messages: Vec<_> = repo::list_lead_messages(&db, thread_id)
+    let messages: Vec<_> = repo::list_lead_messages(db, thread_id)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -1666,7 +1693,7 @@ pub async fn switch_lead_tool(
         .collect();
     let digest = engine::build_switch_digest(&before.lead_tool, &tool, &messages);
 
-    repo::switch_thread_tool(&db, thread_id, &tool, model.as_deref())
+    repo::switch_thread_tool(db, thread_id, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
     // Re-stamp the freeze-recovery grace marker BEFORE clearing native id —
@@ -1677,15 +1704,15 @@ pub async fn switch_lead_tool(
     // elapsed and auto-redrive this freshly-switched lead within one sweep
     // tick. Best-effort (logged, not fatal) — the switch's own correctness
     // does not depend on it.
-    if let Err(err) = repo::mark_turn_freeze_recovered(&db, thread_id, None).await {
+    if let Err(err) = repo::mark_turn_freeze_recovered(db, thread_id, None).await {
         eprintln!("[weft] switch_lead_tool: failed to stamp the freeze-recovery grace marker for thread {thread_id}: {err}");
     }
-    engine::clear_native_id(&db, None, thread_id)
+    engine::clear_native_id(db, None, thread_id)
         .await
         .map_err(|e| e.to_string())?;
 
     let lang = lang.unwrap_or_else(|| "en".to_string());
-    let eng = lead_engine(&app, &db, thread_id, &lang)
+    let eng = lead_engine(app, db, thread_id, &lang)
         .await
         .map_err(|e| e.to_string())?;
     if !digest.is_empty() {
@@ -1697,8 +1724,9 @@ pub async fn switch_lead_tool(
         new_tool: tool,
         old_model: before.lead_model,
         new_model: model,
+        reason,
     };
-    insert_switch_marker(&app, &db, thread_id, None, &outcome).await;
+    insert_switch_marker(app, db, thread_id, None, &outcome).await;
     Ok(outcome)
 }
 
@@ -1728,15 +1756,29 @@ pub async fn switch_worker_tool(
     tool: String,
     model: Option<String>,
 ) -> Result<SwitchOutcome, String> {
+    switch_worker_tool_inner(&app, &db, session_id, tool, model, None).await
+}
+
+/// The body of [`switch_worker_tool`] — see [`switch_lead_tool_inner`]'s doc
+/// for why this split exists (issue #97's [`maybe_failover_on_quota`] is the
+/// other caller). Purely mechanical split, no behavior change.
+async fn switch_worker_tool_inner(
+    app: &AppHandle,
+    db: &Db,
+    session_id: i32,
+    tool: String,
+    model: Option<String>,
+    reason: Option<String>,
+) -> Result<SwitchOutcome, String> {
     if !KNOWN_TOOLS.contains(&tool.as_str()) {
         return Err(format!("unknown tool {tool:?}"));
     }
     let model = normalize_model(model);
-    let sess = repo::get_session(&db, session_id)
+    let sess = repo::get_session(db, session_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("session {session_id} not found"))?;
-    let dir = repo::get_direction(&db, sess.direction_id)
+    let dir = repo::get_direction(db, sess.direction_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("direction {} not found", sess.direction_id))?;
@@ -1745,29 +1787,29 @@ pub async fn switch_worker_tool(
         asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
     }
     if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
-        engine::teardown_for_switch(&app, &eng).await;
+        engine::teardown_for_switch(app, &eng).await;
     }
 
-    let messages = repo::list_lead_messages(&db, dir.thread_id).await.unwrap_or_default();
+    let messages = repo::list_lead_messages(db, dir.thread_id).await.unwrap_or_default();
     let own: Vec<_> = messages
         .into_iter()
         .filter(|m| m.session_id == Some(session_id))
         .collect();
     let digest = engine::build_switch_digest(&sess.tool, &tool, &own);
 
-    repo::switch_worker_tool_txn(&db, sess.direction_id, session_id, &tool, model.as_deref())
+    repo::switch_worker_tool_txn(db, sess.direction_id, session_id, &tool, model.as_deref())
         .await
         .map_err(|e| e.to_string())?;
     // See switch_lead_tool's identical call for why — same grace-window reuse,
     // same best-effort posture, ordered before the native-id clear.
-    if let Err(err) = repo::mark_turn_freeze_recovered(&db, dir.thread_id, Some(session_id)).await {
+    if let Err(err) = repo::mark_turn_freeze_recovered(db, dir.thread_id, Some(session_id)).await {
         eprintln!("[weft] switch_worker_tool: failed to stamp the freeze-recovery grace marker for session {session_id}: {err}");
     }
-    engine::clear_native_id(&db, Some(session_id), dir.thread_id)
+    engine::clear_native_id(db, Some(session_id), dir.thread_id)
         .await
         .map_err(|e| e.to_string())?;
 
-    let eng = worker_engine(&app, &db, session_id)
+    let eng = worker_engine(app, db, session_id)
         .await
         .map_err(|e| e.to_string())?;
     if !digest.is_empty() {
@@ -1779,9 +1821,197 @@ pub async fn switch_worker_tool(
         new_tool: tool,
         old_model: sess.model,
         new_model: model,
+        reason,
     };
-    insert_switch_marker(&app, &db, dir.thread_id, Some(session_id), &outcome).await;
+    insert_switch_marker(app, db, dir.thread_id, Some(session_id), &outcome).await;
     Ok(outcome)
+}
+
+// ───────────────────────── issue #97: quota fail-over ─────────────────────────
+
+/// app_setting key gating auto fail-over on a quota-exceeded turn (see
+/// [`maybe_failover_on_quota`]). Unset/anything else = DISABLED — this is
+/// opt-in: switching engines mid-task ships that engine's own history digest
+/// to a DIFFERENT provider, a cost/privacy tradeoff only the user should turn
+/// on (surfaced as a toggle in Settings → Automation).
+pub const K_QUOTA_FAILOVER_ENABLED: &str = "quota_failover_on_exceeded";
+
+/// The reason tag [`maybe_failover_on_quota`] stamps on the [`SwitchOutcome`]
+/// it produces, so the timeline marker (and anything else reading
+/// `engine_switch` rows) can tell an auto fail-over apart from a switch the
+/// user clicked.
+pub const QUOTA_FAILOVER_REASON: &str = "quota_exceeded";
+
+/// The other half of Weft's two-engine fail-over pool, or `None` when `tool`
+/// isn't one Weft knows a fallback for (opencode, or a future/unknown
+/// identity — no auto-switch target). Pure: every case is a plain unit test,
+/// no DB/AppHandle required.
+fn fallback_tool(tool: &str) -> Option<&'static str> {
+    match tool {
+        "claude" => Some("codex"),
+        "codex" => Some("claude"),
+        _ => None,
+    }
+}
+
+/// Minimum gap between two auto fail-overs of the SAME (thread, session) —
+/// the storm-breaker alongside the "fallback isn't ALSO exceeded" check in
+/// [`maybe_failover_on_quota`]: a flapping quota reading, or two failed turns
+/// landing close together before the first switch's teardown even finishes,
+/// must not turn into a rapid-fire switch loop.
+const QUOTA_FAILOVER_COOLDOWN_SECS: u64 = 120;
+
+type QuotaFailoverKey = (i32, Option<i32>);
+
+fn quota_failover_cooldowns() -> &'static std::sync::Mutex<std::collections::HashMap<QuotaFailoverKey, std::time::Instant>>
+{
+    static COOLDOWNS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<QuotaFailoverKey, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    COOLDOWNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Claims the fail-over slot for `key` (thread_id, session_id) iff it hasn't
+/// already fired within [`QUOTA_FAILOVER_COOLDOWN_SECS`] — a one-shot gate,
+/// not a queue: a call that returns `false` should just skip this round
+/// entirely, not retry.
+fn claim_quota_failover_slot(key: QuotaFailoverKey) -> bool {
+    let mut cooldowns = quota_failover_cooldowns()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if let Some(last) = cooldowns.get(&key) {
+        if now.duration_since(*last).as_secs() < QUOTA_FAILOVER_COOLDOWN_SECS {
+            return false;
+        }
+    }
+    cooldowns.insert(key, now);
+    true
+}
+
+/// Fire-and-forget entry point: engine.rs's two TurnEnd sites (codex_consumer,
+/// spawn_reader) call this right after a turn ends in error (issue #97).
+/// Spawns its OWN task so it can safely re-lock the engine —
+/// `switch_lead_tool_inner`/`switch_worker_tool_inner` tear down and
+/// reconstruct it — without deadlocking the CALLER, which may still be
+/// holding that very lock (a `tokio::sync::Mutex` is not reentrant).
+pub fn spawn_quota_failover_check(
+    app: AppHandle,
+    db: Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    tool: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        maybe_failover_on_quota(&app, &db, thread_id, session_id, &tool).await;
+    });
+}
+
+/// issue #97: auto-switch a thread/session away from `tool` onto its
+/// [`fallback_tool`] when ALL of:
+///   1. the [`K_QUOTA_FAILOVER_ENABLED`] setting is on (opt-in, see its doc);
+///   2. the engine_quota hub's LAST-OBSERVED reading for `tool` says
+///      [`crate::engine_quota::QuotaStatus::Exceeded`] (structured — never a
+///      guess from turn-failure text);
+///   3. Weft actually knows a fallback for `tool`;
+///   4. that fallback isn't ALSO known-exceeded — the loop-breaker: two
+///      simultaneously exhausted engines must never ping-pong;
+///   5. this (thread, session) hasn't already auto-switched within the last
+///      [`QUOTA_FAILOVER_COOLDOWN_SECS`] — the storm-breaker.
+///
+/// Reuses [`switch_lead_tool_inner`]/[`switch_worker_tool_inner`] VERBATIM —
+/// the exact six-step teardown/persist/reconstruct sequence #139 shipped and
+/// reviewed, never a hand-rolled partial tool/model update (the #139-review
+/// lesson this issue's brief calls out by name: a claimed switch must
+/// actually reach the backend, not just look like it did in the UI). Every
+/// failure is logged and swallowed — best-effort throughout, since nothing is
+/// waiting on this fire-and-forget check.
+async fn maybe_failover_on_quota(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    tool: &str,
+) {
+    let enabled = matches!(
+        repo::get_setting(db, K_QUOTA_FAILOVER_ENABLED)
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("1") | Some("true")
+    );
+    if !enabled {
+        return;
+    }
+    let Some(snapshot) = crate::engine_quota::current(tool) else {
+        return;
+    };
+    if snapshot.status != crate::engine_quota::QuotaStatus::Exceeded {
+        return;
+    }
+    let Some(fallback) = fallback_tool(tool) else {
+        return;
+    };
+    if let Some(fb_snapshot) = crate::engine_quota::current(fallback) {
+        if fb_snapshot.status == crate::engine_quota::QuotaStatus::Exceeded {
+            eprintln!(
+                "[weft][quota] {tool} exceeded but fallback {fallback} is ALSO exceeded — staying put (thread {thread_id}, session {session_id:?})"
+            );
+            return;
+        }
+    }
+    if !claim_quota_failover_slot((thread_id, session_id)) {
+        return;
+    }
+    eprintln!(
+        "[weft][quota] {tool} exceeded its usage limit — auto-switching to {fallback} (thread {thread_id}, session {session_id:?})"
+    );
+    let reason = Some(QUOTA_FAILOVER_REASON.to_string());
+    let result = match session_id {
+        Some(sid) => {
+            switch_worker_tool_inner(app, db, sid, fallback.to_string(), None, reason)
+                .await
+                .map(|_| ())
+        }
+        None => {
+            switch_lead_tool_inner(app, db, thread_id, fallback.to_string(), None, None, reason)
+                .await
+                .map(|_| ())
+        }
+    };
+    if let Err(err) = result {
+        eprintln!("[weft][quota] auto fail-over {tool} -> {fallback} failed: {err}");
+    }
+}
+
+#[cfg(test)]
+mod quota_failover_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_tool_alternates_claude_and_codex_only() {
+        assert_eq!(fallback_tool("claude"), Some("codex"));
+        assert_eq!(fallback_tool("codex"), Some("claude"));
+        assert_eq!(fallback_tool("opencode"), None);
+        assert_eq!(fallback_tool("unknown-future-tool"), None);
+    }
+
+    #[test]
+    fn quota_failover_cooldown_blocks_immediate_repeat_then_releases() {
+        // Distinct key per test run (module-global hub) so parallel test
+        // threads can't collide on the same cooldown slot.
+        let key: QuotaFailoverKey = (900_001, None);
+        assert!(claim_quota_failover_slot(key), "first claim should succeed");
+        assert!(
+            !claim_quota_failover_slot(key),
+            "immediate second claim within the cooldown must be refused"
+        );
+        // A DIFFERENT key (e.g. a worker session on the same thread) is
+        // independent — the cooldown is keyed, not global.
+        let other: QuotaFailoverKey = (900_001, Some(1));
+        assert!(claim_quota_failover_slot(other));
+    }
 }
 
 #[tauri::command]

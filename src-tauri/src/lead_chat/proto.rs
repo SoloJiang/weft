@@ -180,6 +180,64 @@ pub fn extract_native(tool: &str, line: &str) -> Option<String> {
     }
 }
 
+/// claude's own status → [`crate::engine_quota::QuotaStatus`]. `None` for any
+/// string claude's CLI hasn't sent us before (defensive against protocol
+/// drift) — the caller still falls back to a plain percent reading via
+/// `more_severe`, so an unrecognized status never SILENTLY loses a real signal.
+fn claude_rate_limit_status(raw: &str) -> Option<crate::engine_quota::QuotaStatus> {
+    use crate::engine_quota::QuotaStatus;
+    match raw {
+        "allowed" => Some(QuotaStatus::Ok),
+        "allowed_warning" => Some(QuotaStatus::Warning),
+        "rejected" => Some(QuotaStatus::Exceeded),
+        _ => None,
+    }
+}
+
+/// claude (`-p --output-format stream-json`) emits a `rate_limit_event` line
+/// whenever its rate-limit status changes — PROACTIVELY, not only on failure.
+/// Verified against the installed claude-code 2.1.201 binary's own bundled zod
+/// schema/log strings (Weft previously just discarded this line entirely; see
+/// `parses_result_and_garbage`'s `rate_limit_event` case below, which predates
+/// this function and only asserted it was ignored, not what it means).
+///
+/// Shape: `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"|
+/// "allowed_warning"|"rejected","resetsAt":<unix seconds>,"rateLimitType":
+/// "five_hour"|"seven_day"|"seven_day_opus"|"seven_day_sonnet"|
+/// "seven_day_overage_included"|"overage","utilization":<0..1 fraction>},
+/// "uuid","session_id"}`. `utilization` is a FRACTION (0..1), not a percent —
+/// the CLI's own renderer does `Math.floor(utilization*100)`, mirrored here.
+/// `None` for any other line, or a `rate_limit_event` missing `status`.
+pub fn claude_quota_snapshot(line: &str) -> Option<crate::engine_quota::QuotaSnapshot> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v["type"].as_str() != Some("rate_limit_event") {
+        return None;
+    }
+    let info = &v["rate_limit_info"];
+    let status_raw = info["status"].as_str()?;
+    let used_percent = info["utilization"]
+        .as_f64()
+        .map(|u| (u * 100.0).round().clamp(0.0, 100.0) as u32);
+    // claude's own status is authoritative (its warning threshold is
+    // multi-dimensional — utilization AND time-remaining — not a flat percent,
+    // see the CLI's own `allowed_warning` derivation); a plain percent reading
+    // is combined in as a floor so an unrecognized status string still surfaces
+    // a high utilization instead of silently reading as Ok.
+    let mapped = claude_rate_limit_status(status_raw).unwrap_or(crate::engine_quota::QuotaStatus::Ok);
+    let status = crate::engine_quota::more_severe(
+        mapped,
+        crate::engine_quota::status_for(used_percent, false),
+    );
+    Some(crate::engine_quota::QuotaSnapshot {
+        tool: "claude".to_string(),
+        status,
+        used_percent,
+        resets_at: info["resetsAt"].as_i64(),
+        window_label: info["rateLimitType"].as_str().map(String::from),
+        observed_at: crate::engine_quota::now_unix(),
+    })
+}
+
 fn parse_codex(line: &str) -> ChatEvent {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return ChatEvent::Other;
@@ -1219,5 +1277,45 @@ mod tests {
             parse_line(r#"{"type":"rate_limit_event"}"#),
             ChatEvent::Other
         ));
+    }
+
+    #[test]
+    fn claude_quota_snapshot_maps_real_shaped_rate_limit_event() {
+        use crate::engine_quota::QuotaStatus;
+        // Real shape verified against the installed claude-code 2.1.201 binary's
+        // own bundled zod schema (`Czf`/`Ezf` in its minified bundle).
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1700003600,"rateLimitType":"five_hour","utilization":0.86},"uuid":"u1","session_id":"s1"}"#;
+        let snapshot = claude_quota_snapshot(line).expect("usable snapshot");
+        assert_eq!(snapshot.tool, "claude");
+        assert_eq!(snapshot.status, QuotaStatus::Warning);
+        assert_eq!(snapshot.used_percent, Some(86));
+        assert_eq!(snapshot.resets_at, Some(1700003600));
+        assert_eq!(snapshot.window_label.as_deref(), Some("five_hour"));
+    }
+
+    #[test]
+    fn claude_quota_snapshot_status_mapping_and_percent_floor() {
+        use crate::engine_quota::QuotaStatus;
+        let status_of = |status: &str, utilization: f64| {
+            let line = format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"{status}","utilization":{utilization}}},"uuid":"u","session_id":"s"}}"#
+            );
+            claude_quota_snapshot(&line).expect("usable snapshot").status
+        };
+        assert_eq!(status_of("allowed", 0.1), QuotaStatus::Ok);
+        assert_eq!(status_of("rejected", 0.5), QuotaStatus::Exceeded);
+        // claude's own status is authoritative even at low reported utilization.
+        assert_eq!(status_of("rejected", 0.0), QuotaStatus::Exceeded);
+        // An unrecognized status string still floors to the generic percent
+        // threshold rather than silently reading Ok.
+        assert_eq!(status_of("some_future_status", 0.95), QuotaStatus::Warning);
+    }
+
+    #[test]
+    fn claude_quota_snapshot_none_for_non_rate_limit_lines() {
+        assert!(claude_quota_snapshot("not json").is_none());
+        assert!(claude_quota_snapshot(r#"{"type":"result","subtype":"success"}"#).is_none());
+        // A `rate_limit_event` with no usable status inside `rate_limit_info`.
+        assert!(claude_quota_snapshot(r#"{"type":"rate_limit_event","rate_limit_info":{}}"#).is_none());
     }
 }

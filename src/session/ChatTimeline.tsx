@@ -987,6 +987,10 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
     ? t("session.engineReloadedMarker", { tool: toolFullName(newTool) })
     : t("session.engineSwitchedMarker", { from: toolFullName(oldTool), to: toolFullName(newTool) });
   const modelChanged = oldModel !== newModel;
+  // issue #97: Weft's own auto fail-over (never a switch the user clicked) is
+  // tagged with this reason so it reads unmistakably as automatic — a claimed
+  // engine switch must always be visibly honest about WHO triggered it.
+  const isQuotaFailover = content.reason === "quota_exceeded";
   return (
     <div className="flex items-center gap-3 px-2 py-1.5">
       <span className="h-px flex-1 bg-border" />
@@ -1002,6 +1006,11 @@ function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
         {modelChanged && (
           <span className="font-mono text-[10.5px]">
             {newModel ?? t("session.engineModelCleared")}
+          </span>
+        )}
+        {isQuotaFailover && (
+          <span className="rounded-full border border-waiting/30 bg-waiting/15 px-1.5 py-0.5 text-[10px] font-medium text-waiting">
+            {t("session.engineSwitchedQuotaReason")}
           </span>
         )}
       </span>

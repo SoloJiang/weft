@@ -6,13 +6,17 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
 import { needsBarMotion } from "../lib/motion";
+import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { shouldApplyProcessQuotaStatus } from "../lib/processQuota";
 import type {
+  EngineQuotaLevel,
+  EngineQuotaSnapshot,
   ProcessQuotaLevel,
   ProcessQuotaStatus,
   ResourceDashboardSnapshot,
   ResourceOwnerCount,
 } from "../lib/types";
+import { resetParts, type ResetGranularity } from "./engineQuotaFormat";
 
 // Backend samples process quota every 3s (process_quota.rs's own monitor
 // cadence) — polling faster would just re-read the same value.
@@ -154,6 +158,12 @@ export function ResourcesSettings() {
         </div>
       </SettingsGroup>
 
+      <SettingsGroup title={t("settings.resourcesEngineQuotaGroup")}>
+        <div className="px-3 py-3.5">
+          <EngineQuotaGroup snapshots={snapshot?.engineQuota ?? null} t={t} />
+        </div>
+      </SettingsGroup>
+
       <SettingsGroup title={t("settings.resourcesTreeGroup")}>
         <div className="px-3 py-3.5">
           <ProcessTree
@@ -272,6 +282,110 @@ function ThresholdTick({ percent }: { percent: number }) {
       className="absolute inset-y-0 w-px bg-ink/25"
       style={{ left: `${Math.max(0, Math.min(100, percent))}%` }}
     />
+  );
+}
+
+// ── 引擎额度:各 CLI 账号侧用量(issue #97,claude/codex 各自的结构化信号) ──────
+
+const ENGINE_QUOTA_TONE: Record<
+  EngineQuotaLevel,
+  { bar: string; text: string; pillBg: string; labelKey: string }
+> = {
+  ok: {
+    bar: "bg-success",
+    text: "text-success",
+    pillBg: "border-success/30 bg-success/15",
+    labelKey: "settings.resourcesEngineQuotaOk",
+  },
+  warning: {
+    bar: "bg-waiting",
+    text: "text-waiting",
+    pillBg: "border-waiting/30 bg-waiting/15",
+    labelKey: "settings.resourcesEngineQuotaWarning",
+  },
+  exceeded: {
+    bar: "bg-danger",
+    text: "text-danger",
+    pillBg: "border-danger/30 bg-danger/15",
+    labelKey: "settings.resourcesEngineQuotaExceeded",
+  },
+};
+
+const RESET_LABEL_KEY: Record<ResetGranularity, string> = {
+  days: "settings.resourcesEngineQuotaResetsDays",
+  hours: "settings.resourcesEngineQuotaResetsHours",
+  minutes: "settings.resourcesEngineQuotaResetsMinutes",
+};
+
+function EngineQuotaGroup({
+  snapshots,
+  t,
+}: {
+  snapshots: EngineQuotaSnapshot[] | null;
+  t: TFunction;
+}) {
+  if (snapshots === null) return <GaugeSkeleton />;
+  if (snapshots.length === 0) {
+    return <p className="text-[11.5px] text-ink-faint">{t("settings.resourcesEngineQuotaEmpty")}</p>;
+  }
+  return (
+    <div className="flex flex-col gap-4">
+      {snapshots.map((s) => (
+        <EngineQuotaRow key={s.tool} snapshot={s} t={t} />
+      ))}
+    </div>
+  );
+}
+
+function EngineQuotaRow({ snapshot, t }: { snapshot: EngineQuotaSnapshot; t: TFunction }) {
+  const reduce = useReducedMotion();
+  const tone = ENGINE_QUOTA_TONE[snapshot.status];
+  const hasPercent = snapshot.usedPercent !== null;
+  const pct = hasPercent ? Math.max(0, Math.min(100, snapshot.usedPercent as number)) : null;
+  const parts = snapshot.resetsAt !== null ? resetParts(snapshot.resetsAt, Date.now()) : null;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <span className="flex items-center gap-1.5 text-[12.5px] font-medium text-ink">
+          <ToolIcon tool={snapshot.tool} size={14} />
+          {toolFullName(snapshot.tool)}
+        </span>
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
+            tone.pillBg,
+            tone.text,
+          )}
+        >
+          {t(tone.labelKey)}
+        </span>
+      </div>
+      {pct !== null && (
+        <div className="h-2 w-full overflow-hidden rounded-full bg-border">
+          <div
+            className={cn(
+              "h-full rounded-full",
+              tone.bar,
+              !reduce && "transition-[width] duration-700 ease-out",
+            )}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      )}
+      {(hasPercent || parts) && (
+        <p className="text-[11.5px] leading-relaxed text-ink-faint">
+          {hasPercent ? t("settings.resourcesEngineQuotaPercent", { percent: pct }) : null}
+          {hasPercent && parts ? " · " : null}
+          {parts
+            ? t(RESET_LABEL_KEY[parts.granularity], {
+                days: parts.days,
+                hours: parts.hours,
+                minutes: parts.minutes,
+              })
+            : null}
+        </p>
+      )}
+    </div>
   );
 }
 
