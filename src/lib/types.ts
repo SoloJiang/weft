@@ -329,6 +329,8 @@ export type LeadChatPush =
       tools: string[];
       model: string | null;
       window: number | null;
+      /** Engine intentionally produced this MCP list (incl. empty). */
+      mcp_known?: boolean;
     }
   | {
       /** 每个 turn 结束推一次当前上下文占用。 */

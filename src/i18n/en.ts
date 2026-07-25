@@ -376,6 +376,8 @@ export const en = {
     rewindTitle: "Rewind the conversation?",
     rewindBody:
       "Messages after this one will be removed and the agent will forget them. This message's text goes back into the input box so you can edit and resend it.",
+    ompSessionMissing: "Could not find this conversation on disk. The agent may have cleaned its session files — try sending a new message instead of rewinding.",
+    ompUserMissing: "Could not locate that message in the agent session file. Try rewinding a different message.",
     rewindConfirm: "Rewind",
     rewindModeConversation: "Conversation only",
     rewindModeConversationDesc:

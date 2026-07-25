@@ -85,8 +85,15 @@ export function RewindDialog({
       await onConfirm(mode);
       onOpenChange(false);
     } catch (e) {
-      setErr(String(e));
-      if (import.meta.env.DEV) console.error("chat rewind failed:", String(e));
+      const raw = String(e);
+      let mapped = raw;
+      if (raw.includes("omp_session_not_found")) {
+        mapped = t("session.ompSessionMissing");
+      } else if (raw.includes("omp_user_not_found")) {
+        mapped = t("session.ompUserMissing");
+      }
+      setErr(mapped);
+      if (import.meta.env.DEV) console.error("chat rewind failed:", raw);
       setBusy(false);
     }
   }

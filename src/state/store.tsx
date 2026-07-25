@@ -1882,7 +1882,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         ...m,
         [threadId]: fillMetaHoles(
           m[threadId],
-          metaFromSnapshot({ ...st, mcp_known: true }),
+          metaFromSnapshot({
+            ...st,
+            // Live engine cache is an MCP reading. Stopped/missing engines that
+            // only hydrated model from disk must not wipe pending MCP rows.
+            mcp_known: st.state === "idle" || st.state === "busy",
+          }),
         ),
       }));
     } catch (e) {

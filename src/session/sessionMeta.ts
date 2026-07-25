@@ -51,11 +51,18 @@ export function metaFromInit(
     tools: string[];
     model: string | null;
     window: number | null;
+    /** Explicit MCP authority (ACP open seeds true even when list empty). */
+    mcp_known?: boolean;
   },
 ): SessionMeta {
   const grouped = groupMcpTools(p.mcp_servers, p.tools);
-  // MCP authority only from MCP payload (raw servers present).
-  const authoritative = p.mcp_servers.length > 0;
+  // Authority discriminators (in order):
+  // 1. explicit mcp_known from engine (ACP open always knows what it injected)
+  // 2. claude system/init carries model — empty mcp_servers is real "none"
+  // 3. non-empty raw list is always a real reading
+  // Placeholder inits (model null, empty servers, no flag) keep previous rows.
+  const authoritative =
+    p.mcp_known === true || p.model != null || p.mcp_servers.length > 0;
   const keepPrevServers = !authoritative && grouped.length === 0;
   return {
     contextTokens: prev?.contextTokens,
@@ -120,12 +127,16 @@ export function metaFromSnapshot(snap: {
   model: string | null;
   mcp_servers: { name: string; status: string }[];
   tools: string[];
+  /** True only when the engine/live path actually produced this MCP list. */
   mcp_known?: boolean;
 }): SessionMeta {
   const mcpServers = groupMcpTools(snap.mcp_servers, snap.tools);
-  // Authority only from MCP reading (mcp_known or non-empty raw list).
-  const mcpAuthoritative =
-    snap.mcp_known === true || snap.mcp_servers.length > 0 ? true : undefined;
+  // Never fabricate authority from model/tokens. Non-empty list is a real
+  // reading; empty list is authoritative only when mcp_known is explicit.
+  let mcpAuthoritative: true | undefined;
+  if (snap.mcp_known === true || snap.mcp_servers.length > 0) {
+    mcpAuthoritative = true;
+  }
   return {
     contextTokens: snap.context_tokens ?? undefined,
     window: snap.window ?? undefined,

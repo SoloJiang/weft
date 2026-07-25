@@ -366,6 +366,8 @@ export const zh = {
     rewindTip: "回退到这条消息之前",
     rewindTitle: "回退对话？",
     rewindBody: "这条消息之后的对话将被移除，agent 将不再记得它们；这条消息的文本会回填到输入框，可编辑后重发。",
+    ompSessionMissing: "找不到本地会话文件（agent 可能已清理）。请直接发新消息，而不是回退。",
+    ompUserMissing: "在 agent 会话文件里找不到这条消息，请换一条再试。",
     rewindConfirm: "回退",
     rewindModeConversation: "仅回退对话",
     rewindModeConversationDesc:

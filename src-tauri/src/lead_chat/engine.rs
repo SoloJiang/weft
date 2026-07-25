@@ -136,6 +136,8 @@ pub enum Push {
         tools: Vec<String>,
         model: Option<String>,
         window: Option<u64>,
+        #[serde(default)]
+        mcp_known: bool,
     },
     /// The tool call currently executing — transient: rendered while it runs,
     /// replaced by the next one, cleared by the Turn event. Never persisted.
@@ -2312,13 +2314,10 @@ pub async fn send(
                 asks.inner().cancel(id);
             }
         }
-        // Command/skill bounce: drop the pooled ACP child so the next
-        // client(program) respawns with the new effective binary.
-        if cmd_now {
-            if crate::acp::backend_for(&tool_for_shutdown).is_some() {
-                crate::acp::runtime::shutdown(&tool_for_shutdown).await;
-            }
-        }
+        // Do NOT backend-wide reap the ACP pool — other sessions may still be
+        // mid-turn on another pin. stop_quiet already cancelled+unsubscribed
+        // THIS engine; next send uses client(backend, new_program).
+        let _ = (cmd_now, tool_for_shutdown);
         {
             let mut g = eng.lock().await;
             g.pending_skill_refresh = false;
@@ -3060,6 +3059,7 @@ async fn spawn_acp_turn(
     };
 
     let had_native = native.is_some();
+    let prior_native = native.clone();
     // Keep mcp specs for Session Info seeding (moved into open calls via clone).
     let mcp_for_meta = mcp.clone();
     let (session_id, open_model, open_thinking) = match native {
@@ -3117,6 +3117,7 @@ async fn spawn_acp_turn(
                 tools: g.last_tools.clone(),
                 model: g.last_model.clone(),
                 window: g.last_window,
+                mcp_known: true,
             },
         );
     }
@@ -3149,10 +3150,17 @@ async fn spawn_acp_turn(
         won
     };
     if stop_won {
+        // Subscribe may already have installed a route before acp_client was
+        // published; stop_quiet couldn't see it. Tear the route down or the
+        // next send reuses a stale-epoch consumer that drops every update.
+        let _ = client.cancel(&session_id).await;
+        client.unsubscribe(&session_id).await;
         return Err(anyhow::anyhow!("engine stopped during ACP connect"));
     }
 
-    if !had_native {
+    // Persist whenever open id differs from the id we started with — resume/
+    // load can mint a replacement even when had_native was true.
+    if prior_native.as_deref() != Some(session_id.as_str()) {
         if let Some(sid) = sid {
             let _ = repo::set_session_native_id(&db, sid, &session_id).await;
         } else {
@@ -3641,6 +3649,7 @@ async fn acp_consumer(
                         tools: inner.last_tools.clone(),
                         model: inner.last_model.clone(),
                         window: inner.last_window,
+                        mcp_known: false,
                     },
                 );
             }
@@ -3660,6 +3669,7 @@ async fn acp_consumer(
                         tools: inner.last_tools.clone(),
                         model: inner.last_model.clone(),
                         window: inner.last_window,
+                        mcp_known: false,
                     },
                 );
             }
@@ -3700,11 +3710,16 @@ async fn acp_consumer(
                 intent_key,
                 options,
             } => {
-                let (thread_id, tool, dir, already_stopped) = {
+                let (thread_id, tool, dir, reject_now) = {
                     let i = eng.lock().await;
-                    (i.thread_id, i.tool.clone(), i.ask_dir.clone(), i.stopped)
+                    (
+                        i.thread_id,
+                        i.tool.clone(),
+                        i.ask_dir.clone(),
+                        i.stopped || i.interrupting,
+                    )
                 };
-                if already_stopped {
+                if reject_now {
                     client
                         .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
                         .await;
@@ -4661,6 +4676,94 @@ const INTERRUPT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Interrupt the current turn: protocol control_request first (verified live:
 /// control_response + result{terminal_reason:aborted_streaming}); kill after 3s
 /// as the hard fallback. Either way `--resume` recovers the session next send.
+
+async fn force_acp_finalize_drain(
+    app: &AppHandle,
+    thread_id: i32,
+    session_id: Option<i32>,
+    turn_id: i32,
+    drain: FrozenTurnDrain,
+) {
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    persist_activity(&db, session_id, thread_id, "idle").await;
+    let had_orphan_texts = !drain.orphan_texts.is_empty() || drain.turn_saw_text;
+    if let Ok(Some(row)) = persist_disconnected_turn_row(
+        &db,
+        thread_id,
+        session_id,
+        turn_id,
+        "interrupted",
+        !had_orphan_texts,
+        drain.current,
+    )
+    .await
+    {
+        match row {
+            DisconnectedTurnRow::Finalized { message_id } => {
+                emit_finalize(app, thread_id, message_id, "interrupted");
+            }
+            DisconnectedTurnRow::Inserted(message) => {
+                let _ = app.emit(EVENT, Push::Message { thread_id, message });
+            }
+        }
+    }
+    for (id, text, agent_thread) in drain.orphan_texts {
+        let _ = repo::update_lead_message(
+            &db,
+            id,
+            &text_row_content(&text, agent_thread.as_deref()),
+            "interrupted",
+        )
+        .await;
+        emit_finalize(app, thread_id, id, "interrupted");
+    }
+    finalize_orphan_tool_rows(app, &db, thread_id, drain.orphan_tools, "interrupted").await;
+    if !drain.drained_queue.is_empty() {
+        if let Ok(rows) =
+            repo::set_queued_status_by_ids(&db, &drain.drained_queue, "interrupted").await
+        {
+            for m in rows {
+                emit_finalize(app, thread_id, m.id, "interrupted");
+            }
+        }
+    }
+}
+
+/// Force-reset a wedged ACP turn after cancel is ignored.
+async fn force_acp_turn_reset(
+    app: &AppHandle,
+    eng: &EngineRef,
+    turn_id: i32,
+    epoch_at_arm: u64,
+) {
+    let snapshot = {
+        let mut inner = eng.lock().await;
+        if !inner.turn.busy || inner.turn_id != turn_id || inner.reset_epoch != epoch_at_arm {
+            return;
+        }
+        if !is_acp_tool(&inner.tool) {
+            return;
+        }
+        let client = inner.acp_client.take();
+        let sid = inner.native_id.clone();
+        let Some(drain) = reset_frozen_appserver_turn(&mut inner, turn_id) else {
+            inner.acp_client = client;
+            return;
+        };
+        inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        (inner.thread_id, inner.session_id, client, sid, drain)
+    };
+    let (thread_id, session_id, client, sid, drain) = snapshot;
+    if let (Some(c), Some(sid)) = (client.as_ref(), sid.as_deref()) {
+        let _ = c.cancel(sid).await;
+        c.unsubscribe(sid).await;
+    }
+    force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
+    emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+}
+
 pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     let mut inner = eng.lock().await;
     if !inner.turn.busy {
@@ -4694,6 +4797,8 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
     if is_acp_tool(&inner.tool) {
         let sid = inner.native_id.clone();
         let client = inner.acp_client.clone();
+        let turn_id = inner.turn_id;
+        let epoch = inner.reset_epoch;
         // Drop open Needs-you cards so Always/Full cannot land after Stop.
         let asks = std::mem::take(&mut inner.acp_pending_asks);
         drop(inner);
@@ -4705,6 +4810,14 @@ pub async fn interrupt(app: &AppHandle, eng: &EngineRef) -> anyhow::Result<()> {
         if let (Some(sid), Some(client)) = (sid, client) {
             let _ = client.cancel(&sid).await;
         }
+        // OMP may ignore session/cancel while request_long sits up to 24h.
+        // Bound recovery: if still the same busy turn after grace, force idle.
+        let eng2 = eng.clone();
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            force_acp_turn_reset(&app2, &eng2, turn_id, epoch).await;
+        });
         return Ok(());
     }
     // Process-tool interrupt by transport (via the adapter): per-turn dialects
@@ -5268,6 +5381,12 @@ enum FreezeClaim {
     /// function) — resetting it again here would race that cleanup, so this
     /// deliberately leaves it alone.
     Owned(Option<(crate::codex_app_server::Client, FrozenTurnDrain)>),
+    /// ACP freeze recovery: session handle taken + turn reset.
+    OwnedAcp {
+        client: Option<crate::acp::runtime::ClientHandle>,
+        session_id: Option<String>,
+        drain: FrozenTurnDrain,
+    },
 }
 
 /// Re-confirm turn ownership AND (app-server dialect) take the live client,
@@ -5309,19 +5428,21 @@ async fn take_frozen_turn(eng: &EngineRef, turn_id: i32) -> FreezeClaim {
     if inner.turn_id != turn_id || !inner.turn.busy {
         return FreezeClaim::Stale;
     }
+    if inner.acp_client.is_some() && inner.codex_client.is_none() {
+        let acp = inner.acp_client.take();
+        let sid = inner.native_id.clone();
+        let Some(drain) = reset_frozen_appserver_turn(&mut inner, turn_id) else {
+            inner.acp_client = acp;
+            return FreezeClaim::Stale;
+        };
+        inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        return FreezeClaim::OwnedAcp {
+            client: acp,
+            session_id: sid,
+            drain,
+        };
+    }
     let client = inner.codex_client.take();
-    // `reset_frozen_appserver_turn` re-checks the SAME turn_id+busy guard
-    // just checked above — redundant in practice (this function holds ONE
-    // continuous `&mut` borrow with no `.await` in between the two checks,
-    // so nothing could have changed `inner`) but deliberately NOT asserted
-    // away with `.expect()`/`.unwrap()` (this crate's production paths ban
-    // both — see CLAUDE.md): reusing the guarded function as-is and letting
-    // `and_then`/`map` degrade a theoretically-unreachable mismatch to
-    // "nothing taken" keeps this provably panic-free, not just
-    // panic-free-by-inspection. `and_then` also means a `None` client
-    // (every non-app-server dialect) short-circuits without ever calling
-    // the reset — see [`FreezeClaim::Owned`] for why that dialect must NOT
-    // have its state reset here.
     let taken = client
         .and_then(|c| reset_frozen_appserver_turn(&mut inner, turn_id).map(|drain| (c, drain)));
     FreezeClaim::Owned(taken)
@@ -5403,6 +5524,19 @@ async fn recover_from_freeze(app: &AppHandle, eng: &EngineRef, freeze_secs: u64)
     // connection drop, no native-id clear, no marker, no notice.
     let taken = match take_frozen_turn(eng, turn_id).await {
         FreezeClaim::Stale => return false,
+        FreezeClaim::OwnedAcp {
+            client,
+            session_id: acp_sid,
+            drain,
+        } => {
+            if let (Some(c), Some(sid)) = (client.as_ref(), acp_sid.as_deref()) {
+                let _ = c.cancel(sid).await;
+                c.unsubscribe(sid).await;
+            }
+            force_acp_finalize_drain(app, thread_id, session_id, turn_id, drain).await;
+            emit_turn_push(app, thread_id, session_id, "idle", false, Vec::new());
+            None
+        }
         FreezeClaim::Owned(taken) => taken,
     };
     if let Some((c, drain)) = taken {
@@ -6624,6 +6758,7 @@ fn spawn_reader(
                             tools: inner.last_tools.clone(),
                             model: inner.last_model.clone(),
                             window: inner.last_window,
+                            mcp_known: false,
                         },
                     );
                 }
@@ -6685,6 +6820,7 @@ fn spawn_reader(
                             tools,
                             model,
                             window,
+                            mcp_known: false,
                         },
                     );
                 }
@@ -6702,6 +6838,7 @@ fn spawn_reader(
                             tools: inner.last_tools.clone(),
                             model: inner.last_model.clone(),
                             window: inner.last_window,
+                            mcp_known: false,
                         },
                     );
                 }

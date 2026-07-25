@@ -200,8 +200,20 @@ pub async fn client(backend_id: &str, program: &str) -> anyhow::Result<ClientHan
     Ok(handle)
 }
 
+/// Tear down one (`backend_id`, `program`) pooled client only.
+pub async fn shutdown_program(backend_id: &str, program: &str) {
+    let key = pool_key(backend_id, program);
+    let c = {
+        let mut g = POOL.clients.lock().await;
+        g.remove(&key)
+    };
+    if let Some(c) = c {
+        c.shutdown_and_reap().await;
+    }
+}
+
 /// Tear down every pooled connection for `backend_id` (any program pin).
-/// Used by tool command bounce / tests.
+/// Prefer [`shutdown_program`] when only one pin should die.
 pub async fn shutdown(backend_id: &str) {
     let victims: Vec<ClientHandle> = {
         let mut g = POOL.clients.lock().await;
@@ -852,6 +864,10 @@ impl ClientHandle {
         mcp: Vec<McpServerSpec>,
     ) -> anyhow::Result<String> {
         let mcp_v = Self::paint_mcp(self.backend_id, mcp);
+        // Known id up front — load responses may omit sessionId, and command/
+        // config updates can race before the RPC future resumes.
+        self.mark_opening(session_id).await;
+        self.set_expecting_session(true).await;
         let result = self
             .request(
                 "session/load",
@@ -861,13 +877,33 @@ impl ClientHandle {
                     "mcpServers": mcp_v,
                 }),
             )
-            .await?;
+            .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_expecting_session(false).await;
+                // Leave opening_sessions: caller may retry/subscribe; explicit
+                // unsubscribe/clear_opening happens on failure paths that drop.
+                // Clear so a failed load does not buffer forever under this sid.
+                if let Some(inner) = self.inner.lock().await.as_mut() {
+                    inner.opening_sessions.remove(session_id);
+                    inner.pending_updates.remove(session_id);
+                }
+                return Err(e);
+            }
+        };
         let sid = result
             .get("sessionId")
             .and_then(|s| s.as_str())
             .unwrap_or(session_id)
             .to_string();
-        self.mark_opening(&sid).await;
+        if sid != session_id {
+            self.mark_opening(&sid).await;
+            if let Some(inner) = self.inner.lock().await.as_mut() {
+                inner.opening_sessions.remove(session_id);
+            }
+        }
+        self.set_expecting_session(false).await;
         Ok(sid)
     }
 

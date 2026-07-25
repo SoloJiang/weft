@@ -557,9 +557,7 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
         return Err(anyhow!("ordinal is 1-based"));
     }
     let Some(src) = find_omp_session_file(cwd, session_id)? else {
-        return Err(anyhow!(
-            "omp rewind: session file for {session_id} not found under ~/.omp/agent/sessions"
-        ));
+        return Err(anyhow!("omp_session_not_found"));
     };
     let raw = std::fs::read_to_string(&src)
         .with_context(|| format!("read omp session {}", src.display()))?;
@@ -604,7 +602,7 @@ pub fn fork_omp_at(cwd: &Path, session_id: &str, text: &str, ordinal: usize) -> 
         }
     }
     let Some(cut) = cut_at else {
-        return Err(anyhow!("omp rewind: user message not found in session file"));
+        return Err(anyhow!("omp_user_not_found"));
     };
     if cut == 0 {
         // Nothing to keep before first line — fresh session.
