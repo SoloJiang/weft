@@ -4,15 +4,15 @@ import { useTranslation } from "react-i18next";
 import { Check, Copy, ExternalLink, FolderOpen, MoreHorizontal, Terminal } from "lucide-react";
 import { api } from "../lib/api";
 import { toast } from "./Toast";
-import { appLink, resumeCommand } from "../lib/resume";
+import { nativeSessionResumeTarget, type NativeSessionResumeTarget } from "../lib/resume";
 import { ToolIcon } from "./ToolIcon";
 import { cn } from "../lib/cn";
 
 /**
  * The per-session "…" menu (escape hatch, §4.7 + resume §5.6). Leads with the
- * way to pick the session back up in your own tools — copy the `cd … && <tool>
- * resume <id>` command, or jump to it in the Codex app — then Reveal / Copy
- * path. No "open terminal": an empty shell at the worktree doesn't resume.
+ * way to pick the session back up in its native surface — non-Codex tools copy
+ * the exact terminal command; Codex jumps to its target thread in the app —
+ * then Reveal / Copy path. Neither resume action stops the Weft engine.
  */
 export function Inspect({
   path,
@@ -34,12 +34,16 @@ export function Inspect({
 }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
-  const link = tool && nativeId ? appLink(tool, nativeId) : null;
+  let resumeTarget: NativeSessionResumeTarget | null = null;
+  if (tool && nativeId) {
+    resumeTarget = nativeSessionResumeTarget(tool, path, nativeId, command);
+  }
 
   async function copyResume() {
-    if (!tool || !nativeId) return;
+    if (!resumeTarget || resumeTarget.kind !== "copy-terminal-command") return;
+    if (!navigator.clipboard) return;
     try {
-      await navigator.clipboard?.writeText(resumeCommand(tool, path, nativeId, command));
+      await navigator.clipboard.writeText(resumeTarget.command);
       setCopied(true);
       setTimeout(() => setCopied(false), 1400);
     } catch {
@@ -67,23 +71,13 @@ export function Inspect({
           onClick={(e) => e.stopPropagation()}
           className="weft-pop z-[60] w-64 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.5)]"
         >
-          {nativeId && tool && (
+          {resumeTarget && (
             <>
-              <Item
-                icon={copied ? <Check size={13} className="text-running" /> : <Terminal size={13} />}
-                onSelect={(e) => {
-                  e.preventDefault();
-                  void copyResume();
-                }}
-              >
-                {copied ? t("resume.copied") : t("resume.copyCommand")}
-              </Item>
-              {link && (
-                <Item icon={<ToolIcon tool="codex" size={13} />} onSelect={() => void api.openUrl(link)}>
-                  {t("resume.openInCodex")}
-                  <ExternalLink size={11} className="ml-auto text-ink-faint" />
-                </Item>
-              )}
+              <InspectResumeAction
+                target={resumeTarget}
+                copied={copied}
+                onCopy={() => void copyResume()}
+              />
               <DM.Separator className="my-1 h-px bg-border" />
             </>
           )}
@@ -116,6 +110,43 @@ export function Inspect({
       </DM.Portal>
     </DM.Root>
   );
+}
+
+function InspectResumeAction({
+  target,
+  copied,
+  onCopy,
+}: {
+  readonly target: NativeSessionResumeTarget;
+  readonly copied: boolean;
+  readonly onCopy: () => void;
+}) {
+  const { t } = useTranslation();
+
+  switch (target.kind) {
+    case "copy-terminal-command":
+      return (
+        <Item
+          icon={copied ? <Check size={13} className="text-running" /> : <Terminal size={13} />}
+          onSelect={(event) => {
+            event.preventDefault();
+            onCopy();
+          }}
+        >
+          {copied ? t("resume.copied") : t("resume.copyCommand")}
+        </Item>
+      );
+    case "open-codex":
+      return (
+        <Item
+          icon={<ToolIcon tool="codex" size={13} />}
+          onSelect={() => void api.openUrl(target.url).catch(() => {})}
+        >
+          {t("resume.openInCodex")}
+          <ExternalLink size={11} className="ml-auto text-ink-faint" />
+        </Item>
+      );
+  }
 }
 
 function Item({

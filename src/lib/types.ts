@@ -382,7 +382,8 @@ export type LeadChatPush =
       /** A conversation rewind truncated this thread's rows for one session
        *  (null = lead console): reload the thread's messages. Carries the
        *  session's NEW native id (null = fresh native session on next send) so
-       *  live session state (Open App / Take Over) can't point at the
+       *  live session re-entry actions (Open in Codex / Copy resume command)
+       *  can't point at the
        *  abandoned pre-rewind conversation. */
       type: "rewound";
       thread_id: number;
