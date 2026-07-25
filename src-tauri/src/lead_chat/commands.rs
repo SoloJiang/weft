@@ -3,7 +3,7 @@
 
 use super::engine::{self, EngineRef, LeadChatState};
 use crate::store::{repo, Db};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 pub(crate) fn lead_key(thread_id: i32) -> i64 {
     -(thread_id as i64)
@@ -280,6 +280,7 @@ pub async fn lead_engine(
         extra_args: extra,
         system_prompt,
         native_id: repo::lead_native_id(db, thread_id).await.ok().flatten(),
+        pending_context_digest: None,
         slash_commands: vec![],
         turn: Default::default(),
         turn_id: repo::next_turn_id(db, thread_id).await.unwrap_or(1) - 1,
@@ -1155,6 +1156,7 @@ pub(crate) async fn chat_open_worker_impl(
                 extra_args: extra,
                 system_prompt: String::new(),
                 native_id: native.clone(),
+                pending_context_digest: None,
                 slash_commands: vec![],
                 turn: Default::default(),
                 turn_id: repo::next_turn_id(db, dir.thread_id).await.unwrap_or(1) - 1,
@@ -1275,6 +1277,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         extra_args: extra,
         system_prompt: String::new(),
         native_id: sess.native_session_id.clone(),
+        pending_context_digest: None,
         slash_commands: vec![],
         turn: Default::default(),
         turn_id: repo::next_turn_id(db, dir.thread_id).await.unwrap_or(1) - 1,
@@ -1427,6 +1430,242 @@ pub async fn lead_rewind(
     engine::rewind(&app, &db, &eng, message_id, engine::RewindMode::Conversation)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The three coding-agent identities weft actually drives. `switch_lead_tool`/
+/// `switch_worker_tool` reject anything else up front — a typo'd tool name
+/// must fail loudly here, not deep inside a spawn as a raw "No such file".
+const KNOWN_TOOLS: &[&str] = &["claude", "codex", "opencode"];
+
+/// Blank → None (a cleared/never-set override), trimmed otherwise. Mirrors how
+/// `set_tool_command` treats an empty alias as "no override" rather than
+/// literally pinning to the empty string.
+fn normalize_model(model: Option<String>) -> Option<String> {
+    model.and_then(|m| {
+        let m = m.trim();
+        if m.is_empty() {
+            None
+        } else {
+            Some(m.to_string())
+        }
+    })
+}
+
+/// Result of switching a lead/worker's engine identity and/or model override
+/// (issue #96/#98). Both success and failure must be honestly visible to the
+/// user (not a bare boolean) — the frontend renders the concrete before/after
+/// (e.g. "claude → codex", "no override → gpt-5.5-high").
+#[derive(serde::Serialize, Clone)]
+pub struct SwitchOutcome {
+    pub old_tool: String,
+    pub new_tool: String,
+    pub old_model: Option<String>,
+    pub new_model: Option<String>,
+}
+
+/// A durable, visible timeline marker for a switch — same "system-owned,
+/// always part of the record" treatment `insert_rewind_marker` gives a
+/// rewind. `session_id` is None for the lead, Some for a worker.
+async fn insert_switch_marker(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+    outcome: &SwitchOutcome,
+) {
+    let turn_id = repo::next_turn_id(db, thread_id).await.unwrap_or(1);
+    let content = serde_json::json!({
+        "old_tool": outcome.old_tool,
+        "new_tool": outcome.new_tool,
+        "old_model": outcome.old_model,
+        "new_model": outcome.new_model,
+    })
+    .to_string();
+    match repo::insert_lead_message(
+        db,
+        thread_id,
+        session_id,
+        turn_id,
+        "system",
+        "engine_switch",
+        &content,
+        "complete",
+    )
+    .await
+    {
+        Ok(m) => {
+            let _ = app.emit(engine::EVENT, engine::Push::Message { thread_id, message: m });
+        }
+        Err(e) => eprintln!("[weft] engine-switch marker insert failed: {e}"),
+    }
+}
+
+/// Switch the LEAD's engine identity and/or model override for `thread_id` —
+/// issue #96 layer 1 of 3 (independent of any worker's tool and of the global
+/// default; see `switch_worker_tool` / `set_default_tool`). Semantics:
+///   1. cancel any ask still pending for this thread's lead
+///      (`AskRegistry::cancel_for`) — it can never be answered by the engine
+///      that is about to be torn down.
+///   2. tear down the live engine, if any — same child-kill + row
+///      finalization as Stop, but landing on "idle" rather than
+///      `STATUS_STOPPED` (`engine::teardown_for_switch`), since this is a
+///      replacement, not a stop the user needs to explicitly resume from.
+///   3. persist the new tool/model (`repo::switch_thread_tool`, which also
+///      clears any stale command-alias pin) and clear the native session id
+///      (`engine::clear_native_id` — the SAME contract turn-freeze recovery
+///      and rewind already rely on: dogfooding pitfall #1, a stale native id
+///      handed to a different engine's `--resume`/`resume` fails fast with
+///      "No conversation found").
+///   4. reconstruct the engine fresh via `lead_engine` — the exact construction
+///      path a cold app boot uses (re-injects the ask-hook/MCP servers/
+///      system-prompt for the NEW tool identity), never a hand-patched partial
+///      update that could drift from it.
+///   5. stage a mechanical history digest (`engine::build_switch_digest`) to
+///      ride the new engine's first turn — dogfooding pitfall #2, "new engine
+///      can't see thread history".
+///   6. insert a durable, visible timeline marker so the switch — success or
+///      (via the `?` below) failure surfaced to the caller — is honest either
+///      way.
+/// Switching to the SAME tool (optionally with a different/cleared model) is
+/// allowed on purpose: it is the only lever weft gives to force a stuck/wedged
+/// engine to restart AND pick up an externally-edited CLI config (e.g. the
+/// user changed `~/.claude/settings.json`'s model) without a full app restart.
+#[tauri::command]
+pub async fn switch_lead_tool(
+    app: AppHandle,
+    db: State<'_, Db>,
+    thread_id: i32,
+    tool: String,
+    model: Option<String>,
+    lang: Option<String>,
+) -> Result<SwitchOutcome, String> {
+    if !KNOWN_TOOLS.contains(&tool.as_str()) {
+        return Err(format!("unknown tool {tool:?}"));
+    }
+    let model = normalize_model(model);
+    let before = repo::get_thread(&db, thread_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("thread {thread_id} not found"))?;
+
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        asks.cancel_for(thread_id, "lead");
+    }
+    if let Some(eng) = app.state::<LeadChatState>().remove(lead_key(thread_id)) {
+        engine::teardown_for_switch(&app, &eng).await;
+    }
+
+    // The lead's OWN timeline only — `list_lead_messages` returns every row for
+    // the thread, including every worker's chat (session_id = Some(_)); the
+    // lead's digest must not get polluted with unrelated worker conversations
+    // (mirrors LeadTab.tsx's own `session_id == null` filter for what the lead
+    // console renders).
+    let messages: Vec<_> = repo::list_lead_messages(&db, thread_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m.session_id.is_none())
+        .collect();
+    let digest = engine::build_switch_digest(&before.lead_tool, &tool, &messages);
+
+    repo::switch_thread_tool(&db, thread_id, &tool, model.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    engine::clear_native_id(&db, None, thread_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let lang = lang.unwrap_or_else(|| "en".to_string());
+    let eng = lead_engine(&app, &db, thread_id, &lang)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !digest.is_empty() {
+        eng.lock().await.pending_context_digest = Some(digest);
+    }
+
+    let outcome = SwitchOutcome {
+        old_tool: before.lead_tool,
+        new_tool: tool,
+        old_model: before.lead_model,
+        new_model: model,
+    };
+    insert_switch_marker(&app, &db, thread_id, None, &outcome).await;
+    Ok(outcome)
+}
+
+/// Switch a WORKER's engine identity and/or model override for `session_id` —
+/// issue #96 layer 2 of 3 (independent of the thread's lead and of the global
+/// default; see `switch_lead_tool` / `set_default_tool`). Same six-step
+/// semantics as `switch_lead_tool`, with two worker-specific differences:
+///   - the durable write is `repo::switch_direction_tool` (NOT just
+///     `switch_session_tool`) — `chat_open_worker_impl`'s cold-recreate path
+///     (which fires the very next time this worker is opened, since the
+///     native id this switch just cleared makes that function's resume
+///     condition false) reads `direction.tool`, not `session.tool`; leaving
+///     the direction stale would silently revert the switch on next open.
+///   - the history digest is built from ONLY this session's own rows (a
+///     worker's timeline is a sub-thread of the lead's, keyed by
+///     `session_id`), not the whole thread's.
+#[tauri::command]
+pub async fn switch_worker_tool(
+    app: AppHandle,
+    db: State<'_, Db>,
+    session_id: i32,
+    tool: String,
+    model: Option<String>,
+) -> Result<SwitchOutcome, String> {
+    if !KNOWN_TOOLS.contains(&tool.as_str()) {
+        return Err(format!("unknown tool {tool:?}"));
+    }
+    let model = normalize_model(model);
+    let sess = repo::get_session(&db, session_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("session {session_id} not found"))?;
+    let dir = repo::get_direction(&db, sess.direction_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("direction {} not found", sess.direction_id))?;
+
+    if let Some(asks) = app.try_state::<crate::ask::AskRegistry>() {
+        asks.cancel_for(dir.thread_id, &sess.direction_id.to_string());
+    }
+    if let Some(eng) = app.state::<LeadChatState>().remove(session_id as i64) {
+        engine::teardown_for_switch(&app, &eng).await;
+    }
+
+    let messages = repo::list_lead_messages(&db, dir.thread_id).await.unwrap_or_default();
+    let own: Vec<_> = messages
+        .into_iter()
+        .filter(|m| m.session_id == Some(session_id))
+        .collect();
+    let digest = engine::build_switch_digest(&sess.tool, &tool, &own);
+
+    repo::switch_direction_tool(&db, sess.direction_id, &tool)
+        .await
+        .map_err(|e| e.to_string())?;
+    repo::switch_session_tool(&db, session_id, &tool, model.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    engine::clear_native_id(&db, Some(session_id), dir.thread_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let eng = worker_engine(&app, &db, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !digest.is_empty() {
+        eng.lock().await.pending_context_digest = Some(digest);
+    }
+
+    let outcome = SwitchOutcome {
+        old_tool: sess.tool,
+        new_tool: tool,
+        old_model: sess.model,
+        new_model: model,
+    };
+    insert_switch_marker(&app, &db, dir.thread_id, Some(session_id), &outcome).await;
+    Ok(outcome)
 }
 
 #[tauri::command]

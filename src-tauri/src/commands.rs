@@ -1725,6 +1725,11 @@ pub struct ObserveRef {
     /// claude `mcp__<server>__<tool>` 名(分组成每个 server 的 tool 列表);重挂后
     /// 即便 init 已不再重放也能展开 tool。
     pub tools: Vec<String>,
+    /// This worker's `--model` override (issue #98), if one was set via
+    /// `switch_worker_tool` — distinct from `model` above (the LIVE probed/
+    /// reported model): the override is what the user asked for, `model` is
+    /// what the engine actually reported running. Prefills the switch dialog.
+    pub model_override: Option<String>,
 }
 
 #[tauri::command]
@@ -1790,6 +1795,7 @@ pub async fn session_for(
         latest.as_ref().and_then(|s| s.command.as_deref()),
         &dir.tool,
     );
+    let model_override = latest.as_ref().and_then(|s| s.model.clone());
     Ok(Some(ObserveRef {
         worktree: wt.path,
         branch: wt.branch,
@@ -1803,6 +1809,7 @@ pub async fn session_for(
         model,
         mcp_servers,
         tools,
+        model_override,
     }))
 }
 

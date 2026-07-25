@@ -74,8 +74,15 @@ const ASK_WAIT: Duration = Duration::from_secs(3600);
 
 /// The Ask Bridge endpoint. A tool's permission hook POSTs its PreToolUse-style
 /// payload here and BLOCKS until the human answers in weft (→ allow/deny) or the
-/// wait elapses (→ empty body, so the tool runs its own prompt — never a
-/// silent stall). Identity (thread/dir) comes from the URL path, not the body.
+/// wait elapses (→ an explicit deny, issue #96 — every weft-spawned engine runs
+/// headless (`-p`/`exec`/`run`, no TTY), so there is no "native prompt" for an
+/// ambiguous/empty response to fall back to; claude's own headless behavior on
+/// an empty PreToolUse response is to deny anyway, and opencode's hook plugin
+/// reads the ABSENCE of the literal string "deny" as an implicit allow — a
+/// fail-OPEN gap for exactly this path. An explicit, well-formed deny (the same
+/// shape a human's real Deny answer produces) is unambiguous for all three
+/// engines and fails closed). Identity (thread/dir) comes from the URL path,
+/// not the body.
 async fn handle_ask(
     Path((thread, dir)): Path<(i32, String)>,
     Query(q): Query<HashMap<String, String>>,
@@ -122,11 +129,13 @@ async fn handle_ask(
             };
             hook_decision(d, reason)
         }
-        // timed out or dropped → drop the card, return no decision: the tool
-        // falls back to its native prompt rather than hanging.
+        // Timed out, or the sender was dropped (e.g. `AskRegistry::cancel_for`
+        // tearing down this ask because its engine is being switched/stopped —
+        // issue #96): drop the card and return an EXPLICIT deny — see this
+        // function's doc for why an empty body is the wrong fallback here.
         _ => {
             asks.cancel(id);
-            Json(json!({})).into_response()
+            hook_decision("deny", "No answer in time — denied by default (weft ask bridge)")
         }
     }
 }

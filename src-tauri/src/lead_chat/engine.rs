@@ -6,6 +6,7 @@
 //! tool protocol when available, with a kill fallback; a dead process resumes
 //! via the stored native session id on the next send.
 
+use crate::store::entities::lead_message;
 use crate::store::{repo, Db};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1476,6 +1477,16 @@ pub struct EngineInner {
     pub extra_args: Vec<String>,
     pub system_prompt: String,
     pub native_id: Option<String>,
+    /// A mechanical digest of the thread's history, staged by an engine/model
+    /// switch (issue #96, pitfall 2: "new engine can't see thread history") to
+    /// ride the NEXT outgoing turn's dispatched text — consumed exactly once by
+    /// `send()`, then cleared. `None` in the common case (no switch pending).
+    /// Deliberately NOT persisted: an app restart between a switch and the next
+    /// send already lost nothing durable (the switch already cleared native_id
+    /// in the DB, so the fresh engine starts a brand-new native session either
+    /// way) — only this one best-effort context nudge would be skipped, not any
+    /// correctness guarantee.
+    pub pending_context_digest: Option<String>,
     pub slash_commands: Vec<super::proto::SlashCmd>,
     pub turn: TurnState,
     pub turn_id: i32,
@@ -2461,7 +2472,17 @@ pub async fn send(
         snapshot_turn_checkpoint(app, db, ctx.session_id, ctx.turn, row_id).await;
     }
 
-    let mut outbound = text.to_string();
+    // A switch (issue #96) may have staged a history digest for exactly this
+    // next turn — consumed once, here, so it rides the DISPATCHED text (agent-
+    // visible) without polluting `content` (the human-visible row built above
+    // from the raw `text`/`kind` a moment ago — the same asymmetry the
+    // "Attached files" appendix below already relies on). `.take()` under a
+    // fresh lock: cheap, and Phase 1 already dropped its lock before this point.
+    let digest = eng.lock().await.pending_context_digest.take();
+    let mut outbound = match digest {
+        Some(d) if !d.is_empty() => format!("{d}\n\n{text}"),
+        _ => text.to_string(),
+    };
     // Capture BEFORE images may be spilled to temp files below (per-turn dialects
     // clear out.images after spill; has_attachments must reflect the original inputs).
     let has_attachments = !files.is_empty() || !images.is_empty();
@@ -4247,17 +4268,134 @@ fn stall_notice_text(stall_secs: u64) -> String {
 }
 
 /// Clear the native session id for whichever surface this engine drives — the
-/// DB half of the turn-freeze auto-recovery (issue #93). Mirrors
-/// `persist_activity`'s session/lead dispatch, but routes to the `_opt`
-/// setters (already shipped for `rewind`'s "back to before the first message"
-/// case) so the id can be cleared rather than merely overwritten: a cleared id
-/// means the next send starts a brand-new native session instead of resuming
-/// one whose transport may still be wedged.
-async fn clear_native_id(db: &Db, session_id: Option<i32>, thread_id: i32) -> anyhow::Result<()> {
+/// DB half of the turn-freeze auto-recovery (issue #93), reused as-is for an
+/// engine/model switch (issue #96, pitfall 1: a stale native id from the OLD
+/// engine handed to the NEW one as `--resume`/`resume` fails fast with "No
+/// conversation found"). Mirrors `persist_activity`'s session/lead dispatch,
+/// but routes to the `_opt` setters (already shipped for `rewind`'s "back to
+/// before the first message" case) so the id can be cleared rather than
+/// merely overwritten: a cleared id means the next send starts a brand-new
+/// native session instead of resuming one that belongs to a different engine
+/// (or whose transport may still be wedged). `pub(crate)`: also called from
+/// `lead_chat::commands`'s switch orchestration.
+pub(crate) async fn clear_native_id(
+    db: &Db,
+    session_id: Option<i32>,
+    thread_id: i32,
+) -> anyhow::Result<()> {
     match session_id {
         Some(sid) => repo::set_session_native_id_opt(db, sid, None).await,
         None => repo::set_lead_native_id_opt(db, thread_id, None).await,
     }
+}
+
+/// Cap on how many recent text turns [`build_switch_digest`] carries forward.
+const SWITCH_DIGEST_MAX_TURNS: usize = 12;
+/// Per-turn character cap inside the digest, so one very long message can't
+/// balloon the injected context.
+const SWITCH_DIGEST_MAX_CHARS: usize = 500;
+
+/// Truncate `s` to at most `max` chars (not bytes — safe on multi-byte UTF-8),
+/// appending an ellipsis when it actually cut something.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// A mechanical (non-LLM) digest of a thread's conversation, staged onto
+/// [`EngineInner::pending_context_digest`] so the NEXT turn's dispatched text
+/// carries it (issue #96, pitfall 2: "new engine can't see thread history").
+/// Deterministic and cheap — no extra agent call, no added latency/cost/risk
+/// of its own. Takes the last [`SWITCH_DIGEST_MAX_TURNS`] plain `kind:"text"`
+/// user/assistant rows (skipping tool calls, cards, and other structured
+/// content — a plain conversational summary, not a full transcript), each
+/// capped at [`SWITCH_DIGEST_MAX_CHARS`], oldest-first (the order the human
+/// actually said them in). Empty history (a thread that never said anything,
+/// or a `messages` slice already filtered to one session) → empty digest, so
+/// callers can treat "" as "nothing to inject" without a separate check.
+pub fn build_switch_digest(old_tool: &str, new_tool: &str, messages: &[lead_message::Model]) -> String {
+    let lines: Vec<String> = messages
+        .iter()
+        .filter(|m| m.kind == "text" && (m.role == "user" || m.role == "assistant"))
+        .filter_map(|m| {
+            let v: serde_json::Value = serde_json::from_str(&m.content).ok()?;
+            let text = v.get("text")?.as_str()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let who = if m.role == "user" { "User" } else { "Assistant" };
+            Some(format!("{who}: {}", truncate_chars(text, SWITCH_DIGEST_MAX_CHARS)))
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let skipped = lines.len().saturating_sub(SWITCH_DIGEST_MAX_TURNS);
+    let tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(SWITCH_DIGEST_MAX_TURNS)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    let change = if old_tool == new_tool {
+        format!("reloaded its engine ({new_tool}) — e.g. to pick up a CLI-side config/model change")
+    } else {
+        format!("switched engines ({old_tool} → {new_tool})")
+    };
+    let omitted = if skipped > 0 {
+        format!(" ({skipped} earlier turn(s) omitted)")
+    } else {
+        String::new()
+    };
+    format!(
+        "[weft: this thread just {change}. You have NO memory of the conversation below — it is \
+         real prior context from the human, not a new request. Condensed history, oldest first{omitted}:\n\
+         {}\n\
+         [end of switch digest — continue the conversation naturally from here]",
+        tail.join("\n")
+    )
+}
+
+/// Tear down the current engine for a tool/model switch (issue #96): same
+/// child-kill + row-finalization as [`stop`], but persists "idle" rather than
+/// [`STATUS_STOPPED`] — a switch replaces this engine outright (the caller
+/// constructs a fresh one right after, with the new tool identity), so there
+/// is nothing "stopped" left for a later resume to reconcile. Landing on
+/// `STATUS_STOPPED` would wrongly render the freshly-switched thread/worker as
+/// taken-over/dead the moment the switch finishes, undermining the "switch
+/// succeeded" feedback the caller is about to surface.
+pub async fn teardown_for_switch(app: &AppHandle, eng: &EngineRef) {
+    let (thread_id, session_id, texts, orphans) = stop_quiet(eng).await;
+    if let Some(db) = app.try_state::<Db>() {
+        persist_activity(&db, session_id, thread_id, "idle").await;
+        finalize_orphan_tool_rows(app, &db, thread_id, orphans, "interrupted").await;
+        for (id, text, agent_thread) in texts {
+            let _ = repo::update_lead_message(
+                &db,
+                id,
+                &text_row_content(&text, agent_thread.as_deref()),
+                "interrupted",
+            )
+            .await;
+            emit_finalize(app, thread_id, id, "interrupted");
+        }
+        mark_queued_status(app, &db, thread_id, session_id, "interrupted").await;
+    }
+    let _ = app.emit(
+        EVENT,
+        Push::Turn {
+            thread_id,
+            session_id,
+            state: "idle".into(),
+            recovered: false,
+            queue: Vec::new(),
+        },
+    );
 }
 
 /// Explains the auto-recovery on the Needs-you feed (issue #93). Unlike the
@@ -6847,6 +6985,97 @@ mod tests {
         clear_native_id(&db, None, t.id).await.unwrap();
     }
 
+    fn text_msg(role: &str, text: &str) -> lead_message::Model {
+        text_msg_kind(role, "text", &serde_json::json!({ "text": text }).to_string())
+    }
+
+    fn text_msg_kind(role: &str, kind: &str, content: &str) -> lead_message::Model {
+        lead_message::Model {
+            id: 0,
+            thread_id: 1,
+            session_id: None,
+            turn_id: 0,
+            role: role.into(),
+            kind: kind.into(),
+            content: content.into(),
+            status: "complete".into(),
+            created_at: "0".into(),
+            seq: None,
+            native_anchor: None,
+            consumed_at: None,
+        }
+    }
+
+    #[test]
+    fn switch_digest_empty_history_is_empty() {
+        assert_eq!(build_switch_digest("claude", "codex", &[]), "");
+        // Only non-text/system rows → still empty, not a digest with nothing in it.
+        let rows = vec![text_msg_kind("system", "meta", "{}")];
+        assert_eq!(build_switch_digest("claude", "codex", &rows), "");
+    }
+
+    #[test]
+    fn switch_digest_carries_prior_turns_and_names_the_switch() {
+        let rows = vec![
+            text_msg("user", "please add login"),
+            text_msg("assistant", "sure, starting now"),
+        ];
+        let d = build_switch_digest("claude", "codex", &rows);
+        assert!(d.contains("claude → codex"), "names old and new tool: {d}");
+        assert!(d.contains("User: please add login"));
+        assert!(d.contains("Assistant: sure, starting now"));
+        // Oldest-first: the user's turn precedes the assistant's in the digest.
+        assert!(d.find("User: please add login") < d.find("Assistant: sure, starting now"));
+    }
+
+    #[test]
+    fn switch_digest_same_tool_reads_as_reload_not_switch() {
+        let rows = vec![text_msg("user", "hi")];
+        let d = build_switch_digest("claude", "claude", &rows);
+        assert!(d.contains("reloaded"), "same tool → reload phrasing: {d}");
+        assert!(!d.contains("→"), "no switch arrow when the tool didn't change: {d}");
+    }
+
+    #[test]
+    fn switch_digest_skips_non_text_and_empty_rows() {
+        let rows = vec![
+            text_msg("user", "  "), // blank text after trim → skipped
+            text_msg_kind("assistant", "tool", r#"{"name":"Bash","summary":"ls"}"#),
+            text_msg("assistant", "here is the plan"),
+        ];
+        let d = build_switch_digest("claude", "codex", &rows);
+        assert!(d.contains("here is the plan"));
+        assert!(!d.contains("Bash"), "tool-kind rows are not part of the conversational digest");
+    }
+
+    #[test]
+    fn switch_digest_caps_turn_count_and_marks_omission() {
+        let rows: Vec<_> = (0..20).map(|i| text_msg("user", &format!("turn {i}"))).collect();
+        let d = build_switch_digest("claude", "claude", &rows);
+        assert!(d.contains("turn 19"), "keeps the most recent turns: {d}");
+        assert!(!d.contains("turn 0\n"), "drops the oldest turns beyond the cap: {d}");
+        assert!(d.contains("earlier turn(s) omitted"), "says something was cut: {d}");
+    }
+
+    #[test]
+    fn switch_digest_caps_per_message_length() {
+        let long = "x".repeat(2000);
+        let rows = vec![text_msg("user", &long)];
+        let d = build_switch_digest("claude", "codex", &rows);
+        assert!(d.len() < long.len(), "a single huge message must be truncated: {}", d.len());
+        assert!(d.contains('…'));
+    }
+
+    #[test]
+    fn truncate_chars_is_utf8_safe_and_idempotent_under_the_limit() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        // Multi-byte chars: must count chars, not bytes (would panic/mis-slice on bytes).
+        let s = "你好世界你好世界"; // 8 chars
+        assert_eq!(truncate_chars(s, 4).chars().count(), 5); // 4 + '…'
+        assert!(truncate_chars(s, 4).starts_with("你好世界"));
+    }
+
     #[tokio::test]
     async fn turn_freeze_recovered_marker_roundtrips_for_the_lead() {
         // Review round 1: originally intended as the issue #116 coordination
@@ -7215,6 +7444,7 @@ mod tests {
             extra_args: vec![],
             system_prompt: String::new(),
             native_id: None,
+            pending_context_digest: None,
             slash_commands: vec![],
             turn: TurnState::default(),
             turn_id: 0,
@@ -7762,6 +7992,7 @@ mod tests {
             extra_args: vec!["--mcp-config".into(), "x".into()],
             system_prompt: "be lead".into(),
             native_id: None,
+            pending_context_digest: None,
             slash_commands: vec![],
             turn: TurnState::default(),
             turn_id: 0,

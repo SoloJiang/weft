@@ -51,6 +51,7 @@ import type {
   SessionMetaSnapshot,
   SessionStatus,
   SlashCmd,
+  SwitchOutcome,
   Thread,
   ToolStatus,
   TurnState,
@@ -229,6 +230,16 @@ interface Store {
   mergeWorkerMeta: (sessionId: number, snap: SessionMetaSnapshot) => void;
   /** 非-claude lead 的带外 meta(lead_session_meta 命令)并入 leadMeta。 */
   mergeLeadMeta: (threadId: number, snap: SessionMetaSnapshot) => void;
+  /** Switch the LEAD's engine identity/model (issue #96/#98, layer 1 of 3). */
+  switchLeadTool: (threadId: number, tool: string, model: string | null) => Promise<SwitchOutcome>;
+  /** Switch a WORKER's engine identity/model (issue #96/#98, layer 2 of 3). */
+  switchWorkerTool: (
+    threadId: number,
+    directionId: number,
+    sessionId: number,
+    tool: string,
+    model: string | null,
+  ) => Promise<SwitchOutcome>;
   /** The thread-bus drawer (demoted from a permanent rail). */
   showBus: boolean;
   setShowBus: (open: boolean) => void;
@@ -1575,6 +1586,57 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const mergeLeadMeta = useCallback((threadId: number, snap: SessionMetaSnapshot) => {
     setLeadMeta((m) => ({ ...m, [threadId]: mergeSnapshot(m[threadId], snap) }));
   }, []);
+
+  // Switch the LEAD's engine identity/model (issue #96/#98, layer 1 of 3 —
+  // see EngineSwitchDialog's doc for the three-layer semantics). The backend
+  // already made the switch honest in its own record (a durable engine_switch
+  // timeline marker, delivered like any other Push::Message); this action's
+  // job is patching the TWO bits of local state the event stream doesn't
+  // reach: `threads` (leadTool/leadModel — read by LeadTab/ChatComposer's
+  // badge) and `leadMeta` (the OLD tool's model/MCP/skills readings, which
+  // would otherwise linger under the NEW tool's badge until the next
+  // turn-triggered probe happens to overwrite them).
+  const switchLeadTool = useCallback(async (threadId: number, tool: string, model: string | null) => {
+    const outcome = await api.switchLeadTool(threadId, tool, model, currentLang());
+    setThreads((cur) =>
+      cur.map((t) =>
+        t.id === threadId ? { ...t, lead_tool: outcome.new_tool, lead_model: outcome.new_model } : t,
+      ),
+    );
+    setLeadMeta((m) => {
+      if (!(threadId in m)) return m;
+      const next = { ...m };
+      delete next[threadId];
+      return next;
+    });
+    return outcome;
+  }, []);
+
+  // Switch a WORKER's engine identity/model (issue #96/#98, layer 2 of 3).
+  // `directionId` is the caller's (WorkerConversation already has it in scope)
+  // — the backend also updates `direction.tool` (so a later reopen doesn't
+  // revert the switch, see switch_worker_tool's doc), and the board reads
+  // that through `directionsByThread`, so it is patched the same way
+  // `renameDirection` patches a name change.
+  const switchWorkerTool = useCallback(
+    async (threadId: number, directionId: number, sessionId: number, tool: string, model: string | null) => {
+      const outcome = await api.switchWorkerTool(sessionId, tool, model);
+      setDirections((m) => ({
+        ...m,
+        [threadId]: (m[threadId] ?? []).map((d) =>
+          d.id === directionId ? { ...d, tool: outcome.new_tool } : d,
+        ),
+      }));
+      setWorkerMeta((m) => {
+        if (!(sessionId in m)) return m;
+        const next = { ...m };
+        delete next[sessionId];
+        return next;
+      });
+      return outcome;
+    },
+    [],
+  );
   // Skills dirty latch: bump on any skills mutation; idle sessions/leads compare
   // against their last-refreshed stamp to flag one engine refresh per episode.
   const [skillsDirtyAt, setSkillsDirtyAt] = useState(0);
@@ -2802,6 +2864,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     hydrateWorkerMeta,
     mergeWorkerMeta,
     mergeLeadMeta,
+    switchLeadTool,
+    switchWorkerTool,
     showBus,
     setShowBus,
     navCollapsed,

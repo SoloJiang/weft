@@ -565,6 +565,34 @@ pub async fn rename_thread(db: &Db, thread_id: i32, title: &str) -> Result<threa
     Ok(a.update(&db.0).await?)
 }
 
+/// Switch a thread's lead engine identity + model override (issue #96/#98).
+/// `model=None` clears any override (follow the CLI's own default). Also
+/// clears `lead_command`: a per-tool alias pin (e.g. `claude` → `cc-claude`)
+/// is meaningless once `lead_tool` names a DIFFERENT tool identity, and
+/// carrying it forward would silently try to spawn the old alias as the new
+/// tool's binary. Does NOT touch `native_id` or any live in-memory engine —
+/// the caller (lead_chat::commands::switch_lead_tool) owns that half of the
+/// switch (tear down the live engine, clear native id, reconstruct fresh) so
+/// this stays a plain, independently-testable field update. No-op fields
+/// (same tool, same model) still write through — callers may use this to
+/// force-reload an engine so an externally-edited CLI config takes effect.
+pub async fn switch_thread_tool(
+    db: &Db,
+    thread_id: i32,
+    tool: &str,
+    model: Option<&str>,
+) -> Result<thread::Model> {
+    let m = thread::Entity::find_by_id(thread_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thread {thread_id} not found"))?;
+    let mut a: thread::ActiveModel = m.into();
+    a.lead_tool = Set(tool.to_string());
+    a.lead_command = Set(None);
+    a.lead_model = Set(model.map(str::to_string));
+    Ok(a.update(&db.0).await?)
+}
+
 pub async fn get_plan(db: &Db, thread_id: i32) -> Result<Option<plan::Model>> {
     Ok(plan::Entity::find()
         .filter(plan::Column::ThreadId.eq(thread_id))
@@ -1131,6 +1159,23 @@ pub async fn rename_direction(db: &Db, direction_id: i32, name: &str) -> Result<
     Ok(a.update(&db.0).await?)
 }
 
+/// Persist a worker's engine identity switch onto the DURABLE side (issue
+/// #96/#98): `direction.tool` is the source `chat_open_worker_impl` reads
+/// whenever it (re)creates a session — e.g. the very next open after this
+/// switch cleared the session's native id, which flips that function's
+/// resume-vs-recreate branch to "recreate". Leaving `direction.tool` stale
+/// would silently revert the switch the next time the worker is opened.
+/// Pair with `switch_session_tool` for the live/session-scoped half.
+pub async fn switch_direction_tool(db: &Db, direction_id: i32, tool: &str) -> Result<direction::Model> {
+    let m = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))?;
+    let mut a: direction::ActiveModel = m.into();
+    a.tool = Set(tool.to_string());
+    Ok(a.update(&db.0).await?)
+}
+
 /// A direction's diff "vs target" config: `(stored, base_ref)` where `stored`
 /// is the per-task target branch ("" = use the repo default) and `base_ref` is
 /// the bound repo's default branch (the effective default). Both empty if the
@@ -1605,6 +1650,30 @@ pub async fn create_session(
         return Err(err);
     }
     Ok(inserted)
+}
+
+/// Persist a worker's engine identity switch onto the LIVE session row (issue
+/// #96/#98): `tool` + model override, and — like `switch_thread_tool` —
+/// clears `command` (a per-tool alias pin that would otherwise silently try
+/// to spawn the OLD tool's alias binary under the NEW tool identity). No-op
+/// (row gone) rather than an error: a session can be reclaimed between the
+/// caller's lookup and this write (e.g. a concurrent worktree delete), and a
+/// switch racing that is moot, not a failure. Pair with `switch_direction_tool`
+/// for the durable/direction-scoped half.
+pub async fn switch_session_tool(
+    db: &Db,
+    session_id: i32,
+    tool: &str,
+    model: Option<&str>,
+) -> Result<()> {
+    if let Some(s) = session::Entity::find_by_id(session_id).one(&db.0).await? {
+        let mut a: session::ActiveModel = s.into();
+        a.tool = Set(tool.to_string());
+        a.command = Set(None);
+        a.model = Set(model.map(str::to_string));
+        a.update(&db.0).await?;
+    }
+    Ok(())
 }
 
 pub async fn set_session_native_id(db: &Db, session_id: i32, native_id: &str) -> Result<()> {
@@ -4847,6 +4916,68 @@ mod tests {
         assert_eq!(d2.name, "api work");
         assert_eq!(d2.slug, "main");
         assert_eq!(d2.branch, "feature/add-login");
+    }
+
+    #[tokio::test]
+    async fn switch_thread_tool_updates_identity_and_clears_stale_pin() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        // A command alias pin for the OLD tool must not survive onto the new one.
+        // `applyToExisting=false` pins the existing thread to its prior resolved
+        // command ("claude") — see `apply_to_existing_true_clears_pins_so_rows_
+        // follow_global` above for why `true` would instead CLEAR the pin.
+        set_tool_command(&db, "claude", "cc-claude", false).await.unwrap();
+        assert_eq!(get_thread(&db, t.id).await.unwrap().unwrap().lead_command.as_deref(), Some("claude"));
+
+        let switched = switch_thread_tool(&db, t.id, "codex", Some("gpt-5.5-high")).await.unwrap();
+        assert_eq!(switched.lead_tool, "codex");
+        assert_eq!(switched.lead_model.as_deref(), Some("gpt-5.5-high"));
+        assert_eq!(switched.lead_command, None, "stale claude alias pin must be cleared");
+
+        // A model override clears the same way when the caller passes None.
+        let cleared = switch_thread_tool(&db, t.id, "codex", None).await.unwrap();
+        assert_eq!(cleared.lead_model, None);
+
+        assert!(switch_thread_tool(&db, 9999, "codex", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn switch_direction_and_session_tool_stay_in_lockstep() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let repo = add_repo_ref(&db, ws.id, "web-app", "/tmp/x", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "Issue", "feature", "claude").await.unwrap();
+        let d = create_direction(&db, t.id, "main", "claude", repo.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let s = create_session(&db, d.id, repo.id, "claude", "/tmp/cwd").await.unwrap();
+        set_session_native_id(&db, s.id, "native-1").await.unwrap();
+        // A stale alias pin for the OLD tool must not survive the switch either.
+        {
+            let mut a: session::ActiveModel = get_session(&db, s.id).await.unwrap().unwrap().into();
+            a.command = Set(Some("cc-claude".to_string()));
+            a.update(&db.0).await.unwrap();
+        }
+
+        switch_direction_tool(&db, d.id, "opencode").await.unwrap();
+        switch_session_tool(&db, s.id, "opencode", Some("kimi-for-coding/k2p6")).await.unwrap();
+
+        let d2 = get_direction(&db, d.id).await.unwrap().unwrap();
+        assert_eq!(d2.tool, "opencode", "direction.tool must follow the switch — chat_open_worker_impl's cold-recreate path reads it, not session.tool");
+        let s2 = get_session(&db, s.id).await.unwrap().unwrap();
+        assert_eq!(s2.tool, "opencode");
+        assert_eq!(s2.model.as_deref(), Some("kimi-for-coding/k2p6"));
+        assert_eq!(s2.command, None, "stale claude alias pin must be cleared");
+        // Switching direction/session tool does not itself touch native id —
+        // that is the caller's (lead_chat::commands) job, layered separately.
+        assert_eq!(s2.native_session_id.as_deref(), Some("native-1"));
+
+        assert!(switch_direction_tool(&db, 9999, "codex").await.is_err());
+        // A missing session is tolerated (not an error) — see the function doc.
+        assert!(switch_session_tool(&db, 9999, "codex", None).await.is_ok());
     }
 
     #[tokio::test]

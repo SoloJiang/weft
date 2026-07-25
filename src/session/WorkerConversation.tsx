@@ -13,8 +13,10 @@ import { SessionInfoPanel } from "./SessionInfoPanel";
 import { Inspect } from "../components/Inspect";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ALL_REWIND_MODES, RewindDialog, RewindPickerDialog } from "./RewindDialog";
+import { EngineSwitchDialog } from "./EngineSwitchDialog";
 import { appLink, resumeCommand } from "../lib/resume";
 import { useImeComposition } from "../lib/useImeComposition";
+import { toast } from "../components/Toast";
 import {
   failChatHistoryLoad,
   workerChatHistoryStatus,
@@ -54,11 +56,14 @@ export function WorkerConversation() {
     markSkillsDirty,
     asks,
     setActiveSidePanel,
+    switchWorkerTool,
+    installedTools,
   } = useStore();
   const { t } = useTranslation();
   const directionId = viewing?.directionId ?? null;
   const repoId = viewing?.repoId ?? null;
   const slotKey = directionId == null || repoId == null ? null : `${directionId}:${repoId}`;
+  const [switchOpen, setSwitchOpen] = useState(false);
   const [sessionLookup, setSessionLookup] = useState<WorkerSessionLookup>({
     slotKey: null,
     status: "loading",
@@ -380,6 +385,7 @@ export function WorkerConversation() {
           tool={ref?.tool}
           onClose={() => setRail("none")}
           onReload={onReload}
+          onSwitchEngine={sid != null ? () => setSwitchOpen(true) : undefined}
           busy={busy}
         />
       )}
@@ -417,6 +423,32 @@ export function WorkerConversation() {
           setRewindId(id);
         }}
       />
+      {sid != null && threadId != null && ref && (
+        <EngineSwitchDialog
+          open={switchOpen}
+          onOpenChange={setSwitchOpen}
+          scope="worker"
+          currentTool={ref.tool}
+          currentModel={ref.model_override}
+          installedTools={installedTools}
+          onConfirm={async (tool, model) => {
+            const outcome = await switchWorkerTool(threadId, directionId, sid, tool, model);
+            toast(
+              outcome.old_tool === outcome.new_tool
+                ? t("session.switchReloadedToast", { tool: toolFullName(outcome.new_tool) })
+                : t("session.switchedToast", {
+                    from: toolFullName(outcome.old_tool),
+                    to: toolFullName(outcome.new_tool),
+                  }),
+            );
+            // The next `sessionFor` poll (≤2s) picks up the new tool/model —
+            // this immediate re-check just avoids a visible stale badge for
+            // the length of one poll interval.
+            setSessionLookupRetry((n) => n + 1);
+            return outcome;
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -52,6 +52,8 @@ impl MigratorTrait for Migrator {
             Box::new(M0038CodeCheckpointNestedRepos),
             Box::new(M0039CodeCheckpointIndexTree),
             Box::new(M0040LeadMessageConsumedAt),
+            Box::new(M0041ThreadLeadModel),
+            Box::new(M0042SessionModel),
         ]
     }
 }
@@ -1791,6 +1793,84 @@ impl MigrationTrait for M0040LeadMessageConsumedAt {
                 Table::alter()
                     .table(Alias::new("lead_message"))
                     .drop_column(Alias::new("consumed_at"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the nullable thread.lead_model override (issue #98: model selection in
+/// the UI). NULL = follow the CLI's own configured default. M0001 reflects the
+/// current entity, so a fresh db already has the column; sqlite has no ADD
+/// COLUMN IF NOT EXISTS, so the duplicate is tolerated like M0019/M0020.
+pub struct M0041ThreadLeadModel;
+impl MigrationName for M0041ThreadLeadModel {
+    fn name(&self) -> &str {
+        "m0041_thread_lead_model"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0041ThreadLeadModel {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .add_column(ColumnDef::new(Alias::new("lead_model")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("thread"))
+                    .drop_column(Alias::new("lead_model"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+/// Adds the nullable session.model override. Same semantics/duplicate
+/// tolerance as M0041, scoped to chat-mode workers.
+pub struct M0042SessionModel;
+impl MigrationName for M0042SessionModel {
+    fn name(&self) -> &str {
+        "m0042_session_model"
+    }
+}
+#[async_trait::async_trait]
+impl MigrationTrait for M0042SessionModel {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .add_column(ColumnDef::new(Alias::new("model")).string().null())
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("session"))
+                    .drop_column(Alias::new("model"))
                     .to_owned(),
             )
             .await

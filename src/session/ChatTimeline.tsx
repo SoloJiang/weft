@@ -32,6 +32,8 @@ import { toast } from "../components/Toast";
 import { PermissionBar } from "./PermissionBar";
 import type { useRepoActions } from "./useRepoActions";
 import type { ChatHistoryStatus } from "../state/chatHistory";
+import { ToolIcon, toolFullName } from "../components/ToolIcon";
+import { switchKindOf } from "./engineSwitch";
 
 type RunAction = ReturnType<typeof useRepoActions>["run"];
 
@@ -624,6 +626,13 @@ function TimelineRow({
     );
   }
 
+  // Engine/model switch marker (issue #96/#98): quiet centered divider, same
+  // treatment as the rewind marker above, but names the concrete before/after
+  // so "did my switch actually take?" never requires digging through Settings.
+  if (m.kind === "engine_switch") {
+    return <EngineSwitchMarker content={c} />;
+  }
+
   if (m.kind === "tool") {
     const content = parse(m.content);
     const name = typeof content.name === "string" ? content.name : "tool";
@@ -956,6 +965,48 @@ function TimelineRow({
         </MessageActionsRow>
       )}
     </Message>
+  );
+}
+
+/** Durable, visible record of an engine/model switch (issue #96/#98) — the
+ *  same quiet centered-divider treatment the rewind marker uses, but names
+ *  the concrete before/after (tool identity + model override, when either
+ *  changed) so a switch's outcome is honest and permanent in the transcript,
+ *  never just a toast that's gone the moment you look away. Same tool +
+ *  same model reads as "reloaded" (see `build_switch_digest`'s doc for why
+ *  that's a real, useful action — forcing a stuck engine to restart, or
+ *  picking up an externally-edited CLI config). */
+function EngineSwitchMarker({ content }: { content: Record<string, unknown> }) {
+  const { t } = useTranslation();
+  const oldTool = typeof content.old_tool === "string" ? content.old_tool : "";
+  const newTool = typeof content.new_tool === "string" ? content.new_tool : "";
+  const oldModel = typeof content.old_model === "string" ? content.old_model : null;
+  const newModel = typeof content.new_model === "string" ? content.new_model : null;
+  const sameTool = switchKindOf(oldTool, newTool) === "reload";
+  const label = sameTool
+    ? t("session.engineReloadedMarker", { tool: toolFullName(newTool) })
+    : t("session.engineSwitchedMarker", { from: toolFullName(oldTool), to: toolFullName(newTool) });
+  const modelChanged = oldModel !== newModel;
+  return (
+    <div className="flex items-center gap-3 px-2 py-1.5">
+      <span className="h-px flex-1 bg-border" />
+      <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-ink-faint">
+        {!sameTool && oldTool && (
+          <>
+            <ToolIcon tool={oldTool} size={12} />
+            <ArrowRight size={10} />
+          </>
+        )}
+        <ToolIcon tool={newTool} size={12} />
+        <span>{label}</span>
+        {modelChanged && (
+          <span className="font-mono text-[10.5px]">
+            {newModel ?? t("session.engineModelCleared")}
+          </span>
+        )}
+      </span>
+      <span className="h-px flex-1 bg-border" />
+    </div>
   );
 }
 
