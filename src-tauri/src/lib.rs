@@ -189,6 +189,11 @@ pub fn run() {
             // seeded synchronously above, before the builder). Ordering hygiene.
             auth_persist::spawn(app.handle().clone());
             lead_chat::revive::spawn_revive(app.handle().clone());
+            // Runtime companion to the boot-only sweep above: re-checks for the
+            // same silent-stall shape (and stopped-worker coverage) on a timer,
+            // since a coordination deadlock can develop while the app is
+            // already running, not only across a restart (issue #95).
+            lead_chat::revive::spawn_stall_watch(app.handle().clone());
             power::spawn_sweep(app.handle().clone());
             process_quota::spawn_monitor(app.handle().clone());
             gc::spawn_periodic(app.handle().clone());
