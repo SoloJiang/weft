@@ -786,6 +786,7 @@ export const zh = {
     resourcesHint:
       "只读展示 Weft 自身在这台机器上的当前占用——进程数、内存、并发会话槽位。采样本身由进程树安全网完成，这个页面只负责展示。",
     resourcesStale: "刷新失败，当前展示的是最近一次读到的数据。",
+    resourcesLoadFailed: "刷新失败，目前还没有取到任何数据。",
     resourcesQuotaGroup: "进程配额",
     resourcesQuotaNormal: "正常",
     resourcesQuotaWarning: "接近上限",

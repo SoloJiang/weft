@@ -809,6 +809,7 @@ export const en = {
     resourcesHint:
       "A read-only view of what Weft itself is using on this machine right now — process count, memory, and session concurrency. Sampling lives in the process-tree safety net; this page only displays it.",
     resourcesStale: "Refresh failed — showing the last known values.",
+    resourcesLoadFailed: "Refresh failed — no data loaded yet.",
     resourcesQuotaGroup: "Process quota",
     resourcesQuotaNormal: "Normal",
     resourcesQuotaWarning: "Warning",

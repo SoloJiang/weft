@@ -59,68 +59,75 @@ pub fn instance_id() -> &'static str {
     ID.get_or_init(|| std::process::id().to_string()).as_str()
 }
 
-/// 逻辑属主 = 谁要的这个子进程,便于按属主整树收尸。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OwnerKind {
-    /// 全局(app-scoped)codex app-server。
-    GlobalAppServer,
-    /// 某个 worker 会话。
-    Session,
-    /// 某个 lead thread 会话。
-    LeadThread,
-    /// 仓库图谱扫描(每仓库/关系一发,短命)。
-    Curator,
-    /// opencode server。
-    Opencode,
-    /// rewind 预览静态服务。
-    Preview,
-    /// 探测(版本/能力,短命)。
-    Probe,
-    /// 其它 / 测试。
-    Other,
+/// Defines [`OwnerKind`] and every method whose correctness depends on
+/// covering all variants, from ONE list of `variant => "label"` lines — so a
+/// variant cannot be *defined* without also being *wired into* [`OwnerKind::all`].
+///
+/// This replaces the previous `next()`-linked-list approach after round-2
+/// review found it didn't actually deliver that guarantee: `next()`'s
+/// exhaustive `match` only forces every variant to have *some* arm, never
+/// that the arm's value keeps it reachable from `all()`'s traversal. A new
+/// variant given an arm like `NewKind => None` satisfies the compiler,
+/// compiles clean, and leaves the old hard-coded-8-item regression test
+/// green — while `all()` / `instance_owner_counts` / the dashboard's
+/// "process tree" breakdown silently drop the new variant. That's the exact
+/// "array literal missing an item" failure round-1 set out to close, just
+/// one indirection removed. (This also corrects an overclaim in that
+/// revision's comments and commit message, which read the exhaustive
+/// `match` as forcing the variant to be "wired into the traversal chain" —
+/// it only forces *an* arm to exist, never that the arm is correct or
+/// reachable. "Compiles" was never the same guarantee as "wired in".)
+///
+/// Generating `all()` as a plain `vec![...]` straight from this list — not a
+/// `while let` walk over a hand-linked chain — also closes the round-2
+/// finding that an accidentally-cyclic chain would hang `all()` forever:
+/// there is no traversal left to loop, so there is nothing to protect with
+/// an iteration cap. `all()` backs the resource dashboard's 3s poll, so a
+/// silent hang here would have been a real incident, not a red test.
+macro_rules! owner_kinds {
+    ($($(#[$doc:meta])* $variant:ident => $label:literal),+ $(,)?) => {
+        /// 逻辑属主 = 谁要的这个子进程,便于按属主整树收尸。
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum OwnerKind {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl OwnerKind {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(OwnerKind::$variant => $label,)+
+                }
+            }
+
+            /// 全部变体,声明顺序,供 [`instance_owner_counts`] 遍历。直接由
+            /// `owner_kinds!` 宏调用(见下方)的 token 列表展开成 `vec![...]`——不是
+            /// 遍历一条手工维护的链,也不是另一份手写数组字面量。一个变体能不能被
+            /// 定义出来,和它会不会出现在这里是**同一件事**(同一次宏展开):不存在
+            /// 「变体已定义、但没接进遍历」的中间状态,也没有链式结构可供死循环。
+            fn all() -> Vec<OwnerKind> {
+                vec![$(OwnerKind::$variant,)+]
+            }
+        }
+    };
 }
 
-impl OwnerKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            OwnerKind::GlobalAppServer => "global_app_server",
-            OwnerKind::Session => "session",
-            OwnerKind::LeadThread => "lead_thread",
-            OwnerKind::Curator => "curator",
-            OwnerKind::Opencode => "opencode",
-            OwnerKind::Preview => "preview",
-            OwnerKind::Probe => "probe",
-            OwnerKind::Other => "other",
-        }
-    }
-
-    /// 声明顺序中排在 `self` 后一个的变体;最后一个(`Other`)之后是 `None`。穷尽
-    /// `match`——和 [`Self::as_str`] 同款写法:新增第 9 个变体若不给它接一条臂,这里
-    /// 编译不过,逼着改动的人在加变体的同一时刻把它接进遍历链,而不是留一个只有
-    /// 运行期才会被发现(或永远不会被发现)的空洞。
-    fn next(self) -> Option<OwnerKind> {
-        match self {
-            OwnerKind::GlobalAppServer => Some(OwnerKind::Session),
-            OwnerKind::Session => Some(OwnerKind::LeadThread),
-            OwnerKind::LeadThread => Some(OwnerKind::Curator),
-            OwnerKind::Curator => Some(OwnerKind::Opencode),
-            OwnerKind::Opencode => Some(OwnerKind::Preview),
-            OwnerKind::Preview => Some(OwnerKind::Probe),
-            OwnerKind::Probe => Some(OwnerKind::Other),
-            OwnerKind::Other => None,
-        }
-    }
-
-    /// 全部变体,声明顺序,供 [`instance_owner_counts`] 遍历。沿 [`Self::next`] 从第
-    /// 一个变体走到链尾——单一来源:能出现在这里的变体必然先在 `next` 的穷尽 `match`
-    /// 里露过面,不像手写字面量数组那样可以悄悄漏掉一个新变体而不报错。
-    fn all() -> Vec<OwnerKind> {
-        let mut out = vec![OwnerKind::GlobalAppServer];
-        while let Some(next) = out.last().copied().and_then(OwnerKind::next) {
-            out.push(next);
-        }
-        out
-    }
+owner_kinds! {
+    /// 全局(app-scoped)codex app-server。
+    GlobalAppServer => "global_app_server",
+    /// 某个 worker 会话。
+    Session => "session",
+    /// 某个 lead thread 会话。
+    LeadThread => "lead_thread",
+    /// 仓库图谱扫描(每仓库/关系一发,短命)。
+    Curator => "curator",
+    /// opencode server。
+    Opencode => "opencode",
+    /// rewind 预览静态服务。
+    Preview => "preview",
+    /// 探测(版本/能力,短命)。
+    Probe => "probe",
+    /// 其它 / 测试。
+    Other => "other",
 }
 
 /// 一个受管子进程的属主标识 `{kind, id}`。`id` 通常是 session/thread id;无自然 id 的
@@ -986,9 +993,13 @@ mod tests {
         assert_eq!(parse_vmrss_kb("VmRSS:\tnot-a-number kB\n"), None);
     }
 
-    /// 回归守卫:`OwnerKind::all()` 必须覆盖全部变体、无重复、顺序即声明顺序。这条
-    /// 本身不是穷尽性保证的来源(那是 `next()` 的穷尽 `match` 在编译期给的)——它防的
-    /// 是另一种漂移:有人往 `next()` 接新变体时把链接错,导致 `all()` 漏掉或重复。
+    /// 回归哨兵(记录性,非穷尽性来源):`OwnerKind::all()` 必须覆盖全部变体、无重复、
+    /// 顺序即声明顺序。自改用 `owner_kinds!` 宏后,「变体存在」与「出现在 `all()`
+    /// 里」已经是同一次宏展开的同一件事,穷尽性由宏结构本身担保(见宏定义处文档),
+    /// 不再靠这条测试撑住。这条测试现在防的是另一件事:有人重排/增删
+    /// `owner_kinds!` 调用里的行时,没意识到顺序变化会影响
+    /// `instance_owner_counts` 对前端的顺序承诺(分类顺序不跳动)——用一份显式的
+    /// 期望列表把当前顺序钉住,变动时逼着改动的人在这里也确认一遍。
     #[test]
     fn owner_kind_all_covers_every_variant_in_declaration_order() {
         assert_eq!(

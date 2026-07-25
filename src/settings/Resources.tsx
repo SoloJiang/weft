@@ -2,9 +2,10 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { listen } from "@tauri-apps/api/event";
-import { useReducedMotion } from "motion/react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { api } from "../lib/api";
 import { cn } from "../lib/cn";
+import { needsBarMotion } from "../lib/motion";
 import type {
   ProcessQuotaLevel,
   ProcessQuotaStatus,
@@ -22,6 +23,24 @@ const POLL_MS = 3000;
 // "right now" — surface a restrained staleness hint instead.
 const STALE_AFTER_CONSECUTIVE_FAILURES = 3;
 
+/** Whether — and why — to show the "the data below may be old" hint under the
+ *  panel description. Derived (not stored) from `snapshot`/`stale` so the two
+ *  pieces of state can't drift into an impossible combination at a render
+ *  site: `staleNoData` covers the case the plain `stale` boolean couldn't
+ *  express — the first few polls after mount fail before any snapshot ever
+ *  lands, so there is no "last known values" to honestly point back to. */
+type SnapshotHint = "none" | "stale" | "staleNoData";
+
+function snapshotHintOf(stale: boolean, hasSnapshot: boolean): SnapshotHint {
+  if (!stale) return "none";
+  return hasSnapshot ? "stale" : "staleNoData";
+}
+
+const SNAPSHOT_HINT_KEY: Record<Exclude<SnapshotHint, "none">, string> = {
+  stale: "settings.resourcesStale",
+  staleNoData: "settings.resourcesLoadFailed",
+};
+
 /** Settings → Resources: read-only local-runtime dashboard (issue #112). Polls
  *  the combined snapshot while mounted and layers the existing
  *  `process-quota://changed` push event on top so a warn/degrade transition
@@ -31,6 +50,7 @@ const STALE_AFTER_CONSECUTIVE_FAILURES = 3;
  *  keep for themselves. */
 export function ResourcesSettings() {
   const { t } = useTranslation();
+  const reduce = useReducedMotion();
   const [snapshot, setSnapshot] = useState<ResourceDashboardSnapshot | null>(null);
   const [stale, setStale] = useState(false);
 
@@ -76,15 +96,30 @@ export function ResourcesSettings() {
     };
   }, []);
 
+  const hint = snapshotHintOf(stale, snapshot !== null);
+
   return (
     <div className="flex flex-col gap-10">
       <div className="flex flex-col gap-1">
         <p className="text-[12px] leading-relaxed text-ink-faint">{t("settings.resourcesHint")}</p>
-        {stale && (
-          <p className="text-[11.5px] leading-relaxed text-ink-faint">
-            {t("settings.resourcesStale")}
-          </p>
-        )}
+        {/* AnimatePresence + height/opacity (not plain conditional mount) so a
+         *  hint appearing/disappearing after a poll blip animates the four
+         *  SettingsGroup sections below into their new position instead of
+         *  snapping them — same treatment the quota/session bars already get
+         *  via `transition-[width]`, now extended to this panel's only other
+         *  piece of conditional layout. Respects useReducedMotion like those
+         *  bars do. */}
+        <AnimatePresence initial={false}>
+          {hint !== "none" && (
+            <motion.p
+              key="resources-snapshot-hint"
+              {...needsBarMotion(Boolean(reduce))}
+              className="overflow-hidden text-[11.5px] leading-relaxed text-ink-faint"
+            >
+              {t(SNAPSHOT_HINT_KEY[hint])}
+            </motion.p>
+          )}
+        </AnimatePresence>
       </div>
 
       <SettingsGroup title={t("settings.resourcesQuotaGroup")}>
